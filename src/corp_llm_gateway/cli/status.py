@@ -21,6 +21,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--token-file", default=os.environ.get("CORP_GATEWAY_TOKEN_FILE", DEFAULT_TOKEN_FILE))
     parser.add_argument("--version-file", default=DEFAULT_VERSION_FILE)
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--check-update",
+        action="store_true",
+        help="check for newer version (default: false)",
+    )
+    parser.add_argument(
+        "--latest-version-url",
+        default=os.environ.get(
+            "CORP_GATEWAY_LATEST_URL",
+            "https://git.corp.lan/.../raw/master/VERSION",
+        ),
+        help="URL returning the latest version string",
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("status", help="show client status (default)")
     args = parser.parse_args(argv)
@@ -29,6 +42,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         gateway_url=args.gateway_url,
         token_file=Path(args.token_file).expanduser(),
         version_file=Path(args.version_file).expanduser(),
+        update_check=args.check_update,
+        latest_version_url=args.latest_version_url,
     )
 
     if args.json:
@@ -44,6 +59,8 @@ def _gather_status(
     gateway_url: str,
     token_file: Path,
     version_file: Path,
+    update_check: bool = False,
+    latest_version_url: str | None = None,
 ) -> dict[str, object]:
     info: dict[str, object] = {
         "gateway_url": gateway_url,
@@ -72,6 +89,15 @@ def _gather_status(
 
     info["live"] = _probe_live(gateway_url)
     info["healthy"] = bool(info["token_present"] and info["live"])
+
+    if update_check and latest_version_url:
+        latest = _fetch_latest_version(latest_version_url)
+        if latest is not None:
+            info["latest_version"] = latest
+            info["update_available"] = bool(
+                info.get("version") and latest != info["version"]
+            )
+
     return info
 
 
@@ -83,6 +109,14 @@ def _probe_live(gateway_url: str) -> bool:
         return False
 
 
+def _fetch_latest_version(url: str) -> str | None:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
 def _print_human(info: dict[str, object]) -> None:
     out = sys.stdout
     out.write(f"gateway_url:    {info['gateway_url']}\n")
@@ -92,6 +126,10 @@ def _print_human(info: dict[str, object]) -> None:
         days = int(info["token_age_seconds"]) // 86400
         out.write(f"token_age:      {days}d\n")
     out.write(f"version:        {info.get('version') or 'unknown'}\n")
+    if "latest_version" in info:
+        out.write(f"latest_version: {info['latest_version']}\n")
+        if info.get("update_available"):
+            out.write("                (update available — re-run install.sh)\n")
     if info["healthy"]:
         out.write("\n✓ healthy\n")
     else:

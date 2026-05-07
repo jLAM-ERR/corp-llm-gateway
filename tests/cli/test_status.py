@@ -88,3 +88,53 @@ def test_main_healthy_when_live_and_token_present(
     assert rc == 0
     out = capsys.readouterr().out
     assert "healthy" in out
+
+
+def test_update_check_reports_newer_version(tmp_path: Path) -> None:
+    (tmp_path / "token").write_text("ct_xyz")
+    (tmp_path / "VERSION").write_text("v0.0.1\n")
+    with patch("corp_llm_gateway.cli.status._probe_live", return_value=True), patch(
+        "corp_llm_gateway.cli.status._fetch_latest_version", return_value="v0.0.2"
+    ):
+        info = _gather_status(
+            gateway_url="https://x",
+            token_file=tmp_path / "token",
+            version_file=tmp_path / "VERSION",
+            update_check=True,
+            latest_version_url="https://x/VERSION",
+        )
+    assert info["latest_version"] == "v0.0.2"
+    assert info["update_available"] is True
+
+
+def test_update_check_no_update_when_same_version(tmp_path: Path) -> None:
+    (tmp_path / "token").write_text("ct_xyz")
+    (tmp_path / "VERSION").write_text("v0.0.1\n")
+    with patch("corp_llm_gateway.cli.status._probe_live", return_value=True), patch(
+        "corp_llm_gateway.cli.status._fetch_latest_version", return_value="v0.0.1"
+    ):
+        info = _gather_status(
+            gateway_url="https://x",
+            token_file=tmp_path / "token",
+            version_file=tmp_path / "VERSION",
+            update_check=True,
+            latest_version_url="https://x/VERSION",
+        )
+    assert info["update_available"] is False
+
+
+def test_update_check_disabled_no_fetch(tmp_path: Path) -> None:
+    (tmp_path / "token").write_text("ct_xyz")
+    (tmp_path / "VERSION").write_text("v0.0.1\n")
+    with patch("corp_llm_gateway.cli.status._probe_live", return_value=True), patch(
+        "corp_llm_gateway.cli.status._fetch_latest_version"
+    ) as mock_fetch:
+        info = _gather_status(
+            gateway_url="https://x",
+            token_file=tmp_path / "token",
+            version_file=tmp_path / "VERSION",
+            update_check=False,
+            latest_version_url="https://x/VERSION",
+        )
+    mock_fetch.assert_not_called()
+    assert "latest_version" not in info
