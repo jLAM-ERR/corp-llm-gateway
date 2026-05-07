@@ -1,0 +1,9 @@
+apiVersion: v2
+name: corp-llm-gateway
+description: Corporate LLM gateway with sanitization guardrail
+type: application
+version: 0.0.1
+appVersion: "0.0.1"
+maintainers:
+  - name: the DRI
+    email: the DRI@gmail.com

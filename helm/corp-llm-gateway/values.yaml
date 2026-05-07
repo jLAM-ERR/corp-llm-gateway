@@ -1,0 +1,71 @@
+replicaCount: 3
+
+image:
+  repository: corp-registry.corp.lan/corp-llm-gateway
+  tag: ""
+  pullPolicy: IfNotPresent
+
+litellm:
+  versionPin: "1.40"
+
+guardrail:
+  contentSizeThresholdBytes: 102400
+  cacheA:
+    ttlSeconds: 36000
+    perTeamQuotaBytes: 1073741824
+  cacheB:
+    slidingTtlSeconds: 3600
+  cacheC:
+    refreshIntervalSeconds: 300
+
+corpLlm:
+  endpoint: ""
+  authProvider: "noop"
+
+prePass:
+  engine: "openai/privacy-filter"
+  pod:
+    resources:
+      requests:
+        cpu: "1"
+        memory: "4Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "2"
+        memory: "8Gi"
+        nvidia.com/gpu: "1"
+
+redis:
+  cluster: true
+  nodes: 3
+  memoryGb: 4
+  policy: allkeys-lru
+
+audit:
+  vector:
+    bufferGb: 5
+    bufferHours: 6
+  sinks:
+    langfuse:
+      enabled: true
+    s3:
+      enabled: true
+      bucket: corp-audit
+    siem:
+      enabled: true
+
+token:
+  ttlDays: 30
+  revocationCacheSeconds: 60
+
+ingress:
+  host: gateway.corp.lan
+  tls: true
+
+failPolicy:
+  corpLlmDown: "fail-closed"
+  prePassDown: "continue"
+  redisClusterDown: "fail-closed"
+  postgresDown: "fail-closed"
+  vectorBufferFull: "fail-closed"
+  s3SinkDown: "fail-closed"
