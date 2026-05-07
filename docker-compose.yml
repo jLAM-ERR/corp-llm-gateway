@@ -1,0 +1,52 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    volumes:
+      - ./src/corp_llm_gateway/tokens/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+
+  corp-llm-mock:
+    build:
+      context: ./docker/corp-llm-mock
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8000/healthz/live\").status==200 else 1)'"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  e2e:
+    build:
+      context: .
+      dockerfile: docker/e2e/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      corp-llm-mock:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
+      CORP_LLM_ENDPOINT: http://corp-llm-mock:8000
+      CORP_LLM_AUTH_PROVIDER: noop
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
