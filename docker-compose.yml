@@ -31,6 +31,15 @@ services:
       timeout: 2s
       retries: 10
 
+  langfuse-mock:
+    build:
+      context: ./docker/langfuse-mock
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:3000/api/public/health\").status==200 else 1)'"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
   e2e:
     build:
       context: .
@@ -42,11 +51,16 @@ services:
         condition: service_healthy
       corp-llm-mock:
         condition: service_healthy
+      langfuse-mock:
+        condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379/0
       POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
       CORP_LLM_ENDPOINT: http://corp-llm-mock:8000
       CORP_LLM_AUTH_PROVIDER: noop
+      LANGFUSE_URL: http://langfuse-mock:3000
+      LANGFUSE_PUBLIC_KEY: pk-test-ci
+      LANGFUSE_SECRET_KEY: sk-test-ci
     volumes:
       - ./src:/app/src:ro
       - ./tests:/app/tests:ro

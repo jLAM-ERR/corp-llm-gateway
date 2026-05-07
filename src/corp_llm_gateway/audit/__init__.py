@@ -4,6 +4,7 @@ from corp_llm_gateway.audit.invariants import (
     NeverFieldPresentError,
     assert_no_never_fields,
 )
+from corp_llm_gateway.audit.langfuse_sink import LangfuseIngestionError, LangfuseSink
 from corp_llm_gateway.audit.logger import AuditLogger
 from corp_llm_gateway.audit.retention import (
     lifecycle_configuration,
@@ -14,6 +15,8 @@ from corp_llm_gateway.audit.sinks import ListSink, Sink, StdoutSink
 __all__ = [
     "AuditEvent",
     "AuditLogger",
+    "LangfuseIngestionError",
+    "LangfuseSink",
     "ListSink",
     "NEVER_FIELDS",
     "NeverFieldPresentError",

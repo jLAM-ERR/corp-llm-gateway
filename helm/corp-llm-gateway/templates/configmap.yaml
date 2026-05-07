@@ -31,11 +31,76 @@ data:
           !exists(.corp_token) &&
           !exists(.authorization)
 
+    transforms:
+      to_langfuse:
+        type: remap
+        inputs: [enforce_audit_schema]
+        source: |
+          # Reshape our flat audit record into Langfuse's batch ingestion
+          # event format (one trace + one generation per request).
+          .__lf = .
+          . = {
+            "batch": [
+              {
+                "id": uuid_v4(),
+                "type": "trace-create",
+                "timestamp": .__lf.timestamp,
+                "body": {
+                  "id": .__lf.request_id,
+                  "name": "corp-llm-gateway",
+                  "userId": .__lf.user_id,
+                  "metadata": {
+                    "team_id": .__lf.team_id,
+                    "redaction_count": .__lf.redaction_count,
+                    "cache_a_hit": .__lf.cache_a_hit,
+                    "finding_label_counts": .__lf.finding_label_counts,
+                    "gateway_version": .__lf.gateway_version,
+                    "status": .__lf.status,
+                    "error_code": .__lf.error_code
+                  },
+                  "tags": [
+                    join(["team:", .__lf.team_id]),
+                    join(["provider:", .__lf.provider])
+                  ]
+                }
+              },
+              {
+                "id": uuid_v4(),
+                "type": "generation-create",
+                "timestamp": .__lf.timestamp,
+                "body": {
+                  "id": uuid_v4(),
+                  "traceId": .__lf.request_id,
+                  "name": join([.__lf.provider, "-call"]),
+                  "model": .__lf.model,
+                  "startTime": .__lf.timestamp,
+                  "usage": {
+                    "input": .__lf.prompt_token_count,
+                    "output": .__lf.completion_token_count,
+                    "total": .__lf.prompt_token_count + .__lf.completion_token_count,
+                    "unit": "TOKENS"
+                  },
+                  "metadata": {
+                    "latency_ms": .__lf.latency_ms,
+                    "corp_llm_latency_ms": .__lf.corp_llm_latency_ms,
+                    "pre_pass_latency_ms": .__lf.pre_pass_latency_ms
+                  }
+                }
+              }
+            ]
+          }
+          del(.__lf)
+
     sinks:
       langfuse:
         type: http
-        inputs: [enforce_audit_schema]
+        inputs: [to_langfuse]
         uri: "http://langfuse.corp.lan/api/public/ingestion"
+        method: post
+        auth:
+          strategy: basic
+          user: "${LANGFUSE_PUBLIC_KEY}"
+          password: "${LANGFUSE_SECRET_KEY}"
         encoding:
           codec: json
         buffer:
