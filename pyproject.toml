@@ -17,6 +17,9 @@ dependencies = [
     "structlog>=24.1",
 ]
 
+[project.scripts]
+gateway-admin = "corp_llm_gateway.cli.admin:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",
