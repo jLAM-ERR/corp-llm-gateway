@@ -1,9 +1,5 @@
 # ADR-001. Реестр интерфейсов для корпоративного LLM-шлюза
 
-> **Совместимость:** internal wiki. Документ оформлен на стандартном Markdown; макросы internal wiki (`{info}`, `{note}`, `{warning}`, `{code}`) указаны там, где они уместны при импорте.
->
-> **Импорт в internal wiki:** макрос *Markdown* (Atlassian Marketplace) или встроенный конвертер. Альтернативно — вставка через панель *Insert → Markup → Markdown*.
-
 ## Статус
 
 **Принято.** План v1, ревизия 5 (2026-05-07).
@@ -50,8 +46,6 @@ src/corp_llm_gateway/<module>/
 
 ### Сводная таблица реестров
 
-> Макрос internal wiki: `{table-plus:enableHeadingAttributes=true|sortable=true}` — обёртка ниже, если требуется сортируемость в internal wiki. В Markdown-источнике достаточно стандартной таблицы.
-
 | Реестр | ABC | Реализации (текущие) | Реализации (заглушки) | Точка переключения |
 |---|---|---|---|---|
 | Аутентификация к corp LLM | `auth.providers.CorpLlmAuthProvider` | `NoopAuthProvider` | `BearerAuthProvider`, `MtlsAuthProvider`, `OidcAuthProvider`, `ApiKeyHeaderAuthProvider` | env: `CORP_LLM_AUTH_PROVIDER` |
@@ -73,9 +67,10 @@ src/corp_llm_gateway/<module>/
 
 ### Пример: переключение аутентификации к corp LLM
 
-> {info:title=Сегодняшнее состояние}
+> [!IMPORTANT] 
+> **Сегодняшнее состояние**
 > Corp LLM не требует аутентификации. В production выбран `NoopAuthProvider`. Семантика — `artifacts()` возвращает пустой набор заголовков и нулевой client cert.
-> {info}
+> 
 
 Для включения Bearer-токена в будущем:
 
@@ -84,9 +79,9 @@ src/corp_llm_gateway/<module>/
 3. Изменить Helm value: `corpLlm.authProvider: bearer`.
 4. Перевыкатить deployment.
 
-> {note:title=Важно}
+> [!NOTE]
 > Никаких изменений в коде `SanitizationOrchestrator`, `CorpLlmClient`, `litellm_hook` или тестах. Это и есть инвариант реестра — переключение реализации остаётся config-only.
-> {note}
+>
 
 ## Последствия
 
