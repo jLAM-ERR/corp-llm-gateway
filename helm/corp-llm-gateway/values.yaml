@@ -62,6 +62,15 @@ ingress:
   host: gateway.corp.lan
   tls: true
 
+coreDnsSinkhole:
+  enabled: false
+  zone: corp.lan
+
+networkPolicy:
+  enabled: false
+  upstreamCidrs: []
+  corpInternalCidrs: []
+
 failPolicy:
   corpLlmDown: "fail-closed"
   prePassDown: "continue"

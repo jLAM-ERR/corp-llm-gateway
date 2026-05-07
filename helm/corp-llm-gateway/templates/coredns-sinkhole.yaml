@@ -1,0 +1,35 @@
+{{- if .Values.coreDnsSinkhole.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}-coredns-sinkhole
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+data:
+  # Plan ref: M5-1. In-cluster CoreDNS Corefile fragment that sinkholes
+  # the upstream provider hostnames. Non-gateway pods that try to resolve
+  # api.anthropic.com / api.openai.com get NXDOMAIN; the gateway pod
+  # bypasses this rule via its own kube-dns search path (NetworkPolicy
+  # in M5-3 ensures only the gateway pod can egress to the real IPs).
+  #
+  # Same fragment is mirrored to the corp resolver in M5-2; ops owns
+  # that piece.
+  Corefile: |
+    api.anthropic.com:53 {
+        log
+        errors
+        # Reply NXDOMAIN to all queries — sinkhole.
+        template ANY ANY {
+            rcode NXDOMAIN
+            authority "api.anthropic.com. 60 IN SOA ns.dns.{{ .Values.coreDnsSinkhole.zone }}. hostmaster.{{ .Values.coreDnsSinkhole.zone }}. (1 7200 1800 86400 30)"
+        }
+    }
+    api.openai.com:53 {
+        log
+        errors
+        template ANY ANY {
+            rcode NXDOMAIN
+            authority "api.openai.com. 60 IN SOA ns.dns.{{ .Values.coreDnsSinkhole.zone }}. hostmaster.{{ .Values.coreDnsSinkhole.zone }}. (1 7200 1800 86400 30)"
+        }
+    }
+{{- end }}
