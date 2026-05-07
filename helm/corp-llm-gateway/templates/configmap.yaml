@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}-vector
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+data:
+  vector.yaml: |
+    sources:
+      gateway_logs:
+        type: stdin
+
+    transforms:
+      parse:
+        type: remap
+        inputs: [gateway_logs]
+        source: |
+          . = parse_json!(.message)
+
+      enforce_audit_schema:
+        type: filter
+        inputs: [parse]
+        condition: |
+          # NEVER fields per docs/audit-schema.md — drop record if any present
+          !exists(.mapping) &&
+          !exists(.mapping_table) &&
+          !exists(.original_content) &&
+          !exists(.unredacted_content) &&
+          !exists(.replace_md) &&
+          !exists(.x_corp_auth) &&
+          !exists(.corp_token) &&
+          !exists(.authorization)
+
+    sinks:
+      langfuse:
+        type: http
+        inputs: [enforce_audit_schema]
+        uri: "http://langfuse.corp.lan/api/public/ingestion"
+        encoding:
+          codec: json
+        buffer:
+          type: disk
+          max_size: 1073741824
+
+      s3:
+        type: aws_s3
+        inputs: [enforce_audit_schema]
+        bucket: {{ .Values.audit.sinks.s3.bucket | quote }}
+        key_prefix: "{{ "{{ team_id }}" }}/dt=%Y-%m-%d/"
+        compression: gzip
+        encoding:
+          codec: json
+        buffer:
+          type: disk
+          max_size: 5368709120

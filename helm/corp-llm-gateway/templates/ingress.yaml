@@ -1,0 +1,26 @@
+{{- if .Values.ingress.host }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+spec:
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "corp-llm-gateway.fullname" . }}
+                port:
+                  number: 4000
+  {{- if .Values.ingress.tls }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ include "corp-llm-gateway.fullname" . }}-tls
+  {{- end }}
+{{- end }}

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 4000
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "corp-llm-gateway.selectorLabels" . | nindent 4 }}

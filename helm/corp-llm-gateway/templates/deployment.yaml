@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "corp-llm-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "corp-llm-gateway.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: litellm
+          image: "ghcr.io/berriai/litellm:v{{ .Values.litellm.versionPin }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 4000
+              protocol: TCP
+          env:
+            - name: CORP_LLM_AUTH_PROVIDER
+              value: {{ .Values.corpLlm.authProvider | quote }}
+            - name: CORP_LLM_ENDPOINT
+              value: {{ .Values.corpLlm.endpoint | quote }}
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+        - name: vector
+          image: "timberio/vector:0.40.0-alpine"
+          args: ["--config", "/etc/vector/vector.yaml"]
+          volumeMounts:
+            - name: vector-config
+              mountPath: /etc/vector
+            - name: vector-buffer
+              mountPath: /var/lib/vector
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: vector-config
+          configMap:
+            name: {{ include "corp-llm-gateway.fullname" . }}-vector
+        - name: vector-buffer
+          emptyDir:
+            sizeLimit: {{ .Values.audit.vector.bufferGb }}Gi
