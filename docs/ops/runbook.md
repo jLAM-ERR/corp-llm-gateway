@@ -48,7 +48,7 @@ Behavior: continue (per matrix).
 
 Action:
 1. Scale pre-pass replicas: `kubectl scale -n corp-llm-gateway deploy/pre-pass --replicas=2`.
-2. Investigate underlying GPU pod (OOM? CUDA error?).
+2. Investigate underlying CPU pod (OOM? worker crash? unusually large payload exceeding the M1-11 threshold?).
 
 ### Redis cluster down
 

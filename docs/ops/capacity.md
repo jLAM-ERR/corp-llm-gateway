@@ -1,6 +1,6 @@
 # Capacity sizing
 
-Plan ref: M4-8 (Vector buffer), M0-10 (pre-pass GPU pod), M1-11
+Plan ref: M4-8 (Vector buffer), M0-10 (pre-pass CPU pod), M1-11
 (per-team Cache A quotas), risks-table corp-LLM rows.
 
 ## Workload assumptions
@@ -33,15 +33,15 @@ SIEM alert at 50% buffer fill (M3-9) gates the bump decision.
 
 ## Pre-pass engine (M0-10)
 
-Default per rev-3: GPU pod (cost over latency tradeoff documented).
+CPU-only — corp k8s has no GPU pods. The pre-pass model runs on CPU; latency is mitigated by horizontal scale-out and the M1-11 content-size threshold.
 
-| Phase | Concurrent calls (est.) | GPU sizing |
+| Phase | Concurrent calls (est.) | CPU sizing |
 |---|---|---|
-| Phase 0–1 | ≤ 5 | 1× T4 / single replica |
-| Phase 2 | ≤ 25 | 1× T4 (replica:1, autoscale to 2 if p95 > 200ms) |
-| Phase 3 | ≤ 200 | 2–4× T4 (replica:2, autoscale to 4) |
+| Phase 0–1 | ≤ 5 | 1 replica × (2 vCPU, 8 GB) |
+| Phase 2 | ≤ 25 | 2 replicas × (4 vCPU, 16 GB), autoscale to 4 if p95 > 500 ms |
+| Phase 3 | ≤ 200 | 4 replicas × (4 vCPU, 16 GB), autoscale to 12 |
 
-Benchmark output (when M0-10 actually runs against real content) gates these numbers; this table is a placeholder for first-day deploy.
+Benchmark output (when M0-10 actually runs against real content) gates these numbers; this table is a placeholder for first-day deploy. If CPU latency makes the 4 s p99 budget infeasible, mitigate first by lowering the M1-11 content-size threshold from 100 KB to 25 KB so the largest payloads bypass sanitization rather than spending the budget.
 
 ## Corp-LLM throughput floor
 
