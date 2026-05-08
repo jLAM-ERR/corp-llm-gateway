@@ -85,12 +85,21 @@ write_rc_block() {
         echo "$RC_MARK_BEGIN"
         if [[ "$shell_name" == "fish" ]]; then
             echo "set -x ANTHROPIC_BASE_URL '$GATEWAY_URL'"
-            echo "set -x OPENAI_BASE_URL '$GATEWAY_URL'"
+            echo "set -x OPENAI_BASE_URL '$GATEWAY_URL/v1'"
             echo "set -x CORP_GATEWAY_TOKEN_FILE '$TOKEN_FILE'"
+            echo "# Pattern 1 (Claude Code): inject X-Corp-Auth via ANTHROPIC_CUSTOM_HEADERS."
+            echo "if test -f '$TOKEN_FILE'"
+            echo "    set -x ANTHROPIC_CUSTOM_HEADERS \"X-Corp-Auth: \$(cat '$TOKEN_FILE')\""
+            echo "end"
         else
             echo "export ANTHROPIC_BASE_URL='$GATEWAY_URL'"
-            echo "export OPENAI_BASE_URL='$GATEWAY_URL'"
+            echo "export OPENAI_BASE_URL='$GATEWAY_URL/v1'"
             echo "export CORP_GATEWAY_TOKEN_FILE='$TOKEN_FILE'"
+            echo "# Pattern 1 (Claude Code): inject X-Corp-Auth via ANTHROPIC_CUSTOM_HEADERS."
+            echo "# Re-evaluated per shell start so token rotation takes effect."
+            echo "if [[ -f '$TOKEN_FILE' ]]; then"
+            echo "  export ANTHROPIC_CUSTOM_HEADERS=\"X-Corp-Auth: \$(cat '$TOKEN_FILE')\""
+            echo "fi"
         fi
         echo "$RC_MARK_END"
     } > "$RC_FILE"

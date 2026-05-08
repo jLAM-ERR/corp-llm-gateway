@@ -61,6 +61,7 @@ services:
       LANGFUSE_URL: http://langfuse-mock:3000
       LANGFUSE_PUBLIC_KEY: pk-test-ci
       LANGFUSE_SECRET_KEY: sk-test-ci
+      RUN_PROXY_E2E: "1"
     volumes:
       - ./src:/app/src:ro
       - ./tests:/app/tests:ro

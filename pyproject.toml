@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 gateway-admin = "corp_llm_gateway.cli.admin:main"
 corp-llm-gateway = "corp_llm_gateway.cli.status:main"
+corp-llm-gateway-proxy = "corp_llm_gateway.cli.proxy:main"
 
 [project.optional-dependencies]
 dev = [
