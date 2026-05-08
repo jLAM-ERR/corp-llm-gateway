@@ -1,0 +1,102 @@
+@startuml corp-llm-gateway-data-flow
+title corp-llm-gateway — request/response data flow
+
+skinparam shadowing false
+skinparam defaultFontName Menlo
+skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 12
+skinparam BoxPadding 10
+
+actor "Claude Code\n(dev laptop)" as Dev
+
+box "LiteLLM Proxy (corp k8s)" #EEF6FF
+  participant "LiteLLM\nProxy" as LL
+  participant "CorpLlmGuardrail\n(litellm_hook)" as G
+  participant "AuthMiddleware\n(tokens/)" as Auth
+  participant "Sanitization\nOrchestrator" as Orc
+  participant "Rules loader\n(replace.md)" as Rules
+  participant "CorpLlmSanitizer\n(vLLM client)" as Sani
+  participant "MappingStore\n(in-mem | Redis)" as Map
+  participant "StreamingDesanitizer\n/ reverse_response" as Des
+  participant "AuditLogger\n+ NEVER gate" as Audit
+end box
+
+participant "Corp vLLM\n(CPU)" as Vllm
+participant "Anthropic /\nOpenAI" as Up
+database "SIEM /\nPostgres" as Sink
+
+== ingress ==
+Dev -> LL : POST /v1/chat/completions\nX-Corp-Auth: <corp token>\nAuthorization: Bearer <BYOK>\nbody: messages[]
+LL -> G : async_pre_call_hook(data)
+
+== pre_call (sanitize) ==
+G -> Auth : authenticate_headers(headers)
+Auth --> G : ctx{user_id, team_id}
+G -> Auth : strip_corp_token(headers)
+note right of G
+  X-Corp-Auth removed.
+  Authorization: Bearer (BYOK)
+  is forwarded untouched.
+end note
+
+loop for each message.content
+  G -> Orc : sanitize(text, team_id, conversation_id)
+  Orc -> Orc : payload-size gate (M1-11)
+  Orc -> Rules : load(team_id) [cached]
+  Rules --> Orc : Rules
+  Orc -> Sani : extract(text, rules)
+  Sani -> Vllm : POST /v1/chat/completions
+  Vllm --> Sani : structured response
+  Sani -> Sani : strategies in order:\n1. FunctionCallStrategy\n2. JsonStrategy\n3. RegexStrategy
+  Sani --> Orc : StrategyResult.pairs\n[(original, placeholder), …]
+  Orc -> Map : merge(conversation_id, pairs)\n(cache A)
+  Map --> Orc : cache_a_hit?
+  Orc --> G : SanitizeResult{sanitized_text, pairs}
+  G -> G : msg.content := sanitized_text\nstate.mapping += pairs
+end
+
+G --> LL : mutated data (sanitized)
+
+== egress ==
+LL -> Up : forward request\n(Authorization: Bearer <BYOK> intact)
+Up --> LL : response (unary or SSE stream)
+
+== post_call (desanitize) ==
+alt unary
+  LL -> G : async_post_call_success_hook(response)
+  G -> Des : reverse(response, mapping)\n(placeholders sorted longest-first — invariant #5)
+  Des --> G : response with originals restored
+else streaming
+  LL -> G : async_post_call_streaming_iterator_hook
+  loop per SSE chunk
+    G -> Des : feed(chunk_text)
+    Des --> G : desanitized chunk
+  end
+  G -> Des : flush()
+  Des --> G : tail
+end
+G --> LL : response
+LL --> Dev : response (originals restored)
+
+== audit (always, success or failure) ==
+LL -> G : async_log_success_event / async_log_failure_event
+G -> Audit : emit(AuditEvent{request_id, user_id, team_id,\nprovider, model, latency_ms, tokens,\nredaction_count, cache_a_hit, status,\nplaceholder_list})
+note right of Audit
+  NEVER-fields gate refuses
+  records that contain
+  mapping / original / credentials.
+  X-Corp-Auth never reaches here.
+end note
+Audit -> Sink : sinks (stdout / Vector → SIEM / Postgres)
+
+== invariants enforced on this path ==
+note over G, Audit #FFF6D6
+  #1  No originals leak (M1-14): logger, errors, traces, metrics, headers, stdout
+  #2  NEVER-fields gate on every audit emit
+  #3  Authorization (BYOK) passthrough untouched
+  #4  X-Corp-Auth stripped pre-call, never logged
+  #5  Placeholder substitution sorted longest-first
+  #6  Fail-policy matrix (M4) — no ad-hoc fail-open
+end note
+
+@enduml

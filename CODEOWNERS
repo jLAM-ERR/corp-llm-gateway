@@ -1,13 +1,13 @@
 # CODEOWNERS — see https://docs.github.com/articles/about-code-owners
 # Required-approval sections (e.g. [Security][1]) can be added once project roles are mapped.
 
-* @the DRI
+* @dri_am
 
 # Plan + design docs require DRI review
-/docs/plans/  @the DRI
+/docs/plans/  @dri_am
 
 # Helm chart changes need ops review (assign when ops owner is known)
-/helm/        @the DRI
+/helm/        @dri_am
 
 # Sanitizer core — security-sensitive, DRI must review
-/src/corp_llm_gateway/sanitizer/  @the DRI
+/src/corp_llm_gateway/sanitizer/  @dri_am

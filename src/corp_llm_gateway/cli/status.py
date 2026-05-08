@@ -2,13 +2,14 @@
 
 import argparse
 import json
-import os
 import sys
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+
+from corp_llm_gateway import config
 
 DEFAULT_TOKEN_FILE = "~/.corp-llm-gateway/token"
 DEFAULT_VERSION_FILE = "~/.corp-llm-gateway/VERSION"
@@ -17,8 +18,8 @@ DEFAULT_GATEWAY_URL = "https://gateway.corp.lan"
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="corp-llm-gateway", description="Gateway client status")
-    parser.add_argument("--gateway-url", default=os.environ.get("CORP_GATEWAY_URL", DEFAULT_GATEWAY_URL))
-    parser.add_argument("--token-file", default=os.environ.get("CORP_GATEWAY_TOKEN_FILE", DEFAULT_TOKEN_FILE))
+    parser.add_argument("--gateway-url", default=config.get("CORP_GATEWAY_URL", DEFAULT_GATEWAY_URL))
+    parser.add_argument("--token-file", default=config.get("CORP_GATEWAY_TOKEN_FILE", DEFAULT_TOKEN_FILE))
     parser.add_argument("--version-file", default=DEFAULT_VERSION_FILE)
     parser.add_argument("--json", action="store_true", help="emit JSON")
     parser.add_argument(
@@ -28,7 +29,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--latest-version-url",
-        default=os.environ.get(
+        default=config.get(
             "CORP_GATEWAY_LATEST_URL",
             "https://git.corp.lan/.../raw/master/VERSION",
         ),

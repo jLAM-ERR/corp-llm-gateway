@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "corp-llm-gateway"
-version = "0.0.1"
+version = "0.0.2"
 description = "Corporate LLM gateway with sanitization guardrail (LiteLLM-based)"
 readme = "README.md"
 requires-python = ">=3.12"
-authors = [{ name = "Corporate Internal", email = "the DRI@gmail.com" }]
+authors = [{ name = "Corporate Internal", email = "corp-internal@corp.lan" }]
 dependencies = [
     "litellm>=1.40,<1.50",
     "redis>=5.0",

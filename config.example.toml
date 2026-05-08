@@ -1,0 +1,39 @@
+# corp-llm-gateway — example config file (TOML).
+#
+# Copy to one of:
+#   ~/.corp-llm-gateway/config.toml         (laptop default)
+#   /etc/corp-llm-gateway/config.toml       (server default)
+# Or point at any path via $CORP_LLM_GATEWAY_CONFIG_FILE.
+#
+# Every key here is the env-var name. Resolution order at runtime:
+#   1. environment variable (env wins — existing deployments unaffected)
+#   2. value from this file
+#   3. caller-supplied default
+#
+# Set only the keys you want — anything you omit falls back to env / default.
+
+# ── Laptop CLIs (corp-llm-gateway status, corp-llm-gateway-proxy) ────────────
+
+# CORP_GATEWAY_URL          = "https://gateway.corp.lan"
+# CORP_GATEWAY_TOKEN_FILE   = "~/.corp-llm-gateway/token"
+# CORP_GATEWAY_LATEST_URL   = "https://git.corp.lan/.../raw/master/VERSION"
+
+# ── Server-side: corp vLLM auth provider (auth/factory.py) ───────────────────
+
+# CORP_LLM_AUTH_PROVIDER    = "noop"     # one of: noop | bearer | mtls | oidc | apikey
+
+# bearer:
+# CORP_LLM_BEARER_TOKEN     = "..."
+
+# mtls:
+# CORP_LLM_MTLS_CERT        = "/etc/corp-llm-gateway/client.crt"
+# CORP_LLM_MTLS_KEY         = "/etc/corp-llm-gateway/client.key"
+
+# oidc:
+# CORP_LLM_OIDC_ISSUER      = "https://keycloak.corp.lan/realms/corp"
+# CORP_LLM_OIDC_CLIENT_ID   = "corp-llm-gateway"
+# CORP_LLM_OIDC_CLIENT_SECRET = "..."
+
+# apikey:
+# CORP_LLM_API_KEY_HEADER   = "X-Api-Key"
+# CORP_LLM_API_KEY          = "..."

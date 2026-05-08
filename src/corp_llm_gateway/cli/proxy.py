@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 import threading
+
+from corp_llm_gateway import config
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -153,11 +154,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--listen", default=DEFAULT_LISTEN)
     parser.add_argument(
         "--upstream",
-        default=os.environ.get("CORP_GATEWAY_URL", DEFAULT_UPSTREAM),
+        default=config.get("CORP_GATEWAY_URL", DEFAULT_UPSTREAM),
     )
     parser.add_argument(
         "--token-file",
-        default=os.environ.get("CORP_GATEWAY_TOKEN_FILE", DEFAULT_TOKEN_FILE),
+        default=config.get("CORP_GATEWAY_TOKEN_FILE", DEFAULT_TOKEN_FILE),
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
