@@ -140,7 +140,9 @@ follow the established interface-registry pattern:
 ## Things NOT to do
 
 - Don't rename `master` to `main`.
-- Don't add internal git host references; we're on internal git host.
+- Don't add `a non-standard CI config` — CI stays on internal git host (`the CI config`).
+  Git hosting IS internal git host (`git.corp.lan`); that split
+  is intentional, not a migration artefact.
 - Don't add GPU deps.
 - Don't introduce a non-OpenAI/Anthropic provider in v1 (Bedrock /
   Gemini / Azure are explicit v2).
