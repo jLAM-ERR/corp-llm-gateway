@@ -39,10 +39,16 @@ tests/                   pytest, pytest-asyncio mode=auto
 ## Running tests
 
 ```
+# Full unit suite (last known: 265 tests, ~16s). Always run before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
-```
 
-265 tests should pass in ~16s. **Always run before committing.**
+# Single test / file / node
+PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py -q
+PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py::test_name -q
+
+# E2E (Langfuse + corp-llm-mock via docker compose; matches CI e2e:langfuse)
+docker compose run --rm e2e pytest -q tests/e2e
+```
 
 ## Tooling
 
@@ -51,6 +57,31 @@ PYTHONPATH=src .venv/bin/pytest tests/ -q
 - Default branch: `master` (NOT main)
 - CI: CI (`the CI config`); NOT other CI
 - httpx for HTTP, Redis via `redis.asyncio`, fakeredis for tests
+- First-time setup: `pip install -e ".[dev]" && pre-commit install`
+- CI lint runs both `ruff check` AND `ruff format --check` — running only
+  `ruff check` locally can still leave you with a CI format failure
+
+## CLI entry points
+
+Wired in `pyproject.toml` `[project.scripts]`:
+
+- `corp-llm-gateway` → `cli/status.py` (dev laptop diagnostics)
+- `corp-llm-gateway-proxy` → `cli/proxy.py` (header-injecting localhost proxy, Pattern 3)
+- `gateway-admin` → `cli/admin.py` (operator: team CRUD, retention, token issue/revoke)
+
+## Config resolution
+
+Every env var the app reads (`CORP_LLM_AUTH_PROVIDER`, `CORP_LLM_BEARER_TOKEN`,
+`CORP_GATEWAY_URL`, `CORP_GATEWAY_TOKEN_FILE`, …) resolves through:
+
+1. env var
+2. `$CORP_LLM_GATEWAY_CONFIG_FILE` → `~/.corp-llm-gateway/config.toml` →
+   `/etc/corp-llm-gateway/config.toml` (first existing)
+3. caller default
+
+Loader: `src/corp_llm_gateway/config.py`. Template: `config.example.toml`.
+When adding a new tunable, plumb it through this loader — don't read
+`os.environ` directly at call sites.
 
 ## Critical invariants — never weaken these
 
@@ -121,8 +152,16 @@ follow the established interface-registry pattern:
 ## Useful one-liners
 
 ```
-# Quick sanity check (lint + tests)
-PYTHONPATH=src .venv/bin/ruff check src tests && PYTHONPATH=src .venv/bin/pytest tests/ -q
+# Quick sanity check (matches CI lint:python — both check and format-check)
+PYTHONPATH=src .venv/bin/ruff check src tests \
+  && PYTHONPATH=src .venv/bin/ruff format --check src tests \
+  && PYTHONPATH=src .venv/bin/pytest tests/ -q
+
+# Helm chart lint (matches CI lint:helm)
+helm lint helm/corp-llm-gateway
+
+# Coverage report
+PYTHONPATH=src .venv/bin/pytest -q --cov=corp_llm_gateway --cov-report=term-missing
 
 # See remaining work
 cat docs/remaining-steps.md
