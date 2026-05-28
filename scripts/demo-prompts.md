@@ -103,8 +103,9 @@ Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
 **What to highlight in Langfuse:**
 - Open the second trace (the re-run)
 - Navigate to metadata
-- Confirm: `cache_a_hit=true` (the gateway recognized this is the same content, used the cached redaction)
-- Confirm: `redactions_recomputed=0` (the tier engine did not re-run; result came from cache)
+- Confirm: `cache_a_hit: true` (the gateway recognized this is the same content and reused the cached redaction; the field is emitted by `src/corp_llm_gateway/audit/event.py:30`)
+- Confirm: `redaction_count` is identical to Prompt 2's value (1)
+- (Optional, if exposed) `pre_pass_latency_ms` should be visibly lower than Prompt 2's — the tier engine did not re-run
 
 **Expected tier:** Regex (same tier as Prompt 2, but this time cached).
 
@@ -114,28 +115,27 @@ Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
 
 **Text:**
 ```
-Paste ~110 KB of repetitive log lines, with one email embedded:
+Paste ≥101 KB of repetitive log lines, with one email embedded:
 
 [2026-05-28 10:00:01] INFO: Processing batch
 [2026-05-28 10:00:02] INFO: Processing batch
 [2026-05-28 10:00:03] INFO: Processing batch
-... (repeat ~110 KB of similar lines, include one line like:)
+... (repeat to exceed 100 KB total; threshold is 100 * 1024 bytes per
+     src/corp_llm_gateway/payload/size_threshold.py:DEFAULT_THRESHOLD_BYTES)
 [2026-05-28 10:04:59] ERROR: Alert from j.doe@corp.lan regarding incident
-... (continue similar lines to reach ~110 KB total)
+... (more lines)
 
 Summarize this log.
 ```
 
-(Adjust the repetition to reach roughly 110 KB when pasted; use a log generator if needed.)
+(One easy way: `yes "[2026-05-28 10:00:01] INFO: Processing batch" | head -2000` produces ~108 KB. Insert the email line somewhere in the middle.)
 
 **What to highlight in Langfuse:**
-- Open the trace
-- Check metadata
-- Confirm: `payload_size_skip=true` (the gateway detected the request exceeded the size threshold)
-- Confirm: the egress **still proceeded** (we do not fail-closed on oversize; we flag it and audit logs it for review)
-- The email in the logs was **not redacted** (skipped the sanitizer engine per M1-11)
+- Open the trace; the **upstream payload still contains `j.doe@corp.lan` in plain text** — pre-pass was skipped per the M1-11 size threshold, so the redaction tiers never ran.
+- The egress still proceeded (we do not fail-closed on oversize; the policy is "deliver and flag")
+- `redaction_count: 0` despite the email being present — this is the smoking-gun signal of the skip, not a dedicated `skipped` field. (`AuditEvent` does not currently expose a `payload_skipped` boolean — the observable is the absence of redactions on content that visibly contained PII.)
 
-**Expected tier:** Skipped — content size exceeded the pre-configured threshold; sanitization was bypassed for latency; the trace is flagged for security review.
+**Expected tier:** Skipped — content size exceeded the pre-configured 100 KB threshold; sanitization was bypassed for latency; the trace is flagged for security review (out-of-band, not via a dedicated audit field).
 
 ---
 
@@ -165,7 +165,7 @@ Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
    ```bash
    docker compose -f docker-compose.demo.yml start vector
    ```
-2. Wait ~10 seconds for Vector healthcheck to pass.
+2. Wait until `docker compose -f docker-compose.demo.yml ps vector` reports `(healthy)` — don't rely on a fixed sleep; Vector boot can race with its own healthcheck. Typically 5–15s on a warm laptop.
 
 3. **Re-send Prompt 7A** (the same text):
    - **Expected:** The request **succeeds** this time
