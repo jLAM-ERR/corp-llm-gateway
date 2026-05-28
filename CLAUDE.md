@@ -36,6 +36,27 @@ scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
 tests/                   pytest, pytest-asyncio mode=auto
 ```
 
+## Request lifecycle (read once, then you understand the engine)
+
+```
+pre_call:  three tiers tried in order — FunctionCall → JSON → Regex
+           (first to detect-and-redact wins; regex is the floor)
+           ↓
+           upstream (api.anthropic.com / api.openai.com) with BYOK Authorization
+           ↓
+post_call: StreamingDesanitizer rebuilds originals using the per-conversation mapping
+           ↓
+           audit: Vector → Langfuse + S3 + SIEM (NEVER-fields gate)
+```
+
+Two caches:
+
+- **Cache A** — content-keyed dedup, shared across conversations, TTL ~10h.
+- **Cache B** — per-conversation mapping store (Redis or in-memory),
+  sliding TTL ~1h, **required** for `post_call` to undo redactions.
+  Today `conversation_id == request_id`, so Cache B doesn't reuse across
+  sibling requests; see `docs/conversation-id.md`.
+
 ## Running tests
 
 ```
