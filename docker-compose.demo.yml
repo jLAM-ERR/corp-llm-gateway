@@ -71,7 +71,7 @@ services:
     depends_on:
       litellm:
         condition: service_healthy
-      langfuse:
+      langfuse-web:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8686/health"]
@@ -79,7 +79,7 @@ services:
       timeout: 3s
       retries: 5
 
-  langfuse:
+  langfuse-web:
     image: langfuse/langfuse:3
     ports:
       - "3000:3000"
