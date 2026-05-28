@@ -191,4 +191,7 @@ cat docs/remaining-steps.md
 
 # See plan rev
 head -3 docs/plans/20260507-external-sanitizer-gateway-v1.md
+
+# Cold-boot the colleague demo stack (~3-5 min first time)
+scripts/demo.sh up
 ```

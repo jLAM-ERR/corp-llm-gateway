@@ -23,6 +23,7 @@ v1 — pre-execution. See [`docs/plans/20260507-external-sanitizer-gateway-v1.md
   - [Install / upgrade](#install--upgrade)
   - [Health checks](#health-checks)
   - [Day-2 ops](#day-2-ops)
+- [Demo (laptop)](#demo-laptop)
 - [CLIs](#clis)
 - [Configuration (Helm values)](#configuration-helm-values)
 - [Conversation identity](#conversation-identity)
@@ -182,6 +183,14 @@ Rollback: `helm rollback gw <revision>` (Helm keeps the last 10). Full release f
 Source of truth: [`docs/ops/runbook.md`](docs/ops/runbook.md) (incident playbook, fail-policy matrix, common operations like `gateway-admin team create`, `gateway-admin token revoke`, kubectl one-liners).
 
 Capacity sizing per phase (Phase 0 alpha → Phase 3 GA at 1000 devs / 50 RPS aggregate): [`docs/ops/capacity.md`](docs/ops/capacity.md).
+
+## Demo (laptop)
+
+For a guided ~15-min walkthrough of the gateway end-to-end — request round-trip,
+audit pipeline lit up in Langfuse, fail-closed posture — bring up the parallel
+demo stack: `scripts/demo.sh up`. Full setup, prompt set, and troubleshooting
+in [`docs/demo.md`](docs/demo.md). The demo stack lives in `docker-compose.demo.yml`
+and is independent of the CI compose at `docker-compose.yml`.
 
 ## CLIs
 
