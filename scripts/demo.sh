@@ -46,6 +46,12 @@ preflight_checks() {
     # Check docker compose v2
     docker compose version >/dev/null 2>&1 || fatal "docker compose v2 required"
 
+    # Check jq (used for healthcheck polling and Langfuse JSON parsing)
+    command -v jq >/dev/null || fatal "jq not on PATH (brew install jq / apt install jq)"
+
+    # Check curl (used for reachability + Langfuse setup API)
+    command -v curl >/dev/null || fatal "curl not on PATH"
+
     # Check .env.demo exists, or copy from .env.demo.example
     if [[ ! -f "$ENV_FILE" ]]; then
         if [[ -f "${ENV_FILE}.example" ]]; then
@@ -145,10 +151,11 @@ seed_langfuse() {
     local public_key
     local secret_key
 
-    if echo "$response" | grep -q '"name":"demo-team"'; then
+    # Use jq for robust JSON extraction (grep-based parsing is brittle to whitespace/ordering).
+    if echo "$response" | jq -e '.[] | select(.name == "demo-team")' >/dev/null 2>&1; then
         info "demo-team project already exists, extracting credentials..."
-        public_key=$(echo "$response" | grep -A5 '"name":"demo-team"' | grep -o '"publicKey":"[^"]*"' | cut -d'"' -f4 | head -1)
-        secret_key=$(echo "$response" | grep -A5 '"name":"demo-team"' | grep -o '"secretKey":"[^"]*"' | cut -d'"' -f4 | head -1)
+        public_key=$(echo "$response" | jq -r '.[] | select(.name == "demo-team") | .publicKey // empty')
+        secret_key=$(echo "$response" | jq -r '.[] | select(.name == "demo-team") | .secretKey // empty')
 
         if [[ -z "$public_key" || -z "$secret_key" ]]; then
             fatal "Could not extract credentials from existing demo-team project"
@@ -160,8 +167,8 @@ seed_langfuse() {
             -H "Content-Type: application/json" \
             -d '{"name":"demo-team"}' 2>/dev/null) || fatal "Failed to create demo-team project"
 
-        public_key=$(echo "$create_response" | grep -o '"publicKey":"[^"]*"' | cut -d'"' -f4 | head -1)
-        secret_key=$(echo "$create_response" | grep -o '"secretKey":"[^"]*"' | cut -d'"' -f4 | head -1)
+        public_key=$(echo "$create_response" | jq -r '.publicKey // empty')
+        secret_key=$(echo "$create_response" | jq -r '.secretKey // empty')
 
         if [[ -z "$public_key" || -z "$secret_key" ]]; then
             fatal "Could not extract credentials from create response: $create_response"
@@ -216,8 +223,13 @@ case "${1:-}" in
 Demo stack is ready!
 
 LiteLLM proxy:   http://localhost:4000
-Langfuse UI:     http://localhost:3000   (login: demo@corp.lan / demo)
+Langfuse UI:     http://localhost:3000   (on first visit, sign up as the
+                                         first user with any email/password;
+                                         the demo-team project is already
+                                         seeded by 'seed-langfuse')
 MinIO console:   http://localhost:9001   (minioadmin/minioadmin)
+
+Next: 'scripts/demo.sh presenter-env' → paste into second shell for Claude Code.
 EOF
         ;;
     down)

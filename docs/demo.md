@@ -7,6 +7,7 @@ This is a ~15-minute terminal-driven walkthrough for colleagues — security, op
 ## Prerequisites
 
 - Docker 24+ and Docker Compose v2
+- `jq` and `curl` (used by `scripts/demo.sh` for healthcheck polling and Langfuse setup; `brew install jq` on macOS, `apt install jq` on Debian/Ubuntu)
 - ~3 GB free RAM
 - Corp VPN connected (needed to reach the actual corp LLM endpoint)
 - Claude Code installed on the laptop
