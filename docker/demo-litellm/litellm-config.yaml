@@ -1,0 +1,14 @@
+model_list:
+  - model_name: "anthropic/*"
+    litellm_params:
+      model: "openai/*"
+      api_base: "os.environ/CORP_LLM_ENDPOINT"
+      api_key: "os.environ/CORP_LLM_AUTH_TOKEN"   # currently empty; corp LLM is auth-less
+  - model_name: "openai/*"
+    litellm_params:
+      model: "openai/*"
+      api_base: "os.environ/CORP_LLM_ENDPOINT"
+      api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
+litellm_settings:
+  callbacks: ["corp_llm_gateway.litellm_hook.CorpLlmGuardrail"]
+  json_logs: true

@@ -1,0 +1,41 @@
+sources:
+  litellm_logs:
+    type: docker_logs
+    include_containers: ["litellm"]
+
+transforms:
+  parse:
+    type: remap
+    inputs: ["litellm_logs"]
+    source: |
+      . = parse_json!(.message)
+  never_fields_gate:                  # mirrors src/corp_llm_gateway/audit/invariants.py
+    type: filter
+    inputs: ["parse"]
+    condition: |
+      !exists(.original_request) &&
+      !exists(.original_response) &&
+      !exists(.mapping) &&
+      !exists(.x_corp_auth)
+  to_langfuse_schema:
+    type: remap
+    inputs: ["never_fields_gate"]
+    source: |
+      # Langfuse v3 ingestion expects { type, id, timestamp, body }
+      # Trace events: type="trace-create"; Observations: type="observation-create"
+      .type = if exists(.span_kind) && .span_kind == "trace" { "trace-create" } else { "observation-create" }
+      .id = .request_id
+      .timestamp = .ts
+      .body = .
+      del(.message)
+
+sinks:
+  langfuse:
+    type: http
+    inputs: ["to_langfuse_schema"]
+    uri: "http://langfuse-web:3000/api/public/ingestion"
+    encoding: { codec: "json" }
+    auth:
+      strategy: "basic"
+      user: "${LANGFUSE_PUBLIC_KEY}"
+      password: "${LANGFUSE_SECRET_KEY}"

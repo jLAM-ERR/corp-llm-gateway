@@ -24,3 +24,5 @@ htmlcov/
 
 helm/*/charts/
 helm/*/Chart.lock
+
+.env.demo

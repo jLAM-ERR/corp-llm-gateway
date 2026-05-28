@@ -1,0 +1,177 @@
+# DEMO ONLY — laptop walkthrough stack.
+# Vector reads container stdout via the Docker socket. Production (helm/) uses a
+# sidecar tailing a file. Do NOT copy this socket-mount pattern to k8s manifests.
+
+services:
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - gateway-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    command: redis-server --appendonly yes
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - gateway-postgres-data:/var/lib/postgresql/data
+      - ./src/corp_llm_gateway/tokens/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.85.0
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./src:/pkg/src:ro
+      - ./pyproject.toml:/pkg/pyproject.toml:ro
+      - ./docker/demo-litellm/litellm-config.yaml:/etc/litellm/config.yaml:ro
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
+      CORP_LLM_AUTH_PROVIDER: noop
+    env_file: .env.demo
+    entrypoint: sh
+    command:
+      - "-c"
+      - "pip install --no-cache-dir -e /pkg --quiet && exec litellm --config /etc/litellm/config.yaml --port 4000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  vector:
+    image: timberio/vector:0.53-alpine
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker/demo-vector/vector.yaml:/etc/vector/vector.yaml:ro
+    env_file: .env.demo
+    command: --config /etc/vector/vector.yaml
+    depends_on:
+      litellm:
+        condition: service_healthy
+      langfuse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8686/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  langfuse:
+    image: langfuse/langfuse:3
+    ports:
+      - "3000:3000"
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://clickhouse:8123
+      NEXTAUTH_SECRET: demo-secret-key-change-in-production
+      NEXTAUTH_URL: http://localhost:3000
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: langfuse
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/public/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://clickhouse:8123
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: langfuse
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  langfuse-postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3-jammy
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: default
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    ports:
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  gateway-postgres-data:
+  gateway-redis-data:
+  langfuse-postgres-data:
+  langfuse-clickhouse-data:
+  minio-data:
