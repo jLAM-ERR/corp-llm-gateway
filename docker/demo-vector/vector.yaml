@@ -9,14 +9,27 @@ transforms:
     inputs: ["litellm_logs"]
     source: |
       . = parse_json!(.message)
-  never_fields_gate:                  # mirrors src/corp_llm_gateway/audit/invariants.py
+  never_fields_gate:                  # mirrors src/corp_llm_gateway/audit/invariants.py NEVER_FIELDS exactly
     type: filter
     inputs: ["parse"]
     condition: |
-      !exists(.original_request) &&
-      !exists(.original_response) &&
       !exists(.mapping) &&
-      !exists(.x_corp_auth)
+      !exists(.mapping_table) &&
+      !exists(.pairs) &&
+      !exists(.original_content) &&
+      !exists(.unredacted_content) &&
+      !exists(.pre_sanitization) &&
+      !exists(.replace_md) &&
+      !exists(.rule_values) &&
+      !exists(.x_corp_auth) &&
+      !exists(."X-Corp-Auth") &&
+      !exists(.corp_token) &&
+      !exists(.authorization) &&
+      !exists(.Authorization) &&
+      !exists(.cookie) &&
+      !exists(.Cookie) &&
+      !exists(.set_cookie) &&
+      !exists(."Set-Cookie")
   to_langfuse_schema:
     type: remap
     inputs: ["never_fields_gate"]
