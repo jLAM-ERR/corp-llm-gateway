@@ -37,7 +37,13 @@ class CorpLlmSanitizer:
         last_error: Exception | None = None
         for strategy in self._strategies:
             try:
-                return await strategy.extract(raw_llm_output)
+                result = await strategy.extract(raw_llm_output)
+                logger.info(
+                    "strategy_succeeded name=%s pairs=%d",
+                    strategy.name,
+                    len(result.pairs),
+                )
+                return result
             except NotImplementedError:
                 logger.debug("strategy_skipped name=%s", strategy.name)
                 continue
@@ -49,6 +55,11 @@ class CorpLlmSanitizer:
                     type(exc).__name__,
                 )
                 continue
+        logger.warning(
+            "strategy_all_failed strategies=%d last=%s",
+            len(self._strategies),
+            type(last_error).__name__ if last_error else "None",
+        )
         raise AllStrategiesFailedError(
             f"all {len(self._strategies)} strategies failed; last={last_error!r}"
         )

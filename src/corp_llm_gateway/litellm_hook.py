@@ -134,21 +134,54 @@ class CorpLlmGuardrail:
         error_code so post-call audit can attribute the failure.
         """
         request_id = self._ensure_request_id(data)
+        model = str(data.get("model") or "unknown")
+        raw_messages = data.get("messages") or []
+        message_count = len(raw_messages) if isinstance(raw_messages, list) else 0
+        logger.info(
+            "litellm_pre_call_received request_id=%s model=%s message_count=%d",
+            request_id,
+            model,
+            message_count,
+        )
 
         try:
             ctx = await self._auth.authenticate_headers(_extract_headers(data))
         except MissingTokenError:
+            logger.info(
+                "litellm_pre_call_auth_failed request_id=%s error_code=E_MISSING_TOKEN",
+                request_id,
+            )
             self._record_failure(request_id, error_code="E_MISSING_TOKEN")
             raise GuardrailHttpException(401, "E_MISSING_TOKEN", "missing X-Corp-Auth")
         except AuthError as exc:
             error_code = _classify_auth_error(exc)
+            logger.info(
+                "litellm_pre_call_auth_failed request_id=%s error_code=%s",
+                request_id,
+                error_code,
+            )
             self._record_failure(request_id, error_code=error_code)
             raise GuardrailHttpException(401, error_code, str(exc)) from exc
 
+        logger.info(
+            "litellm_pre_call_auth_ok request_id=%s team_id=%s user_id=%s",
+            request_id,
+            ctx.team_id,
+            ctx.user_id,
+        )
+
         data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
+        logger.info(
+            "litellm_pre_call_corp_token_stripped request_id=%s",
+            request_id,
+        )
 
         messages = data.get("messages") or []
         if not isinstance(messages, list):
+            logger.info(
+                "litellm_pre_call_bad_request request_id=%s error_code=E_BAD_REQUEST",
+                request_id,
+            )
             self._record_failure(request_id, error_code="E_BAD_REQUEST")
             raise GuardrailHttpException(400, "E_BAD_REQUEST", "messages must be a list")
 
@@ -158,7 +191,7 @@ class CorpLlmGuardrail:
             user_id=ctx.user_id,
             team_id=ctx.team_id,
             provider=provider,
-            model=str(data.get("model") or "unknown"),
+            model=model,
             redaction_count=0,
             placeholders=[],
             cache_a_hit=False,
@@ -171,7 +204,21 @@ class CorpLlmGuardrail:
                 continue
             content = msg.get("content")
             if not isinstance(content, str) or not content:
+                logger.info(
+                    "litellm_pre_call_message_skipped request_id=%s "
+                    "message_index=%d reason=empty_or_non_string",
+                    request_id,
+                    i,
+                )
                 continue
+            logger.info(
+                "litellm_pre_call_message_sanitize_start request_id=%s "
+                "message_index=%d role=%s content_bytes=%d",
+                request_id,
+                i,
+                str(msg.get("role") or "unknown"),
+                len(content.encode("utf-8")),
+            )
             result = await self._orch.sanitize(
                 content,
                 team_id=ctx.team_id,
@@ -179,7 +226,26 @@ class CorpLlmGuardrail:
             )
             messages[i] = {**msg, "content": result.sanitized_text}
             self._merge_into_state(state, result)
+            logger.info(
+                "litellm_pre_call_message_sanitize_done request_id=%s "
+                "message_index=%d redaction_count=%d cache_a_hit=%s skipped=%s",
+                request_id,
+                i,
+                len(result.pairs),
+                result.cache_a_hit,
+                result.skipped,
+            )
 
+        logger.info(
+            "litellm_pre_call_complete request_id=%s team_id=%s provider=%s "
+            "model=%s total_redactions=%d placeholder_count=%d",
+            request_id,
+            ctx.team_id,
+            provider,
+            model,
+            state.redaction_count,
+            len(state.placeholders),
+        )
         return data
 
     async def post_call_stream(
@@ -191,12 +257,24 @@ class CorpLlmGuardrail:
         request_id = self._ensure_request_id(request_data)
         state = self._req_state.get(request_id)
         if state is None or not state.mapping.pairs:
+            logger.info(
+                "litellm_post_call_stream_passthrough request_id=%s reason=%s",
+                request_id,
+                "no_state" if state is None else "no_mapping",
+            )
             async for chunk in response:
                 yield chunk
             return
 
+        logger.info(
+            "litellm_post_call_stream_desanitize_start request_id=%s pairs=%d",
+            request_id,
+            len(state.mapping.pairs),
+        )
         desanitizer = StreamingDesanitizer(state.mapping)
+        chunk_count = 0
         async for chunk in response:
+            chunk_count += 1
             text = _extract_chunk_text(chunk)
             if text is None:
                 yield chunk
@@ -207,6 +285,11 @@ class CorpLlmGuardrail:
         tail = desanitizer.flush()
         if tail:
             yield _replace_chunk_text(_make_text_chunk(), tail)
+        logger.info(
+            "litellm_post_call_stream_desanitize_done request_id=%s chunk_count=%d",
+            request_id,
+            chunk_count,
+        )
 
     async def post_call_unary(
         self,
@@ -217,7 +300,17 @@ class CorpLlmGuardrail:
         request_id = self._ensure_request_id(request_data)
         state = self._req_state.get(request_id)
         if state is None or not state.mapping.pairs:
+            logger.info(
+                "litellm_post_call_unary_passthrough request_id=%s reason=%s",
+                request_id,
+                "no_state" if state is None else "no_mapping",
+            )
             return response
+        logger.info(
+            "litellm_post_call_unary_desanitize request_id=%s pairs=%d",
+            request_id,
+            len(state.mapping.pairs),
+        )
         return _apply_reverse_to_response(response, state.mapping)
 
     async def audit(
@@ -252,6 +345,17 @@ class CorpLlmGuardrail:
             ),
         )
         await self._audit.emit(event)
+        logger.info(
+            "litellm_audit_emitted request_id=%s status=%s latency_ms=%d "
+            "redaction_count=%d cache_a_hit=%s prompt_tokens=%d completion_tokens=%d",
+            request_id,
+            status,
+            latency_ms,
+            event.redaction_count,
+            event.cache_a_hit,
+            prompt_tokens,
+            completion_tokens,
+        )
 
     # ---- internals --------------------------------------------------------
 

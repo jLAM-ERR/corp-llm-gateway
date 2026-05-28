@@ -77,23 +77,56 @@ class SanitizationOrchestrator:
         team_id: str,
         conversation_id: str,
     ) -> SanitizeResult:
+        content_bytes = len(text.encode("utf-8"))
+        logger.info(
+            "sanitize_start team_id=%s conversation_id=%s content_bytes=%d",
+            team_id,
+            conversation_id,
+            content_bytes,
+        )
+
         if should_skip_sanitization(
-            len(text.encode("utf-8")), threshold_bytes=self._size_threshold
+            content_bytes, threshold_bytes=self._size_threshold
         ):
             logger.info(
-                "sanitize_skipped_size team_id=%s size=%d threshold=%d",
+                "sanitize_skipped_size team_id=%s conversation_id=%s "
+                "size=%d threshold=%d",
                 team_id,
-                len(text),
+                conversation_id,
+                content_bytes,
                 self._size_threshold,
             )
             return SanitizeResult(text, (), cache_a_hit=False, skipped=True)
 
         rules = await self._rules_loader.load(team_id)
+        logger.info(
+            "sanitize_rules_loaded team_id=%s conversation_id=%s rule_count=%d",
+            team_id,
+            conversation_id,
+            len(rules.rules),
+        )
+
         content_hash = _content_hash(team_id, rules, text)
 
         cached = await self._mapping_store.get_dedup(content_hash)
         if cached is not None:
+            logger.info(
+                "sanitize_cache_a_hit team_id=%s conversation_id=%s "
+                "content_hash=%s pairs=%d",
+                team_id,
+                conversation_id,
+                content_hash[:12],
+                len(cached.pairs),
+            )
             await self._record_conversation_mappings(conversation_id, cached.pairs)
+            logger.info(
+                "sanitize_cache_b_recorded team_id=%s conversation_id=%s "
+                "pairs=%d ttl=%d source=cache_a",
+                team_id,
+                conversation_id,
+                len(cached.pairs),
+                self._cache_b_ttl,
+            )
             return SanitizeResult(
                 _apply_pairs(text, cached.pairs),
                 cached.pairs,
@@ -101,11 +134,47 @@ class SanitizationOrchestrator:
                 skipped=False,
             )
 
+        logger.info(
+            "sanitize_cache_a_miss team_id=%s conversation_id=%s content_hash=%s",
+            team_id,
+            conversation_id,
+            content_hash[:12],
+        )
+        logger.info(
+            "sanitize_corp_llm_call_start team_id=%s conversation_id=%s",
+            team_id,
+            conversation_id,
+        )
         result = await self._call_corp_llm(text, rules)
+        logger.info(
+            "sanitize_corp_llm_call_done team_id=%s conversation_id=%s pairs=%d",
+            team_id,
+            conversation_id,
+            len(result.pairs),
+        )
+
         await self._mapping_store.set_dedup(
             content_hash, result, ttl_seconds=self._cache_a_ttl
         )
+        logger.info(
+            "sanitize_cache_a_stored team_id=%s conversation_id=%s "
+            "content_hash=%s ttl=%d pairs=%d",
+            team_id,
+            conversation_id,
+            content_hash[:12],
+            self._cache_a_ttl,
+            len(result.pairs),
+        )
+
         await self._record_conversation_mappings(conversation_id, result.pairs)
+        logger.info(
+            "sanitize_cache_b_recorded team_id=%s conversation_id=%s "
+            "pairs=%d ttl=%d source=corp_llm",
+            team_id,
+            conversation_id,
+            len(result.pairs),
+            self._cache_b_ttl,
+        )
 
         return SanitizeResult(
             _apply_pairs(text, result.pairs),
