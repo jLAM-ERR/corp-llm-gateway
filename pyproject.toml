@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Corporate Internal", email = "corp-internal@corp.lan" }]
 dependencies = [
-    "litellm>=1.40,<1.50",
+    "litellm>=1.40,<2.0",
     "redis>=5.0",
     "httpx>=0.27",
     "pydantic>=2.7",
