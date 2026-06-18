@@ -1,12 +1,12 @@
-# Demo: 7-Prompt Walkthrough
+# Demo: 6-Prompt Walkthrough
 
-A curated set of prompts that exercise each sanitizer tier, Cache A, the oversize skip (M1-11), and the fail-closed audit pipeline.
+A curated set of prompts that exercise each sanitizer tier, Cache A, and the oversize skip (M1-11). The fail-closed audit posture is described last as a *planned* behavior (not yet wired in the demo build) so you can speak to the v1 design without live-firing a feature that isn't there.
 
 ## Stage 0 — Presenter Setup
 
 **Two-shell layout:**
 - **Left shell:** your laptop, running Claude Code
-- **Right shell/browser:** http://localhost:3000 (Langfuse OSS UI), login with `demo@corp.lan` / `demo`
+- **Right shell/browser:** http://localhost:3000 (Langfuse OSS UI), login with `demo@corp.lan` / `demo-password-12345` (pre-seeded via `LANGFUSE_INIT_*` in `docker-compose.demo.yml`)
 
 **Second shell environment:**
 Run this in the second shell (the one where you'll interact with Claude Code) to route traffic through the demo gateway:
@@ -46,7 +46,7 @@ Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
 **What to highlight in Langfuse:**
 - Open the trace
 - Find the **"Request"** section or upstream payload view (e.g., the JSON body sent to the gateway)
-- Confirm: the email address is replaced with a placeholder like `<EMAIL_1>`
+- Confirm: the email address is replaced with a placeholder like `[EMAIL_001]` (the corp LLM is instructed to emit `[LABEL_NNN]` shape — see `src/corp_llm_gateway/sanitizer/orchestrator.py:_build_system_prompt`)
 - Switch to the **"Response"** or **"Rendered response"** section in Claude Code
 - Confirm: the original email `the DRI@gmail.com` is restored in the model's output (our post-call desanitizer worked)
 
@@ -66,7 +66,7 @@ Validate this JSON config and explain any issues:
 **What to highlight in Langfuse:**
 - Open the trace
 - Find the request payload
-- Confirm: the `api_key` field's value is redacted (e.g., `"api_key": "<TOKEN_1>"`), but the **field name** `api_key` is preserved (JSON tier does not redact keys)
+- Confirm: the `api_key` field's value is redacted (e.g., `"api_key": "[TOKEN_001]"`), but the **field name** `api_key` is preserved (JSON tier does not redact keys)
 - The endpoint URL may also be redacted depending on your regex rules
 
 **Expected tier:** JSON — the detector recognized a structured AWS/cloud API key pattern.
@@ -83,7 +83,7 @@ Use the search_kb tool with query='customer email j.doe@corp.lan asked about X'
 **What to highlight in Langfuse:**
 - Open the trace
 - Find the **function call arguments** section (the JSON args to the tool)
-- Confirm: the email in `query=` is redacted to `<EMAIL_2>` (or similar)
+- Confirm: the email in `query=` is redacted to `[EMAIL_002]` (or similar — same `[LABEL_NNN]` shape as Prompt 2)
 - After the model executes the tool, check the **tool result** in the response
 - Confirm: the desanitizer rebuilt the original email in the rendered response shown in Claude Code
 
@@ -139,46 +139,31 @@ Summarize this log.
 
 ---
 
-## Prompt 7 — Fail-Closed Audit Pipeline
+## Talking Point — Fail-Closed Audit (planned for GA, not live in this build)
 
-**Text (Part A):**
-```
-Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
-```
+The remaining v1 commitment that *this demo build does not yet exercise live* is the fail-closed posture on the audit pipeline. Walk colleagues through it as a design promise, not a live click-through, because the runtime guard hasn't been wired into `CorpLlmGuardrail` yet.
 
-**Before you send (Part A):**
-1. In a **third shell** (or in a separate window), run:
-   ```bash
-   docker compose -f docker-compose.demo.yml stop vector
-   ```
-2. Wait a few seconds for Vector to fully stop.
+**The promise (per `docs/plans/20260507-external-sanitizer-gateway-v1.md` M4 fail-policy matrix):**
 
-**Send Prompt 7A:**
-- In Claude Code, send the prompt
-- **Expected:** The gateway returns HTTP **503 Service Unavailable** with a body message containing `audit pipeline unhealthy`
+| Component down | Default behavior | Team-overridable |
+|---|---|---|
+| Corp LLM (sanitizer) down | **fail-closed, 503 `E_CORP_LLM_DOWN`** | no |
+| Redis (mapping store) down | **fail-closed, 503 `E_REDIS_DOWN`** | no |
+| Postgres (tokens) down | **fail-closed for new auth; cached auth tolerated 60s** | no |
+| Vector buffer full | **fail-closed, 503 by default** | yes — `audit_buffer_full=continue` |
+| S3 audit sink down | **fail-closed, 503** (S3 is the durable sink) | no |
 
-**This is intentional — it demonstrates the fail-closed posture:** when the audit pipeline (Vector → Langfuse) is down, we reject traffic. No data leaves the corp without an audit trail.
+**Where it's enumerated in code today:**
+- Policy enums: `src/corp_llm_gateway/team_config/models.py` (`AuditSinkDownPolicy`, `AuditBufferFullPolicy`, `PrePassDownPolicy`).
+- Health check shape: `src/corp_llm_gateway/healthz/checks.py` (live / ready / sanitization-deep-check).
+- Runbook for operators: `docs/ops/runbook.md` (search for "fail-closed").
 
-**Text (Part B — Recovery):**
+**What ships before GA:**
+- A Vector / sink readiness probe wired into the LiteLLM `pre_call` path.
+- 503 short-circuit with a structured error body (`error_code`, `component`, `request_id`) so the developer's Claude Code can surface "the gateway is down for audit, not for you."
+- Audit-buffer overflow detection in the Vector sink.
 
-1. Restart Vector:
-   ```bash
-   docker compose -f docker-compose.demo.yml start vector
-   ```
-2. Wait until `docker compose -f docker-compose.demo.yml ps vector` reports `(healthy)` — don't rely on a fixed sleep; Vector boot can race with its own healthcheck. Typically 5–15s on a warm laptop.
-
-3. **Re-send Prompt 7A** (the same text):
-   - **Expected:** The request **succeeds** this time
-   - Check Langfuse: a new trace appears for this re-attempt
-   - The original email is redacted upstream, restored in the response
-
-**What this demonstrates:**
-- Pre-call sanitation still works (Regex tier catches the email).
-- Post-call desanitization restores the email in the response.
-- The gateway correctly fails closed when audit infra is unhealthy.
-- Recovery is automatic once audit infra recovers.
-
-**Expected tier:** Regex (same as Prompt 2).
+**Why we don't live-demo it today:** the runtime guard would return 503 in `pre_call` based on a sink-health snapshot. None of that code exists yet — searching for `"audit pipeline unhealthy"` in `src/` returns no matches. Demoing it via a doctored response would mislead the room about what's actually built. The design is correct; the wiring is the milestone after this one (M4-3 / M4-5 / M4-6 in the plan).
 
 ---
 
