@@ -14,5 +14,9 @@ model_list:
       api_base: "os.environ/CORP_LLM_ENDPOINT"
       api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
 litellm_settings:
-  callbacks: ["corp_llm_gateway.litellm_hook.CorpLlmGuardrail"]
+  # Reference a module-level INSTANCE (`guardrail`), not the class.
+  # litellm's get_instance_fn returns whatever object lives at the path
+  # and then calls methods on it. A class fails ("missing self");
+  # an instance works. See litellm's own custom_callbacks1.py example.
+  callbacks: ["corp_llm_gateway._demo_guardrail.guardrail"]
   json_logs: true

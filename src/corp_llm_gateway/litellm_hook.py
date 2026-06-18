@@ -95,11 +95,15 @@ class CorpLlmGuardrail:
 
     async def async_post_call_success_hook(
         self,
-        user_api_key_dict: dict[str, Any] | None,
-        cache: Any,
         data: dict[str, Any],
+        user_api_key_dict: dict[str, Any] | None,
         response: Any,
     ) -> Any:
+        # NOTE: litellm v1.85 dropped `cache` from this hook's signature
+        # and reordered to (data, user_api_key_dict, response). Earlier
+        # litellm versions had (user_api_key_dict, cache, data, response).
+        # If you upgrade or downgrade litellm and see "missing positional
+        # argument" errors here, that's the signature drift to check.
         return await self.post_call_unary(data, response)
 
     async def async_log_success_event(

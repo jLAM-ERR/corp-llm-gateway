@@ -46,6 +46,11 @@ services:
       # config dir, not via importlib — so make the entry-point hook
       # visible at /etc/litellm/corp_llm_gateway/litellm_hook.py.
       - ./src/corp_llm_gateway/litellm_hook.py:/etc/litellm/corp_llm_gateway/litellm_hook.py:ro
+      # litellm registers config-yaml callbacks as the literal object at
+      # that import path. A class object fails ("missing self") — it
+      # needs to be a module-level INSTANCE. _demo_guardrail.guardrail
+      # is that instance.
+      - ./src/corp_llm_gateway/_demo_guardrail.py:/etc/litellm/corp_llm_gateway/_demo_guardrail.py:ro
     environment:
       REDIS_URL: redis://redis:6379/0
       POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
