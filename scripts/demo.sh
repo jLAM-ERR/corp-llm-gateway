@@ -238,11 +238,16 @@ EOF
         ;;
     presenter-env)
         cat <<'EOF'
-export ANTHROPIC_BASE_URL=http://localhost:4000
+# Use 127.0.0.1, NOT `localhost`. When traffic flows through xray's HTTP
+# inbound, the destination hostname `localhost` triggers a DNS-resolution
+# code path that breaks the response (xray's HTTP forward returns 503).
+# An explicit 127.0.0.1 skips that path entirely and works under every
+# configuration we tested (direct, SOCKS5, xray HTTP-proxy).
+export ANTHROPIC_BASE_URL=http://127.0.0.1:4000
 export ANTHROPIC_CUSTOM_HEADERS='X-Corp-Auth: demo-team-token'
 # If you have a corp HTTP_PROXY / HTTPS_PROXY set, claude-code's node SDK
-# will route the localhost gateway call through it and get 503. Exclude
-# the local gateway from proxying. (Node honors both cases.)
+# will route the gateway call through it. Exclude the local gateway from
+# proxying so loopback stays direct. (Node honors both cases.)
 export NO_PROXY="localhost,127.0.0.1${NO_PROXY:+,$NO_PROXY}"
 export no_proxy="localhost,127.0.0.1${no_proxy:+,$no_proxy}"
 EOF
