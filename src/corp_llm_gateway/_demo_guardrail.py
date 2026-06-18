@@ -30,6 +30,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 
 from corp_llm_gateway.audit import AuditLogger, StdoutSink
+from corp_llm_gateway.auth import BearerAuthProvider, NoopAuthProvider
 from corp_llm_gateway.corp_llm import CorpLlmClient
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.rules import Rules, RulesLoader
@@ -46,10 +47,29 @@ class _NoTeamRules(RulesLoader):
         return Rules(rules=())
 
 
+# Per-request output cap. Claude Code defaults to max_tokens=64000
+# (Claude Opus value). The corp vLLM has a 65536-token total context
+# window, so any non-trivial prompt + 64000 output overshoots. Pass
+# this to CorpLlmGuardrail via max_output_tokens_cap.
+#
+# Why not subclass? litellm's proxy dispatcher checks
+# `"async_pre_call_hook" in vars(_callback.__class__)` — that returns
+# only attributes defined DIRECTLY on the class, not inherited ones.
+# A subclass that overrides only `pre_call` (without overriding
+# `async_pre_call_hook`) gets silently skipped.
+_DEMO_MAX_OUTPUT_TOKENS = 4096
+
+
 def _build_demo_guardrail() -> CorpLlmGuardrail:
     corp_endpoint = os.environ.get(
         "CORP_LLM_ENDPOINT", "https://corp-llm.example/v1"
     )
+    # CorpLlmClient hardcodes /v1/chat/completions onto its base_url.
+    # litellm-config.yaml needs CORP_LLM_ENDPOINT to include /v1 (so
+    # hosted_vllm hits .../v1/chat/completions correctly). We want the
+    # bare host for CorpLlmClient so it doesn't construct /v1/v1/...
+    # Strip a trailing /v1 if present.
+    corp_endpoint_root = corp_endpoint.rstrip("/").removesuffix("/v1")
     demo_token = os.environ.get("DEMO_TEAM_TOKEN", "demo-team-token")
 
     token_store = InMemoryTokenStore()
@@ -74,10 +94,17 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
     # globally opens MITM risk.
     ssl_verify = os.environ.get("SSL_VERIFY", "true").lower() != "false"
     http = httpx.AsyncClient(timeout=30.0, verify=ssl_verify)
+    corp_auth_token = os.environ.get("CORP_LLM_AUTH_TOKEN", "")
+    auth_provider = (
+        BearerAuthProvider(token=corp_auth_token)
+        if corp_auth_token
+        else NoopAuthProvider()
+    )
     corp_llm = CorpLlmClient(
-        base_url=corp_endpoint,
+        base_url=corp_endpoint_root,
         model="GLM-5.1-AWQ",
         http=http,
+        auth_provider=auth_provider,
     )
     orchestrator = SanitizationOrchestrator(
         corp_llm,
@@ -87,7 +114,12 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
 
     audit_logger = AuditLogger(StdoutSink(), gateway_version="demo")
 
-    return CorpLlmGuardrail(orchestrator, auth, audit_logger)
+    return CorpLlmGuardrail(
+        orchestrator,
+        auth,
+        audit_logger,
+        max_output_tokens_cap=_DEMO_MAX_OUTPUT_TOKENS,
+    )
 
 
 # This is the name the demo litellm-config.yaml references.

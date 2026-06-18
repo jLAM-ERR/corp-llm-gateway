@@ -23,8 +23,8 @@ class BearerAuthProvider(CorpLlmAuthProvider):
         self._token = token
 
     def artifacts(self) -> AuthArtifacts:
-        raise NotImplementedError(
-            "BearerAuthProvider stub — implement when corp LLM enables Bearer auth"
+        return AuthArtifacts(
+            headers={"Authorization": f"Bearer {self._token}"}
         )
 
 

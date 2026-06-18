@@ -41,6 +41,19 @@ from corp_llm_gateway.tokens import (
     MissingTokenError,
 )
 
+# litellm v1.85's proxy dispatcher filters callbacks via
+# `isinstance(cb, CustomLogger)` before invoking any hook method.
+# Without the inheritance, our pre_call/post_call hooks are silently
+# skipped for /v1/messages requests. Import optionally so unit tests
+# that don't have litellm installed still work — production always
+# has it.
+try:
+    from litellm.integrations.custom_logger import (
+        CustomLogger as _LitellmCustomLogger,
+    )
+except ImportError:  # pragma: no cover
+    _LitellmCustomLogger = object  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,18 +71,40 @@ class GuardrailHttpException(Exception):
         self.error_code = error_code
 
 
-class CorpLlmGuardrail:
-    """LiteLLM custom-callback adapter wiring the sanitization pipeline."""
+class CorpLlmGuardrail(_LitellmCustomLogger):
+    """LiteLLM custom-callback adapter wiring the sanitization pipeline.
+
+    Inherits from `litellm.integrations.custom_logger.CustomLogger` so
+    that litellm's proxy dispatcher recognises this as a hook-eligible
+    callback (`isinstance(cb, CustomLogger)` check in
+    `proxy/utils.py::pre_call_hook`). Without it, our hook methods are
+    silently dropped.
+    """
 
     def __init__(
         self,
         orchestrator: SanitizationOrchestrator,
         auth_middleware: AuthMiddleware,
         audit_logger: AuditLogger,
+        *,
+        max_output_tokens_cap: int | None = None,
     ) -> None:
+        # Best-effort super().__init__ — when litellm is installed this
+        # initializes CustomLogger's internal state; when it isn't
+        # (object), this is a no-op kwargs-only call.
+        try:
+            super().__init__()
+        except TypeError:  # pragma: no cover
+            pass
         self._orch = orchestrator
         self._auth = auth_middleware
         self._audit = audit_logger
+        # Optional clamp on `max_tokens` in the inbound request, applied
+        # before sanitization + upstream call. Used by the laptop demo
+        # to keep Claude Code's default 64000 from exceeding the corp
+        # vLLM's 65536-token total context window. Default None = no
+        # clamp; behaviour is unchanged in production.
+        self._max_output_tokens_cap = max_output_tokens_cap
         # Per-request state. Keyed by request_id; cleared in post_call.
         self._req_state: dict[str, _RequestState] = {}
 
@@ -133,6 +168,11 @@ class CorpLlmGuardrail:
     async def pre_call(self, data: dict[str, Any]) -> dict[str, Any]:
         """Sanitize a request body in-place; return the mutated dict.
 
+        If `max_output_tokens_cap` was passed to __init__, clamp the
+        request's `max_tokens` before any other step. This stops
+        Claude-Code-style requests with a huge default output budget
+        from overshooting the upstream model's context window.
+
         Order: auth → strip corp token → sanitize messages → return.
         Failures are mapped to GuardrailHttpException with stable
         error_code so post-call audit can attribute the failure.
@@ -147,6 +187,20 @@ class CorpLlmGuardrail:
             model,
             message_count,
         )
+
+        # Optional max_tokens clamp — first thing so litellm's own
+        # validation and the upstream call both see the capped value.
+        if self._max_output_tokens_cap is not None:
+            mt = data.get("max_tokens")
+            if isinstance(mt, int) and mt > self._max_output_tokens_cap:
+                logger.info(
+                    "litellm_pre_call_max_tokens_clamped request_id=%s "
+                    "requested=%d capped=%d",
+                    request_id,
+                    mt,
+                    self._max_output_tokens_cap,
+                )
+                data["max_tokens"] = self._max_output_tokens_cap
 
         try:
             ctx = await self._auth.authenticate_headers(_extract_headers(data))
@@ -321,14 +375,20 @@ class CorpLlmGuardrail:
         self,
         request_data: dict[str, Any],
         response: Any,
-        start_time: float,
-        end_time: float,
+        start_time: Any,
+        end_time: Any,
         *,
         status: str,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
         state = self._req_state.pop(request_id, None)
-        latency_ms = max(0, int((end_time - start_time) * 1000))
+        # litellm v1.85 passes datetime objects for start_time / end_time
+        # to async_log_*_event; older versions used floats. Handle both.
+        delta = end_time - start_time
+        if hasattr(delta, "total_seconds"):
+            latency_ms = max(0, int(delta.total_seconds() * 1000))
+        else:
+            latency_ms = max(0, int(delta * 1000))
         prompt_tokens, completion_tokens = _extract_token_counts(response)
 
         event = AuditEvent(
