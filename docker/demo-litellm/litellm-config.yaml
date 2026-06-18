@@ -13,6 +13,12 @@ model_list:
       model: "hosted_vllm/GLM-5.1-AWQ"
       api_base: "os.environ/CORP_LLM_ENDPOINT"
       api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
+      # Claude Code sends max_tokens=64000 (Claude Opus default).
+      # GLM-5.1-AWQ has a 65536-token total context window, so any
+      # non-trivial prompt + 64000 output overshoots. Cap the
+      # per-deployment max_tokens to a value that leaves headroom
+      # for the prompt. 4096 covers any realistic demo answer.
+      max_tokens: 4096
 litellm_settings:
   # Reference a module-level INSTANCE (`guardrail`), not the class.
   # litellm's get_instance_fn returns whatever object lives at the path
