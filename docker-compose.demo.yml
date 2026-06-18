@@ -50,6 +50,19 @@ services:
       REDIS_URL: redis://redis:6379/0
       POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
       CORP_LLM_AUTH_PROVIDER: noop
+      # LiteLLM Admin UI — http://localhost:4000/ui (login: admin / demo-password-12345)
+      # LITELLM_MASTER_KEY is the Bearer token for the admin API.
+      # LITELLM_SALT_KEY encrypts virtual keys in postgres; required once master key is set.
+      LITELLM_MASTER_KEY: sk-demo-master-12345
+      LITELLM_SALT_KEY: sk-demo-salt-12345
+      UI_USERNAME: admin
+      UI_PASSWORD: demo-password-12345
+      # LiteLLM stores virtual keys / team / user metadata in DATABASE_URL
+      # (Prisma). It shares the gateway postgres; litellm's tables are
+      # _litellm_*-prefixed so they don't collide with the corp_llm_gateway
+      # tokens schema.
+      DATABASE_URL: postgresql://gateway:gateway@postgres:5432/gateway
+      STORE_MODEL_IN_DB: "true"
     env_file: .env.demo
     entrypoint: sh
     command:
