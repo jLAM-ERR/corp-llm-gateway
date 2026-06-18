@@ -119,14 +119,23 @@ wait_for_healthcheck() {
     fatal "Services did not reach healthy state within ${max_wait}s"
 }
 
-# Seed Langfuse with demo-team project (idempotent)
+# Seed Langfuse with demo-team project (idempotent).
+#
+# Langfuse v3 has no anonymous project-bootstrap API. The project, org,
+# and user are pre-seeded via LANGFUSE_INIT_* env vars in
+# docker-compose.demo.yml (search for LANGFUSE_INIT_PROJECT_PUBLIC_KEY).
+# This function just verifies the seeded keys actually work and writes
+# them to .env.demo. The pair below MUST match the compose values.
 seed_langfuse() {
     local langfuse_url="http://localhost:3000"
     local health_endpoint="$langfuse_url/api/public/health"
-    local projects_endpoint="$langfuse_url/api/public/projects"
     local max_wait=60
     local elapsed=0
     local interval=2
+
+    # Keep in sync with docker-compose.demo.yml `LANGFUSE_INIT_PROJECT_*_KEY`.
+    local public_key="pk-lf-demo-00000000-0000-0000-0000-000000000001"
+    local secret_key="sk-lf-demo-00000000-0000-0000-0000-000000000002"
 
     info "Waiting for Langfuse to be ready..."
 
@@ -144,38 +153,25 @@ seed_langfuse() {
         fatal "Langfuse health check timed out after ${max_wait}s"
     fi
 
-    # Check if demo-team project already exists
-    local response
-    response=$(curl -fsS "$projects_endpoint" 2>/dev/null) || fatal "Failed to query Langfuse projects"
+    # Verify the pre-seeded keys actually authenticate. If not, the
+    # init didn't run (usually a stale langfuse-postgres volume that
+    # predates the LANGFUSE_INIT_* block).
+    local auth_check
+    auth_check=$(curl -sS -o /dev/null -w '%{http_code}' \
+        --max-time 5 -u "${public_key}:${secret_key}" \
+        "$langfuse_url/api/public/projects" 2>/dev/null) || auth_check="000"
 
-    local public_key
-    local secret_key
-
-    # Use jq for robust JSON extraction (grep-based parsing is brittle to whitespace/ordering).
-    if echo "$response" | jq -e '.[] | select(.name == "demo-team")' >/dev/null 2>&1; then
-        info "demo-team project already exists, extracting credentials..."
-        public_key=$(echo "$response" | jq -r '.[] | select(.name == "demo-team") | .publicKey // empty')
-        secret_key=$(echo "$response" | jq -r '.[] | select(.name == "demo-team") | .secretKey // empty')
-
-        if [[ -z "$public_key" || -z "$secret_key" ]]; then
-            fatal "Could not extract credentials from existing demo-team project"
-        fi
-    else
-        info "Creating demo-team project..."
-        local create_response
-        create_response=$(curl -fsS -X POST "$projects_endpoint" \
-            -H "Content-Type: application/json" \
-            -d '{"name":"demo-team"}' 2>/dev/null) || fatal "Failed to create demo-team project"
-
-        public_key=$(echo "$create_response" | jq -r '.publicKey // empty')
-        secret_key=$(echo "$create_response" | jq -r '.secretKey // empty')
-
-        if [[ -z "$public_key" || -z "$secret_key" ]]; then
-            fatal "Could not extract credentials from create response: $create_response"
-        fi
+    if [[ "$auth_check" != "200" ]]; then
+        fatal "Pre-seeded Langfuse keys do not authenticate (HTTP $auth_check).
+       This usually means langfuse-postgres has data from a run that
+       predates the LANGFUSE_INIT_* block in docker-compose.demo.yml.
+       Wipe it and retry:
+         docker compose -f docker-compose.demo.yml down
+         docker volume rm corp-llm-gateway_langfuse-postgres-data
+         scripts/demo.sh up"
     fi
 
-    info "Langfuse credentials: public_key=${public_key:0:8}..., secret_key=${secret_key:0:8}..."
+    info "Langfuse credentials verified: public_key=${public_key:0:11}..., secret_key=${secret_key:0:11}..."
 
     # Update .env.demo with sed (in-place replacement, no duplicates)
     info "Updating ${ENV_FILE} with Langfuse credentials..."
@@ -223,11 +219,8 @@ case "${1:-}" in
 Demo stack is ready!
 
 LiteLLM proxy:   http://localhost:4000
-Langfuse UI:     http://localhost:3000   (on first visit, sign up as the
-                                         first user with any email/password;
-                                         the demo-team project is already
-                                         seeded by 'seed-langfuse')
-MinIO console:   http://localhost:9001   (minioadmin/minioadmin)
+Langfuse UI:     http://localhost:3000   (login: demo@corp.lan / demo-password-12345)
+MinIO console:   http://localhost:9001   (login: minioadmin / minioadmin)
 
 Next: 'scripts/demo.sh presenter-env' → paste into second shell for Claude Code.
 EOF

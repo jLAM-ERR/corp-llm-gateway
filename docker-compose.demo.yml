@@ -135,6 +135,17 @@ services:
       LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
       LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
       TELEMETRY_ENABLED: "false"
+      # Headless init — must match scripts/demo.sh seed_langfuse() values.
+      # Per langfuse docs: do NOT double-quote LANGFUSE_INIT_* values.
+      LANGFUSE_INIT_ORG_ID: demo-org
+      LANGFUSE_INIT_ORG_NAME: Demo Org
+      LANGFUSE_INIT_PROJECT_ID: demo-project
+      LANGFUSE_INIT_PROJECT_NAME: demo-team
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-demo-00000000-0000-0000-0000-000000000001
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-demo-00000000-0000-0000-0000-000000000002
+      LANGFUSE_INIT_USER_EMAIL: demo@corp.lan
+      LANGFUSE_INIT_USER_NAME: Demo User
+      LANGFUSE_INIT_USER_PASSWORD: demo-password-12345
     healthcheck:
       # langfuse-web binds to eth0, not 127.0.0.1; no curl in the image.
       test: ["CMD-SHELL", "wget -q --spider http://$(hostname):3000/api/public/health"]
