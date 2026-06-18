@@ -1,11 +1,16 @@
 model_list:
   # The corp vLLM only exposes one model (`GLM-5.1-AWQ` — confirmed via
-  # GET /v1/models). Rewrite every inbound model name to that single
-  # upstream model. Drop the `openai/*` passthrough — passing
-  # `claude-sonnet-4-5` straight through earns a vLLM model-not-found.
+  # GET /v1/models). Rewrite every inbound model name to that upstream
+  # model.
+  #
+  # `hosted_vllm/` (NOT `openai/`) is the right provider prefix here.
+  # `openai/` in litellm v1.85+ defaults to the OpenAI Responses API
+  # (`POST /responses`), which vLLM does not implement → 404 on every
+  # request. `hosted_vllm/` forces the legacy `/chat/completions` path
+  # that vLLM actually serves.
   - model_name: "*"
     litellm_params:
-      model: "openai/GLM-5.1-AWQ"
+      model: "hosted_vllm/GLM-5.1-AWQ"
       api_base: "os.environ/CORP_LLM_ENDPOINT"
       api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
 litellm_settings:
