@@ -3,7 +3,7 @@ model_list:
     litellm_params:
       model: "openai/*"
       api_base: "os.environ/CORP_LLM_ENDPOINT"
-      api_key: "os.environ/CORP_LLM_AUTH_TOKEN"   # currently empty; corp LLM is auth-less
+      api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
   - model_name: "openai/*"
     litellm_params:
       model: "openai/*"
