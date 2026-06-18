@@ -5,15 +5,35 @@ api:
 sources:
   litellm_logs:
     type: docker_logs
-    include_containers: ["litellm"]
+    # docker_logs matches `include_containers` by name PREFIX, not by
+    # substring. Compose names the container `corp-llm-gateway-litellm-1`,
+    # so `["litellm"]` doesn't match and vector EXCLUDES it. Use the
+    # full compose-prefixed name.
+    include_containers: ["corp-llm-gateway-litellm"]
 
 transforms:
+  # Try to parse each docker log line as JSON. LiteLLM emits both
+  # structured JSON (its own wrappers + our AuditEvent records) and
+  # plain-text uvicorn access logs. Use the non-strict form (no `!`)
+  # so plain text doesn't blow up the event — we filter to audit
+  # shape next.
   parse:
     type: remap
     inputs: ["litellm_logs"]
     source: |
-      . = parse_json!(.message)
-  never_fields_gate:                  # mirrors src/corp_llm_gateway/audit/invariants.py NEVER_FIELDS exactly
+      parsed, err = parse_json(.message)
+      if err == null {
+        . = parsed
+      } else {
+        # Mark as unparsable so the filter below drops it.
+        ._unparsable = true
+      }
+
+  # NEVER-fields gate (mirrors src/corp_llm_gateway/audit/invariants.py).
+  # Defence-in-depth: even if a future regression smuggles original/
+  # mapping data into a forwarded event, drop it here before it hits
+  # Langfuse.
+  never_fields_gate:
     type: filter
     inputs: ["parse"]
     condition: |
@@ -34,24 +54,60 @@ transforms:
       !exists(.Cookie) &&
       !exists(.set_cookie) &&
       !exists(."Set-Cookie")
+
+  # Keep ONLY events shaped like AuditEvent (StdoutSink output). Drop
+  # litellm's own JSON wrappers, parse failures, and anything else.
+  # AuditEvent is uniquely identified by having both `request_id` and
+  # `redaction_count`.
+  audit_only:
+    type: filter
+    inputs: ["never_fields_gate"]
+    condition: |
+      !exists(._unparsable) &&
+      exists(.request_id) &&
+      exists(.redaction_count)
+
+  # Build the full Langfuse envelope `{"batch":[<one trace>]}` and
+  # encode it as a single JSON STRING on `.message`. The HTTP sink
+  # below uses codec=text so the body is exactly that string — no
+  # wrapper array, no double-encoding.
   to_langfuse_schema:
     type: remap
-    inputs: ["never_fields_gate"]
+    inputs: ["audit_only"]
     source: |
-      # Langfuse v3 ingestion expects { type, id, timestamp, body }
-      # Trace events: type="trace-create"; Observations: type="observation-create"
-      .type = if exists(.span_kind) && .span_kind == "trace" { "trace-create" } else { "observation-create" }
-      .id = .request_id
-      .timestamp = .ts
-      .body = .
-      del(.message)
+      audit = .
+      envelope = {
+        "batch": [{
+          "id": audit.request_id,
+          "type": "trace-create",
+          "timestamp": audit.timestamp,
+          "body": {
+            "id": audit.request_id,
+            "name": "gateway-request",
+            "timestamp": audit.timestamp,
+            "userId": audit.user_id,
+            "metadata": audit,
+          }
+        }]
+      }
+      . = { "message": encode_json(envelope) }
 
 sinks:
   langfuse:
     type: http
     inputs: ["to_langfuse_schema"]
     uri: "http://langfuse-web:3000/api/public/ingestion"
-    encoding: { codec: "json" }
+    method: "post"
+    encoding:
+      codec: "text"
+      only_fields: ["message"]
+    # One event per HTTP POST. Each .message is already a complete
+    # `{"batch":[...]}` JSON string envelope.
+    batch:
+      max_events: 1
+    request:
+      headers:
+        Content-Type: "application/json"
     auth:
       strategy: "basic"
       user: "${LANGFUSE_PUBLIC_KEY}"
