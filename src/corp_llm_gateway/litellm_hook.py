@@ -88,6 +88,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         audit_logger: AuditLogger,
         *,
         max_output_tokens_cap: int | None = None,
+        strip_inbound_headers_to_upstream: bool = False,
     ) -> None:
         # Best-effort super().__init__ — when litellm is installed this
         # initializes CustomLogger's internal state; when it isn't
@@ -105,6 +106,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # vLLM's 65536-token total context window. Default None = no
         # clamp; behaviour is unchanged in production.
         self._max_output_tokens_cap = max_output_tokens_cap
+        # When True, strip inbound HTTP client headers from `data` before
+        # litellm's provider layer forwards them to the upstream LLM.
+        # Some providers (e.g. hosted_vllm) silently pass
+        # `proxy_server_request.headers` through, so the upstream sees
+        # `Host: 127.0.0.1:4000` and the corp ingress 503s on the unknown
+        # vhost. Off by default to preserve existing behaviour.
+        self._strip_inbound_headers_to_upstream = strip_inbound_headers_to_upstream
         # Per-request state. Keyed by request_id; cleared in post_call.
         self._req_state: dict[str, _RequestState] = {}
 
@@ -233,6 +241,21 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             "litellm_pre_call_corp_token_stripped request_id=%s",
             request_id,
         )
+
+        # Optional: strip inbound HTTP wire headers from data so litellm
+        # providers (notably hosted_vllm) don't forward them upstream.
+        # `Host: 127.0.0.1:4000` going to the corp ingress earns a
+        # vhost-not-found 503. Only nuke the hop-by-hop / wire-level
+        # headers; preserve protocol-meaningful ones like
+        # `anthropic-version` and `authorization` (BYOK passthrough).
+        if self._strip_inbound_headers_to_upstream:
+            _drop_wire_headers(data.get("headers"))
+            proxy_req = data.get("proxy_server_request")
+            if isinstance(proxy_req, dict):
+                _drop_wire_headers(proxy_req.get("headers"))
+            md = data.get("litellm_metadata")
+            if isinstance(md, dict):
+                _drop_wire_headers(md.get("headers"))
 
         messages = data.get("messages") or []
         if not isinstance(messages, list):
@@ -446,6 +469,24 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
 
 # ---- helpers --------------------------------------------------------------
+
+
+# Inbound HTTP wire-level headers that must NOT be forwarded to upstream
+# LLMs by any provider. Mostly hop-by-hop or request-scoped values that
+# describe the LiteLLM proxy's own connection from the client.
+_WIRE_HEADERS_TO_DROP = frozenset({
+    "host", "user-agent", "content-length", "accept", "connection",
+    "content-type", "x-forwarded-for", "x-forwarded-proto",
+    "x-forwarded-host", "x-real-ip",
+})
+
+
+def _drop_wire_headers(headers: Any) -> None:
+    if not isinstance(headers, dict):
+        return
+    for key in list(headers):
+        if isinstance(key, str) and key.lower() in _WIRE_HEADERS_TO_DROP:
+            del headers[key]
 
 
 class _RequestState:

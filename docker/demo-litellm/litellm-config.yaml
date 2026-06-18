@@ -3,11 +3,13 @@ model_list:
   # GET /v1/models). Rewrite every inbound model name to that upstream
   # model.
   #
-  # `hosted_vllm/` (NOT `openai/`) is the right provider prefix here.
-  # `openai/` in litellm v1.85+ defaults to the OpenAI Responses API
-  # (`POST /responses`), which vLLM does not implement → 404 on every
-  # request. `hosted_vllm/` forces the legacy `/chat/completions` path
-  # that vLLM actually serves.
+  # `openai/` + `use_responses_api: false` sends the legacy
+  # `/chat/completions` HTTP shape that direct curl uses (and that the
+  # corp vLLM accepts cleanly). `hosted_vllm/` did the same path but
+  # added wrapper headers/body fields that the corp's ingress 503'd
+  # ("No server is available to handle this request" from what looks
+  # like a k8s ingress default 503 page). openai/ keeps the wire
+  # format closer to what works in direct curls.
   - model_name: "*"
     litellm_params:
       model: "hosted_vllm/GLM-5.1-AWQ"
@@ -18,6 +20,7 @@ model_list:
       # non-trivial prompt + 64000 output overshoots. Cap the
       # per-deployment max_tokens to a value that leaves headroom
       # for the prompt. 4096 covers any realistic demo answer.
+      # (The CorpLlmGuardrail pre_call also clamps for belt+braces.)
       max_tokens: 4096
 litellm_settings:
   # Reference a module-level INSTANCE (`guardrail`), not the class.

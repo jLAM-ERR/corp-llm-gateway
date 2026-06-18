@@ -119,6 +119,10 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         auth,
         audit_logger,
         max_output_tokens_cap=_DEMO_MAX_OUTPUT_TOKENS,
+        # litellm's hosted_vllm provider forwards proxy_server_request
+        # headers (including Host: 127.0.0.1:4000) to the corp ingress,
+        # which 503s the unknown vhost. Strip them.
+        strip_inbound_headers_to_upstream=True,
     )
 
 
