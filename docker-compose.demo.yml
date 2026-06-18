@@ -62,7 +62,7 @@ services:
       retries: 5
 
   vector:
-    image: timberio/vector:0.53-alpine
+    image: timberio/vector:0.53.0-alpine
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./docker/demo-vector/vector.yaml:/etc/vector/vector.yaml:ro
@@ -142,7 +142,7 @@ services:
       retries: 5
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.3-jammy
+    image: clickhouse:26.3-jammy
     volumes:
       - langfuse-clickhouse-data:/var/lib/clickhouse
     environment:
