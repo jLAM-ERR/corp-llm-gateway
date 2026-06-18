@@ -72,7 +72,7 @@ preflight_checks() {
     fi
 
     # Non-fatal reachability check
-    curl -fsS --max-time 5 "$CORP_LLM_ENDPOINT/health" >/dev/null 2>&1 || \
+    curl -kfsS --max-time 5 "$CORP_LLM_ENDPOINT/health" >/dev/null 2>&1 || \
         warn "Corp LLM unreachable at $CORP_LLM_ENDPOINT — VPN connected?"
 }
 
@@ -240,6 +240,11 @@ EOF
         cat <<'EOF'
 export ANTHROPIC_BASE_URL=http://localhost:4000
 export ANTHROPIC_CUSTOM_HEADERS='X-Corp-Auth: demo-team-token'
+# If you have a corp HTTP_PROXY / HTTPS_PROXY set, claude-code's node SDK
+# will route the localhost gateway call through it and get 503. Exclude
+# the local gateway from proxying. (Node honors both cases.)
+export NO_PROXY="localhost,127.0.0.1${NO_PROXY:+,$NO_PROXY}"
+export no_proxy="localhost,127.0.0.1${no_proxy:+,$no_proxy}"
 EOF
         ;;
     --help|-h|help)
