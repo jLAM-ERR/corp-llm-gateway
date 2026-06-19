@@ -772,14 +772,34 @@ def _reverse_choice(choice: Any, reverse_fn: Any) -> Any:
 
 
 def _extract_token_counts(response: Any) -> tuple[int, int]:
-    if not isinstance(response, dict):
+    """Pull (prompt, completion) token counts from a response, shape-tolerant.
+
+    litellm hands ``async_log_*_event`` a ``ModelResponse`` OBJECT whose
+    ``.usage`` is a ``Usage`` object (attribute access), not a dict — the old
+    dict-only path bailed and every audit logged 0/0. Handle both a dict
+    response (``response["usage"]``) and an object response
+    (``response.usage``), where ``usage`` itself may be a dict or an object,
+    and accept both the OpenAI (``prompt_tokens``/``completion_tokens``) and
+    Anthropic (``input_tokens``/``output_tokens``) field names.
+    """
+    usage = response.get("usage") if isinstance(response, dict) else getattr(
+        response, "usage", None
+    )
+    if usage is None:
         return 0, 0
-    usage = response.get("usage") or {}
-    if not isinstance(usage, dict):
-        return 0, 0
-    prompt = int(usage.get("prompt_tokens") or 0)
-    completion = int(usage.get("completion_tokens") or 0)
-    return prompt, completion
+
+    def _field(name: str) -> Any:
+        if isinstance(usage, dict):
+            return usage.get(name)
+        return getattr(usage, name, None)
+
+    prompt = _field("prompt_tokens")
+    if prompt is None:
+        prompt = _field("input_tokens")
+    completion = _field("completion_tokens")
+    if completion is None:
+        completion = _field("output_tokens")
+    return int(prompt or 0), int(completion or 0)
 
 
 # Suppress unused import warning for `time` (kept for downstream callers).

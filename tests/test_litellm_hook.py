@@ -459,3 +459,41 @@ async def test_audit_recovers_state_via_litellm_call_id() -> None:
     assert rec["model"] == "claude"
     assert rec["redaction_count"] == 1
     assert rec["status"] == "ok"
+
+
+async def test_audit_extracts_tokens_from_response_object_usage() -> None:
+    """litellm hands async_log_*_event a ModelResponse OBJECT whose ``.usage``
+    is a Usage object (attribute access), not a dict. The audit must still
+    capture token counts — regression: the dict-only path logged 0/0.
+    """
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    class _Usage:
+        prompt_tokens = 13
+        completion_tokens = 48
+
+    class _ModelResponse:
+        usage = _Usage()
+
+    start = time.time()
+    await g.audit(
+        data, _ModelResponse(), start_time=start, end_time=start + 0.1, status="ok"
+    )
+    rec = sink.records[0]
+    assert rec["prompt_token_count"] == 13
+    assert rec["completion_token_count"] == 48
+
+
+async def test_audit_extracts_tokens_anthropic_usage_shape() -> None:
+    """Anthropic-style usage (input_tokens/output_tokens) is captured too."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+    response = {"usage": {"input_tokens": 20, "output_tokens": 7}}
+    start = time.time()
+    await g.audit(data, response, start_time=start, end_time=start + 0.1, status="ok")
+    rec = sink.records[0]
+    assert rec["prompt_token_count"] == 20
+    assert rec["completion_token_count"] == 7
