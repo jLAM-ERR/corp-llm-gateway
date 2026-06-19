@@ -5,6 +5,7 @@ The full HTTP integration of the proxy is exercised in docker compose
 small enough that the contract is mostly its argparse + the
 header-injection logic, both of which are testable without sockets.
 """
+
 from pathlib import Path
 
 import pytest

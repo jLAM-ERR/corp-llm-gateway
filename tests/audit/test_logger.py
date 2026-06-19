@@ -5,10 +5,10 @@ from datetime import UTC, datetime
 import pytest
 
 from corp_llm_gateway.audit import (
+    NEVER_FIELDS,
     AuditEvent,
     AuditLogger,
     ListSink,
-    NEVER_FIELDS,
     NeverFieldPresentError,
     StdoutSink,
     assert_no_never_fields,
@@ -90,9 +90,7 @@ async def test_conditional_fields_absent_when_unset() -> None:
 async def test_placeholder_list_emitted_when_set() -> None:
     sink = ListSink()
     logger = AuditLogger(sink, gateway_version="0.0.1")
-    await logger.emit(
-        _event(redaction_count=2, placeholder_list=("[NAME_001]", "[EMAIL_002]"))
-    )
+    await logger.emit(_event(redaction_count=2, placeholder_list=("[NAME_001]", "[EMAIL_002]")))
     assert sink.records[0]["placeholder_list"] == ["[NAME_001]", "[EMAIL_002]"]
 
 

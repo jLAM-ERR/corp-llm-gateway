@@ -23,9 +23,7 @@ def test_team_set_retention_defaults(capsys: pytest.CaptureFixture[str]) -> None
 
 
 def test_team_set_retention_overrides(capsys: pytest.CaptureFixture[str]) -> None:
-    rc = main(
-        ["team", "set-retention", "--team-id", "t1", "--hot-days", "30", "--cold-years", "1"]
-    )
+    rc = main(["team", "set-retention", "--team-id", "t1", "--hot-days", "30", "--cold-years", "1"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "team.set_retention team_id=t1 hot_days=30 cold_years=1" in out

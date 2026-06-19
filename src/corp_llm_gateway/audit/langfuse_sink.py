@@ -9,6 +9,7 @@ Vector for low-volume / debug traffic).
 Authentication: HTTP Basic with `public_key:secret_key`. Set per-team
 override via env or per-deploy secret.
 """
+
 from __future__ import annotations
 
 import base64
@@ -38,7 +39,7 @@ class LangfuseSink(Sink):
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._auth_header = "Basic " + base64.b64encode(
-            f"{public_key}:{secret_key}".encode("utf-8")
+            f"{public_key}:{secret_key}".encode()
         ).decode("ascii")
         self._timeout = timeout
         self._http = http or httpx.AsyncClient(timeout=timeout)

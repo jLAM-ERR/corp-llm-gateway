@@ -7,7 +7,6 @@ from corp_llm_gateway.healthz import (
     SanitizationCheck,
 )
 
-
 # Live ----------------------------------------------------------------------
 
 
@@ -109,5 +108,5 @@ async def test_sanitization_exception_caught() -> None:
 
 def test_status_is_immutable_dataclass() -> None:
     s = HealthStatus(True)
-    with pytest.raises(Exception):
+    with pytest.raises(AttributeError):
         s.healthy = False  # type: ignore[misc]

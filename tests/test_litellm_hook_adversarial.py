@@ -5,6 +5,7 @@ Focus: the SSE bytes path (bytes|str chunks), split placeholders across
 deltas, framing integrity, and passthrough correctness.  Dict-chunk path
 is covered by test_litellm_hook.py; we only supplement here.
 """
+
 from __future__ import annotations
 
 import json
@@ -120,9 +121,7 @@ async def _iter(items: list[Any]) -> AsyncIterator[Any]:
         yield it
 
 
-async def _collect(
-    g: CorpLlmGuardrail, data: dict, chunks: list[Any]
-) -> list[Any]:
+async def _collect(g: CorpLlmGuardrail, data: dict, chunks: list[Any]) -> list[Any]:
     out: list[Any] = []
     async for chunk in g.post_call_stream(data, _iter(chunks)):
         out.append(chunk)
@@ -325,9 +324,9 @@ async def test_post_call_stream_mixed_bytes_and_dict_chunks() -> None:
     await g.pre_call(data)
 
     chunks: list[Any] = [
-        _MSG_START,                                                # bytes SSE
-        {"choices": [{"delta": {"content": "from dict"}}]},       # dict
-        _PING,                                                     # bytes SSE
+        _MSG_START,  # bytes SSE
+        {"choices": [{"delta": {"content": "from dict"}}]},  # dict
+        _PING,  # bytes SSE
     ]
     # Must not raise.
     out = await _collect(g, data, chunks)

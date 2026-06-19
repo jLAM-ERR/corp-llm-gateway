@@ -33,9 +33,7 @@ def test_parse_mixed_quoting() -> None:
 
 def test_parse_multiple_rules() -> None:
     text = "- alice → [N1]\n# comment\n- bob → [N2]\n"
-    assert parse(text) == Rules(
-        rules=(Rule("alice", "[N1]"), Rule("bob", "[N2]"))
-    )
+    assert parse(text) == Rules(rules=(Rule("alice", "[N1]"), Rule("bob", "[N2]")))
 
 
 def test_parse_rejects_ascii_arrow() -> None:
@@ -60,6 +58,4 @@ def test_parse_rejects_empty_original() -> None:
 
 
 def test_parse_strips_whitespace() -> None:
-    assert parse("  -   alice   →   [N1]  ") == Rules(
-        rules=(Rule("alice", "[N1]"),)
-    )
+    assert parse("  -   alice   →   [N1]  ") == Rules(rules=(Rule("alice", "[N1]"),))

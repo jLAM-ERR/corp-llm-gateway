@@ -157,10 +157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # Oversize payload (M1-11): the pre-pass was bypassed, so the
                 # content went UNREDACTED. Say so explicitly — "redactions: 0"
                 # alone would read as a false "clean input".
-                print(
-                    "redactions: SKIPPED — payload over size threshold; "
-                    "content sent UNREDACTED"
-                )
+                print("redactions: SKIPPED — payload over size threshold; content sent UNREDACTED")
             else:
                 print(f"redactions: {len(result.pairs)}")
                 for original, replacement in result.pairs:

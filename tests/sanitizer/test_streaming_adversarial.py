@@ -4,6 +4,7 @@ Covers framing integrity, malformed inputs, non-text delta types, block
 edge-cases, wire-format variants, ensure_ascii, usage pass-through, and
 empty/no-op paths not exercised by the happy-path suite.
 """
+
 from __future__ import annotations
 
 import json
@@ -126,9 +127,7 @@ def test_done_sentinel_after_openai_content_flushes_desanitizer() -> None:
     by StreamingDesanitizer.flush() is passed directly to self._encode()
     instead of being wrapped in a data:{choices:[{delta:{content:...}}]} event.
     """
-    openai_delta = (
-        b'data: {"choices": [{"delta": {"content": "[N1]"}}]}\n\n'
-    )
+    openai_delta = b'data: {"choices": [{"delta": {"content": "[N1]"}}]}\n\n'
     done_event = b"data: [DONE]\n\n"
     sse = SseStreamDesanitizer(_mapping(("alice", "[N1]")))
     out = _collect_bytes(sse, [openai_delta, done_event])
@@ -194,10 +193,7 @@ def _input_json_delta_event(index: int = 0, partial_json: str = '{"k":') -> byte
         "index": index,
         "delta": {"type": "input_json_delta", "partial_json": partial_json},
     }
-    return (
-        b"event: content_block_delta\n"
-        b"data: " + json.dumps(obj).encode() + b"\n\n"
-    )
+    return b"event: content_block_delta\ndata: " + json.dumps(obj).encode() + b"\n\n"
 
 
 def _thinking_delta_event(index: int = 0, thinking: str = "let me think") -> bytes:
@@ -206,10 +202,7 @@ def _thinking_delta_event(index: int = 0, thinking: str = "let me think") -> byt
         "index": index,
         "delta": {"type": "thinking_delta", "thinking": thinking},
     }
-    return (
-        b"event: content_block_delta\n"
-        b"data: " + json.dumps(obj).encode() + b"\n\n"
-    )
+    return b"event: content_block_delta\ndata: " + json.dumps(obj).encode() + b"\n\n"
 
 
 def _tool_use_block_start(index: int = 1) -> bytes:
@@ -218,10 +211,7 @@ def _tool_use_block_start(index: int = 1) -> bytes:
         "index": index,
         "content_block": {"type": "tool_use", "id": "tu1", "name": "bash", "input": {}},
     }
-    return (
-        b"event: content_block_start\n"
-        b"data: " + json.dumps(obj).encode() + b"\n\n"
-    )
+    return b"event: content_block_start\ndata: " + json.dumps(obj).encode() + b"\n\n"
 
 
 def test_input_json_delta_passes_through_byte_identical() -> None:
@@ -299,13 +289,9 @@ def test_placeholder_held_until_block_stop_then_flushed() -> None:
     out = _collect_bytes(sse, [_cb_start(0), ev, _cb_stop(0)])
 
     # Find the stop event position.
-    stop_pos = next(
-        (i for i, c in enumerate(out) if b"content_block_stop" in c), None
-    )
+    stop_pos = next((i for i, c in enumerate(out) if b"content_block_stop" in c), None)
     # There must be at least one content_block_delta emitted before stop.
-    delta_before_stop = any(
-        b"content_block_delta" in out[i] for i in range(stop_pos or 0)
-    )
+    delta_before_stop = any(b"content_block_delta" in out[i] for i in range(stop_pos or 0))
     # Reconstruct all delta text (before and at/after stop).
     all_delta_text = "".join(
         _data_obj(c)["delta"]["text"]
@@ -351,7 +337,8 @@ def test_two_text_blocks_each_placeholder_restored_independently() -> None:
     delta_texts = [
         _data_obj(c)["delta"]["text"]
         for c in out
-        if b"content_block_delta" in c and _data_obj(c) is not None
+        if b"content_block_delta" in c
+        and _data_obj(c) is not None
         and _data_obj(c).get("type") == "content_block_delta"
     ]
     joined = "".join(delta_texts)
@@ -428,10 +415,7 @@ def test_crlf_event_separators_accepted_no_exception() -> None:
         b'data: {"type": "content_block_start", "index": 0,'
         b' "content_block": {"type": "text", "text": ""}}\r\n\r\n'
     )
-    stop = (
-        b"event: content_block_stop\r\n"
-        b'data: {"type": "content_block_stop", "index": 0}\r\n\r\n'
-    )
+    stop = b'event: content_block_stop\r\ndata: {"type": "content_block_stop", "index": 0}\r\n\r\n'
     sse = SseStreamDesanitizer(_mapping(("alice", "[N1]")))
     out = _collect_bytes(sse, [start, ev, stop])
     # Reconstruct text from all content_block_delta chunks.
@@ -489,9 +473,7 @@ def test_multibyte_cyrillic_original_not_corrupted() -> None:
     ev_bytes = (
         b"event: content_block_delta\n"
         b'data: {"type": "content_block_delta", "index": 0,'
-        b' "delta": {"type": "text_delta", "text": "'
-        + cyrillic.encode("utf-8")
-        + b'"}}\n\n'
+        b' "delta": {"type": "text_delta", "text": "' + cyrillic.encode("utf-8") + b'"}}\n\n'
     )
     # Split in the middle of the UTF-8 bytes.
     split = len(ev_bytes) // 2
@@ -518,9 +500,7 @@ def test_non_ascii_original_emitted_as_utf8_not_escaped() -> None:
         if b"content_block_delta" not in chunk:
             continue
         # The raw UTF-8 bytes of the Cyrillic name must appear in the chunk.
-        assert original.encode("utf-8") in chunk, (
-            f"Cyrillic original was JSON-escaped: {chunk!r}"
-        )
+        assert original.encode("utf-8") in chunk, f"Cyrillic original was JSON-escaped: {chunk!r}"
         # Confirm no \\u escape for the first Cyrillic char (U+0410).
         assert b"\\u0410" not in chunk
 
@@ -683,6 +663,7 @@ def test_openai_sse_bytes_placeholder_not_emitted_in_choices_chunks() -> None:
     choices delta content field.  The full restoration is gated by the
     [DONE]-flush bug (see test_done_sentinel_after_openai_content_flushes_desanitizer).
     """
+
     def _openai_delta(content: str) -> bytes:
         obj = {"choices": [{"delta": {"content": content}}]}
         return b"data: " + json.dumps(obj).encode() + b"\n\n"
@@ -747,9 +728,7 @@ def test_anthropic_truncated_flush_tail_emitted_as_valid_content_block_delta() -
             try:
                 json.loads(payload)
             except json.JSONDecodeError as exc:
-                pytest.fail(
-                    f"flush() tail emitted as raw non-JSON data: {payload!r} — {exc}"
-                )
+                pytest.fail(f"flush() tail emitted as raw non-JSON data: {payload!r} — {exc}")
 
     # The original must be present in the delta text fields.
     all_text = ""
@@ -768,6 +747,7 @@ def test_openai_truncated_flush_tail_emitted_as_valid_choices_event() -> None:
     When the stream ends without [DONE] and the OpenAI desanitizer has a
     held-back tail, flush() must wrap it in a choices SSE event, not raw text.
     """
+
     def _openai_delta(content: str) -> bytes:
         obj = {"choices": [{"delta": {"content": content}}]}
         return b"data: " + json.dumps(obj).encode() + b"\n\n"
@@ -789,16 +769,10 @@ def test_openai_truncated_flush_tail_emitted_as_valid_choices_event() -> None:
             try:
                 obj = json.loads(payload)
             except json.JSONDecodeError as exc:
-                pytest.fail(
-                    f"flush() OpenAI tail emitted as raw non-JSON: {payload!r} — {exc}"
-                )
-            assert "choices" in obj, (
-                f"flush() tail has no choices envelope: {chunk!r}"
-            )
+                pytest.fail(f"flush() OpenAI tail emitted as raw non-JSON: {payload!r} — {exc}")
+            assert "choices" in obj, f"flush() tail has no choices envelope: {chunk!r}"
 
     all_text = "".join(
-        chunk.decode("utf-8", errors="replace")
-        for chunk in out
-        if b"choices" in chunk
+        chunk.decode("utf-8", errors="replace") for chunk in out if b"choices" in chunk
     )
     assert "alice" in all_text

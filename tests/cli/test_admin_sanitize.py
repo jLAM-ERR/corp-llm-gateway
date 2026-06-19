@@ -1,4 +1,5 @@
 """Tests for gateway-admin sanitize subcommand."""
+
 import json
 from typing import Any
 
@@ -179,9 +180,7 @@ def test_sanitize_team_id_forwarded(
 
     def _build() -> tuple[SanitizationOrchestrator, CorpLlmClient]:
         corp_llm = _corp_llm_returning([])
-        orch = SanitizationOrchestrator(
-            corp_llm, InMemoryMappingStore(), _CapturingRules()
-        )
+        orch = SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _CapturingRules())
         return orch, corp_llm
 
     monkeypatch.setattr(

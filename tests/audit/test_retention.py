@@ -27,9 +27,7 @@ def test_default_retention_expires_after_7_years() -> None:
 
 
 def test_team_overrides_retention_values() -> None:
-    rule = lifecycle_rule_for(
-        _team("t-short", retention_hot_days=30, retention_cold_years=1)
-    )
+    rule = lifecycle_rule_for(_team("t-short", retention_hot_days=30, retention_cold_years=1))
     assert rule["Transitions"][0]["Days"] == 30
     assert rule["Expiration"]["Days"] == 30 + 365
 

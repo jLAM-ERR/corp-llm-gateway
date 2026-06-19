@@ -13,12 +13,12 @@ from corp_llm_gateway.audit.retention import (
 from corp_llm_gateway.audit.sinks import ListSink, Sink, StdoutSink
 
 __all__ = [
+    "NEVER_FIELDS",
     "AuditEvent",
     "AuditLogger",
     "LangfuseIngestionError",
     "LangfuseSink",
     "ListSink",
-    "NEVER_FIELDS",
     "NeverFieldPresentError",
     "Sink",
     "StdoutSink",

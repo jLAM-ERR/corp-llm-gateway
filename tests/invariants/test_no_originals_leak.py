@@ -16,8 +16,10 @@ the integration tests for those once corp-LLM URL lands). It guards the
 parts that exist today — sanitizer engine, streaming desanitizer, audit
 logger, auth middleware — so a regression here trips a hard test failure.
 """
+
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import logging
@@ -41,8 +43,8 @@ from corp_llm_gateway.detectors import (
 from corp_llm_gateway.sanitizer import (
     CorpLlmSanitizer,
     SanitizerStrategy,
-    StreamingDesanitizer,
     StrategyResult,
+    StreamingDesanitizer,
 )
 from corp_llm_gateway.sanitizer.strategies import StrategyError
 from corp_llm_gateway.tokens import (
@@ -51,7 +53,6 @@ from corp_llm_gateway.tokens import (
     InvalidTokenError,
     TokenInfo,
 )
-
 
 ORIGINAL_CORPUS = [
     "alice.smith@corp.lan",
@@ -180,14 +181,9 @@ async def test_sanitizer_failure_log_does_not_carry_raw_output(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     secret_blob = "\n".join(ORIGINAL_CORPUS)
-    sanitizer = CorpLlmSanitizer(
-        strategies=[_AlwaysFailsStrategy(), _AlwaysFailsStrategy()]
-    )
-    with caplog.at_level(logging.DEBUG):
-        try:
-            await sanitizer.extract(secret_blob)
-        except Exception:
-            pass
+    sanitizer = CorpLlmSanitizer(strategies=[_AlwaysFailsStrategy(), _AlwaysFailsStrategy()])
+    with caplog.at_level(logging.DEBUG), contextlib.suppress(Exception):
+        await sanitizer.extract(secret_blob)
     assert _haystack_contains_any_original(caplog.text) is None
 
 

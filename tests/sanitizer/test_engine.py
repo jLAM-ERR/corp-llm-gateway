@@ -103,9 +103,7 @@ async def test_engine_falls_through_on_strategy_error() -> None:
 
 
 async def test_engine_raises_when_all_strategies_fail() -> None:
-    sanitizer = CorpLlmSanitizer(
-        strategies=[_FailingStrategy("a"), _FailingStrategy("b")]
-    )
+    sanitizer = CorpLlmSanitizer(strategies=[_FailingStrategy("a"), _FailingStrategy("b")])
     with pytest.raises(AllStrategiesFailedError):
         await sanitizer.extract("raw")
 
@@ -121,15 +119,11 @@ async def test_engine_raises_when_only_stubs() -> None:
 
 def test_apply_uses_length_descending_order() -> None:
     sanitizer = CorpLlmSanitizer(strategies=[_NotImplementedStrategy()])
-    mapping = StrategyResult(
-        pairs=(("alice cooper", "[NAME_002]"), ("alice", "[NAME_001]"))
-    )
+    mapping = StrategyResult(pairs=(("alice cooper", "[NAME_002]"), ("alice", "[NAME_001]")))
     assert sanitizer.apply("hello alice cooper", mapping) == "hello [NAME_002]"
 
 
 def test_reverse_uses_length_descending_order() -> None:
     sanitizer = CorpLlmSanitizer(strategies=[_NotImplementedStrategy()])
-    mapping = StrategyResult(
-        pairs=(("alice", "[NAME_1]"), ("bob", "[NAME_12]"))
-    )
+    mapping = StrategyResult(pairs=(("alice", "[NAME_1]"), ("bob", "[NAME_12]")))
     assert sanitizer.reverse("[NAME_12] and [NAME_1]", mapping) == "bob and alice"

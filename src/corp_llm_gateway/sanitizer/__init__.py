@@ -23,8 +23,8 @@ __all__ = [
     "SanitizeResult",
     "SanitizerStrategy",
     "SseStreamDesanitizer",
-    "StreamingDesanitizer",
     "StrategyResult",
+    "StreamingDesanitizer",
     "default_sanitizer",
     "sort_placeholders_by_descending_length",
 ]

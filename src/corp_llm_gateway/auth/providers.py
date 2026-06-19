@@ -23,9 +23,7 @@ class BearerAuthProvider(CorpLlmAuthProvider):
         self._token = token
 
     def artifacts(self) -> AuthArtifacts:
-        return AuthArtifacts(
-            headers={"Authorization": f"Bearer {self._token}"}
-        )
+        return AuthArtifacts(headers={"Authorization": f"Bearer {self._token}"})
 
 
 class MtlsAuthProvider(CorpLlmAuthProvider):
@@ -34,9 +32,7 @@ class MtlsAuthProvider(CorpLlmAuthProvider):
         self._key_path = key_path
 
     def artifacts(self) -> AuthArtifacts:
-        raise NotImplementedError(
-            "MtlsAuthProvider stub — implement when corp LLM enables mTLS"
-        )
+        raise NotImplementedError("MtlsAuthProvider stub — implement when corp LLM enables mTLS")
 
 
 class OidcAuthProvider(CorpLlmAuthProvider):
@@ -46,9 +42,7 @@ class OidcAuthProvider(CorpLlmAuthProvider):
         self._client_secret = client_secret
 
     def artifacts(self) -> AuthArtifacts:
-        raise NotImplementedError(
-            "OidcAuthProvider stub — implement when corp LLM enables OIDC"
-        )
+        raise NotImplementedError("OidcAuthProvider stub — implement when corp LLM enables OIDC")
 
 
 class ApiKeyHeaderAuthProvider(CorpLlmAuthProvider):

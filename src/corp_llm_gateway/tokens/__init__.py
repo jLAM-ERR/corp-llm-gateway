@@ -19,10 +19,10 @@ from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
 from corp_llm_gateway.tokens.store import TokenStore
 
 __all__ = [
+    "DEFAULT_TOKEN_TTL_DAYS",
     "AuthContext",
     "AuthError",
     "AuthMiddleware",
-    "DEFAULT_TOKEN_TTL_DAYS",
     "ExpiredTokenError",
     "InMemoryTokenStore",
     "InvalidTokenError",

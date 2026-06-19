@@ -1,14 +1,11 @@
 import time
 from dataclasses import dataclass
-from typing import Generic, TypeVar
 
 from corp_llm_gateway.storage.mapping import MappingStore, PlaceholderMapping
 
-T = TypeVar("T")
-
 
 @dataclass
-class _Entry(Generic[T]):
+class _Entry[T]:
     value: T
     expires_at: float
     sliding_ttl_seconds: float | None = None

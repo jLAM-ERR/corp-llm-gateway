@@ -3,6 +3,7 @@
 Targets the vLLM OpenAI-compatible chat/completions response shape per
 openapi.json. Order: function-call → JSON → regex.
 """
+
 from __future__ import annotations
 
 import json
@@ -57,9 +58,7 @@ class FunctionCallStrategy(SanitizerStrategy):
             None,
         )
         if target is None:
-            raise StrategyError(
-                f"tool_call for {SANITIZE_TOOL_NAME!r} not present"
-            )
+            raise StrategyError(f"tool_call for {SANITIZE_TOOL_NAME!r} not present")
         args_raw = (target.get("function") or {}).get("arguments")
         if not isinstance(args_raw, str):
             raise StrategyError("tool_call arguments missing or not a string")
@@ -131,7 +130,7 @@ def _extract_tool_calls(raw: Any) -> list[dict[str, Any]]:
         choices = raw.get("choices") or []
         if not choices:
             return []
-        msg = (choices[0].get("message") or {})
+        msg = choices[0].get("message") or {}
         tc = msg.get("tool_calls") or []
         return tc if isinstance(tc, list) else []
     return []

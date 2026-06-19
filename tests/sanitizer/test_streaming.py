@@ -115,9 +115,7 @@ def test_feed_split_one_char_at_a_time() -> None:
 
 
 def test_feed_two_placeholders_back_to_back() -> None:
-    d = StreamingDesanitizer(
-        _mapping(("alice", "[NAME_1]"), ("bob", "[NAME_2]"))
-    )
+    d = StreamingDesanitizer(_mapping(("alice", "[NAME_1]"), ("bob", "[NAME_2]")))
     out = d.feed("[NAME_1][NAME_2]")
     out += d.flush()
     assert out == "alicebob"
@@ -167,9 +165,7 @@ def test_empty_mapping_passthrough() -> None:
 
 def test_length_descending_replacement() -> None:
     """A longer placeholder must replace before its prefix counterpart."""
-    d = StreamingDesanitizer(
-        _mapping(("alice cooper", "[NAME_LONG]"), ("alice", "[NAME]"))
-    )
+    d = StreamingDesanitizer(_mapping(("alice cooper", "[NAME_LONG]"), ("alice", "[NAME]")))
     out = d.feed("[NAME_LONG] vs [NAME]")
     out += d.flush()
     assert out == "alice cooper vs alice"
@@ -224,12 +220,8 @@ async def test_stream_no_placeholders() -> None:
 
 
 async def test_stream_multiple_placeholders_with_split_boundary() -> None:
-    d = StreamingDesanitizer(
-        _mapping(("alice", "[NAME_1]"), ("bob", "[NAME_2]"))
-    )
-    chunks = [
-        c async for c in d.stream(_async_iter(["hi [NAM", "E_1] and [NAME", "_2] done"]))
-    ]
+    d = StreamingDesanitizer(_mapping(("alice", "[NAME_1]"), ("bob", "[NAME_2]")))
+    chunks = [c async for c in d.stream(_async_iter(["hi [NAM", "E_1] and [NAME", "_2] done"]))]
     assert "".join(chunks) == "hi alice and bob done"
 
 
@@ -308,8 +300,11 @@ def test_sse_passthrough_events_byte_identical() -> None:
     """ping, message_delta, message_stop, message_start, content_block_start pass unchanged."""
     sse = SseStreamDesanitizer(_mapping(("alice", "[NAME_001]")))
     passthrough_types = {
-        "ping", "message_delta", "message_stop",
-        "message_start", "content_block_start",
+        "ping",
+        "message_delta",
+        "message_stop",
+        "message_start",
+        "content_block_start",
     }
     out = _collect(sse, list(ANTHROPIC_SSE_FIXTURE))
     out_by_type: dict[str, bytes] = {}
@@ -377,10 +372,7 @@ def test_sse_crlf_separators_accepted() -> None:
         b'data: {"type": "content_block_start", "index": 0,'
         b' "content_block": {"type": "text", "text": ""}}\r\n\r\n'
     )
-    stop = (
-        b"event: content_block_stop\r\n"
-        b'data: {"type": "content_block_stop", "index": 0}\r\n\r\n'
-    )
+    stop = b'event: content_block_stop\r\ndata: {"type": "content_block_stop", "index": 0}\r\n\r\n'
     sse = SseStreamDesanitizer(_mapping(("alice", "[NAME_001]")))
     out = _collect(sse, [start, ev, stop])
     delta_chunks = [c for c in out if b"content_block_delta" in c]
@@ -398,21 +390,15 @@ def test_sse_multibyte_utf8_split_across_chunks_not_corrupted() -> None:
     ev_bytes = (
         b"event: content_block_delta\n"
         b'data: {"type": "content_block_delta", "index": 0,'
-        b' "delta": {"type": "text_delta", "text": "'
-        + text.encode("utf-8")
-        + b'"}}\n\n'
+        b' "delta": {"type": "text_delta", "text": "' + text.encode("utf-8") + b'"}}\n\n'
     )
     # Split at the first byte of the emoji (inside the UTF-8 sequence).
     emoji_start = ev_bytes.index(b"\xf0")
-    part1 = ev_bytes[:emoji_start + 1]
-    part2 = ev_bytes[emoji_start + 1:]
+    part1 = ev_bytes[: emoji_start + 1]
+    part2 = ev_bytes[emoji_start + 1 :]
     sse = SseStreamDesanitizer(_mapping())
     out = _collect(sse, [_cb_start(), part1, part2, _cb_stop()])
-    all_text = "".join(
-        _data_of(c)["delta"]["text"]
-        for c in out
-        if b"content_block_delta" in c
-    )
+    all_text = "".join(_data_of(c)["delta"]["text"] for c in out if b"content_block_delta" in c)
     assert emoji in all_text
     assert "hi" in all_text
 

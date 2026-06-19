@@ -11,7 +11,7 @@ class MappingStore(ABC):
     """Two-level cache for sanitization mappings.
 
     Cache A (dedup):     content_hash → full PlaceholderMapping. Fixed TTL.
-    Cache B (per-conv):  conversation_id × original ↔ placeholder. Sliding TTL —
+    Cache B (per-conv):  conversation_id x original ↔ placeholder. Sliding TTL —
                          each get refreshes expiry.
     """
 

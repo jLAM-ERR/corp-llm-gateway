@@ -50,25 +50,33 @@ def test_version_file_read(tmp_path: Path) -> None:
 def test_main_returns_nonzero_when_unhealthy(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    rc = main([
-        "--gateway-url", "http://127.0.0.1:1",
-        "--token-file", str(tmp_path / "missing"),
-        "--version-file", str(tmp_path / "missing-v"),
-    ])
+    rc = main(
+        [
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--token-file",
+            str(tmp_path / "missing"),
+            "--version-file",
+            str(tmp_path / "missing-v"),
+        ]
+    )
     assert rc == 1
     out = capsys.readouterr().out
     assert "unhealthy" in out
 
 
-def test_main_json_output(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    rc = main([
-        "--json",
-        "--gateway-url", "http://127.0.0.1:1",
-        "--token-file", str(tmp_path / "missing"),
-        "--version-file", str(tmp_path / "missing-v"),
-    ])
+def test_main_json_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(
+        [
+            "--json",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--token-file",
+            str(tmp_path / "missing"),
+            "--version-file",
+            str(tmp_path / "missing-v"),
+        ]
+    )
     assert rc == 1
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["healthy"] is False
@@ -80,11 +88,16 @@ def test_main_healthy_when_live_and_token_present(
 ) -> None:
     (tmp_path / "token").write_text("ct_xyz")
     with patch("corp_llm_gateway.cli.status._probe_live", return_value=True):
-        rc = main([
-            "--gateway-url", "https://gateway.example",
-            "--token-file", str(tmp_path / "token"),
-            "--version-file", str(tmp_path / "missing-v"),
-        ])
+        rc = main(
+            [
+                "--gateway-url",
+                "https://gateway.example",
+                "--token-file",
+                str(tmp_path / "token"),
+                "--version-file",
+                str(tmp_path / "missing-v"),
+            ]
+        )
     assert rc == 0
     out = capsys.readouterr().out
     assert "healthy" in out
@@ -93,8 +106,9 @@ def test_main_healthy_when_live_and_token_present(
 def test_update_check_reports_newer_version(tmp_path: Path) -> None:
     (tmp_path / "token").write_text("ct_xyz")
     (tmp_path / "VERSION").write_text("v0.0.1\n")
-    with patch("corp_llm_gateway.cli.status._probe_live", return_value=True), patch(
-        "corp_llm_gateway.cli.status._fetch_latest_version", return_value="v0.0.2"
+    with (
+        patch("corp_llm_gateway.cli.status._probe_live", return_value=True),
+        patch("corp_llm_gateway.cli.status._fetch_latest_version", return_value="v0.0.2"),
     ):
         info = _gather_status(
             gateway_url="https://x",
@@ -110,8 +124,9 @@ def test_update_check_reports_newer_version(tmp_path: Path) -> None:
 def test_update_check_no_update_when_same_version(tmp_path: Path) -> None:
     (tmp_path / "token").write_text("ct_xyz")
     (tmp_path / "VERSION").write_text("v0.0.1\n")
-    with patch("corp_llm_gateway.cli.status._probe_live", return_value=True), patch(
-        "corp_llm_gateway.cli.status._fetch_latest_version", return_value="v0.0.1"
+    with (
+        patch("corp_llm_gateway.cli.status._probe_live", return_value=True),
+        patch("corp_llm_gateway.cli.status._fetch_latest_version", return_value="v0.0.1"),
     ):
         info = _gather_status(
             gateway_url="https://x",
@@ -126,9 +141,10 @@ def test_update_check_no_update_when_same_version(tmp_path: Path) -> None:
 def test_update_check_disabled_no_fetch(tmp_path: Path) -> None:
     (tmp_path / "token").write_text("ct_xyz")
     (tmp_path / "VERSION").write_text("v0.0.1\n")
-    with patch("corp_llm_gateway.cli.status._probe_live", return_value=True), patch(
-        "corp_llm_gateway.cli.status._fetch_latest_version"
-    ) as mock_fetch:
+    with (
+        patch("corp_llm_gateway.cli.status._probe_live", return_value=True),
+        patch("corp_llm_gateway.cli.status._fetch_latest_version") as mock_fetch,
+    ):
         info = _gather_status(
             gateway_url="https://x",
             token_file=tmp_path / "token",

@@ -18,8 +18,10 @@ We register the class via LiteLLM proxy config:
 
 The class is duck-typed; LiteLLM doesn't require strict subclassing.
 """
+
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 import uuid
@@ -34,8 +36,8 @@ from corp_llm_gateway.sanitizer import (
     SanitizationOrchestrator,
     SanitizeResult,
     SseStreamDesanitizer,
-    StreamingDesanitizer,
     StrategyResult,
+    StreamingDesanitizer,
 )
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.tokens import (
@@ -60,7 +62,7 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
-class GuardrailHttpException(Exception):
+class GuardrailHttpException(Exception):  # noqa: N818 — intentional name; LiteLLM-facing API
     """Raised to signal LiteLLM that the request must be rejected.
 
     LiteLLM's proxy maps this to an HTTP error response. We carry both
@@ -96,10 +98,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Best-effort super().__init__ — when litellm is installed this
         # initializes CustomLogger's internal state; when it isn't
         # (object), this is a no-op kwargs-only call.
-        try:
+        with contextlib.suppress(TypeError):  # pragma: no cover
             super().__init__()
-        except TypeError:  # pragma: no cover
-            pass
         self._orch = orchestrator
         self._auth = auth_middleware
         self._audit = audit_logger
@@ -170,9 +170,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         end_time: float,
     ) -> None:
         request_data = _resolve_request_data(kwargs)
-        await self.audit(
-            request_data, response_obj, start_time, end_time, status="failed"
-        )
+        await self.audit(request_data, response_obj, start_time, end_time, status="failed")
 
     # ---- Pure logic (unit-testable without LiteLLM) -----------------------
 
@@ -205,8 +203,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             mt = data.get("max_tokens")
             if isinstance(mt, int) and mt > self._max_output_tokens_cap:
                 logger.info(
-                    "litellm_pre_call_max_tokens_clamped request_id=%s "
-                    "requested=%d capped=%d",
+                    "litellm_pre_call_max_tokens_clamped request_id=%s requested=%d capped=%d",
                     request_id,
                     mt,
                     self._max_output_tokens_cap,
@@ -221,7 +218,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 request_id,
             )
             self._record_failure(request_id, error_code="E_MISSING_TOKEN")
-            raise GuardrailHttpException(401, "E_MISSING_TOKEN", "missing X-Corp-Auth")
+            raise GuardrailHttpException(401, "E_MISSING_TOKEN", "missing X-Corp-Auth") from None
         except AuthError as exc:
             error_code = _classify_auth_error(exc)
             logger.info(
@@ -600,9 +597,7 @@ def _resolve_request_data(kwargs: dict[str, Any]) -> dict[str, Any]:
     call_id = kwargs.get("litellm_call_id")
     if not (isinstance(call_id, str) and call_id):
         lparams_in = kwargs.get("litellm_params")
-        if isinstance(lparams_in, dict) and isinstance(
-            lparams_in.get("litellm_call_id"), str
-        ):
+        if isinstance(lparams_in, dict) and isinstance(lparams_in.get("litellm_call_id"), str):
             call_id = lparams_in["litellm_call_id"]
     if isinstance(call_id, str) and call_id:
         out["litellm_call_id"] = call_id
@@ -619,11 +614,20 @@ def _resolve_request_data(kwargs: dict[str, Any]) -> dict[str, Any]:
 # Inbound HTTP wire-level headers that must NOT be forwarded to upstream
 # LLMs by any provider. Mostly hop-by-hop or request-scoped values that
 # describe the LiteLLM proxy's own connection from the client.
-_WIRE_HEADERS_TO_DROP = frozenset({
-    "host", "user-agent", "content-length", "accept", "connection",
-    "content-type", "x-forwarded-for", "x-forwarded-proto",
-    "x-forwarded-host", "x-real-ip",
-})
+_WIRE_HEADERS_TO_DROP = frozenset(
+    {
+        "host",
+        "user-agent",
+        "content-length",
+        "accept",
+        "connection",
+        "content-type",
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "x-real-ip",
+    }
+)
 
 
 def _drop_wire_headers(headers: Any) -> None:
@@ -636,16 +640,16 @@ def _drop_wire_headers(headers: Any) -> None:
 
 class _RequestState:
     __slots__ = (
-        "request_id",
-        "user_id",
-        "team_id",
-        "provider",
-        "model",
-        "redaction_count",
-        "placeholders",
         "cache_a_hit",
-        "mapping",
         "error_code",
+        "mapping",
+        "model",
+        "placeholders",
+        "provider",
+        "redaction_count",
+        "request_id",
+        "team_id",
+        "user_id",
     )
 
     def __init__(
@@ -796,8 +800,8 @@ def _extract_token_counts(response: Any) -> tuple[int, int]:
     and accept both the OpenAI (``prompt_tokens``/``completion_tokens``) and
     Anthropic (``input_tokens``/``output_tokens``) field names.
     """
-    usage = response.get("usage") if isinstance(response, dict) else getattr(
-        response, "usage", None
+    usage = (
+        response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
     )
     if usage is None:
         return 0, 0

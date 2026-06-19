@@ -19,6 +19,7 @@ Example file::
     CORP_LLM_AUTH_PROVIDER = "bearer"
     CORP_LLM_BEARER_TOKEN = "ct_..."
 """
+
 from __future__ import annotations
 
 import os
@@ -36,9 +37,7 @@ _DEFAULT_PATHS: tuple[str, ...] = (
 @lru_cache(maxsize=1)
 def _load_file() -> dict[str, Any]:
     explicit = os.environ.get("CORP_LLM_GATEWAY_CONFIG_FILE")
-    candidates: tuple[str, ...] = (
-        (explicit, *_DEFAULT_PATHS) if explicit else _DEFAULT_PATHS
-    )
+    candidates: tuple[str, ...] = (explicit, *_DEFAULT_PATHS) if explicit else _DEFAULT_PATHS
     for raw in candidates:
         if not raw:
             continue

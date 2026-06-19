@@ -61,9 +61,7 @@ async def test_shadow_agreement_does_not_log(caplog: pytest.LogCaptureFixture) -
 async def test_shadow_disagreement_is_logged_but_originals_are_not(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    canonical = _StaticDetector(
-        [Finding("alice@corp.lan", "EMAIL", 0, 16, 0.9)]
-    )
+    canonical = _StaticDetector([Finding("alice@corp.lan", "EMAIL", 0, 16, 0.9)])
     shadow = _StaticDetector(
         [Finding("alice@corp.lan", "EMAIL", 0, 16, 0.9), Finding("bob", "PERSON", 20, 23, 0.5)]
     )

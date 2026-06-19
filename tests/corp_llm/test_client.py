@@ -4,10 +4,10 @@ import httpx
 import pytest
 
 from corp_llm_gateway.corp_llm import (
-    CorpLlmClient,
-    CorpLlmHttpError,
     SANITIZE_TOOL_NAME,
     SANITIZE_TOOL_SCHEMA,
+    CorpLlmClient,
+    CorpLlmHttpError,
 )
 
 
@@ -26,9 +26,7 @@ async def test_chat_completion_posts_to_v1_chat_completions() -> None:
 
     http = _mock_transport(handler)
     client = CorpLlmClient("https://corp-llm.example", model="m", http=http)
-    resp = await client.chat_completion(
-        messages=[{"role": "user", "content": "hi"}], max_tokens=10
-    )
+    resp = await client.chat_completion(messages=[{"role": "user", "content": "hi"}], max_tokens=10)
     assert captured["method"] == "POST"
     assert captured["url"] == "https://corp-llm.example/v1/chat/completions"
     body = captured["body"]

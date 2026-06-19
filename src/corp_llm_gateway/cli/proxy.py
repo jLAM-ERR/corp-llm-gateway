@@ -12,20 +12,21 @@ stream they would get directly from the gateway.
 Usage:
     corp-llm-gateway proxy --listen 127.0.0.1:9999 --upstream https://gateway.corp.lan
 """
+
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
 import threading
-
-from corp_llm_gateway import config
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 from urllib.request import ProxyHandler, Request, build_opener
+
+from corp_llm_gateway import config
 
 # Don't honor env-based proxy lookup. The whole point of this CLI is to BE
 # the proxy; silently routing through a system HTTP_PROXY would defeat that
@@ -62,12 +63,23 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         logger.info("%s - " + format, self.client_address[0], *args)
 
-    def do_GET(self) -> None: self._handle()
-    def do_POST(self) -> None: self._handle()
-    def do_PUT(self) -> None: self._handle()
-    def do_DELETE(self) -> None: self._handle()
-    def do_PATCH(self) -> None: self._handle()
-    def do_OPTIONS(self) -> None: self._handle()
+    def do_GET(self) -> None:
+        self._handle()
+
+    def do_POST(self) -> None:
+        self._handle()
+
+    def do_PUT(self) -> None:
+        self._handle()
+
+    def do_DELETE(self) -> None:
+        self._handle()
+
+    def do_PATCH(self) -> None:
+        self._handle()
+
+    def do_OPTIONS(self) -> None:
+        self._handle()
 
     def _handle(self) -> None:
         try:
@@ -102,7 +114,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     def _forward_headers(self) -> dict[str, str]:
         out: dict[str, str] = {}
-        for name in self.headers.keys():
+        for name in self.headers:
             if name.lower() in _HOP_HEADERS:
                 continue
             value = self.headers[name]

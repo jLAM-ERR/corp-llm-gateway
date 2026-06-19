@@ -32,7 +32,9 @@ def _event(**overrides: object) -> AuditEvent:
     return AuditEvent(**base)  # type: ignore[arg-type]
 
 
-def _capturing_sink(public: str = "pk", secret: str = "sk") -> tuple[LangfuseSink, list[httpx.Request]]:
+def _capturing_sink(
+    public: str = "pk", secret: str = "sk"
+) -> tuple[LangfuseSink, list[httpx.Request]]:
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -40,9 +42,7 @@ def _capturing_sink(public: str = "pk", secret: str = "sk") -> tuple[LangfuseSin
         return httpx.Response(207, json={"successes": 2, "errors": []})
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    sink = LangfuseSink(
-        "https://langfuse.example", public_key=public, secret_key=secret, http=http
-    )
+    sink = LangfuseSink("https://langfuse.example", public_key=public, secret_key=secret, http=http)
     return sink, captured
 
 
@@ -74,9 +74,7 @@ async def test_strips_trailing_slash_in_base_url() -> None:
         return httpx.Response(207, json={})
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    sink = LangfuseSink(
-        "https://langfuse.example/", public_key="pk", secret_key="sk", http=http
-    )
+    sink = LangfuseSink("https://langfuse.example/", public_key="pk", secret_key="sk", http=http)
     await sink.write_event(_event())
     assert str(captured[0].url) == "https://langfuse.example/api/public/ingestion"
 
@@ -147,6 +145,7 @@ async def test_write_record_passes_never_field_gate() -> None:
 async def test_write_record_rejects_never_fields() -> None:
     sink, _ = _capturing_sink()
     from corp_llm_gateway.audit import NeverFieldPresentError
+
     with pytest.raises(NeverFieldPresentError):
         await sink.write({"mapping": [["alice", "[N1]"]]})
 

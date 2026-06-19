@@ -43,9 +43,7 @@ class CachedRulesLoader(RulesLoader):
             if entry is not None and entry.expires_at > time.monotonic():
                 return entry.rules
             rules = await self._inner.load(team_id)
-            self._cache[team_id] = _Entry(
-                rules=rules, expires_at=time.monotonic() + self._ttl
-            )
+            self._cache[team_id] = _Entry(rules=rules, expires_at=time.monotonic() + self._ttl)
             return rules
 
     async def _get_team_lock(self, team_id: str) -> asyncio.Lock:

@@ -8,6 +8,7 @@ This client is intentionally thin — no retries, no streaming. The
 guardrail layer composes retries via the failure-policy matrix; the
 caller decides streaming. We just speak the protocol.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -154,9 +155,7 @@ class CorpLlmClient:
             ) from exc
 
         if resp.status_code >= 400:
-            raise CorpLlmHttpError(
-                f"corp-llm returned {resp.status_code}: {resp.text[:500]}"
-            )
+            raise CorpLlmHttpError(f"corp-llm returned {resp.status_code}: {resp.text[:500]}")
         return ChatCompletionResponse(raw=resp.json())
 
     async def aclose(self) -> None:

@@ -35,6 +35,4 @@ def get_auth_provider() -> CorpLlmAuthProvider:
             key=config.get_required("CORP_LLM_API_KEY"),
         )
 
-    raise ValueError(
-        f"Unknown CORP_LLM_AUTH_PROVIDER={name!r}; expected one of {_KNOWN_PROVIDERS}"
-    )
+    raise ValueError(f"Unknown CORP_LLM_AUTH_PROVIDER={name!r}; expected one of {_KNOWN_PROVIDERS}")

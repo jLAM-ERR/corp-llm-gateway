@@ -1,6 +1,7 @@
 """corp-llm-gateway status — onboarded-laptop diagnostics (M6-5)."""
 
 import argparse
+import contextlib
 import json
 import sys
 import urllib.error
@@ -18,8 +19,12 @@ DEFAULT_GATEWAY_URL = "https://gateway.corp.lan"
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="corp-llm-gateway", description="Gateway client status")
-    parser.add_argument("--gateway-url", default=config.get("CORP_GATEWAY_URL", DEFAULT_GATEWAY_URL))
-    parser.add_argument("--token-file", default=config.get("CORP_GATEWAY_TOKEN_FILE", DEFAULT_TOKEN_FILE))
+    parser.add_argument(
+        "--gateway-url", default=config.get("CORP_GATEWAY_URL", DEFAULT_GATEWAY_URL)
+    )
+    parser.add_argument(
+        "--token-file", default=config.get("CORP_GATEWAY_TOKEN_FILE", DEFAULT_TOKEN_FILE)
+    )
     parser.add_argument("--version-file", default=DEFAULT_VERSION_FILE)
     parser.add_argument("--json", action="store_true", help="emit JSON")
     parser.add_argument(
@@ -76,17 +81,13 @@ def _gather_status(
         info["token_present"] = True
         try:
             stat = token_file.stat()
-            info["token_age_seconds"] = int(
-                (datetime.now(UTC).timestamp() - stat.st_mtime)
-            )
+            info["token_age_seconds"] = int(datetime.now(UTC).timestamp() - stat.st_mtime)
         except OSError:
             pass
 
     if version_file.is_file():
-        try:
+        with contextlib.suppress(OSError):
             info["version"] = version_file.read_text().strip()
-        except OSError:
-            pass
 
     info["live"] = _probe_live(gateway_url)
     info["healthy"] = bool(info["token_present"] and info["live"])
@@ -95,9 +96,7 @@ def _gather_status(
         latest = _fetch_latest_version(latest_version_url)
         if latest is not None:
             info["latest_version"] = latest
-            info["update_available"] = bool(
-                info.get("version") and latest != info["version"]
-            )
+            info["update_available"] = bool(info.get("version") and latest != info["version"])
 
     return info
 

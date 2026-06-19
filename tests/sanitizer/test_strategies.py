@@ -41,12 +41,14 @@ def _chat_response_with_text(text: str) -> dict:
 
 
 async def test_function_call_extracts_pairs() -> None:
-    raw = _chat_response_with_tool_call({
-        "pairs": [
-            {"original": "alice", "replacement": "[NAME_001]"},
-            {"original": "bob", "replacement": "[NAME_002]"},
-        ]
-    })
+    raw = _chat_response_with_tool_call(
+        {
+            "pairs": [
+                {"original": "alice", "replacement": "[NAME_001]"},
+                {"original": "bob", "replacement": "[NAME_002]"},
+            ]
+        }
+    )
     result = await FunctionCallStrategy().extract(raw)
     assert result.pairs == (("alice", "[NAME_001]"), ("bob", "[NAME_002]"))
 
@@ -95,12 +97,14 @@ async def test_function_call_missing_pairs_field_raises() -> None:
 
 
 async def test_function_call_drops_pair_with_empty_original() -> None:
-    raw = _chat_response_with_tool_call({
-        "pairs": [
-            {"original": "", "replacement": "[X]"},
-            {"original": "alice", "replacement": "[NAME_001]"},
-        ]
-    })
+    raw = _chat_response_with_tool_call(
+        {
+            "pairs": [
+                {"original": "", "replacement": "[X]"},
+                {"original": "alice", "replacement": "[NAME_001]"},
+            ]
+        }
+    )
     result = await FunctionCallStrategy().extract(raw)
     assert result.pairs == (("alice", "[NAME_001]"),)
 
@@ -109,18 +113,16 @@ async def test_function_call_drops_pair_with_empty_original() -> None:
 
 
 async def test_json_strategy_pure_json_message() -> None:
-    raw = _chat_response_with_text(
-        '{"pairs": [{"original": "alice", "replacement": "[N1]"}]}'
-    )
+    raw = _chat_response_with_text('{"pairs": [{"original": "alice", "replacement": "[N1]"}]}')
     result = await JsonStrategy().extract(raw)
     assert result.pairs == (("alice", "[N1]"),)
 
 
 async def test_json_strategy_extracts_embedded_json() -> None:
     raw = _chat_response_with_text(
-        'Here are the findings:\n```json\n'
+        "Here are the findings:\n```json\n"
         '{"pairs": [{"original": "alice", "replacement": "[N1]"}]}\n'
-        '```'
+        "```"
     )
     result = await JsonStrategy().extract(raw)
     assert result.pairs == (("alice", "[N1]"),)
@@ -133,15 +135,13 @@ async def test_json_strategy_no_json_raises() -> None:
 
 
 async def test_json_strategy_malformed_json_raises() -> None:
-    raw = _chat_response_with_text('Look: {pairs: not valid}')
+    raw = _chat_response_with_text("Look: {pairs: not valid}")
     with pytest.raises(StrategyError):
         await JsonStrategy().extract(raw)
 
 
 async def test_json_strategy_handles_nested_braces() -> None:
-    raw = _chat_response_with_text(
-        '{"pairs": [{"original": "a {b} c", "replacement": "[X]"}]}'
-    )
+    raw = _chat_response_with_text('{"pairs": [{"original": "a {b} c", "replacement": "[X]"}]}')
     result = await JsonStrategy().extract(raw)
     assert result.pairs == (("a {b} c", "[X]"),)
 
@@ -150,9 +150,7 @@ async def test_json_strategy_handles_nested_braces() -> None:
 
 
 async def test_regex_strategy_em_dash_lines() -> None:
-    raw = _chat_response_with_text(
-        "Findings:\n- alice → [NAME_001]\n- bob → [NAME_002]\n"
-    )
+    raw = _chat_response_with_text("Findings:\n- alice → [NAME_001]\n- bob → [NAME_002]\n")
     result = await RegexStrategy().extract(raw)
     assert result.pairs == (("alice", "[NAME_001]"), ("bob", "[NAME_002]"))
 
@@ -176,8 +174,6 @@ async def test_regex_strategy_no_pairs_raises() -> None:
 
 
 async def test_regex_strategy_skips_non_matching_lines() -> None:
-    raw = _chat_response_with_text(
-        "Header\n- alice → [N1]\nSome explanation\n- bob → [N2]\nFooter"
-    )
+    raw = _chat_response_with_text("Header\n- alice → [N1]\nSome explanation\n- bob → [N2]\nFooter")
     result = await RegexStrategy().extract(raw)
     assert result.pairs == (("alice", "[N1]"), ("bob", "[N2]"))

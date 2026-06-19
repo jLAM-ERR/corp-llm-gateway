@@ -22,6 +22,7 @@ Reads from env at module load:
                                   (default: "demo-team-token"; must match
                                   ``scripts/demo.sh presenter-env``)
 """
+
 from __future__ import annotations
 
 import logging
@@ -93,17 +94,13 @@ def _configure_demo_logging() -> None:
     if not any(h.get_name() == _DEMO_LOG_HANDLER_NAME for h in pkg_logger.handlers):
         handler = logging.StreamHandler(sys.stdout)
         handler.set_name(_DEMO_LOG_HANDLER_NAME)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
         pkg_logger.addHandler(handler)
     pkg_logger.propagate = False
 
 
 def _build_demo_guardrail() -> CorpLlmGuardrail:
-    corp_endpoint = os.environ.get(
-        "CORP_LLM_ENDPOINT", "https://corp-llm.example/v1"
-    )
+    corp_endpoint = os.environ.get("CORP_LLM_ENDPOINT", "https://corp-llm.example/v1")
     # CorpLlmClient hardcodes /v1/chat/completions onto its base_url.
     # litellm-config.yaml needs CORP_LLM_ENDPOINT to include /v1 (so
     # hosted_vllm hits .../v1/chat/completions correctly). We want the
@@ -136,9 +133,7 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
     http = httpx.AsyncClient(timeout=30.0, verify=ssl_verify)
     corp_auth_token = os.environ.get("CORP_LLM_AUTH_TOKEN", "")
     auth_provider = (
-        BearerAuthProvider(token=corp_auth_token)
-        if corp_auth_token
-        else NoopAuthProvider()
+        BearerAuthProvider(token=corp_auth_token) if corp_auth_token else NoopAuthProvider()
     )
     corp_llm = CorpLlmClient(
         base_url=corp_endpoint_root,

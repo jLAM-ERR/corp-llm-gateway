@@ -347,9 +347,7 @@ async def test_post_call_unary_reverses_placeholder() -> None:
     data = _data_with_token("tok-1", content="hi alice")
     await g.pre_call(data)
 
-    response = {
-        "choices": [{"message": {"role": "assistant", "content": "hello [N1]!"}}]
-    }
+    response = {"choices": [{"message": {"role": "assistant", "content": "hello [N1]!"}}]}
     out = await g.post_call_unary(data, response)
     assert out["choices"][0]["message"]["content"] == "hello alice!"
 
@@ -357,9 +355,7 @@ async def test_post_call_unary_reverses_placeholder() -> None:
 async def test_post_call_unary_no_state_returns_unchanged() -> None:
     g, _ = _build_guardrail()
     response = {"choices": [{"message": {"content": "no map"}}]}
-    out = await g.post_call_unary(
-        {"_corp_gateway_request_id": "missing"}, response
-    )
+    out = await g.post_call_unary({"_corp_gateway_request_id": "missing"}, response)
     assert out == response
 
 
@@ -562,9 +558,7 @@ async def test_audit_extracts_tokens_from_response_object_usage() -> None:
         usage = _Usage()
 
     start = time.time()
-    await g.audit(
-        data, _ModelResponse(), start_time=start, end_time=start + 0.1, status="ok"
-    )
+    await g.audit(data, _ModelResponse(), start_time=start, end_time=start + 0.1, status="ok")
     rec = sink.records[0]
     assert rec["prompt_token_count"] == 13
     assert rec["completion_token_count"] == 48

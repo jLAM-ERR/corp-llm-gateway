@@ -8,6 +8,7 @@ shape.
 Run via:
   docker compose run --rm e2e
 """
+
 from __future__ import annotations
 
 import os
@@ -109,9 +110,7 @@ async def test_failure_status_and_error_code_emitted(sink_and_client) -> None:
 @skip_if_no_langfuse
 async def test_token_usage_in_generation(sink_and_client) -> None:
     sink, control = sink_and_client
-    await sink.write_event(
-        _event(prompt_token_count=100, completion_token_count=200)
-    )
+    await sink.write_event(_event(prompt_token_count=100, completion_token_count=200))
     cap = (await control.get("/__captures")).json()["captures"][0]
     gen = next(e for e in cap["body"]["batch"] if e["type"] == "generation-create")["body"]
     assert gen["usage"] == {

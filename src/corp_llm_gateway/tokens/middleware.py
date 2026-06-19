@@ -100,6 +100,4 @@ class AuthMiddleware:
             raise RevokedTokenError("token has been revoked")
         if info.expires_at <= now:
             raise ExpiredTokenError("token has expired")
-        return AuthContext(
-            user_id=info.user_id, team_id=info.team_id, scopes=info.scopes
-        )
+        return AuthContext(user_id=info.user_id, team_id=info.team_id, scopes=info.scopes)

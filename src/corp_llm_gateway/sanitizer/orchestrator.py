@@ -5,6 +5,7 @@ Composes: corp-LLM client + three-tier strategies + MappingStore (cache A
 pre_call hook adapter wraps this for actual deployment; this module is
 framework-free and unit-testable.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -12,9 +13,9 @@ import logging
 from dataclasses import dataclass
 
 from corp_llm_gateway.corp_llm import (
-    CorpLlmClient,
     SANITIZE_TOOL_NAME,
     SANITIZE_TOOL_SCHEMA,
+    CorpLlmClient,
 )
 from corp_llm_gateway.payload import (
     DEFAULT_THRESHOLD_BYTES,
@@ -45,9 +46,7 @@ class SanitizeResult:
 
 
 def default_sanitizer() -> CorpLlmSanitizer:
-    return CorpLlmSanitizer(
-        strategies=[FunctionCallStrategy(), JsonStrategy(), RegexStrategy()]
-    )
+    return CorpLlmSanitizer(strategies=[FunctionCallStrategy(), JsonStrategy(), RegexStrategy()])
 
 
 class SanitizationOrchestrator:
@@ -85,12 +84,9 @@ class SanitizationOrchestrator:
             content_bytes,
         )
 
-        if should_skip_sanitization(
-            content_bytes, threshold_bytes=self._size_threshold
-        ):
+        if should_skip_sanitization(content_bytes, threshold_bytes=self._size_threshold):
             logger.info(
-                "sanitize_skipped_size team_id=%s conversation_id=%s "
-                "size=%d threshold=%d",
+                "sanitize_skipped_size team_id=%s conversation_id=%s size=%d threshold=%d",
                 team_id,
                 conversation_id,
                 content_bytes,
@@ -111,8 +107,7 @@ class SanitizationOrchestrator:
         cached = await self._mapping_store.get_dedup(content_hash)
         if cached is not None:
             logger.info(
-                "sanitize_cache_a_hit team_id=%s conversation_id=%s "
-                "content_hash=%s pairs=%d",
+                "sanitize_cache_a_hit team_id=%s conversation_id=%s content_hash=%s pairs=%d",
                 team_id,
                 conversation_id,
                 content_hash[:12],
@@ -153,12 +148,9 @@ class SanitizationOrchestrator:
             len(result.pairs),
         )
 
-        await self._mapping_store.set_dedup(
-            content_hash, result, ttl_seconds=self._cache_a_ttl
-        )
+        await self._mapping_store.set_dedup(content_hash, result, ttl_seconds=self._cache_a_ttl)
         logger.info(
-            "sanitize_cache_a_stored team_id=%s conversation_id=%s "
-            "content_hash=%s ttl=%d pairs=%d",
+            "sanitize_cache_a_stored team_id=%s conversation_id=%s content_hash=%s ttl=%d pairs=%d",
             team_id,
             conversation_id,
             content_hash[:12],

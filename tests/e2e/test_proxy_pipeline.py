@@ -4,6 +4,7 @@ Skipped unless RUN_PROXY_E2E is set (it's the heaviest test — spins up
 a real upstream HTTP server, a real proxy, and exercises both with
 urllib). Runs cleanly in docker compose where the env is hygienic.
 """
+
 from __future__ import annotations
 
 import json
@@ -81,7 +82,9 @@ def proxy(upstream: tuple[str, list], tmp_path: Path) -> Iterator[str]:
 def _post(url: str, body: dict, headers: dict[str, str] | None = None) -> dict:
     data = json.dumps(body).encode()
     req = urllib.request.Request(
-        url, data=data, method="POST",
+        url,
+        data=data,
+        method="POST",
         headers={"Content-Type": "application/json", **(headers or {})},
     )
     with urllib.request.urlopen(req, timeout=5) as resp:

@@ -38,6 +38,4 @@ def assert_no_never_fields(record: Mapping[str, Any]) -> None:
     for key in record:
         normalized = key.lower().replace("-", "_")
         if normalized in NEVER_FIELDS:
-            raise NeverFieldPresentError(
-                f"NEVER field {key!r} present in audit record"
-            )
+            raise NeverFieldPresentError(f"NEVER field {key!r} present in audit record")

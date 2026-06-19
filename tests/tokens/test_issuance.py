@@ -3,8 +3,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from corp_llm_gateway.tokens import (
-    AuthMiddleware,
     DEFAULT_TOKEN_TTL_DAYS,
+    AuthMiddleware,
     InMemoryTokenStore,
     OidcClaims,
     OidcVerificationError,
@@ -17,6 +17,7 @@ def _verifier(claims: OidcClaims):
         if oidc_token == "invalid":
             raise OidcVerificationError("bad signature")
         return claims
+
     return verify
 
 
@@ -28,9 +29,7 @@ async def test_default_ttl_is_30_days() -> None:
 @pytest.mark.asyncio
 async def test_issues_token_with_default_ttl() -> None:
     store = InMemoryTokenStore()
-    issuer = TokenIssuer(
-        store, _verifier(OidcClaims(user_id="alice", team_id="t1"))
-    )
+    issuer = TokenIssuer(store, _verifier(OidcClaims(user_id="alice", team_id="t1")))
     before = datetime.now(UTC)
     result = await issuer.issue("oidc-tok")
     assert result.corp_token.startswith("ct_")
@@ -55,9 +54,7 @@ async def test_issued_token_lookups_in_store() -> None:
 @pytest.mark.asyncio
 async def test_issued_token_authenticates_via_middleware() -> None:
     store = InMemoryTokenStore()
-    issuer = TokenIssuer(
-        store, _verifier(OidcClaims(user_id="alice", team_id="t1"))
-    )
+    issuer = TokenIssuer(store, _verifier(OidcClaims(user_id="alice", team_id="t1")))
     result = await issuer.issue("oidc-tok")
     mw = AuthMiddleware(store)
     ctx = await mw.authenticate(result.corp_token)
@@ -66,18 +63,14 @@ async def test_issued_token_authenticates_via_middleware() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_oidc_token_rejected() -> None:
-    issuer = TokenIssuer(
-        InMemoryTokenStore(), _verifier(OidcClaims(user_id="x", team_id="x"))
-    )
+    issuer = TokenIssuer(InMemoryTokenStore(), _verifier(OidcClaims(user_id="x", team_id="x")))
     with pytest.raises(OidcVerificationError):
         await issuer.issue("")
 
 
 @pytest.mark.asyncio
 async def test_invalid_oidc_token_rejected() -> None:
-    issuer = TokenIssuer(
-        InMemoryTokenStore(), _verifier(OidcClaims(user_id="x", team_id="x"))
-    )
+    issuer = TokenIssuer(InMemoryTokenStore(), _verifier(OidcClaims(user_id="x", team_id="x")))
     with pytest.raises(OidcVerificationError):
         await issuer.issue("invalid")
 
@@ -96,9 +89,7 @@ async def test_custom_ttl_respected() -> None:
 
 @pytest.mark.asyncio
 async def test_each_issue_returns_unique_token() -> None:
-    issuer = TokenIssuer(
-        InMemoryTokenStore(), _verifier(OidcClaims(user_id="alice", team_id="t1"))
-    )
+    issuer = TokenIssuer(InMemoryTokenStore(), _verifier(OidcClaims(user_id="alice", team_id="t1")))
     r1 = await issuer.issue("oidc-tok")
     r2 = await issuer.issue("oidc-tok")
     assert r1.corp_token != r2.corp_token

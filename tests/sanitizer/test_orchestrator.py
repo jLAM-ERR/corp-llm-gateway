@@ -2,11 +2,9 @@ import json
 from typing import Any
 
 import httpx
-import pytest
 
-from corp_llm_gateway.corp_llm import CorpLlmClient, SANITIZE_TOOL_NAME
+from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.rules import (
-    FileRulesLoader,
     Rule,
     Rules,
     RulesLoader,
@@ -42,12 +40,14 @@ def _client_returning_pairs(pairs: list[tuple[str, str]]) -> tuple[CorpLlmClient
                                     "type": "function",
                                     "function": {
                                         "name": SANITIZE_TOOL_NAME,
-                                        "arguments": json.dumps({
-                                            "pairs": [
-                                                {"original": o, "replacement": r}
-                                                for o, r in pairs
-                                            ]
-                                        }),
+                                        "arguments": json.dumps(
+                                            {
+                                                "pairs": [
+                                                    {"original": o, "replacement": r}
+                                                    for o, r in pairs
+                                                ]
+                                            }
+                                        ),
                                     },
                                 }
                             ]
@@ -130,9 +130,7 @@ async def test_cache_a_invalidated_when_rules_change() -> None:
 async def test_cache_b_records_conversation_mappings() -> None:
     client, _ = _client_returning_pairs([("alice", "[N1]")])
     store = InMemoryMappingStore()
-    orch = SanitizationOrchestrator(
-        client, store, _StaticRulesLoader(Rules(rules=()))
-    )
+    orch = SanitizationOrchestrator(client, store, _StaticRulesLoader(Rules(rules=())))
     await orch.sanitize("hello alice", team_id="t1", conversation_id="c1")
     assert await store.get_placeholder("c1", "alice") == "[N1]"
     assert await store.get_original("c1", "[N1]") == "alice"
@@ -175,15 +173,11 @@ async def test_oversize_input_skips_sanitization() -> None:
 
 async def test_long_pattern_replaces_before_short_one() -> None:
     """Without descending-length sort, `alice` would shadow `alice cooper`."""
-    client, _ = _client_returning_pairs(
-        [("alice", "[NAME]"), ("alice cooper", "[NAME_LONG]")]
-    )
+    client, _ = _client_returning_pairs([("alice", "[NAME]"), ("alice cooper", "[NAME_LONG]")])
     orch = SanitizationOrchestrator(
         client, InMemoryMappingStore(), _StaticRulesLoader(Rules(rules=()))
     )
-    result = await orch.sanitize(
-        "alice cooper sang", team_id="t1", conversation_id="c1"
-    )
+    result = await orch.sanitize("alice cooper sang", team_id="t1", conversation_id="c1")
     assert "[NAME_LONG]" in result.sanitized_text
 
 

@@ -70,7 +70,7 @@ class CorpLlmSanitizer:
         mapping: StrategyResult,
     ) -> str:
         """Substitute placeholders into text in length-descending order (M1-9)."""
-        by_original = {original: placeholder for original, placeholder in mapping.pairs}
+        by_original = dict(mapping.pairs)
         for original in sort_placeholders_by_descending_length(by_original):
             text = text.replace(original, by_original[original])
         return text

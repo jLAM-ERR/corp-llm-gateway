@@ -10,8 +10,10 @@ Or locally with running Redis + corp-llm-mock:
   CORP_LLM_ENDPOINT=http://localhost:8000 \
   PYTHONPATH=src .venv/bin/pytest tests/e2e -q
 """
+
 from __future__ import annotations
 
+import contextlib
 import os
 
 import pytest
@@ -21,7 +23,6 @@ from corp_llm_gateway.corp_llm import CorpLlmClient
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.storage import RedisMappingStore
-
 
 REDIS_URL = os.environ.get("REDIS_URL")
 CORP_LLM_ENDPOINT = os.environ.get("CORP_LLM_ENDPOINT")
@@ -41,10 +42,8 @@ class _StaticRules(RulesLoader):
 async def orch():
     assert REDIS_URL and CORP_LLM_ENDPOINT
     r = redis_asyncio.from_url(REDIS_URL, decode_responses=True)
-    try:
+    with contextlib.suppress(Exception):
         await r.flushdb()
-    except Exception:
-        pass
 
     client = CorpLlmClient(CORP_LLM_ENDPOINT, model="mock")
     store = RedisMappingStore(r)

@@ -80,9 +80,7 @@ async def test_list_all_returns_all() -> None:
 @pytest.mark.asyncio
 async def test_per_team_retention_overrides_persist() -> None:
     store = InMemoryTeamConfigStore()
-    await store.upsert(
-        _team("t1", retention_hot_days=30, retention_cold_years=1)
-    )
+    await store.upsert(_team("t1", retention_hot_days=30, retention_cold_years=1))
     cfg = await store.get("t1")
     assert cfg.retention_hot_days == 30
     assert cfg.retention_cold_years == 1

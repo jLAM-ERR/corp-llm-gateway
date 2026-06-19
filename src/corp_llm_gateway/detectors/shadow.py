@@ -22,9 +22,7 @@ class ShadowDetector(PIIDetector):
         try:
             shadow_findings = await self._shadow.detect(text)
         except Exception as exc:
-            logger.warning(
-                "shadow_detector_failed exception=%s", type(exc).__name__
-            )
+            logger.warning("shadow_detector_failed exception=%s", type(exc).__name__)
             return canonical_findings
 
         if not _equivalent(canonical_findings, shadow_findings):
@@ -40,6 +38,4 @@ class ShadowDetector(PIIDetector):
 
 
 def _equivalent(a: list[Finding], b: list[Finding]) -> bool:
-    return {(f.label, f.start, f.end) for f in a} == {
-        (f.label, f.start, f.end) for f in b
-    }
+    return {(f.label, f.start, f.end) for f in a} == {(f.label, f.start, f.end) for f in b}

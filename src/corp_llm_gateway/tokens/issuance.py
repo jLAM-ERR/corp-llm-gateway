@@ -13,6 +13,7 @@ OIDC validation is delegated to a `OidcVerifier` callable that the host
 wires up — this keeps the issuance code free of any specific OIDC SDK
 choice.
 """
+
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field

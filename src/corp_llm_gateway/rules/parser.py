@@ -24,17 +24,13 @@ def parse(text: str) -> Rules:
         if stripped.startswith("#") or stripped.startswith("<!--"):
             continue
         if "->" in stripped and "→" not in stripped:
-            raise RulesParseError(
-                f"line {line_no}: use em-dash separator → (U+2192), not ascii ->"
-            )
+            raise RulesParseError(f"line {line_no}: use em-dash separator → (U+2192), not ascii ->")
         m = _RULE_RE.match(line)
         if not m:
             raise RulesParseError(f"line {line_no}: not a valid rule: {line!r}")
         original = (m.group("orig_q") or m.group("orig") or "").strip()
         replacement = (m.group("rep_q") or m.group("rep") or "").strip()
         if not original or not replacement:
-            raise RulesParseError(
-                f"line {line_no}: empty original or replacement"
-            )
+            raise RulesParseError(f"line {line_no}: empty original or replacement")
         rules.append(Rule(pattern=original, replacement=replacement))
     return Rules(rules=tuple(rules))
