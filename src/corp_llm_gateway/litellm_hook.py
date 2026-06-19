@@ -22,6 +22,7 @@ The class is duck-typed; LiteLLM doesn't require strict subclassing.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import time
 import uuid
@@ -38,6 +39,10 @@ from corp_llm_gateway.sanitizer import (
     SseStreamDesanitizer,
     StrategyResult,
     StreamingDesanitizer,
+)
+from corp_llm_gateway.sanitizer.content_blocks import (
+    desanitize_content,
+    sanitize_content,
 )
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.tokens import (
@@ -280,11 +285,18 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         )
         self._req_state[request_id] = state
 
+        async def sanitize_one(text: str) -> SanitizeResult:
+            return await self._orch.sanitize(
+                text,
+                team_id=ctx.team_id,
+                conversation_id=request_id,
+            )
+
         for i, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 continue
             content = msg.get("content")
-            if not isinstance(content, str) or not content:
+            if content is None or (isinstance(content, str) and not content):
                 logger.info(
                     "litellm_pre_call_message_skipped request_id=%s "
                     "message_index=%d reason=empty_or_non_string",
@@ -292,20 +304,23 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     i,
                 )
                 continue
+
+            # Compute content byte size for logging (never logs content bodies).
+            if isinstance(content, str):
+                content_bytes = len(content.encode("utf-8"))
+            else:
+                content_bytes = len(json.dumps(content).encode("utf-8"))
+
             logger.info(
                 "litellm_pre_call_message_sanitize_start request_id=%s "
                 "message_index=%d role=%s content_bytes=%d",
                 request_id,
                 i,
                 str(msg.get("role") or "unknown"),
-                len(content.encode("utf-8")),
+                content_bytes,
             )
             try:
-                result = await self._orch.sanitize(
-                    content,
-                    team_id=ctx.team_id,
-                    conversation_id=request_id,
-                )
+                new_content, results = await sanitize_content(content, sanitize_one)
             except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
                 # Fail-policy matrix (plan M4 / docs/ops/runbook.md): a
                 # corp-LLM sanitization failure is fail-CLOSED. We must
@@ -330,16 +345,62 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "E_CORP_LLM_DOWN",
                     "corp sanitization LLM unavailable",
                 ) from exc
-            messages[i] = {**msg, "content": result.sanitized_text}
-            self._merge_into_state(state, result)
+
+            messages[i] = {**msg, "content": new_content}
+            # Merge every segment result; emit one done-log per MESSAGE (D).
+            msg_redaction_count = 0
+            for result in results:
+                self._merge_into_state(state, result)
+                msg_redaction_count += len(result.pairs)
             logger.info(
                 "litellm_pre_call_message_sanitize_done request_id=%s "
-                "message_index=%d redaction_count=%d cache_a_hit=%s skipped=%s",
+                "message_index=%d redaction_count=%d",
                 request_id,
                 i,
-                len(result.pairs),
-                result.cache_a_hit,
-                result.skipped,
+                msg_redaction_count,
+            )
+
+        # Sanitize system field if present and non-empty (E: truthy guard skips ""/[]).
+        system = data.get("system")
+        if system:
+            if isinstance(system, str):
+                system_bytes = len(system.encode("utf-8"))
+            else:
+                system_bytes = len(json.dumps(system).encode("utf-8"))
+            logger.info(
+                "litellm_pre_call_system_sanitize_start request_id=%s content_bytes=%d",
+                request_id,
+                system_bytes,
+            )
+            try:
+                new_system, results = await sanitize_content(system, sanitize_one)
+            except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
+                logger.warning(
+                    "litellm_pre_call_corp_llm_failed request_id=%s "
+                    "field=system error_code=E_CORP_LLM_DOWN exception=%s",
+                    request_id,
+                    type(exc).__name__,
+                )
+                self._record_failure(request_id, error_code="E_CORP_LLM_DOWN")
+                raise GuardrailHttpException(
+                    503,
+                    "E_CORP_LLM_DOWN",
+                    "corp sanitization LLM unavailable",
+                ) from exc
+            data["system"] = new_system
+            for result in results:
+                self._merge_into_state(state, result)
+                if result.skipped:
+                    logger.warning(
+                        "litellm_pre_call_system_sanitize_skipped_size request_id=%s "
+                        "content_bytes=%d",
+                        request_id,
+                        system_bytes,
+                    )
+            logger.info(
+                "litellm_pre_call_system_sanitize_done request_id=%s total_redaction_count=%d",
+                request_id,
+                state.redaction_count,
             )
 
         logger.info(
@@ -772,6 +833,9 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
         choices = out.get("choices")
         if isinstance(choices, list):
             out["choices"] = [_reverse_choice(c, _reverse) for c in choices]
+        # Handle Anthropic-native top-level content str or list (no choices).
+        elif "content" in out and isinstance(out["content"], (str, list)):
+            out["content"] = desanitize_content(out["content"], _reverse)
         return out
     return response
 
@@ -783,8 +847,11 @@ def _reverse_choice(choice: Any, reverse_fn: Any) -> Any:
     msg = out.get("message")
     if isinstance(msg, dict):
         new_msg = {**msg}
-        if isinstance(new_msg.get("content"), str):
-            new_msg["content"] = reverse_fn(new_msg["content"])
+        content = new_msg.get("content")
+        if isinstance(content, str):
+            new_msg["content"] = reverse_fn(content)
+        elif isinstance(content, list):
+            new_msg["content"] = desanitize_content(content, reverse_fn)
         out["message"] = new_msg
     return out
 

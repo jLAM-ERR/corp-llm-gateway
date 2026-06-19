@@ -60,7 +60,7 @@ Two caches:
 ## Running tests
 
 ```
-# Full unit suite (last known: 381 passed + 14 skipped, ~13s). Always run before committing.
+# Full unit suite (last known: 427 passed + 14 skipped, ~13s). Always run before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
 
 # Single test / file / node

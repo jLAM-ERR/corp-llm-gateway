@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -114,12 +115,21 @@ def _build_guardrail(
     return CorpLlmGuardrail(orch, auth, audit_logger), sink
 
 
-def _data_with_token(token: str, *, content: str = "hello", model: str = "claude") -> dict:
-    return {
+def _data_with_token(
+    token: str,
+    *,
+    content: str | list[Any] = "hello",
+    model: str = "claude",
+    system: str | list[Any] | None = None,
+) -> dict:
+    data = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
         "headers": {"X-Corp-Auth": token, "Authorization": "Bearer byok"},
     }
+    if system is not None:
+        data["system"] = system
+    return data
 
 
 # ---- Pre-call ------------------------------------------------------------
@@ -359,6 +369,176 @@ async def test_post_call_unary_no_state_returns_unchanged() -> None:
     assert out == response
 
 
+# ---- New task tests (tasks 2 & 4) -------------------------------------------
+
+
+async def test_pre_call_block_list_message_content_sanitized() -> None:
+    """Task 2: messages with list-of-blocks content are sanitized (Anthropic shape)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    content = [
+        {"type": "text", "text": "hello alice"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    # Text block is sanitized, image block is untouched.
+    assert len(out["messages"][0]["content"]) == 2
+    assert out["messages"][0]["content"][0]["type"] == "text"
+    assert out["messages"][0]["content"][0]["text"] == "hello [N1]"
+    assert out["messages"][0]["content"][1] == content[1]
+
+
+async def test_pre_call_tool_result_block_sanitized() -> None:
+    """Task 2: tool_result blocks with str content are sanitized."""
+    g, _ = _build_guardrail([("secret", "[SECRET_001]")])
+    content = [
+        {
+            "type": "tool_result",
+            "content": "the secret is revealed",
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    assert out["messages"][0]["content"][0]["type"] == "tool_result"
+    assert out["messages"][0]["content"][0]["content"] == "the [SECRET_001] is revealed"
+
+
+async def test_pre_call_system_str_sanitized() -> None:
+    """Task 3: system field as str is sanitized."""
+    g, _ = _build_guardrail([("SecretEnv", "[ENV_001]")])
+    data = _data_with_token("tok-1", content="hello", system="SecretEnv=/prod")
+    out = await g.pre_call(data)
+
+    assert out["system"] == "[ENV_001]=/prod"
+
+
+async def test_pre_call_system_list_sanitized() -> None:
+    """Task 3: system field as list of blocks is sanitized."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    system = [{"type": "text", "text": "Context: alice"}]
+    data = _data_with_token("tok-1", content="hello", system=system)
+    out = await g.pre_call(data)
+
+    assert isinstance(out["system"], list)
+    assert out["system"][0]["text"] == "Context: [N1]"
+
+
+async def test_pre_call_no_system_no_op() -> None:
+    """Task 3: messages without system field are unaffected."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hello alice")
+    out = await g.pre_call(data)
+
+    assert "system" not in out
+    assert out["messages"][0]["content"] == "hello [N1]"
+
+
+async def test_pre_call_str_message_regression() -> None:
+    """Task 2: plain-string message content still works (OpenAI-compatible regression)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    out = await g.pre_call(data)
+
+    assert out["messages"][0]["content"] == "hi [N1]"
+
+
+async def test_post_call_unary_anthropic_native_block_response() -> None:
+    """Task 4: Anthropic-native response with top-level content list is desanitized."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    # Anthropic native response shape: {"type":"message","content":[...]}
+    response = {
+        "type": "message",
+        "content": [
+            {"type": "text", "text": "hello [N1]!"},
+            {"type": "image_url", "image_url": {"url": "https://..."}},
+        ],
+    }
+    out = await g.post_call_unary(data, response)
+
+    assert out["content"][0]["type"] == "text"
+    assert out["content"][0]["text"] == "hello alice!"
+    assert out["content"][1] == response["content"][1]
+
+
+async def test_post_call_unary_choices_list_content() -> None:
+    """Task 4: choices with list-of-blocks message.content are desanitized."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    # OpenAI-compatible choices format with list content (gpt-4o multimodal).
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "response [N1] text"},
+                        {"type": "image_url", "image_url": {"url": "https://..."}},
+                    ]
+                }
+            }
+        ]
+    }
+    out = await g.post_call_unary(data, response)
+
+    assert out["choices"][0]["message"]["content"][0]["type"] == "text"
+    assert out["choices"][0]["message"]["content"][0]["text"] == "response alice text"
+    original_image = response["choices"][0]["message"]["content"][1]
+    assert out["choices"][0]["message"]["content"][1] == original_image
+
+
+async def test_post_call_unary_choices_str_content_regression() -> None:
+    """Task 4: choices with str message.content still work (OpenAI str regression)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = {"choices": [{"message": {"content": "hello [N1]!"}}]}
+    out = await g.post_call_unary(data, response)
+
+    assert out["choices"][0]["message"]["content"] == "hello alice!"
+
+
+async def test_post_call_unary_gpt4o_multimodal_content_parts() -> None:
+    """Task 4: OpenAI gpt-4o multimodal content-parts are handled (image untouched)."""
+    g, _ = _build_guardrail([("user@example.com", "[EMAIL_001]")])
+    data = _data_with_token("tok-1", content="contact user@example.com", model="gpt-4o")
+    await g.pre_call(data)
+
+    # gpt-4o-style response with mixed content types.
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Email is [EMAIL_001]"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.com/image.png",
+                                "detail": "high",
+                            },
+                        },
+                    ]
+                }
+            }
+        ]
+    }
+    out = await g.post_call_unary(data, response)
+
+    # Text part reversed, image part untouched.
+    assert out["choices"][0]["message"]["content"][0]["text"] == "Email is user@example.com"
+    assert (
+        out["choices"][0]["message"]["content"][1]
+        == response["choices"][0]["message"]["content"][1]
+    )
+
+
 # ---- Audit -----------------------------------------------------------------
 
 
@@ -575,3 +755,438 @@ async def test_audit_extracts_tokens_anthropic_usage_shape() -> None:
     rec = sink.records[0]
     assert rec["prompt_token_count"] == 20
     assert rec["completion_token_count"] == 7
+
+
+# ---- Adversarial / hardening tests ------------------------------------------
+
+
+async def test_pre_call_no_leak_original_in_logs(caplog: pytest.LogCaptureFixture) -> None:
+    """M1-14: original PII must never leak into logs.
+
+    Feed a known secret through the sanitization pipeline and assert
+    that the secret string never appears in any log record emitted,
+    only redaction counts and byte sizes.
+    """
+    secret = "alice.smith@corp.internal"
+    g, _ = _build_guardrail([(secret, "[EMAIL_001]")])
+    data = _data_with_token("tok-1", content=f"Contact: {secret}")
+
+    with caplog.at_level(logging.INFO):
+        await g.pre_call(data)
+
+    # Assert the original secret does NOT appear anywhere in captured logs.
+    for record in caplog.records:
+        msg_text = record.getMessage()
+        assert secret not in msg_text, f"LEAK DETECTED: secret '{secret}' found in log: {msg_text}"
+    # Verify logs DO contain redaction metadata (byte size, count).
+    log_text = caplog.text
+    assert "litellm_pre_call_message_sanitize_start" in log_text
+    assert "content_bytes=" in log_text
+    assert "[EMAIL_001]" not in log_text
+
+
+async def test_pre_call_no_leak_original_in_system_logs(caplog: pytest.LogCaptureFixture) -> None:
+    """M1-14: system field sanitization logs never leak the original."""
+    secret_env = "DB_PASSWORD=hunter2secret"
+    g, _ = _build_guardrail([(secret_env, "[SECRET_001]")])
+    data = _data_with_token("tok-1", content="hello", system=secret_env)
+
+    with caplog.at_level(logging.INFO):
+        await g.pre_call(data)
+
+    for record in caplog.records:
+        msg = record.getMessage()
+        assert secret_env not in msg, f"LEAK in system logs: {msg}"
+        assert "hunter2secret" not in msg
+
+
+async def test_pre_call_empty_list_content_no_crash() -> None:
+    """Edge: empty list content (no blocks) should not crash and return empty list."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    content: list[Any] = []
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    assert out["messages"][0]["content"] == []
+
+
+async def test_pre_call_content_with_only_non_text_blocks() -> None:
+    """Edge: list with only non-text blocks (image, tool_use) should not call corp-LLM."""
+    # Build a guardrail that would raise if corp-LLM is called.
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
+    content = [
+        {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+        {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {}},
+    ]
+    data = _data_with_token("tok-1", content=content)
+
+    # This should NOT fail because no corp-LLM call is made for non-text blocks.
+    out = await g.pre_call(data)
+    assert len(out["messages"][0]["content"]) == 2
+    assert out["messages"][0]["content"][0]["type"] == "image_url"
+    assert out["messages"][0]["content"][1]["type"] == "tool_use"
+
+
+async def test_pre_call_missing_content_field_no_crash() -> None:
+    """Edge: message without content field should not crash."""
+    g, _ = _build_guardrail()
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user"}],  # No content field
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data)
+
+    # Should pass through unchanged.
+    assert out["messages"][0] == {"role": "user"}
+
+
+async def test_pre_call_system_empty_str() -> None:
+    """Edge: empty system string is skipped (truthy guard) and passed through unchanged."""
+    g, _ = _build_guardrail()
+    data = _data_with_token("tok-1", content="hello", system="")
+    out = await g.pre_call(data)
+
+    # Empty string is falsy → skipped entirely; value is preserved as-is in data.
+    assert out.get("system") == ""
+
+
+async def test_pre_call_system_empty_list() -> None:
+    """Edge: empty system list is skipped (truthy guard) and passed through unchanged."""
+    g, _ = _build_guardrail()
+    data = _data_with_token("tok-1", content="hello", system=[])
+    out = await g.pre_call(data)
+
+    # Empty list is falsy → skipped entirely; value is preserved as-is in data.
+    assert out.get("system") == []
+
+
+async def test_pre_call_corp_llm_down_on_system_fails_closed_503(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fail-closed (M4): corp-LLM error on system field also raises 503 E_CORP_LLM_DOWN."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
+    data = _data_with_token("tok-1", content="hello", system="SecretEnv=/prod")
+
+    with caplog.at_level(logging.WARNING), pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+
+    assert ei.value.status_code == 503
+    assert ei.value.error_code == "E_CORP_LLM_DOWN"
+    # Verify the failure was logged.
+    assert "litellm_pre_call_corp_llm_failed" in caplog.text
+
+
+async def test_pre_call_multiple_text_blocks_in_content_all_sanitized() -> None:
+    """Multiple text blocks in same message are all sanitized."""
+    g, _ = _build_guardrail([("alice", "[N1]"), ("bob", "[N2]")])
+    content = [
+        {"type": "text", "text": "hello alice"},
+        {"type": "image_url", "image_url": {"url": "https://..."}},
+        {"type": "text", "text": "goodbye bob"},
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    assert out["messages"][0]["content"][0]["text"] == "hello [N1]"
+    assert out["messages"][0]["content"][1]["type"] == "image_url"
+    assert out["messages"][0]["content"][2]["text"] == "goodbye [N2]"
+
+
+async def test_pre_call_deeply_nested_tool_result_blocks_sanitized() -> None:
+    """tool_result with nested list content: all text blocks are sanitized recursively."""
+    g, _ = _build_guardrail([("secret", "[SECRET_001]")])
+    content = [
+        {
+            "type": "tool_result",
+            "content": [
+                {"type": "text", "text": "part one: secret"},
+                {
+                    "type": "tool_result",
+                    "content": {"type": "text", "text": "nested: secret"},
+                },
+            ],
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    # Top-level tool_result content list
+    tool_result = out["messages"][0]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert isinstance(tool_result["content"], list)
+    # First text block in the list is sanitized
+    assert tool_result["content"][0]["text"] == "part one: [SECRET_001]"
+    # Nested tool_result (inside the list) — its content is a bare dict text block.
+    # Fix A: bare dict is now routed through _sanitize_block, so it IS redacted.
+    nested_tool_result = tool_result["content"][1]
+    assert nested_tool_result["type"] == "tool_result"
+    assert nested_tool_result["content"]["type"] == "text"
+    nested_text = nested_tool_result["content"]["text"]
+    assert "[SECRET_001]" in nested_text
+    assert "secret" not in nested_text
+
+
+async def test_post_call_unary_both_choices_and_content_ignores_content() -> None:
+    """If response has BOTH choices AND top-level content, only choices path runs."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    # Malformed response with both choices and content.
+    response = {
+        "choices": [{"message": {"content": [{"type": "text", "text": "from choices [N1]"}]}}],
+        "content": [{"type": "text", "text": "from top-level [N1]"}],
+    }
+    out = await g.post_call_unary(data, response)
+
+    # Only choices path is executed (per the if/elif in code).
+    assert out["choices"][0]["message"]["content"][0]["text"] == "from choices alice"
+    # Top-level content is untouched (may or may not be present in response).
+
+
+async def test_post_call_unary_non_text_blocks_byte_identical() -> None:
+    """Non-text blocks in post_call response are byte-identical to input."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    image_block = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/image.png", "detail": "high"},
+    }
+    tool_use_block = {
+        "type": "tool_use",
+        "id": "t1",
+        "name": "get_weather",
+        "input": {"location": "NYC"},
+    }
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "hello [N1]"},
+                        image_block,
+                        tool_use_block,
+                    ]
+                }
+            }
+        ]
+    }
+    out = await g.post_call_unary(data, response)
+
+    # Non-text blocks must be dict-equal (byte-identical).
+    assert out["choices"][0]["message"]["content"][1] == image_block
+    assert out["choices"][0]["message"]["content"][2] == tool_use_block
+
+
+async def test_post_call_unary_placeholder_in_one_block_not_another() -> None:
+    """Placeholder that appears in one text block is only reversed in that block."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "first block: [N1]"},
+                        {"type": "text", "text": "second block: no placeholder"},
+                    ]
+                }
+            }
+        ]
+    }
+    out = await g.post_call_unary(data, response)
+
+    assert out["choices"][0]["message"]["content"][0]["text"] == "first block: alice"
+    assert out["choices"][0]["message"]["content"][1]["text"] == "second block: no placeholder"
+
+
+async def test_round_trip_list_content_preserves_structure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sanitize list-content message (pre_call), then desanitize response (post_call).
+
+    Original structure must be preserved and content restored exactly.
+    """
+    g, _ = _build_guardrail([("alice", "[N1]"), ("bob", "[N2]")])
+    content = [
+        {"type": "text", "text": "hello alice"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+        {"type": "text", "text": "goodbye bob"},
+    ]
+    data = _data_with_token("tok-1", content=content)
+
+    with caplog.at_level(logging.INFO):
+        await g.pre_call(data)
+
+    # Simulate response from upstream.
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "hi [N1]"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+                        {"type": "text", "text": "bye [N2]"},
+                    ]
+                }
+            }
+        ]
+    }
+
+    out = await g.post_call_unary(data, response)
+
+    # Verify round-trip: structure preserved, originals restored.
+    out_content = out["choices"][0]["message"]["content"]
+    assert len(out_content) == 3
+    assert out_content[0]["type"] == "text"
+    assert out_content[0]["text"] == "hi alice"
+    assert out_content[1]["type"] == "image_url"
+    assert out_content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/img.png"},
+    }
+    assert out_content[2]["type"] == "text"
+    assert out_content[2]["text"] == "bye bob"
+
+
+async def test_length_descending_placeholder_substitution_prevents_shadowing() -> None:
+    """M1-9: longer placeholders must be reversed before shorter ones.
+
+    If we have [EMAIL_1] and [EMAIL_12], reversing [EMAIL_1] first would
+    shadow [EMAIL_12] and produce [EMAIL_12] → incorrect.
+    Sort longest first to avoid this.
+    """
+    g, _ = _build_guardrail(
+        [
+            ("alice@corp.com", "[EMAIL_1]"),
+            ("alice.smith@corp.com", "[EMAIL_12]"),
+        ]
+    )
+    data = _data_with_token("tok-1", content="emails alice@corp.com and alice.smith@corp.com")
+    await g.pre_call(data)
+
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": "[EMAIL_12] and [EMAIL_1]",
+                }
+            }
+        ]
+    }
+    out = await g.post_call_unary(data, response)
+
+    # Verify BOTH are reversed correctly (not one shadows the other).
+    result_text = out["choices"][0]["message"]["content"]
+    assert "alice.smith@corp.com" in result_text
+    assert "alice@corp.com" in result_text
+
+
+async def test_pre_call_non_dict_message_items_skipped() -> None:
+    """Non-dict items in messages list should be skipped gracefully."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = {
+        "model": "claude",
+        "messages": [
+            {"role": "user", "content": "hi alice"},
+            "not a dict",  # Invalid, should be skipped.
+            123,
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data)
+
+    # First message sanitized, others untouched.
+    assert out["messages"][0]["content"] == "hi [N1]"
+    assert out["messages"][1] == "not a dict"
+    assert out["messages"][2] == 123
+
+
+async def test_post_call_unary_anthropic_native_with_multiple_content_types() -> None:
+    """Anthropic native response: top-level content list with mixed types."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = {
+        "type": "message",
+        "content": [
+            {"type": "text", "text": "hello [N1]"},
+            {"type": "image_url", "image_url": {"url": "https://..."}},
+            {"type": "text", "text": "footer [N1]"},
+        ],
+    }
+    out = await g.post_call_unary(data, response)
+
+    assert out["content"][0]["text"] == "hello alice"
+    assert out["content"][1] == response["content"][1]
+    assert out["content"][2]["text"] == "footer alice"
+
+
+async def test_pre_call_tool_result_bare_dict_content_sanitized() -> None:
+    """Fix A: tool_result whose content is a bare dict text block is redacted.
+
+    The bare-dict path previously fell through to the 'pass through unchanged'
+    branch, leaking the original text. The _sanitize_block helper now handles
+    it identically to a list-item dict.
+    """
+    g, _ = _build_guardrail([("secret", "[SECRET_001]")])
+    content = [
+        {
+            "type": "tool_result",
+            # content is a bare dict, not a list — the pre-fix blind spot.
+            "content": {"type": "text", "text": "the secret value"},
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    nested = out["messages"][0]["content"][0]["content"]
+    assert nested["type"] == "text"
+    assert "[SECRET_001]" in nested["text"]
+    assert "secret" not in nested["text"]
+
+
+async def test_post_call_unary_anthropic_native_top_level_content_str_reversed() -> None:
+    """Fix B: Anthropic-native response with top-level content as a STR is reversed.
+
+    Before fix B, the elif branch only matched list; a str top-level content
+    with a placeholder would egress un-reversed.
+    """
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    # Anthropic-native shape with str content (edge case but valid).
+    response = {"type": "message", "content": "Hello [N1], your request was processed."}
+    out = await g.post_call_unary(data, response)
+
+    assert out["content"] == "Hello alice, your request was processed."
+    assert "[N1]" not in out["content"]
+
+
+async def test_pre_call_logs_sanitize_done_per_block(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each text block sanitized logs a sanitize_done entry with redaction count."""
+    g, _ = _build_guardrail([("alice", "[N1]"), ("bob", "[N2]")])
+    content = [
+        {"type": "text", "text": "hi alice"},
+        {"type": "text", "text": "bye bob"},
+    ]
+    data = _data_with_token("tok-1", content=content)
+
+    with caplog.at_level(logging.INFO):
+        await g.pre_call(data)
+
+    # Verify the request completes and sanitization logs are emitted.
+    assert data["messages"][0]["content"][0]["text"] == "hi [N1]"
+    assert data["messages"][0]["content"][1]["text"] == "bye [N2]"
+    # Verify log output contains sanitization info
+    assert "litellm_pre_call_message_sanitize_done" in caplog.text
+    assert "redaction_count" in caplog.text
