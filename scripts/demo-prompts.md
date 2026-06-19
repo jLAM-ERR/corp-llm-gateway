@@ -18,6 +18,30 @@ export ANTHROPIC_CUSTOM_HEADERS='X-Corp-Auth: demo-team-token'
 
 Alternatively, run `scripts/demo.sh presenter-env` and copy-paste the output.
 
+**Seeing redaction before→after — the `sanitize` helper.** Langfuse stores
+audit **metadata only**; it never stores prompt/response text (by design — no
+original content in the audit store, so a trace's **Input/Output are always
+empty**). To show the actual sanitization, use the gateway's `sanitize` CLI,
+which runs the same three-tier sanitizer against the corp LLM and prints
+before→after:
+
+```bash
+docker compose -f docker-compose.demo.yml exec litellm \
+  gateway-admin sanitize "Draft a follow-up email to the DRI@gmail.com about the Q3 plan."
+```
+
+```
+BEFORE: Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
+AFTER : Draft a follow-up email to [EMAIL_001] about the Q3 plan.
+redactions: 1
+  the DRI@gmail.com -> [EMAIL_001]
+```
+
+Add `--json` for scripted output. This is a **side tool**: it does not egress
+to the upstream model and does not write to the audit pipeline, so it's safe
+to run live. The prompts below say "run the Stage 0 `sanitize` helper" — that
+means this command with the prompt's own text.
+
 ---
 
 ## Prompt 1 — Baseline (No Sanitization)
@@ -43,12 +67,10 @@ What's the capital of France?
 Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
 ```
 
-**What to highlight in Langfuse:**
-- Open the trace
-- Find the **"Request"** section or upstream payload view (e.g., the JSON body sent to the gateway)
-- Confirm: the email address is replaced with a placeholder like `[EMAIL_001]` (the corp LLM is instructed to emit `[LABEL_NNN]` shape — see `src/corp_llm_gateway/sanitizer/orchestrator.py:_build_system_prompt`)
-- Switch to the **"Response"** or **"Rendered response"** section in Claude Code
-- Confirm: the original email `the DRI@gmail.com` is restored in the model's output (our post-call desanitizer worked)
+**What to show:**
+- **Redaction (before→after)** — run the Stage 0 `sanitize` helper with this prompt's text; confirm the email becomes `[EMAIL_001]` in the `AFTER` line (the corp LLM emits `[LABEL_NNN]` shape — see `src/corp_llm_gateway/sanitizer/orchestrator.py:_build_system_prompt`).
+- **Audit (Langfuse)** — open the trace → **Metadata** tab → confirm `redaction_count: 1` and that `placeholder_list` contains `[EMAIL_001]`. The trace's **Input/Output are intentionally empty** — the audit store holds metadata only, never prompt/response content.
+- **Restored output (Claude Code)** — confirm the original email `the DRI@gmail.com` is rebuilt in the model's answer (the post-call desanitizer worked).
 
 **Expected tier:** Regex — the email pattern matched the regex tier's PII detector.
 
@@ -63,11 +85,9 @@ Validate this JSON config and explain any issues:
 {"endpoint": "https://api.internal", "api_key": "sk_live_AKIAIOSFODNN7EXAMPLE"}
 ```
 
-**What to highlight in Langfuse:**
-- Open the trace
-- Find the request payload
-- Confirm: the `api_key` field's value is redacted (e.g., `"api_key": "[TOKEN_001]"`), but the **field name** `api_key` is preserved (JSON tier does not redact keys)
-- The endpoint URL may also be redacted depending on your regex rules
+**What to show:**
+- **Redaction** — run the Stage 0 `sanitize` helper with this prompt's text; confirm the `api_key` **value** is redacted (e.g. `"api_key": "[TOKEN_001]"`) while the **field name** `api_key` is preserved. The endpoint URL may also be redacted depending on your rules.
+- **Audit (Langfuse)** — trace → **Metadata** → `redaction_count` ≥ 1 and the token placeholder appears in `placeholder_list`. (Input/Output empty by design — metadata-only audit store.)
 
 **Expected tier:** JSON — the detector recognized a structured AWS/cloud API key pattern.
 
@@ -80,12 +100,10 @@ Validate this JSON config and explain any issues:
 Use the search_kb tool with query='customer email j.doe@corp.lan asked about X'
 ```
 
-**What to highlight in Langfuse:**
-- Open the trace
-- Find the **function call arguments** section (the JSON args to the tool)
-- Confirm: the email in `query=` is redacted to `[EMAIL_002]` (or similar — same `[LABEL_NNN]` shape as Prompt 2)
-- After the model executes the tool, check the **tool result** in the response
-- Confirm: the desanitizer rebuilt the original email in the rendered response shown in Claude Code
+**What to show:**
+- **Redaction** — run the Stage 0 `sanitize` helper with this prompt's text; confirm the email inside `query=...` is redacted to `[EMAIL_002]` (same `[LABEL_NNN]` shape as Prompt 2).
+- **Restored output (Claude Code)** — after the model executes the tool, the desanitizer rebuilds the original email in the rendered response.
+- **Audit (Langfuse)** — trace → **Metadata** → the redaction is reflected in `redaction_count` / `placeholder_list`. (Input/Output empty by design.)
 
 **Expected tier:** FunctionCall — the tier successfully detected and redacted sensitive data in structured function-call arguments.
 
@@ -130,10 +148,10 @@ Summarize this log.
 
 (One easy way: `yes "[2026-05-28 10:00:01] INFO: Processing batch" | head -2000` produces ~108 KB. Insert the email line somewhere in the middle.)
 
-**What to highlight in Langfuse:**
-- Open the trace; the **upstream payload still contains `j.doe@corp.lan` in plain text** — pre-pass was skipped per the M1-11 size threshold, so the redaction tiers never ran.
-- The egress still proceeded (we do not fail-closed on oversize; the policy is "deliver and flag")
-- `redaction_count: 0` despite the email being present — this is the smoking-gun signal of the skip, not a dedicated `skipped` field. (`AuditEvent` does not currently expose a `payload_skipped` boolean — the observable is the absence of redactions on content that visibly contained PII.)
+**What to show:**
+- **The skip, made explicit** — run the Stage 0 `sanitize` helper on an oversize input (≥100 KB). Instead of redactions it prints `redactions: SKIPPED — payload over size threshold; content sent UNREDACTED`. The pre-pass was bypassed per M1-11 (threshold is `100 * 1024` bytes — see `src/corp_llm_gateway/payload/size_threshold.py`), so the email would egress in plain text.
+- **Egress still proceeded** — we do not fail-closed on oversize; the policy is "deliver and flag".
+- **Audit (Langfuse)** — trace → **Metadata** → `redaction_count: 0` despite the email being present. That's the smoking-gun signal of the skip (no dedicated `payload_skipped` field; the observable is zero redactions on content that visibly contained PII). NOTE: the audit store does **not** carry the payload, so confirm the skip via the CLI above — not by reading the prompt in Langfuse.
 
 **Expected tier:** Skipped — content size exceeded the pre-configured 100 KB threshold; sanitization was bypassed for latency; the trace is flagged for security review (out-of-band, not via a dedicated audit field).
 

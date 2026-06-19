@@ -24,7 +24,9 @@ Reads from env at module load:
 """
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -58,6 +60,44 @@ class _NoTeamRules(RulesLoader):
 # A subclass that overrides only `pre_call` (without overriding
 # `async_pre_call_hook`) gets silently skipped.
 _DEMO_MAX_OUTPUT_TOKENS = 4096
+
+_DEMO_LOG_HANDLER_NAME = "corp-demo-stdout"
+
+
+def _configure_demo_logging() -> None:
+    """Surface the gateway's per-request lifecycle in the demo container logs.
+
+    The gateway logs its whole pipeline at INFO across the ``corp_llm_gateway``
+    package (auth → per-message sanitize → which tier won → cache hit/miss →
+    desanitize → audit), but litellm's logging setup suppresses our INFO by
+    default — so a presenter watching ``docker compose logs litellm`` only sees
+    warnings and errors. Configure the package's PARENT logger once; every
+    child logger (``litellm_hook``, ``sanitizer.*``, ``detectors.*``) inherits
+    it.
+
+    Demo-only: production wires ``CorpLlmGuardrail`` directly and never imports
+    this module, so prod logging is untouched. Level is overridable via
+    ``CORP_LLM_LOG_LEVEL`` (default ``INFO``); set ``WARNING`` to quiet the
+    per-request chatter.
+
+    Lines are plain text and go only to our handler (``propagate = False``), so
+    Vector's JSON-only audit filter drops them — they never reach Langfuse;
+    only the JSON ``AuditEvent`` records flow on.
+    """
+    level_name = os.environ.get("CORP_LLM_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    pkg_logger = logging.getLogger("corp_llm_gateway")
+    pkg_logger.setLevel(level)
+    # Idempotent: don't stack handlers if this module is imported twice
+    # (litellm may load it both as a package module and via its file path).
+    if not any(h.get_name() == _DEMO_LOG_HANDLER_NAME for h in pkg_logger.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.set_name(_DEMO_LOG_HANDLER_NAME)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+        pkg_logger.addHandler(handler)
+    pkg_logger.propagate = False
 
 
 def _build_demo_guardrail() -> CorpLlmGuardrail:
@@ -125,6 +165,10 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         strip_inbound_headers_to_upstream=True,
     )
 
+
+# Configure logging before building the guardrail so the build's own log
+# lines are captured too.
+_configure_demo_logging()
 
 # This is the name the demo litellm-config.yaml references.
 guardrail = _build_demo_guardrail()
