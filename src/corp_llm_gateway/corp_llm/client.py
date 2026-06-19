@@ -98,12 +98,17 @@ class CorpLlmClient:
         http: httpx.AsyncClient | None = None,
         auth_provider: CorpLlmAuthProvider | None = None,
         timeout: float = 30.0,
+        verify: bool = True,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
         self._auth = auth_provider or NoopAuthProvider()
-        self._http = http or httpx.AsyncClient(timeout=timeout)
+        # When no client is injected we own (and must close) one, so
+        # ``aclose()`` actually frees the connection pool. ``verify`` applies
+        # only to that owned client; an injected client carries its own TLS
+        # config and its lifecycle belongs to the caller.
+        self._http = http or httpx.AsyncClient(timeout=timeout, verify=verify)
         self._owned_http = http is None
 
     async def chat_completion(
@@ -139,7 +144,14 @@ class CorpLlmClient:
                 headers={"Content-Type": "application/json", **artifacts.headers},
             )
         except httpx.HTTPError as exc:
-            raise CorpLlmHttpError(f"corp-llm transport error: {exc}") from exc
+            # httpx timeout exceptions (Connect/ReadTimeout) stringify to
+            # '' — interpolating bare ``{exc}`` yields an undiagnosable
+            # "corp-llm transport error: " with nothing after the colon
+            # (exactly the empty 500 body seen in the field). Prepend the
+            # exception type so logs/audit show WHAT failed.
+            raise CorpLlmHttpError(
+                f"corp-llm transport error: {type(exc).__name__}: {exc}"
+            ) from exc
 
         if resp.status_code >= 400:
             raise CorpLlmHttpError(

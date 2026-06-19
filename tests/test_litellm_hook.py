@@ -60,10 +60,26 @@ def _corp_llm_returning(pairs: list[tuple[str, str]]) -> CorpLlmClient:
     return CorpLlmClient("https://corp-llm.example", model="m", http=http)
 
 
+def _corp_llm_unreachable() -> CorpLlmClient:
+    """A corp LLM whose transport always times out.
+
+    Simulates the corp sanitization LLM being unreachable — the 30s
+    ConnectTimeout from the debug-log incident that surfaced to the dev
+    as an empty ``500 {"message":"corp-llm transport error: "}``.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("", request=request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+
 def _build_guardrail(
     pairs: list[tuple[str, str]] | None = None,
     *,
     valid_token: str = "tok-1",
+    corp_llm: CorpLlmClient | None = None,
 ) -> tuple[CorpLlmGuardrail, ListSink]:
     pairs = pairs if pairs is not None else []
     token_store = InMemoryTokenStore()
@@ -80,7 +96,7 @@ def _build_guardrail(
     )
     auth = AuthMiddleware(token_store)
     orch = SanitizationOrchestrator(
-        _corp_llm_returning(pairs),
+        corp_llm if corp_llm is not None else _corp_llm_returning(pairs),
         InMemoryMappingStore(),
         _StaticRules(),
     )
@@ -138,6 +154,36 @@ async def test_pre_call_rejects_non_list_messages() -> None:
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
     assert ei.value.error_code == "E_BAD_REQUEST"
+
+
+async def test_pre_call_corp_llm_down_fails_closed_503() -> None:
+    """Fail-policy matrix (M4): a corp-LLM sanitization failure must fail
+    CLOSED with 503 E_CORP_LLM_DOWN — not leak as a generic 500.
+
+    Regression for the field incident where a 30s corp-LLM timeout
+    surfaced to Claude Code as ``500 {"message":"corp-llm transport
+    error: "}`` (empty — httpx timeouts stringify to '') because
+    pre_call let the raw CorpLlmHttpError escape.
+    """
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
+    data = _data_with_token("tok-1", content="hello alice")
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 503
+    assert ei.value.error_code == "E_CORP_LLM_DOWN"
+
+
+async def test_pre_call_corp_llm_down_does_not_forward_content() -> None:
+    """Belt-and-braces on the fail-closed posture: when sanitization
+    can't run, the request must be rejected — never forwarded with the
+    original (un-sanitized) content."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
+    data = _data_with_token("tok-1", content="my secret is hunter2")
+    with pytest.raises(GuardrailHttpException):
+        await g.pre_call(data)
+    # The raise short-circuits the upstream call; the original content
+    # was never handed back as a sanitized payload.
+    assert data["messages"][0]["content"] == "my secret is hunter2"
 
 
 async def test_pre_call_handles_proxy_server_request_headers_shape() -> None:
@@ -332,6 +378,11 @@ async def test_audit_preserves_user_and_team_across_pre_post_handoff() -> None:
          top level) but where metadata/litellm_params carry the id.
 
     The audit must round-trip the id via metadata and recover state.
+
+    NOTE: this covers the legacy metadata-scatter FALLBACK (no
+    ``litellm_call_id`` in the envelope). The primary path — litellm's own
+    ``litellm_call_id`` carried across the boundary — is covered by
+    ``test_audit_recovers_state_via_litellm_call_id``.
     """
     g, sink = _build_guardrail([("alice", "[N1]")])
     data_pre = _data_with_token("tok-1", content="hi alice")
@@ -363,4 +414,48 @@ async def test_audit_preserves_user_and_team_across_pre_post_handoff() -> None:
     assert rec["user_id"] == "alice", f"got {rec['user_id']!r}, expected alice"
     assert rec["team_id"] == "t1", f"got {rec['team_id']!r}, expected t1"
     assert rec["model"] == "claude", f"got {rec['model']!r}, expected claude"
+    assert rec["status"] == "ok"
+
+
+async def test_audit_recovers_state_via_litellm_call_id() -> None:
+    """Regression: litellm v1.85 carries ``litellm_call_id`` (NOT our scattered
+    ``_corp_gateway_request_id``, and no top-level ``metadata``) across the
+    pre_call → log-event boundary. Per-request state must be keyed on
+    ``litellm_call_id`` so the audit keeps the real identity + redaction count.
+
+    Before the fix the audit fell back to a fresh UUID → user/team/model
+    "unknown" and redaction_count 0 (seen live as audit records whose
+    request_id differed from pre_call's).
+    """
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    call_id = "litellm-call-abc123"
+    data = _data_with_token("tok-1", content="hi alice")
+    data["litellm_call_id"] = call_id
+    await g.pre_call(data)
+    assert data["_corp_gateway_request_id"] == call_id  # state keyed on litellm id
+
+    # litellm's log-event envelope, matching the live v1.85 shape: carries
+    # litellm_call_id but NOT our id, and no top-level metadata dict.
+    kwargs = {
+        "litellm_call_id": call_id,
+        "optional_params": {"model": "claude"},
+        "litellm_params": {"litellm_call_id": call_id, "metadata": {}},
+    }
+    start = time.time()
+    await g.async_log_success_event(
+        kwargs=kwargs,
+        response_obj={
+            "choices": [{"message": {"content": "ok [N1]"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+        },
+        start_time=start,
+        end_time=start + 0.1,
+    )
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    assert rec["request_id"] == call_id, f"got {rec['request_id']!r}"
+    assert rec["user_id"] == "alice"
+    assert rec["team_id"] == "t1"
+    assert rec["model"] == "claude"
+    assert rec["redaction_count"] == 1
     assert rec["status"] == "ok"

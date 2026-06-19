@@ -29,12 +29,14 @@ from typing import Any
 
 from corp_llm_gateway.audit import AuditEvent, AuditLogger
 from corp_llm_gateway.audit.event import Provider
+from corp_llm_gateway.corp_llm import CorpLlmHttpError
 from corp_llm_gateway.sanitizer import (
     SanitizationOrchestrator,
     SanitizeResult,
     StreamingDesanitizer,
     StrategyResult,
 )
+from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.tokens import (
     AuthError,
     AuthMiddleware,
@@ -300,11 +302,36 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 str(msg.get("role") or "unknown"),
                 len(content.encode("utf-8")),
             )
-            result = await self._orch.sanitize(
-                content,
-                team_id=ctx.team_id,
-                conversation_id=request_id,
-            )
+            try:
+                result = await self._orch.sanitize(
+                    content,
+                    team_id=ctx.team_id,
+                    conversation_id=request_id,
+                )
+            except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
+                # Fail-policy matrix (plan M4 / docs/ops/runbook.md): a
+                # corp-LLM sanitization failure is fail-CLOSED. We must
+                # NEVER forward un-sanitized content upstream when the
+                # sanitizer can't run, so map it to the documented
+                # 503 E_CORP_LLM_DOWN. Without this, the raw exception
+                # escaped pre_call and litellm wrapped it as a generic
+                # 500 — and httpx timeouts stringify to '', so the leaked
+                # body read "corp-llm transport error: " (no detail).
+                # Log the exception TYPE; keep the client message stable
+                # and content-free.
+                logger.warning(
+                    "litellm_pre_call_corp_llm_failed request_id=%s "
+                    "message_index=%d error_code=E_CORP_LLM_DOWN exception=%s",
+                    request_id,
+                    i,
+                    type(exc).__name__,
+                )
+                self._record_failure(request_id, error_code="E_CORP_LLM_DOWN")
+                raise GuardrailHttpException(
+                    503,
+                    "E_CORP_LLM_DOWN",
+                    "corp sanitization LLM unavailable",
+                ) from exc
             messages[i] = {**msg, "content": result.sanitized_text}
             self._merge_into_state(state, result)
             logger.info(
@@ -448,25 +475,33 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
     @staticmethod
     def _ensure_request_id(data: dict[str, Any]) -> str:
-        """Round-trip a stable request_id across the pre/post handoff.
+        """Return a stable id that survives the pre_call → log-event handoff.
 
-        LiteLLM passes a different ``data`` dict reference to
-        ``async_log_*_event`` than to ``async_pre_call_hook`` (it
-        re-builds the kwargs envelope around the call). A naive
-        top-level write in pre_call wouldn't survive — the post hook
-        would generate a fresh UUID and the per-request state lookup
-        would miss.
+        litellm's own per-call id, ``litellm_call_id``, is the one identifier
+        present and IDENTICAL on both sides (confirmed for litellm v1.85:
+        ``data["litellm_call_id"]`` in ``async_pre_call_hook`` ==
+        ``kwargs["litellm_call_id"]`` in ``async_log_*_event``). We key
+        per-request state on it.
 
-        Read order on entry:
+        litellm does NOT carry our own ``_corp_gateway_request_id`` through to
+        the log-event kwargs (and drops the top-level ``metadata`` dict it
+        passed to pre_call), so that scatter mechanism is only a FALLBACK — for
+        the unit tests and any path/version where ``litellm_call_id`` is
+        absent. The read order is therefore:
+
+          0. ``data["litellm_call_id"]`` (litellm's per-call id; preferred)
           1. ``data["_corp_gateway_request_id"]`` (set by pre_call)
           2. ``data["metadata"]["_corp_gateway_request_id"]``
           3. ``data["litellm_metadata"]["_corp_gateway_request_id"]``
           4. ``data["litellm_params"]["metadata"]["_corp_gateway_request_id"]``
 
-        On miss, generate a UUID and write it to ALL of those
-        locations so whichever envelope litellm hands the post hooks
-        will find it. Defensive but cheap; the dicts are small.
+        On a total miss, generate a UUID. In all cases scatter the chosen id so
+        the fallback lookup paths keep working.
         """
+        call_id = data.get("litellm_call_id")
+        if isinstance(call_id, str) and call_id:
+            _scatter(data, call_id)
+            return call_id
         for path in _REQUEST_ID_LOOKUP_PATHS:
             rid = _dig(data, path)
             if isinstance(rid, str) and rid:
@@ -532,21 +567,32 @@ def _scatter(data: dict[str, Any], rid: str) -> None:
 
 
 def _resolve_request_data(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Pick the dict litellm hands us in async_log_*_event and merge any
-    nested metadata into a flat surface ``_ensure_request_id`` can read.
+    """Pick the dict litellm hands us in async_log_*_event and surface the
+    join key ``_ensure_request_id`` needs.
 
-    LiteLLM's logging callbacks receive a ``kwargs`` envelope whose
-    ``data`` may NOT be the same dict we mutated in pre_call (the
-    anthropic-passthrough path rebuilds it). The request id we scattered
-    via ``_scatter`` is also present at ``kwargs["metadata"]`` and
-    ``kwargs["litellm_params"]["metadata"]`` — copy those into the
-    returned dict so ``_ensure_request_id`` finds the id without having
-    to know about litellm's call envelope.
+    litellm's logging callbacks receive a ``kwargs`` envelope that does NOT
+    carry our scattered ``_corp_gateway_request_id`` (and has no top-level
+    ``metadata``), but it DOES carry litellm's own ``litellm_call_id`` — the
+    same value pre_call saw. Surface that (plus the legacy metadata locations
+    as a fallback) so ``_ensure_request_id`` keys on the SAME id pre_call used.
     """
     base = kwargs.get("data") or kwargs.get("optional_params") or {}
     if not isinstance(base, dict):
-        return {}
+        base = {}
     out: dict[str, Any] = dict(base)
+    # Primary join key: litellm's per-call id (top-level, else nested in
+    # litellm_params). Surfacing it lets _ensure_request_id recover the
+    # per-request state stored under the same id in pre_call.
+    call_id = kwargs.get("litellm_call_id")
+    if not (isinstance(call_id, str) and call_id):
+        lparams_in = kwargs.get("litellm_params")
+        if isinstance(lparams_in, dict) and isinstance(
+            lparams_in.get("litellm_call_id"), str
+        ):
+            call_id = lparams_in["litellm_call_id"]
+    if isinstance(call_id, str) and call_id:
+        out["litellm_call_id"] = call_id
+    # Fallback: legacy scatter locations (older litellm / unit tests).
     for top in ("metadata", "litellm_metadata"):
         if isinstance(kwargs.get(top), dict) and top not in out:
             out[top] = kwargs[top]

@@ -103,6 +103,20 @@ async def test_raises_on_transport_error() -> None:
         await client.chat_completion(messages=[])
 
 
+async def test_transport_error_message_names_the_exception_type() -> None:
+    """httpx timeout exceptions stringify to '' — the error message must
+    still name the exception TYPE so a "corp-llm transport error: " with
+    nothing after it (the field incident) can't recur."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("", request=request)
+
+    http = _mock_transport(handler)
+    client = CorpLlmClient("https://x", model="m", http=http)
+    with pytest.raises(CorpLlmHttpError, match="ConnectTimeout"):
+        await client.chat_completion(messages=[])
+
+
 async def test_response_first_tool_calls_extracts() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -148,3 +162,27 @@ async def test_text_content_handles_content_parts() -> None:
     client = CorpLlmClient("https://x", model="m", http=http)
     resp = await client.chat_completion(messages=[])
     assert resp.text_content == "alpha beta"
+
+
+async def test_owned_client_is_closed_by_aclose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no injected client, CorpLlmClient OWNS its httpx client, so
+    aclose() must actually close it — otherwise a one-shot caller (the
+    gateway-admin `sanitize` CLI) would leak the connection pool."""
+    # Build the owned client independent of the dev's ambient proxy env —
+    # httpx parses HTTP(S)_PROXY at construction, and a malformed value there
+    # would fail this test for reasons unrelated to close behavior.
+    for var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    client = CorpLlmClient("https://x", model="m")
+    assert client._http.is_closed is False
+    await client.aclose()
+    assert client._http.is_closed is True
