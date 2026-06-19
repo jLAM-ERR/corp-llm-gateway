@@ -156,7 +156,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         start_time: float,
         end_time: float,
     ) -> None:
-        request_data = kwargs.get("data") or kwargs.get("optional_params") or {}
+        request_data = _resolve_request_data(kwargs)
         await self.audit(request_data, response_obj, start_time, end_time, status="ok")
 
     async def async_log_failure_event(
@@ -166,7 +166,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         start_time: float,
         end_time: float,
     ) -> None:
-        request_data = kwargs.get("data") or kwargs.get("optional_params") or {}
+        request_data = _resolve_request_data(kwargs)
         await self.audit(
             request_data, response_obj, start_time, end_time, status="failed"
         )
@@ -448,11 +448,32 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
     @staticmethod
     def _ensure_request_id(data: dict[str, Any]) -> str:
-        rid = data.get("_corp_gateway_request_id")
-        if isinstance(rid, str) and rid:
-            return rid
+        """Round-trip a stable request_id across the pre/post handoff.
+
+        LiteLLM passes a different ``data`` dict reference to
+        ``async_log_*_event`` than to ``async_pre_call_hook`` (it
+        re-builds the kwargs envelope around the call). A naive
+        top-level write in pre_call wouldn't survive — the post hook
+        would generate a fresh UUID and the per-request state lookup
+        would miss.
+
+        Read order on entry:
+          1. ``data["_corp_gateway_request_id"]`` (set by pre_call)
+          2. ``data["metadata"]["_corp_gateway_request_id"]``
+          3. ``data["litellm_metadata"]["_corp_gateway_request_id"]``
+          4. ``data["litellm_params"]["metadata"]["_corp_gateway_request_id"]``
+
+        On miss, generate a UUID and write it to ALL of those
+        locations so whichever envelope litellm hands the post hooks
+        will find it. Defensive but cheap; the dicts are small.
+        """
+        for path in _REQUEST_ID_LOOKUP_PATHS:
+            rid = _dig(data, path)
+            if isinstance(rid, str) and rid:
+                _scatter(data, rid)
+                return rid
         rid = str(uuid.uuid4())
-        data["_corp_gateway_request_id"] = rid
+        _scatter(data, rid)
         return rid
 
     @staticmethod
@@ -469,6 +490,70 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
 
 # ---- helpers --------------------------------------------------------------
+
+
+_REQUEST_ID_KEY = "_corp_gateway_request_id"
+
+# Locations where litellm may or may not preserve our request id across
+# the pre→post handoff. Read in this order, write to all of them.
+_REQUEST_ID_LOOKUP_PATHS: tuple[tuple[str, ...], ...] = (
+    (_REQUEST_ID_KEY,),
+    ("metadata", _REQUEST_ID_KEY),
+    ("litellm_metadata", _REQUEST_ID_KEY),
+    ("litellm_params", "metadata", _REQUEST_ID_KEY),
+)
+
+
+def _dig(d: Any, path: tuple[str, ...]) -> Any:
+    cur: Any = d
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _scatter(data: dict[str, Any], rid: str) -> None:
+    """Write the request id into every supported location."""
+    data[_REQUEST_ID_KEY] = rid
+    for top in ("metadata", "litellm_metadata"):
+        bucket = data.get(top)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            data[top] = bucket
+        bucket[_REQUEST_ID_KEY] = rid
+    lparams = data.get("litellm_params")
+    if isinstance(lparams, dict):
+        meta = lparams.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+            lparams["metadata"] = meta
+        meta[_REQUEST_ID_KEY] = rid
+
+
+def _resolve_request_data(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Pick the dict litellm hands us in async_log_*_event and merge any
+    nested metadata into a flat surface ``_ensure_request_id`` can read.
+
+    LiteLLM's logging callbacks receive a ``kwargs`` envelope whose
+    ``data`` may NOT be the same dict we mutated in pre_call (the
+    anthropic-passthrough path rebuilds it). The request id we scattered
+    via ``_scatter`` is also present at ``kwargs["metadata"]`` and
+    ``kwargs["litellm_params"]["metadata"]`` — copy those into the
+    returned dict so ``_ensure_request_id`` finds the id without having
+    to know about litellm's call envelope.
+    """
+    base = kwargs.get("data") or kwargs.get("optional_params") or {}
+    if not isinstance(base, dict):
+        return {}
+    out: dict[str, Any] = dict(base)
+    for top in ("metadata", "litellm_metadata"):
+        if isinstance(kwargs.get(top), dict) and top not in out:
+            out[top] = kwargs[top]
+    lparams = kwargs.get("litellm_params")
+    if isinstance(lparams, dict) and "litellm_params" not in out:
+        out["litellm_params"] = lparams
+    return out
 
 
 # Inbound HTTP wire-level headers that must NOT be forwarded to upstream

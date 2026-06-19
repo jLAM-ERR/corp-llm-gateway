@@ -22,7 +22,9 @@ def test_noop_returns_empty_artifacts() -> None:
 @pytest.mark.parametrize(
     ("provider_factory",),
     [
-        (lambda: BearerAuthProvider(token="tok"),),
+        # BearerAuthProvider is no longer a stub — it returns the
+        # Authorization header. Covered separately by
+        # ``test_bearer_provider_emits_authorization_header``.
         (lambda: MtlsAuthProvider(cert_path="/c", key_path="/k"),),
         (lambda: OidcAuthProvider(issuer="i", client_id="c", client_secret="s"),),
         (lambda: ApiKeyHeaderAuthProvider(header_name="X-Api-Key", key="k"),),
@@ -34,6 +36,12 @@ def test_stub_providers_raise_not_implemented(
     instance: CorpLlmAuthProvider = provider_factory()  # type: ignore[operator]
     with pytest.raises(NotImplementedError):
         instance.artifacts()
+
+
+def test_bearer_provider_emits_authorization_header() -> None:
+    artifacts = BearerAuthProvider(token="my-token").artifacts()
+    assert artifacts.headers == {"Authorization": "Bearer my-token"}
+    assert artifacts.client_cert is None
 
 
 def test_factory_default_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:

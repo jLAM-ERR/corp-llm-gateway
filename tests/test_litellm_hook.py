@@ -317,3 +317,50 @@ async def test_async_log_success_event_emits_audit() -> None:
     )
     assert len(sink.records) == 1
     assert sink.records[0]["status"] == "ok"
+
+
+async def test_audit_preserves_user_and_team_across_pre_post_handoff() -> None:
+    """Regression: litellm's anthropic-passthrough route hands the
+    post-call hooks a NEW ``data`` dict that doesn't carry our top-level
+    ``_corp_gateway_request_id``. Before the fix, the audit emitted
+    user_id/team_id/model="unknown" because _req_state lookup missed.
+
+    Simulate this by:
+      1. running pre_call on dict A,
+      2. invoking async_log_success_event with a kwargs envelope where
+         ``data`` is a FRESH dict B (no _corp_gateway_request_id at the
+         top level) but where metadata/litellm_params carry the id.
+
+    The audit must round-trip the id via metadata and recover state.
+    """
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data_pre = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data_pre)
+    rid = data_pre["_corp_gateway_request_id"]
+
+    # Build a fresh dict the way litellm's anthropic-passthrough does.
+    fresh_data: dict[str, object] = {
+        "model": "claude-opus-4-8",
+        "messages": data_pre["messages"],
+    }
+    kwargs_envelope = {
+        "data": fresh_data,
+        "metadata": {"_corp_gateway_request_id": rid},
+        "litellm_params": {
+            "metadata": {"_corp_gateway_request_id": rid},
+        },
+    }
+    start = time.time()
+    await g.async_log_success_event(
+        kwargs=kwargs_envelope,
+        response_obj={"choices": [{"message": {"content": "ok [N1]"}}]},
+        start_time=start,
+        end_time=start + 0.100,
+    )
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    assert rec["request_id"] == rid, "round-trip failed: new UUID generated"
+    assert rec["user_id"] == "alice", f"got {rec['user_id']!r}, expected alice"
+    assert rec["team_id"] == "t1", f"got {rec['team_id']!r}, expected t1"
+    assert rec["model"] == "claude", f"got {rec['model']!r}, expected claude"
+    assert rec["status"] == "ok"
