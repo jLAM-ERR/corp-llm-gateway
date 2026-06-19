@@ -33,6 +33,7 @@ from corp_llm_gateway.corp_llm import CorpLlmHttpError
 from corp_llm_gateway.sanitizer import (
     SanitizationOrchestrator,
     SanitizeResult,
+    SseStreamDesanitizer,
     StreamingDesanitizer,
     StrategyResult,
 )
@@ -379,18 +380,31 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             request_id,
             len(state.mapping.pairs),
         )
-        desanitizer = StreamingDesanitizer(state.mapping)
+        # SSE bytes/str path: Anthropic passthrough emits raw SSE events.
+        sse = SseStreamDesanitizer(state.mapping)
+        # Dict path: OpenAI-dict chunks use the classic feed/flush interface.
+        dict_desanitizer = StreamingDesanitizer(state.mapping)
         chunk_count = 0
         async for chunk in response:
             chunk_count += 1
-            text = _extract_chunk_text(chunk)
-            if text is None:
+            if isinstance(chunk, (bytes, str)):
+                for out_chunk in sse.feed(chunk):
+                    yield out_chunk
+            elif isinstance(chunk, dict):
+                text = _extract_chunk_text(chunk)
+                if text is None:
+                    yield chunk
+                    continue
+                out = dict_desanitizer.feed(text)
+                if out:
+                    yield _replace_chunk_text(chunk, out)
+            else:
                 yield chunk
-                continue
-            out = desanitizer.feed(text)
-            if out:
-                yield _replace_chunk_text(chunk, out)
-        tail = desanitizer.flush()
+        # Flush SSE desanitizer (handles truncated streams / held-back tail).
+        for out_chunk in sse.flush():
+            yield out_chunk
+        # Flush dict desanitizer tail.
+        tail = dict_desanitizer.flush()
         if tail:
             yield _replace_chunk_text(_make_text_chunk(), tail)
         logger.info(

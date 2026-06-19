@@ -8,15 +8,24 @@ import httpx
 import pytest
 
 from corp_llm_gateway.audit import AuditLogger, ListSink
-from corp_llm_gateway.corp_llm import CorpLlmClient, SANITIZE_TOOL_NAME
+from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.rules import Rules, RulesLoader
-from corp_llm_gateway.sanitizer import SanitizationOrchestrator, StrategyResult
+from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import (
     AuthMiddleware,
     InMemoryTokenStore,
     TokenInfo,
+)
+from tests.sanitizer.test_streaming import (
+    _MSG_DELTA,
+    _MSG_START,
+    _MSG_STOP,
+    _PING,
+    _cb_start,
+    _cb_stop,
+    _delta,
 )
 
 
@@ -253,6 +262,81 @@ async def test_post_call_stream_unknown_request_passes_through() -> None:
     async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
         out.append(chunk)
     assert out == chunks_in
+
+
+async def test_post_call_stream_openai_dict_gpt4o_contract() -> None:
+    """Lock the dict contract for gpt-4o model — must desanitize choices delta content."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    await g.pre_call(data)
+
+    chunks_in = [
+        {"choices": [{"delta": {"content": "hello [N"}}]},
+        {"choices": [{"delta": {"content": "1] world"}}]},
+    ]
+    out_text = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+    assert out_text == "hello alice world"
+
+
+async def test_post_call_stream_anthropic_sse_bytes_placeholder_restored() -> None:
+    """Anthropic SSE bytes: placeholder split across deltas is restored, framing intact."""
+    g, _ = _build_guardrail([("user@example.com", "[EMAIL_001]")])
+    data = _data_with_token("tok-1", content="email is user@example.com")
+    await g.pre_call(data)
+
+    # Matches the verified wire format: bytes SSE events from litellm's Anthropic passthrough.
+    # [EMAIL_001] arrives as 5 separate text_delta events (the captured live split).
+    sse_events: list[bytes] = [
+        _MSG_START,
+        _cb_start(0),
+        _PING,
+        _delta(" ["),
+        _delta("EMAIL"),
+        _delta("_"),
+        _delta("001"),
+        _delta("]"),
+        _cb_stop(0),
+        _MSG_DELTA,
+        _MSG_STOP,
+    ]
+
+    out_chunks: list[bytes] = []
+    async for chunk in g.post_call_stream(data, _async_iter(sse_events)):
+        assert isinstance(chunk, bytes), f"expected bytes, got {type(chunk)}"
+        out_chunks.append(chunk)
+
+    # Collect all text from content_block_delta chunks.
+    text_parts: list[str] = []
+    for chunk in out_chunks:
+        for line in chunk.decode().splitlines():
+            if line.startswith("data:"):
+                try:
+                    obj = json.loads(line[5:].lstrip())
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "content_block_delta":
+                    delta = obj.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text_parts.append(delta["text"])
+
+    full_text = "".join(text_parts)
+    assert "user@example.com" in full_text, f"original not restored: {full_text!r}"
+    assert "[EMAIL_001]" not in full_text
+
+    # Verify message_stop and content_block_stop framing are intact.
+    all_types = set()
+    for chunk in out_chunks:
+        for line in chunk.decode().splitlines():
+            if line.startswith("data:"):
+                try:
+                    obj = json.loads(line[5:].lstrip())
+                    all_types.add(obj.get("type"))
+                except json.JSONDecodeError:
+                    pass
+    assert "message_stop" in all_types
+    assert "content_block_stop" in all_types
 
 
 # ---- Unary post-call -------------------------------------------------------

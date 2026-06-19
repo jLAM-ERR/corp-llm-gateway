@@ -1,7 +1,15 @@
+from __future__ import annotations
+
+import codecs
+import json
+import re
 from collections.abc import AsyncIterable, AsyncIterator
 
 from corp_llm_gateway.sanitizer.placeholder import sort_placeholders_by_descending_length
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
+
+# Regex that matches a complete SSE event boundary (two consecutive newlines).
+_SSE_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
 
 
 class StreamingDesanitizer:
@@ -67,3 +75,237 @@ class StreamingDesanitizer:
         for placeholder in self._sorted_placeholders:
             text = text.replace(placeholder, self._by_placeholder[placeholder])
         return text
+
+
+class SseStreamDesanitizer:
+    """De-sanitize an Anthropic or OpenAI SSE byte stream.
+
+    Each ``feed`` call accepts one or more raw SSE bytes/str chunks (as
+    produced by litellm's Anthropic passthrough).  The class accumulates
+    a byte buffer, splits on SSE event boundaries (``\\n\\n`` /
+    ``\\r\\n\\r\\n`` / ``\\r\\r``), and rewrites only model text fields:
+
+    - Anthropic ``content_block_delta`` with ``delta.type == "text_delta"``
+    - OpenAI ``choices[N].delta.content``
+
+    Every other event (``message_start``, ``ping``, ``message_delta``,
+    ``message_stop``, ``content_block_start``, ``content_block_stop``,
+    ``error``, ``[DONE]``) passes through byte-identical.
+
+    Placeholder assembly across delta boundaries uses one
+    ``StreamingDesanitizer`` per Anthropic text content block (flushed at
+    ``content_block_stop``), preserving the M1-9 length-descending rule.
+    """
+
+    def __init__(self, mapping: StrategyResult) -> None:
+        self._mapping = mapping
+        # True when the source stream emits bytes; False for str.
+        self._source_is_bytes: bool | None = None
+        # Incremental UTF-8 decoder shared across all feeds.
+        self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+        # Raw byte accumulator; always bytes internally.
+        self._buf: bytes = b""
+        # Per-block (index → desanitizer) for Anthropic text content blocks.
+        self._block_desanitizers: dict[int, StreamingDesanitizer] = {}
+        # Single desanitizer for OpenAI streams (one content stream total).
+        self._openai_desanitizer: StreamingDesanitizer | None = None
+
+    # ------------------------------------------------------------------ public
+
+    def feed(self, chunk: bytes | str) -> list[bytes | str]:
+        if self._source_is_bytes is None:
+            self._source_is_bytes = isinstance(chunk, bytes)
+        raw = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+        decoded = self._utf8.decode(raw, final=False)
+        self._buf += decoded.encode("utf-8")
+        return self._drain()
+
+    def flush(self) -> list[bytes | str]:
+        # Decode any remaining bytes held by the incremental decoder.
+        tail_decoded = self._utf8.decode(b"", final=True)
+        self._buf += tail_decoded.encode("utf-8")
+        out: list[bytes | str] = []
+        # Emit any complete events accumulated so far.
+        out.extend(self._drain())
+        # Flush any still-active block desanitizers (defensive: truncated stream
+        # with no content_block_stop, or placeholders held in their buffer).
+        for idx, ds in list(self._block_desanitizers.items()):
+            tail = ds.flush()
+            if tail:
+                ev = _make_text_delta_event(idx, tail)
+                out.append(self._encode(ev + "\n\n"))
+            del self._block_desanitizers[idx]
+        if self._openai_desanitizer is not None:
+            oi_tail = self._openai_desanitizer.flush()
+            if oi_tail:
+                out.append(self._encode(_make_openai_delta_event(oi_tail)))
+            self._openai_desanitizer = None
+        # Emit whatever partial (incomplete) SSE event remains in the buffer.
+        if self._buf:
+            partial = self._buf
+            self._buf = b""
+            out.append(self._encode(partial.decode("utf-8", errors="replace")))
+        return out
+
+    # ----------------------------------------------------------------- private
+
+    def _drain(self) -> list[bytes | str]:
+        """Split accumulated buffer into complete SSE events and process each."""
+        out: list[bytes | str] = []
+        while True:
+            text = self._buf.decode("utf-8", errors="replace")
+            m = _SSE_BOUNDARY.search(text)
+            if m is None:
+                break
+            event_text = text[: m.end()]
+            self._buf = text[m.end() :].encode("utf-8")
+            out.extend(self._process_event(event_text))
+        return out
+
+    def _process_event(self, event_text: str) -> list[bytes | str]:
+        """Rewrite model-text fields in one complete SSE event; pass others unchanged."""
+        data_str = _extract_data_line(event_text)
+        if data_str is None:
+            # No data line at all (e.g. bare ping line) — pass through.
+            return [self._encode(event_text)]
+        if data_str == "[DONE]":
+            # End-of-stream sentinel (OpenAI) — flush OpenAI desanitizer first.
+            result: list[bytes | str] = []
+            if self._openai_desanitizer is not None:
+                oi_tail = self._openai_desanitizer.flush()
+                if oi_tail:
+                    result.append(self._encode(_make_openai_delta_event(oi_tail)))
+                self._openai_desanitizer = None
+            result.append(self._encode(event_text))
+            return result
+        try:
+            obj = json.loads(data_str)
+        except json.JSONDecodeError:
+            return [self._encode(event_text)]
+
+        ev_type = obj.get("type") if isinstance(obj, dict) else None
+
+        # Anthropic: content_block_start — fresh desanitizer for this index.
+        if ev_type == "content_block_start":
+            cb = obj.get("content_block") or {}
+            if isinstance(cb, dict) and cb.get("type") == "text":
+                idx = int(obj.get("index", 0))
+                self._block_desanitizers[idx] = StreamingDesanitizer(self._mapping)
+            return [self._encode(event_text)]
+
+        # Anthropic: content_block_delta — rewrite text_delta.
+        if ev_type == "content_block_delta":
+            delta = obj.get("delta") or {}
+            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                idx = int(obj.get("index", 0))
+                text_in = delta.get("text", "")
+                if not isinstance(text_in, str):
+                    return [self._encode(event_text)]
+                ds = self._block_desanitizers.get(idx)
+                if ds is None:
+                    # Desanitizer not started (e.g. non-text block) — pass through.
+                    return [self._encode(event_text)]
+                rewritten = ds.feed(text_in)
+                if not rewritten:
+                    # Held back — emit nothing for this event.
+                    return []
+                new_obj = dict(obj)
+                new_obj["delta"] = {**delta, "text": rewritten}
+                boundary = _boundary_from(event_text)
+                return [self._encode(_rebuild_event(event_text, new_obj, boundary))]
+
+        # Anthropic: content_block_stop — flush that block's desanitizer tail first.
+        if ev_type == "content_block_stop":
+            idx = int(obj.get("index", 0))
+            result = []
+            ds = self._block_desanitizers.pop(idx, None)
+            if ds is not None:
+                tail = ds.flush()
+                if tail:
+                    tail_ev = _make_text_delta_event(idx, tail)
+                    boundary = _boundary_from(event_text)
+                    result.append(self._encode(tail_ev + boundary))
+            result.append(self._encode(event_text))
+            return result
+
+        # OpenAI: choices[N].delta.content — single stream desanitizer.
+        if isinstance(obj, dict) and "choices" in obj:
+            choices = obj.get("choices")
+            if isinstance(choices, list) and choices:
+                first_choice = choices[0]
+                if isinstance(first_choice, dict):
+                    delta = first_choice.get("delta") or {}
+                    if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                        if self._openai_desanitizer is None:
+                            self._openai_desanitizer = StreamingDesanitizer(self._mapping)
+                        rewritten = self._openai_desanitizer.feed(delta["content"])
+                        if not rewritten:
+                            return []
+                        new_delta = {**delta, "content": rewritten}
+                        new_first = {**first_choice, "delta": new_delta}
+                        new_choices = [new_first, *list(choices[1:])]
+                        new_obj = {**obj, "choices": new_choices}
+                        boundary = _boundary_from(event_text)
+                        return [self._encode(_rebuild_event(event_text, new_obj, boundary))]
+
+        # Everything else (message_start, ping, message_delta, message_stop,
+        # error, non-text blocks) — byte-identical pass-through.
+        return [self._encode(event_text)]
+
+    def _encode(self, text: str | bytes) -> bytes | str:
+        """Re-emit in the same type (bytes vs str) as the source stream."""
+        if isinstance(text, bytes):
+            # Already bytes; return as-is if source is bytes, else decode.
+            return text if self._source_is_bytes else text.decode("utf-8", errors="replace")
+        # text is str
+        if self._source_is_bytes:
+            return text.encode("utf-8")
+        return text
+
+
+# ---------------------------------------------------------------------------
+# SSE helpers (module-private)
+# ---------------------------------------------------------------------------
+
+
+def _extract_data_line(event_text: str) -> str | None:
+    """Return the payload from the first ``data:`` line, or None."""
+    for line in event_text.splitlines():
+        if line.startswith("data:"):
+            return line[5:].lstrip(" ")
+    return None
+
+
+def _boundary_from(event_text: str) -> str:
+    """Return the trailing boundary (two newlines) used in the event."""
+    m = _SSE_BOUNDARY.search(event_text)
+    return m.group(0) if m else "\n\n"
+
+
+def _rebuild_event(original_event: str, new_obj: dict, boundary: str) -> str:
+    """Reconstruct an SSE event preserving any ``event:`` line, rewriting ``data:``."""
+    lines = original_event.rstrip("\r\n").splitlines()
+    out_lines: list[str] = []
+    for line in lines:
+        if line.startswith("data:"):
+            out_lines.append("data: " + json.dumps(new_obj, ensure_ascii=False))
+        else:
+            out_lines.append(line)
+    sep = "\r\n" if "\r\n" in boundary else "\n"
+    return sep.join(out_lines) + boundary
+
+
+def _make_text_delta_event(index: int, text: str) -> str:
+    """Build a bare ``content_block_delta`` SSE event string (no trailing boundary)."""
+    obj = {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "text_delta", "text": text},
+    }
+    return "event: content_block_delta\ndata: " + json.dumps(obj, ensure_ascii=False)
+
+
+def _make_openai_delta_event(content: str) -> str:
+    """Build a complete OpenAI-format SSE event for a choices delta tail."""
+    obj = {"choices": [{"delta": {"content": content}}]}
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
