@@ -43,6 +43,19 @@ from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
 
 
+# Demo-only: silence the container's every-5s healthcheck probe in the logs
+# (uvicorn.access `GET /health/liveliness ... 200`) so the demo stream shows the
+# sanitize/desanitize flow, not health-probe spam. Filtering the *named* logger
+# survives litellm's json-log handler setup, and prod never imports this module,
+# so real deployments keep full access logs.
+class _DropHealthcheckAccessLogs(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health/" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_DropHealthcheckAccessLogs())
+
+
 class _NoTeamRules(RulesLoader):
     """No team-specific rules for the demo; engine still applies the
     PII regex floor + general detector tier."""

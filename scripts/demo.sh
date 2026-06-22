@@ -29,12 +29,14 @@ Subcommands:
   reset           Stop demo stack and nuke all volumes
   seed-langfuse   Idempotent Langfuse project setup (run after Langfuse is healthy)
   presenter-env   Print copy-pasteable export block for second shell
+  logs            Tail litellm filtered to the sanitize/desanitize flow + audit
   --help, -h      Print this help and exit
 
 Examples:
   scripts/demo.sh up               # Cold boot the demo stack
   scripts/demo.sh down             # Tear down, preserve state
   scripts/demo.sh presenter-env    # Get env vars for Claude Code shell
+  scripts/demo.sh logs             # Watch only the sanitize/desanitize flow
 EOF
 }
 
@@ -235,6 +237,15 @@ EOF
         ;;
     seed-langfuse)
         seed_langfuse
+        ;;
+    logs)
+        # Focused view: only the gateway sanitize/desanitize flow + audit
+        # records. Drops uvicorn access logs, the every-5s healthcheck probe,
+        # and litellm's own startup/info noise. For the full, unfiltered stream
+        # use: docker compose -f docker-compose.demo.yml logs -f litellm
+        info "Tailing the sanitize/desanitize flow (Ctrl-C to stop)..."
+        docker compose -f "$COMPOSE_FILE" logs -f --no-log-prefix litellm \
+            | grep --line-buffered -E 'corp_llm_gateway|"redaction_count"'
         ;;
     presenter-env)
         cat <<'EOF'
