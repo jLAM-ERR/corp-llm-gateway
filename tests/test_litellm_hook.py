@@ -1305,6 +1305,161 @@ async def test_post_call_unary_anthropic_native_top_level_content_str_reversed()
     assert "[N1]" not in out["content"]
 
 
+# ---- Placeholder-allocator hardening tests ------------------------------------
+
+
+async def test_cache_a_hit_segment_plus_fresh_segment_no_collision() -> None:
+    """Cache-A hit for one segment + fresh corp-LLM call for another must not collide.
+
+    Scenario (Prompt-4 path):
+    - Request 1: system='admin is a@corp.example' → warms Cache A for that text.
+    - Request 2 (new request_id): same system (Cache-A hit, returns EMAIL_001)
+      + message 'contact b@corp.example' (fresh, corp-LLM also returns EMAIL_001).
+    The RequestPlaceholderAllocator must assign distinct canonical labels so both
+    originals survive de-sanitization.
+    """
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+
+    # Warm Cache A for the system text.
+    warm_data = _data_with_token(
+        "tok-1",
+        content="no email here",
+        system="admin is a@corp.example",
+    )
+    await g.pre_call(warm_data)
+
+    # Second request: same system (Cache-A hit) + fresh message email.
+    data2 = _data_with_token(
+        "tok-1",
+        content="contact b@corp.example",
+        system="admin is a@corp.example",
+    )
+    out = await g.pre_call(data2)
+
+    msg_text = out["messages"][0]["content"]
+    sys_text = out["system"]
+
+    # Both originals must be redacted.
+    assert "a@corp.example" not in sys_text, f"system leaked: {sys_text!r}"
+    assert "b@corp.example" not in msg_text, f"message leaked: {msg_text!r}"
+
+    msg_ph = re.search(r"\[EMAIL_\d+\]", msg_text).group(0)
+    sys_ph = re.search(r"\[EMAIL_\d+\]", sys_text).group(0)
+    assert msg_ph != sys_ph, f"collision: both resolved to {msg_ph!r}"
+
+    # Round-trip: post_call_stream must restore EACH placeholder to its own original.
+    chunks_in = [{"choices": [{"delta": {"content": f"msg={msg_ph} sys={sys_ph}"}}]}]
+    out_text = ""
+    async for chunk in g.post_call_stream(data2, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+    assert out_text == "msg=b@corp.example sys=a@corp.example", f"round-trip failed: {out_text!r}"
+
+
+async def test_oversize_message_egresses_unredacted_normal_system_redacted() -> None:
+    """M1-11: a segment larger than DEFAULT_THRESHOLD_BYTES is skipped (deliver-and-flag).
+
+    The oversized message content egresses UNCHANGED — the email inside it is
+    intentionally NOT redacted. This is the documented M1-11 policy, not a bug.
+    The normal system field IS redacted. pre_call must not crash on the mix.
+    """
+    from corp_llm_gateway.payload import DEFAULT_THRESHOLD_BYTES
+
+    email_in_big_msg = "overflow@corp.example"
+    # Build a message body that exceeds the threshold.
+    padding = "x" * (DEFAULT_THRESHOLD_BYTES + 1)
+    big_content = f"{padding} {email_in_big_msg}"
+
+    email_in_system = "admin@corp.example"
+    system_text = f"admin is {email_in_system}"
+
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token("tok-1", content=big_content, system=system_text)
+    out = await g.pre_call(data)
+
+    # M1-11: oversize message content passes through UNCHANGED (intentional).
+    assert out["messages"][0]["content"] == big_content, (
+        "M1-11 skip violated: oversize content was mutated"
+    )
+    assert email_in_big_msg in out["messages"][0]["content"], (
+        "M1-11 skip violated: email in oversize message must egress unredacted"
+    )
+
+    # Normal system field is still redacted.
+    sys_out = out["system"]
+    assert email_in_system not in sys_out, f"system email leaked: {sys_out!r}"
+    sys_ph = re.search(r"\[EMAIL_\d+\]", sys_out)
+    assert sys_ph is not None, f"system email not redacted: {sys_out!r}"
+
+
+async def test_corp_llm_fails_on_second_segment_fails_closed_503() -> None:
+    """M4 fail-closed: if corp-LLM succeeds on segment 1 then dies on segment 2,
+    pre_call must raise GuardrailHttpException 503 E_CORP_LLM_DOWN.
+
+    Partially-sanitized content must never egress; the request is rejected
+    before any mutated data reaches the upstream LLM.
+    """
+    call_count = 0
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First segment succeeds.
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "c1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": SANITIZE_TOOL_NAME,
+                                            "arguments": json.dumps(
+                                                {
+                                                    "pairs": [
+                                                        {
+                                                            "original": "a@corp.example",
+                                                            "replacement": "[EMAIL_001]",
+                                                        }
+                                                    ]
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        # Second segment times out.
+        raise httpx.ConnectTimeout("", request=request)
+
+    from corp_llm_gateway.corp_llm import CorpLlmClient
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    flaky_corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    g, _ = _build_guardrail(corp_llm=flaky_corp_llm)
+    # Two distinct emails in two segments: message + system.
+    data = _data_with_token(
+        "tok-1",
+        content="message from a@corp.example",
+        system="system has b@corp.example",
+    )
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+
+    assert ei.value.status_code == 503, f"expected 503, got {ei.value.status_code}"
+    assert ei.value.error_code == "E_CORP_LLM_DOWN", (
+        f"expected E_CORP_LLM_DOWN, got {ei.value.error_code!r}"
+    )
+
+
 async def test_pre_call_logs_sanitize_done_per_block(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
