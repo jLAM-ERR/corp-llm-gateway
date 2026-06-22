@@ -1,5 +1,6 @@
 from corp_llm_gateway.sanitizer.placeholder import (
     apply_pairs,
+    find_placeholder_literals,
     sort_placeholders_by_descending_length,
 )
 
@@ -30,3 +31,26 @@ def test_sort_placeholders_descending_length_stable() -> None:
         "[AA]",
         "[A]",
     ]
+
+
+def test_find_placeholder_literals_matches_real_tokens() -> None:
+    assert find_placeholder_literals("send to [EMAIL_001] ok") == ["[EMAIL_001]"]
+    assert find_placeholder_literals("key [API_KEY_001] here") == ["[API_KEY_001]"]
+
+
+def test_find_placeholder_literals_rejects_code_identifiers() -> None:
+    assert find_placeholder_literals("[my_var_1]") == []
+    assert find_placeholder_literals("[item_3]") == []
+    assert find_placeholder_literals("[MAX_SIZE_3]") == []
+
+
+def test_find_placeholder_literals_empty_string() -> None:
+    assert find_placeholder_literals("") == []
+
+
+def test_find_placeholder_literals_multiple_real_tokens() -> None:
+    text = "[EMAIL_001] and [API_KEY_002] in text"
+    result = find_placeholder_literals(text)
+    assert "[EMAIL_001]" in result
+    assert "[API_KEY_002]" in result
+    assert len(result) == 2

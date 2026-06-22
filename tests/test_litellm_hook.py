@@ -1584,55 +1584,58 @@ async def test_substring_originals_longer_replaced_first_no_corruption() -> None
     )
 
 
-async def test_user_typed_placeholder_collides_with_real_redaction_known_limitation() -> None:
-    """Task 4: KNOWN LIMITATION — a user-typed placeholder token is
-    indistinguishable from a real redaction token.
+async def test_user_typed_placeholder_literal_preserved_not_collided(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Security fix: a user-typed [FAMILY_NNN] literal must not collide with a real redaction.
 
-    When the user's message contains the literal string "[EMAIL_001]" AND
-    the corp-LLM also redacts a@corp.example to [EMAIL_001], the sanitized
-    egress contains two identical tokens. The reverse mapping cannot tell
-    them apart, so the user's literal "[EMAIL_001]" is also reversed to
-    a@corp.example on egress.
-
-    This is NOT a regression from the allocator. The allocator correctly
-    handles per-segment collisions between DIFFERENT originals. The problem
-    here is that a user-typed literal is semantically ambiguous with a real
-    placeholder — both are the same string in the reverse map.
-
-    Mitigation note: the allocator could skip any label that appears
-    verbatim in the segment text when minting a fresh placeholder (pre-
-    empting the collision before it is recorded). That would require
-    scanning segment text for existing placeholder patterns before
-    accepting a corp-LLM-proposed label. Tracked as a design decision.
+    The real email a@corp.example must be assigned a DIFFERENT token (e.g.
+    [EMAIL_002]), because [EMAIL_001] is already present verbatim in the input.
+    On the reverse pass, [EMAIL_001] is NOT in the mapping, so it stays unchanged
+    in the response (the user's literal is preserved). The real redaction token
+    ([EMAIL_002]) IS in the mapping and restores correctly.
     """
     g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
-    # The user's message contains: a real email + a literal placeholder string.
     data = _data_with_token(
         "tok-1", content="My email a@corp.example and the marker [EMAIL_001] in docs"
     )
-    out = await g.pre_call(data)
+
+    with caplog.at_level(logging.WARNING):
+        out = await g.pre_call(data)
 
     sanitized = out["messages"][0]["content"]
-    # The corp-LLM redacts a@corp.example -> [EMAIL_001]. The user's literal
-    # "[EMAIL_001]" is unchanged (it's already the placeholder text). The
-    # sanitized content therefore contains "[EMAIL_001]" twice.
-    assert "[EMAIL_001]" in sanitized, f"redaction not applied: {sanitized!r}"
 
-    # Run a response chunk containing [EMAIL_001] through post_call_stream.
-    chunks_in = [{"choices": [{"delta": {"content": "[EMAIL_001]"}}]}]
+    # The real email must be redacted to a token OTHER than [EMAIL_001].
+    assert "a@corp.example" not in sanitized, f"email not redacted: {sanitized!r}"
+    real_ph = re.search(r"\[EMAIL_\d+\]", sanitized.replace("[EMAIL_001]", ""))
+    assert real_ph is not None, f"no redaction token found: {sanitized!r}"
+    real_token = real_ph.group(0)
+    assert real_token != "[EMAIL_001]", (
+        "collision: real email got [EMAIL_001] despite user typing it verbatim"
+    )
+
+    # The user's literal "[EMAIL_001]" still appears verbatim in egress.
+    assert "[EMAIL_001]" in sanitized, f"user literal was removed: {sanitized!r}"
+
+    # On post_call_stream: a response with both tokens restores correctly.
+    chunks_in = [{"choices": [{"delta": {"content": f"{real_token} and [EMAIL_001]"}}]}]
     out_text = ""
     async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
+    # The real token is restored; the user's literal is unchanged (not in mapping).
+    assert "a@corp.example" in out_text, f"real email not restored: {out_text!r}"
+    assert "[EMAIL_001]" in out_text, f"user literal was reversed: {out_text!r}"
 
-    # KNOWN LIMITATION: the reverse map is keyed on the placeholder string.
-    # There is exactly one entry: [EMAIL_001] -> a@corp.example.
-    # Both the real redaction AND the user's literal are reversed to a@corp.example.
-    # The user's literal "[EMAIL_001]" in the response is corrupted — it becomes
-    # a@corp.example — even though it was never PII.
-    assert out_text == "a@corp.example", (
-        f"behavior changed from known limitation: got {out_text!r}, "
-        "expected 'a@corp.example' (user's literal reversed to original)"
-    )
+    # Breadcrumb: warning was emitted with count=1 and contains NO email content.
+    breadcrumb_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if "input_placeholder_literal_detected" in r.getMessage()
+    ]
+    assert breadcrumb_lines, "breadcrumb warning not emitted"
+    assert "count=1" in breadcrumb_lines[0], f"expected count=1 in: {breadcrumb_lines[0]!r}"
+    assert "a@corp.example" not in breadcrumb_lines[0], "email leaked into breadcrumb log"
+    assert "[EMAIL_001]" not in breadcrumb_lines[0], "literal leaked into breadcrumb log"
 
 
 # ---- Audit distinct-secret + finding_label_counts tests ----------------------
@@ -1703,3 +1706,29 @@ async def test_audit_invariant_sum_equals_redaction_count_equals_placeholder_len
     rec = sink.records[0]
     assert sum(rec["finding_label_counts"].values()) == rec["redaction_count"]
     assert rec["redaction_count"] == len(rec["placeholder_list"])
+
+
+async def test_audit_finding_label_counts_keys_never_contain_originals() -> None:
+    """M1-14: finding_label_counts keys must be category labels, never originals.
+
+    Pins that _label_counts uses placeholder families (e.g. 'EMAIL'), not
+    the original PII values ('bob@corp.example' or the local-part 'bob').
+    """
+    g, sink = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token("tok-1", content="mail bob@corp.example")
+    await g.pre_call(data)
+    start = time.time()
+    await g.audit(data, {}, start_time=start, end_time=start, status="ok")
+
+    rec = sink.records[0]
+    flc = rec["finding_label_counts"]
+
+    # (a) keys are category labels, not originals
+    assert "EMAIL" in flc, f"expected 'EMAIL' key, got {flc!r}"
+
+    # (b) neither the full address nor the local-part appears anywhere in keys or repr
+    flc_repr = repr(flc)
+    assert "bob@corp.example" not in flc_repr, (
+        f"original leaked into finding_label_counts: {flc_repr!r}"
+    )
+    assert "bob" not in flc_repr, f"local-part leaked into finding_label_counts: {flc_repr!r}"

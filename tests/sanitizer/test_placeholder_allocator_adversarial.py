@@ -3,7 +3,8 @@
 These guard the *class* of bug behind project_placeholder_collision_cross_segment:
 independent per-segment placeholder numbering producing colliding tokens. They
 probe the nastier orderings (a minted label later clashing with a corp-LLM
-label, multi-way collisions, repeated originals) rather than the happy path.
+label, multi-way collisions, repeated originals, user-typed literal forbid) rather
+than the happy path.
 """
 
 from corp_llm_gateway.sanitizer.placeholder_allocator import (
@@ -55,6 +56,43 @@ def test_long_collision_chain_stays_bijective() -> None:
         assert ph not in seen  # never reuse a token for a different original
         seen.add(ph)
     assert len(seen) == 50
+
+
+def test_forbid_forces_mint_past_forbidden_label() -> None:
+    # User typed [EMAIL_001] verbatim; the corp-LLM proposes [EMAIL_001] for a
+    # real secret. The allocator must mint [EMAIL_002] instead.
+    a = RequestPlaceholderAllocator()
+    a.forbid(["[EMAIL_001]"])
+    result = a.remap((("secret@corp.example", "[EMAIL_001]"),))
+    assert result == (("secret@corp.example", "[EMAIL_002]"),)
+
+
+def test_forbid_skips_corp_llm_proposed_label_during_minting() -> None:
+    # [EMAIL_001] is forbidden (user-typed literal). The corp-LLM proposes
+    # [EMAIL_001] for original A (minted -> [EMAIL_002]) and then proposes
+    # [EMAIL_002] for original B (already minted for A, so B gets [EMAIL_003]).
+    a = RequestPlaceholderAllocator()
+    a.forbid(["[EMAIL_001]"])
+    r1 = a.remap((("A@corp.example", "[EMAIL_001]"),))
+    assert r1 == (("A@corp.example", "[EMAIL_002]"),)
+    r2 = a.remap((("B@corp.example", "[EMAIL_002]"),))
+    assert r2 == (("B@corp.example", "[EMAIL_003]"),)
+
+
+def test_forbid_multiple_labels() -> None:
+    # Both [EMAIL_001] and [EMAIL_002] are forbidden; first available is [EMAIL_003].
+    a = RequestPlaceholderAllocator()
+    a.forbid(["[EMAIL_001]", "[EMAIL_002]"])
+    result = a.remap((("x@corp.example", "[EMAIL_001]"),))
+    assert result == (("x@corp.example", "[EMAIL_003]"),)
+
+
+def test_forbid_does_not_affect_different_family() -> None:
+    # Forbidding [EMAIL_001] must not block [NAME_001] in a different family.
+    a = RequestPlaceholderAllocator()
+    a.forbid(["[EMAIL_001]"])
+    result = a.remap((("alice", "[NAME_001]"),))
+    assert result == (("alice", "[NAME_001]"),)
 
 
 def test_distinct_originals_never_share_after_arbitrary_mix() -> None:

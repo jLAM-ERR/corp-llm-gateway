@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from corp_llm_gateway.sanitizer.content_blocks import (
+    collect_text,
     desanitize_content,
     sanitize_content,
 )
@@ -18,6 +19,87 @@ class MockSanitizeResult:
     pairs: tuple[tuple[str, str], ...] = ()
     cache_a_hit: bool = False
     skipped: bool = False
+
+
+# ---- collect_text (read-only pre-scan) --------------------------------------
+
+
+def test_collect_text_str() -> None:
+    assert collect_text("hello world") == ["hello world"]
+
+
+def test_collect_text_none() -> None:
+    assert collect_text(None) == []
+
+
+def test_collect_text_int() -> None:
+    assert collect_text(42) == []
+
+
+def test_collect_text_empty_list() -> None:
+    assert collect_text([]) == []
+
+
+def test_collect_text_list_text_block() -> None:
+    assert collect_text([{"type": "text", "text": "hello"}]) == ["hello"]
+
+
+def test_collect_text_list_skips_non_text_blocks() -> None:
+    content = [
+        {"type": "text", "text": "keep me"},
+        {"type": "image_url", "image_url": {"url": "https://..."}},
+        {"type": "tool_use", "id": "t1", "name": "fn", "input": {}},
+    ]
+    assert collect_text(content) == ["keep me"]
+
+
+def test_collect_text_list_skips_non_dict_items() -> None:
+    assert collect_text([{"type": "text", "text": "a"}, "plain", 1]) == ["a"]
+
+
+def test_collect_text_tool_result_str_content() -> None:
+    content = [{"type": "tool_result", "content": "some text"}]
+    assert collect_text(content) == ["some text"]
+
+
+def test_collect_text_tool_result_list_content() -> None:
+    content = [
+        {
+            "type": "tool_result",
+            "content": [
+                {"type": "text", "text": "inner"},
+                {"type": "image_url", "image_url": {"url": "https://..."}},
+            ],
+        }
+    ]
+    assert collect_text(content) == ["inner"]
+
+
+def test_collect_text_bare_dict_text_block() -> None:
+    assert collect_text({"type": "text", "text": "bare"}) == ["bare"]
+
+
+def test_collect_text_bare_dict_tool_result() -> None:
+    block = {"type": "tool_result", "content": "nested"}
+    assert collect_text(block) == ["nested"]
+
+
+def test_collect_text_bare_dict_non_text_type() -> None:
+    assert collect_text({"type": "image_url", "image_url": {}}) == []
+
+
+def test_collect_text_multiple_text_blocks() -> None:
+    content = [
+        {"type": "text", "text": "first"},
+        {"type": "text", "text": "second"},
+    ]
+    assert collect_text(content) == ["first", "second"]
+
+
+def test_collect_text_does_not_mutate() -> None:
+    content = [{"type": "text", "text": "hello"}]
+    collect_text(content)
+    assert content == [{"type": "text", "text": "hello"}]
 
 
 # ---- Async sanitize tests ---------------------------------------------------

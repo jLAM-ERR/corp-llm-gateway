@@ -1,6 +1,15 @@
 import re
 from collections.abc import Iterable
 
+_PLACEHOLDER_FIND_RE = re.compile(r"\[[A-Z][A-Z0-9_]*_\d{3,}\]")
+
+
+def find_placeholder_literals(text: str) -> list[str]:
+    """All [FAMILY_NNN]-format substrings literally present in `text`
+    (e.g. a user who typed '[EMAIL_001]' in their prompt). Used to forbid
+    a real redaction from reusing a token the user typed verbatim."""
+    return _PLACEHOLDER_FIND_RE.findall(text)
+
 
 def sort_placeholders_by_descending_length(placeholders: Iterable[str]) -> list[str]:
     """Return placeholders sorted by descending length, stable on ties.

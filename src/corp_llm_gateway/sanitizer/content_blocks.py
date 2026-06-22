@@ -35,6 +35,11 @@ async def _sanitize_block(
     if block_type == "tool_result" and "content" in block:
         new_sub, sub_results = await sanitize_content(block["content"], sanitize_one)
         return {**block, "content": new_sub}, sub_results
+    # SECURITY (known gap, not yet handled): `tool_use` blocks carry an `input`
+    # dict that is passed through UN-sanitized. In a multi-turn flow a client may
+    # replay a restored original inside a tool-call arg, which would then egress
+    # un-redacted. Sanitizing tool_use.input is a separate follow-up task. See
+    # project_tool_use_input_unsanitized in session memory.
     # Image, image_url, tool_use, document, unknown → pass through unchanged.
     return block, []
 
@@ -91,6 +96,39 @@ async def sanitize_content(
 
     # Genuinely unknown non-dict/non-str/non-list → pass through unchanged.
     return content, []
+
+
+def collect_text(content: Any) -> list[str]:
+    """Collect every sanitizable text string from a content value
+    (str | list[block] | tool_result-nested | bare block dict), read-only.
+    Mirrors sanitize_content's traversal so the pre-scan sees exactly what
+    will be sanitized."""
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        out: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            block_type = item.get("type")
+            if block_type == "text" and isinstance(item.get("text"), str):
+                out.append(item["text"])
+            elif block_type == "tool_result" and "content" in item:
+                out.extend(collect_text(item["content"]))
+        return out
+    if isinstance(content, dict):
+        block_type = content.get("type")
+        if block_type == "text" and isinstance(content.get("text"), str):
+            return [content["text"]]
+        if block_type == "tool_result" and "content" in content:
+            return collect_text(content["content"])
+        # SECURITY (known gap, not yet handled): `tool_use` blocks carry an `input`
+        # dict that is passed through UN-sanitized. In a multi-turn flow a client may
+        # replay a restored original inside a tool-call arg, which would then egress
+        # un-redacted. Sanitizing tool_use.input is a separate follow-up task. See
+        # project_tool_use_input_unsanitized in session memory.
+        return []
+    return []
 
 
 def desanitize_content(

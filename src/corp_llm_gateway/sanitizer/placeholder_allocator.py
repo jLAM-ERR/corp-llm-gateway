@@ -25,11 +25,10 @@ session memory.
 
 from __future__ import annotations
 
-import re
+from collections.abc import Iterable
 
-# A standard placeholder is ``[FAMILY_NNN]`` where FAMILY may itself contain
-# underscores (e.g. ``API_KEY``); the trailing ``_<digits>`` is the index.
-_LABEL_RE = re.compile(r"^\[(?P<family>.+)_(?P<index>\d+)\]$")
+from corp_llm_gateway.sanitizer.placeholder import placeholder_family
+
 _FALLBACK_FAMILY = "REDACTED"
 
 
@@ -43,6 +42,20 @@ class RequestPlaceholderAllocator:
     def __init__(self) -> None:
         self._by_original: dict[str, str] = {}
         self._by_placeholder: dict[str, str] = {}
+        self._forbidden: set[str] = set()
+        self._family_next: dict[str, int] = {}
+
+    def forbid(self, labels: Iterable[str]) -> None:
+        """Mark labels that must never be assigned (they appear literally in
+        the request input). SECURITY: prevents a real redaction's token from
+        being indistinguishable from a user-typed literal on the reverse pass;
+        today conversation_id == request_id so a collision stays within one
+        request, but this would become a cross-context leak if conversation_id
+        widens (see docs/conversation-id.md)."""
+        self._forbidden.update(labels)
+
+    def _is_taken(self, label: str) -> bool:
+        return label in self._by_placeholder or label in self._forbidden
 
     def remap(self, pairs: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
         """Return request-canonical ``(original, placeholder)`` pairs.
@@ -60,18 +73,16 @@ class RequestPlaceholderAllocator:
             # Same original seen before (possibly in another segment): reuse its
             # placeholder so the model sees one consistent token for it.
             return existing
-        chosen = placeholder if placeholder not in self._by_placeholder else self._mint(placeholder)
+        chosen = placeholder if not self._is_taken(placeholder) else self._mint(placeholder)
         self._by_original[original] = chosen
         self._by_placeholder[chosen] = original
         return chosen
 
     def _mint(self, placeholder: str) -> str:
         """Allocate a fresh unused placeholder in the same label family."""
-        match = _LABEL_RE.match(placeholder)
-        family = match.group("family") if match else _FALLBACK_FAMILY
-        index = 1
-        while True:
-            candidate = f"[{family}_{index:03d}]"
-            if candidate not in self._by_placeholder:
-                return candidate
+        family = placeholder_family(placeholder) or _FALLBACK_FAMILY
+        index = self._family_next.get(family, 1)
+        while self._is_taken(f"[{family}_{index:03d}]"):
             index += 1
+        self._family_next[family] = index + 1
+        return f"[{family}_{index:03d}]"

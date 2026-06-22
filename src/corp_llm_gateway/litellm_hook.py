@@ -41,11 +41,16 @@ from corp_llm_gateway.sanitizer import (
     StreamingDesanitizer,
 )
 from corp_llm_gateway.sanitizer.content_blocks import (
+    collect_text,
     desanitize_content,
     sanitize_content,
 )
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
-from corp_llm_gateway.sanitizer.placeholder import apply_pairs, placeholder_family
+from corp_llm_gateway.sanitizer.placeholder import (
+    apply_pairs,
+    find_placeholder_literals,
+    placeholder_family,
+)
 from corp_llm_gateway.sanitizer.placeholder_allocator import (
     RequestPlaceholderAllocator,
 )
@@ -299,6 +304,24 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # project_placeholder_collision_cross_segment.
         allocator = RequestPlaceholderAllocator()
 
+        # SECURITY: forbid any placeholder a real redaction might reuse that the
+        # user already typed literally in the input — otherwise the user's literal
+        # is reversed to the original, and it can be a sanitizer-probing attempt.
+        input_literals: list[str] = []
+        for _m in messages:
+            if isinstance(_m, dict):
+                for _seg in collect_text(_m.get("content")):
+                    input_literals.extend(find_placeholder_literals(_seg))
+        for _seg in collect_text(data.get("system")):
+            input_literals.extend(find_placeholder_literals(_seg))
+        if input_literals:
+            allocator.forbid(input_literals)
+            logger.warning(
+                "litellm_pre_call_input_placeholder_literal_detected request_id=%s count=%d",
+                request_id,
+                len(input_literals),
+            )
+
         async def sanitize_one(text: str) -> SanitizeResult:
             result = await self._orch.sanitize(
                 text,
@@ -378,16 +401,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
             messages[i] = {**msg, "content": new_content}
             # Merge every segment result; emit one done-log per MESSAGE (D).
-            msg_redaction_count = 0
+            msg_placeholders: set[str] = set()
             for result in results:
                 self._merge_into_state(state, result)
-                msg_redaction_count += len(result.pairs)
+                msg_placeholders.update(ph for _, ph in result.pairs)
             logger.info(
                 "litellm_pre_call_message_sanitize_done request_id=%s "
                 "message_index=%d redaction_count=%d",
                 request_id,
                 i,
-                msg_redaction_count,
+                len(msg_placeholders),
             )
 
         # Sanitize system field if present and non-empty (E: truthy guard skips ""/[]).
