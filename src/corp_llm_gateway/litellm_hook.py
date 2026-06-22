@@ -45,6 +45,10 @@ from corp_llm_gateway.sanitizer.content_blocks import (
     sanitize_content,
 )
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
+from corp_llm_gateway.sanitizer.placeholder import apply_pairs
+from corp_llm_gateway.sanitizer.placeholder_allocator import (
+    RequestPlaceholderAllocator,
+)
 from corp_llm_gateway.tokens import (
     AuthError,
     AuthMiddleware,
@@ -285,11 +289,37 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         )
         self._req_state[request_id] = state
 
+        # One allocator per request. The corp-LLM numbers placeholders from
+        # [LABEL_001] independently for each segment's sanitize() call, so
+        # distinct originals across segments (e.g. a system-blob email and a
+        # message email) collide on the same token. Remap every segment to a
+        # request-canonical placeholder: the same original reuses one token and
+        # different originals never share one — otherwise de-sanitization
+        # (keyed by placeholder) can only restore one of them. See
+        # project_placeholder_collision_cross_segment.
+        allocator = RequestPlaceholderAllocator()
+
         async def sanitize_one(text: str) -> SanitizeResult:
-            return await self._orch.sanitize(
+            result = await self._orch.sanitize(
                 text,
                 team_id=ctx.team_id,
                 conversation_id=request_id,
+            )
+            if not result.pairs:
+                return result
+            canonical_pairs = allocator.remap(result.pairs)
+            if canonical_pairs == result.pairs:
+                return result
+            # Re-derive the sanitized text from the ORIGINAL segment text using
+            # the canonical labels. Re-applying to the original (rather than
+            # renaming labels in the already-substituted text) avoids any
+            # chained-replacement hazard when a minted label coincides with
+            # another segment's token.
+            return SanitizeResult(
+                sanitized_text=apply_pairs(text, canonical_pairs),
+                pairs=canonical_pairs,
+                cache_a_hit=result.cache_a_hit,
+                skipped=result.skipped,
             )
 
         for i, msg in enumerate(messages):

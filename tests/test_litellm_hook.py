@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -85,6 +86,43 @@ def _corp_llm_unreachable() -> CorpLlmClient:
     return CorpLlmClient("https://corp-llm.example", model="m", http=http)
 
 
+def _corp_llm_email_per_segment() -> CorpLlmClient:
+    """A corp LLM that redacts whatever single email it finds in the segment
+    to ``[EMAIL_001]`` — modelling the real per-call numbering that makes two
+    different emails in two segments collide on the same token."""
+    email_re = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seg_text = body["messages"][-1]["content"]
+        m = email_re.search(seg_text)
+        pairs = [{"original": m.group(0), "replacement": "[EMAIL_001]"}] if m else []
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": json.dumps({"pairs": pairs}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+
 def _build_guardrail(
     pairs: list[tuple[str, str]] | None = None,
     *,
@@ -165,6 +203,103 @@ async def test_pre_call_replaces_message_content_with_sanitized() -> None:
     data = _data_with_token("tok-1", content="hello alice")
     out = await g.pre_call(data)
     assert out["messages"][0]["content"] == "hello [NAME_001]"
+
+
+async def test_pre_call_cross_segment_email_collision_split_and_restored() -> None:
+    """Regression for the cross-segment placeholder collision: a system-blob
+    email and a user-message email both get [EMAIL_001] from their independent
+    per-segment corp-LLM calls. The per-request allocator must split them so
+    (a) egress uses two distinct tokens and (b) BOTH restore on the reverse."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content="contact customer b@corp.example",
+        system="admin is a@corp.example",
+    )
+    out = await g.pre_call(data)
+
+    msg_text = out["messages"][0]["content"]
+    sys_text = out["system"]
+    # Both originals are redacted out...
+    assert "a@corp.example" not in sys_text
+    assert "b@corp.example" not in msg_text
+    # ...to DIFFERENT tokens (the collision is resolved).
+    msg_ph = re.search(r"\[EMAIL_\d+\]", msg_text).group(0)
+    sys_ph = re.search(r"\[EMAIL_\d+\]", sys_text).group(0)
+    assert msg_ph != sys_ph, (msg_ph, sys_ph)
+
+    # The reverse path restores EACH token to its own original.
+    chunks_in = [{"choices": [{"delta": {"content": f"msg={msg_ph} sys={sys_ph}"}}]}]
+    out_text = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+    assert out_text == "msg=b@corp.example sys=a@corp.example"
+
+
+async def test_pre_call_same_email_two_segments_reuses_one_token() -> None:
+    """The other half of the bijection: the SAME original in two segments must
+    reuse ONE token (not be split into two), so the model sees it consistently."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content="email a@corp.example",
+        system="a@corp.example is admin",
+    )
+    out = await g.pre_call(data)
+    msg_ph = re.search(r"\[EMAIL_\d+\]", out["messages"][0]["content"]).group(0)
+    sys_ph = re.search(r"\[EMAIL_\d+\]", out["system"]).group(0)
+    assert msg_ph == sys_ph == "[EMAIL_001]"
+
+
+async def test_pre_call_collision_across_blocks_in_one_message() -> None:
+    """Collision is not only system-vs-message: two text blocks in the SAME
+    message carry different emails that both come back [EMAIL_001]."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content=[
+            {"type": "text", "text": "first a@corp.example"},
+            {"type": "text", "text": "second b@corp.example"},
+        ],
+    )
+    out = await g.pre_call(data)
+    blocks = out["messages"][0]["content"]
+    ph0 = re.search(r"\[EMAIL_\d+\]", blocks[0]["text"]).group(0)
+    ph1 = re.search(r"\[EMAIL_\d+\]", blocks[1]["text"]).group(0)
+    assert ph0 != ph1, (ph0, ph1)
+
+
+async def test_pre_call_collision_message_vs_tool_result() -> None:
+    """tool_result content is sanitized via the walker recursion; an email
+    there must not collide with a different email in a sibling text block."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content=[
+            {"type": "text", "text": "user a@corp.example"},
+            {"type": "tool_result", "content": "tool saw b@corp.example"},
+        ],
+    )
+    out = await g.pre_call(data)
+    blocks = out["messages"][0]["content"]
+    text_ph = re.search(r"\[EMAIL_\d+\]", blocks[0]["text"]).group(0)
+    tr_ph = re.search(r"\[EMAIL_\d+\]", blocks[1]["content"]).group(0)
+    assert text_ph != tr_ph, (text_ph, tr_ph)
+
+
+async def test_post_call_stream_unmapped_placeholder_passes_through() -> None:
+    """A placeholder the model invented (never in the request mapping) must
+    pass through untouched — only known tokens are reversed."""
+    g, _ = _build_guardrail([("a@x", "[EMAIL_001]")])
+    data = _data_with_token("tok-1", content="a@x")
+    await g.pre_call(data)
+    chunks_in = [
+        {"choices": [{"delta": {"content": "known [EMAIL_001] hallucinated [EMAIL_999]"}}]}
+    ]
+    out_text = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+    assert out_text == "known a@x hallucinated [EMAIL_999]"
 
 
 async def test_pre_call_rejects_non_list_messages() -> None:
