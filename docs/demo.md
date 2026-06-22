@@ -27,6 +27,15 @@ This is a ~15-minute terminal-driven walkthrough for colleagues — security, op
    # (e.g., https://corp-llm.corp.lan)
    ```
 
+   TLS to the corp GLM is **verified**, not bypassed. The corp LLM presents a
+   cert signed by the internal corporate CA, so the demo trusts that chain
+   (`crt/corp-ca-bundle.pem`, committed in the repo) rather than disabling
+   verification: the gateway's httpx client verifies against `CORP_LLM_CA_BUNDLE`,
+   and the LiteLLM container builds a combined certifi-plus-corp-CA bundle and
+   points `SSL_CERT_FILE` at it for its `aiohttp` upstream. Both are wired in
+   `docker-compose.demo.yml` — no `.env.demo` change is needed. (The old
+   `SSL_VERIFY=False` opt-out is gone.)
+
 3. Cold-boot the stack (~3–5 minutes on first run):
    ```bash
    scripts/demo.sh up
@@ -34,6 +43,14 @@ This is a ~15-minute terminal-driven walkthrough for colleagues — security, op
    This pulls images, creates volumes, seeds Langfuse with demo credentials, and prints the URLs.
 
 4. Note the printed URLs: http://localhost:4000 (LiteLLM proxy), http://localhost:3000 (Langfuse).
+
+5. (Optional, useful in a third shell) Tail the redaction flow as it happens:
+   ```bash
+   scripts/demo.sh logs
+   ```
+   This follows the LiteLLM container's logs filtered to the sanitize/desanitize
+   flow and audit lines, with healthcheck access-log spam suppressed — a
+   terminal-side view of the same activity you'll watch land in Langfuse.
 
 ## Two-Shell Layout
 
@@ -91,6 +108,10 @@ Both commands are safe; they do not touch the git working tree or source code.
 - **LiteLLM container fails to start** — Usually a network issue during `pip install -e /pkg`. Check logs: `docker compose -f docker-compose.demo.yml logs litellm`. Retry `scripts/demo.sh up`.
 
 - **First boot takes >5 minutes** — Expected on first run; ClickHouse and Langfuse images are large. Subsequent boots (~30s) are warm.
+
+- **"Claude Code printed my real email / API key — did it leak?"** — No. Claude Code's answer shows the **restored original** value because the `post_call` desanitizer rebuilds it on the way back; the placeholder existed only on the gateway↔corp-LLM hop, and the corp LLM never saw the secret. To *see* the redaction, use the Stage 0 `sanitize` helper (before→after) or the Langfuse `placeholder_list`, not the rendered answer. Per-prompt detail in [`scripts/demo-prompts.md`](../scripts/demo-prompts.md).
+
+- **Extra traces with `redaction_count: 0`** — Claude Code fires small warm-up / probe requests on its own; these land as separate traces and are neither your prompt nor a redaction failure. Identify your prompt's trace by `prompt_token_count` and expected `redaction_count`, not by "the latest trace." See [`scripts/demo-prompts.md`](../scripts/demo-prompts.md).
 
 ## Non-Goals
 

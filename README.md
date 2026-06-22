@@ -81,7 +81,7 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
 helm/corp-llm-gateway/  Helm chart (deployment, service, configmap, NetworkPolicy, CoreDNS sinkhole)
 docs/                   plan + audit-schema + ops/* + rbac-matrix + data-flow + integration docs
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                  pytest, pytest-asyncio mode=auto (265 tests, ~16s)
+tests/                  pytest, pytest-asyncio mode=auto (546 tests, ~16s)
 ```
 
 ## Developer quickstart (laptop)
@@ -188,7 +188,9 @@ Capacity sizing per phase (Phase 0 alpha → Phase 3 GA at 1000 devs / 50 RPS ag
 
 For a guided ~15-min walkthrough of the gateway end-to-end — request round-trip,
 audit pipeline lit up in Langfuse, fail-closed posture — bring up the parallel
-demo stack: `scripts/demo.sh up`. Full setup, prompt set, and troubleshooting
+demo stack: `scripts/demo.sh up`. To watch the redaction flow as it happens, run
+`scripts/demo.sh logs` (tails the LiteLLM container filtered to the
+sanitize/desanitize flow + audit). Full setup, prompt set, and troubleshooting
 in [`docs/demo.md`](docs/demo.md). The demo stack lives in `docker-compose.demo.yml`
 and is independent of the CI compose at `docker-compose.yml`.
 
@@ -263,6 +265,7 @@ The corp token lives on disk at `~/.corp-llm-gateway/token` (issued by `install.
 | [`docs/x-corp-auth.md`](docs/x-corp-auth.md) | corp token lifecycle, per-pattern freshness, failure modes |
 | [`docs/conversation-id.md`](docs/conversation-id.md) | `conversation_id` behavior today + how to wire a real session ID |
 | [`docs/audit-schema.md`](docs/audit-schema.md) | audit event schema + ALWAYS / CONDITIONAL / NEVER field classification |
+| [`docs/security.md`](docs/security.md) | sanitization coverage, audit-pipeline guarantees, SIEM / Langfuse handling, known config gaps |
 | [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md) | how to write per-team `replace.md` rules files |
 | [`docs/rbac-matrix.md`](docs/rbac-matrix.md) | who can do what (devs / team leads / operators / security) |
 | [`docs/remaining-steps.md`](docs/remaining-steps.md) | running checklist of v1 work left |
@@ -277,7 +280,7 @@ Requires Python 3.12+.
 ```bash
 pip install -e ".[dev]"
 pre-commit install
-PYTHONPATH=src .venv/bin/pytest tests/ -q     # 265 tests, ~16s
+PYTHONPATH=src .venv/bin/pytest tests/ -q     # 546 tests, ~16s
 PYTHONPATH=src .venv/bin/ruff check src tests
 ```
 

@@ -31,7 +31,7 @@ src/corp_llm_gateway/
   tokens/       schema.sql + AuthMiddleware + TokenIssuer
   litellm_hook.py  CorpLlmGuardrail — LiteLLM callback adapter (M1-7)
 helm/corp-llm-gateway/   Helm chart (deployment, service, configmap, NetworkPolicy, CoreDNS sinkhole)
-docs/                    plan + audit-schema + ops/* + rbac-matrix + replace-md-authoring + remaining-steps
+docs/                    plan + audit-schema + security + ops/* + rbac-matrix + replace-md-authoring + remaining-steps
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
 tests/                   pytest, pytest-asyncio mode=auto
 ```
@@ -93,7 +93,8 @@ Wired in `pyproject.toml` `[project.scripts]`:
 ## Config resolution
 
 Every env var the app reads (`CORP_LLM_AUTH_PROVIDER`, `CORP_LLM_BEARER_TOKEN`,
-`CORP_GATEWAY_URL`, `CORP_GATEWAY_TOKEN_FILE`, …) resolves through:
+`CORP_GATEWAY_URL`, `CORP_GATEWAY_TOKEN_FILE`, `CORP_LLM_CA_BUNDLE` (path to a
+PEM CA bundle — verify corp-LLM TLS against an internal CA), …) resolves through:
 
 1. env var
 2. `$CORP_LLM_GATEWAY_CONFIG_FILE` → `~/.corp-llm-gateway/config.toml` →
@@ -194,4 +195,7 @@ head -3 docs/plans/20260507-external-sanitizer-gateway-v1.md
 
 # Cold-boot the colleague demo stack (~3-5 min first time)
 scripts/demo.sh up
+
+# Watch only the sanitize/desanitize flow (tails litellm, filtered)
+scripts/demo.sh logs
 ```
