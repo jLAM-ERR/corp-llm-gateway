@@ -1480,3 +1480,156 @@ async def test_pre_call_logs_sanitize_done_per_block(
     # Verify log output contains sanitization info
     assert "litellm_pre_call_message_sanitize_done" in caplog.text
     assert "redaction_count" in caplog.text
+
+
+# ---- New adversarial tests (tasks 1-4) ----------------------------------------
+
+
+async def test_nested_tool_result_list_collision_split_and_restored() -> None:
+    """Task 1: two text blocks inside a tool_result's list content carry
+    different emails; both come back [EMAIL_001] from per-segment corp-LLM
+    calls. The allocator must split them to distinct tokens, and
+    post_call_stream must restore both originals."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    content = [
+        {
+            "type": "tool_result",
+            "content": [
+                {"type": "text", "text": "first a@corp.example"},
+                {"type": "text", "text": "second b@corp.example"},
+            ],
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    nested = out["messages"][0]["content"][0]["content"]
+    ph0 = re.search(r"\[EMAIL_\d+\]", nested[0]["text"]).group(0)
+    ph1 = re.search(r"\[EMAIL_\d+\]", nested[1]["text"]).group(0)
+    assert ph0 != ph1, f"collision: both got {ph0!r}"
+
+    # Originals must be redacted from each block.
+    assert "a@corp.example" not in nested[0]["text"]
+    assert "b@corp.example" not in nested[1]["text"]
+
+    # post_call_stream must restore both.
+    chunks_in = [{"choices": [{"delta": {"content": f"first={ph0} second={ph1}"}}]}]
+    out_text = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+    assert out_text == "first=a@corp.example second=b@corp.example", (
+        f"round-trip failed: {out_text!r}"
+    )
+
+
+async def test_openai_gpt4o_multimodal_text_parts_collision_split_image_passthrough() -> None:
+    """Task 2: gpt-4o multimodal content with two text parts and one image_url.
+    The two text parts carry different emails that both come back [EMAIL_001];
+    the allocator must split them. The image_url block must be byte-identical
+    on egress. Both emails must restore via post_call_stream."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    image_block = {"type": "image_url", "image_url": {"url": "http://img.example/x.png"}}
+    content = [
+        {"type": "text", "text": "a@corp.example"},
+        image_block,
+        {"type": "text", "text": "b@corp.example"},
+    ]
+    data = _data_with_token("tok-1", content=content, model="gpt-4o")
+    out = await g.pre_call(data)
+
+    out_blocks = out["messages"][0]["content"]
+    assert len(out_blocks) == 3
+
+    ph0 = re.search(r"\[EMAIL_\d+\]", out_blocks[0]["text"]).group(0)
+    ph1 = re.search(r"\[EMAIL_\d+\]", out_blocks[2]["text"]).group(0)
+    assert ph0 != ph1, f"collision: both text parts got {ph0!r}"
+
+    # image_url block must be byte-identical (unchanged dict).
+    assert out_blocks[1] == image_block
+
+    # Both emails must restore via post_call_stream.
+    chunks_in = [{"choices": [{"delta": {"content": f"{ph0} / {ph1}"}}]}]
+    out_text = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+    assert out_text == "a@corp.example / b@corp.example", f"round-trip failed: {out_text!r}"
+
+
+async def test_substring_originals_longer_replaced_first_no_corruption() -> None:
+    """Task 3 / M1-9: when one original is a substring of another, the longer
+    one must be replaced first on the forward pass so the shorter one doesn't
+    partially corrupt the longer original. Same guard applies to the reverse
+    pass (length-descending sort on placeholders)."""
+    g, _ = _build_guardrail(
+        [
+            ("john.doe@corp.example", "[EMAIL_001]"),
+            ("john", "[NAME_001]"),
+        ]
+    )
+    data = _data_with_token("tok-1", content="contact john.doe@corp.example or just john")
+    out = await g.pre_call(data)
+
+    sanitized = out["messages"][0]["content"]
+    assert sanitized == "contact [EMAIL_001] or just [NAME_001]", (
+        f"forward substitution corrupted: {sanitized!r}"
+    )
+
+    # Reverse: post_call_stream must restore both without one shadowing the other.
+    chunks_in = [{"choices": [{"delta": {"content": "[EMAIL_001] / [NAME_001]"}}]}]
+    out_text = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+    assert out_text == "john.doe@corp.example / john", (
+        f"reverse substitution corrupted: {out_text!r}"
+    )
+
+
+async def test_user_typed_placeholder_collides_with_real_redaction_known_limitation() -> None:
+    """Task 4: KNOWN LIMITATION — a user-typed placeholder token is
+    indistinguishable from a real redaction token.
+
+    When the user's message contains the literal string "[EMAIL_001]" AND
+    the corp-LLM also redacts a@corp.example to [EMAIL_001], the sanitized
+    egress contains two identical tokens. The reverse mapping cannot tell
+    them apart, so the user's literal "[EMAIL_001]" is also reversed to
+    a@corp.example on egress.
+
+    This is NOT a regression from the allocator. The allocator correctly
+    handles per-segment collisions between DIFFERENT originals. The problem
+    here is that a user-typed literal is semantically ambiguous with a real
+    placeholder — both are the same string in the reverse map.
+
+    Mitigation note: the allocator could skip any label that appears
+    verbatim in the segment text when minting a fresh placeholder (pre-
+    empting the collision before it is recorded). That would require
+    scanning segment text for existing placeholder patterns before
+    accepting a corp-LLM-proposed label. Tracked as a design decision.
+    """
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    # The user's message contains: a real email + a literal placeholder string.
+    data = _data_with_token(
+        "tok-1", content="My email a@corp.example and the marker [EMAIL_001] in docs"
+    )
+    out = await g.pre_call(data)
+
+    sanitized = out["messages"][0]["content"]
+    # The corp-LLM redacts a@corp.example -> [EMAIL_001]. The user's literal
+    # "[EMAIL_001]" is unchanged (it's already the placeholder text). The
+    # sanitized content therefore contains "[EMAIL_001]" twice.
+    assert "[EMAIL_001]" in sanitized, f"redaction not applied: {sanitized!r}"
+
+    # Run a response chunk containing [EMAIL_001] through post_call_stream.
+    chunks_in = [{"choices": [{"delta": {"content": "[EMAIL_001]"}}]}]
+    out_text = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+
+    # KNOWN LIMITATION: the reverse map is keyed on the placeholder string.
+    # There is exactly one entry: [EMAIL_001] -> a@corp.example.
+    # Both the real redaction AND the user's literal are reversed to a@corp.example.
+    # The user's literal "[EMAIL_001]" in the response is corrupted — it becomes
+    # a@corp.example — even though it was never PII.
+    assert out_text == "a@corp.example", (
+        f"behavior changed from known limitation: got {out_text!r}, "
+        "expected 'a@corp.example' (user's literal reversed to original)"
+    )
