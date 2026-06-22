@@ -1,3 +1,4 @@
+import re
 from collections.abc import Iterable
 
 
@@ -24,3 +25,15 @@ def apply_pairs(text: str, pairs: Iterable[tuple[str, str]]) -> str:
     for original, placeholder in sorted(pairs, key=lambda p: -len(p[0])):
         text = text.replace(original, placeholder)
     return text
+
+
+_PLACEHOLDER_LABEL_RE = re.compile(r"^\[(?P<family>.+)_(?P<index>\d+)\]$")
+
+
+def placeholder_family(label: str) -> str | None:
+    """FAMILY of a [FAMILY_NNN] placeholder ('EMAIL' from '[EMAIL_001]'),
+    or None if not in that form. A category name only — never original
+    text, so it is safe for audit histograms. Keep the pattern in sync
+    with placeholder_allocator._LABEL_RE."""
+    m = _PLACEHOLDER_LABEL_RE.match(label)
+    return m.group("family") if m else None

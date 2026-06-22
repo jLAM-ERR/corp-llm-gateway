@@ -45,7 +45,7 @@ from corp_llm_gateway.sanitizer.content_blocks import (
     sanitize_content,
 )
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
-from corp_llm_gateway.sanitizer.placeholder import apply_pairs
+from corp_llm_gateway.sanitizer.placeholder import apply_pairs, placeholder_family
 from corp_llm_gateway.sanitizer.placeholder_allocator import (
     RequestPlaceholderAllocator,
 )
@@ -554,10 +554,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             prompt_token_count=prompt_tokens,
             completion_token_count=completion_tokens,
             redaction_count=(state.redaction_count if state else 0),
+            finding_label_counts=(_label_counts(state.placeholders) if state else {}),
             cache_a_hit=(state.cache_a_hit if state else False),
             status=status,  # type: ignore[arg-type]
             placeholder_list=(
-                tuple(state.placeholders) if (state and state.placeholders) else None
+                tuple(sorted(state.placeholders)) if (state and state.placeholders) else None
             ),
         )
         await self._audit.emit(event)
@@ -615,11 +616,14 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
     @staticmethod
     def _merge_into_state(state: _RequestState, result: SanitizeResult) -> None:
-        state.redaction_count += len(result.pairs)
-        state.placeholders.extend(p for _, p in result.pairs)
+        # Count DISTINCT secrets: one canonical placeholder per distinct original.
+        # The reverse mapping still keeps every pair so de-sanitization is complete.
+        for _, placeholder in result.pairs:
+            if placeholder not in state.placeholders:
+                state.placeholders.append(placeholder)
+        state.redaction_count = len(state.placeholders)
         state.cache_a_hit = state.cache_a_hit or result.cache_a_hit
-        merged_pairs = state.mapping.pairs + result.pairs
-        state.mapping = StrategyResult(pairs=merged_pairs)
+        state.mapping = StrategyResult(pairs=state.mapping.pairs + result.pairs)
 
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:
@@ -627,6 +631,14 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
 
 # ---- helpers --------------------------------------------------------------
+
+
+def _label_counts(placeholders: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for ph in placeholders:
+        family = placeholder_family(ph) or "UNKNOWN"
+        counts[family] = counts.get(family, 0) + 1
+    return counts
 
 
 _REQUEST_ID_KEY = "_corp_gateway_request_id"

@@ -1633,3 +1633,73 @@ async def test_user_typed_placeholder_collides_with_real_redaction_known_limitat
         f"behavior changed from known limitation: got {out_text!r}, "
         "expected 'a@corp.example' (user's literal reversed to original)"
     )
+
+
+# ---- Audit distinct-secret + finding_label_counts tests ----------------------
+
+
+async def test_audit_same_email_two_segments_redaction_count_one() -> None:
+    """Same email in system + message must produce redaction_count==1, one placeholder."""
+    g, sink = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content="contact a@corp.example",
+        system="a@corp.example is admin",
+    )
+    await g.pre_call(data)
+    start = time.time()
+    await g.audit(data, {}, start_time=start, end_time=start, status="ok")
+
+    rec = sink.records[0]
+    assert rec["redaction_count"] == 1
+    assert rec["placeholder_list"] == ["[EMAIL_001]"]
+    assert rec["finding_label_counts"] == {"EMAIL": 1}
+
+
+async def test_audit_two_different_emails_redaction_count_two() -> None:
+    """Two DIFFERENT emails (system + message) -> redaction_count==2, two placeholders."""
+    g, sink = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content="contact b@corp.example",
+        system="a@corp.example is admin",
+    )
+    await g.pre_call(data)
+    start = time.time()
+    await g.audit(data, {}, start_time=start, end_time=start, status="ok")
+
+    rec = sink.records[0]
+    assert rec["redaction_count"] == 2
+    assert rec["finding_label_counts"] == {"EMAIL": 2}
+    assert len(rec["placeholder_list"]) == 2
+    assert len(set(rec["placeholder_list"])) == 2
+
+
+async def test_audit_mixed_families_label_counts() -> None:
+    """Mixed families: EMAIL + API_KEY -> finding_label_counts has both, redaction_count==2."""
+    g, sink = _build_guardrail([("a@x.com", "[EMAIL_001]"), ("SEKRET", "[API_KEY_001]")])
+    data = _data_with_token("tok-1", content="mail a@x.com key SEKRET")
+    await g.pre_call(data)
+    start = time.time()
+    await g.audit(data, {}, start_time=start, end_time=start, status="ok")
+
+    rec = sink.records[0]
+    assert rec["finding_label_counts"] == {"EMAIL": 1, "API_KEY": 1}
+    assert rec["redaction_count"] == 2
+
+
+async def test_audit_invariant_sum_equals_redaction_count_equals_placeholder_len() -> None:
+    """sum(finding_label_counts.values()) == redaction_count == len(placeholder_list)."""
+    g, sink = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content="contact b@corp.example",
+        system="a@corp.example is admin",
+    )
+    await g.pre_call(data)
+    start = time.time()
+    await g.audit(data, {}, start_time=start, end_time=start, status="ok")
+
+    rec = sink.records[0]
+    assert sum(rec["finding_label_counts"].values()) == rec["redaction_count"]
+    assert rec["redaction_count"] == len(rec["placeholder_list"])

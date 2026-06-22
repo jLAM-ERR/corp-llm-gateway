@@ -24,8 +24,8 @@ and Vector drops it.
 | `latency_ms` | int | Wall-clock from receive to last byte upstream |
 | `prompt_token_count` | int | From upstream response |
 | `completion_token_count` | int | From upstream response |
-| `redaction_count` | int | Number of placeholders applied across the request |
-| `finding_label_counts` | object\<string, int\> | `{"EMAIL": 2, "PERSON": 1}` style; label histogram only — no text |
+| `redaction_count` | int | Number of DISTINCT secrets redacted in the request (one per distinct original — NOT an occurrence count) |
+| `finding_label_counts` | object\<string, int\> | `{"EMAIL": 2, "PERSON": 1}` style; label histogram only — no text; always populated; `sum(values) == redaction_count` |
 | `cache_a_hit` | bool | Whether this request hit the dedup cache |
 | `gateway_version` | string | App version that handled the request |
 | `status` | string | `ok` / `failed` / `degraded` |
@@ -56,7 +56,7 @@ Present only under the conditions noted; absent otherwise.
 
 | Field | Condition | Description |
 |---|---|---|
-| `placeholder_list` | `redaction_count > 0` | List of placeholder strings only (e.g. `["[NAME_001]", "[EMAIL_002]"]`) — NEVER includes the originals |
+| `placeholder_list` | `redaction_count > 0` | Unique, sorted list of placeholder strings only (e.g. `["[EMAIL_001]", "[NAME_002]"]`) — NEVER includes the originals |
 | `error_code` | `status != "ok"` | Stable error code; no exception text |
 | `corp_llm_latency_ms` | corp-LLM path was taken | Sub-stage latency for capacity tuning |
 | `pre_pass_latency_ms` | pre-pass path was taken | Sub-stage latency |
