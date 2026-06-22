@@ -336,10 +336,11 @@ by construction; if one appears to, that is an M1-14 regression.
 
 | # | Gap | Severity |
 |---|---|---|
-| (a) | **Prod Helm `templates/configmap.yaml` has a DUPLICATE `transforms:` key.** The second `transforms:` block (declaring `to_langfuse`) re-declares the mapping key, so YAML keeps only the last value — `parse` and `enforce_audit_schema` are **dropped** from the parsed config. As written, the prod Vector pipeline would not parse logs or run the NEVER gate before the langfuse/s3 sinks. | **High** — would break the prod audit pipeline + bypass the Vector-side NEVER gate |
+| (a) | ~~Prod Helm `templates/configmap.yaml` had a DUPLICATE `transforms:` key that dropped `parse` + `enforce_audit_schema`.~~ **FIXED** — single `transforms:` block now (`parse` → `enforce_audit_schema` → `audit_only` → `to_langfuse`); `parse` is non-strict (tolerates plain-text uvicorn lines), an `audit_only` filter keeps non-audit events out of both sinks, and the Vector-side NEVER gate now mirrors the full in-process list (13 keys + `-`/`_` case variants). `langfuse` ← `to_langfuse`, `s3` ← `audit_only`. | **Resolved** |
 | (b) | **SIEM sink enabled in values but not defined in the configmap.** `audit.sinks.siem.enabled: true` has no corresponding `sinks.siem` in the Vector configmap; `audit_drop` alerting (M3-9) also pending. | **Medium** — SIEM monitoring (incl. leak-attempt alerts) not yet active |
 | (c) | **Streaming-response `tool_use` desanitization** (`input_json_delta`) not handled — model's NEW tool calls in a streamed response surface placeholders, not originals. | **Low** — functional gap, NOT a leak |
 | (d) | **`thinking` / `redacted_thinking` blocks not sanitized.** Model-generated; the model only ever saw placeholders. | **Low** — no original ever reaches these blocks |
 
-Items (a) and (b) are config fixes; (c) and (d) are sanitization follow-ups.
-All four are mirrored in [`remaining-steps.md`](remaining-steps.md).
+**(a) is now fixed** (configmap de-duplicated, NEVER gate completed, `audit_only`
+added). (b) is a config fix; (c) and (d) are sanitization follow-ups. These are
+mirrored in [`remaining-steps.md`](remaining-steps.md).

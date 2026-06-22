@@ -11,30 +11,63 @@ data:
         type: stdin
 
     transforms:
+      # Parse each stdin line as JSON. The gateway emits AuditEvent JSON
+      # (StdoutSink) interleaved with litellm's own JSON wrappers and plain-text
+      # uvicorn access logs. Non-strict parse (no `!`) so a plain-text line does
+      # not abort the event — it is flagged `_unparsable` and dropped by
+      # `audit_only` below.
       parse:
         type: remap
         inputs: [gateway_logs]
         source: |
-          . = parse_json!(.message)
+          parsed, err = parse_json(.message)
+          if err == null {
+            . = parsed
+          } else {
+            ._unparsable = true
+          }
 
+      # NEVER-fields gate. Mirrors src/corp_llm_gateway/audit/invariants.py
+      # (NEVER_FIELDS) and docs/audit-schema.md EXACTLY, including header-style
+      # case variants. Defence-in-depth: drop any record carrying mapping /
+      # original / credential data before it can reach a sink.
       enforce_audit_schema:
         type: filter
         inputs: [parse]
         condition: |
-          # NEVER fields per docs/audit-schema.md — drop record if any present
           !exists(.mapping) &&
           !exists(.mapping_table) &&
+          !exists(.pairs) &&
           !exists(.original_content) &&
           !exists(.unredacted_content) &&
+          !exists(.pre_sanitization) &&
           !exists(.replace_md) &&
+          !exists(.rule_values) &&
           !exists(.x_corp_auth) &&
+          !exists(."X-Corp-Auth") &&
           !exists(.corp_token) &&
-          !exists(.authorization)
+          !exists(.authorization) &&
+          !exists(.Authorization) &&
+          !exists(.cookie) &&
+          !exists(.Cookie) &&
+          !exists(.set_cookie) &&
+          !exists(."Set-Cookie")
 
-    transforms:
+      # Keep ONLY AuditEvent-shaped records: drop parse failures (plain-text
+      # uvicorn lines) and litellm's own JSON wrappers, so neither Langfuse nor
+      # the durable S3 store is polluted with non-audit events. An AuditEvent is
+      # uniquely identified by having both `request_id` and `redaction_count`.
+      audit_only:
+        type: filter
+        inputs: [enforce_audit_schema]
+        condition: |
+          !exists(._unparsable) &&
+          exists(.request_id) &&
+          exists(.redaction_count)
+
       to_langfuse:
         type: remap
-        inputs: [enforce_audit_schema]
+        inputs: [audit_only]
         source: |
           # Reshape our flat audit record into Langfuse's batch ingestion
           # event format (one trace + one generation per request).
@@ -109,7 +142,9 @@ data:
 
       s3:
         type: aws_s3
-        inputs: [enforce_audit_schema]
+        # Durable audit store gets the FLAT, gated, audit-only records (not the
+        # Langfuse-reshaped envelope).
+        inputs: [audit_only]
         bucket: {{ .Values.audit.sinks.s3.bucket | quote }}
         key_prefix: "{{ "{{ team_id }}" }}/dt=%Y-%m-%d/"
         compression: gzip
