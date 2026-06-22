@@ -1,7 +1,8 @@
 # Audit field schema
 
 Source of truth for what the gateway emits to its audit pipeline.
-Plan ref: M3-0. Read-with: `docs/plans/20260507-external-sanitizer-gateway-v1.md`.
+Plan ref: M3-0. Read-with: `docs/plans/20260507-external-sanitizer-gateway-v1.md`
+and `docs/security.md` (pipeline flow, Langfuse/SIEM/S3 sinks, invariants).
 
 The custom logger (M3-1) emits one JSON record per gateway request.
 Vector (M3-3) parses each record and asserts the `NEVER` rules — any record
