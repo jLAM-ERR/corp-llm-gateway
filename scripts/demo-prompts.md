@@ -42,6 +42,15 @@ to the upstream model and does not write to the audit pipeline, so it's safe
 to run live. The prompts below say "run the Stage 0 `sanitize` helper" — that
 means this command with the prompt's own text.
 
+**Finding *your* trace in Langfuse.** Claude Code fires small warm-up / probe
+requests (a handful of tokens) on its own; these show up as separate traces with
+`redaction_count: 0` — not your prompt, and not a redaction failure. Identify
+your prompt's trace by its size (`prompt_token_count`) and expected
+`redaction_count`, not by "the first/latest trace." And note: the Stage 0
+`sanitize` helper and any direct corp-LLM diagnostic call do **not** appear in
+Langfuse at all — only requests that flow through the gateway on `:4000` emit an
+audit trace.
+
 ---
 
 ## Prompt 1 — Baseline (No Sanitization)
@@ -88,6 +97,7 @@ Validate this JSON config and explain any issues:
 **What to show:**
 - **Redaction** — run the Stage 0 `sanitize` helper with this prompt's text; confirm the `api_key` **value** is redacted (e.g. `"api_key": "[TOKEN_001]"`) while the **field name** `api_key` is preserved. The endpoint URL may also be redacted depending on your rules.
 - **Audit (Langfuse)** — trace → **Metadata** → `redaction_count` ≥ 1 and the token placeholder appears in `placeholder_list`. (Input/Output empty by design — metadata-only audit store.)
+- **Restored output (Claude Code)** — ⚠️ the model's answer **shows your original `api_key` value, not `[API_KEY_001]` — and that is correct, not a leak.** The post-call desanitizer rebuilds the real value on the way back (exactly as Prompt 2 restores the email); the placeholder exists *only* on the gateway↔corp-LLM hop, and the corp LLM never saw your key. To **see** the redaction, use the Stage 0 `sanitize` helper (before→after) or the Langfuse `placeholder_list` — never the rendered answer. Tell-tale: the model often describes the value as "a placeholder / template variable," precisely because it literally saw `[API_KEY_001]`.
 
 **Expected tier:** JSON — the detector recognized a structured AWS/cloud API key pattern.
 
