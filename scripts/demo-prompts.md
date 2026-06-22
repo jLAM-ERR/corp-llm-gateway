@@ -27,14 +27,14 @@ before→after:
 
 ```bash
 docker compose -f docker-compose.demo.yml exec litellm \
-  gateway-admin sanitize "Draft a follow-up email to the DRI@gmail.com about the Q3 plan."
+  gateway-admin sanitize "Draft a follow-up email to jane.doe@example.com about the Q3 plan."
 ```
 
 ```
-BEFORE: Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
+BEFORE: Draft a follow-up email to jane.doe@example.com about the Q3 plan.
 AFTER : Draft a follow-up email to [EMAIL_001] about the Q3 plan.
 redactions: 1
-  the DRI@gmail.com -> [EMAIL_001]
+  jane.doe@example.com -> [EMAIL_001]
 ```
 
 Add `--json` for scripted output. This is a **side tool**: it does not egress
@@ -73,13 +73,13 @@ What's the capital of France?
 
 **Text:**
 ```
-Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
+Draft a follow-up email to jane.doe@example.com about the Q3 plan.
 ```
 
 **What to show:**
 - **Redaction (before→after)** — run the Stage 0 `sanitize` helper with this prompt's text; confirm the email becomes `[EMAIL_001]` in the `AFTER` line (the corp LLM emits `[LABEL_NNN]` shape — see `src/corp_llm_gateway/sanitizer/orchestrator.py:_build_system_prompt`).
 - **Audit (Langfuse)** — open the trace → **Metadata** tab → confirm `redaction_count: 1` and that `placeholder_list` contains `[EMAIL_001]`. The trace's **Input/Output are intentionally empty** — the audit store holds metadata only, never prompt/response content.
-- **Restored output (Claude Code)** — confirm the original email `the DRI@gmail.com` is rebuilt in the model's answer (the post-call desanitizer worked).
+- **Restored output (Claude Code)** — confirm the original email `jane.doe@example.com` is rebuilt in the model's answer (the post-call desanitizer worked).
 
 **Expected tier:** Regex — the email pattern matched the regex tier's PII detector.
 
@@ -123,7 +123,7 @@ Use the search_kb tool with query='customer email j.doe@corp.lan asked about X'
 
 **Text:**
 ```
-Draft a follow-up email to the DRI@gmail.com about the Q3 plan.
+Draft a follow-up email to jane.doe@example.com about the Q3 plan.
 ```
 
 (This is **Prompt 2 verbatim**. Send it again.)

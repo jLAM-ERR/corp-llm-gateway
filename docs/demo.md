@@ -75,7 +75,7 @@ Each prompt exercises a different part of the gateway. Full prompt text and setu
 | # | Prompt | What it demonstrates | Tier / Observable |
 |---|--------|----------------------|-------------------|
 | 1 | "What's the capital of France?" | Baseline—no PII, no sanitization | None; `redactions=0` |
-| 2 | "Draft an email to the DRI@gmail.com…" | Email redaction and restoration | Regex; `cache_a_miss` |
+| 2 | "Draft an email to jane.doe@example.com…" | Email redaction and restoration | Regex; `cache_a_miss` |
 | 3 | Validate JSON with an AWS API key | Structured API-key detection | JSON tier |
 | 4 | Function call with embedded email | Redaction within tool arguments | FunctionCall tier |
 | 5 | Prompt 2 again (exact repeat) | Content-keyed dedup (Cache A) | Regex; `cache_a_hit: true` |
