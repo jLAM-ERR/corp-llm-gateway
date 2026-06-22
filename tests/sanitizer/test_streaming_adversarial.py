@@ -776,3 +776,179 @@ def test_openai_truncated_flush_tail_emitted_as_valid_choices_event() -> None:
         chunk.decode("utf-8", errors="replace") for chunk in out if b"choices" in chunk
     )
     assert "alice" in all_text
+
+
+# ---------------------------------------------------------------------------
+# 12. Streaming tool_use input_json_delta desanitization
+# ---------------------------------------------------------------------------
+
+
+def _tool_use_start(index: int = 1, name: str = "bash") -> bytes:
+    obj = {
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "tool_use", "id": "tu1", "name": name, "input": {}},
+    }
+    return b"event: content_block_start\ndata: " + json.dumps(obj).encode() + b"\n\n"
+
+
+def _input_json_delta(index: int = 1, partial_json: str = "") -> bytes:
+    obj = {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
+    }
+    return b"event: content_block_delta\ndata: " + json.dumps(obj).encode() + b"\n\n"
+
+
+def _thinking_block_start(index: int = 0) -> bytes:
+    obj = {
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "thinking", "thinking": ""},
+    }
+    return b"event: content_block_start\ndata: " + json.dumps(obj).encode() + b"\n\n"
+
+
+def _thinking_delta(index: int = 0, thinking: str = "") -> bytes:
+    obj = {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "thinking_delta", "thinking": thinking},
+    }
+    return b"event: content_block_delta\ndata: " + json.dumps(obj).encode() + b"\n\n"
+
+
+def _signature_delta(index: int = 0, signature: str = "sig") -> bytes:
+    obj = {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "signature_delta", "signature": signature},
+    }
+    return b"event: content_block_delta\ndata: " + json.dumps(obj).encode() + b"\n\n"
+
+
+def _collect_partial_jsons(out: list[bytes]) -> list[str]:
+    """Collect all partial_json values from input_json_delta chunks in output."""
+    result = []
+    for chunk in out:
+        obj = _data_obj(chunk)
+        if obj and obj.get("type") == "content_block_delta":
+            delta = obj.get("delta", {})
+            if delta.get("type") == "input_json_delta":
+                pj = delta.get("partial_json", "")
+                if pj:
+                    result.append(pj)
+    return result
+
+
+def test_tool_use_input_json_delta_placeholder_split_across_two_deltas() -> None:
+    """[EMAIL_001] split across two input_json_delta fragments is desanitized; output valid JSON."""
+    mapping = _mapping(("a@b.com", "[EMAIL_001]"))
+    events = [
+        _tool_use_start(1),
+        _input_json_delta(1, '{"to": "[EMA'),
+        _input_json_delta(1, 'IL_001]"}'),
+        _cb_stop(1),
+    ]
+    sse = SseStreamDesanitizer(mapping)
+    out = _collect_bytes(sse, events)
+    parts = _collect_partial_jsons(out)
+    reassembled = "".join(parts)
+    assert "[EMAIL_001]" not in reassembled, f"placeholder leaked: {reassembled!r}"
+    assert "a@b.com" in reassembled, f"original not restored: {reassembled!r}"
+    parsed = json.loads(reassembled)
+    assert parsed == {"to": "a@b.com"}
+
+
+def test_tool_use_input_json_delta_json_escape_correctness() -> None:
+    """An original with a double-quote is JSON-string-escaped so partial_json stays valid JSON."""
+    mapping = _mapping(('a"b', "[NAME_001]"))
+    events = [
+        _tool_use_start(1),
+        _input_json_delta(1, '{"x":"[NAME_001]"}'),
+        _cb_stop(1),
+    ]
+    sse = SseStreamDesanitizer(mapping)
+    out = _collect_bytes(sse, events)
+    parts = _collect_partial_jsons(out)
+    reassembled = "".join(parts)
+    assert "[NAME_001]" not in reassembled, f"placeholder leaked: {reassembled!r}"
+    parsed = json.loads(reassembled)
+    assert parsed == {"x": 'a"b'}, f"unexpected parse result: {parsed!r}"
+
+
+def test_tool_use_input_json_delta_no_placeholders_passes_through() -> None:
+    """A tool_use block with no placeholders in input_json_delta passes through unchanged."""
+    mapping = _mapping(("alice", "[NAME_001]"))
+    partial = '{"cmd": "ls -la"}'
+    events = [
+        _tool_use_start(1),
+        _input_json_delta(1, partial),
+        _cb_stop(1),
+    ]
+    sse = SseStreamDesanitizer(mapping)
+    out = _collect_bytes(sse, events)
+    parts = _collect_partial_jsons(out)
+    reassembled = "".join(parts)
+    assert reassembled == partial, f"unexpected rewrite: {reassembled!r}"
+
+
+def test_thinking_delta_with_placeholder_passes_through_verbatim() -> None:
+    """A thinking_delta containing a placeholder is NOT rewritten (thinking blocks are signed)."""
+    placeholder = "[EMAIL_001]"
+    mapping = _mapping(("a@b.com", placeholder))
+    ev = _thinking_delta(0, f"the user email is {placeholder}")
+    sse = SseStreamDesanitizer(mapping)
+    out = _collect_bytes(sse, [_thinking_block_start(0), ev, _cb_stop(0)])
+    combined = b"".join(out).decode("utf-8")
+    assert placeholder in combined, f"placeholder was rewritten in thinking_delta: {combined!r}"
+    assert "a@b.com" not in combined, f"original leaked into thinking_delta: {combined!r}"
+
+
+def test_signature_delta_passes_through_byte_identical() -> None:
+    """signature_delta (part of thinking block signing) must pass through byte-identical."""
+    sig_ev = _signature_delta(0, "SomeSig==")
+    sse = SseStreamDesanitizer(_mapping(("alice", "[N1]")))
+    out = _collect_bytes(sse, [_thinking_block_start(0), sig_ev, _cb_stop(0)])
+    assert sig_ev in out, "signature_delta was not passed through unchanged"
+
+
+def test_mixed_text_and_tool_use_blocks_both_desanitize() -> None:
+    """Text block (index 0) and tool_use block (index 1) both desanitize in one message."""
+    mapping = _mapping(("alice", "[NAME_001]"), ("a@b.com", "[EMAIL_001]"))
+    events = [
+        _cb_start(0),
+        _delta("[NAME_001]", 0),
+        _cb_stop(0),
+        _tool_use_start(1),
+        _input_json_delta(1, '{"to":"[EMAIL_001]"}'),
+        _cb_stop(1),
+    ]
+    sse = SseStreamDesanitizer(mapping)
+    out = _collect_bytes(sse, events)
+
+    # Collect text delta text
+    text_parts = []
+    json_parts = []
+    for chunk in out:
+        obj = _data_obj(chunk)
+        if obj and obj.get("type") == "content_block_delta":
+            delta = obj.get("delta", {})
+            if delta.get("type") == "text_delta":
+                text_parts.append(delta.get("text", ""))
+            elif delta.get("type") == "input_json_delta":
+                pj = delta.get("partial_json", "")
+                if pj:
+                    json_parts.append(pj)
+
+    text_joined = "".join(text_parts)
+    json_joined = "".join(json_parts)
+
+    assert "alice" in text_joined, f"text block not desanitized: {text_joined!r}"
+    assert "[NAME_001]" not in text_joined
+    assert "a@b.com" in json_joined, f"tool_use block not desanitized: {json_joined!r}"
+    assert "[EMAIL_001]" not in json_joined
+    # tool_use partial_json must also be valid JSON
+    parsed = json.loads(json_joined)
+    assert parsed == {"to": "a@b.com"}

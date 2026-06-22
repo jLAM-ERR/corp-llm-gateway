@@ -3,7 +3,7 @@ from __future__ import annotations
 import codecs
 import json
 import re
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 
 from corp_llm_gateway.sanitizer.placeholder import sort_placeholders_by_descending_length
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
@@ -25,9 +25,10 @@ class StreamingDesanitizer:
     can't be shadowed by a shorter prefix-match one.
     """
 
-    def __init__(self, mapping: StrategyResult) -> None:
+    def __init__(self, mapping: StrategyResult, escape: Callable[[str], str] | None = None) -> None:
         self._by_placeholder: dict[str, str] = {
-            placeholder: original for original, placeholder in mapping.pairs
+            placeholder: (escape(original) if escape else original)
+            for original, placeholder in mapping.pairs
         }
         self._sorted_placeholders: tuple[str, ...] = tuple(
             sort_placeholders_by_descending_length(self._by_placeholder)
@@ -105,8 +106,10 @@ class SseStreamDesanitizer:
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
         # Raw byte accumulator; always bytes internally.
         self._buf: bytes = b""
-        # Per-block (index → desanitizer) for Anthropic text content blocks.
+        # Per-block (index → desanitizer) for Anthropic text/tool_use content blocks.
         self._block_desanitizers: dict[int, StreamingDesanitizer] = {}
+        # Tracks block type ("text" or "tool_use") per index for correct flush delta type.
+        self._block_types: dict[int, str] = {}
         # Single desanitizer for OpenAI streams (one content stream total).
         self._openai_desanitizer: StreamingDesanitizer | None = None
 
@@ -132,9 +135,14 @@ class SseStreamDesanitizer:
         for idx, ds in list(self._block_desanitizers.items()):
             tail = ds.flush()
             if tail:
-                ev = _make_text_delta_event(idx, tail)
+                btype = self._block_types.get(idx, "text")
+                if btype == "tool_use":
+                    ev = _make_input_json_delta_event(idx, tail)
+                else:
+                    ev = _make_text_delta_event(idx, tail)
                 out.append(self._encode(ev + "\n\n"))
             del self._block_desanitizers[idx]
+        self._block_types.clear()
         if self._openai_desanitizer is not None:
             oi_tail = self._openai_desanitizer.flush()
             if oi_tail:
@@ -185,15 +193,24 @@ class SseStreamDesanitizer:
 
         ev_type = obj.get("type") if isinstance(obj, dict) else None
 
-        # Anthropic: content_block_start — fresh desanitizer for this index.
+        # Anthropic: content_block_start — fresh desanitizer for text and tool_use blocks.
         if ev_type == "content_block_start":
             cb = obj.get("content_block") or {}
-            if isinstance(cb, dict) and cb.get("type") == "text":
+            if isinstance(cb, dict):
                 idx = int(obj.get("index", 0))
-                self._block_desanitizers[idx] = StreamingDesanitizer(self._mapping)
+                if cb.get("type") == "text":
+                    self._block_desanitizers[idx] = StreamingDesanitizer(self._mapping)
+                    self._block_types[idx] = "text"
+                elif cb.get("type") == "tool_use":
+                    # JSON-escape originals so substitution inside partial_json is valid JSON.
+                    self._block_desanitizers[idx] = StreamingDesanitizer(
+                        self._mapping, escape=_json_string_escape
+                    )
+                    self._block_types[idx] = "tool_use"
+                # thinking / redacted_thinking / other blocks: no desanitizer (pass through).
             return [self._encode(event_text)]
 
-        # Anthropic: content_block_delta — rewrite text_delta.
+        # Anthropic: content_block_delta — rewrite text_delta and input_json_delta.
         if ev_type == "content_block_delta":
             delta = obj.get("delta") or {}
             if isinstance(delta, dict) and delta.get("type") == "text_delta":
@@ -213,16 +230,36 @@ class SseStreamDesanitizer:
                 new_obj["delta"] = {**delta, "text": rewritten}
                 boundary = _boundary_from(event_text)
                 return [self._encode(_rebuild_event(event_text, new_obj, boundary))]
+            if isinstance(delta, dict) and delta.get("type") == "input_json_delta":
+                idx = int(obj.get("index", 0))
+                pj = delta.get("partial_json", "")
+                if not isinstance(pj, str):
+                    return [self._encode(event_text)]
+                ds = self._block_desanitizers.get(idx)
+                if ds is None:
+                    return [self._encode(event_text)]
+                rewritten = ds.feed(pj)
+                if not rewritten:
+                    return []
+                new_obj = dict(obj)
+                new_obj["delta"] = {**delta, "partial_json": rewritten}
+                boundary = _boundary_from(event_text)
+                return [self._encode(_rebuild_event(event_text, new_obj, boundary))]
 
         # Anthropic: content_block_stop — flush that block's desanitizer tail first.
         if ev_type == "content_block_stop":
             idx = int(obj.get("index", 0))
             result = []
             ds = self._block_desanitizers.pop(idx, None)
+            btype = self._block_types.pop(idx, "text")
             if ds is not None:
                 tail = ds.flush()
                 if tail:
-                    tail_ev = _make_text_delta_event(idx, tail)
+                    tail_ev = (
+                        _make_input_json_delta_event(idx, tail)
+                        if btype == "tool_use"
+                        else _make_text_delta_event(idx, tail)
+                    )
                     boundary = _boundary_from(event_text)
                     result.append(self._encode(tail_ev + boundary))
             result.append(self._encode(event_text))
@@ -295,12 +332,29 @@ def _rebuild_event(original_event: str, new_obj: dict, boundary: str) -> str:
     return sep.join(out_lines) + boundary
 
 
+def _json_string_escape(s: str) -> str:
+    """Escape a string for safe substitution INSIDE a JSON string literal
+    (e.g. inside an input_json_delta fragment). json.dumps wraps + escapes;
+    strip the surrounding quotes."""
+    return json.dumps(s)[1:-1]
+
+
 def _make_text_delta_event(index: int, text: str) -> str:
     """Build a bare ``content_block_delta`` SSE event string (no trailing boundary)."""
     obj = {
         "type": "content_block_delta",
         "index": index,
         "delta": {"type": "text_delta", "text": text},
+    }
+    return "event: content_block_delta\ndata: " + json.dumps(obj, ensure_ascii=False)
+
+
+def _make_input_json_delta_event(index: int, partial_json: str) -> str:
+    """Build a bare ``content_block_delta`` SSE event for input_json_delta (no boundary)."""
+    obj = {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
     }
     return "event: content_block_delta\ndata: " + json.dumps(obj, ensure_ascii=False)
 

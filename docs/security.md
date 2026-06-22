@@ -54,8 +54,12 @@ pre-scan sees exactly what will be sanitized.
 |---|---|
 | `document` `source` with `type` `base64` / `url` | Binary or out-of-scope content; left untouched (deliberate) |
 | `image` / `image_url` blocks | Binary payload or a low-risk URL; passed through |
-| `thinking` / `redacted_thinking` blocks | Model-generated — the model only ever sees placeholders, never originals — so there is nothing to redact. Deferred (low risk). |
-| **Response-side** desanitizing the model's NEW tool calls in a **streaming** response (`input_json_delta`) | **Functional gap, NOT a leak**: the model only ever emits placeholders (it never saw originals), so a streamed new tool call would surface a `[LABEL_NNN]` token rather than an original. Deferred; tracked as a follow-up. |
+| `thinking` / `redacted_thinking` blocks | **Intentionally** passed through unmodified — Anthropic signs thinking blocks and rejects modified ones on multi-turn replay, so they must never be rewritten; the model only ever sees placeholders anyway (no original reaches them). Correct by design, not a gap. |
+
+Response-side de-sanitization (the reverse path) restores originals in streamed
+and unary **text**, **`tool_use` input** (`input_json_delta`, JSON-escaped so the
+rebuilt JSON stays valid), and OpenAI content; only `thinking` is deliberately
+left untouched (per the row above).
 
 Oversize skip (M1-11): when a single segment exceeds
 `guardrail.contentSizeThresholdBytes` (default `102400`), the orchestrator
@@ -338,9 +342,9 @@ by construction; if one appears to, that is an M1-14 regression.
 |---|---|---|
 | (a) | ~~Prod Helm `templates/configmap.yaml` had a DUPLICATE `transforms:` key that dropped `parse` + `enforce_audit_schema`.~~ **FIXED** — single `transforms:` block now (`parse` → `enforce_audit_schema` → `audit_only` → `to_langfuse`); `parse` is non-strict (tolerates plain-text uvicorn lines), an `audit_only` filter keeps non-audit events out of both sinks, and the Vector-side NEVER gate now mirrors the full in-process list (13 keys + `-`/`_` case variants). `langfuse` ← `to_langfuse`, `s3` ← `audit_only`. | **Resolved** |
 | (b) | **SIEM sink enabled in values but not defined in the configmap.** `audit.sinks.siem.enabled: true` has no corresponding `sinks.siem` in the Vector configmap; `audit_drop` alerting (M3-9) also pending. | **Medium** — SIEM monitoring (incl. leak-attempt alerts) not yet active |
-| (c) | **Streaming-response `tool_use` desanitization** (`input_json_delta`) not handled — model's NEW tool calls in a streamed response surface placeholders, not originals. | **Low** — functional gap, NOT a leak |
-| (d) | **`thinking` / `redacted_thinking` blocks not sanitized.** Model-generated; the model only ever saw placeholders. | **Low** — no original ever reaches these blocks |
+| (c) | ✅ **FIXED** — streamed `tool_use` `input_json_delta` is now desanitized (JSON-escaped) in `sanitizer/streaming.py`, so the developer's tool receives real values, not `[LABEL_NNN]` tokens. | **Resolved** |
+| (d) | ✅ **By design (not a gap)** — `thinking` / `redacted_thinking` are passed through UNMODIFIED: Anthropic signs thinking blocks and rejects modified ones on multi-turn replay, and the model only ever sees placeholders (no original reaches them). | **Resolved (by design)** |
 
-**(a) is now fixed** (configmap de-duplicated, NEVER gate completed, `audit_only`
-added). (b) is a config fix; (c) and (d) are sanitization follow-ups. These are
-mirrored in [`remaining-steps.md`](remaining-steps.md).
+**(a) and (c) are fixed; (d) is correct by design.** The only remaining open item
+is **(b)** — wiring the SIEM sink (gated on the SIEM target). See
+[`remaining-steps.md`](remaining-steps.md).

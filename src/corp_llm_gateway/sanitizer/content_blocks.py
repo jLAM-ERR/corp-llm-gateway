@@ -134,13 +134,13 @@ async def _sanitize_block(
                 results.extend(sub)
             # base64 / url sources: binary or out-of-scope → leave untouched
         return new_block, results
-    # SECURITY (deferred, low risk): thinking/redacted_thinking blocks are
-    # model-generated — the model only ever sees placeholders, never originals —
-    # so they are not sanitized here; tracked in project_tool_use_input_unsanitized.
-    # SECURITY: egress sanitization now covers tool_use.input (string leaves only).
-    # The remaining gap is desanitizing the model's NEW tool calls in a STREAMING
-    # response (input_json_delta) — a FUNCTIONAL gap, not a leak (the model only ever
-    # sees placeholders), deferred; see project_tool_use_input_unsanitized in memory.
+    # SECURITY: thinking/redacted_thinking blocks are intentionally passed through
+    # unchanged. Anthropic SIGNS thinking blocks and rejects modified ones on
+    # multi-turn replay — rewriting them would break conversations. The model only
+    # ever sees placeholders anyway, so no originals are present to leak.
+    # SECURITY: egress sanitization covers tool_use.input (string leaves, non-streaming).
+    # Streaming tool_use desanitization (input_json_delta) is handled in streaming.py
+    # via SseStreamDesanitizer with JSON-string-escaping of originals.
     # Image, image_url, unknown → pass through unchanged.
     return block, []
 
@@ -256,10 +256,8 @@ def collect_text(content: Any) -> list[str]:
             return [content["text"]]
         if block_type == "tool_result" and "content" in content:
             return collect_text(content["content"])
-        # SECURITY: egress sanitization now covers tool_use.input (string leaves only).
-        # The remaining gap is desanitizing the model's NEW tool calls in a STREAMING
-        # response (input_json_delta) — a FUNCTIONAL gap, not a leak (the model only ever
-        # sees placeholders), deferred; see project_tool_use_input_unsanitized in memory.
+        # SECURITY: egress sanitization covers tool_use.input (string leaves, non-streaming).
+        # Streaming tool_use desanitization (input_json_delta) is handled in streaming.py.
         if block_type == "tool_use" and "input" in content:
             return _collect_json_text(content["input"])
         if block_type == "document":
