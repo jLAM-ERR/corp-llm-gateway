@@ -73,3 +73,20 @@ def get_required(name: str) -> str:
             f"{_DEFAULT_PATHS[0]} (or $CORP_LLM_GATEWAY_CONFIG_FILE)"
         )
     return value
+
+
+def corp_llm_verify() -> bool | str:
+    """``verify`` value for the corp-LLM httpx client (TLS to the corp LLM).
+
+    Precedence:
+      1. ``CORP_LLM_CA_BUNDLE`` — path to a PEM CA bundle. When set, the corp
+         LLM cert is verified AGAINST that bundle (verification stays ON). Use
+         this when the corp LLM presents a cert signed by an internal CA (e.g.
+         the Corp Root + Issuing CA chain).
+      2. ``SSL_VERIFY`` — ``"false"`` disables verification; anything else (or
+         unset) leaves it ON against the system/certifi trust store.
+    """
+    ca_bundle = get("CORP_LLM_CA_BUNDLE", "")
+    if ca_bundle:
+        return ca_bundle
+    return get("SSL_VERIFY", "true").lower() != "false"

@@ -99,7 +99,7 @@ class CorpLlmClient:
         http: httpx.AsyncClient | None = None,
         auth_provider: CorpLlmAuthProvider | None = None,
         timeout: float = 30.0,
-        verify: bool = True,
+        verify: bool | str = True,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model

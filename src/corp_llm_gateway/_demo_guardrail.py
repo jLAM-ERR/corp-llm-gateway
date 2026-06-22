@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 
+from corp_llm_gateway import config
 from corp_llm_gateway.audit import AuditLogger, StdoutSink
 from corp_llm_gateway.auth import BearerAuthProvider, NoopAuthProvider
 from corp_llm_gateway.corp_llm import CorpLlmClient
@@ -123,14 +124,10 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
     )
     auth = AuthMiddleware(token_store)
 
-    # TLS verification defaults to ON. The demo opts out by setting
-    # SSL_VERIFY=False on the litellm process env, because the corp
-    # LLM uses an internal CA the container doesn't trust. PROD MUST
-    # leave SSL_VERIFY unset (or =True) and mount the corp CA bundle
-    # into the container's trust store — disabling verification
-    # globally opens MITM risk.
-    ssl_verify = os.environ.get("SSL_VERIFY", "true").lower() != "false"
-    http = httpx.AsyncClient(timeout=30.0, verify=ssl_verify)
+    # TLS verification to the corp LLM. CORP_LLM_CA_BUNDLE (a PEM bundle of the
+    # internal corporate CA chain) keeps verification ON against that bundle;
+    # else SSL_VERIFY=false (demo-only) opts out. PROD: set CORP_LLM_CA_BUNDLE.
+    http = httpx.AsyncClient(timeout=30.0, verify=config.corp_llm_verify())
     corp_auth_token = os.environ.get("CORP_LLM_AUTH_TOKEN", "")
     auth_provider = (
         BearerAuthProvider(token=corp_auth_token) if corp_auth_token else NoopAuthProvider()

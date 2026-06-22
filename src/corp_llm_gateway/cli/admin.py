@@ -32,16 +32,15 @@ def _build_orchestrator(model: str) -> tuple[SanitizationOrchestrator, CorpLlmCl
     root = corp_endpoint.rstrip("/").removesuffix("/v1")
     token = config.get("CORP_LLM_AUTH_TOKEN", "")
     auth_provider = BearerAuthProvider(token=token) if token else NoopAuthProvider()
-    ssl_verify = config.get("SSL_VERIFY", "true").lower() != "false"
     # Let CorpLlmClient OWN its http client so `_run`'s `aclose()` actually
-    # closes the connection pool — a one-shot CLI must not leak it. `verify`
-    # carries the SSL_VERIFY opt-out the demo uses for the corp internal CA.
+    # closes the connection pool. `verify` uses CORP_LLM_CA_BUNDLE (corp
+    # internal CA) when set, else the SSL_VERIFY bool.
     corp_llm = CorpLlmClient(
         base_url=root,
         model=model,
         auth_provider=auth_provider,
         timeout=30.0,
-        verify=ssl_verify,
+        verify=config.corp_llm_verify(),
     )
     orch = SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoTeamRules())
     return orch, corp_llm
