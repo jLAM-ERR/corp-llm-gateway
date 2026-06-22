@@ -717,6 +717,70 @@ async def test_audit_after_failed_pre_call_uses_unknown_user() -> None:
     assert sink.records[0]["user_id"] == "unknown"
 
 
+# ---- Document block integration tests (A) -----------------------------------
+
+
+async def test_pre_call_document_block_title_and_text_source_redacted() -> None:
+    """document block: title and source.data (text) are redacted; no original in egress."""
+    g, _ = _build_guardrail(
+        [
+            ("alice@corp.example", "[E1]"),
+            ("bob@corp.example", "[E2]"),
+        ]
+    )
+    content = [
+        {
+            "type": "document",
+            "title": "Report for alice@corp.example",
+            "source": {"type": "text", "data": "Authored by bob@corp.example"},
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    serialized = json.dumps(out["messages"][0]["content"])
+    assert "alice@corp.example" not in serialized
+    assert "bob@corp.example" not in serialized
+    assert "[E1]" in serialized or "[E2]" in serialized
+
+
+async def test_pre_call_document_block_base64_source_untouched() -> None:
+    """document block with base64 source must pass through unchanged."""
+    b64_data = "SGVsbG8gV29ybGQ="
+    g, _ = _build_guardrail([("alice@corp.example", "[E1]")])
+    content = [
+        {
+            "type": "document",
+            "title": "alice@corp.example",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data},
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    blk = out["messages"][0]["content"][0]
+    assert blk["source"]["data"] == b64_data
+    assert "alice@corp.example" not in blk["title"]
+
+
+# ---- Deep nesting 400 integration test (C) ----------------------------------
+
+
+async def test_pre_call_deep_nesting_returns_400_e_bad_request() -> None:
+    """A tool_use input nested > _MAX_JSON_DEPTH must return 400 E_BAD_REQUEST."""
+    g, _ = _build_guardrail(corp_llm=_corp_llm_returning([]))
+    # Build a dict nested 66 levels deep (exceeds _MAX_JSON_DEPTH=64).
+    deep: dict = {"v": "leaf"}
+    for _ in range(66):
+        deep = {"k": deep}
+    content = [{"type": "tool_use", "id": "t1", "name": "fn", "input": deep}]
+    data = _data_with_token("tok-1", content=content)
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 400
+    assert ei.value.error_code == "E_BAD_REQUEST"
+
+
 async def test_audit_provider_detection_anthropic_claude() -> None:
     g, sink = _build_guardrail()
     data = _data_with_token("tok-1", model="claude-opus-4-7")
@@ -1732,3 +1796,195 @@ async def test_audit_finding_label_counts_keys_never_contain_originals() -> None
         f"original leaked into finding_label_counts: {flc_repr!r}"
     )
     assert "bob" not in flc_repr, f"local-part leaked into finding_label_counts: {flc_repr!r}"
+
+
+# ---- tool_use.input sanitization (M2 fix) ------------------------------------
+
+
+async def test_tool_use_input_round_trip_distinct_emails_restored() -> None:
+    """M2: tool_use.input PII is redacted on egress and restored on unary reverse.
+
+    A message with a tool_use block whose input carries two distinct emails.
+    After pre_call: no original email appears in input values; the two emails
+    get distinct tokens (allocator collision-split). After post_call_unary with
+    a response whose tool_use input echoes those placeholders, both originals
+    are restored.
+    """
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "send",
+            "input": {"to": "a@corp.example", "cc": ["b@corp.example"]},
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    tool_block = out["messages"][0]["content"][0]
+    assert tool_block["type"] == "tool_use"
+    to_val = tool_block["input"]["to"]
+    cc_val = tool_block["input"]["cc"][0]
+
+    # Originals must not appear in egress.
+    assert "a@corp.example" not in to_val, f"to leaked: {to_val!r}"
+    assert "b@corp.example" not in cc_val, f"cc leaked: {cc_val!r}"
+
+    # Two distinct emails must get distinct tokens.
+    assert to_val != cc_val, f"collision: both got {to_val!r}"
+
+    # post_call_unary must restore both placeholders in a tool_use response block.
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "send",
+                            "input": {"to": to_val, "cc": [cc_val]},
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    result = await g.post_call_unary(data, response)
+    restored = result["choices"][0]["message"]["content"][0]["input"]
+    assert restored["to"] == "a@corp.example", f"to not restored: {restored['to']!r}"
+    assert restored["cc"] == ["b@corp.example"], f"cc not restored: {restored['cc']!r}"
+
+
+async def test_tool_use_input_nested_dict_in_dict_sanitized() -> None:
+    """Nested dict-in-dict: all string leaves are sanitized; non-str scalars unchanged."""
+    g, _ = _build_guardrail([("secret", "[SEC_001]")])
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {
+                "outer": {"inner": "secret"},
+                "count": 42,
+                "active": True,
+                "note": None,
+            },
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    inp = out["messages"][0]["content"][0]["input"]
+    assert inp["outer"]["inner"] == "[SEC_001]"
+    assert inp["count"] == 42
+    assert inp["active"] is True
+    assert inp["note"] is None
+
+
+async def test_tool_use_input_list_of_strings_sanitized() -> None:
+    """List of strings inside tool_use.input: every element is sanitized."""
+    g, _ = _build_guardrail([("secret", "[SEC_001]")])
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"items": ["secret", "harmless", "secret"]},
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    assert out["messages"][0]["content"][0]["input"]["items"] == [
+        "[SEC_001]",
+        "harmless",
+        "[SEC_001]",
+    ]
+
+
+async def test_tool_use_input_dict_keys_not_altered() -> None:
+    """Dict keys in tool_use.input must NOT be sanitized — only values.
+
+    The key name "to" is a common English word; even if the corp-LLM were to
+    redact it, we verify it stays unchanged. The value carries the PII email.
+    """
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"to": "addr@corp.example"},
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    inp = out["messages"][0]["content"][0]["input"]
+    # Key "to" must survive unchanged.
+    assert "to" in inp, f"key was altered: {inp!r}"
+    # Value must be sanitized.
+    assert "addr@corp.example" not in inp["to"], f"value not sanitized: {inp['to']!r}"
+
+
+async def test_tool_use_input_no_pii_passes_through() -> None:
+    """tool_use.input with no PII: block structure preserved, no corp-LLM call for values."""
+    g, _ = _build_guardrail([("secret", "[SEC_001]")])
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "get_weather",
+            "input": {"city": "Moscow", "units": "metric"},
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    inp = out["messages"][0]["content"][0]["input"]
+    assert inp["city"] == "Moscow"
+    assert inp["units"] == "metric"
+
+
+async def test_tool_use_input_image_block_still_passes_through() -> None:
+    """image_url block alongside tool_use is still unchanged (regression)."""
+    g, _ = _build_guardrail([("secret", "[SEC_001]")])
+    image_block = {"type": "image_url", "image_url": {"url": "https://img.example/x.png"}}
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"note": "secret"},
+        },
+        image_block,
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    assert out["messages"][0]["content"][1] == image_block
+    assert out["messages"][0]["content"][0]["input"]["note"] == "[SEC_001]"
+
+
+async def test_tool_use_input_no_leak_in_logs(caplog: pytest.LogCaptureFixture) -> None:
+    """M1-14: PII inside tool_use.input must not appear in any log record."""
+    secret = "tool-secret@corp.internal"
+    g, _ = _build_guardrail([(secret, "[EMAIL_001]")])
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"to": secret},
+        }
+    ]
+    data = _data_with_token("tok-1", content=content)
+
+    with caplog.at_level(logging.INFO):
+        await g.pre_call(data)
+
+    for record in caplog.records:
+        msg = record.getMessage()
+        assert secret not in msg, f"LEAK in logs: {msg!r}"

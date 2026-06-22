@@ -41,6 +41,7 @@ from corp_llm_gateway.sanitizer import (
     StreamingDesanitizer,
 )
 from corp_llm_gateway.sanitizer.content_blocks import (
+    ContentTooDeepError,
     collect_text,
     desanitize_content,
     sanitize_content,
@@ -374,6 +375,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             )
             try:
                 new_content, results = await sanitize_content(content, sanitize_one)
+            except ContentTooDeepError as exc:
+                self._record_failure(request_id, error_code="E_BAD_REQUEST")
+                raise GuardrailHttpException(
+                    400,
+                    "E_BAD_REQUEST",
+                    "request content nesting too deep",
+                ) from exc
             except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
                 # Fail-policy matrix (plan M4 / docs/ops/runbook.md): a
                 # corp-LLM sanitization failure is fail-CLOSED. We must
@@ -427,6 +435,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             )
             try:
                 new_system, results = await sanitize_content(system, sanitize_one)
+            except ContentTooDeepError as exc:
+                self._record_failure(request_id, error_code="E_BAD_REQUEST")
+                raise GuardrailHttpException(
+                    400,
+                    "E_BAD_REQUEST",
+                    "request content nesting too deep",
+                ) from exc
             except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
                 logger.warning(
                     "litellm_pre_call_corp_llm_failed request_id=%s "

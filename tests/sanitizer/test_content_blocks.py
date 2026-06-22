@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
+import pytest
+
 from corp_llm_gateway.sanitizer.content_blocks import (
+    ContentTooDeepError,
+    _collect_json_text,
+    _sanitize_json,
     collect_text,
     desanitize_content,
     sanitize_content,
@@ -361,7 +367,7 @@ def test_desanitize_empty_list() -> None:
 
 
 def test_desanitize_list_with_non_text_blocks_unchanged() -> None:
-    """Non-text blocks (image, tool_use, document) pass through byte-identical."""
+    """Non-text blocks (image, tool_use with empty input, document) pass through byte-identical."""
 
     def reverse(text: str) -> str:
         return text.replace("[N1]", "alice")
@@ -377,3 +383,558 @@ def test_desanitize_list_with_non_text_blocks_unchanged() -> None:
     assert new_content[0]["text"] == "hello alice"
     assert new_content[1] == content[1]
     assert new_content[2] == content[2]
+
+
+# ---- _collect_json_text helper -----------------------------------------------
+
+
+def test_collect_json_text_str() -> None:
+    assert _collect_json_text("hello") == ["hello"]
+
+
+def test_collect_json_text_int() -> None:
+    assert _collect_json_text(42) == []
+
+
+def test_collect_json_text_bool() -> None:
+    assert _collect_json_text(True) == []
+
+
+def test_collect_json_text_none() -> None:
+    assert _collect_json_text(None) == []
+
+
+def test_collect_json_text_flat_dict() -> None:
+    assert _collect_json_text({"to": "a@x.com", "cc": "b@x.com"}) == ["a@x.com", "b@x.com"]
+
+
+def test_collect_json_text_dict_preserves_only_values() -> None:
+    # Keys must NOT appear in the collected strings.
+    result = _collect_json_text({"email": "a@x.com"})
+    assert result == ["a@x.com"]
+    assert "email" not in result
+
+
+def test_collect_json_text_list_of_strings() -> None:
+    assert _collect_json_text(["a@x.com", "b@x.com"]) == ["a@x.com", "b@x.com"]
+
+
+def test_collect_json_text_nested_dict() -> None:
+    result = _collect_json_text({"outer": {"inner": "secret"}})
+    assert result == ["secret"]
+
+
+def test_collect_json_text_mixed_scalars() -> None:
+    result = _collect_json_text({"name": "alice", "age": 30, "active": True, "note": None})
+    assert result == ["alice"]
+
+
+# ---- collect_text: tool_use.input inclusion ---------------------------------
+
+
+def test_collect_text_tool_use_flat_input() -> None:
+    content = [{"type": "tool_use", "id": "t1", "name": "send", "input": {"to": "a@x.com"}}]
+    assert collect_text(content) == ["a@x.com"]
+
+
+def test_collect_text_tool_use_list_input() -> None:
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "send",
+            "input": {"cc": ["a@x.com", "b@x.com"]},
+        }
+    ]
+    assert collect_text(content) == ["a@x.com", "b@x.com"]
+
+
+def test_collect_text_tool_use_empty_input() -> None:
+    content = [{"type": "tool_use", "id": "t1", "name": "fn", "input": {}}]
+    assert collect_text(content) == []
+
+
+def test_collect_text_tool_use_mixed_scalars_in_input() -> None:
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"email": "a@x.com", "count": 5, "active": True},
+        }
+    ]
+    assert collect_text(content) == ["a@x.com"]
+
+
+def test_collect_text_tool_use_keys_not_collected() -> None:
+    content = [{"type": "tool_use", "id": "t1", "name": "fn", "input": {"email": "a@x.com"}}]
+    result = collect_text(content)
+    assert "email" not in result
+
+
+def test_collect_text_bare_dict_tool_use() -> None:
+    block = {"type": "tool_use", "id": "t1", "name": "fn", "input": {"to": "a@x.com"}}
+    assert collect_text(block) == ["a@x.com"]
+
+
+def test_collect_text_image_still_empty() -> None:
+    content = [{"type": "image_url", "image_url": {"url": "https://..."}}]
+    assert collect_text(content) == []
+
+
+# ---- sanitize_content: tool_use.input sanitization --------------------------
+
+
+async def test_sanitize_tool_use_flat_input() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(
+            text.replace("a@x.com", "[EMAIL_001]"),
+            pairs=(("a@x.com", "[EMAIL_001]"),),
+        )
+
+    content = [{"type": "tool_use", "id": "t1", "name": "send", "input": {"to": "a@x.com"}}]
+    new_content, results = await sanitize_content(content, mock_sanitize)
+
+    assert new_content[0]["input"]["to"] == "[EMAIL_001]"
+    assert new_content[0]["id"] == "t1"
+    assert new_content[0]["name"] == "send"
+    assert len(results) == 1
+
+
+async def test_sanitize_tool_use_dict_key_preserved() -> None:
+    calls: list[str] = []
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        calls.append(text)
+        return MockSanitizeResult(text.upper(), pairs=())
+
+    content = [{"type": "tool_use", "id": "t1", "name": "fn", "input": {"email": "a@x.com"}}]
+    new_content, _ = await sanitize_content(content, mock_sanitize)
+
+    # Key "email" must be unchanged; only the value is sanitized.
+    assert "email" in new_content[0]["input"]
+    assert new_content[0]["input"]["email"] == "A@X.COM"
+    assert "EMAIL" not in new_content[0]["input"]
+    # sanitize_one must be called with the VALUE, not the key.
+    assert "email" not in calls
+    assert "a@x.com" in calls
+
+
+async def test_sanitize_tool_use_list_input() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text.replace("a@x.com", "[E1]").replace("b@x.com", "[E2]")
+        return MockSanitizeResult(replaced, pairs=())
+
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"cc": ["a@x.com", "b@x.com"]},
+        }
+    ]
+    new_content, _ = await sanitize_content(content, mock_sanitize)
+
+    assert new_content[0]["input"]["cc"] == ["[E1]", "[E2]"]
+
+
+async def test_sanitize_tool_use_non_str_scalars_unchanged() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text, pairs=())
+
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"count": 42, "active": True, "ratio": 0.5, "note": None},
+        }
+    ]
+    new_content, results = await sanitize_content(content, mock_sanitize)
+
+    inp = new_content[0]["input"]
+    assert inp["count"] == 42
+    assert inp["active"] is True
+    assert inp["ratio"] == 0.5
+    assert inp["note"] is None
+    assert results == []
+
+
+async def test_sanitize_tool_use_nested_dict() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text.replace("secret", "[SEC]"), pairs=())
+
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"outer": {"inner": "secret"}},
+        }
+    ]
+    new_content, _ = await sanitize_content(content, mock_sanitize)
+    assert new_content[0]["input"]["outer"]["inner"] == "[SEC]"
+
+
+async def test_sanitize_image_still_passes_through_unchanged() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        raise AssertionError("should not be called")
+
+    content = [{"type": "image_url", "image_url": {"url": "https://..."}}]
+    new_content, results = await sanitize_content(content, mock_sanitize)
+
+    assert new_content[0] == content[0]
+    assert results == []
+
+
+# ---- desanitize_content: tool_use.input desanitization ----------------------
+
+
+def test_desanitize_tool_use_flat_input() -> None:
+    def reverse(text: str) -> str:
+        return text.replace("[EMAIL_001]", "a@x.com")
+
+    content = [{"type": "tool_use", "id": "t1", "name": "fn", "input": {"to": "[EMAIL_001]"}}]
+    new_content = desanitize_content(content, reverse)
+
+    assert new_content[0]["input"]["to"] == "a@x.com"
+    assert new_content[0]["id"] == "t1"
+
+
+def test_desanitize_tool_use_dict_key_preserved() -> None:
+    def reverse(text: str) -> str:
+        return text.upper()
+
+    content = [{"type": "tool_use", "id": "t1", "name": "fn", "input": {"email": "[E1]"}}]
+    new_content = desanitize_content(content, reverse)
+
+    assert "email" in new_content[0]["input"]
+    assert new_content[0]["input"]["email"] == "[E1]".upper()
+
+
+def test_desanitize_tool_use_list_input() -> None:
+    def reverse(text: str) -> str:
+        return text.replace("[E1]", "a@x.com").replace("[E2]", "b@x.com")
+
+    content = [{"type": "tool_use", "id": "t1", "name": "fn", "input": {"cc": ["[E1]", "[E2]"]}}]
+    new_content = desanitize_content(content, reverse)
+
+    assert new_content[0]["input"]["cc"] == ["a@x.com", "b@x.com"]
+
+
+def test_desanitize_tool_use_non_str_scalars_unchanged() -> None:
+    def reverse(text: str) -> str:
+        return text.upper()
+
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "fn",
+            "input": {"count": 42, "active": True, "ratio": 0.5, "note": None},
+        }
+    ]
+    new_content = desanitize_content(content, reverse)
+
+    inp = new_content[0]["input"]
+    assert inp["count"] == 42
+    assert inp["active"] is True
+    assert inp["ratio"] == 0.5
+    assert inp["note"] is None
+
+
+# ---- E (NIT): desanitize tool_use with non-empty placeholder input ----------
+
+
+def test_desanitize_tool_use_nonempty_input_placeholder_rewritten() -> None:
+    """Non-empty tool_use.input with a placeholder is actually rewritten."""
+
+    def reverse(text: str) -> str:
+        return text.replace("[EMAIL_001]", "a@x.com")
+
+    content = [{"type": "tool_use", "id": "t1", "name": "fn", "input": {"to": "[EMAIL_001]"}}]
+    new_content = desanitize_content(content, reverse)
+    assert new_content[0]["input"]["to"] == "a@x.com"
+
+
+# ---- A: document block tests ------------------------------------------------
+
+
+async def test_sanitize_document_title_and_text_source() -> None:
+    """document block: title and source.data (text) are redacted; no originals survive."""
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        t = text.replace("alice@corp.example", "[E1]").replace("bob@corp.example", "[E2]")
+        pairs: list[tuple[str, str]] = []
+        if "alice@corp.example" in text:
+            pairs.append(("alice@corp.example", "[E1]"))
+        if "bob@corp.example" in text:
+            pairs.append(("bob@corp.example", "[E2]"))
+        return MockSanitizeResult(t, pairs=tuple(pairs))
+
+    block = {
+        "type": "document",
+        "title": "Report for alice@corp.example",
+        "context": "Drafted by alice@corp.example",
+        "source": {"type": "text", "data": "See bob@corp.example for details"},
+    }
+    content = [block]
+    new_content, results = await sanitize_content(content, mock_sanitize)
+
+    serialized = json.dumps(new_content)
+    assert "alice@corp.example" not in serialized
+    assert "bob@corp.example" not in serialized
+    assert "[E1]" in serialized
+    assert "[E2]" in serialized
+    assert new_content[0]["title"] == "Report for [E1]"
+    assert new_content[0]["context"] == "Drafted by [E1]"
+    assert new_content[0]["source"]["data"] == "See [E2] for details"
+    assert len(results) == 3
+
+
+def test_desanitize_document_title_and_text_source() -> None:
+    """document block: title, context, source.data placeholders are restored."""
+
+    def reverse(text: str) -> str:
+        return text.replace("[E1]", "alice@corp.example").replace("[E2]", "bob@corp.example")
+
+    content = [
+        {
+            "type": "document",
+            "title": "Report for [E1]",
+            "context": "Drafted by [E1]",
+            "source": {"type": "text", "data": "See [E2] for details"},
+        }
+    ]
+    new_content = desanitize_content(content, reverse)
+
+    assert new_content[0]["title"] == "Report for alice@corp.example"
+    assert new_content[0]["context"] == "Drafted by alice@corp.example"
+    assert new_content[0]["source"]["data"] == "See bob@corp.example for details"
+
+
+async def test_sanitize_document_roundtrip_restores_originals() -> None:
+    """Full round-trip: sanitize then desanitize returns originals in document block."""
+    mapping: dict[str, str] = {}
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text
+        pairs: list[tuple[str, str]] = []
+        for orig in ("alice@corp.example", "bob@corp.example"):
+            if orig in replaced:
+                ph = f"[E{len(mapping) + 1}]"
+                mapping[ph] = orig
+                replaced = replaced.replace(orig, ph)
+                pairs.append((orig, ph))
+        return MockSanitizeResult(replaced, pairs=tuple(pairs))
+
+    def reverse(text: str) -> str:
+        for ph, orig in mapping.items():
+            text = text.replace(ph, orig)
+        return text
+
+    block = {
+        "type": "document",
+        "title": "Report for alice@corp.example",
+        "source": {"type": "text", "data": "See bob@corp.example"},
+    }
+    new_content, _ = await sanitize_content([block], mock_sanitize)
+    restored = desanitize_content(new_content, reverse)
+
+    assert restored[0]["title"] == "Report for alice@corp.example"
+    assert restored[0]["source"]["data"] == "See bob@corp.example"
+
+
+async def test_sanitize_document_base64_source_untouched() -> None:
+    """document with source.type==base64 must not be altered."""
+    call_count = 0
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        nonlocal call_count
+        call_count += 1
+        return MockSanitizeResult(text, pairs=())
+
+    b64_data = "SGVsbG8gV29ybGQ="
+    block = {
+        "type": "document",
+        "title": "A title",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data},
+    }
+    new_content, _ = await sanitize_content([block], mock_sanitize)
+
+    # title is sanitized (1 call), base64 data is NOT touched
+    assert call_count == 1
+    assert new_content[0]["source"]["data"] == b64_data
+
+
+async def test_sanitize_document_url_source_untouched() -> None:
+    """document with source.type==url must not be altered."""
+    call_count = 0
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        nonlocal call_count
+        call_count += 1
+        return MockSanitizeResult(text, pairs=())
+
+    block = {
+        "type": "document",
+        "title": "Doc",
+        "source": {"type": "url", "url": "https://example.com/secret.pdf"},
+    }
+    new_content, _ = await sanitize_content([block], mock_sanitize)
+    assert call_count == 1
+    assert new_content[0]["source"]["url"] == "https://example.com/secret.pdf"
+
+
+async def test_sanitize_document_content_source_recurses() -> None:
+    """document with source.type==content recurses into the content block list."""
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        t = text.replace("alice@corp.example", "[E1]")
+        pairs = (("alice@corp.example", "[E1]"),) if "alice@corp.example" in text else ()
+        return MockSanitizeResult(t, pairs=pairs)
+
+    block = {
+        "type": "document",
+        "source": {
+            "type": "content",
+            "content": [{"type": "text", "text": "Contact alice@corp.example"}],
+        },
+    }
+    new_content, results = await sanitize_content([block], mock_sanitize)
+
+    inner = new_content[0]["source"]["content"][0]["text"]
+    assert inner == "Contact [E1]"
+    assert "alice@corp.example" not in json.dumps(new_content)
+    assert len(results) == 1
+
+
+def test_collect_text_document_title_context_text_source() -> None:
+    content = [
+        {
+            "type": "document",
+            "title": "My title",
+            "context": "Some context",
+            "source": {"type": "text", "data": "Body text"},
+        }
+    ]
+    result = collect_text(content)
+    assert result == ["My title", "Some context", "Body text"]
+
+
+def test_collect_text_document_base64_source_not_collected() -> None:
+    content = [
+        {
+            "type": "document",
+            "title": "Doc",
+            "source": {"type": "base64", "data": "SGVsbG8="},
+        }
+    ]
+    result = collect_text(content)
+    assert result == ["Doc"]
+    assert "SGVsbG8=" not in result
+
+
+def test_collect_text_document_content_source_recurses() -> None:
+    content = [
+        {
+            "type": "document",
+            "source": {
+                "type": "content",
+                "content": [{"type": "text", "text": "inner text"}],
+            },
+        }
+    ]
+    result = collect_text(content)
+    assert result == ["inner text"]
+
+
+# ---- C: recursion depth guard tests -----------------------------------------
+
+
+async def test_sanitize_json_depth_limit_raises() -> None:
+    """_sanitize_json raises ContentTooDeepError beyond _MAX_JSON_DEPTH."""
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text, pairs=())
+
+    # Build a dict nested 65 levels deep (exceeds _MAX_JSON_DEPTH=64).
+    deep: dict = {"v": "leaf"}
+    for _ in range(65):
+        deep = {"k": deep}
+
+    with pytest.raises(ContentTooDeepError):
+        await _sanitize_json(deep, mock_sanitize)
+
+
+def test_desanitize_json_depth_limit_caps_silently() -> None:
+    """_desanitize_json silently caps at depth limit (no raise, no infinite loop)."""
+    from corp_llm_gateway.sanitizer.content_blocks import _desanitize_json
+
+    calls: list[str] = []
+
+    def reverse(text: str) -> str:
+        calls.append(text)
+        return text.upper()
+
+    # 65-deep nested dict — desanitize must return without raising.
+    deep: dict = {"v": "leaf"}
+    for _ in range(65):
+        deep = {"k": deep}
+
+    result = _desanitize_json(deep, reverse)
+    # Must return something (not raise); the capped branch returns value unchanged.
+    assert result is not None
+
+
+def test_collect_json_text_depth_limit_caps_silently() -> None:
+    """_collect_json_text silently returns [] at depth limit."""
+    # 65-deep nested dict
+    deep: dict = {"v": "leaf"}
+    for _ in range(65):
+        deep = {"k": deep}
+
+    result = _collect_json_text(deep)
+    # Must return a list (not raise); leaf may be missing (capped).
+    assert isinstance(result, list)
+
+
+# ---- D: M1-14 — no original survives sanitization for tool_use + document ---
+
+
+async def test_no_original_in_sanitized_tool_use_and_document() -> None:
+    """M1-14: raw PII must be absent from the serialized sanitized egress."""
+    email1 = "alice@corp.example"
+    email2 = "bob@corp.example"
+    mapping_store: dict[str, str] = {}
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text
+        pairs: list[tuple[str, str]] = []
+        for orig in (email1, email2):
+            if orig in replaced:
+                ph = f"[E{len(mapping_store) + 1}]"
+                mapping_store[ph] = orig
+                replaced = replaced.replace(orig, ph)
+                pairs.append((orig, ph))
+        return MockSanitizeResult(replaced, pairs=tuple(pairs))
+
+    content = [
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "send_email",
+            "input": {"to": email1, "subject": f"Hi {email1}"},
+        },
+        {
+            "type": "document",
+            "title": f"Report for {email2}",
+            "source": {"type": "text", "data": f"Authored by {email2}"},
+        },
+    ]
+    new_content, _ = await sanitize_content(content, mock_sanitize)
+    serialized = json.dumps(new_content)
+
+    assert email1 not in serialized, f"raw {email1!r} leaked into egress"
+    assert email2 not in serialized, f"raw {email2!r} leaked into egress"
+    assert "[E1]" in serialized or "[E2]" in serialized
