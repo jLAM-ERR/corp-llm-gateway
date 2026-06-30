@@ -36,6 +36,8 @@ from corp_llm_gateway import config
 from corp_llm_gateway.audit import AuditLogger, StdoutSink
 from corp_llm_gateway.auth import BearerAuthProvider, NoopAuthProvider
 from corp_llm_gateway.corp_llm import CorpLlmClient
+from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
+from corp_llm_gateway.detectors.base import PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
@@ -151,10 +153,15 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         http=http,
         auth_provider=auth_provider,
     )
+    local_first = config.get("CORP_LLM_LOCAL_FIRST", "1") not in ("0", "false", "False", "FALSE")
+    local_detectors: list[PIIDetector] | None = (
+        [RegexChecksumDetector(), DualNerDetector()] if local_first else None
+    )
     orchestrator = SanitizationOrchestrator(
         corp_llm,
         InMemoryMappingStore(),
         _NoTeamRules(),
+        local_detectors=local_detectors,
     )
 
     audit_logger = AuditLogger(StdoutSink(), gateway_version="demo")
