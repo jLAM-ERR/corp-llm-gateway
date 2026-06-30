@@ -292,3 +292,109 @@ def test_streaming_desanitizer_full_round_trip_recovers_originals() -> None:
     out += d.flush()
     for original in ORIGINAL_CORPUS:
         assert original in out
+
+
+# (vii) Stage-0 block path: GuardrailHttpException and block_reason are original-free
+
+
+def test_stage0_block_exception_message_contains_no_raw_content() -> None:
+    """The GuardrailHttpException raised by Stage 0 must carry no raw user content."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    # The message is always the generic constant string — never the payload.
+    exc = GuardrailHttpException(422, "E_POLICY_BLOCKED", "request blocked by content policy")
+    exc_text = str(exc)
+    for original in ORIGINAL_CORPUS:
+        assert original not in exc_text, f"Original {original!r} leaked into exception text"
+
+
+def test_stage0_block_reason_values_contain_no_raw_content() -> None:
+    """classify_block must return only short reason-code tokens, never payload text."""
+    from corp_llm_gateway.payload.classifier import classify_block
+
+    # Build a payload that contains originals from the corpus.
+    env_payload = "\n".join(
+        [
+            f"SECRET={ORIGINAL_CORPUS[5]}",  # API_KEY=sk-secret-...
+            f"EMAIL={ORIGINAL_CORPUS[0]}",  # alice.smith@corp.lan
+            f"SERVER={ORIGINAL_CORPUS[4]}",  # Server: db-prod-13...
+            "DEBUG=False",
+            "LOG_LEVEL=INFO",
+        ]
+    )
+    reason = classify_block(env_payload)
+    assert reason is not None, "payload should be classified"
+    for original in ORIGINAL_CORPUS:
+        assert original not in reason, f"Original {original!r} leaked into block_reason"
+
+
+@pytest.mark.asyncio
+async def test_stage0_audit_record_contains_no_raw_content() -> None:
+    """An audit record emitted after a Stage-0 block must contain no originals."""
+    import json
+    from datetime import timedelta
+
+    import httpx
+
+    from corp_llm_gateway.audit import AuditLogger, ListSink
+    from corp_llm_gateway.corp_llm import CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+    from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
+
+    def _dummy_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("upstream must NOT be called for blocked requests")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_dummy_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+    )
+
+    env_payload = (
+        f"DATABASE_URL=postgres://{ORIGINAL_CORPUS[0]}:hunter2@db.corp.lan/prod\n"
+        f"SECRET_KEY={ORIGINAL_CORPUS[5]}\n"
+        "DEBUG=False\n"
+        "REDIS_URL=redis://cache.corp.lan:6379\n"
+        "ALLOWED_HOSTS=*.corp.lan\n"
+    )
+
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(
+            {
+                "model": "claude",
+                "messages": [{"role": "user", "content": env_payload}],
+                "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+            }
+        )
+
+    assert ei.value.error_code == "E_POLICY_BLOCKED"
+    # Exactly one audit record emitted at block site.
+    assert len(sink.records) >= 1
+    serialized = json.dumps(sink.records[0])
+    for original in ORIGINAL_CORPUS:
+        assert original not in serialized, f"Original {original!r} leaked into audit record"

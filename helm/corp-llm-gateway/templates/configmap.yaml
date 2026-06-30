@@ -89,7 +89,8 @@ data:
                     "finding_label_counts": .__lf.finding_label_counts,
                     "gateway_version": .__lf.gateway_version,
                     "status": .__lf.status,
-                    "error_code": .__lf.error_code
+                    "error_code": .__lf.error_code,
+                    "block_reason": .__lf.block_reason
                   },
                   "tags": [
                     join(["team:", .__lf.team_id]),

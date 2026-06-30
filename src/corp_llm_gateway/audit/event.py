@@ -32,6 +32,7 @@ class AuditEvent:
 
     placeholder_list: tuple[str, ...] | None = None
     error_code: str | None = None
+    block_reason: str | None = None
     corp_llm_latency_ms: int | None = None
     pre_pass_latency_ms: int | None = None
     audit_buffer_full: bool | None = None

@@ -59,6 +59,7 @@ Present only under the conditions noted; absent otherwise.
 |---|---|---|
 | `placeholder_list` | `redaction_count > 0` | Unique, sorted list of placeholder strings only (e.g. `["[EMAIL_001]", "[NAME_002]"]`) — NEVER includes the originals |
 | `error_code` | `status != "ok"` | Stable error code; no exception text |
+| `block_reason` | Stage-0 payload block fired | Short reason code for the content-policy refusal: `config:env`, `config:kube`, `config:nginx`, `config:ini`, `log:dump`. Never contains raw payload content. |
 | `corp_llm_latency_ms` | corp-LLM path was taken | Sub-stage latency for capacity tuning |
 | `pre_pass_latency_ms` | pre-pass path was taken | Sub-stage latency |
 | `audit_buffer_full` | Vector buffer at ≥50% | Operational signal |

@@ -36,6 +36,8 @@ class AuditLogger:
             record["placeholder_list"] = list(event.placeholder_list)
         if event.error_code is not None:
             record["error_code"] = event.error_code
+        if event.block_reason is not None:
+            record["block_reason"] = event.block_reason
         if event.corp_llm_latency_ms is not None:
             record["corp_llm_latency_ms"] = event.corp_llm_latency_ms
         if event.pre_pass_latency_ms is not None:

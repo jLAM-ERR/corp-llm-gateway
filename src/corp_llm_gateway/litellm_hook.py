@@ -32,7 +32,9 @@ from typing import Any
 
 from corp_llm_gateway.audit import AuditEvent, AuditLogger
 from corp_llm_gateway.audit.event import Provider
+from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
+from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.sanitizer import (
     SanitizationOrchestrator,
     SanitizeResult,
@@ -323,6 +325,33 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 len(input_literals),
             )
 
+        # Stage 0: payload classifier — block config/log dumps before egress (R10/R11).
+        # Runs after auth + _RequestState so the block carries user/team attribution.
+        if _config_get("CORP_LLM_BLOCK_PAYLOADS", "1") != "0":
+            _s0_texts: list[str] = []
+            for _s0_msg in messages:
+                if isinstance(_s0_msg, dict):
+                    _s0_texts.extend(collect_text(_s0_msg.get("content")))
+            _s0_texts.extend(collect_text(data.get("system")))
+            _s0_reason = classify_block("\n".join(_s0_texts))
+            if _s0_reason is not None:
+                state.block_reason = _s0_reason
+                self._record_failure(request_id, error_code="E_POLICY_BLOCKED")
+                logger.info(
+                    "litellm_pre_call_blocked request_id=%s block_reason=%s",
+                    request_id,
+                    _s0_reason,
+                )
+                # Emit audit at block site — pre_call rejection may not trigger
+                # litellm's failure-event path, so we cannot rely on it.
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    422,
+                    "E_POLICY_BLOCKED",
+                    "request blocked by content policy",
+                )
+
         async def sanitize_one(text: str) -> SanitizeResult:
             result = await self._orch.sanitize(
                 text,
@@ -598,6 +627,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             placeholder_list=(
                 tuple(sorted(state.placeholders)) if (state and state.placeholders) else None
             ),
+            error_code=(state.error_code if state else None),
+            block_reason=(state.block_reason if state else None),
         )
         await self._audit.emit(event)
         logger.info(
@@ -781,6 +812,7 @@ def _drop_wire_headers(headers: Any) -> None:
 
 class _RequestState:
     __slots__ = (
+        "block_reason",
         "cache_a_hit",
         "error_code",
         "mapping",
@@ -816,6 +848,7 @@ class _RequestState:
         self.cache_a_hit = cache_a_hit
         self.mapping = mapping
         self.error_code: str | None = None
+        self.block_reason: str | None = None
 
 
 def _extract_headers(data: dict[str, Any]) -> dict[str, str]:
