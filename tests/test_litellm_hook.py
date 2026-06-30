@@ -2100,8 +2100,13 @@ async def test_stage0_audit_record_emitted_with_block_reason() -> None:
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
     assert ei.value.error_code == "E_POLICY_BLOCKED"
-    # Audit record must have been emitted at block time.
-    assert len(sink.records) >= 1
+    # litellm fires async_log_failure_event after the pre_call rejection;
+    # simulate it (same pattern as test_audit_after_failed_pre_call_uses_unknown_user).
+    # The block must NOT audit inline — that would double-audit.
+    _start = time.time()
+    await g.audit(data, None, start_time=_start, end_time=_start + 0.05, status="failed")
+    # Exactly one record — proves no inline double-audit at the block site.
+    assert len(sink.records) == 1
     rec = sink.records[0]
     assert rec.get("block_reason") == "config:env"
     assert rec.get("status") == "failed"

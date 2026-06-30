@@ -342,10 +342,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     request_id,
                     _s0_reason,
                 )
-                # Emit audit at block site — pre_call rejection may not trigger
-                # litellm's failure-event path, so we cannot rely on it.
-                _now = datetime.now(UTC)
-                await self.audit(data, None, _now, _now, status="failed")
+                # The block is audited by litellm's async_log_failure_event →
+                # audit(status="failed"), which reads state.block_reason + full
+                # attribution (state was created above). This mirrors the
+                # E_BAD_REQUEST path; emitting audit() here too would
+                # double-audit, since the failure event still fires.
                 raise GuardrailHttpException(
                     422,
                     "E_POLICY_BLOCKED",

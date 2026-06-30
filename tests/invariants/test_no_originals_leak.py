@@ -383,18 +383,20 @@ async def test_stage0_audit_record_contains_no_raw_content() -> None:
 
     from corp_llm_gateway.litellm_hook import GuardrailHttpException
 
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": env_payload}],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
     with pytest.raises(GuardrailHttpException) as ei:
-        await guardrail.pre_call(
-            {
-                "model": "claude",
-                "messages": [{"role": "user", "content": env_payload}],
-                "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
-            }
-        )
+        await guardrail.pre_call(data)
 
     assert ei.value.error_code == "E_POLICY_BLOCKED"
-    # Exactly one audit record emitted at block site.
-    assert len(sink.records) >= 1
+    # litellm fires async_log_failure_event after the rejection; simulate it.
+    # The block is NOT audited inline (that would double-audit), so drive the
+    # failure-event path to produce the single audit record.
+    await guardrail.audit(data, None, start_time=now, end_time=now, status="failed")
+    assert len(sink.records) == 1
     serialized = json.dumps(sink.records[0])
     for original in ORIGINAL_CORPUS:
         assert original not in serialized, f"Original {original!r} leaked into audit record"
