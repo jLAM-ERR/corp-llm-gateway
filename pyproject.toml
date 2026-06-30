@@ -32,6 +32,15 @@ dev = [
     "mypy>=1.10",
     "pre-commit>=3.7",
 ]
+# CPU-only NER stack (torch-free). Install natasha + slovnet from PyPI.
+# en_core_web_md is NOT on PyPI by package name — install via its wheel URL:
+#   pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl
+# or in uv: uv pip install <same URL> (uv lacks `python -m spacy download` pip access).
+ner = [
+    "natasha>=1.6",
+    "slovnet>=0.6",
+    "spacy>=3.8,<3.9",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/corp_llm_gateway"]
