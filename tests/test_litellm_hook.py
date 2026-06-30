@@ -2161,3 +2161,114 @@ async def test_stage0_disabled_by_flag_allows_through() -> None:
     finally:
         del os.environ["CORP_LLM_BLOCK_PAYLOADS"]
         _cfg_module.reset_cache()
+
+
+# ---- Stage 5 DLP egress guard -----------------------------------------------
+
+
+def _build_guardrail_with_dlp(
+    canary: str,
+    *,
+    corp_llm_pairs: list[tuple[str, str]] | None = None,
+    valid_token: str = "tok-1",
+) -> tuple[CorpLlmGuardrail, ListSink]:
+    """Guardrail with a DLP guard seeded with *canary*; no secret_rescan."""
+    from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
+
+    corp_llm_pairs = corp_llm_pairs if corp_llm_pairs is not None else []
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token=valid_token,
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    auth = AuthMiddleware(token_store)
+    orch = SanitizationOrchestrator(
+        _corp_llm_returning(corp_llm_pairs),
+        InMemoryMappingStore(),
+        _StaticRules(),
+    )
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    dlp = DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    return CorpLlmGuardrail(orch, auth, audit_logger, dlp_guard=dlp), sink
+
+
+async def test_stage5_dlp_blocks_canary_survivor(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stage 5 blocks a canary that the primary sanitizer did not redact."""
+    canary = "DLP-CANARY-RAW-99999"
+    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    data = _data_with_token("tok-1", content=f"here is {canary}")
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+    assert "litellm_egress_blocked" in caplog.text
+    assert "dlp:canary" in caplog.text
+
+
+async def test_stage5_dlp_clean_request_passes_through() -> None:
+    """A request without the canary passes Stage 5 and returns data."""
+    canary = "DLP-CANARY-RAW-99999"
+    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    data = _data_with_token("tok-1", content="ordinary request without canary")
+    out = await g.pre_call(data)
+    assert out["messages"][0]["content"] == "ordinary request without canary"
+
+
+async def test_stage5_dlp_audit_has_block_reason_dlp_canary() -> None:
+    """The failure-event audit after Stage-5 block carries block_reason='dlp:canary'."""
+    canary = "DLP-CANARY-RAW-99999"
+    g, sink = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    now = datetime.now(UTC)
+    data = _data_with_token("tok-1", content=f"leaked {canary} here")
+    with pytest.raises(GuardrailHttpException):
+        await g.pre_call(data)
+    # Simulate litellm's async_log_failure_event → audit(status="failed").
+    await g.audit(data, None, start_time=now, end_time=now, status="failed")
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    assert rec.get("block_reason") == "dlp:canary"
+    assert rec.get("error_code") == "E_DLP_BLOCKED"
+    assert rec.get("status") == "failed"
+    # Raw canary value must NOT appear in any audit field.
+    assert canary not in json.dumps(rec)
+
+
+async def test_stage5_dlp_raw_secret_blocked_by_default_guard() -> None:
+    """A raw OpenAI API key that survived the primary sanitizer is blocked by Stage 5."""
+    raw_key = "sk-" + "a" * 48
+    # Default DlpEgressGuard (secret_rescan=True) — no canaries needed.
+    g, _ = _build_guardrail(pairs=[])
+    data = _data_with_token("tok-1", content=f"my key is {raw_key}")
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+
+
+async def test_stage5_dlp_disabled_by_flag_passes_through() -> None:
+    """When CORP_LLM_DLP_GUARD=0 Stage 5 is skipped entirely."""
+    import os
+
+    from corp_llm_gateway import config as _cfg_module
+
+    canary = "DLP-CANARY-RAW-99999"
+    os.environ["CORP_LLM_DLP_GUARD"] = "0"
+    _cfg_module.reset_cache()
+    try:
+        g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+        data = _data_with_token("tok-1", content=f"here is {canary}")
+        out = await g.pre_call(data)
+        assert canary in out["messages"][0]["content"]
+    finally:
+        del os.environ["CORP_LLM_DLP_GUARD"]
+        _cfg_module.reset_cache()

@@ -25,6 +25,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
 from corp_llm_gateway.audit import (
@@ -326,6 +327,187 @@ def test_stage0_block_reason_values_contain_no_raw_content() -> None:
     assert reason is not None, "payload should be classified"
     for original in ORIGINAL_CORPUS:
         assert original not in reason, f"Original {original!r} leaked into block_reason"
+
+
+# (viii) Stage-5 DLP guard path: exception, log, and audit are original-free
+
+
+def test_stage5_dlp_exception_message_contains_no_raw_content() -> None:
+    """GuardrailHttpException raised by Stage 5 carries no raw canary/secret value."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    exc = GuardrailHttpException(422, "E_DLP_BLOCKED", "request blocked by DLP egress policy")
+    exc_text = str(exc)
+    for original in ORIGINAL_CORPUS:
+        assert original not in exc_text, f"Original {original!r} leaked into exception text"
+
+
+def test_stage5_dlp_block_reason_values_contain_no_raw_content() -> None:
+    """DlpEgressGuard.scan() must return only short reason codes, never the matched value."""
+    from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
+
+    canary = ORIGINAL_CORPUS[0]  # "alice.smith@corp.lan"
+    guard = DlpEgressGuard(canary_patterns=[canary], secret_rescan=True)
+    text_with_canary = f"text containing {canary}"
+    reason = guard.scan(text_with_canary)
+    assert reason is not None, "guard should detect the canary"
+    for original in ORIGINAL_CORPUS:
+        assert original not in reason, f"Original {original!r} leaked into block_reason"
+
+
+@pytest.mark.asyncio
+async def test_stage5_dlp_log_contains_no_raw_canary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The litellm_egress_blocked log line emits no raw canary or secret value."""
+    from corp_llm_gateway.audit import AuditLogger, ListSink
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
+    from corp_llm_gateway.storage import InMemoryMappingStore
+    from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
+
+    canary = ORIGINAL_CORPUS[0]  # "alice.smith@corp.lan"
+
+    def _empty_pairs_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": '{"pairs": []}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_empty_pairs_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    dlp = DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(store),
+        AuditLogger(ListSink(), gateway_version="0.0.1"),
+        dlp_guard=dlp,
+    )
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": f"message with {canary}"}],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), contextlib.suppress(Exception):
+        await guardrail.pre_call(data)
+    for original in ORIGINAL_CORPUS:
+        assert original not in caplog.text, f"Original {original!r} leaked into logs"
+
+
+@pytest.mark.asyncio
+async def test_stage5_audit_record_contains_no_raw_content() -> None:
+    """Audit record after a Stage-5 block must contain no raw originals."""
+    from corp_llm_gateway.audit import AuditLogger, ListSink
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
+    from corp_llm_gateway.storage import InMemoryMappingStore
+    from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
+
+    canary = ORIGINAL_CORPUS[0]  # "alice.smith@corp.lan"
+
+    def _empty_pairs_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": '{"pairs": []}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_empty_pairs_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv2",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    dlp = DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+        dlp_guard=dlp,
+    )
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": f"message containing {canary}"}],
+        "headers": {"X-Corp-Auth": "tok-inv2", "Authorization": "Bearer byok"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+    await guardrail.audit(data, None, start_time=now, end_time=now, status="failed")
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    for original in ORIGINAL_CORPUS:
+        assert original not in serialized, f"Original {original!r} leaked into audit record"
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ from corp_llm_gateway.sanitizer.content_blocks import (
     desanitize_content,
     sanitize_content,
 )
+from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.sanitizer.placeholder import (
     apply_pairs,
@@ -111,6 +112,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         *,
         max_output_tokens_cap: int | None = None,
         strip_inbound_headers_to_upstream: bool = False,
+        dlp_guard: DlpEgressGuard | None = None,
     ) -> None:
         # Best-effort super().__init__ — when litellm is installed this
         # initializes CustomLogger's internal state; when it isn't
@@ -133,6 +135,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # `Host: 127.0.0.1:4000` and the corp ingress 503s on the unknown
         # vhost. Off by default to preserve existing behaviour.
         self._strip_inbound_headers_to_upstream = strip_inbound_headers_to_upstream
+        self._dlp_guard = dlp_guard if dlp_guard is not None else DlpEgressGuard()
         # Per-request state. Keyed by request_id; cleared in post_call.
         self._req_state: dict[str, _RequestState] = {}
 
@@ -500,6 +503,31 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 request_id,
                 state.redaction_count,
             )
+
+        # Stage 5: DLP egress guard — re-scan the SANITIZED outbound request.
+        # Defence-in-depth: catches canaries / raw secrets that survived the
+        # primary sanitizer. Do NOT audit inline — litellm's failure event
+        # fires async_log_failure_event → audit(), same as the Stage-0 path.
+        if _config_get("CORP_LLM_DLP_GUARD", "1") != "0":
+            _s5_texts: list[str] = []
+            for _s5_msg in data.get("messages") or []:
+                if isinstance(_s5_msg, dict):
+                    _s5_texts.extend(collect_text(_s5_msg.get("content")))
+            _s5_texts.extend(collect_text(data.get("system")))
+            _s5_reason = self._dlp_guard.scan("\n".join(_s5_texts))
+            if _s5_reason is not None:
+                state.block_reason = _s5_reason
+                self._record_failure(request_id, error_code="E_DLP_BLOCKED")
+                logger.info(
+                    "litellm_egress_blocked request_id=%s block_reason=%s",
+                    request_id,
+                    _s5_reason,
+                )
+                raise GuardrailHttpException(
+                    422,
+                    "E_DLP_BLOCKED",
+                    "request blocked by DLP egress policy",
+                )
 
         logger.info(
             "litellm_pre_call_complete request_id=%s team_id=%s provider=%s "

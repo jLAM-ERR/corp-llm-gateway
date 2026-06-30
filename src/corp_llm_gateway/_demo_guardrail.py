@@ -41,6 +41,7 @@ from corp_llm_gateway.detectors.base import PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.rules import Gazetteer, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
 
@@ -174,6 +175,12 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
 
     audit_logger = AuditLogger(StdoutSink(), gateway_version="demo")
 
+    # Stage-5 DLP egress guard: canary list from CORP_LLM_DLP_CANARIES
+    # (comma-separated literal strings / regexes), default empty.
+    _canary_raw = config.get("CORP_LLM_DLP_CANARIES", "")
+    _canary_list = [c.strip() for c in _canary_raw.split(",") if c.strip()] if _canary_raw else []
+    dlp_guard = DlpEgressGuard(canary_patterns=_canary_list or None, secret_rescan=True)
+
     return CorpLlmGuardrail(
         orchestrator,
         auth,
@@ -183,6 +190,7 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         # headers (including Host: 127.0.0.1:4000) to the corp ingress,
         # which 503s the unknown vhost. Strip them.
         strip_inbound_headers_to_upstream=True,
+        dlp_guard=dlp_guard,
     )
 
 
