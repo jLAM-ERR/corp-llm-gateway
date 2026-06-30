@@ -182,3 +182,78 @@ def test_term_to_lemma_seq_lowercases() -> None:
     seq = _term_to_lemma_seq("AML CFT")
     # Without morphology libs, fallback is .lower()
     assert "aml" in seq or "AML".lower() in seq
+
+
+# ---------------------------------------------------------------------------
+# Identifier sub-token scanning tests (DP-5)
+# Surface-fallback: no morphology needed; .lower() is sufficient for EN codenames.
+# These tests run on Python 3.14 (no pymorphy3/spaCy) and 3.12 (with deps).
+# ---------------------------------------------------------------------------
+
+
+async def test_identifier_companynameabc_service_yields_product() -> None:
+    """CompanynameabcService → PRODUCT finding for 'Companynameabc' sub-token."""
+    gaz = Gazetteer({"Companynameabc": "PRODUCT", "Betadirect": "PRODUCT", "Kdir": "PRODUCT"})
+    text = "using CompanynameabcService"
+    findings = await gaz.detect(text)
+    assert any(f.label == "PRODUCT" and f.text == "Companynameabc" for f in findings)
+    for f in findings:
+        assert text[f.start : f.end] == f.text, f"offset mismatch for {f.text!r}"
+
+
+async def test_identifier_betadirect_client_yields_product() -> None:
+    """BetadirectClient → PRODUCT finding for 'Betadirect' sub-token."""
+    gaz = Gazetteer({"Betadirect": "PRODUCT"})
+    text = "import BetadirectClient"
+    findings = await gaz.detect(text)
+    assert any(f.label == "PRODUCT" and f.text == "Betadirect" for f in findings)
+    for f in findings:
+        assert text[f.start : f.end] == f.text
+
+
+async def test_identifier_kdir_service_yields_product() -> None:
+    """KdirService → PRODUCT finding for 'Kdir' sub-token."""
+    gaz = Gazetteer({"Kdir": "PRODUCT"})
+    text = "class KdirService:"
+    findings = await gaz.detect(text)
+    assert any(f.label == "PRODUCT" and f.text == "Kdir" for f in findings)
+    for f in findings:
+        assert text[f.start : f.end] == f.text
+
+
+async def test_clean_identifier_yields_no_findings() -> None:
+    """UserAccountService has no gazetteer terms — nothing is redacted (R8 / UX)."""
+    gaz = Gazetteer({"Companynameabc": "PRODUCT", "Betadirect": "PRODUCT", "Kdir": "PRODUCT"})
+    findings = await gaz.detect("UserAccountService is a standard service")
+    assert findings == []
+
+
+async def test_no_duplicate_finding_for_standalone_term() -> None:
+    """A term that appears standalone matches once, not twice (whole + sub-token)."""
+    gaz = Gazetteer({"Betadirect": "PRODUCT"})
+    text = "Betadirect is the product"
+    findings = await gaz.detect(text)
+    betadirect_hits = [f for f in findings if "betadirect" in f.text.lower()]
+    assert len(betadirect_hits) == 1
+
+
+async def test_identifier_offsets_absolute_in_original_text() -> None:
+    """Sub-token finding offsets must be absolute into the original text string."""
+    gaz = Gazetteer({"Kdir": "PRODUCT"})
+    text = "see also KdirService for details"
+    findings = await gaz.detect(text)
+    kdir_findings = [f for f in findings if f.text == "Kdir"]
+    assert len(kdir_findings) == 1
+    f = kdir_findings[0]
+    assert text[f.start : f.end] == "Kdir"
+    # "KdirService" starts at position 9 in text; "Kdir" sub-token at 9
+    assert f.start == text.index("Kdir")
+
+
+async def test_identifier_snake_case_sub_token() -> None:
+    """Snake-case identifier sub-tokens are also scanned."""
+    gaz = Gazetteer({"Betadirect": "PRODUCT"})
+    text = "betadirect_client = connect()"
+    findings = await gaz.detect(text)
+    # "betadirect" is its own \w+ token in snake_case, so whole-token match
+    assert any(f.label == "PRODUCT" for f in findings)

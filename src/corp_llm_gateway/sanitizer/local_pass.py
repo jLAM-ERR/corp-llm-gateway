@@ -1,4 +1,4 @@
-"""Local detection pass: concurrent detector union with de-overlap."""
+"""Local detection pass: segment-aware concurrent detector union with de-overlap."""
 
 from __future__ import annotations
 
@@ -6,17 +6,46 @@ import asyncio
 
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.detectors.regex_checksum import _deduplicate
+from corp_llm_gateway.sanitizer.segmenter import SegmentKind, split_segments
 
 
 class LocalDetectionPass:
-    def __init__(self, detectors: list[PIIDetector]) -> None:
+    def __init__(
+        self,
+        detectors: list[PIIDetector],
+        *,
+        code_safe_detectors: list[PIIDetector] | None = None,
+    ) -> None:
         self._detectors = detectors
+        # Detectors to run on raw CODE segments (e.g. regex, gazetteer — not NER).
+        # Defaults to all detectors when not specified (backward-compatible).
+        self._code_detectors = code_safe_detectors if code_safe_detectors is not None else detectors
 
     async def findings(self, text: str) -> list[Finding]:
         if not self._detectors:
             return []
-        results = await asyncio.gather(*(d.detect(text) for d in self._detectors))
-        raw: list[Finding] = []
-        for r in results:
-            raw.extend(r)
-        return _deduplicate(raw)
+
+        segments = split_segments(text)
+        if not segments:
+            return []
+
+        all_raw: list[Finding] = []
+        for seg in segments:
+            chosen = self._code_detectors if seg.kind == SegmentKind.CODE else self._detectors
+            if not chosen:
+                continue
+            results = await asyncio.gather(*(d.detect(seg.text) for d in chosen))
+            for r in results:
+                for f in r:
+                    # Offset sub-segment findings back to absolute positions in text.
+                    all_raw.append(
+                        Finding(
+                            text=f.text,
+                            label=f.label,
+                            start=seg.start + f.start,
+                            end=seg.start + f.end,
+                            score=f.score,
+                        )
+                    )
+
+        return _deduplicate(all_raw)

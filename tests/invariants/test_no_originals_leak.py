@@ -230,6 +230,59 @@ async def test_invalid_token_error_does_not_carry_token_text() -> None:
 # emits a placeholder verbatim into a downstream consumer -------------------
 
 
+# (vi-bis) Segmenter output is pure slices; never logs content ----------------
+
+
+def test_segmenter_split_segments_is_pure_slices(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """split_segments returns exact text[start:end] slices; never logs originals."""
+    import logging
+
+    from corp_llm_gateway.sanitizer.segmenter import split_segments
+
+    original = ORIGINAL_CORPUS[0]  # "alice.smith@corp.lan"
+    text = f"see code:\n```python\nresult = call('{original}')\n```\ndone"
+    with caplog.at_level(logging.DEBUG):
+        segments = split_segments(text)
+    for seg in segments:
+        assert seg.text == text[seg.start : seg.end], f"segment text is not a slice: {seg!r}"
+    assert _haystack_contains_any_original(caplog.text) is None
+
+
+def test_segmenter_split_identifier_is_pure_slices(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """split_identifier returns exact name[start:end] slices; never logs originals."""
+    import logging
+
+    from corp_llm_gateway.sanitizer.segmenter import split_identifier
+
+    name = "AliceSmithCorpLanService"
+    with caplog.at_level(logging.DEBUG):
+        sub_tokens = split_identifier(name)
+    for token_text, start, end in sub_tokens:
+        assert token_text == name[start:end], (
+            f"sub-token is not a slice: {token_text!r} at [{start}:{end}]"
+        )
+    assert _haystack_contains_any_original(caplog.text) is None
+
+
+def test_segmenter_does_not_introduce_new_content() -> None:
+    """Every character in every Segment.text is present in the original text at that position."""
+    from corp_llm_gateway.sanitizer.segmenter import split_segments
+
+    text = "\n".join(ORIGINAL_CORPUS)
+    segments = split_segments(text)
+    for seg in segments:
+        # Pure-slice invariant: content must be identical to the source span.
+        assert seg.text == text[seg.start : seg.end]
+
+
+# (ii) StreamingDesanitizer correctly de-redacts; partial state never
+# emits a placeholder verbatim into a downstream consumer -------------------
+
+
 def test_streaming_desanitizer_full_round_trip_recovers_originals() -> None:
     mapping = StrategyResult(pairs=_redacted_pairs())
     placeholders = [p for _, p in _redacted_pairs()]

@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.detectors.regex_checksum import _deduplicate
 
 # ---------------------------------------------------------------------------
 # Lazy morphology handles (module-level singletons, loaded once)
@@ -112,6 +113,13 @@ class Gazetteer(PIIDetector):
     Each matched surface span yields a Finding with score 0.95. The label
     is one of PRODUCT / REGULATED / CONFIDENTIAL_MARK. Offsets satisfy
     ``text[finding.start : finding.end] == finding.text``.
+
+    Identifier scanning: for every ``\\w+`` token that splits into multiple
+    sub-tokens (camelCase / PascalCase / snake_case), each sub-token is
+    lemmatized and matched against single-term gazetteer entries. A match
+    emits a Finding whose span covers only the matched sub-token. This closes
+    the ``CompanynameabcService`` / ``BetadirectClient`` benchmark case on the
+    fast local path without redacting generic code structure (R8).
     """
 
     def __init__(self, term_categories: dict[str, str]) -> None:
@@ -121,13 +129,19 @@ class Gazetteer(PIIDetector):
         """
         # Maps lemma-token-tuple → label (first registration wins on collision)
         self._index: dict[tuple[str, ...], str] = {}
+        # Fast single-token lookup for identifier sub-token scanning
+        self._single_lemmas: dict[str, str] = {}
         for term, label in term_categories.items():
             term = term.strip()
             if not term:
                 continue
             seq = _term_to_lemma_seq(term)
-            if seq and seq not in self._index:
+            if not seq:
+                continue
+            if seq not in self._index:
                 self._index[seq] = label
+            if len(seq) == 1:
+                self._single_lemmas.setdefault(seq[0], label)
 
     async def detect(self, text: str) -> list[Finding]:
         if not text.strip() or not self._index:
@@ -139,6 +153,8 @@ class Gazetteer(PIIDetector):
         n = len(lemmas)
 
         findings: list[Finding] = []
+
+        # --- whole-token / multi-word matching (original logic) ---
         for seq, label in self._index.items():
             seq_len = len(seq)
             if seq_len > n:
@@ -156,7 +172,38 @@ class Gazetteer(PIIDetector):
                             score=0.95,
                         )
                     )
-        return findings
+
+        # --- identifier sub-token scanning ---
+        if self._single_lemmas:
+            # Lazy import breaks the rules → sanitizer → rules circular dependency
+            # (sanitizer/__init__ imports orchestrator which imports rules).
+            from corp_llm_gateway.sanitizer.segmenter.identifiers import (
+                split_identifier,
+            )
+
+            for word, tok_start, _tok_end in tokens:
+                sub_tokens = split_identifier(word)
+                # Only scan when the identifier actually splits (>1 sub-token);
+                # single-token words are already covered by the loop above.
+                if len(sub_tokens) <= 1:
+                    continue
+                for sub_text, sub_rel_start, sub_rel_end in sub_tokens:
+                    lemma = _lemmatize_word(sub_text)
+                    label = self._single_lemmas.get(lemma)
+                    if label is not None:
+                        abs_start = tok_start + sub_rel_start
+                        abs_end = tok_start + sub_rel_end
+                        findings.append(
+                            Finding(
+                                text=text[abs_start:abs_end],
+                                label=label,
+                                start=abs_start,
+                                end=abs_end,
+                                score=0.95,
+                            )
+                        )
+
+        return _deduplicate(findings)
 
     @classmethod
     def from_defaults(cls) -> Gazetteer:
