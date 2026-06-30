@@ -19,11 +19,13 @@ from corp_llm_gateway.corp_llm import (
     CorpLlmClient,
 )
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.detectors.regex_checksum import _deduplicate
 from corp_llm_gateway.payload import (
     DEFAULT_THRESHOLD_BYTES,
     should_skip_sanitization,
 )
 from corp_llm_gateway.rules import Rules, RulesLoader
+from corp_llm_gateway.rules.gazetteer import Gazetteer
 from corp_llm_gateway.sanitizer.engine import (
     AllStrategiesFailedError,
     CorpLlmSanitizer,
@@ -66,6 +68,7 @@ class SanitizationOrchestrator:
         cache_b_ttl_seconds: int = 3600,
         size_threshold_bytes: int = DEFAULT_THRESHOLD_BYTES,
         local_detectors: list[PIIDetector] | None = None,
+        gazetteer: Gazetteer | None = None,
     ) -> None:
         self._corp_llm = corp_llm
         self._mapping_store = mapping_store
@@ -75,6 +78,7 @@ class SanitizationOrchestrator:
         self._cache_b_ttl = cache_b_ttl_seconds
         self._size_threshold = size_threshold_bytes
         self._local = LocalDetectionPass(local_detectors) if local_detectors else None
+        self._gazetteer = gazetteer
 
     async def sanitize(
         self,
@@ -142,20 +146,65 @@ class SanitizationOrchestrator:
             conversation_id,
             content_hash[:12],
         )
-        logger.info(
-            "sanitize_corp_llm_call_start team_id=%s conversation_id=%s",
-            team_id,
-            conversation_id,
-        )
-        result = await self._call_corp_llm(text, rules)
-        logger.info(
-            "sanitize_corp_llm_call_done team_id=%s conversation_id=%s pairs=%d",
-            team_id,
-            conversation_id,
-            len(result.pairs),
-        )
 
-        if self._local is not None:
+        if self._gazetteer is not None:
+            # DP-4: run gazetteer + local first; oracle is conditional on a gazetteer hit.
+            gaz_findings = await self._gazetteer.detect(text)
+            local_findings = await self._local.findings(text) if self._local is not None else []
+            combined = _deduplicate(local_findings + gaz_findings)
+            if gaz_findings:
+                logger.info(
+                    "sanitize_branch=gazetteer_hit oracle=yes "
+                    "team_id=%s conversation_id=%s gaz_hits=%d",
+                    team_id,
+                    conversation_id,
+                    len(gaz_findings),
+                )
+                logger.info(
+                    "sanitize_corp_llm_call_start team_id=%s conversation_id=%s",
+                    team_id,
+                    conversation_id,
+                )
+                oracle_result = await self._call_corp_llm(text, rules)
+                logger.info(
+                    "sanitize_corp_llm_call_done team_id=%s conversation_id=%s pairs=%d",
+                    team_id,
+                    conversation_id,
+                    len(oracle_result.pairs),
+                )
+                merged_pairs = _merge_local(oracle_result.pairs, combined)
+                _emit_gazetteer_proposal(oracle_result.pairs, combined, team_id, conversation_id)
+            else:
+                # No gazetteer hit → local pass is authoritative; oracle skipped.
+                logger.info(
+                    "sanitize_branch=gazetteer_nohit oracle=skipped "
+                    "team_id=%s conversation_id=%s local_findings=%d",
+                    team_id,
+                    conversation_id,
+                    len(local_findings),
+                )
+                merged_pairs = _merge_local((), combined)
+            result = StrategyResult(pairs=merged_pairs)
+
+        elif self._local is not None:
+            # DP-3 path: oracle always on, local merged additively.
+            logger.info(
+                "sanitize_branch=local_pass oracle=yes team_id=%s conversation_id=%s",
+                team_id,
+                conversation_id,
+            )
+            logger.info(
+                "sanitize_corp_llm_call_start team_id=%s conversation_id=%s",
+                team_id,
+                conversation_id,
+            )
+            result = await self._call_corp_llm(text, rules)
+            logger.info(
+                "sanitize_corp_llm_call_done team_id=%s conversation_id=%s pairs=%d",
+                team_id,
+                conversation_id,
+                len(result.pairs),
+            )
             local_findings = await self._local.findings(text)
             merged_pairs = _merge_local(result.pairs, local_findings)
             logger.info(
@@ -168,6 +217,26 @@ class SanitizationOrchestrator:
                 len(merged_pairs),
             )
             result = StrategyResult(pairs=merged_pairs)
+
+        else:
+            # Legacy path: oracle only.
+            logger.info(
+                "sanitize_branch=oracle_only team_id=%s conversation_id=%s",
+                team_id,
+                conversation_id,
+            )
+            logger.info(
+                "sanitize_corp_llm_call_start team_id=%s conversation_id=%s",
+                team_id,
+                conversation_id,
+            )
+            result = await self._call_corp_llm(text, rules)
+            logger.info(
+                "sanitize_corp_llm_call_done team_id=%s conversation_id=%s pairs=%d",
+                team_id,
+                conversation_id,
+                len(result.pairs),
+            )
 
         await self._mapping_store.set_dedup(content_hash, result, ttl_seconds=self._cache_a_ttl)
         logger.info(
@@ -264,6 +333,35 @@ def _apply_pairs(text: str, pairs: tuple[tuple[str, str], ...]) -> str:
     for original, placeholder in sorted_pairs:
         text = text.replace(original, placeholder)
     return text
+
+
+def _emit_gazetteer_proposal(
+    oracle_pairs: tuple[tuple[str, str], ...],
+    combined_findings: list[Finding],
+    team_id: str,
+    conversation_id: str,
+) -> None:
+    """Log counts+labels for oracle-found items not covered by gazetteer/local.
+
+    Logs only counts and label shapes — NO raw values (M1-14 compliant).
+    # TODO(DP-4): wire ShadowDetector human-approval loop
+    """
+    covered_originals = {f.text for f in combined_findings}
+    uncovered_placeholders = [p for o, p in oracle_pairs if o not in covered_originals]
+    if not uncovered_placeholders:
+        return
+    label_counts: dict[str, int] = {}
+    for placeholder in uncovered_placeholders:
+        m = _PLACEHOLDER_LABEL_RE.match(placeholder)
+        label = m.group(1) if m else "UNKNOWN"
+        label_counts[label] = label_counts.get(label, 0) + 1
+    logger.info(
+        "gazetteer_proposal team_id=%s conversation_id=%s uncovered_count=%d label_counts=%s",
+        team_id,
+        conversation_id,
+        len(uncovered_placeholders),
+        label_counts,
+    )
 
 
 def _merge_local(

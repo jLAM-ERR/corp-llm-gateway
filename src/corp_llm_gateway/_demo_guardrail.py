@@ -39,7 +39,7 @@ from corp_llm_gateway.corp_llm import CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
-from corp_llm_gateway.rules import Rules, RulesLoader
+from corp_llm_gateway.rules import Gazetteer, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
@@ -157,11 +157,19 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
     local_detectors: list[PIIDetector] | None = (
         [RegexChecksumDetector(), DualNerDetector()] if local_first else None
     )
+    gazetteer_enabled = config.get("CORP_LLM_GAZETTEER", "1") not in (
+        "0",
+        "false",
+        "False",
+        "FALSE",
+    )
+    gazetteer: Gazetteer | None = Gazetteer.from_defaults() if gazetteer_enabled else None
     orchestrator = SanitizationOrchestrator(
         corp_llm,
         InMemoryMappingStore(),
         _NoTeamRules(),
         local_detectors=local_detectors,
+        gazetteer=gazetteer,
     )
 
     audit_logger = AuditLogger(StdoutSink(), gateway_version="demo")

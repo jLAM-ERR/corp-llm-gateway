@@ -1,0 +1,13 @@
+# Gateway-level defaults — not legal advice. Ops team curates and extends.
+# Format: one term per line (bilingual where relevant). Lines starting with
+# '#' are comments and are ignored by the loader.
+Project Polaris
+Полярная звезда
+Project Vega
+Ядро Вега
+Project Aurora
+Аврора платформа
+Project Nexus
+Nexus Core
+Acme Platform
+Акме платформа

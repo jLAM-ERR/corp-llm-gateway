@@ -1,0 +1,20 @@
+# Gateway-level defaults — not legal advice. Ops team curates and extends.
+# Confidentiality markings (98-ФЗ грифы and international equivalents).
+Коммерческая тайна
+Коммерческая тайна организации
+ДСП
+Для служебного пользования
+НОУ-ХАУ
+Ноу-хау
+Секрет производства
+Конфиденциально
+Конфиденциальная информация
+Строго конфиденциально
+Confidential
+Strictly Confidential
+NDA
+Non-Disclosure Agreement
+Proprietary
+Internal Only
+Company Confidential
+Trade Secret
