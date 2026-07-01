@@ -378,5 +378,3 @@ Open-source components this gateway assembles (Architecture B — best-of-breed)
 - **State & storage** — [Redis](https://redis.io) (mapping / dedup caches) · [PostgreSQL](https://www.postgresql.org) via [asyncpg](https://github.com/MagicStack/asyncpg) (token store)
 - **Audit & observability** — [Vector](https://vector.dev) → [Langfuse](https://langfuse.com) + S3 + SIEM
 - **Delivery & clients** — [Helm](https://helm.sh) (chart) · [CoreDNS](https://coredns.io) (egress sinkhole) · [httpx](https://www.python-httpx.org) (corp-LLM client)
-
-Upstream providers reached with the developer's BYOK key: [Anthropic](https://www.anthropic.com) / [OpenAI](https://openai.com). Laptop client: [Claude Code](https://github.com/anthropics/claude-code).
