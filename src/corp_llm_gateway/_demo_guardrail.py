@@ -29,6 +29,7 @@ import logging
 import os
 import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 
@@ -39,7 +40,14 @@ from corp_llm_gateway.corp_llm import CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
-from corp_llm_gateway.rules import Gazetteer, Rules, RulesLoader
+from corp_llm_gateway.rules import (
+    CachedRulesLoader,
+    FileRulesLoader,
+    Gazetteer,
+    Rules,
+    RulesLoader,
+    RulesNotFoundError,
+)
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.allowlist import Allowlist
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
@@ -60,12 +68,17 @@ class _DropHealthcheckAccessLogs(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_DropHealthcheckAccessLogs())
 
 
-class _NoTeamRules(RulesLoader):
-    """No team-specific rules for the demo; engine still applies the
-    PII regex floor + general detector tier."""
+class _DemoRulesLoader(RulesLoader):
+    """Loads team replace.md rules from disk; falls back to empty on missing file."""
+
+    def __init__(self, directory: str) -> None:
+        self._inner = CachedRulesLoader(FileRulesLoader(Path(directory)))
 
     async def load(self, team_id: str) -> Rules:
-        return Rules(rules=())
+        try:
+            return await self._inner.load(team_id)
+        except RulesNotFoundError:
+            return Rules(rules=())
 
 
 # Per-request output cap. Claude Code defaults to max_tokens=64000
@@ -166,10 +179,11 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         "FALSE",
     )
     gazetteer: Gazetteer | None = Gazetteer.from_defaults() if gazetteer_enabled else None
+    rules_dir = config.get("CORP_LLM_RULES_DIR", "/etc/corp-llm-gateway/rules")
     orchestrator = SanitizationOrchestrator(
         corp_llm,
         InMemoryMappingStore(),
-        _NoTeamRules(),
+        _DemoRulesLoader(rules_dir),
         local_detectors=local_detectors,
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),

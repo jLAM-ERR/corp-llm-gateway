@@ -45,6 +45,11 @@ _PLACEHOLDER_LABEL_RE = re.compile(r"^\[([A-Z_]+)_(\d+)\]$")
 logger = logging.getLogger(__name__)
 
 
+def _rules_pairs(rules: Rules, text: str) -> tuple[tuple[str, str], ...]:
+    """Return (pattern, replacement) pairs from rules whose pattern appears in text."""
+    return tuple((r.pattern, r.replacement) for r in rules.rules if r.pattern in text)
+
+
 @dataclass(frozen=True)
 class SanitizeResult:
     sanitized_text: str
@@ -155,6 +160,9 @@ class SanitizationOrchestrator:
             gaz_findings = await self._gazetteer.detect(text)
             local_findings = await self._local.findings(text) if self._local is not None else []
             combined = _deduplicate(local_findings + gaz_findings)
+            # Rules are top-priority: computed once, applied in both sub-branches.
+            rules_pairs = _rules_pairs(rules, text)
+            rule_origins = {o for o, _ in rules_pairs}
             if gaz_findings:
                 logger.info(
                     "sanitize_branch=gazetteer_hit oracle=yes "
@@ -175,10 +183,12 @@ class SanitizationOrchestrator:
                     conversation_id,
                     len(oracle_result.pairs),
                 )
-                merged_pairs = _merge_local(oracle_result.pairs, combined)
+                # Exclude oracle pairs whose origin a rule already covers; rules go first.
+                oracle_kept = tuple((o, p) for o, p in oracle_result.pairs if o not in rule_origins)
+                merged_pairs = _merge_local(rules_pairs + oracle_kept, combined)
                 _emit_gazetteer_proposal(oracle_result.pairs, combined, team_id, conversation_id)
             else:
-                # No gazetteer hit → local pass is authoritative; oracle skipped.
+                # No gazetteer hit → rules still apply; oracle skipped.
                 logger.info(
                     "sanitize_branch=gazetteer_nohit oracle=skipped "
                     "team_id=%s conversation_id=%s local_findings=%d",
@@ -186,7 +196,7 @@ class SanitizationOrchestrator:
                     conversation_id,
                     len(local_findings),
                 )
-                merged_pairs = _merge_local((), combined)
+                merged_pairs = _merge_local(rules_pairs, combined)
             result = StrategyResult(pairs=merged_pairs)
 
         elif self._local is not None:
