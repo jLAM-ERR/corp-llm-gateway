@@ -1,0 +1,16 @@
+# Production value overrides — apply with: helm upgrade -f values-prod.yaml
+# Dev defaults (values.yaml) keep both controls OFF; this file flips them ON.
+
+networkPolicy:
+  enabled: true
+  # Anthropic / OpenAI public egress — update with confirmed ranges from corp networking (open Q#4).
+  upstreamCidrs:
+    - "2620:1ec:c11::/48"
+    - "104.18.0.0/16"
+  # Corp-internal services: Redis, Postgres, corp LLM, Langfuse, S3, SIEM.
+  corpInternalCidrs:
+    - "10.0.0.0/8"
+
+coreDnsSinkhole:
+  enabled: true
+  zone: corp.lan
