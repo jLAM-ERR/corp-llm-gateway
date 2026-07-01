@@ -15,6 +15,7 @@ from collections.abc import Sequence
 
 from corp_llm_gateway import config
 from corp_llm_gateway.auth import BearerAuthProvider, NoopAuthProvider
+from corp_llm_gateway.auth.rbac import OperatorDenied, get_admin_token, verify_operator
 from corp_llm_gateway.corp_llm import CorpLlmClient, CorpLlmHttpError
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator, SanitizeResult
@@ -58,8 +59,34 @@ async def _run(
         await corp_llm.aclose()
 
 
+def _enforce_rbac(args: argparse.Namespace) -> int | None:
+    """Check gateway:operator claim before a mutating command.
+
+    Returns 2 on denial (and prints to stderr), None when the caller is allowed.
+    Skipped entirely when CORP_GATEWAY_RBAC=0 (local dev bypass).
+    """
+    if config.get("CORP_GATEWAY_RBAC", "1") == "0":
+        return None
+    token = get_admin_token(getattr(args, "token", None))
+    try:
+        verify_operator(token)
+    except OperatorDenied:
+        print("error: gateway:operator role required", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gateway-admin")
+    parser.add_argument(
+        "--token",
+        default=None,
+        metavar="JWT",
+        help="operator JWT (or set CORP_GATEWAY_ADMIN_TOKEN)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_team = sub.add_parser("team", help="manage teams")
@@ -103,6 +130,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "team":
+        rbac_rc = _enforce_rbac(args)
+        if rbac_rc is not None:
+            return rbac_rc
         if args.team_command == "create":
             print(f"team.create team_id={args.team_id} name={args.name}")
             return 0
@@ -117,6 +147,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
     if args.command == "token" and args.token_command == "revoke":
+        rbac_rc = _enforce_rbac(args)
+        if rbac_rc is not None:
+            return rbac_rc
         print(f"token.revoke user={args.user}")
         return 0
 

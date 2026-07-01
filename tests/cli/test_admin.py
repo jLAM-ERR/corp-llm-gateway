@@ -3,6 +3,11 @@ import pytest
 from corp_llm_gateway.cli.admin import main
 
 
+@pytest.fixture(autouse=True)
+def _bypass_rbac(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", "0")
+
+
 def test_team_create(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["team", "create", "--team-id", "t1", "--name", "Team One"])
     assert rc == 0

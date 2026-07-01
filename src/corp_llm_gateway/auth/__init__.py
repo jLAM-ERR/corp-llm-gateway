@@ -8,6 +8,7 @@ from corp_llm_gateway.auth.providers import (
     NoopAuthProvider,
     OidcAuthProvider,
 )
+from corp_llm_gateway.auth.rbac import OperatorDenied, get_admin_token, verify_operator
 
 __all__ = [
     "ApiKeyHeaderAuthProvider",
@@ -17,5 +18,8 @@ __all__ = [
     "MtlsAuthProvider",
     "NoopAuthProvider",
     "OidcAuthProvider",
+    "OperatorDenied",
+    "get_admin_token",
     "get_auth_provider",
+    "verify_operator",
 ]
