@@ -1,4 +1,4 @@
-@startuml corp-llm-gateway-data-flow
+@startuml data-flow
 title corp-llm-gateway — request/response data flow (local-first)
 
 skinparam shadowing false
