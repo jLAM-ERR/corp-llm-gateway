@@ -171,7 +171,7 @@ tests/                  pytest, pytest-asyncio mode=auto (546 тестов, ~16 
 ### Установка
 
 ```bash
-curl -fsSL https://git.corp.lan/<group>/corp-llm-gateway/-/raw/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh | bash
 ```
 
 Что он делает ([`scripts/install.sh`](scripts/install.sh)):
@@ -181,6 +181,12 @@ curl -fsSL https://git.corp.lan/<group>/corp-llm-gateway/-/raw/master/scripts/in
 3. Прогоняет smoke-тест шлюза строкой, подлежащей маскированию, и проверяет round-trip.
 
 Повторный запуск установщика идемпотентен — он ротирует токен и перезаписывает rc-блок.
+
+Опциональный диагностический CLI `corp-llm-gateway` (используется в *Проверке* ниже) ставится из репозитория:
+
+```bash
+pipx install "git+https://github.com/jLAM-ERR/corp-llm-gateway.git"   # или: pip install "git+https://…"
+```
 
 ### Проверка
 

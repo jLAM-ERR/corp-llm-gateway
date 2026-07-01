@@ -3,10 +3,10 @@
 # corp-llm-gateway installer (M6-1..M6-5).
 #
 # Usage:
-#   curl -fsSL https://git.corp.lan/<group>/corp-llm-gateway/-/raw/master/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh | bash
 #
-# Or, with a pinned version:
-#   curl -fsSL .../install.sh?v=v0.x.y | bash
+# Or pinned to a tag/ref (GitHub serves raw by ref in the path):
+#   curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/v0.x.y/scripts/install.sh | bash
 #
 # What it does:
 #   1. Detects shell (bash / zsh / fish) and writes ANTHROPIC_BASE_URL,

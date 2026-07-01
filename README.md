@@ -171,7 +171,7 @@ tests/                  pytest, pytest-asyncio mode=auto (546 tests, ~16s)
 ### Install
 
 ```bash
-curl -fsSL https://git.corp.lan/<group>/corp-llm-gateway/-/raw/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh | bash
 ```
 
 What it does ([`scripts/install.sh`](scripts/install.sh)):
@@ -181,6 +181,12 @@ What it does ([`scripts/install.sh`](scripts/install.sh)):
 3. Smokes the gateway with a redactable string and verifies round-trip.
 
 Re-running the installer is idempotent — it rotates the token and rewrites the rc block.
+
+The optional `corp-llm-gateway` diagnostics CLI (used by *Verify* below) installs from the repo:
+
+```bash
+pipx install "git+https://github.com/jLAM-ERR/corp-llm-gateway.git"   # or: pip install "git+https://…"
+```
 
 ### Verify
 
