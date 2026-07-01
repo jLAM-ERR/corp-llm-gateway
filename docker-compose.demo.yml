@@ -34,7 +34,12 @@ services:
       retries: 5
 
   litellm:
-    image: ghcr.io/berriai/litellm:v1.85.0
+    # Demo image = litellm v1.85 + the `ner` extra baked in (see
+    # docker/demo-litellm/Dockerfile) so bilingual NER runs instead of degrading.
+    build:
+      context: .
+      dockerfile: docker/demo-litellm/Dockerfile
+    image: corp-llm-gateway-demo-litellm:local
     ports:
       - "4000:4000"
     volumes:
