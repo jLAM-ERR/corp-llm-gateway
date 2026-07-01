@@ -250,6 +250,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 request_id,
             )
             self._record_failure(request_id, error_code="E_MISSING_TOKEN")
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed", error_code="E_MISSING_TOKEN")
             raise GuardrailHttpException(401, "E_MISSING_TOKEN", "missing X-Corp-Auth") from None
         except AuthError as exc:
             error_code = _classify_auth_error(exc)
@@ -259,6 +261,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 error_code,
             )
             self._record_failure(request_id, error_code=error_code)
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed", error_code=error_code)
             raise GuardrailHttpException(401, error_code, str(exc)) from exc
 
         logger.info(
@@ -296,6 +300,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 request_id,
             )
             self._record_failure(request_id, error_code="E_BAD_REQUEST")
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed", error_code="E_BAD_REQUEST")
             raise GuardrailHttpException(400, "E_BAD_REQUEST", "messages must be a list")
 
         provider = _detect_provider(data)
@@ -424,6 +430,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 new_content, results = await sanitize_content(content, sanitize_one)
             except ContentTooDeepError as exc:
                 self._record_failure(request_id, error_code="E_BAD_REQUEST")
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
                 raise GuardrailHttpException(
                     400,
                     "E_BAD_REQUEST",
@@ -448,6 +456,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     type(exc).__name__,
                 )
                 self._record_failure(request_id, error_code="E_CORP_LLM_DOWN")
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
                 raise GuardrailHttpException(
                     503,
                     "E_CORP_LLM_DOWN",
@@ -484,6 +494,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 new_system, results = await sanitize_content(system, sanitize_one)
             except ContentTooDeepError as exc:
                 self._record_failure(request_id, error_code="E_BAD_REQUEST")
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
                 raise GuardrailHttpException(
                     400,
                     "E_BAD_REQUEST",
@@ -497,6 +509,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     type(exc).__name__,
                 )
                 self._record_failure(request_id, error_code="E_CORP_LLM_DOWN")
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
                 raise GuardrailHttpException(
                     503,
                     "E_CORP_LLM_DOWN",
@@ -643,6 +657,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         end_time: Any,
         *,
         status: str,
+        error_code: str | None = None,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
         if request_id in self._audited_ids:
@@ -678,7 +693,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             placeholder_list=(
                 tuple(sorted(state.placeholders)) if (state and state.placeholders) else None
             ),
-            error_code=(state.error_code if state else None),
+            error_code=(
+                error_code if error_code is not None else (state.error_code if state else None)
+            ),
             block_reason=(state.block_reason if state else None),
         )
         await self._audit.emit(event)

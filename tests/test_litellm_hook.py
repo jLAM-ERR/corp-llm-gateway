@@ -701,20 +701,39 @@ async def test_audit_emits_full_event_after_pre_and_post() -> None:
 
 
 async def test_audit_after_failed_pre_call_uses_unknown_user() -> None:
-    """A request that never made it past auth still gets audited.
+    """A request that never made it past auth still gets audited — INLINE.
 
-    The audit record uses placeholder identity rather than leaking
-    nothing — operators need to see auth-failure rates.
+    litellm does NOT fire async_log_failure_event for a pre_call rejection, so the
+    auth-failure audit is emitted inline (operators need auth-failure rates). The
+    record uses placeholder identity ("unknown") since no state was created.
     """
     g, sink = _build_guardrail()
     data = {"model": "claude", "messages": [], "headers": {}}
-    with pytest.raises(GuardrailHttpException):
+    with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
-    start = time.time()
-    await g.audit(data, None, start_time=start, end_time=start + 0.05, status="failed")
-
+    assert ei.value.error_code == "E_MISSING_TOKEN"
+    # Emitted inline by pre_call — no manual failure-event call needed.
+    assert len(sink.records) == 1
     assert sink.records[0]["status"] == "failed"
     assert sink.records[0]["user_id"] == "unknown"
+    assert sink.records[0]["error_code"] == "E_MISSING_TOKEN"
+    # Idempotency: a follow-up failure event adds no second record.
+    start = time.time()
+    await g.audit(data, None, start_time=start, end_time=start + 0.05, status="failed")
+    assert len(sink.records) == 1
+
+
+async def test_pre_call_bad_request_audits_inline() -> None:
+    """A malformed request (messages not a list) audits inline as E_BAD_REQUEST."""
+    g, sink = _build_guardrail()
+    data = _data_with_token("tok-1", content="hi")
+    data["messages"] = "not-a-list"
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_BAD_REQUEST"
+    assert len(sink.records) == 1
+    assert sink.records[0]["status"] == "failed"
+    assert sink.records[0]["error_code"] == "E_BAD_REQUEST"
 
 
 # ---- Document block integration tests (A) -----------------------------------
