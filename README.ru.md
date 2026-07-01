@@ -6,7 +6,7 @@
 
 ## Статус
 
-v1 — до старта реализации. См. [`docs/plans/20260507-external-sanitizer-gateway-v1.md`](docs/plans/20260507-external-sanitizer-gateway-v1.md). Некомпромиссный критерий успеха: **ноль подтверждённых инцидентов утечки** за 90 дней после GA.
+v1 — local-first detection cascade + compliance pack реализованы; до GA. См. [`CHANGELOG.md`](CHANGELOG.md), [`docs/requirements-compliance.md`](docs/requirements-compliance.md) и план проектирования [`docs/plans/20260507-external-sanitizer-gateway-v1.md`](docs/plans/20260507-external-sanitizer-gateway-v1.md). Некомпромиссный критерий успеха: **ноль подтверждённых инцидентов утечки** за 90 дней после GA.
 
 ## Оглавление
 

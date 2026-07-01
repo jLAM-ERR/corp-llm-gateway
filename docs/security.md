@@ -257,12 +257,13 @@ pre_sanitization, replace_md, rule_values, x_corp_auth, corp_token,
 authorization, cookie, set_cookie
 ```
 
-**Current status (honest).** `audit.sinks.siem.enabled: true` exists in
-`helm/.../values.yaml`, **but the Helm Vector configmap does not yet define a
-SIEM sink** — only `langfuse` and `s3` sinks are declared. SIEM routing is
-**designed, not yet wired** (remaining-steps Stage 3 step 19 + 22; gated on the
-SIEM target, open question #3). The `audit_drop` metric alert (M3-9) is
-likewise pending.
+**Current status (2026-07-01).** The Vector SIEM sink **and** the
+`AuditVectorDropHigh` / `LeakAttemptDetected` alerts are now **wired** (CP-3:
+`helm/.../templates/configmap.yaml` siem sink + `templates/siem-alerts.yaml`,
+routed through the same NEVER-fields VRL gate). The **only** remaining item is
+confirming the real SIEM endpoint (open question #3) — the configured endpoint
+is still a placeholder. See `docs/requirements-compliance.md` (R15) for the
+current status.
 
 ## 7. S3 durable audit store
 

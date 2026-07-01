@@ -266,12 +266,12 @@ pre_sanitization, replace_md, rule_values, x_corp_auth, corp_token,
 authorization, cookie, set_cookie
 ```
 
-**Текущий статус (честно).** `audit.sinks.siem.enabled: true` есть в
-`helm/.../values.yaml`, **но Vector-configmap в Helm пока не определяет
-SIEM-sink** — объявлены только sink-и `langfuse` и `s3`. SIEM-роутинг
-**спроектирован, но ещё не подключён** (remaining-steps Stage 3 шаги 19 + 22;
-зависит от SIEM-таргета, open question #3). Алерт по метрике `audit_drop` (M3-9)
-также в ожидании.
+**Текущий статус (2026-07-01).** Vector SIEM-sink **и** алерты
+`AuditVectorDropHigh` / `LeakAttemptDetected` теперь **подключены** (CP-3:
+`helm/.../templates/configmap.yaml` siem-sink + `templates/siem-alerts.yaml`,
+через тот же VRL-гейт NEVER-полей). Остаётся **единственный** пункт —
+подтвердить реальный SIEM-эндпоинт (open question #3); настроенный эндпоинт пока
+placeholder. Актуальный статус — в `docs/requirements-compliance.md` (R15).
 
 ## 7. Долговременное аудит-хранилище S3
 

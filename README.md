@@ -6,7 +6,7 @@ Replaces the per-laptop `data-sanitizer` Claude Code plugin (which only covered 
 
 ## Status
 
-v1 — pre-execution. See [`docs/plans/20260507-external-sanitizer-gateway-v1.md`](docs/plans/20260507-external-sanitizer-gateway-v1.md). Non-negotiable success criterion: **zero confirmed leak incidents** in the 90 days post-GA.
+v1 — the local-first detection cascade + compliance pack are implemented; pre-GA. See [`CHANGELOG.md`](CHANGELOG.md), [`docs/requirements-compliance.md`](docs/requirements-compliance.md), and the design plan [`docs/plans/20260507-external-sanitizer-gateway-v1.md`](docs/plans/20260507-external-sanitizer-gateway-v1.md). Non-negotiable success criterion: **zero confirmed leak incidents** in the 90 days post-GA.
 
 ## Table of contents
 
