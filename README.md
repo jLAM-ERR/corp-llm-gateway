@@ -34,6 +34,7 @@ v1 — the local-first detection cascade + compliance pack are implemented; pre-
 - [`X-Corp-Auth` token flow](#x-corp-auth-token-flow)
 - [Documentation index](#documentation-index)
 - [Development](#development)
+- [Built on](#built-on)
 
 ## Overview
 
@@ -367,3 +368,15 @@ PYTHONPATH=src .venv/bin/ruff check src tests
 ```
 
 Conventions, invariants, and "things NOT to do" are pinned in [`CLAUDE.md`](CLAUDE.md). Default branch is `master`. CI is CI (`the CI config`).
+
+## Built on
+
+Open-source components this gateway assembles (Architecture B — best-of-breed):
+
+- **Proxy & serving** — [LiteLLM](https://github.com/BerriAI/litellm) (multi-provider proxy + guardrail hooks) · [vLLM](https://github.com/vllm-project/vllm) (backs the corp pre-pass oracle)
+- **Bilingual NER & morphology** — RU: [Natasha](https://github.com/natasha/natasha) · [Slovnet](https://github.com/natasha/slovnet) · [Navec](https://github.com/natasha/navec) · [Razdel](https://github.com/natasha/razdel) · [pymorphy3](https://pypi.org/project/pymorphy3/); EN: [spaCy](https://spacy.io) + [`en_core_web_md`](https://spacy.io/models/en). Alternatives weighed in [ADR-003](docs/adr/ADR-003-ner-orchestration.md): [Presidio](https://github.com/microsoft/presidio), [DeepPavlov](https://github.com/deeppavlov/DeepPavlov)
+- **State & storage** — [Redis](https://redis.io) (mapping / dedup caches) · [PostgreSQL](https://www.postgresql.org) via [asyncpg](https://github.com/MagicStack/asyncpg) (token store)
+- **Audit & observability** — [Vector](https://vector.dev) → [Langfuse](https://langfuse.com) + S3 + SIEM
+- **Delivery & clients** — [Helm](https://helm.sh) (chart) · [CoreDNS](https://coredns.io) (egress sinkhole) · [httpx](https://www.python-httpx.org) (corp-LLM client)
+
+Upstream providers reached with the developer's BYOK key: [Anthropic](https://www.anthropic.com) / [OpenAI](https://openai.com). Laptop client: [Claude Code](https://github.com/anthropics/claude-code).
