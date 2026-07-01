@@ -62,15 +62,16 @@ services:
       REDIS_URL: redis://redis:6379/0
       POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
       CORP_LLM_AUTH_PROVIDER: noop
-      # The corp LLM uses a cert signed by the internal corporate CA (Root +
-      # Issuing). We mount that bundle (./crt) and trust it so TLS to the corp
-      # LLM is VERIFIED on BOTH paths that reach it:
+      # If the corp LLM presents a cert signed by an internal CA, drop that CA
+      # chain at ./crt/corp-ca-bundle.pem (operator-provided, git-ignored — see
+      # crt/README.md). We mount ./crt and trust it so TLS to the corp LLM is
+      # VERIFIED on BOTH paths that reach it:
       #  - our CorpLlmClient (httpx) verifies against CORP_LLM_CA_BUNDLE;
       #  - litellm's hosted_vllm upstream uses aiohttp, whose default SSL context
       #    honours SSL_CERT_FILE (not certifi) — so `command` builds a combined
-      #    bundle (certifi public roots + the corporate CA chain) and SSL_CERT_FILE
-      #    points at it (keeps public roots so litellm can still fetch its
-      #    model-cost map over HTTPS).
+      #    bundle (certifi public roots + the corporate CA chain IF present) and
+      #    SSL_CERT_FILE points at it. When the bundle is absent the demo falls
+      #    back to public roots only (enough for the mock + public providers).
       CORP_LLM_CA_BUNDLE: /etc/corp-llm-gateway/crt/corp-ca-bundle.pem
       SSL_CERT_FILE: /tmp/corp-ca-bundle.pem
       # NOTE: do NOT enable LITELLM_MASTER_KEY / UI auth here. Once it's
@@ -82,7 +83,7 @@ services:
     entrypoint: sh
     command:
       - "-c"
-      - "python3 -m ensurepip --upgrade >/dev/null 2>&1 && python3 -m pip install --no-cache-dir -e /pkg --quiet && cat \"$(python3 -c 'import certifi; print(certifi.where())')\" /etc/corp-llm-gateway/crt/corp-ca-bundle.pem > /tmp/corp-ca-bundle.pem && exec litellm --config /etc/litellm/config.yaml --port 4000"
+      - "python3 -m ensurepip --upgrade >/dev/null 2>&1 && python3 -m pip install --no-cache-dir -e /pkg --quiet && { cat \"$(python3 -c 'import certifi; print(certifi.where())')\"; if [ -f /etc/corp-llm-gateway/crt/corp-ca-bundle.pem ]; then cat /etc/corp-llm-gateway/crt/corp-ca-bundle.pem; fi; } > /tmp/corp-ca-bundle.pem && exec litellm --config /etc/litellm/config.yaml --port 4000"
     depends_on:
       redis:
         condition: service_healthy
