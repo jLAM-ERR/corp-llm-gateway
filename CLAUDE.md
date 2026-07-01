@@ -38,16 +38,35 @@ tests/                   pytest, pytest-asyncio mode=auto
 
 ## Request lifecycle (read once, then you understand the engine)
 
+The cascade was **inverted to local-first** (plan `docs/plans/20260630-bilingual-local-first-detection.md`,
+decision `docs/adr/ADR-003-ner-orchestration.md`). Old order was LLM-oracle-first; now:
+
 ```
-pre_call:  three tiers tried in order — FunctionCall → JSON → Regex
-           (first to detect-and-redact wins; regex is the floor)
+pre_call:  Stage 0 — payload classifier: config/log shape → refuse before egress (422 + block_reason)
+           ↓
+           local-first cascade (per text leaf, ~6ms p50 on CPU):
+             replace.md → regex+checksum → dual-NER (Natasha RU + spaCy EN, run-both-union)
+             → lemma-gazetteer (products/ПОД-ФТ/markings) → code-identifier splitter
+           ↓
+           LLM oracle — CONDITIONAL fallback: called ONLY on a deterministic gazetteer hit
+             (no hit ⇒ oracle NOT called — the latency win; no confidence thresholds)
+           ↓
+           merge local+oracle pairs (M1-9 bijection preserved) → request allocator canonicalizes
+           ↓
+           Stage 5 — DLP egress guard: re-scan the SANITIZED request → block on canary/raw secret
            ↓
            upstream (api.anthropic.com / api.openai.com) with BYOK Authorization
            ↓
 post_call: StreamingDesanitizer rebuilds originals using the per-conversation mapping
            ↓
-           audit: Vector → Langfuse + S3 + SIEM (NEVER-fields gate)
+           audit: Vector → Langfuse + S3 + SIEM (NEVER-fields gate; + block_reason)
 ```
+
+The old three tiers (FunctionCall → JSON → Regex, `sanitizer/engine.py`) still parse the oracle's
+response when it IS called; they are no longer the primary detection path. Local detectors live in
+`detectors/` (`regex_checksum`, `ner_ru`/`ner_en`/`dual_ner`) + `rules/gazetteer.py` +
+`sanitizer/segmenter/`; NER needs Python 3.12 (no 3.14 wheels — lazy imports keep the package
+importable on 3.14 with graceful degradation).
 
 Two caches:
 
@@ -60,7 +79,9 @@ Two caches:
 ## Running tests
 
 ```
-# Full unit suite (last known: 546 passed + 14 skipped, ~13s). Always run before committing.
+# Full unit suite. Local .venv is Python 3.14 (graceful NER degradation): last known
+# 817 passed + 39 skipped, ~20s. Authoritative NER run is Python 3.12 (.venv-bench,
+# with the `ner`/`postgres`/`oidc` extras): 875 passed. Always run before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
 
 # Single test / file / node
