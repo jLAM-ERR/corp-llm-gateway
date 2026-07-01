@@ -32,7 +32,6 @@ v1 — the local-first detection cascade + compliance pack are implemented; pre-
 - [`X-Corp-Auth` token flow](#x-corp-auth-token-flow)
 - [Documentation index](#documentation-index)
 - [Development](#development)
-- [Owner](#owner)
 
 ## Overview
 
@@ -43,11 +42,7 @@ A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. 
 | `X-Corp-Auth` | `~/.corp-llm-gateway/token` (laptop) | corp identity / team resolution; **stripped** before egress |
 | `Authorization: Bearer …` | dev's Anthropic / OpenAI key | BYOK passthrough; forwarded **untouched** |
 
-Full per-request data flow:
-
-![corp-llm-gateway request/response data flow](docs/data-flow.png)
-
-Source: [`docs/data-flow.puml`](docs/data-flow.puml) (re-render with `plantuml docs/data-flow.puml`).
+Full per-request data flow: see the [Architecture](#architecture) diagram below.
 
 ## Architecture
 
@@ -163,7 +158,7 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
   tokens/               schema.sql + AuthMiddleware + TokenIssuer
   litellm_hook.py       CorpLlmGuardrail — LiteLLM callback adapter
 helm/corp-llm-gateway/  Helm chart (deployment, service, configmap, NetworkPolicy, CoreDNS sinkhole)
-docs/                   plan + audit-schema + ops/* + rbac-matrix + data-flow + integration docs
+docs/                   plan + audit-schema + ops/* + rbac-matrix + integration docs
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
 tests/                  pytest, pytest-asyncio mode=auto (546 tests, ~16s)
 ```
@@ -346,9 +341,7 @@ The corp token lives on disk at `~/.corp-llm-gateway/token` (issued by `install.
 | [`docs/plans/20260507-external-sanitizer-gateway-v1.md`](docs/plans/20260507-external-sanitizer-gateway-v1.md) | v1 plan (current rev in header) — single source of architectural truth |
 | [`docs/plans/20260630-bilingual-local-first-detection.md`](docs/plans/20260630-bilingual-local-first-detection.md) | local-first detection cycle plan (DP-0…DP-9, CP-1…CP-4) |
 | [`docs/requirements-compliance.md`](docs/requirements-compliance.md) | ИБ requirements compliance matrix — ✅ 11 / 🟡 3 / ⚪ 1 vs 15 requirements |
-| [`docs/adr/ADR-003-ner-orchestration.md`](docs/adr/ADR-003-ner-orchestration.md) | ADR: hand-roll dual-NER (Natasha RU + spaCy EN) over Presidio/DeepPavlov |
-| [`docs/data-flow.puml`](docs/data-flow.puml) + [`docs/data-flow.png`](docs/data-flow.png) | end-to-end sequence diagram (PlantUML source + rendered PNG) |
-| [`docs/harness-integration.md`](docs/harness-integration.md) | per-harness setup recipes (Claude Code, Codex, Cursor, …) |
+| [`docs/adr/ADR-003-ner-orchestration.md`](docs/adr/ADR-003-ner-orchestration.md) | ADR: hand-roll dual-NER (Natasha RU + spaCy EN) over Presidio/DeepPavlov || [`docs/harness-integration.md`](docs/harness-integration.md) | per-harness setup recipes (Claude Code, Codex, Cursor, …) |
 | [`docs/x-corp-auth.md`](docs/x-corp-auth.md) | corp token lifecycle, per-pattern freshness, failure modes |
 | [`docs/conversation-id.md`](docs/conversation-id.md) | `conversation_id` behavior today + how to wire a real session ID |
 | [`docs/audit-schema.md`](docs/audit-schema.md) | audit event schema + ALWAYS / CONDITIONAL / NEVER field classification |
@@ -372,7 +365,3 @@ PYTHONPATH=src .venv/bin/ruff check src tests
 ```
 
 Conventions, invariants, and "things NOT to do" are pinned in [`CLAUDE.md`](CLAUDE.md). Default branch is `master`. CI is CI (`the CI config`).
-
-## Owner
-
-corp-internal@corp.lan

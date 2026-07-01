@@ -3,9 +3,9 @@
 Как corp-llm-gateway удерживает PII внутри корпоративного периметра, что он
 санитизирует и куда смотреть при расследовании инцидента.
 
-Читать вместе с: [`audit-schema.md`](audit-schema.md) (источник истины по полям),
-[`x-corp-auth.md`](x-corp-auth.md), [`conversation-id.md`](conversation-id.md),
-[`ops/runbook.md`](ops/runbook.md) и планом
+Читать вместе с: [`audit-schema.md`](audit-schema.ru.md) (источник истины по полям),
+[`x-corp-auth.md`](x-corp-auth.ru.md), [`conversation-id.md`](conversation-id.ru.md),
+[`ops/runbook.md`](ops/runbook.ru.md) и планом
 [`plans/20260507-external-sanitizer-gateway-v1.md`](plans/20260507-external-sanitizer-gateway-v1.md)
 (M4 fail-policy матрица — единственный источник истины по поведению при отказах).
 
@@ -100,7 +100,7 @@ per-request **биекцию** через `RequestPlaceholderAllocator`
 бы развёрнут в несвязанный оригинал на обратном проходе. Сегодня
 `conversation_id == request_id`, поэтому коллизия остаётся в пределах одного
 запроса, но это стало бы cross-context утечкой, если `conversation_id`
-расширится (см. [`conversation-id.md`](conversation-id.md)). При обнаружении
+расширится (см. [`conversation-id.md`](conversation-id.ru.md)). При обнаружении
 любого литерала `pre_call` логирует **не содержащий контента** маркер:
 
 ```
@@ -164,7 +164,7 @@ reshape → sinks (Langfuse, S3; SIEM designed, see §6)
 | `pre_pass_latency_ms` | был задействован путь pre-pass |
 | `audit_buffer_full` | присутствует сигнал буфера Vector |
 
-См. [`audit-schema.md`](audit-schema.md) для полной схемы и типов (это источник
+См. [`audit-schema.md`](audit-schema.ru.md) для полной схемы и типов (это источник
 истины по полям).
 
 ### Семантика счётчиков
