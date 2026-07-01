@@ -18,6 +18,12 @@
 # CORP_GATEWAY_TOKEN_FILE   = "~/.corp-llm-gateway/token"
 # CORP_GATEWAY_LATEST_URL   = "https://git.corp.lan/.../raw/master/VERSION"
 
+# ── Inbound auth: token store backend (tokens/postgres_store.py) ─────────────
+
+# PostgresTokenStore is used when this DSN is set (requires the 'postgres' extra).
+# Without it, InMemoryTokenStore is used (dev/demo only — tokens lost on restart).
+# CORP_LLM_PG_DSN = "postgresql://gateway:gateway@postgres:5432/gateway"
+
 # ── Server-side: corp vLLM auth provider (auth/factory.py) ───────────────────
 
 # CORP_LLM_AUTH_PROVIDER    = "noop"     # one of: noop | bearer | mtls | oidc | apikey

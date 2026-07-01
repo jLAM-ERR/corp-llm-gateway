@@ -101,3 +101,24 @@ class AuthMiddleware:
         if info.expires_at <= now:
             raise ExpiredTokenError("token has expired")
         return AuthContext(user_id=info.user_id, team_id=info.team_id, scopes=info.scopes)
+
+
+def make_auth_middleware(*, revocation_cache_seconds: float = 60.0) -> AuthMiddleware:
+    """Build AuthMiddleware from config.
+
+    Uses PostgresTokenStore when CORP_LLM_PG_DSN is configured; raises
+    RuntimeError if the DSN is set but asyncpg is absent (misconfiguration).
+    Falls back to InMemoryTokenStore when no DSN is configured (dev/demo).
+    """
+    from corp_llm_gateway.config import get as _get_cfg
+    from corp_llm_gateway.tokens.in_memory import InMemoryTokenStore
+
+    dsn = _get_cfg("CORP_LLM_PG_DSN")
+    store: TokenStore
+    if dsn:
+        from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+        store = PostgresTokenStore(dsn)  # raises RuntimeError if asyncpg absent
+    else:
+        store = InMemoryTokenStore()
+    return AuthMiddleware(store, revocation_cache_seconds=revocation_cache_seconds)

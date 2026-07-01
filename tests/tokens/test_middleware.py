@@ -182,16 +182,15 @@ async def test_revocation_cache_picks_up_revoke_after_ttl() -> None:
         await mw.authenticate("tok-1")
 
 
-# Postgres stub -------------------------------------------------------------
+# PostgresTokenStore import guard -------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_postgres_store_lookup_stub_raises() -> None:
-    with pytest.raises(NotImplementedError):
-        await PostgresTokenStore("postgres://x").lookup("tok")
-
-
-@pytest.mark.asyncio
-async def test_postgres_store_revoke_stub_raises() -> None:
-    with pytest.raises(NotImplementedError):
-        await PostgresTokenStore("postgres://x").revoke_user("alice")
+def test_postgres_store_without_asyncpg_raises() -> None:
+    """When asyncpg is absent, instantiating PostgresTokenStore raises RuntimeError."""
+    try:
+        import asyncpg  # noqa: F401
+    except ImportError:
+        with pytest.raises(RuntimeError, match="asyncpg"):
+            PostgresTokenStore("postgresql://x")
+    else:
+        pytest.skip("asyncpg is installed; cannot test the absent-asyncpg path")

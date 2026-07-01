@@ -14,6 +14,7 @@ wires up — this keeps the issuance code free of any specific OIDC SDK
 choice.
 """
 
+import asyncio
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -88,4 +89,7 @@ async def _store_upsert(store: TokenStore, info: TokenInfo) -> None:
             f"TokenStore impl {type(store).__name__} lacks upsert; "
             "issuance requires a store with insert capability"
         )
-    upsert(info)
+    # upsert may be sync (InMemoryTokenStore) or async (PostgresTokenStore)
+    result = upsert(info)
+    if asyncio.iscoroutine(result):
+        await result
