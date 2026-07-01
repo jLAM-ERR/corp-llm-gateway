@@ -41,6 +41,7 @@ from corp_llm_gateway.detectors.base import PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.rules import Gazetteer, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.allowlist import Allowlist
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
@@ -171,6 +172,7 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         _NoTeamRules(),
         local_detectors=local_detectors,
         gazetteer=gazetteer,
+        allowlist=Allowlist.from_config(),
     )
 
     audit_logger = AuditLogger(StdoutSink(), gateway_version="demo")

@@ -26,6 +26,7 @@ from corp_llm_gateway.payload import (
 )
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.rules.gazetteer import Gazetteer
+from corp_llm_gateway.sanitizer.allowlist import Allowlist
 from corp_llm_gateway.sanitizer.engine import (
     AllStrategiesFailedError,
     CorpLlmSanitizer,
@@ -69,6 +70,7 @@ class SanitizationOrchestrator:
         size_threshold_bytes: int = DEFAULT_THRESHOLD_BYTES,
         local_detectors: list[PIIDetector] | None = None,
         gazetteer: Gazetteer | None = None,
+        allowlist: Allowlist | None = None,
     ) -> None:
         self._corp_llm = corp_llm
         self._mapping_store = mapping_store
@@ -79,6 +81,7 @@ class SanitizationOrchestrator:
         self._size_threshold = size_threshold_bytes
         self._local = LocalDetectionPass(local_detectors) if local_detectors else None
         self._gazetteer = gazetteer
+        self._allowlist = allowlist
 
     async def sanitize(
         self,
@@ -237,6 +240,9 @@ class SanitizationOrchestrator:
                 conversation_id,
                 len(result.pairs),
             )
+
+        if self._allowlist is not None:
+            result = StrategyResult(pairs=self._allowlist.filter_pairs(result.pairs))
 
         await self._mapping_store.set_dedup(content_hash, result, ttl_seconds=self._cache_a_ttl)
         logger.info(
