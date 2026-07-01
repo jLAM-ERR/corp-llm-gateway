@@ -12,6 +12,8 @@ v1 — pre-execution. See [`docs/plans/20260507-external-sanitizer-gateway-v1.md
 
 - [Overview](#overview)
 - [Architecture](#architecture)
+- [Features](#features)
+- [Team rules (`replace.md`)](#team-rules-replacemd)
 - [Repo layout](#repo-layout)
 - [Developer quickstart (laptop)](#developer-quickstart-laptop)
   - [Install](#install)
@@ -51,15 +53,97 @@ Source: [`docs/data-flow.puml`](docs/data-flow.puml) (re-render with `plantuml d
 
 Architecture B (assemble best-of-breed): single custom Python guardrail plugged into LiteLLM proxy; everything else (audit pipeline, auth, observability) is open-source operated.
 
-```
-Claude Code → gateway.corp.lan → LiteLLM (with custom guardrail) → api.anthropic.com / api.openai.com
-                                       │
-                                       ├── pre_call:  sanitize via three-tier strategies (FunctionCall → JSON → Regex)
-                                       ├── post_call: de-sanitize streaming / unary response (longest-first substitution)
-                                       └── audit:     Vector → Langfuse + S3 + SIEM (NEVER-fields gate)
+```mermaid
+flowchart TD
+    Dev["Claude Code (laptop)"]
+    Dev -->|"POST /v1/chat/completions<br/>X-Corp-Auth + Authorization:Bearer"| S0
+
+    subgraph gw["LiteLLM proxy · CorpLlmGuardrail (corp k8s)"]
+        S0["Stage 0 · payload classifier"]
+        S0 -->|"config / log hit"| B0(["HTTP 422  block_reason"])
+        S0 -->|pass| RULES
+
+        subgraph lc["Local-first cascade — ~6 ms p50 on CPU"]
+            RULES["1. replace.md rules  (per-team, length-sorted, OVERRIDES detection)"]
+            --> RX["2. regex + checksum  (ИНН · КПП · ОГРН · БИК · JWT · IP · secrets)"]
+            --> NER["3. dual-NER run-both-union  (Natasha RU + spaCy en_core_web_md EN)"]
+            --> GZ["4. lemma-gazetteer  (products · ПОД-ФТ · markings)"]
+            --> SEG["5. code-identifier splitter"]
+        end
+
+        SEG -->|"gazetteer hit"| ORC["LLM oracle — corp vLLM  (conditional · ~7–15 s)"]
+        SEG -->|"no hit"| DLP
+        ORC --> DLP["Stage 5 · DLP egress guard"]
+        DLP -->|"canary / secret leak"| B5(["HTTP 422  block_reason"])
+    end
+
+    DLP -->|clean| UP["Anthropic / OpenAI  (Authorization:Bearer untouched)"]
+    UP --> DS["post_call · StreamingDesanitizer  (placeholders longest-first)"]
+    DS --> AUD["audit · Vector → Langfuse + S3 + SIEM  (NEVER-fields gate)"]
+    DS -->|"originals restored"| Dev
 ```
 
-Full architecture in the v1 plan.
+Request lifecycle:
+
+1. **Stage 0** — payload classifier: `.env`, kubeconfig, log-dump signatures → HTTP 422 `block_reason`; upstream never called.
+2. **Local-first cascade** (deterministic, ~6 ms p50 on CPU):
+   - `replace.md` per-team rules (length-sorted, OVERRIDES auto-detection)
+   - regex + checksum: ИНН / КПП / ОГРН / БИК / СНИЛС / р-счёт, JWT, PEM, `sk-` / `AKIA` / `ghp_`, IPv4/6, internal hostnames
+   - dual-NER run-both-union: Natasha/Slovnet (RU) + spaCy `en_core_web_md` (EN) — bilingual ФИО / org / geo
+   - lemma-gazetteer: product code-names, regulated ПОД-ФТ terms, confidentiality markings
+   - code-identifier splitter: `CompanynameabcService`-style camel/snake identifiers in code
+3. **LLM oracle** (conditional fallback): invoked only on a deterministic gazetteer hit; adds Tier-2 coverage for unmarked know-how. Latency ~7–15 s vs ~6 ms local. Two-venv reality: Python 3.12 = full NER; Python 3.14 = graceful degradation (NER imports are lazy, `[ner]` optional extra).
+4. **Stage 5 DLP egress guard**: independent second-layer re-scan of the sanitized outbound payload for canary strings and high-confidence secrets; blocks any survivor.
+5. **post_call**: `StreamingDesanitizer` rebuilds originals from the per-conversation mapping (placeholders sorted longest-first — invariant #5).
+6. **audit**: Vector → Langfuse + S3 + SIEM with NEVER-fields gate.
+
+Full architecture in the [v1 plan](docs/plans/20260507-external-sanitizer-gateway-v1.md).
+
+## Features
+
+### Detection
+
+- **Russian entity checksums** — ИНН (10/12), КПП, ОГРН (13/15), БИК, СНИЛС, р/счёт with algorithm-validated checksums; near-zero false positives
+- **Bilingual NER** — Natasha/Slovnet RU + spaCy `en_core_web_md` EN, run-both-union; covers ФИО, organisations, addresses in mixed-language requests
+- **Lemma-gazetteer** — product code-names, regulated ПОД-ФТ / AML-CFT terms, confidentiality markings (`Коммерческая тайна`, `ДСП`, `Confidential`, `NDA`) matched by lemma, not exact string
+- **Code-identifier splitter** — splits camel/snake identifiers (`CompanynameabcService`) and scans segments against the gazetteer
+- **Test-data allowlist** — deterministic exemption for test fixtures; cannot suppress actual secrets
+- **Secret patterns** — JWT, PEM private key, `sk-` / `AKIA` / `ghp_` / generic `password=` / `Bearer` values
+
+### Blocking
+
+- **Stage 0 pre-egress block** — `.env`, kubeconfig, nginx.conf, log-dump signatures → HTTP 422 with `block_reason`; upstream is never called
+- **Stage 5 DLP egress guard** — independent second-layer re-scan of the sanitized payload for canary strings and high-confidence secrets; blocks any survivor
+
+### Auth & compliance
+
+- **X-Corp-Auth + Postgres token store** — `AuthMiddleware` validates tokens against `PostgresTokenStore` (asyncpg); 60 s revocation propagation upper bound
+- **`gateway:operator` RBAC** — admin CLI commands gated on JWT claim `gateway:operator`; verified via PyJWT against Keycloak realm roles
+- **Audit pipeline** — rich `AuditEvent` schema (ALWAYS / CONDITIONAL field tiers) + NEVER-fields gate: the logger refuses records containing `mapping`, `original`, or `credentials`
+- **SIEM sink** — Vector HTTP sink with inherited NEVER-gate + Helm alerts (`AuditVectorDropHigh`, `LeakAttemptDetected`)
+- **Egress lockdown** — `NetworkPolicy` (pod egress constrained to upstream + corp CIDRs) + CoreDNS sinkhole (blocks direct `api.anthropic.com` / `api.openai.com` resolution from the cluster), both enabled in `helm/.../values-prod.yaml`
+
+**Compliance:** ✅ 11 / 🟡 3 / ⚪ 1 vs the 15 ИБ requirements — see [`docs/requirements-compliance.md`](docs/requirements-compliance.md).
+
+## Team rules (`replace.md`)
+
+Each team maintains a `replace.md` file at `<rules-dir>/<team_id>.md`. These rules run **first** in the local cascade and **override** auto-detection — a term listed here is always replaced, regardless of what the detectors find.
+
+Format — one rule per line:
+
+```
+- `ORIGINAL` → `REPLACEMENT`
+```
+
+The separator is `→` (U+2192), **not** ASCII `->`. Rules are applied longest-first (invariant #5). Example:
+
+```markdown
+- `Project Polaris` → `[CONFIDENTIAL_PROJECT]`
+- `acme-internal-crm.corp.lan` → `[INTERNAL_HOST]`
+- `dr.smith@partnerlab.com` → `[PARTNER_CONTACT]`
+```
+
+The demo's live rules file is `docker/demo-litellm/rules/demo-team.md`. Full spec and authoring tips: [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md).
 
 ## Repo layout
 
@@ -69,11 +153,11 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
   audit/                AuditEvent + Logger + Sinks + retention generator + NEVER-fields gate
   cli/                  gateway-admin (operators), corp-llm-gateway status (devs), proxy
   corp_llm/             httpx client speaking vLLM /v1/chat/completions
-  detectors/            PIIDetector + ShadowDetector
+  detectors/            PIIDetector + ShadowDetector + RegexChecksumDetector + DualNerDetector
   healthz/              live / ready / sanitization deep-check
   payload/              size threshold + gzip + per-team quota
   rules/                replace.md parser + cached file loader
-  sanitizer/            three-tier strategies + engine + StreamingDesanitizer + orchestrator
+  sanitizer/            local-first engine + StreamingDesanitizer + DLP guard + orchestrator
   storage/              MappingStore (in-memory + Redis)
   team_config/          TeamConfig + store
   tokens/               schema.sql + AuthMiddleware + TokenIssuer
@@ -260,6 +344,9 @@ The corp token lives on disk at `~/.corp-llm-gateway/token` (issued by `install.
 | Doc | What's inside |
 |---|---|
 | [`docs/plans/20260507-external-sanitizer-gateway-v1.md`](docs/plans/20260507-external-sanitizer-gateway-v1.md) | v1 plan (current rev in header) — single source of architectural truth |
+| [`docs/plans/20260630-bilingual-local-first-detection.md`](docs/plans/20260630-bilingual-local-first-detection.md) | local-first detection cycle plan (DP-0…DP-9, CP-1…CP-4) |
+| [`docs/requirements-compliance.md`](docs/requirements-compliance.md) | ИБ requirements compliance matrix — ✅ 11 / 🟡 3 / ⚪ 1 vs 15 requirements |
+| [`docs/adr/ADR-003-ner-orchestration.md`](docs/adr/ADR-003-ner-orchestration.md) | ADR: hand-roll dual-NER (Natasha RU + spaCy EN) over Presidio/DeepPavlov |
 | [`docs/data-flow.puml`](docs/data-flow.puml) + [`docs/data-flow.png`](docs/data-flow.png) | end-to-end sequence diagram (PlantUML source + rendered PNG) |
 | [`docs/harness-integration.md`](docs/harness-integration.md) | per-harness setup recipes (Claude Code, Codex, Cursor, …) |
 | [`docs/x-corp-auth.md`](docs/x-corp-auth.md) | corp token lifecycle, per-pattern freshness, failure modes |

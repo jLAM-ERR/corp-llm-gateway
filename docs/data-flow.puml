@@ -1,5 +1,5 @@
 @startuml corp-llm-gateway-data-flow
-title corp-llm-gateway — request/response data flow
+title corp-llm-gateway — request/response data flow (local-first)
 
 skinparam shadowing false
 skinparam defaultFontName Menlo
@@ -13,9 +13,12 @@ box "LiteLLM Proxy (corp k8s)" #EEF6FF
   participant "LiteLLM\nProxy" as LL
   participant "CorpLlmGuardrail\n(litellm_hook)" as G
   participant "AuthMiddleware\n(tokens/)" as Auth
+  participant "Payload\nClassifier\n(Stage 0)" as Clf
   participant "Sanitization\nOrchestrator" as Orc
   participant "Rules loader\n(replace.md)" as Rules
+  participant "LocalDetectors\n(regex+checksum\ndual-NER\ngazetteer\nsegmenter)" as Local
   participant "CorpLlmSanitizer\n(vLLM client)" as Sani
+  participant "DLP Guard\n(Stage 5)" as DLP
   participant "MappingStore\n(in-mem | Redis)" as Map
   participant "StreamingDesanitizer\n/ reverse_response" as Des
   participant "AuditLogger\n+ NEVER gate" as Audit
@@ -29,7 +32,7 @@ database "SIEM /\nPostgres" as Sink
 Dev -> LL : POST /v1/chat/completions\nX-Corp-Auth: <corp token>\nAuthorization: Bearer <BYOK>\nbody: messages[]
 LL -> G : async_pre_call_hook(data)
 
-== pre_call (sanitize) ==
+== pre_call — auth ==
 G -> Auth : authenticate_headers(headers)
 Auth --> G : ctx{user_id, team_id}
 G -> Auth : strip_corp_token(headers)
@@ -39,20 +42,79 @@ note right of G
   is forwarded untouched.
 end note
 
+== pre_call — Stage 0 payload block ==
+G -> Clf : classify_block(messages)
+note right of Clf
+  Signatures: .env / kubeconfig /
+  nginx.conf / log-dump / stack-trace.
+  Conservative thresholds — normal
+  code and prose are not blocked.
+end note
+alt config / log detected
+  Clf --> G : block_reason
+  G --> LL : HTTP 422 (upstream never called)
+  LL --> Dev : HTTP 422 + block_reason
+else pass
+  Clf --> G : ok
+end
+
+== pre_call — local-first cascade + conditional oracle ==
 loop for each message.content
   G -> Orc : sanitize(text, team_id, conversation_id)
   Orc -> Orc : payload-size gate (M1-11)
-  Orc -> Rules : load(team_id) [cached]
-  Rules --> Orc : Rules
-  Orc -> Sani : extract(text, rules)
-  Sani -> Vllm : POST /v1/chat/completions
-  Vllm --> Sani : structured response
-  Sani -> Sani : strategies in order:\n1. FunctionCallStrategy\n2. JsonStrategy\n3. RegexStrategy
-  Sani --> Orc : StrategyResult.pairs\n[(original, placeholder), …]
+
+  Orc -> Rules : load(team_id) [cached 5 min]
+  Rules --> Orc : replace.md pairs\n(applied length-descending, OVERRIDES detection)
+
+  Orc -> Local : detect(text)
+  note right of Local
+    Local cascade — ~6 ms p50 on CPU:
+    1. regex + checksum
+       (ИНН/КПП/ОГРН/БИК/JWT/IP/secrets)
+    2. dual-NER run-both-union
+       (Natasha RU + spaCy en_core_web_md EN)
+    3. lemma-gazetteer
+       (products · ПОД-ФТ · markings)
+    4. code-identifier splitter
+    Thread-offloaded off the async event loop.
+    Python 3.12: full NER; 3.14: graceful degrade.
+  end note
+  Local --> Orc : local_pairs + gazetteer_hit?
+
+  opt gazetteer_hit
+    Orc -> Sani : extract_conditional(text, rules)
+    Sani -> Vllm : POST /v1/chat/completions
+    Vllm --> Sani : structured response
+    Sani --> Orc : oracle_pairs
+    note right of Sani
+      Oracle adds Tier-2 coverage
+      (unmarked know-how).
+      Latency: ~7–15 s round-trip.
+      Not called when no gazetteer hit.
+    end note
+  end
+
+  Orc -> Orc : merge(local_pairs, oracle_pairs)
   Orc -> Map : merge(conversation_id, pairs)\n(cache A)
   Map --> Orc : cache_a_hit?
   Orc --> G : SanitizeResult{sanitized_text, pairs}
   G -> G : msg.content := sanitized_text\nstate.mapping += pairs
+end
+
+== pre_call — Stage 5 DLP egress guard ==
+G -> DLP : scan(sanitized_messages)
+note right of DLP
+  Re-scans sanitized outbound payload
+  for canary strings and high-confidence
+  secrets that survived the local cascade.
+  Independent second layer.
+end note
+alt canary / secret leak detected
+  DLP --> G : block_reason
+  G --> LL : HTTP 422
+  LL --> Dev : HTTP 422 + block_reason
+else clean
+  DLP --> G : ok
 end
 
 G --> LL : mutated data (sanitized)
@@ -80,23 +142,26 @@ LL --> Dev : response (originals restored)
 
 == audit (always, success or failure) ==
 LL -> G : async_log_success_event / async_log_failure_event
-G -> Audit : emit(AuditEvent{request_id, user_id, team_id,\nprovider, model, latency_ms, tokens,\nredaction_count, cache_a_hit, status,\nplaceholder_list})
+G -> Audit : emit(AuditEvent{request_id, user_id, team_id,\nprovider, model, latency_ms, tokens,\nredaction_count, cache_a_hit, block_reason,\nfinding_label_counts, status})
 note right of Audit
   NEVER-fields gate refuses
   records that contain
   mapping / original / credentials.
   X-Corp-Auth never reaches here.
+  Stage-0 / Stage-5 blocks are
+  audited inline via failure event.
 end note
 Audit -> Sink : sinks (stdout / Vector → SIEM / Postgres)
 
 == invariants enforced on this path ==
 note over G, Audit #FFF6D6
   #1  No originals leak (M1-14): logger, errors, traces, metrics, headers, stdout
-  #2  NEVER-fields gate on every audit emit
+  #2  NEVER-fields gate on every audit emit (+ Vector VRL defense-in-depth)
   #3  Authorization (BYOK) passthrough untouched
   #4  X-Corp-Auth stripped pre-call, never logged
   #5  Placeholder substitution sorted longest-first
   #6  Fail-policy matrix (M4) — no ad-hoc fail-open
+  #7  Stage-0 / Stage-5 blocks audited inline (block_reason CONDITIONAL field)
 end note
 
 @enduml
