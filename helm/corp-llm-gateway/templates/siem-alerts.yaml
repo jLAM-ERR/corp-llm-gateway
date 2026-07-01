@@ -1,0 +1,33 @@
+{{- if .Values.audit.sinks.siem.prometheusRules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}-alerts
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: corp-llm-gateway.audit
+      rules:
+        - alert: AuditVectorDropHigh
+          # M3-9: fires when the SIEM sink buffer drops events (disk full / endpoint down).
+          expr: increase(vector_buffer_events_dropped_total{component_name="siem"}[5m]) > 0
+          for: 1m
+          labels:
+            severity: warning
+            service: corp-llm-gateway
+          annotations:
+            summary: "Vector SIEM buffer dropping audit events"
+            description: "Audit events dropped from the SIEM sink buffer in the last 5 minutes. Check SIEM endpoint connectivity (open Q#3)."
+
+        - alert: LeakAttemptDetected
+          # M3-6: fires when the DLP guard or canary blocks an egress attempt.
+          expr: increase(corp_llm_gateway_blocked_requests_total{block_reason=~"dlp.*|canary.*"}[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            service: corp-llm-gateway
+          annotations:
+            summary: "DLP guard or canary leak attempt detected"
+            description: "DLP egress guard triggered — possible sanitizer miss. Review block_reason in the audit log."
+{{- end }}

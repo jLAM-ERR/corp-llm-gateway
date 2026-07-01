@@ -154,3 +154,17 @@ data:
         buffer:
           type: disk
           max_size: 5368709120
+{{- if .Values.audit.sinks.siem.enabled }}
+      siem:
+        type: http
+        # Inherits the NEVER-fields gate (audit_only ← enforce_audit_schema).
+        # Endpoint pending open Q#3; update in values once SIEM target is confirmed.
+        inputs: [audit_only]
+        uri: {{ .Values.audit.sinks.siem.endpoint | quote }}
+        method: post
+        encoding:
+          codec: {{ .Values.audit.sinks.siem.encoding }}
+        buffer:
+          type: disk
+          max_size: 1073741824
+{{- end }}

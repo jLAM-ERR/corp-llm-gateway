@@ -51,6 +51,11 @@ audit:
       bucket: corp-audit
     siem:
       enabled: true
+      # Placeholder endpoint — update once SIEM target is confirmed (open Q#3).
+      endpoint: "http://siem.corp.lan/ingest"
+      encoding: json
+      prometheusRules:
+        enabled: true
 
 token:
   ttlDays: 30
