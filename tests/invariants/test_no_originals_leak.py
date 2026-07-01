@@ -574,10 +574,8 @@ async def test_stage0_audit_record_contains_no_raw_content() -> None:
         await guardrail.pre_call(data)
 
     assert ei.value.error_code == "E_POLICY_BLOCKED"
-    # litellm fires async_log_failure_event after the rejection; simulate it.
-    # The block is NOT audited inline (that would double-audit), so drive the
-    # failure-event path to produce the single audit record.
-    await guardrail.audit(data, None, start_time=now, end_time=now, status="failed")
+    # The block audits INLINE (litellm does not fire the failure event for a
+    # pre_call rejection). The single audit record must contain no raw originals.
     assert len(sink.records) == 1
     serialized = json.dumps(sink.records[0])
     for original in ORIGINAL_CORPUS:

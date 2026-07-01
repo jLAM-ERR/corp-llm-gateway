@@ -26,6 +26,7 @@ import json
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
@@ -78,6 +79,11 @@ except ImportError:  # pragma: no cover
     _LitellmCustomLogger = object  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
+
+# Cap on the audit-idempotency set (bounded FIFO). The two possible audit() calls
+# for one request (inline block-audit + any litellm event) happen ms apart, so a
+# small window suffices; this just prevents unbounded growth over process life.
+_AUDIT_DEDUP_CAP = 4096
 
 
 class GuardrailHttpException(Exception):  # noqa: N818 — intentional name; LiteLLM-facing API
@@ -138,6 +144,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         self._dlp_guard = dlp_guard if dlp_guard is not None else DlpEgressGuard()
         # Per-request state. Keyed by request_id; cleared in post_call.
         self._req_state: dict[str, _RequestState] = {}
+        # Idempotency guard for audit(): litellm does NOT fire
+        # async_log_failure_event for a pre_call GuardrailHttpException (confirmed
+        # live, v1.85), so Stage-0/Stage-5 blocks audit INLINE. This bounded set
+        # keeps audit() exactly-once even if a future litellm version also fires
+        # the failure event for the same request_id.
+        self._audited_ids: OrderedDict[str, None] = OrderedDict()
 
     # ---- LiteLLM hook entry points ----------------------------------------
 
@@ -345,11 +357,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     request_id,
                     _s0_reason,
                 )
-                # The block is audited by litellm's async_log_failure_event →
-                # audit(status="failed"), which reads state.block_reason + full
-                # attribution (state was created above). This mirrors the
-                # E_BAD_REQUEST path; emitting audit() here too would
-                # double-audit, since the failure event still fires.
+                # litellm does NOT fire async_log_failure_event for a pre_call
+                # rejection (confirmed live, v1.85), so audit the block INLINE —
+                # otherwise it is never recorded (R13). audit() is idempotent via
+                # self._audited_ids, so this stays exactly-once even if a future
+                # litellm version also fires the failure event.
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
                 raise GuardrailHttpException(
                     422,
                     "E_POLICY_BLOCKED",
@@ -506,8 +520,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         # Stage 5: DLP egress guard — re-scan the SANITIZED outbound request.
         # Defence-in-depth: catches canaries / raw secrets that survived the
-        # primary sanitizer. Do NOT audit inline — litellm's failure event
-        # fires async_log_failure_event → audit(), same as the Stage-0 path.
+        # primary sanitizer. Audit the block INLINE (idempotent) — litellm does
+        # not fire the failure event for pre_call rejections; see Stage 0.
         if _config_get("CORP_LLM_DLP_GUARD", "1") != "0":
             _s5_texts: list[str] = []
             for _s5_msg in data.get("messages") or []:
@@ -523,6 +537,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     request_id,
                     _s5_reason,
                 )
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
                 raise GuardrailHttpException(
                     422,
                     "E_DLP_BLOCKED",
@@ -629,6 +645,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         status: str,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
+        if request_id in self._audited_ids:
+            logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
+            return
+        self._audited_ids[request_id] = None
+        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+            self._audited_ids.popitem(last=False)
         state = self._req_state.pop(request_id, None)
         # litellm v1.85 passes datetime objects for start_time / end_time
         # to async_log_*_event; older versions used floats. Handle both.

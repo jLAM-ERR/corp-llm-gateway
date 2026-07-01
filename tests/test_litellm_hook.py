@@ -2100,12 +2100,8 @@ async def test_stage0_audit_record_emitted_with_block_reason() -> None:
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
     assert ei.value.error_code == "E_POLICY_BLOCKED"
-    # litellm fires async_log_failure_event after the pre_call rejection;
-    # simulate it (same pattern as test_audit_after_failed_pre_call_uses_unknown_user).
-    # The block must NOT audit inline — that would double-audit.
-    _start = time.time()
-    await g.audit(data, None, start_time=_start, end_time=_start + 0.05, status="failed")
-    # Exactly one record — proves no inline double-audit at the block site.
+    # litellm does NOT fire async_log_failure_event for a pre_call rejection, so
+    # the block is audited INLINE — exactly one record right after pre_call.
     assert len(sink.records) == 1
     rec = sink.records[0]
     assert rec.get("block_reason") == "config:env"
@@ -2114,6 +2110,10 @@ async def test_stage0_audit_record_emitted_with_block_reason() -> None:
     # Attribution fields must be real (not "unknown") because state was created before Stage 0.
     assert rec.get("user_id") == "alice"
     assert rec.get("team_id") == "t1"
+    # Idempotency: if a future litellm ALSO fired the failure event, no 2nd record.
+    _start = time.time()
+    await g.audit(data, None, start_time=_start, end_time=_start + 0.05, status="failed")
+    assert len(sink.records) == 1
 
 
 async def test_stage0_clean_request_passes_through() -> None:
@@ -2232,8 +2232,8 @@ async def test_stage5_dlp_audit_has_block_reason_dlp_canary() -> None:
     data = _data_with_token("tok-1", content=f"leaked {canary} here")
     with pytest.raises(GuardrailHttpException):
         await g.pre_call(data)
-    # Simulate litellm's async_log_failure_event → audit(status="failed").
-    await g.audit(data, None, start_time=now, end_time=now, status="failed")
+    # The Stage-5 block audits INLINE (litellm doesn't fire the failure event for
+    # a pre_call rejection) — exactly one record right after pre_call.
     assert len(sink.records) == 1
     rec = sink.records[0]
     assert rec.get("block_reason") == "dlp:canary"
@@ -2241,6 +2241,9 @@ async def test_stage5_dlp_audit_has_block_reason_dlp_canary() -> None:
     assert rec.get("status") == "failed"
     # Raw canary value must NOT appear in any audit field.
     assert canary not in json.dumps(rec)
+    # Idempotency: a follow-up failure-event audit adds no second record.
+    await g.audit(data, None, start_time=now, end_time=now, status="failed")
+    assert len(sink.records) == 1
 
 
 async def test_stage5_dlp_raw_secret_blocked_by_default_guard() -> None:
