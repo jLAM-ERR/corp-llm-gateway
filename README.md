@@ -1,5 +1,7 @@
 # corp-llm-gateway
 
+**English** · [Русский](README.ru.md)
+
 Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances and Anthropic / OpenAI before it leaves the corp boundary.
 
 Replaces the per-laptop `data-sanitizer` Claude Code plugin (which only covered user prompts) with a centrally-enforced, auditable, multi-provider gateway.
