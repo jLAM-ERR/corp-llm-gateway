@@ -8,6 +8,9 @@ This module is safe to import when spaCy or the model are absent.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 
 _EN_LABEL_MAP: dict[str, str] = {
@@ -20,6 +23,11 @@ _EN_LABEL_MAP: dict[str, str] = {
 # Module-level model cache. Set once on first successful load.
 _spacy_nlp: object | None = None
 _spacy_tried: bool = False
+
+# spaCy Language objects are not thread-safe for concurrent nlp(text) calls.
+# Inference is serialised through this lock; model load happens on the event loop
+# (single-threaded) so the lock is only needed during inference.
+_en_lock = threading.Lock()
 
 
 def _load_spacy() -> object:
@@ -44,19 +52,9 @@ def _load_spacy() -> object:
     return _spacy_nlp
 
 
-class EnNerDetector(PIIDetector):
-    """English NER via spaCy en_core_web_md.
-
-    Maps PERSON→PERSON, ORG→ORG, GPE/LOC→LOCATION.
-    Span offsets (start_char, end_char) are character positions;
-    text[start_char:end_char] == ent.text.
-    Score is fixed at 0.8 (probabilistic model — not a hard rule).
-    """
-
-    async def detect(self, text: str) -> list[Finding]:
-        if not text.strip():
-            return []
-        nlp = _load_spacy()
+def _infer_en(nlp: object, text: str) -> list[Finding]:
+    """Run spaCy NER in a worker thread, serialised by _en_lock."""
+    with _en_lock:
         doc = nlp(text)  # type: ignore[call-arg]
         findings: list[Finding] = []
         for ent in doc.ents:  # type: ignore[attr-defined]
@@ -73,3 +71,21 @@ class EnNerDetector(PIIDetector):
                 )
             )
         return findings
+
+
+class EnNerDetector(PIIDetector):
+    """English NER via spaCy en_core_web_md.
+
+    Maps PERSON→PERSON, ORG→ORG, GPE/LOC→LOCATION.
+    Span offsets (start_char, end_char) are character positions;
+    text[start_char:end_char] == ent.text.
+    Score is fixed at 0.8 (probabilistic model — not a hard rule).
+    """
+
+    async def detect(self, text: str) -> list[Finding]:
+        if not text.strip():
+            return []
+        # Load model on the event loop (once, serialised by the loop); then offload
+        # the CPU-bound inference to a thread so the event loop stays responsive.
+        nlp = _load_spacy()
+        return await asyncio.to_thread(_infer_en, nlp, text)

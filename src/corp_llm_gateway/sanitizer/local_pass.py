@@ -1,4 +1,11 @@
-"""Local detection pass: segment-aware concurrent detector union with de-overlap."""
+"""Local detection pass: segment-aware concurrent detector union with de-overlap.
+
+asyncio.gather fans out detectors per segment. NER detectors (ner_ru / ner_en)
+offload their CPU-bound inference via asyncio.to_thread so the event loop stays
+free during model calls; a per-model threading.Lock serialises concurrent callers
+(spaCy Language and Natasha tagger are not thread-safe for concurrent calls).
+Regex stays inline — it is microseconds and purely GIL-free stdlib.
+"""
 
 from __future__ import annotations
 
