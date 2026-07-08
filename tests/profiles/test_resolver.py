@@ -12,9 +12,15 @@ import pytest
 from corp_llm_gateway.detectors.regex_checksum import RegexChecksumDetector
 from corp_llm_gateway.profiles import (
     FileProfileLoader,
+    PolicyKnobs,
+    ProfileBundle,
     ProfileNotFoundError,
     ProfileResolver,
+    bundle_fingerprint,
 )
+from corp_llm_gateway.rules.gazetteer import Gazetteer
+from corp_llm_gateway.rules.models import Rule, Rules
+from corp_llm_gateway.sanitizer.allowlist import Allowlist
 from corp_llm_gateway.team_config import TeamConfig
 
 
@@ -145,3 +151,79 @@ async def test_resolve_team_reresolves_when_layer_key_changes(tmp_path: Path) ->
     assert division is not ru
     assert division.profile_ids == ("core", "ru", "division")
     assert ru.profile_ids == ("core", "ru")
+
+
+# bundle_fingerprint: D3 cache-key identity ---------------------------------
+
+
+def _bundle(
+    *,
+    profile_ids: tuple[str, ...] = ("core",),
+    detectors: tuple[object, ...] = (),
+    gazetteer: Gazetteer | None = None,
+    rules: Rules | None = None,
+    policy: PolicyKnobs | None = None,
+) -> ProfileBundle:
+    return ProfileBundle(
+        detectors=detectors,  # type: ignore[arg-type]
+        gazetteer=gazetteer,
+        rules=rules or Rules(rules=()),
+        allowlist=Allowlist(()),
+        policy=policy or PolicyKnobs(),
+        profile_ids=profile_ids,
+    )
+
+
+def test_bundle_fingerprint_is_stable_and_hex() -> None:
+    fp = bundle_fingerprint(_bundle())
+    assert fp == bundle_fingerprint(_bundle())
+    assert len(fp) == 64 and all(c in "0123456789abcdef" for c in fp)
+
+
+def test_bundle_fingerprint_differs_by_layer_key() -> None:
+    assert bundle_fingerprint(_bundle(profile_ids=("core",))) != bundle_fingerprint(
+        _bundle(profile_ids=("core", "ru"))
+    )
+
+
+def test_bundle_fingerprint_differs_by_detector_set() -> None:
+    assert bundle_fingerprint(_bundle(detectors=())) != bundle_fingerprint(
+        _bundle(detectors=(RegexChecksumDetector(),))
+    )
+
+
+def test_bundle_fingerprint_differs_by_gazetteer_presence() -> None:
+    assert bundle_fingerprint(_bundle(gazetteer=None)) != bundle_fingerprint(
+        _bundle(gazetteer=Gazetteer({"sistema": "PRODUCT"}))
+    )
+
+
+def test_bundle_fingerprint_differs_by_policy_knob() -> None:
+    assert bundle_fingerprint(_bundle(policy=PolicyKnobs())) != bundle_fingerprint(
+        _bundle(policy=PolicyKnobs(block_payloads=True))
+    )
+    # allowed_providers = None (no restriction) must differ from the empty set.
+    assert bundle_fingerprint(
+        _bundle(policy=PolicyKnobs(allowed_providers=None))
+    ) != bundle_fingerprint(_bundle(policy=PolicyKnobs(allowed_providers=frozenset())))
+
+
+def test_bundle_fingerprint_differs_by_rules() -> None:
+    assert bundle_fingerprint(_bundle(rules=Rules(rules=()))) != bundle_fingerprint(
+        _bundle(rules=Rules(rules=(Rule("acme", "[CO]"),)))
+    )
+
+
+async def test_resolved_bundles_get_distinct_fingerprints(tmp_path: Path) -> None:
+    resolver = ProfileResolver(FileProfileLoader(_layered_root(tmp_path)))
+    division = await resolver.resolve_team(_team("t1", ("division",)))
+    ru = await resolver.resolve_team(_team("t1", ("ru",)))
+    assert bundle_fingerprint(division) != bundle_fingerprint(ru)
+
+
+async def test_shared_resolved_bundle_shares_fingerprint(tmp_path: Path) -> None:
+    resolver = ProfileResolver(FileProfileLoader(_layered_root(tmp_path)))
+    a = await resolver.resolve_team(_team("t1", ("division",)))
+    b = await resolver.resolve_team(_team("t2", ("division",)))
+    assert a is b
+    assert bundle_fingerprint(a) == bundle_fingerprint(b)
