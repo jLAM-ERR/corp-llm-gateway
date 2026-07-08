@@ -903,3 +903,106 @@ async def test_openai_tool_call_raw_secret_in_dict_arguments_blocked_and_no_leak
     assert _haystack_contains_any_original(serialized) is None, "original in audit record"
     assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
     assert secret not in serialized and secret not in caplog.text, "secret leaked into a surface"
+
+
+# (xii) Code-fence lang-tag surface (F5): a value smuggled into the ```<lang>
+# fence-opener position must be redacted by the local pass before egress. Pre-fix
+# the segmenter left the fence-delimiter spans uncovered, so the local detectors
+# never scanned them and lang-tag PII (not a rule/gazetteer/DLP term) egressed. --
+
+
+def _fence_tag_guardrail() -> tuple[object, ListSink]:
+    """A guardrail whose LOCAL regex pass is the only redactor (oracle returns no
+    pairs) — so a value reachable ONLY via the local pass proves the segmenter now
+    covers the fence-delimiter span (F5)."""
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.detectors.regex_checksum import RegexChecksumDetector
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+    from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
+
+    def _empty_pairs_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": '{"pairs": []}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_empty_pairs_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(
+            corp_llm,
+            InMemoryMappingStore(),
+            _NoRules(),
+            local_detectors=[RegexChecksumDetector()],
+        ),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+    )
+    return guardrail, sink
+
+
+@pytest.mark.asyncio
+async def test_fence_lang_tag_value_redacted_before_egress(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A value in the opening-fence lang-tag position is redacted before egress and
+    appears in no forwarded content, log line, or audit record (F5)."""
+    guardrail, sink = _fence_tag_guardrail()
+    email = ORIGINAL_CORPUS[0]  # alice.smith@corp.lan
+    fence = "```"
+    content = f"here is a snippet:\n{fence}{email}\nvalue = compute()\n{fence}\nend"
+    data = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": content}],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    forwarded = json.dumps(out["messages"])
+    assert email not in forwarded, "fence-tag email egressed unredacted (F5)"
+    assert _haystack_contains_any_original(forwarded) is None, "original egressed in fence tag"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+
+    now = datetime.now(UTC)
+    await guardrail.audit(data, None, start_time=now, end_time=now, status="ok")  # type: ignore[attr-defined]
+    assert len(sink.records) == 1
+    assert _haystack_contains_any_original(json.dumps(sink.records[0])) is None
