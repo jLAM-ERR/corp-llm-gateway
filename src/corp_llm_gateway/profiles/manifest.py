@@ -1,11 +1,15 @@
-"""profile.toml parsing + extends resolution + integrity hooks.
+"""profile.toml parsing + extends resolution + bundle integrity (D6).
 
 ``resolve_extends`` flattens the extends DAG to an ordered ``[core, ...,
 most-specific]`` layer list, guarded against cycles (``ProfileCycleError``) and
-runaway depth (``ProfileDepthError``, mirroring
-``content_blocks.ContentTooDeepError``). ``verify_signature`` is the D6 seam and
-is intentionally inert until offline PKI exists; ``verify_integrity`` enforces a
-self-contained content hash when a manifest declares one.
+runaway depth (``ProfileDepthError``, mirroring ``content_blocks``). Hash-
+integrity ships fail-closed: a profile may declare ``content_hash`` — an order-
+independent SHA-256 over the bundle's other files (``compute_content_hash``;
+``profile.toml`` itself excluded to avoid self-reference) — which
+``verify_integrity`` recomputes at load and refuses on mismatch, catching a
+bundle tampered vs its own manifest with no external PKI. Detached-signature
+verify (``verify_signature``) stays a gated no-op behind
+``CORP_PROFILE_REQUIRE_SIGNATURE`` until the offline cosign/PKI decision lands.
 """
 
 from __future__ import annotations
@@ -39,6 +43,10 @@ class ProfileDepthError(Exception):
 
 
 class ProfileIntegrityError(Exception):
+    pass
+
+
+class ProfileSignatureError(Exception):
     pass
 
 
@@ -125,17 +133,43 @@ def compute_content_hash(parts: Iterable[tuple[str, bytes]]) -> str:
     return digest.hexdigest()
 
 
-def verify_signature(manifest: ProfileManifest, *, enforce: bool = False) -> None:
-    """D6 detached-signature seam — inert until offline PKI lands.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
-    A missing/invalid signature never blocks startup pre-PKI; ``enforce`` is
-    accepted so callers can wire the flag now without changing signatures.
+
+def _require_signature() -> bool:
+    from corp_llm_gateway import config
+
+    value = config.get("CORP_PROFILE_REQUIRE_SIGNATURE", "0") or "0"
+    return value.strip().lower() in _TRUTHY
+
+
+def verify_signature(manifest: ProfileManifest, *, require: bool | None = None) -> None:
+    """Detached-signature seam — a gated no-op until offline PKI lands.
+
+    ``require`` defaults to the ``CORP_PROFILE_REQUIRE_SIGNATURE`` flag. Off (the
+    default) → inert; on → fail closed rather than silently pass.
     """
-    return None
+    if require is None:
+        require = _require_signature()
+    if not require:
+        return None
+    # BLOCKER: offline cosign/PKI decision (plan Post-Completion) — no in-tree
+    # verifier and no air-gapped home for verification keys yet. Enforcing by
+    # default would brick startup, so this is opt-in; opting in fails closed
+    # (no ad-hoc fail-open — CLAUDE.md invariant 6) until keys exist.
+    raise ProfileSignatureError(
+        "CORP_PROFILE_REQUIRE_SIGNATURE is set but detached-signature "
+        "verification is not implemented — blocked on the offline cosign/PKI "
+        "decision; unset the flag until verification keys exist"
+    )
 
 
 def verify_integrity(manifest: ProfileManifest, computed_hash: str) -> None:
-    """Enforce the self-contained content hash (no-op when none is declared)."""
+    """Fail closed on a content-hash mismatch, then run the signature seam.
+
+    No-op on the hash when the manifest declares none; the signature seam is
+    itself a gated no-op (see :func:`verify_signature`).
+    """
     if manifest.content_hash is not None and manifest.content_hash != computed_hash:
         raise ProfileIntegrityError(
             f"profile {manifest.name!r} content-hash mismatch: "
