@@ -40,3 +40,9 @@ class AuditEvent:
     corp_llm_latency_ms: int | None = None
     pre_pass_latency_ms: int | None = None
     audit_buffer_full: bool | None = None
+
+    # Which profile bundle(s) / jurisdiction resolved for this request.
+    # METADATA, not a NEVER field: carries policy identity, never content.
+    # Value populated at request time by the profile-aware orchestrator (D4).
+    profile_ids: tuple[str, ...] = ()
+    jurisdiction: str | None = None

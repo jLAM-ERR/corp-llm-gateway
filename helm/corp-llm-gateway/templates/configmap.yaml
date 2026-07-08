@@ -96,7 +96,9 @@ data:
                     "gateway_version": .__lf.gateway_version,
                     "status": .__lf.status,
                     "error_code": .__lf.error_code,
-                    "block_reason": .__lf.block_reason
+                    "block_reason": .__lf.block_reason,
+                    "profile_ids": .__lf.profile_ids,
+                    "jurisdiction": .__lf.jurisdiction
                   },
                   "tags": [
                     join(["team:", .__lf.team_id]),
