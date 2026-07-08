@@ -43,3 +43,36 @@
 # apikey:
 # CORP_LLM_API_KEY_HEADER   = "X-Api-Key"
 # CORP_LLM_API_KEY          = "..."
+
+# ── Extensions & providers (nested tables, read via config.get_table) ────────
+#
+# Unlike the scalar keys above, these are TOML *tables* keyed by kind/name and
+# have no env-var equivalent (env carries scalars only). Set them here or let
+# the Helm values render them. config.get_table("extensions") returns the whole
+# {kind: {name: {...}}} tree; get_table("providers") returns the provider map.
+#
+# Extensions — [extensions.<kind>.<name>], where <kind> is one of:
+#   audit_sink | metrics | tracing | provider | detector | rules | payload_policy
+#
+# [extensions.audit_sink.langfuse]
+# enabled     = true
+# version     = "1"
+# api_version = "1"          # must match core EXTENSION_API_VERSION or startup refuses it
+# rollout     = "on"         # off | canary | on
+# fail_policy = "fail-open"  # fail-closed (default) | fail-open
+# endpoint    = "https://langfuse.corp.lan"
+#
+# [extensions.detector.presidio]
+# enabled     = false
+# api_version = "1"
+#
+# Providers — [providers.<name>]. v1 allows anthropic | openai (upstream) and
+# corp-vllm (oracle); any other name is refused unless CORP_ALLOW_V2_PROVIDERS=1.
+#
+# [providers.anthropic]
+# role    = "upstream"       # upstream | oracle
+# enabled = true
+#
+# [providers.corp-vllm]
+# role       = "oracle"
+# health_url = "https://corp-llm.corp.lan/health"
