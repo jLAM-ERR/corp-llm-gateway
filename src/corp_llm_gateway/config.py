@@ -117,6 +117,13 @@ def oversize_policy() -> str:
 
 _TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
+_PROD_ENVS: frozenset[str] = frozenset({"prod", "production"})
+
+
+def is_prod() -> bool:
+    """Whether ``CORP_ENV`` marks a production deployment (prod | production)."""
+    return (get("CORP_ENV", "") or "").strip().lower() in _PROD_ENVS
+
 
 def require_ner() -> bool:
     """Whether a self-disabled NER engine must fail the request CLOSED (M4/F2).
@@ -149,4 +156,13 @@ def corp_llm_verify() -> bool | str:
     ca_bundle = get("CORP_LLM_CA_BUNDLE", "")
     if ca_bundle:
         return ca_bundle
-    return get("SSL_VERIFY", "true").lower() != "false"
+    verify = (get("SSL_VERIFY", "true") or "true").lower() != "false"
+    if not verify and is_prod():
+        # SSL_VERIFY=false disables TLS verification on the corp-LLM call, which
+        # carries RAW user content. Refuse it under CORP_ENV=prod (F9); point at
+        # an internal CA via CORP_LLM_CA_BUNDLE instead.
+        raise RuntimeError(
+            "SSL_VERIFY=false disables TLS verification on the corp-LLM call and "
+            "is refused when CORP_ENV=prod; set CORP_LLM_CA_BUNDLE to a PEM CA bundle"
+        )
+    return verify

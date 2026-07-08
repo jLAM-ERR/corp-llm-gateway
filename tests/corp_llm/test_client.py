@@ -91,6 +91,27 @@ async def test_raises_on_5xx() -> None:
         await client.chat_completion(messages=[])
 
 
+async def test_error_message_excludes_response_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F8: a corp-LLM error body may echo the RAW request back. It must not
+    ride the exception message or cause chain — status code only."""
+    canary = "RAW-SECRET-echoed-in-body-9f3c"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text=f"bad request: {canary}")
+
+    http = _mock_transport(handler)
+    client = CorpLlmClient("https://x", model="m", http=http)
+    with pytest.raises(CorpLlmHttpError) as exc_info:
+        await client.chat_completion(messages=[])
+
+    exc = exc_info.value
+    assert "400" in str(exc)
+    assert canary not in str(exc)
+    # The status-code raise is not inside an except block, so nothing chains a body.
+    assert exc.__cause__ is None
+    assert canary not in repr(exc.__context__)
+
+
 async def test_raises_on_transport_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")

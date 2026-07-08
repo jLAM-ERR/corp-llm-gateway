@@ -111,6 +111,64 @@ def test_corp_llm_verify_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> No
     assert config.corp_llm_verify() is True
 
 
+def _isolate_from_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", "/nonexistent/config.toml")
+    config.reset_cache()
+
+
+def test_corp_llm_verify_prod_refuses_ssl_verify_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F9: SSL_VERIFY=false disables TLS on the raw-content corp-LLM call; refuse in prod."""
+    _isolate_from_file(monkeypatch)
+    monkeypatch.delenv("CORP_LLM_CA_BUNDLE", raising=False)
+    monkeypatch.setenv("CORP_ENV", "prod")
+    monkeypatch.setenv("SSL_VERIFY", "false")
+
+    with pytest.raises(RuntimeError, match="SSL_VERIFY=false"):
+        config.corp_llm_verify()
+
+
+def test_corp_llm_verify_prod_allows_ca_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CA bundle keeps verification ON, so prod + SSL_VERIFY=false + bundle is fine."""
+    _isolate_from_file(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", "prod")
+    monkeypatch.setenv("SSL_VERIFY", "false")
+    monkeypatch.setenv("CORP_LLM_CA_BUNDLE", "/etc/certs/bundle.pem")
+
+    assert config.corp_llm_verify() == "/etc/certs/bundle.pem"
+
+
+def test_corp_llm_verify_demo_allows_ssl_verify_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_from_file(monkeypatch)
+    monkeypatch.delenv("CORP_LLM_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("CORP_ENV", raising=False)
+    monkeypatch.setenv("SSL_VERIFY", "false")
+
+    assert config.corp_llm_verify() is False
+
+
+def test_corp_llm_verify_prod_true_when_verify_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_from_file(monkeypatch)
+    monkeypatch.delenv("CORP_LLM_CA_BUNDLE", raising=False)
+    monkeypatch.setenv("CORP_ENV", "prod")
+    monkeypatch.delenv("SSL_VERIFY", raising=False)
+
+    assert config.corp_llm_verify() is True
+
+
+@pytest.mark.parametrize("value", ["prod", "production", "PROD", "Production"])
+def test_is_prod_true(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_from_file(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", value)
+    assert config.is_prod() is True
+
+
+@pytest.mark.parametrize("value", ["", "dev", "demo", "staging"])
+def test_is_prod_false(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_from_file(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", value)
+    assert config.is_prod() is False
+
+
 def test_require_ner_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default off so the dev / Python-3.14 graceful path stays (F2/A2)."""
     monkeypatch.delenv("CORP_LLM_REQUIRE_NER", raising=False)

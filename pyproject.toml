@@ -35,7 +35,8 @@ dev = [
 # Postgres token store backend. Keeps the default install lean.
 postgres = ["asyncpg>=0.29"]
 # JWT verification for RBAC enforcement (gateway-admin operator claims).
-oidc = ["pyjwt>=2.8"]
+# [crypto] pulls `cryptography` — required: RBAC is pinned to RS256 (F11).
+oidc = ["pyjwt[crypto]>=2.8"]
 # CPU-only NER stack (torch-free). Install natasha + slovnet from PyPI.
 # en_core_web_md is NOT on PyPI by package name — install via its wheel URL:
 #   pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl

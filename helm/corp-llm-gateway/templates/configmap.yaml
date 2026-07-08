@@ -37,6 +37,16 @@ data:
       # (NEVER_FIELDS) and docs/audit-schema.md EXACTLY, including header-style
       # case variants. Defence-in-depth: drop any record carrying mapping /
       # original / credential data before it can reach a sink.
+      #
+      # ASYMMETRY (F10): this VRL gate is FLAT — `!exists(.field)` only inspects
+      # TOP-LEVEL keys. A NEVER key nested inside a dict/list would NOT be caught
+      # here. A recursive walk is not cleanly/safely expressible in this filter
+      # (VRL closures can't accumulate across for_each, and a flatten()+filter()
+      # rewrite is unverifiable without a Vector runtime in CI), so the PRIMARY
+      # recursive defense is the in-proc `assert_no_never_fields` walk in
+      # invariants.py, which runs before any record is emitted to stdout (and thus
+      # before Vector ever sees it). This flat gate stays as a top-level backstop.
+      # See docs/security.md §6.
       enforce_audit_schema:
         type: filter
         inputs: [parse]
