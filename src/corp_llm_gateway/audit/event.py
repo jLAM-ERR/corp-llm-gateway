@@ -2,7 +2,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
-Provider = Literal["anthropic", "openai"]
+# A registry-validated provider name. Was Literal["anthropic","openai"]; the
+# valid set now lives in corp_llm_gateway.providers so adding a v2 upstream does
+# not require editing this leaf module. Values reaching an AuditEvent are
+# produced by _detect_provider, which resolves through the provider registry.
+Provider = str
 Status = Literal["ok", "failed", "degraded"]
 
 
