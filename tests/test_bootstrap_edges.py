@@ -11,6 +11,7 @@ Complements tests/test_bootstrap.py (happy paths). Focus areas:
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
@@ -22,42 +23,10 @@ from corp_llm_gateway.storage import InMemoryMappingStore, RedisMappingStore
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, PostgresTeamConfigStore
 from corp_llm_gateway.tokens import InMemoryTokenStore, InvalidTokenError
 
-# Every config key the composition root reads, plus common decoy aliases that a
-# naive implementation might read instead of the canonical names.
-_MANAGED_ENV = (
-    "CORP_LLM_PG_DSN",
-    "REDIS_URL",
-    "CORP_LLM_ENDPOINT",
-    "CORP_LLM_MODEL",
-    "CORP_LLM_RULES_DIR",
-    "CORP_LLM_LOCAL_FIRST",
-    "CORP_LLM_GAZETTEER",
-    "CORP_LLM_DLP_CANARIES",
-    "CORP_LLM_CA_BUNDLE",
-    "SSL_VERIFY",
-    "CORP_LLM_AUTH_PROVIDER",
-    "CORP_LLM_BEARER_TOKEN",
-    "CORP_LLM_OIDC_ISSUER",
-    "CORP_LLM_OIDC_CLIENT_ID",
-    "CORP_LLM_OIDC_CLIENT_SECRET",
-    "DEMO_TEAM_TOKEN",
-    "CORP_LLM_GATEWAY_CONFIG_FILE",
-    # decoy aliases (must be ignored):
-    "DATABASE_URL",
-    "POSTGRES_DSN",
-    "CORP_LLM_DSN",
-    "CORP_LLM_REDIS_URL",
-    "CORP_LLM_CACHE_URL",
-)
-
 
 @pytest.fixture(autouse=True)
-def _clean_config(monkeypatch: pytest.MonkeyPatch):
-    for name in _MANAGED_ENV:
-        monkeypatch.delenv(name, raising=False)
-    config.reset_cache()
-    yield
-    config.reset_cache()
+def _clean_config(hermetic_gateway_config: None):
+    """Resolve config hermetically for every test here (see tests/conftest.py)."""
 
 
 @pytest.fixture
@@ -338,3 +307,34 @@ def test_malformed_canary_regex_fails_fast_at_build(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(re.error):
         bootstrap.build_guardrail()
+
+
+# ── corp-LLM endpoint placeholder warning ────────────────────────────────────
+
+
+@pytest.mark.usefixtures("_restore_pkg_logger")
+def test_endpoint_placeholder_default_warns(caplog: pytest.LogCaptureFixture) -> None:
+    # CORP_LLM_ENDPOINT unset → the client falls back to the placeholder; a
+    # WARNING at build time makes the misconfiguration diagnosable in prod logs
+    # (the hard fail-fast lives in startup validation, not here).
+    logging.getLogger("corp_llm_gateway").propagate = True
+    with caplog.at_level(logging.WARNING, logger="corp_llm_gateway.bootstrap"):
+        bootstrap.build_corp_llm_client()
+
+    assert any(
+        "CORP_LLM_ENDPOINT" in r.getMessage() and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
+
+
+@pytest.mark.usefixtures("_restore_pkg_logger")
+def test_endpoint_set_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    logging.getLogger("corp_llm_gateway").propagate = True
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://corp-llm.corp.lan/v1")
+    config.reset_cache()
+    with caplog.at_level(logging.WARNING, logger="corp_llm_gateway.bootstrap"):
+        bootstrap.build_corp_llm_client()
+
+    assert not any("CORP_LLM_ENDPOINT" in r.getMessage() for r in caplog.records)

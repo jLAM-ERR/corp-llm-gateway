@@ -9,13 +9,17 @@ contract). Backend selection is config-driven:
 - mapping store → Redis when ``REDIS_URL`` is set, else in-memory
 - corp-LLM auth → `auth.factory.get_auth_provider` (never inline auth)
 
-Module-level ``guardrail`` is the instance LiteLLM's ``callbacks:`` imports as
-``corp_llm_gateway.bootstrap.guardrail``. Construction performs NO network I/O —
-stores and clients connect lazily on first await.
+The ``guardrail`` attribute is the instance LiteLLM's ``callbacks:`` imports as
+``corp_llm_gateway.bootstrap.guardrail``. It is built lazily on first access
+(PEP 562 ``__getattr__``) so importing this module — or any module that imports
+it — stays side-effect-free; prod still fails fast on the first callback
+resolution. Construction performs NO network I/O — stores and clients connect
+lazily on first await.
 """
 
 from __future__ import annotations
 
+import logging
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -53,6 +57,8 @@ _DEFAULT_ENDPOINT = "https://corp-llm.example/v1"
 _DEFAULT_MODEL = "GLM-5.1-AWQ"
 _DEFAULT_RULES_DIR = "/etc/corp-llm-gateway/rules"
 _FALSEY = frozenset({"0", "false", "False", "FALSE"})
+
+_log = logging.getLogger(__name__)
 
 
 def _flag(name: str, default: str = "1") -> bool:
@@ -106,7 +112,12 @@ def build_mapping_store() -> MappingStore:
 
 def build_corp_llm_client() -> CorpLlmClient:
     """corp-LLM (vLLM oracle) client; auth comes from `get_auth_provider`."""
-    endpoint = config.get("CORP_LLM_ENDPOINT", _DEFAULT_ENDPOINT) or _DEFAULT_ENDPOINT
+    endpoint = config.get("CORP_LLM_ENDPOINT") or _DEFAULT_ENDPOINT
+    if endpoint == _DEFAULT_ENDPOINT:
+        _log.warning(
+            "CORP_LLM_ENDPOINT is unset; using placeholder %s. Set it before production egress.",
+            _DEFAULT_ENDPOINT,
+        )
     # CorpLlmClient appends /v1/chat/completions; strip a trailing /v1 that
     # the litellm hosted_vllm api_base needs but this client must not double.
     base_url = endpoint.rstrip("/").removesuffix("/v1")
@@ -173,6 +184,15 @@ def build_guardrail(
     )
 
 
-# The instance LiteLLM's `callbacks:` references as
-# `corp_llm_gateway.bootstrap.guardrail`. Built at import; no network I/O.
-guardrail = build_guardrail()
+_guardrail: CorpLlmGuardrail | None = None
+
+
+def __getattr__(name: str) -> CorpLlmGuardrail:
+    # PEP 562 lazy attribute: `corp_llm_gateway.bootstrap.guardrail` builds on
+    # first access and caches, keeping plain imports side-effect-free.
+    if name != "guardrail":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    global _guardrail
+    if _guardrail is None:
+        _guardrail = build_guardrail()
+    return _guardrail

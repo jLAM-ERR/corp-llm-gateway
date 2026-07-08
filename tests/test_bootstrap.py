@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import logging
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,16 +15,10 @@ from corp_llm_gateway.storage import InMemoryMappingStore, RedisMappingStore
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, PostgresTeamConfigStore
 from corp_llm_gateway.tokens import InMemoryTokenStore
 
-_BACKEND_ENV = ("CORP_LLM_PG_DSN", "REDIS_URL", "CORP_LLM_ENDPOINT", "DEMO_TEAM_TOKEN")
-
 
 @pytest.fixture(autouse=True)
-def _clean_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in _BACKEND_ENV:
-        monkeypatch.delenv(name, raising=False)
-    config.reset_cache()
-    yield
-    config.reset_cache()
+def _clean_config(hermetic_gateway_config: None) -> None:
+    """Resolve config hermetically for every test here (see tests/conftest.py)."""
 
 
 # ── build_guardrail: defaults ────────────────────────────────────────────────
@@ -39,6 +35,40 @@ def test_build_guardrail_returns_guardrail_with_in_memory_backends() -> None:
 def test_module_level_guardrail_is_importable_instance() -> None:
     # LiteLLM `callbacks:` imports `corp_llm_gateway.bootstrap.guardrail`.
     assert isinstance(bootstrap.guardrail, CorpLlmGuardrail)
+
+
+def test_importing_module_does_not_build_guardrail() -> None:
+    # A fresh import (simulated via reload) must leave the guardrail unbuilt;
+    # construction is deferred to first attribute access (PEP 562 __getattr__).
+    reloaded = importlib.reload(bootstrap)
+
+    assert reloaded._guardrail is None
+    assert "guardrail" not in vars(reloaded)
+
+
+def test_guardrail_attribute_builds_once_and_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    real = bootstrap.build_guardrail
+
+    def counting(*args: object, **kwargs: object) -> CorpLlmGuardrail:
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(bootstrap, "_guardrail", None)
+    monkeypatch.setattr(bootstrap, "build_guardrail", counting)
+
+    assert calls == 0  # patching / importing alone builds nothing
+    first = bootstrap.guardrail
+    assert calls == 1  # first access is the single build
+    assert first is bootstrap.guardrail  # cached: second access does not rebuild
+    assert calls == 1
+    assert isinstance(first, CorpLlmGuardrail)
+
+
+def test_getattr_raises_for_unknown_attribute() -> None:
+    with pytest.raises(AttributeError):
+        bootstrap.does_not_exist  # noqa: B018
 
 
 def test_gateway_version_is_metadata_not_demo_string() -> None:
@@ -94,16 +124,16 @@ def test_build_guardrail_selects_postgres_token_store(monkeypatch: pytest.Monkey
 # ── config-only: no os.environ at call sites ─────────────────────────────────
 
 
-def test_bootstrap_does_not_read_process_environment() -> None:
+def _assert_no_process_env_reads(path: Path) -> None:
     # AST-level so docstring/comment mentions of os.environ don't false-trip:
     # the module must not import `os` nor touch os.environ/os.getenv in code.
-    tree = ast.parse(Path(bootstrap.__file__).read_text())
+    tree = ast.parse(path.read_text())
     imports_os = any(
         (isinstance(n, ast.Import) and any(a.name == "os" for a in n.names))
         or (isinstance(n, ast.ImportFrom) and n.module == "os")
         for n in ast.walk(tree)
     )
-    assert not imports_os, "bootstrap must resolve settings via config, not import os"
+    assert not imports_os, f"{path.name} must resolve settings via config, not import os"
     env_reads = [
         n
         for n in ast.walk(tree)
@@ -112,7 +142,16 @@ def test_bootstrap_does_not_read_process_environment() -> None:
         and n.value.id == "os"
         and n.attr in {"environ", "getenv"}
     ]
-    assert not env_reads
+    assert not env_reads, f"{path.name} must read config, not os.environ/os.getenv"
+
+
+def test_bootstrap_does_not_read_process_environment() -> None:
+    _assert_no_process_env_reads(Path(bootstrap.__file__))
+
+
+def test_demo_guardrail_does_not_read_process_environment() -> None:
+    # Pin the demo shim to the same config-only contract as the prod root.
+    _assert_no_process_env_reads(Path(bootstrap.__file__).with_name("_demo_guardrail.py"))
 
 
 def test_backends_resolve_from_config_file_without_env(
@@ -160,3 +199,19 @@ async def test_demo_shim_yields_in_memory_deps_and_working_guardrail() -> None:
     ctx = await guardrail._auth.authenticate("demo-team-token")
     assert ctx.team_id == "demo-team"
     assert ctx.user_id == "demo-user"
+
+
+@pytest.mark.usefixtures("_restore_pkg_logger")
+def test_importing_demo_guardrail_with_pg_dsn_and_no_asyncpg_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: the demo container sets CORP_LLM_PG_DSN but ships without
+    # asyncpg. Importing the demo shim must NOT eagerly trigger bootstrap's prod
+    # build (a Postgres token store) — which used to crash at import time.
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@10.255.255.1:5432/gw")
+    config.reset_cache()
+    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
+
+    module = importlib.import_module("corp_llm_gateway._demo_guardrail")
+
+    assert isinstance(module.guardrail, CorpLlmGuardrail)
