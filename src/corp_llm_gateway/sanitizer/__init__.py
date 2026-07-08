@@ -12,12 +12,17 @@ from corp_llm_gateway.sanitizer.strategies import (
     SanitizerStrategy,
     StrategyResult,
 )
-from corp_llm_gateway.sanitizer.streaming import SseStreamDesanitizer, StreamingDesanitizer
+from corp_llm_gateway.sanitizer.streaming import (
+    OpenAiToolCallDesanitizer,
+    SseStreamDesanitizer,
+    StreamingDesanitizer,
+)
 
 __all__ = [
     "CorpLlmSanitizer",
     "FunctionCallStrategy",
     "JsonStrategy",
+    "OpenAiToolCallDesanitizer",
     "RegexStrategy",
     "SanitizationOrchestrator",
     "SanitizeResult",
