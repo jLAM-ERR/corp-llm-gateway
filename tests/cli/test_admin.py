@@ -497,3 +497,103 @@ def test_extensions_enable_unknown_target(
     rc = main(["extensions", "enable", "provider:nope"])
     assert rc == 2
     assert "Unknown extension" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# config check — validate settings + probe dependencies
+# ---------------------------------------------------------------------------
+
+
+async def _probe_ok(_arg: str) -> tuple[bool, str]:
+    return True, "reachable"
+
+
+async def _probe_down(_arg: str) -> tuple[bool, str]:
+    return False, "unreachable: ConnectError"
+
+
+def test_config_check_ok(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://corp-llm.corp.lan/v1")
+    rc = main(["config", "check", "--no-probe"])
+    assert rc == 0
+    assert "config: OK" in capsys.readouterr().out
+
+
+def test_config_check_missing_endpoint_exits_nonzero(
+    hermetic_gateway_config: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["config", "check", "--no-probe"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "config: INVALID" in err
+    assert "CORP_LLM_ENDPOINT" in err
+
+
+def test_config_check_malformed_value_exits_nonzero(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_OVERSIZE_POLICY", "banana")
+    rc = main(["config", "check", "--no-probe"])
+    assert rc == 1
+    assert "CORP_LLM_OVERSIZE_POLICY" in capsys.readouterr().err
+
+
+def test_config_check_json_ok(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    rc = main(["config", "check", "--no-probe", "--json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["config_valid"] is True
+    assert data["healthy"] is True
+    assert data["probes"] == []
+
+
+def test_config_check_json_invalid(
+    hermetic_gateway_config: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["config", "check", "--no-probe", "--json"])
+    assert rc == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["config_valid"] is False
+    assert data["healthy"] is False
+    assert any("CORP_LLM_ENDPOINT" in p for p in data["problems"])
+
+
+def test_config_check_probe_unreachable_exits_nonzero(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._probe_corp_llm", _probe_down)
+    rc = main(["config", "check"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "UNREACHABLE" in out
+    assert "corp-llm" in out
+
+
+def test_config_check_probe_ok_only_configured_deps(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # only CORP_LLM_ENDPOINT is configured (no PG/Redis), so only corp-llm is probed.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._probe_corp_llm", _probe_ok)
+    rc = main(["config", "check", "--json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [p["dependency"] for p in data["probes"]] == ["corp-llm"]
+    assert data["healthy"] is True
