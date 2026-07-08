@@ -454,6 +454,73 @@ async def test_pre_call_handles_proxy_server_request_headers_shape() -> None:
     assert out["messages"][0]["content"] == "hi [N1]"
 
 
+def _data_all_header_locations(token: str) -> dict[str, Any]:
+    """Inbound headers duplicated across every location litellm may forward upstream."""
+    hdrs = {"X-Corp-Auth": token, "Authorization": "Bearer byok"}
+    return {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": dict(hdrs),
+        "proxy_server_request": {"headers": dict(hdrs)},
+        "metadata": {"headers": dict(hdrs)},
+        "litellm_metadata": {"headers": dict(hdrs)},
+    }
+
+
+async def test_pre_call_strips_corp_token_from_all_header_locations() -> None:
+    """F6: the corp token must not survive in ANY header-bearing location, and the
+    BYOK Authorization header must pass through untouched (invariant 3)."""
+    g, _ = _build_guardrail()
+    data = _data_all_header_locations("tok-1")
+    out = await g.pre_call(data)
+    for loc in (
+        out["headers"],
+        out["proxy_server_request"]["headers"],
+        out["metadata"]["headers"],
+        out["litellm_metadata"]["headers"],
+    ):
+        assert not any(k.lower() == "x-corp-auth" for k in loc)
+        assert loc["Authorization"] == "Bearer byok"
+
+
+async def test_pre_call_strips_corp_token_from_proxy_server_request_headers() -> None:
+    """The token in proxy_server_request.headers is stripped in place (pre-fix it survived)."""
+    g, _ = _build_guardrail()
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hi"}],
+        "proxy_server_request": {
+            "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"}
+        },
+    }
+    out = await g.pre_call(data)
+    assert "X-Corp-Auth" not in out["proxy_server_request"]["headers"]
+    assert out["proxy_server_request"]["headers"]["Authorization"] == "Bearer byok"
+
+
+async def test_pre_call_strips_corp_token_case_insensitive_all_locations() -> None:
+    """litellm normalizes header case; a lower-cased `x-corp-auth` is stripped everywhere."""
+    g, _ = _build_guardrail()
+    hdrs = {"x-corp-auth": "tok-1", "authorization": "Bearer byok"}
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": dict(hdrs),
+        "proxy_server_request": {"headers": dict(hdrs)},
+        "metadata": {"headers": dict(hdrs)},
+        "litellm_metadata": {"headers": dict(hdrs)},
+    }
+    out = await g.pre_call(data)
+    for loc in (
+        out["headers"],
+        out["proxy_server_request"]["headers"],
+        out["metadata"]["headers"],
+        out["litellm_metadata"]["headers"],
+    ):
+        assert not any(k.lower() == "x-corp-auth" for k in loc)
+        assert loc["authorization"] == "Bearer byok"
+
+
 async def test_pre_call_request_id_stable_across_calls_on_same_data() -> None:
     g, _ = _build_guardrail()
     data = _data_with_token("tok-1")
