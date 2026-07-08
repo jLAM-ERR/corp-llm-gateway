@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from corp_llm_gateway.corp_llm import (
@@ -19,9 +20,14 @@ from corp_llm_gateway.corp_llm import (
     CorpLlmClient,
 )
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
-from corp_llm_gateway.detectors.regex_checksum import _deduplicate
+from corp_llm_gateway.detectors.regex_checksum import RegexChecksumDetector, _deduplicate
 from corp_llm_gateway.payload import (
     DEFAULT_THRESHOLD_BYTES,
+    OVERSIZE_CHUNK,
+    OVERSIZE_DELIVER_FLAG,
+    OVERSIZE_FAIL_CLOSED,
+    OversizeContentError,
+    normalize_oversize_policy,
     should_skip_sanitization,
 )
 from corp_llm_gateway.rules import Rules, RulesLoader
@@ -32,6 +38,7 @@ from corp_llm_gateway.sanitizer.engine import (
     CorpLlmSanitizer,
 )
 from corp_llm_gateway.sanitizer.local_pass import LocalDetectionPass
+from corp_llm_gateway.sanitizer.placeholder_allocator import RequestPlaceholderAllocator
 from corp_llm_gateway.sanitizer.strategies import (
     FunctionCallStrategy,
     JsonStrategy,
@@ -41,6 +48,17 @@ from corp_llm_gateway.sanitizer.strategies import (
 from corp_llm_gateway.storage import MappingStore
 
 _PLACEHOLDER_LABEL_RE = re.compile(r"^\[([A-Z_]+)_(\d+)\]$")
+
+# Chunk overlap sizing (F1 chunk policy). Regex/checksum patterns are LINEAR and
+# now run over the FULL text (see `_sanitize_chunked`), so the overlap no longer
+# has to contain them — critically, several regex patterns are UNBOUNDED (JWT,
+# Bearer {20,}, sk-{32,}, DB URL {3,}) and could never be bounded by a fixed
+# overlap anyway (H1). The overlap only has to keep a BOUNDED entity from the
+# CHUNKED pass (NER spans, gazetteer terms) inside one window; 8192+128 is a
+# conservative upper bound for those and is retained as a safe margin.
+_MAX_ENTITY_CHARS = 8192 + 128
+_DEFAULT_CHUNK_OVERLAP_CHARS = _MAX_ENTITY_CHARS
+_DEFAULT_CHUNK_WINDOW_CHARS = 4 * _MAX_ENTITY_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +74,13 @@ class SanitizeResult:
     pairs: tuple[tuple[str, str], ...]
     cache_a_hit: bool
     skipped: bool
+    # Set on the opt-in oversize deliver-flag egress so the audit trail can
+    # distinguish a delivered oversize original from a normal zero-redaction
+    # request (M1). None on every other path.
+    block_reason: str | None = None
+
+
+OVERSIZE_DELIVERED_REASON = "oversize:delivered"
 
 
 def default_sanitizer() -> CorpLlmSanitizer:
@@ -73,6 +98,10 @@ class SanitizationOrchestrator:
         cache_a_ttl_seconds: int = 36000,
         cache_b_ttl_seconds: int = 3600,
         size_threshold_bytes: int = DEFAULT_THRESHOLD_BYTES,
+        oversize_policy: str = OVERSIZE_FAIL_CLOSED,
+        oversize_deliver_teams: frozenset[str] = frozenset(),
+        chunk_window_chars: int = _DEFAULT_CHUNK_WINDOW_CHARS,
+        chunk_overlap_chars: int = _DEFAULT_CHUNK_OVERLAP_CHARS,
         local_detectors: list[PIIDetector] | None = None,
         gazetteer: Gazetteer | None = None,
         allowlist: Allowlist | None = None,
@@ -84,9 +113,25 @@ class SanitizationOrchestrator:
         self._cache_a_ttl = cache_a_ttl_seconds
         self._cache_b_ttl = cache_b_ttl_seconds
         self._size_threshold = size_threshold_bytes
+        self._oversize_policy = normalize_oversize_policy(oversize_policy)
+        self._oversize_deliver_teams = oversize_deliver_teams
+        self._chunk_window = chunk_window_chars
+        self._chunk_overlap = chunk_overlap_chars
         self._local = LocalDetectionPass(local_detectors) if local_detectors else None
+        # NER-only pass for chunk mode: regex/checksum is pulled out and run over
+        # the FULL text (H1), so the chunked pass carries only the size-bounded
+        # detectors. None when no non-regex detector is configured.
+        chunk_detectors = (
+            [d for d in local_detectors if not isinstance(d, RegexChecksumDetector)]
+            if local_detectors
+            else []
+        )
+        self._chunk_local = LocalDetectionPass(chunk_detectors) if chunk_detectors else None
         self._gazetteer = gazetteer
         self._allowlist = allowlist
+        # Deterministic regex+checksum detector used both for the deliver-flag
+        # rescan and for the full-text (seam-independent) pass in chunk mode.
+        self._regex_checksum = RegexChecksumDetector()
 
     async def sanitize(
         self,
@@ -104,14 +149,12 @@ class SanitizationOrchestrator:
         )
 
         if should_skip_sanitization(content_bytes, threshold_bytes=self._size_threshold):
-            logger.info(
-                "sanitize_skipped_size team_id=%s conversation_id=%s size=%d threshold=%d",
-                team_id,
-                conversation_id,
-                content_bytes,
-                self._size_threshold,
+            return await self._handle_oversize(
+                text,
+                team_id=team_id,
+                conversation_id=conversation_id,
+                content_bytes=content_bytes,
             )
-            return SanitizeResult(text, (), cache_a_hit=False, skipped=True)
 
         rules = await self._rules_loader.load(team_id)
         logger.info(
@@ -155,10 +198,56 @@ class SanitizationOrchestrator:
             content_hash[:12],
         )
 
+        result = await self._detect(text, rules, team_id=team_id, conversation_id=conversation_id)
+
+        await self._mapping_store.set_dedup(content_hash, result, ttl_seconds=self._cache_a_ttl)
+        logger.info(
+            "sanitize_cache_a_stored team_id=%s conversation_id=%s content_hash=%s ttl=%d pairs=%d",
+            team_id,
+            conversation_id,
+            content_hash[:12],
+            self._cache_a_ttl,
+            len(result.pairs),
+        )
+
+        await self._record_conversation_mappings(conversation_id, result.pairs)
+        logger.info(
+            "sanitize_cache_b_recorded team_id=%s conversation_id=%s "
+            "pairs=%d ttl=%d source=corp_llm",
+            team_id,
+            conversation_id,
+            len(result.pairs),
+            self._cache_b_ttl,
+        )
+
+        return SanitizeResult(
+            _apply_pairs(text, result.pairs),
+            result.pairs,
+            cache_a_hit=False,
+            skipped=False,
+        )
+
+    async def _detect(
+        self,
+        text: str,
+        rules: Rules,
+        *,
+        team_id: str,
+        conversation_id: str,
+        chunked: bool = False,
+    ) -> StrategyResult:
+        """Run the local-first cascade over one text leaf; return merged pairs.
+
+        The size check, Cache A/B, and placeholder substitution live in the
+        callers (`sanitize` / `_sanitize_chunked`) — this is the detection core.
+        When *chunked*, the NER-only local pass is used (regex/checksum runs
+        full-text in `_sanitize_chunked`, so it is not repeated per chunk — H1).
+        """
+        local_pass = self._chunk_local if chunked else self._local
         if self._gazetteer is not None:
             # DP-4: run gazetteer + local first; oracle is conditional on a gazetteer hit.
             gaz_findings = await self._gazetteer.detect(text)
-            local_findings = await self._local.findings(text) if self._local is not None else []
+            local_findings = await local_pass.findings(text) if local_pass is not None else []
             combined = _deduplicate(local_findings + gaz_findings)
             # Rules are top-priority: computed once, applied in both sub-branches.
             rules_pairs = _rules_pairs(rules, text)
@@ -199,7 +288,7 @@ class SanitizationOrchestrator:
                 merged_pairs = _merge_local(rules_pairs, combined)
             result = StrategyResult(pairs=merged_pairs)
 
-        elif self._local is not None:
+        elif local_pass is not None:
             # DP-3 path: oracle always on, local merged additively.
             logger.info(
                 "sanitize_branch=local_pass oracle=yes team_id=%s conversation_id=%s",
@@ -218,7 +307,7 @@ class SanitizationOrchestrator:
                 conversation_id,
                 len(result.pairs),
             )
-            local_findings = await self._local.findings(text)
+            local_findings = await local_pass.findings(text)
             merged_pairs = _merge_local(result.pairs, local_findings)
             logger.info(
                 "sanitize_local_pass team_id=%s conversation_id=%s "
@@ -253,33 +342,185 @@ class SanitizationOrchestrator:
 
         if self._allowlist is not None:
             result = StrategyResult(pairs=self._allowlist.filter_pairs(result.pairs))
+        return result
 
-        await self._mapping_store.set_dedup(content_hash, result, ttl_seconds=self._cache_a_ttl)
-        logger.info(
-            "sanitize_cache_a_stored team_id=%s conversation_id=%s content_hash=%s ttl=%d pairs=%d",
+    async def _handle_oversize(
+        self,
+        text: str,
+        *,
+        team_id: str,
+        conversation_id: str,
+        content_bytes: int,
+    ) -> SanitizeResult:
+        """Dispatch an oversize leaf on CORP_LLM_OVERSIZE_POLICY (default fail-closed).
+
+        F1: the old skip-and-deliver path forwarded the ORIGINAL leaf UNSANITIZED.
+        Every branch here either sanitizes the content or refuses egress.
+        """
+        policy = self._oversize_policy
+        logger.warning(
+            "sanitize_oversize team_id=%s conversation_id=%s size=%d threshold=%d policy=%s",
             team_id,
             conversation_id,
-            content_hash[:12],
-            self._cache_a_ttl,
-            len(result.pairs),
+            content_bytes,
+            self._size_threshold,
+            policy,
         )
-
-        await self._record_conversation_mappings(conversation_id, result.pairs)
-        logger.info(
-            "sanitize_cache_b_recorded team_id=%s conversation_id=%s "
-            "pairs=%d ttl=%d source=corp_llm",
+        if policy == OVERSIZE_CHUNK:
+            rules = await self._rules_loader.load(team_id)
+            return await self._sanitize_chunked(
+                text, rules, team_id=team_id, conversation_id=conversation_id
+            )
+        if policy == OVERSIZE_DELIVER_FLAG and team_id in self._oversize_deliver_teams:
+            rules = await self._rules_loader.load(team_id)
+            return await self._deliver_oversize(
+                text,
+                rules,
+                team_id=team_id,
+                conversation_id=conversation_id,
+                content_bytes=content_bytes,
+            )
+        # fail-closed (default), or deliver-flag requested without a team opt-in.
+        logger.warning(
+            "sanitize_oversize_blocked team_id=%s conversation_id=%s size=%d policy=%s",
             team_id,
             conversation_id,
-            len(result.pairs),
-            self._cache_b_ttl,
+            content_bytes,
+            policy,
+        )
+        raise OversizeContentError(
+            content_bytes=content_bytes, threshold_bytes=self._size_threshold
         )
 
+    async def _sanitize_chunked(
+        self,
+        text: str,
+        rules: Rules,
+        *,
+        team_id: str,
+        conversation_id: str,
+    ) -> SanitizeResult:
+        """Full-text regex/checksum + sliding-window NER, one shared allocator.
+
+        H1: regex/checksum matching is LINEAR and size-independent, and several
+        of its patterns are UNBOUNDED (JWT, Bearer {20,}, sk-{32,}, DB URL {3,}),
+        so a fixed chunk overlap can never guarantee they stay inside one window.
+        Run them over the FULL text instead — seam position is then irrelevant for
+        them, and no unbounded-pattern secret can survive a seam. Only the
+        size-bounded NER (+ gazetteer + conditional oracle) pass is chunked; the
+        overlap keeps a BOUNDED entity straddling a seam inside one window. All
+        findings route through ONE RequestPlaceholderAllocator so the reassembled
+        result keeps the request-wide bijection (M1-9).
+        """
+        allocator = RequestPlaceholderAllocator()
+        pairs: list[tuple[str, str]] = []
+        seen_originals: set[str] = set()
+
+        def _absorb(candidate: tuple[tuple[str, str], ...]) -> None:
+            for original, placeholder in allocator.remap(candidate):
+                if original in seen_originals:
+                    continue
+                seen_originals.add(original)
+                pairs.append((original, placeholder))
+
+        # Full-text linear pass: unbounded secrets are matched whole regardless
+        # of where a chunk seam falls.
+        full_regex_findings = await self._regex_checksum.detect(text)
+        _absorb(_merge_local((), full_regex_findings))
+
+        # Chunked size-bounded pass (NER + gazetteer + conditional oracle).
+        chunk_count = 0
+        for chunk in _iter_overlapping_chunks(text, self._chunk_window, self._chunk_overlap):
+            chunk_count += 1
+            chunk_result = await self._detect(
+                chunk, rules, team_id=team_id, conversation_id=conversation_id, chunked=True
+            )
+            _absorb(chunk_result.pairs)
+        canonical = tuple(pairs)
+        logger.info(
+            "sanitize_oversize_chunked team_id=%s conversation_id=%s chunks=%d "
+            "regex_findings=%d pairs=%d",
+            team_id,
+            conversation_id,
+            chunk_count,
+            len(full_regex_findings),
+            len(canonical),
+        )
+        await self._record_conversation_mappings(conversation_id, canonical)
         return SanitizeResult(
-            _apply_pairs(text, result.pairs),
-            result.pairs,
+            _apply_pairs(text, canonical),
+            canonical,
             cache_a_hit=False,
             skipped=False,
         )
+
+    async def _deliver_oversize(
+        self,
+        text: str,
+        rules: Rules,
+        *,
+        team_id: str,
+        conversation_id: str,
+        content_bytes: int,
+    ) -> SanitizeResult:
+        """Opt-in deliver-flag: forward the original ONLY if a full rescan is clean.
+
+        Runs the SAME detection the normal path would (regex+checksum + configured
+        detectors + gazetteer + rules + the conditional oracle-on-gazetteer-hit) —
+        not just the DLP guard's handful of secret regexes — so an oracle-only
+        finding also blocks the egress (M2). Any finding fails closed; a clean scan
+        delivers the original, flagged distinctly for the audit trail (M1).
+        """
+        findings = await self._scan_findings(text, rules)
+        if findings:
+            logger.warning(
+                "sanitize_oversize_deliver_blocked team_id=%s conversation_id=%s "
+                "size=%d finding_count=%d",
+                team_id,
+                conversation_id,
+                content_bytes,
+                len(findings),
+            )
+            raise OversizeContentError(
+                content_bytes=content_bytes, threshold_bytes=self._size_threshold
+            )
+        logger.warning(
+            "sanitize_oversize_delivered team_id=%s conversation_id=%s size=%d block_reason=%s",
+            team_id,
+            conversation_id,
+            content_bytes,
+            OVERSIZE_DELIVERED_REASON,
+        )
+        return SanitizeResult(
+            text, (), cache_a_hit=False, skipped=True, block_reason=OVERSIZE_DELIVERED_REASON
+        )
+
+    async def _scan_findings(self, text: str, rules: Rules) -> list[Finding]:
+        # Always-on deterministic floor: regex+checksum runs regardless of which
+        # local detectors are configured (defence-in-depth for the opt-in path).
+        findings: list[Finding] = list(await self._regex_checksum.detect(text))
+        gaz_findings: list[Finding] = []
+        if self._gazetteer is not None:
+            gaz_findings = list(await self._gazetteer.detect(text))
+            findings.extend(gaz_findings)
+        if self._local is not None:
+            findings.extend(await self._local.findings(text))
+        for pattern, _ in _rules_pairs(rules, text):
+            findings.append(
+                Finding(text=pattern, label="RULE", start=0, end=len(pattern), score=1.0)
+            )
+        # M2: mirror the normal path's conditional oracle so an oracle-only finding
+        # (no regex/local/gazetteer/rule hit) also blocks a deliver-flag egress.
+        # Identical trigger to `_detect`: the oracle runs unless a gazetteer is
+        # configured and produced no hit.
+        oracle_runs = bool(gaz_findings) if self._gazetteer is not None else True
+        if oracle_runs:
+            oracle_result = await self._call_corp_llm(text, rules)
+            findings.extend(
+                Finding(text=o, label="ORACLE", start=0, end=len(o), score=1.0)
+                for o, _ in oracle_result.pairs
+            )
+        return findings
 
     async def _call_corp_llm(self, text: str, rules: Rules) -> StrategyResult:
         system_prompt = _build_system_prompt(rules)
@@ -349,6 +590,24 @@ def _apply_pairs(text: str, pairs: tuple[tuple[str, str], ...]) -> str:
     for original, placeholder in sorted_pairs:
         text = text.replace(original, placeholder)
     return text
+
+
+def _iter_overlapping_chunks(text: str, window: int, overlap: int) -> Iterator[str]:
+    """Yield fixed-size windows advancing by (window - overlap).
+
+    Any substring no longer than *overlap* is fully contained in at least one
+    window, so a secret straddling a chunk seam still matches on rescan.
+    """
+    step = window - overlap
+    if step <= 0:
+        raise ValueError(f"chunk window {window} must exceed overlap {overlap}")
+    n = len(text)
+    start = 0
+    while True:
+        yield text[start : start + window]
+        if start + window >= n:
+            return
+        start += step
 
 
 def _emit_gazetteer_proposal(

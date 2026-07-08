@@ -516,9 +516,9 @@ def test_sanitize_error_no_stdout_leak(
     assert "my-secret-text" not in out
 
 
-# 9. Oversize payload (M1-11): pre-pass is skipped, so content goes UNREDACTED.
-#    Human output must say SKIPPED, not the misleading "redactions: 0".
-def test_sanitize_oversize_skipped_surfaced(
+# 9. Oversize payload (F1): the pre-pass now fails CLOSED — the payload is
+#    refused, never sent unredacted. The human output must say BLOCKED.
+def test_sanitize_oversize_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -527,8 +527,11 @@ def test_sanitize_oversize_skipped_surfaced(
         "corp_llm_gateway.cli.admin._build_orchestrator",
         lambda model: _mock_orchestrator([]),
     )
-    big = "A" * (101 * 1024)  # over the 100 KB threshold → orchestrator skips
+    big = "A" * (101 * 1024)  # over the 100 KB threshold → orchestrator fails closed
     rc = main(["sanitize", big])
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "SKIPPED" in out
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "BLOCKED" in captured.err
+    # The refusal must not echo the oversize payload back.
+    assert big not in captured.out
+    assert big not in captured.err

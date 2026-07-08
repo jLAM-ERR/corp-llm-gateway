@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.payload import OversizeContentError
 from corp_llm_gateway.rules import Gazetteer, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.storage import InMemoryMappingStore
@@ -382,8 +384,8 @@ async def test_round_trip_restores_original_gazetteer_nohit() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_size_threshold_skips_gazetteer_too() -> None:
-    """Oversize input is short-circuited before gazetteer even runs."""
+async def test_size_threshold_fails_closed_before_gazetteer() -> None:
+    """Oversize input is short-circuited (fail-closed) before gazetteer/oracle run."""
     gaz = Gazetteer({"AML": "REGULATED"})
     client, call_count = _client_with_counter([])
     orch = SanitizationOrchestrator(
@@ -393,8 +395,8 @@ async def test_size_threshold_skips_gazetteer_too() -> None:
         gazetteer=gaz,
         size_threshold_bytes=5,
     )
-    result = await orch.sanitize("AML oversize text here", team_id="t1", conversation_id="c1")
-    assert result.skipped is True
+    with pytest.raises(OversizeContentError):
+        await orch.sanitize("AML oversize text here", team_id="t1", conversation_id="c1")
     assert call_count[0] == 0
 
 

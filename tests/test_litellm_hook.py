@@ -11,6 +11,7 @@ import pytest
 
 from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+from corp_llm_gateway.detectors import RegexChecksumDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
@@ -151,6 +152,44 @@ def _build_guardrail(
     sink = ListSink()
     audit_logger = AuditLogger(sink, gateway_version="0.0.1")
     return CorpLlmGuardrail(orch, auth, audit_logger), sink
+
+
+def _build_guardrail_oversize(
+    *,
+    threshold: int,
+    policy: str = "fail-closed",
+    deliver_teams: frozenset[str] = frozenset(),
+    local_detectors: list[Any] | None = None,
+) -> tuple[CorpLlmGuardrail, ListSink]:
+    """A guardrail whose orchestrator trips the size threshold at *threshold* bytes."""
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    orch = SanitizationOrchestrator(
+        _corp_llm_returning([]),
+        InMemoryMappingStore(),
+        _StaticRules(),
+        size_threshold_bytes=threshold,
+        oversize_policy=policy,
+        oversize_deliver_teams=deliver_teams,
+        local_detectors=local_detectors,
+    )
+    sink = ListSink()
+    return (
+        CorpLlmGuardrail(
+            orch, AuthMiddleware(token_store), AuditLogger(sink, gateway_version="0.0.1")
+        ),
+        sink,
+    )
 
 
 def _data_with_token(
@@ -1438,40 +1477,100 @@ async def test_cache_a_hit_segment_plus_fresh_segment_no_collision() -> None:
     assert out_text == "msg=b@corp.example sys=a@corp.example", f"round-trip failed: {out_text!r}"
 
 
-async def test_oversize_message_egresses_unredacted_normal_system_redacted() -> None:
-    """M1-11: a segment larger than DEFAULT_THRESHOLD_BYTES is skipped (deliver-and-flag).
+async def test_oversize_message_leaf_fails_closed_not_leaked() -> None:
+    """F1: an oversize message leaf is refused (fail-closed), never forwarded verbatim.
 
-    The oversized message content egresses UNCHANGED — the email inside it is
-    intentionally NOT redacted. This is the documented M1-11 policy, not a bug.
-    The normal system field IS redacted. pre_call must not crash on the mix.
+    Replaces the old M1-11 deliver-and-flag behaviour, which egressed the email
+    inside an oversize message UNREDACTED — the exact leak F1 closes.
     """
     from corp_llm_gateway.payload import DEFAULT_THRESHOLD_BYTES
 
     email_in_big_msg = "overflow@corp.example"
-    # Build a message body that exceeds the threshold.
     padding = "x" * (DEFAULT_THRESHOLD_BYTES + 1)
     big_content = f"{padding} {email_in_big_msg}"
 
-    email_in_system = "admin@corp.example"
-    system_text = f"admin is {email_in_system}"
-
     g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
-    data = _data_with_token("tok-1", content=big_content, system=system_text)
+    data = _data_with_token("tok-1", content=big_content, system="admin is a@corp.example")
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+
+
+async def test_pre_call_oversize_message_leaf_repro_blocked() -> None:
+    """F1 repro (message leaf): an oversize leaf carrying an sk- key must not egress."""
+    secret = "sk-" + "a" * 40
+    g, _ = _build_guardrail_oversize(threshold=64)
+    big = f"{secret} " + "x" * 200
+    data = _data_with_token("tok-1", content=big)
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+
+
+async def test_pre_call_oversize_document_source_data_repro_blocked() -> None:
+    """F1 repro (document.source.data leaf): oversize document data must not egress."""
+    secret = "sk-" + "b" * 40
+    g, _ = _build_guardrail_oversize(threshold=64)
+    big = f"{secret} " + "y" * 200
+    doc = [{"type": "document", "source": {"type": "text", "data": big}}]
+    data = _data_with_token("tok-1", content=doc)
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+
+
+async def test_pre_call_oversize_message_chunk_policy_sanitizes() -> None:
+    """chunk policy at the hook level: an oversize leaf's email is redacted, not leaked."""
+    email = "chunky@corp.example"
+    g, _ = _build_guardrail_oversize(
+        threshold=64, policy="chunk", local_detectors=[RegexChecksumDetector()]
+    )
+    big = "prefix " + email + " " + "x" * 200
+    data = _data_with_token("tok-1", content=big)
     out = await g.pre_call(data)
+    body = out["messages"][0]["content"]
+    assert email not in body, "chunk policy leaked the email"
+    assert re.search(r"\[EMAIL_\d+\]", body), f"email not redacted: {body[:80]!r}"
 
-    # M1-11: oversize message content passes through UNCHANGED (intentional).
-    assert out["messages"][0]["content"] == big_content, (
-        "M1-11 skip violated: oversize content was mutated"
-    )
-    assert email_in_big_msg in out["messages"][0]["content"], (
-        "M1-11 skip violated: email in oversize message must egress unredacted"
-    )
 
-    # Normal system field is still redacted.
-    sys_out = out["system"]
-    assert email_in_system not in sys_out, f"system email leaked: {sys_out!r}"
-    sys_ph = re.search(r"\[EMAIL_\d+\]", sys_out)
-    assert sys_ph is not None, f"system email not redacted: {sys_out!r}"
+async def test_oversize_deliver_flag_marks_audit_block_reason() -> None:
+    """M1: a deliver-flag egress is marked oversize:delivered in the audit record."""
+    g, sink = _build_guardrail_oversize(
+        threshold=64, policy="deliver-flag", deliver_teams=frozenset({"t1"})
+    )
+    clean = "the quick brown fox jumps over the lazy dog and keeps running along here"
+    assert len(clean.encode("utf-8")) > 64
+    data = _data_with_token("tok-1", content=clean)
+    out = await g.pre_call(data)
+    assert out["messages"][0]["content"] == clean, "clean oversize leaf must be delivered"
+    start = time.time()
+    await g.async_log_success_event(
+        kwargs={"data": data},
+        response_obj={"choices": [{"message": {"content": "ok"}}]},
+        start_time=start,
+        end_time=start + 0.100,
+    )
+    assert len(sink.records) == 1
+    assert sink.records[0]["block_reason"] == "oversize:delivered"
+
+
+async def test_normal_request_audit_has_no_block_reason() -> None:
+    """M1 control: a normal zero/non-zero-redaction request carries no marker."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+    start = time.time()
+    await g.async_log_success_event(
+        kwargs={"data": data},
+        response_obj={"choices": [{"message": {"content": "ok [N1]"}}]},
+        start_time=start,
+        end_time=start + 0.100,
+    )
+    assert len(sink.records) == 1
+    assert "block_reason" not in sink.records[0]
 
 
 async def test_corp_llm_fails_on_second_segment_fails_closed_503() -> None:

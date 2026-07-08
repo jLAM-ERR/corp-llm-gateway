@@ -90,6 +90,16 @@ def get_table(prefix: str) -> dict[str, Any]:
     return node if isinstance(node, dict) else {}
 
 
+def oversize_policy() -> str:
+    """Resolve ``CORP_LLM_OVERSIZE_POLICY`` (fail-closed | chunk | deliver-flag).
+
+    Unset/empty resolves to ``fail-closed``; an unknown value raises ``ValueError``.
+    """
+    from corp_llm_gateway.payload.size_threshold import normalize_oversize_policy
+
+    return normalize_oversize_policy(get("CORP_LLM_OVERSIZE_POLICY"))
+
+
 def corp_llm_verify() -> bool | str:
     """``verify`` value for the corp-LLM httpx client (TLS to the corp LLM).
 

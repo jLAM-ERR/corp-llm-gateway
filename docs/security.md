@@ -61,12 +61,27 @@ and unary **text**, **`tool_use` input** (`input_json_delta`, JSON-escaped so th
 rebuilt JSON stays valid), and OpenAI content; only `thinking` is deliberately
 left untouched (per the row above).
 
-Oversize skip (M1-11): when a single segment exceeds
-`guardrail.contentSizeThresholdBytes` (default `102400`), the orchestrator
-**delivers the content unsanitized and flags it** (`SanitizeResult(skipped=True)`,
-no pairs) and `pre_call` logs `litellm_pre_call_system_sanitize_skipped_size`.
-This is a deliver-and-flag tradeoff for latency, surfaced in logs — not a silent
-drop.
+Oversize policy (F1): when a single text leaf exceeds
+`guardrail.contentSizeThresholdBytes` (default `102400`), the old code delivered
+the leaf **unsanitized** — a confirmed leak. Handling is now governed by
+`CORP_LLM_OVERSIZE_POLICY`:
+
+- **`fail-closed` (default)** — refuse egress with HTTP 422 `E_OVERSIZE_BLOCKED`
+  (`OversizeContentError` carries byte sizes only, never raw content). No
+  original reaches the error body, logs, or upstream.
+- **`chunk`** — split the leaf into overlapping sliding windows and sanitize.
+  Regex/checksum detection is **linear and runs over the full text** (so an
+  unbounded-pattern secret — JWT, `Bearer {20,}`, `sk-{32,}`, DB URL — cannot
+  survive a chunk seam, H1); only the size-bounded NER + gazetteer + conditional
+  oracle pass is chunked, with an overlap that keeps a bounded entity inside one
+  window. One `RequestPlaceholderAllocator` preserves the request-wide bijection.
+- **`deliver-flag`** — forward the original, but ONLY for a team listed in
+  `CORP_LLM_OVERSIZE_DELIVER_TEAMS` and ONLY when a full rescan (the same
+  detection the normal path runs: regex+checksum + configured detectors +
+  gazetteer + rules + the conditional oracle) is clean; any finding falls back to
+  fail-closed. A delivered leaf is marked `block_reason="oversize:delivered"` in
+  the audit record and logged as `litellm_pre_call_system_oversize_delivered`, so
+  every deliver-flag egress is auditable.
 
 ## 3. Placeholder model
 

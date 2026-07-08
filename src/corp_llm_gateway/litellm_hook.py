@@ -36,6 +36,7 @@ from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
 from corp_llm_gateway.payload.classifier import classify_block
+from corp_llm_gateway.payload.size_threshold import OversizeContentError
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.sanitizer import (
     SanitizationOrchestrator,
@@ -398,6 +399,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 pairs=canonical_pairs,
                 cache_a_hit=result.cache_a_hit,
                 skipped=result.skipped,
+                block_reason=result.block_reason,
             )
 
         for i, msg in enumerate(messages):
@@ -437,6 +439,25 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     400,
                     "E_BAD_REQUEST",
                     "request content nesting too deep",
+                ) from exc
+            except OversizeContentError as exc:
+                # F1: fail-closed on an oversize leaf. Never forward the original.
+                state.block_reason = "oversize:blocked"
+                self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
+                logger.info(
+                    "litellm_pre_call_oversize_blocked request_id=%s message_index=%d "
+                    "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
+                    request_id,
+                    i,
+                    exc.content_bytes,
+                    exc.threshold_bytes,
+                )
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    422,
+                    "E_OVERSIZE_BLOCKED",
+                    "request blocked: oversize content",
                 ) from exc
             except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
                 # Fail-policy matrix (plan M4 / docs/ops/runbook.md): a
@@ -502,6 +523,24 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "E_BAD_REQUEST",
                     "request content nesting too deep",
                 ) from exc
+            except OversizeContentError as exc:
+                # F1: fail-closed on an oversize system leaf. Never forward the original.
+                state.block_reason = "oversize:blocked"
+                self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
+                logger.info(
+                    "litellm_pre_call_oversize_blocked request_id=%s field=system "
+                    "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
+                    request_id,
+                    exc.content_bytes,
+                    exc.threshold_bytes,
+                )
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    422,
+                    "E_OVERSIZE_BLOCKED",
+                    "request blocked: oversize content",
+                ) from exc
             except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
                 logger.warning(
                     "litellm_pre_call_corp_llm_failed request_id=%s "
@@ -521,11 +560,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             for result in results:
                 self._merge_into_state(state, result)
                 if result.skipped:
+                    # Reachable only via the opt-in oversize deliver-flag policy
+                    # (the old size-skip is gone — oversize now fails closed or
+                    # chunks by default). The original was delivered on purpose
+                    # after a clean full rescan; flagged for the audit trail.
                     logger.warning(
-                        "litellm_pre_call_system_sanitize_skipped_size request_id=%s "
-                        "content_bytes=%d",
+                        "litellm_pre_call_system_oversize_delivered request_id=%s "
+                        "content_bytes=%d block_reason=%s",
                         request_id,
                         system_bytes,
+                        result.block_reason,
                     )
             logger.info(
                 "litellm_pre_call_system_sanitize_done request_id=%s total_redaction_count=%d",
@@ -762,6 +806,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         state.redaction_count = len(state.placeholders)
         state.cache_a_hit = state.cache_a_hit or result.cache_a_hit
         state.mapping = StrategyResult(pairs=state.mapping.pairs + result.pairs)
+        # M1: surface an oversize deliver-flag egress in the audit record so an
+        # operator can find every delivered oversize original. Only the deliver
+        # path sets this; normal results leave it None.
+        if result.block_reason is not None:
+            state.block_reason = result.block_reason
 
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:

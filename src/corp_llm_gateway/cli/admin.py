@@ -23,6 +23,7 @@ from corp_llm_gateway.auth import BearerAuthProvider, NoopAuthProvider
 from corp_llm_gateway.auth.rbac import OperatorDenied, get_admin_token, verify_operator
 from corp_llm_gateway.corp_llm import CorpLlmClient, CorpLlmHttpError
 from corp_llm_gateway.extensions import ExtensionKind, ExtensionRegistry, ExtensionSpec
+from corp_llm_gateway.payload import OversizeContentError
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator, SanitizeResult
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
@@ -62,7 +63,12 @@ def _build_orchestrator(model: str) -> tuple[SanitizationOrchestrator, CorpLlmCl
         timeout=30.0,
         verify=config.corp_llm_verify(),
     )
-    orch = SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoTeamRules())
+    orch = SanitizationOrchestrator(
+        corp_llm,
+        InMemoryMappingStore(),
+        _NoTeamRules(),
+        oversize_policy=config.oversize_policy(),
+    )
     return orch, corp_llm
 
 
@@ -681,6 +687,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
             print(
                 f"corp sanitization LLM unavailable: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return 1
+        except OversizeContentError as exc:
+            # F1 fail-closed: an oversize payload is refused, never sent unredacted.
+            print(
+                f"BLOCKED: payload {exc.content_bytes} bytes exceeds the "
+                f"{exc.threshold_bytes}-byte threshold; not sent "
+                f"(CORP_LLM_OVERSIZE_POLICY={config.oversize_policy()})",
                 file=sys.stderr,
             )
             return 1

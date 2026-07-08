@@ -140,10 +140,14 @@ def _build_orchestrator(
     )
     gazetteer = Gazetteer.from_defaults() if _flag("CORP_LLM_GAZETTEER") else None
     rules_dir = config.get("CORP_LLM_RULES_DIR", _DEFAULT_RULES_DIR) or _DEFAULT_RULES_DIR
+    raw_teams = config.get("CORP_LLM_OVERSIZE_DELIVER_TEAMS", "") or ""
+    deliver_teams = frozenset(t.strip() for t in raw_teams.split(",") if t.strip())
     return SanitizationOrchestrator(
         corp_llm,
         mapping_store,
         _RulesLoader(rules_dir),
+        oversize_policy=config.oversize_policy(),
+        oversize_deliver_teams=deliver_teams,
         local_detectors=local_detectors,
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),
