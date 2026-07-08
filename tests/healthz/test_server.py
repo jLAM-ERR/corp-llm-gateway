@@ -3,6 +3,8 @@ import pytest
 
 from corp_llm_gateway.healthz import build_health_router
 from corp_llm_gateway.healthz.checks import (
+    ExtensionsCheck,
+    HealthStatus,
     LiveCheck,
     ReadyCheck,
     SanitizationCheck,
@@ -28,6 +30,14 @@ async def _raise() -> bool:
     raise RuntimeError("boom")
 
 
+async def _ext_healthy() -> dict[str, HealthStatus]:
+    return {"audit_sink:stdout": HealthStatus(True, "ok")}
+
+
+async def _ext_unhealthy() -> dict[str, HealthStatus]:
+    return {"audit_sink:stdout": HealthStatus(False, "backend_down")}
+
+
 def _make_issuer(*, reject: bool = False, store: InMemoryTokenStore | None = None) -> TokenIssuer:
     store = store if store is not None else InMemoryTokenStore()
 
@@ -43,6 +53,7 @@ def _router(
     *,
     ready: ReadyCheck | None = None,
     sanitization: SanitizationCheck | None = None,
+    extensions: ExtensionsCheck | None = None,
     issuer: TokenIssuer | None = None,
     fallthrough: object | None = None,
 ) -> HealthRouter:
@@ -51,6 +62,9 @@ def _router(
         ready_check=ready if ready is not None else ReadyCheck(check_redis=_ok, check_postgres=_ok),
         sanitization_check=(
             sanitization if sanitization is not None else SanitizationCheck(run_round_trip=_ok)
+        ),
+        extensions_check=(
+            extensions if extensions is not None else ExtensionsCheck(health_all=_ext_healthy)
         ),
         token_issuer=issuer if issuer is not None else _make_issuer(),
         fallthrough=fallthrough,  # type: ignore[arg-type]
@@ -118,6 +132,40 @@ async def test_sanitization_exception_returns_503() -> None:
     async with _client(router) as client:
         resp = await client.get("/healthz/sanitization")
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_extensions_healthy_returns_200() -> None:
+    router = _router(extensions=ExtensionsCheck(health_all=_ext_healthy))
+    async with _client(router) as client:
+        resp = await client.get("/healthz/extensions")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_extensions_unhealthy_returns_503() -> None:
+    router = _router(extensions=ExtensionsCheck(health_all=_ext_unhealthy))
+    async with _client(router) as client:
+        resp = await client.get("/healthz/extensions")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_ready_ignores_extension_health() -> None:
+    # A deep-check, not an LB gate: an unhealthy extension flips /extensions to
+    # 503 but must leave /ready green (else a flapping sink yo-yos the pod).
+    router = _router(
+        ready=ReadyCheck(check_redis=_ok, check_postgres=_ok),
+        extensions=ExtensionsCheck(health_all=_ext_unhealthy),
+    )
+    async with _client(router) as client:
+        ready = await client.get("/healthz/ready")
+        ext = await client.get("/healthz/extensions")
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "healthy"
+    assert ext.status_code == 503
 
 
 # Token issuance ------------------------------------------------------------

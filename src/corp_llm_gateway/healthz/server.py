@@ -5,6 +5,7 @@
     GET  /healthz/live            -> LiveCheck
     GET  /healthz/ready           -> ReadyCheck          (503 when unhealthy)
     GET  /healthz/sanitization    -> SanitizationCheck   (503 when unhealthy)
+    GET  /healthz/extensions      -> ExtensionsCheck     (503 when unhealthy)
     POST /internal/issue-token    -> TokenIssuer         (fixes install.sh:149)
 
 Framework choice: a framework-free ASGI app. LiteLLM is built on
@@ -21,12 +22,14 @@ Production wiring is a thin hook (do NOT edit bootstrap.py to test this) --
 construct the checks + issuer, then serve the router as the ASGI entrypoint
 with LiteLLM's app as `fallthrough`::
 
+    from corp_llm_gateway.extensions import REGISTRY
     from corp_llm_gateway.healthz import build_health_router
 
     router = build_health_router(
         live_check=LiveCheck(),
         ready_check=ReadyCheck(check_redis=..., check_postgres=...),
         sanitization_check=SanitizationCheck(run_round_trip=...),
+        extensions_check=ExtensionsCheck(health_all=REGISTRY.health_all),
         token_issuer=TokenIssuer(store, verifier),
         fallthrough=litellm_asgi_app,  # unknown paths delegate to litellm
     )
@@ -62,6 +65,7 @@ class HealthRouter:
         live_check: HealthCheck,
         ready_check: HealthCheck,
         sanitization_check: HealthCheck,
+        extensions_check: HealthCheck,
         token_issuer: TokenIssuer,
         fallthrough: ASGIApp | None = None,
     ) -> None:
@@ -69,6 +73,7 @@ class HealthRouter:
             "/healthz/live": live_check,
             "/healthz/ready": ready_check,
             "/healthz/sanitization": sanitization_check,
+            "/healthz/extensions": extensions_check,
         }
         self._issuer = token_issuer
         self._fallthrough = fallthrough
@@ -150,6 +155,7 @@ def build_health_router(
     live_check: HealthCheck,
     ready_check: HealthCheck,
     sanitization_check: HealthCheck,
+    extensions_check: HealthCheck,
     token_issuer: TokenIssuer,
     fallthrough: ASGIApp | None = None,
 ) -> HealthRouter:
@@ -158,6 +164,7 @@ def build_health_router(
         live_check=live_check,
         ready_check=ready_check,
         sanitization_check=sanitization_check,
+        extensions_check=extensions_check,
         token_issuer=token_issuer,
         fallthrough=fallthrough,
     )

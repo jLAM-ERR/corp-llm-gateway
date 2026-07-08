@@ -1,6 +1,9 @@
+from collections.abc import Awaitable, Callable
+
 import pytest
 
 from corp_llm_gateway.healthz import (
+    ExtensionsCheck,
     HealthStatus,
     LiveCheck,
     ReadyCheck,
@@ -104,6 +107,81 @@ async def test_sanitization_exception_caught() -> None:
     status = await sc.check()
     assert status.healthy is False
     assert "sanitization_error" in status.detail
+
+
+# Extensions deep-check -----------------------------------------------------
+
+
+def _health_all(
+    report: dict[str, HealthStatus],
+) -> Callable[[], Awaitable[dict[str, HealthStatus]]]:
+    async def _run() -> dict[str, HealthStatus]:
+        return report
+
+    return _run
+
+
+@pytest.mark.asyncio
+async def test_extensions_healthy_when_all_healthy() -> None:
+    ec = ExtensionsCheck(
+        health_all=_health_all(
+            {
+                "audit_sink:stdout": HealthStatus(True, "ok"),
+                "metrics:prometheus": HealthStatus(True, "ok"),
+            }
+        )
+    )
+    status = await ec.check()
+    assert status.healthy is True
+
+
+@pytest.mark.asyncio
+async def test_extensions_healthy_when_registry_empty() -> None:
+    status = await ExtensionsCheck(health_all=_health_all({})).check()
+    assert status.healthy is True
+    assert "no_extensions" in status.detail
+
+
+@pytest.mark.asyncio
+async def test_extensions_degraded_names_only_the_unhealthy() -> None:
+    ec = ExtensionsCheck(
+        health_all=_health_all(
+            {
+                "audit_sink:stdout": HealthStatus(True, "ok"),
+                "metrics:prometheus": HealthStatus(False, "scrape_failed"),
+            }
+        )
+    )
+    status = await ec.check()
+    assert status.healthy is False
+    assert "degraded" in status.detail
+    assert "metrics:prometheus" in status.detail
+    assert "audit_sink:stdout" not in status.detail
+
+
+@pytest.mark.asyncio
+async def test_extensions_unhealthy_when_all_unhealthy() -> None:
+    ec = ExtensionsCheck(
+        health_all=_health_all(
+            {
+                "audit_sink:stdout": HealthStatus(False, "down"),
+                "metrics:prometheus": HealthStatus(False, "down"),
+            }
+        )
+    )
+    status = await ec.check()
+    assert status.healthy is False
+    assert "unhealthy" in status.detail
+
+
+@pytest.mark.asyncio
+async def test_extensions_exception_caught() -> None:
+    async def _boom() -> dict[str, HealthStatus]:
+        raise RuntimeError("registry blew up")
+
+    status = await ExtensionsCheck(health_all=_boom).check()
+    assert status.healthy is False
+    assert "extensions_error" in status.detail
 
 
 def test_status_is_immutable_dataclass() -> None:
