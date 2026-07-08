@@ -75,6 +75,21 @@ def get_required(name: str) -> str:
     return value
 
 
+def get_table(prefix: str) -> dict[str, Any]:
+    """Resolve a nested TOML table by dotted ``prefix`` (file-only; missing → ``{}``).
+
+    Env vars carry flat scalars only, so tables have no env override — unlike
+    :func:`get`, this never reads ``os.environ``. A scalar at the path (or a
+    missing key) yields an empty dict.
+    """
+    node: Any = _load_file()
+    for part in prefix.split("."):
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(part)
+    return node if isinstance(node, dict) else {}
+
+
 def corp_llm_verify() -> bool | str:
     """``verify`` value for the corp-LLM httpx client (TLS to the corp LLM).
 

@@ -111,6 +111,72 @@ def test_corp_llm_verify_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> No
     assert config.corp_llm_verify() is True
 
 
+def test_get_table_reads_nested_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[extensions.audit_sink.langfuse]\nenabled = true\nendpoint = "https://langfuse.corp.lan"\n'
+    )
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+
+    assert config.get_table("extensions") == {
+        "audit_sink": {"langfuse": {"enabled": True, "endpoint": "https://langfuse.corp.lan"}}
+    }
+
+
+def test_get_table_dotted_prefix_descends(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[providers.anthropic]\nrole = "upstream"\n[providers.corp-vllm]\nrole = "oracle"\n'
+    )
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+
+    assert config.get_table("providers.anthropic") == {"role": "upstream"}
+    assert config.get_table("providers")["corp-vllm"] == {"role": "oracle"}
+
+
+def test_get_table_missing_returns_empty_dict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('CORP_GATEWAY_URL = "https://x.example"\n')
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+
+    assert config.get_table("extensions") == {}
+    assert config.get_table("extensions.audit_sink") == {}
+
+
+def test_get_table_no_file_returns_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", "/nonexistent/config.toml")
+
+    assert config.get_table("extensions") == {}
+
+
+def test_get_table_on_scalar_path_returns_empty_dict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('CORP_GATEWAY_URL = "https://x.example"\n')
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+
+    assert config.get_table("CORP_GATEWAY_URL") == {}
+
+
+def test_get_table_does_not_break_scalar_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'CORP_GATEWAY_URL = "https://from-file.example"\n'
+        "[extensions.audit_sink.langfuse]\n"
+        "enabled = true\n"
+    )
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    monkeypatch.setenv("CORP_GATEWAY_URL", "https://from-env.example")
+
+    assert config.get("CORP_GATEWAY_URL") == "https://from-env.example"
+    assert config.get_table("extensions")["audit_sink"]["langfuse"]["enabled"] is True
+
+
 def test_auth_factory_reads_from_config_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
