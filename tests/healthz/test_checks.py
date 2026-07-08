@@ -8,6 +8,7 @@ from corp_llm_gateway.healthz import (
     LiveCheck,
     ReadyCheck,
     SanitizationCheck,
+    make_ner_ready_probe,
 )
 
 # Live ----------------------------------------------------------------------
@@ -83,6 +84,93 @@ async def test_ready_short_circuits_on_redis_failure() -> None:
 
     await ReadyCheck(check_redis=_fail, check_postgres=pg).check()
     assert pg_called is False, "Postgres should not be checked once Redis fails"
+
+
+# Ready — NER probe (F2/A2, wired only when CORP_LLM_REQUIRE_NER is set) ------
+
+
+@pytest.mark.asyncio
+async def test_ready_healthy_when_ner_probe_ok() -> None:
+    rc = ReadyCheck(check_redis=_ok, check_postgres=_ok, check_ner=_ok)
+    status = await rc.check()
+    assert status.healthy is True
+    assert status.detail == "ready"
+
+
+@pytest.mark.asyncio
+async def test_ready_unhealthy_when_ner_probe_reports_not_loaded() -> None:
+    rc = ReadyCheck(check_redis=_ok, check_postgres=_ok, check_ner=_fail)
+    status = await rc.check()
+    assert status.healthy is False
+    assert status.detail == "ner_unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_ready_ner_unavailable_error_surfaces_as_unhealthy() -> None:
+    from corp_llm_gateway.detectors import NerUnavailableError
+
+    async def _ner_absent() -> bool:
+        raise NerUnavailableError("NER required but unavailable: RuNerDetector")
+
+    rc = ReadyCheck(check_redis=_ok, check_postgres=_ok, check_ner=_ner_absent)
+    status = await rc.check()
+    assert status.healthy is False
+    assert "ner_error:NerUnavailableError" in status.detail
+
+
+@pytest.mark.asyncio
+async def test_ready_ner_probe_not_run_until_deps_pass() -> None:
+    ner_called = False
+
+    async def _ner() -> bool:
+        nonlocal ner_called
+        ner_called = True
+        return True
+
+    await ReadyCheck(check_redis=_fail, check_postgres=_ok, check_ner=_ner).check()
+    assert ner_called is False, "NER probe should not run once Redis fails"
+
+
+@pytest.mark.asyncio
+async def test_ready_no_ner_probe_stays_on_dev_graceful_path() -> None:
+    """require-ner off ⇒ no check_ner wired ⇒ readiness unchanged (dev path)."""
+    rc = ReadyCheck(check_redis=_ok, check_postgres=_ok)
+    assert (await rc.check()).healthy is True
+
+
+@pytest.mark.asyncio
+async def test_make_ner_ready_probe_healthy_on_finding() -> None:
+    from corp_llm_gateway.detectors.base import Finding
+
+    async def _detect(text: str) -> list[Finding]:
+        return [Finding(text="John Smith", label="PERSON", start=0, end=10, score=0.8)]
+
+    probe = make_ner_ready_probe(_detect)
+    assert await probe() is True
+
+
+@pytest.mark.asyncio
+async def test_make_ner_ready_probe_unhealthy_on_no_finding() -> None:
+    from corp_llm_gateway.detectors.base import Finding
+
+    async def _detect(text: str) -> list[Finding]:
+        return []
+
+    probe = make_ner_ready_probe(_detect)
+    assert await probe() is False
+
+
+@pytest.mark.asyncio
+async def test_make_ner_ready_probe_propagates_detector_error() -> None:
+    from corp_llm_gateway.detectors import NerUnavailableError
+    from corp_llm_gateway.detectors.base import Finding
+
+    async def _detect(text: str) -> list[Finding]:
+        raise NerUnavailableError("boom")
+
+    probe = make_ner_ready_probe(_detect)
+    with pytest.raises(NerUnavailableError):
+        await probe()
 
 
 # Sanitization deep-check ---------------------------------------------------

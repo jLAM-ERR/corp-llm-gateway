@@ -75,6 +75,22 @@
 # CORP_LLM_OVERSIZE_POLICY        = "fail-closed"
 # CORP_LLM_OVERSIZE_DELIVER_TEAMS = "team-a,team-b"
 
+# ── Require NER — fail closed when a NER model is missing (detectors/dual_ner) ─
+#
+# The dual-NER stack (Natasha RU + spaCy EN) needs Python 3.12 + the [ner] extra
+# and a manually-installed en_core_web_md wheel. If a configured engine's model
+# is ABSENT at runtime it self-disables; by default the gateway then degrades to
+# no-NER (returns no findings) — fine for dev / the Python-3.14 graceful path,
+# but in production that silently forwards a PERSON/ORG only NER would redact.
+#
+#   true  — PRODUCTION default: a self-disabled NER engine fails the request
+#           CLOSED (503 E_NER_UNAVAILABLE) and /healthz/ready probes NER-loaded,
+#           so a pod missing the model falls out of the load balancer.
+#   false — dev / 3.14 graceful degradation (no NER, no 503). Code default.
+#
+# Turn this ON in every prod profile / Helm values file that ships the NER model.
+# CORP_LLM_REQUIRE_NER = true
+
 # ── Extensions & providers (nested tables, read via config.get_table) ────────
 #
 # Unlike the scalar keys above, these are TOML *tables* keyed by kind/name and
