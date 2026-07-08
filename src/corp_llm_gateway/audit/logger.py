@@ -44,4 +44,8 @@ class AuditLogger:
             record["pre_pass_latency_ms"] = event.pre_pass_latency_ms
         if event.audit_buffer_full is not None:
             record["audit_buffer_full"] = event.audit_buffer_full
+        if event.profile_ids:
+            record["profile_ids"] = list(event.profile_ids)
+        if event.jurisdiction is not None:
+            record["jurisdiction"] = event.jurisdiction
         return record
