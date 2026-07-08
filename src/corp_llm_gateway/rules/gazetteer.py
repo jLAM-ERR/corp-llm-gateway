@@ -233,3 +233,13 @@ def _load_dir(directory: Path) -> dict[str, str]:
 def load_defaults_terms() -> dict[str, str]:
     """Public helper: return {term: label} from the bundled defaults dir."""
     return _load_dir(_DEFAULTS_DIR)
+
+
+def load_terms(directory: Path) -> dict[str, str]:
+    """Public helper: return {term: label} from an arbitrary term directory.
+
+    Same category-file convention as ``Gazetteer.from_dir``; exposed so profile
+    loaders can merge term maps across layers without rebuilding a Gazetteer per
+    layer (single source of truth stays this module).
+    """
+    return _load_dir(directory)
