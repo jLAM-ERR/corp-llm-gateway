@@ -7,6 +7,7 @@ post_call with configurable rewrite callbacks.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -91,6 +92,138 @@ def _collect_json_text(value: Any, _depth: int = 0) -> list[str]:
             out.extend(_collect_json_text(item, _depth + 1))
         return out
     return []
+
+
+async def _sanitize_arguments(arguments: str, sanitize_one: SanitizeOne) -> tuple[str, list[Any]]:
+    """Sanitize a JSON-encoded OpenAI ``function.arguments`` string.
+
+    Parse → sanitize string leaves → re-serialize (mirrors ``tool_use.input``).
+    If the string is not valid JSON, sanitize it whole as one leaf so a raw
+    secret can never egress un-scanned (fail-safe)."""
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, ValueError):
+        result = await sanitize_one(arguments)
+        return result.sanitized_text, [result]
+    new_value, results = await _sanitize_json(parsed, sanitize_one)
+    return json.dumps(new_value, ensure_ascii=False), results
+
+
+def _desanitize_arguments(arguments: str, reverse: ReverseOne) -> str:
+    """Reverse placeholders inside a JSON-encoded ``function.arguments`` string.
+
+    Parse → desanitize string leaves → re-serialize; ``json.dumps`` re-escapes
+    so an original containing quotes/backslashes stays valid JSON. Falls back to
+    a raw string reverse when the arguments are not valid JSON."""
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, ValueError):
+        return reverse(arguments)
+    return json.dumps(_desanitize_json(parsed, reverse), ensure_ascii=False)
+
+
+def _collect_arguments_text(arguments: str) -> list[str]:
+    """Collect the string leaves of a JSON-encoded ``function.arguments`` string.
+
+    Mirrors ``_sanitize_arguments`` so the Stage-0/Stage-5 pre-scan sees exactly
+    what will be sanitized (whole string when it is not valid JSON)."""
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, ValueError):
+        return [arguments]
+    return _collect_json_text(parsed)
+
+
+def message_has_tool_calls(message: dict[str, Any]) -> bool:
+    """True if a chat message carries OpenAI ``tool_calls`` or legacy ``function_call``."""
+    return isinstance(message.get("tool_calls"), list) or isinstance(
+        message.get("function_call"), dict
+    )
+
+
+async def sanitize_tool_calls(
+    message: dict[str, Any], sanitize_one: SanitizeOne
+) -> tuple[dict[str, Any], list[Any]]:
+    """Sanitize OpenAI message-level ``tool_calls[].function.arguments`` and legacy
+    ``function_call.arguments``. Content is handled by ``sanitize_content`` — this
+    only rewrites the tool-call argument spans. Returns (new_message, results)."""
+    results: list[Any] = []
+    new_message = dict(message)
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        new_calls: list[Any] = []
+        for call in tool_calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                new_args, r = await _sanitize_arguments(fn["arguments"], sanitize_one)
+                new_calls.append({**call, "function": {**fn, "arguments": new_args}})
+                results.extend(r)
+            else:
+                new_calls.append(call)
+        new_message["tool_calls"] = new_calls
+    fc = message.get("function_call")
+    if isinstance(fc, dict) and isinstance(fc.get("arguments"), str):
+        new_args, r = await _sanitize_arguments(fc["arguments"], sanitize_one)
+        new_message["function_call"] = {**fc, "arguments": new_args}
+        results.extend(r)
+    return new_message, results
+
+
+async def sanitize_message(
+    message: dict[str, Any], sanitize_one: SanitizeOne
+) -> tuple[dict[str, Any], list[Any]]:
+    """Sanitize a full chat message: content blocks PLUS OpenAI tool-call arguments.
+
+    Empty/absent content is skipped (so a tool-call-only assistant message is
+    still processed for its arguments)."""
+    results: list[Any] = []
+    new_message = dict(message)
+    content = message.get("content")
+    if content is not None and content != "":
+        new_content, content_results = await sanitize_content(content, sanitize_one)
+        new_message["content"] = new_content
+        results.extend(content_results)
+    new_message, tc_results = await sanitize_tool_calls(new_message, sanitize_one)
+    results.extend(tc_results)
+    return new_message, results
+
+
+def desanitize_tool_calls(message: dict[str, Any], reverse: ReverseOne) -> dict[str, Any]:
+    """Reverse placeholders in a response message's ``tool_calls``/``function_call`` args."""
+    new_message = dict(message)
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        new_calls: list[Any] = []
+        for call in tool_calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                new_args = _desanitize_arguments(fn["arguments"], reverse)
+                new_calls.append({**call, "function": {**fn, "arguments": new_args}})
+            else:
+                new_calls.append(call)
+        new_message["tool_calls"] = new_calls
+    fc = message.get("function_call")
+    if isinstance(fc, dict) and isinstance(fc.get("arguments"), str):
+        new_message["function_call"] = {
+            **fc,
+            "arguments": _desanitize_arguments(fc["arguments"], reverse),
+        }
+    return new_message
+
+
+def collect_tool_call_text(message: dict[str, Any]) -> list[str]:
+    """Collect sanitizable text from a message's ``tool_calls``/``function_call`` args."""
+    out: list[str] = []
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                out.extend(_collect_arguments_text(fn["arguments"]))
+    fc = message.get("function_call")
+    if isinstance(fc, dict) and isinstance(fc.get("arguments"), str):
+        out.extend(_collect_arguments_text(fc["arguments"]))
+    return out
 
 
 async def _sanitize_block(

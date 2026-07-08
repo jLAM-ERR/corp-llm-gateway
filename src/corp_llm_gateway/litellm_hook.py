@@ -40,6 +40,7 @@ from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.payload.size_threshold import OversizeContentError
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.sanitizer import (
+    OpenAiToolCallDesanitizer,
     SanitizationOrchestrator,
     SanitizeResult,
     SseStreamDesanitizer,
@@ -49,8 +50,12 @@ from corp_llm_gateway.sanitizer import (
 from corp_llm_gateway.sanitizer.content_blocks import (
     ContentTooDeepError,
     collect_text,
+    collect_tool_call_text,
     desanitize_content,
+    desanitize_tool_calls,
+    message_has_tool_calls,
     sanitize_content,
+    sanitize_message,
 )
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
@@ -339,6 +344,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             if isinstance(_m, dict):
                 for _seg in collect_text(_m.get("content")):
                     input_literals.extend(find_placeholder_literals(_seg))
+                for _seg in collect_tool_call_text(_m):
+                    input_literals.extend(find_placeholder_literals(_seg))
         for _seg in collect_text(data.get("system")):
             input_literals.extend(find_placeholder_literals(_seg))
         if input_literals:
@@ -356,6 +363,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             for _s0_msg in messages:
                 if isinstance(_s0_msg, dict):
                     _s0_texts.extend(collect_text(_s0_msg.get("content")))
+                    _s0_texts.extend(collect_tool_call_text(_s0_msg))
             _s0_texts.extend(collect_text(data.get("system")))
             _s0_reason = classify_block("\n".join(_s0_texts))
             if _s0_reason is not None:
@@ -407,7 +415,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             if not isinstance(msg, dict):
                 continue
             content = msg.get("content")
-            if content is None or (isinstance(content, str) and not content):
+            content_empty = content is None or (isinstance(content, str) and not content)
+            # A tool-call-only assistant message (content=None) still carries
+            # sanitizable data in tool_calls[].function.arguments (F4) — process it.
+            if content_empty and not message_has_tool_calls(msg):
                 logger.info(
                     "litellm_pre_call_message_skipped request_id=%s "
                     "message_index=%d reason=empty_or_non_string",
@@ -419,8 +430,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             # Compute content byte size for logging (never logs content bodies).
             if isinstance(content, str):
                 content_bytes = len(content.encode("utf-8"))
-            else:
+            elif content is not None:
                 content_bytes = len(json.dumps(content).encode("utf-8"))
+            else:
+                content_bytes = len(
+                    json.dumps(msg.get("tool_calls") or msg.get("function_call")).encode("utf-8")
+                )
 
             logger.info(
                 "litellm_pre_call_message_sanitize_start request_id=%s "
@@ -431,7 +446,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 content_bytes,
             )
             try:
-                new_content, results = await sanitize_content(content, sanitize_one)
+                new_msg, results = await sanitize_message(msg, sanitize_one)
             except ContentTooDeepError as exc:
                 self._record_failure(request_id, error_code="E_BAD_REQUEST")
                 _now = datetime.now(UTC)
@@ -507,7 +522,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "NER detector unavailable",
                 ) from exc
 
-            messages[i] = {**msg, "content": new_content}
+            messages[i] = new_msg
             # Merge every segment result; emit one done-log per MESSAGE (D).
             msg_placeholders: set[str] = set()
             for result in results:
@@ -623,6 +638,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             for _s5_msg in data.get("messages") or []:
                 if isinstance(_s5_msg, dict):
                     _s5_texts.extend(collect_text(_s5_msg.get("content")))
+                    _s5_texts.extend(collect_tool_call_text(_s5_msg))
             _s5_texts.extend(collect_text(data.get("system")))
             _s5_reason = self._dlp_guard.scan("\n".join(_s5_texts))
             if _s5_reason is not None:
@@ -680,6 +696,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         sse = SseStreamDesanitizer(state.mapping)
         # Dict path: OpenAI-dict chunks use the classic feed/flush interface.
         dict_desanitizer = StreamingDesanitizer(state.mapping)
+        # Dict path: OpenAI tool_calls[].function.arguments deltas (F4), per index.
+        dict_tool_calls = OpenAiToolCallDesanitizer(state.mapping)
         chunk_count = 0
         async for chunk in response:
             chunk_count += 1
@@ -687,6 +705,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 for out_chunk in sse.feed(chunk):
                     yield out_chunk
             elif isinstance(chunk, dict):
+                chunk = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
                 text = _extract_chunk_text(chunk)
                 if text is None:
                     yield chunk
@@ -703,6 +722,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         tail = dict_desanitizer.flush()
         if tail:
             yield _replace_chunk_text(_make_text_chunk(), tail)
+        # Flush any held-back tool_calls arguments tails.
+        for tc_index, tc_tail in dict_tool_calls.flush():
+            yield _make_tool_call_chunk(tc_index, tc_tail)
         logger.info(
             "litellm_post_call_stream_desanitize_done request_id=%s chunk_count=%d",
             request_id,
@@ -1082,6 +1104,44 @@ def _make_text_chunk() -> dict[str, Any]:
     return {"choices": [{"delta": {"content": ""}}]}
 
 
+def _make_tool_call_chunk(index: int, arguments: str) -> dict[str, Any]:
+    return {
+        "choices": [
+            {"delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments}}]}}
+        ]
+    }
+
+
+def _desanitize_chunk_tool_calls(
+    chunk: dict[str, Any], desanitizer: OpenAiToolCallDesanitizer
+) -> dict[str, Any]:
+    """Rewrite placeholders in an OpenAI dict chunk's tool_calls argument deltas.
+
+    Returns the original chunk unchanged when it carries no tool_calls deltas."""
+    choices = chunk.get("choices")
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+        return chunk
+    delta = choices[0].get("delta")
+    if not isinstance(delta, dict) or not isinstance(delta.get("tool_calls"), list):
+        return chunk
+    new_calls: list[Any] = []
+    changed = False
+    for tc in delta["tool_calls"]:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+            idx = int(tc.get("index", 0))
+            rewritten = desanitizer.feed(idx, fn["arguments"])
+            new_calls.append({**tc, "function": {**fn, "arguments": rewritten}})
+            changed = True
+        else:
+            new_calls.append(tc)
+    if not changed:
+        return chunk
+    new_delta = {**delta, "tool_calls": new_calls}
+    new_first = {**choices[0], "delta": new_delta}
+    return {**chunk, "choices": [new_first, *choices[1:]]}
+
+
 def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
     by_placeholder = {placeholder: original for original, placeholder in mapping.pairs}
     sorted_placeholders = sorted(by_placeholder, key=lambda p: -len(p))
@@ -1117,6 +1177,8 @@ def _reverse_choice(choice: Any, reverse_fn: Any) -> Any:
             new_msg["content"] = reverse_fn(content)
         elif isinstance(content, list):
             new_msg["content"] = desanitize_content(content, reverse_fn)
+        # OpenAI tool-call arguments in the assistant response (F4).
+        new_msg = desanitize_tool_calls(new_msg, reverse_fn)
         out["message"] = new_msg
     return out
 

@@ -773,6 +773,190 @@ async def test_post_call_unary_gpt4o_multimodal_content_parts() -> None:
     )
 
 
+# ---- OpenAI tool_calls / function_call (F4 / A3) ---------------------------
+
+
+def _assistant_tool_call_msg(arguments: str, *, name: str = "save") -> dict:
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}
+        ],
+    }
+
+
+async def test_pre_call_openai_tool_calls_arguments_sanitized() -> None:
+    """F4: a tool-call-only assistant message has function.arguments sanitized."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="do it", model="gpt-4o")
+    data["messages"].append(_assistant_tool_call_msg(json.dumps({"user": "hi alice", "id": 7})))
+    out = await g.pre_call(data)
+
+    new_args = json.loads(out["messages"][1]["tool_calls"][0]["function"]["arguments"])
+    assert new_args == {"user": "hi [N1]", "id": 7}
+    assert "alice" not in json.dumps(out["messages"][1])
+
+
+async def test_pre_call_legacy_function_call_arguments_sanitized() -> None:
+    """F4: legacy message.function_call.arguments is sanitized."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi", model="gpt-4o")
+    data["messages"].append(
+        {
+            "role": "assistant",
+            "content": None,
+            "function_call": {"name": "f", "arguments": json.dumps({"note": "call alice"})},
+        }
+    )
+    out = await g.pre_call(data)
+
+    new_args = json.loads(out["messages"][1]["function_call"]["arguments"])
+    assert new_args == {"note": "call [N1]"}
+
+
+async def test_pre_call_tool_calls_secret_in_arguments_caught_by_dlp() -> None:
+    """F4 repro (inverted): an sk- secret in tool_calls arguments is rescanned by Stage 5.
+
+    Pre-fix, collect_text excluded tool_calls so the secret bypassed the DLP guard.
+    """
+    g, _ = _build_guardrail([])  # oracle redacts nothing → secret survives to Stage 5
+    secret = "sk-" + "a" * 40
+    data = _data_with_token("tok-1", content="hello", model="gpt-4o")
+    data["messages"].append(_assistant_tool_call_msg(json.dumps({"key": secret})))
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+
+
+async def test_pre_call_tool_calls_invalid_json_arguments_sanitized_whole() -> None:
+    """F4 edge: non-JSON arguments are sanitized as a single leaf (never egress raw)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi", model="gpt-4o")
+    data["messages"].append(_assistant_tool_call_msg("raw alice text"))
+    out = await g.pre_call(data)
+
+    assert out["messages"][1]["tool_calls"][0]["function"]["arguments"] == "raw [N1] text"
+
+
+async def test_pre_call_anthropic_tool_use_still_sanitized() -> None:
+    """Regression: Anthropic tool_use.input stays sanitized; the F4 path is additive."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    content = [
+        {"type": "text", "text": "using tool"},
+        {"type": "tool_use", "id": "tu1", "name": "save", "input": {"who": "hi alice"}},
+    ]
+    data = _data_with_token("tok-1", content=content)
+    out = await g.pre_call(data)
+
+    assert out["messages"][0]["content"][1]["input"] == {"who": "hi [N1]"}
+    assert "tool_calls" not in out["messages"][0]
+
+
+async def test_post_call_unary_tool_calls_arguments_desanitized() -> None:
+    """F4: placeholders in a response's tool_calls arguments are reversed."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": '{"who": "[N1]"}'},
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    out = await g.post_call_unary(data, response)
+
+    new_args = json.loads(out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+    assert new_args == {"who": "alice"}
+
+
+async def test_post_call_unary_legacy_function_call_desanitized() -> None:
+    """F4: placeholders in a response's legacy function_call arguments are reversed."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = {
+        "choices": [{"message": {"function_call": {"name": "f", "arguments": '{"who": "[N1]"}'}}}]
+    }
+    out = await g.post_call_unary(data, response)
+
+    new_args = json.loads(out["choices"][0]["message"]["function_call"]["arguments"])
+    assert new_args == {"who": "alice"}
+
+
+def _tc_delta_chunk(arguments: str, *, index: int = 0, first: bool = False) -> dict:
+    """One OpenAI streaming tool_calls delta chunk. The first fragment carries id/name."""
+    fn: dict[str, Any] = {"arguments": arguments}
+    tc: dict[str, Any] = {"index": index, "function": fn}
+    if first:
+        fn["name"] = "f"
+        tc["id"] = "c1"
+        tc["type"] = "function"
+    return {"choices": [{"delta": {"tool_calls": [tc]}}]}
+
+
+async def test_post_call_stream_openai_tool_calls_arguments_desanitized() -> None:
+    """F4: streamed OpenAI tool_calls argument deltas are desanitized (dict chunks)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    await g.pre_call(data)
+
+    # [N1] straddles two argument fragments; id/name arrive on the first delta.
+    chunks_in = [
+        _tc_delta_chunk("", first=True),
+        _tc_delta_chunk('{"who": "[N'),
+        _tc_delta_chunk('1]"}'),
+    ]
+    args_out = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        for tc in chunk["choices"][0]["delta"].get("tool_calls") or []:
+            args_out += tc["function"]["arguments"]
+    assert json.loads(args_out) == {"who": "alice"}
+
+
+async def test_post_call_stream_openai_tool_calls_sse_desanitized() -> None:
+    """F4: raw-SSE OpenAI tool_calls argument deltas are desanitized (bytes path)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    await g.pre_call(data)
+
+    def _ev(obj: dict) -> bytes:
+        return ("data: " + json.dumps(obj) + "\n\n").encode()
+
+    sse_in = [
+        _ev(_tc_delta_chunk("", first=True)),
+        _ev(_tc_delta_chunk('{"who": "[N')),
+        _ev(_tc_delta_chunk('1]"}')),
+        b"data: [DONE]\n\n",
+    ]
+    args_out = ""
+    async for chunk in g.post_call_stream(data, _async_iter(sse_in)):
+        for line in chunk.decode().splitlines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                continue
+            obj = json.loads(payload)
+            for tc in obj["choices"][0]["delta"].get("tool_calls") or []:
+                args_out += tc["function"]["arguments"]
+    assert json.loads(args_out) == {"who": "alice"}
+
+
 # ---- Audit -----------------------------------------------------------------
 
 

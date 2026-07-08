@@ -78,6 +78,37 @@ class StreamingDesanitizer:
         return text
 
 
+class OpenAiToolCallDesanitizer:
+    """Per-tool-call desanitizer for streamed OpenAI ``tool_calls[].function.arguments``.
+
+    OpenAI streams a tool call's ``arguments`` as JSON-text fragments across
+    chunks, keyed by ``tool_calls[].index``; a placeholder may straddle two
+    fragments. One :class:`StreamingDesanitizer` per index reassembles it, and
+    originals are JSON-string-escaped so the reversed value stays valid inside
+    the raw arguments string (mirrors the Anthropic ``input_json_delta`` path).
+    """
+
+    def __init__(self, mapping: StrategyResult) -> None:
+        self._mapping = mapping
+        self._by_index: dict[int, StreamingDesanitizer] = {}
+
+    def feed(self, index: int, fragment: str) -> str:
+        ds = self._by_index.get(index)
+        if ds is None:
+            ds = StreamingDesanitizer(self._mapping, escape=_json_string_escape)
+            self._by_index[index] = ds
+        return ds.feed(fragment)
+
+    def flush(self) -> list[tuple[int, str]]:
+        out: list[tuple[int, str]] = []
+        for idx, ds in self._by_index.items():
+            tail = ds.flush()
+            if tail:
+                out.append((idx, tail))
+        self._by_index.clear()
+        return out
+
+
 class SseStreamDesanitizer:
     """De-sanitize an Anthropic or OpenAI SSE byte stream.
 
@@ -112,6 +143,8 @@ class SseStreamDesanitizer:
         self._block_types: dict[int, str] = {}
         # Single desanitizer for OpenAI streams (one content stream total).
         self._openai_desanitizer: StreamingDesanitizer | None = None
+        # OpenAI tool_calls arguments stream, keyed by tool_calls[].index.
+        self._openai_tool_calls = OpenAiToolCallDesanitizer(mapping)
 
     # ------------------------------------------------------------------ public
 
@@ -148,6 +181,8 @@ class SseStreamDesanitizer:
             if oi_tail:
                 out.append(self._encode(_make_openai_delta_event(oi_tail)))
             self._openai_desanitizer = None
+        for tc_idx, tc_tail in self._openai_tool_calls.flush():
+            out.append(self._encode(_make_openai_tool_call_delta_event(tc_idx, tc_tail)))
         # Emit whatever partial (incomplete) SSE event remains in the buffer.
         if self._buf:
             partial = self._buf
@@ -184,6 +219,8 @@ class SseStreamDesanitizer:
                 if oi_tail:
                     result.append(self._encode(_make_openai_delta_event(oi_tail)))
                 self._openai_desanitizer = None
+            for tc_idx, tc_tail in self._openai_tool_calls.flush():
+                result.append(self._encode(_make_openai_tool_call_delta_event(tc_idx, tc_tail)))
             result.append(self._encode(event_text))
             return result
         try:
@@ -284,6 +321,27 @@ class SseStreamDesanitizer:
                         new_obj = {**obj, "choices": new_choices}
                         boundary = _boundary_from(event_text)
                         return [self._encode(_rebuild_event(event_text, new_obj, boundary))]
+                    if isinstance(delta, dict) and isinstance(delta.get("tool_calls"), list):
+                        new_calls: list[object] = []
+                        changed = False
+                        for tc in delta["tool_calls"]:
+                            fn = tc.get("function") if isinstance(tc, dict) else None
+                            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                                idx = int(tc.get("index", 0))
+                                rewritten = self._openai_tool_calls.feed(idx, fn["arguments"])
+                                new_calls.append({**tc, "function": {**fn, "arguments": rewritten}})
+                                changed = True
+                            else:
+                                new_calls.append(tc)
+                        if changed:
+                            # Always emit: the first tool_call event carries id/name that
+                            # must survive; a held-back arguments tail flushes at [DONE].
+                            new_delta = {**delta, "tool_calls": new_calls}
+                            new_first = {**first_choice, "delta": new_delta}
+                            new_choices = [new_first, *list(choices[1:])]
+                            new_obj = {**obj, "choices": new_choices}
+                            boundary = _boundary_from(event_text)
+                            return [self._encode(_rebuild_event(event_text, new_obj, boundary))]
 
         # Everything else (message_start, ping, message_delta, message_stop,
         # error, non-text blocks) — byte-identical pass-through.
@@ -362,4 +420,14 @@ def _make_input_json_delta_event(index: int, partial_json: str) -> str:
 def _make_openai_delta_event(content: str) -> str:
     """Build a complete OpenAI-format SSE event for a choices delta tail."""
     obj = {"choices": [{"delta": {"content": content}}]}
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+
+def _make_openai_tool_call_delta_event(index: int, arguments: str) -> str:
+    """Build a complete OpenAI-format SSE event for a tool_calls arguments tail."""
+    obj = {
+        "choices": [
+            {"delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments}}]}}
+        ]
+    }
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
