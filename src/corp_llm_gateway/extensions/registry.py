@@ -16,8 +16,17 @@ class ExtensionRegistry:
         self._specs: dict[tuple[str, str], ExtensionSpec] = {}
         self._factories: dict[tuple[str, str], ExtensionFactory] = {}
 
-    def register(self, spec: ExtensionSpec, factory: ExtensionFactory) -> None:
+    def register(
+        self, spec: ExtensionSpec, factory: ExtensionFactory, *, replace: bool = False
+    ) -> None:
         key = (spec.kind, spec.name)
+        # Duplicate (kind, name) fails closed: a silent overwrite could shadow a
+        # NEVER-gate-wrapped audit_sink or a detector on the egress path.
+        if not replace and key in self._factories:
+            raise ValueError(
+                f"extension {spec.kind}:{spec.name} already registered; "
+                f"pass replace=True to override"
+            )
         self._specs[key] = spec
         self._factories[key] = factory
 
@@ -49,7 +58,12 @@ class ExtensionRegistry:
                 )
 
     def discover(self) -> None:
-        """On-demand seam for config-driven registration; reads nothing at import."""
+        """On-demand seam for config-driven registration; reads nothing at import.
+
+        Intentionally a no-op today (ADR-001 rule 3): config-driven registration
+        lands in C2 (sink factory) and C3 (get_table). Kept callable so callers
+        may invoke it now without a raise.
+        """
 
     def _known(self) -> tuple[str, ...]:
         return tuple(sorted(f"{kind}:{name}" for kind, name in self._factories))

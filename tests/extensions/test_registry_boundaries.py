@@ -48,15 +48,25 @@ def _spec(
 # duplicate registration -----------------------------------------------------
 
 
-def test_duplicate_registration_last_write_wins() -> None:
-    # register() has no documented duplicate policy; it silently overwrites the
-    # same (kind, name) pair. Pin the observable last-write-wins so a future
-    # edit cannot flip it unnoticed (reviewer: confirm reject-vs-overwrite).
+def test_duplicate_registration_rejected() -> None:
+    # register() rejects a duplicate (kind, name); replace=True overrides.
     reg = ExtensionRegistry()
     first = _spec("stdout", version="1")
     second = _spec("stdout", version="2")
     reg.register(first, lambda: _FakeExtension(first))
-    reg.register(second, lambda: _FakeExtension(second))
+    with pytest.raises(ValueError, match="audit_sink:stdout"):
+        reg.register(second, lambda: _FakeExtension(second))
+    survivors = reg.enabled("audit_sink")
+    assert len(survivors) == 1
+    assert reg.get("audit_sink", "stdout").spec.version == "1"
+
+
+def test_duplicate_registration_replace_true_overrides() -> None:
+    reg = ExtensionRegistry()
+    first = _spec("stdout", version="1")
+    second = _spec("stdout", version="2")
+    reg.register(first, lambda: _FakeExtension(first))
+    reg.register(second, lambda: _FakeExtension(second), replace=True)
     survivors = reg.enabled("audit_sink")
     assert len(survivors) == 1
     assert reg.get("audit_sink", "stdout").spec.version == "2"
@@ -68,7 +78,7 @@ def test_duplicate_registration_last_write_wins() -> None:
 def test_register_accepts_mismatched_api_version() -> None:
     # register() is not the gate: a version-incompatible spec registers, and
     # get() will hand it back. The fail-closed check is validate_api_version(),
-    # expected to run at bootstrap (see reviewer note on the opt-in gate).
+    # a separate opt-in gate.
     reg = ExtensionRegistry()
     spec = _spec("stdout", api_version="99")
     reg.register(spec, lambda: _FakeExtension(spec))
