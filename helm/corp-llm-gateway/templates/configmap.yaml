@@ -7,15 +7,21 @@ metadata:
 data:
   vector.yaml: |
     sources:
+      # Read the gateway container's stdout from the node (a `stdin` source can
+      # never see a sibling container's stdout). Scoped to THIS release's pods so
+      # the sidecar does not ingest every pod on the node.
       gateway_logs:
-        type: stdin
+        type: kubernetes_logs
+        self_node_name: "${VECTOR_SELF_NODE_NAME}"
+        extra_label_selector: "app.kubernetes.io/name={{ include "corp-llm-gateway.name" . }},app.kubernetes.io/instance={{ .Release.Name }}"
 
     transforms:
-      # Parse each stdin line as JSON. The gateway emits AuditEvent JSON
+      # Parse each log line as JSON. The gateway emits AuditEvent JSON
       # (StdoutSink) interleaved with litellm's own JSON wrappers and plain-text
       # uvicorn access logs. Non-strict parse (no `!`) so a plain-text line does
       # not abort the event — it is flagged `_unparsable` and dropped by
-      # `audit_only` below.
+      # `audit_only` below. `. = parsed` replaces the event, dropping the
+      # kubernetes_logs metadata enrichment so only audit fields reach the sinks.
       parse:
         type: remap
         inputs: [gateway_logs]

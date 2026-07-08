@@ -1,0 +1,27 @@
+# Server image: the LiteLLM proxy with the corp-llm-gateway guardrail installed
+# as a callback. The sibling `Dockerfile` builds the `gateway-admin` CLI image;
+# this one runs the request path.
+#
+# Base must ship Python >=3.12 (the wheel is `requires-python >=3.12`). Override
+# the pin at build time: --build-arg LITELLM_VERSION=v1.40.x
+ARG LITELLM_VERSION=main-stable
+
+FROM python:3.12-slim AS build
+WORKDIR /build
+RUN pip install --no-cache-dir build
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN python -m build --wheel
+
+FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
+# Install onto the litellm base with the server extras so the proxy can import
+# `corp_llm_gateway.bootstrap.guardrail`. [metrics] is deliberately omitted —
+# that extra ships in task B4; adding it here breaks the build until then.
+# The RU/EN NER models are NOT pulled by [ner] (en_core_web_md is a wheel URL,
+# see pyproject) — install the model layer separately when NER must be non-degraded.
+COPY --from=build /build/dist/*.whl /tmp/
+RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[ner,postgres,oidc]" && rm -f /tmp/*.whl
+
+# The pod mounts the litellm proxy config (with the guardrail callback) here via
+# the configmap-litellm.yaml ConfigMap.
+ENTRYPOINT ["litellm", "--config", "/etc/litellm/config.yaml", "--port", "4000"]

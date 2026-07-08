@@ -10,6 +10,11 @@ litellm:
 
 guardrail:
   contentSizeThresholdBytes: 102400
+  # Local-first cascade (ADR-003): CORP_LLM_LOCAL_FIRST / CORP_LLM_GAZETTEER.
+  localFirst: true
+  gazetteer: true
+  # Per-team replace.md rules dir (CORP_LLM_RULES_DIR).
+  rulesDir: "/etc/corp-llm-gateway/rules"
   cacheA:
     ttlSeconds: 36000
     perTeamQuotaBytes: 1073741824
@@ -21,6 +26,10 @@ guardrail:
 corpLlm:
   endpoint: ""
   authProvider: "noop"
+  # Upstream model the corp vLLM oracle exposes (litellm rewrites all names to it).
+  model: "GLM-5.1-AWQ"
+  # Cap output tokens to leave context headroom (GLM-5.1-AWQ is a 65536 window).
+  maxTokens: 4096
 
 prePass:
   engine: "openai/privacy-filter"
@@ -40,6 +49,9 @@ redis:
   policy: allkeys-lru
 
 audit:
+  # In-process audit sink (CORP_AUDIT_SINK: stdout|langfuse|list). stdout feeds
+  # the Vector sidecar, which fans out to Langfuse + S3 + SIEM.
+  sink: "stdout"
   vector:
     bufferGb: 5
     bufferHours: 6
@@ -84,3 +96,86 @@ failPolicy:
   postgresDown: "fail-closed"
   vectorBufferFull: "fail-closed"
   s3SinkDown: "fail-closed"
+
+# Set to the name of an external (Vault / external-secrets) Secret to source the
+# sensitive env contract from it. When set, the chart renders no Secret and the
+# `secret:` map below is ignored. Leave empty to have the chart manage the Secret.
+existingSecret: ""
+
+# Sensitive env contract (mounted into both containers via envFrom). Defaults are
+# EMPTY so nothing sensitive is committed. Supply real values from a NON-committed
+# values file / --set, or use `existingSecret` above.
+secret:
+  CORP_LLM_PG_DSN: ""          # Postgres token + team-config store
+  REDIS_URL: ""                # Redis mapping store (Cache B)
+  CORP_LLM_AUTH_TOKEN: ""      # corp-LLM api key (litellm model_list)
+  CORP_LLM_BEARER_TOKEN: ""    # corp-LLM oracle bearer (auth provider)
+  CORP_LANGFUSE_PUBLIC_KEY: "" # in-process LangfuseSink
+  CORP_LANGFUSE_SECRET_KEY: ""
+  LANGFUSE_PUBLIC_KEY: ""      # Vector langfuse sink
+  LANGFUSE_SECRET_KEY: ""
+  AWS_ACCESS_KEY_ID: ""        # Vector S3 audit sink
+  AWS_SECRET_ACCESS_KEY: ""
+  CORP_GATEWAY_OIDC_KEY: ""    # RBAC JWT verification key
+  CORP_GATEWAY_ADMIN_TOKEN: ""
+
+# Internal-CA bundle for TLS to the corp LLM / corp services. When enabled the
+# bundle is mounted and CORP_LLM_CA_BUNDLE + SSL_CERT_FILE point at it.
+caBundle:
+  enabled: false
+  existingSecret: ""           # Secret with key `ca-bundle.pem`; else inline `content`
+  content: ""
+  mountPath: /etc/corp-llm-gateway/ca
+
+# Pull secrets for the private registry image.
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  # ClusterRole + binding granting the Vector sidecar's kubernetes_logs source
+  # read on pod metadata. Only rendered when serviceAccount.create is true.
+  create: true
+
+# Pod-level context: fsGroup for the emptyDir buffers; the Vector sidecar
+# overrides to root at the container level to read node logs.
+podSecurityContext:
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# Gateway container context: non-root, no privilege escalation, drop all caps.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+startupProbe:
+  # NER model load + first-request warmup can be slow on CPU; give it headroom
+  # (failureThreshold x periodSeconds) before liveness takes over.
+  failureThreshold: 30
+  periodSeconds: 10
+
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  # ~10x burst headroom (capacity.md) on CPU-only pods; scale out, not up.
+  maxReplicas: 30
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+metrics:
+  # ServiceMonitor scraping /metrics. Default OFF — the series ship in task B4;
+  # this stays inert until then.
+  enabled: false
+  path: /metrics
+  interval: 30s

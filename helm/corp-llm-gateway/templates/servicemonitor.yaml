@@ -1,0 +1,19 @@
+{{- if .Values.metrics.enabled }}
+# Scrapes /metrics on the gateway. INERT until task B4 emits the series
+# (corp_llm_gateway_blocked_requests_total, gateway_failure, latency histograms)
+# that siem-alerts.yaml already references. Default-off (metrics.enabled=false).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "corp-llm-gateway.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: {{ .Values.metrics.path | quote }}
+      interval: {{ .Values.metrics.interval | quote }}
+{{- end }}
