@@ -23,7 +23,7 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 from corp_llm_gateway import config
@@ -89,7 +89,26 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_body()
+
+        # The request target is client-controlled. An absolute-form
+        # ("http://host/…") or protocol-relative ("//host/…") target would
+        # otherwise steer the injected corp token + BYOK key to an attacker
+        # host; the upstream host must come from config alone, never the target.
+        requested = urlsplit(self.path)
+        if requested.scheme or requested.netloc:
+            self._send_error(403, "proxy target must be a relative path")
+            return
         upstream_url = urljoin(self.upstream_base.rstrip("/") + "/", self.path.lstrip("/"))
+        base = urlsplit(self.upstream_base)
+        target = urlsplit(upstream_url)
+        if (target.scheme, target.hostname, target.port) != (
+            base.scheme,
+            base.hostname,
+            base.port,
+        ):
+            self._send_error(403, "proxy target must stay on the configured upstream")
+            return
+
         headers = self._forward_headers()
         headers["X-Corp-Auth"] = corp_token
 
