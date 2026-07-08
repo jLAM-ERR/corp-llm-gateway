@@ -2,9 +2,16 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+from corp_llm_gateway.detectors import RegexChecksumDetector
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.payload import (
+    OVERSIZE_CHUNK,
+    OVERSIZE_DELIVER_FLAG,
+    OversizeContentError,
+)
 from corp_llm_gateway.rules import (
     Gazetteer,
     Rule,
@@ -152,10 +159,11 @@ async def test_idempotency_same_input_same_output() -> None:
     assert r1.pairs == r2.pairs
 
 
-# Size threshold ------------------------------------------------------------
+# Size threshold / oversize policy (F1) -------------------------------------
 
 
-async def test_oversize_input_skips_sanitization() -> None:
+async def test_oversize_input_fails_closed_by_default() -> None:
+    """F1 repro: an oversize leaf must NOT egress verbatim — default fails closed."""
     client, captured = _client_returning_pairs([("alice", "[N1]")])
     orch = SanitizationOrchestrator(
         client,
@@ -163,11 +171,122 @@ async def test_oversize_input_skips_sanitization() -> None:
         _StaticRulesLoader(Rules(rules=())),
         size_threshold_bytes=10,
     )
-    big = "x" * 50
+    big = "alice " + "x" * 50
+    with pytest.raises(OversizeContentError) as ei:
+        await orch.sanitize(big, team_id="t1", conversation_id="c1")
+    assert ei.value.threshold_bytes == 10
+    assert ei.value.content_bytes == len(big.encode("utf-8"))
+    assert len(captured) == 0, "oversize input must not call corp-LLM"
+    # The error carries sizes only — never the raw content (M1-14).
+    assert "alice" not in str(ei.value)
+
+
+async def test_oversize_chunk_policy_redacts_secret() -> None:
+    """chunk policy: an oversize leaf is chunked + sanitized; the secret is redacted."""
+    secret = "sk-" + "a" * 40
+    client, _ = _client_returning_pairs([])  # oracle returns nothing; local finds it
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=32,
+        oversize_policy=OVERSIZE_CHUNK,
+        local_detectors=[RegexChecksumDetector()],
+    )
+    big = "context " + secret + " more " + "y" * 80
+    result = await orch.sanitize(big, team_id="t1", conversation_id="c1")
+    assert result.skipped is False
+    assert secret not in result.sanitized_text, "secret leaked through the chunk path"
+    assert any(o == secret for o, _ in result.pairs)
+    placeholders = [p for _, p in result.pairs]
+    assert len(placeholders) == len(set(placeholders)), "bijection: placeholders must be distinct"
+
+
+async def test_oversize_chunk_secret_on_seam_still_redacted() -> None:
+    """A secret straddling a chunk seam stays fully inside an overlapping window."""
+    client, _ = _client_returning_pairs([])
+    window, overlap = 40, 25  # step 15; overlap >= the 8-char email
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=20,
+        oversize_policy=OVERSIZE_CHUNK,
+        chunk_window_chars=window,
+        chunk_overlap_chars=overlap,
+        local_detectors=[RegexChecksumDetector()],
+    )
+    email = "me@ex.io"  # 8 chars
+    # Email occupies [35, 43): cut by window0 [0, 40) but whole inside window1 [15, 55).
+    text = "a" * 34 + " " + email + " " + "b" * 60
+    result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+    assert email not in result.sanitized_text, "seam-straddling secret leaked"
+    assert any(o == email for o, _ in result.pairs)
+
+
+async def test_default_chunk_overlap_covers_longest_entity() -> None:
+    """Safety property: the default overlap must exceed the longest matchable entity."""
+    from corp_llm_gateway.sanitizer.orchestrator import (
+        _DEFAULT_CHUNK_OVERLAP_CHARS,
+        _DEFAULT_CHUNK_WINDOW_CHARS,
+    )
+
+    assert _DEFAULT_CHUNK_OVERLAP_CHARS >= 8192  # PEM private-key body cap
+    assert _DEFAULT_CHUNK_WINDOW_CHARS > _DEFAULT_CHUNK_OVERLAP_CHARS
+
+
+async def test_oversize_deliver_flag_requires_team_optin() -> None:
+    """deliver-flag without a team opt-in falls back to fail-closed."""
+    client, _ = _client_returning_pairs([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=10,
+        oversize_policy=OVERSIZE_DELIVER_FLAG,
+        oversize_deliver_teams=frozenset({"other-team"}),
+    )
+    big = "clean text " + "z" * 50
+    with pytest.raises(OversizeContentError):
+        await orch.sanitize(big, team_id="t1", conversation_id="c1")
+
+
+async def test_oversize_deliver_flag_optin_clean_delivers() -> None:
+    """deliver-flag + opt-in + a clean full rescan → delivers the original, flagged."""
+    client, _ = _client_returning_pairs([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=10,
+        oversize_policy=OVERSIZE_DELIVER_FLAG,
+        oversize_deliver_teams=frozenset({"t1"}),
+    )
+    big = "the quick brown fox jumps over the lazy dog and then again"
     result = await orch.sanitize(big, team_id="t1", conversation_id="c1")
     assert result.skipped is True
     assert result.sanitized_text == big
-    assert len(captured) == 0, "oversize input must not call corp-LLM"
+    assert result.pairs == ()
+
+
+async def test_oversize_deliver_flag_optin_dirty_blocks() -> None:
+    """deliver-flag + opt-in but the content has PII → full rescan trips → fail-closed.
+
+    Uses an EMAIL: caught by the full regex+checksum rescan but NOT one of the DLP
+    guard's five secret regexes — proving the rescan is the full cascade.
+    """
+    client, _ = _client_returning_pairs([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=10,
+        oversize_policy=OVERSIZE_DELIVER_FLAG,
+        oversize_deliver_teams=frozenset({"t1"}),
+    )
+    big = "please contact leak@corp.example about this " + "q" * 40
+    with pytest.raises(OversizeContentError):
+        await orch.sanitize(big, team_id="t1", conversation_id="c1")
 
 
 # Length-descending substitution invariant ---------------------------------

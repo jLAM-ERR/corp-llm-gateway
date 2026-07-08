@@ -36,6 +36,7 @@ from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
 from corp_llm_gateway.payload.classifier import classify_block
+from corp_llm_gateway.payload.size_threshold import OversizeContentError
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.sanitizer import (
     SanitizationOrchestrator,
@@ -438,6 +439,25 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "E_BAD_REQUEST",
                     "request content nesting too deep",
                 ) from exc
+            except OversizeContentError as exc:
+                # F1: fail-closed on an oversize leaf. Never forward the original.
+                state.block_reason = "oversize:blocked"
+                self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
+                logger.info(
+                    "litellm_pre_call_oversize_blocked request_id=%s message_index=%d "
+                    "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
+                    request_id,
+                    i,
+                    exc.content_bytes,
+                    exc.threshold_bytes,
+                )
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    422,
+                    "E_OVERSIZE_BLOCKED",
+                    "request blocked: oversize content",
+                ) from exc
             except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
                 # Fail-policy matrix (plan M4 / docs/ops/runbook.md): a
                 # corp-LLM sanitization failure is fail-CLOSED. We must
@@ -501,6 +521,24 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     400,
                     "E_BAD_REQUEST",
                     "request content nesting too deep",
+                ) from exc
+            except OversizeContentError as exc:
+                # F1: fail-closed on an oversize system leaf. Never forward the original.
+                state.block_reason = "oversize:blocked"
+                self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
+                logger.info(
+                    "litellm_pre_call_oversize_blocked request_id=%s field=system "
+                    "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
+                    request_id,
+                    exc.content_bytes,
+                    exc.threshold_bytes,
+                )
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    422,
+                    "E_OVERSIZE_BLOCKED",
+                    "request blocked: oversize content",
                 ) from exc
             except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
                 logger.warning(

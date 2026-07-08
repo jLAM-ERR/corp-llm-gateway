@@ -56,6 +56,20 @@
 # CORP_LANGFUSE_PUBLIC_KEY  = "pk-..."
 # CORP_LANGFUSE_SECRET_KEY  = "sk-..."
 
+# ── Oversize content policy (payload/size_threshold.py) ─────────────────────
+#
+# A single text leaf larger than ~100 KB (Claude Code's file-context payloads
+# routinely are) used to be forwarded UNSANITIZED. CORP_LLM_OVERSIZE_POLICY now
+# governs what happens instead; the default fails closed.
+#   fail-closed  — reject the request (HTTP 422) before egress. Safe default.
+#   chunk        — split the leaf into overlapping windows, sanitize each through
+#                  the full cascade, reassemble (placeholder bijection preserved).
+#   deliver-flag — forward the original, but ONLY for a team listed in
+#                  CORP_LLM_OVERSIZE_DELIVER_TEAMS and ONLY when a full PII/DLP
+#                  rescan is clean; otherwise it falls back to fail-closed.
+# CORP_LLM_OVERSIZE_POLICY        = "fail-closed"
+# CORP_LLM_OVERSIZE_DELIVER_TEAMS = "team-a,team-b"
+
 # ── Extensions & providers (nested tables, read via config.get_table) ────────
 #
 # Unlike the scalar keys above, these are TOML *tables* keyed by kind/name and

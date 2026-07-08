@@ -580,3 +580,96 @@ async def test_stage0_audit_record_contains_no_raw_content() -> None:
     serialized = json.dumps(sink.records[0])
     for original in ORIGINAL_CORPUS:
         assert original not in serialized, f"Original {original!r} leaked into audit record"
+
+
+# (ix) Oversize content (F1): a leaf over the size threshold is fail-closed and
+# never egresses the original via any surface (log line or audit record) --------
+
+
+def _oversize_guardrail() -> tuple[object, ListSink]:
+    """A guardrail whose orchestrator fail-closes any leaf over 32 bytes."""
+    from corp_llm_gateway.corp_llm import CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+    from corp_llm_gateway.tokens import InMemoryTokenStore, TokenInfo
+
+    def _no_upstream(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("oracle/upstream must NOT be called for an oversize block")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_no_upstream))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(
+            corp_llm, InMemoryMappingStore(), _NoRules(), size_threshold_bytes=32
+        ),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+    )
+    return guardrail, sink
+
+
+@pytest.mark.asyncio
+async def test_oversize_message_leaf_blocks_and_never_leaks_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An oversize message leaf carrying every corpus original egresses nowhere."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _oversize_guardrail()
+    big = "\n".join(ORIGINAL_CORPUS) + " " + "x" * 64  # > 32 bytes; carries all originals
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": big}],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert _haystack_contains_any_original(serialized) is None, "original in audit record"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+
+
+@pytest.mark.asyncio
+async def test_oversize_document_leaf_blocks_and_never_leaks_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An oversize document.source.data leaf is fail-closed with no original egress."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _oversize_guardrail()
+    big = "\n".join(ORIGINAL_CORPUS) + " " + "y" * 64
+    doc = [{"type": "document", "source": {"type": "text", "data": big}}]
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": doc}],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert _haystack_contains_any_original(serialized) is None, "original in audit record"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
