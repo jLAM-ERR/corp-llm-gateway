@@ -4,9 +4,11 @@ from typing import Literal
 DEFAULT_RETENTION_HOT_DAYS = 90
 DEFAULT_RETENTION_COLD_YEARS = 7
 
-AuditSinkDownPolicy = Literal["fail-closed", "continue"]
-AuditBufferFullPolicy = Literal["fail-closed", "continue"]
-PrePassDownPolicy = Literal["fail-closed", "continue"]
+# Single source of truth for the M4 fail-policy vocabulary.
+FailPolicy = Literal["fail-closed", "continue"]
+AuditSinkDownPolicy = FailPolicy
+AuditBufferFullPolicy = FailPolicy
+PrePassDownPolicy = FailPolicy
 
 
 @dataclass(frozen=True)
