@@ -17,6 +17,8 @@ from collections.abc import Sequence
 from datetime import timedelta
 from typing import Any, cast, get_args
 
+import httpx
+
 from corp_llm_gateway import config, extensions, providers
 from corp_llm_gateway.audit import get_sink, register_sink, sink_name_for
 from corp_llm_gateway.auth import BearerAuthProvider, NoopAuthProvider
@@ -27,6 +29,7 @@ from corp_llm_gateway.payload import OversizeContentError
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator, SanitizeResult
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
+from corp_llm_gateway.settings import ConfigError
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.team_config import (
     PostgresTeamConfigStore,
@@ -306,6 +309,107 @@ def _dispatch_extensions(args: argparse.Namespace) -> int:
     if args.ext_command == "enable":
         return _ext_enable(registry, args.ref, team=args.team, rollout=args.rollout)
     return _ext_disable(registry, args.ref, team=args.team)
+
+
+# ── config check: validate settings + probe dependencies ─────────────────────
+
+
+async def _probe_postgres(dsn: str) -> tuple[bool, str]:
+    try:
+        import asyncpg
+    except ImportError:
+        return False, "asyncpg not installed (install the 'postgres' extra)"
+    try:
+        conn = await asyncpg.connect(dsn, timeout=5.0)
+    except Exception as exc:  # any driver/network failure ⇒ unreachable
+        return False, f"unreachable: {type(exc).__name__}"
+    await conn.close()
+    return True, "reachable"
+
+
+async def _probe_redis(url: str) -> tuple[bool, str]:
+    from redis.asyncio import from_url
+
+    client = from_url(url)
+    try:
+        await client.ping()
+    except Exception as exc:
+        return False, f"unreachable: {type(exc).__name__}"
+    finally:
+        await client.aclose()
+    return True, "reachable"
+
+
+async def _probe_corp_llm(endpoint: str) -> tuple[bool, str]:
+    # Any HTTP response (even 4xx/5xx) proves reachability; only a transport
+    # failure means the endpoint is unroutable.
+    async with httpx.AsyncClient(timeout=5.0, verify=config.corp_llm_verify()) as client:
+        try:
+            resp = await client.get(endpoint)
+        except httpx.HTTPError as exc:
+            return False, f"unreachable: {type(exc).__name__}"
+    return True, f"reachable (HTTP {resp.status_code})"
+
+
+async def _gather_probes() -> list[tuple[str, bool, str]]:
+    results: list[tuple[str, bool, str]] = []
+    dsn = config.get("CORP_LLM_PG_DSN")
+    if dsn:
+        ok, detail = await _probe_postgres(dsn)
+        results.append(("postgres", ok, detail))
+    url = config.get("REDIS_URL")
+    if url:
+        ok, detail = await _probe_redis(url)
+        results.append(("redis", ok, detail))
+    endpoint = config.get("CORP_LLM_ENDPOINT")
+    if endpoint:
+        ok, detail = await _probe_corp_llm(endpoint)
+        results.append(("corp-llm", ok, detail))
+    return results
+
+
+def _dispatch_config(args: argparse.Namespace) -> int:
+    problems: list[str] = []
+    try:
+        config.validate()
+        config_ok = True
+    except ConfigError as exc:
+        config_ok = False
+        problems = exc.problems
+
+    probes: list[tuple[str, bool, str]] = []
+    if not args.no_probe:
+        probes = asyncio.run(_gather_probes())
+
+    healthy = config_ok and all(ok for _, ok, _ in probes)
+
+    if args.json_output:
+        print(
+            json.dumps(
+                {
+                    "config_valid": config_ok,
+                    "problems": problems,
+                    "probes": [
+                        {"dependency": name, "reachable": ok, "detail": detail}
+                        for name, ok, detail in probes
+                    ],
+                    "healthy": healthy,
+                }
+            )
+        )
+        return 0 if healthy else 1
+
+    if config_ok:
+        print("config: OK")
+    else:
+        print("config: INVALID", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+    if probes:
+        rows: list[tuple[str, ...]] = [("DEPENDENCY", "STATUS", "DETAIL")]
+        rows += [(name, "OK" if ok else "UNREACHABLE", detail) for name, ok, detail in probes]
+        _print_table(rows)
+    return 0 if healthy else 1
 
 
 # ── team / token stores ──────────────────────────────────────────────────────
@@ -650,6 +754,16 @@ def build_parser() -> argparse.ArgumentParser:
     ext_disable.add_argument("ref", metavar="KIND:NAME")
     ext_disable.add_argument("--team", default=None)
 
+    p_config = sub.add_parser("config", help="validate configuration and probe dependencies")
+    config_sub = p_config.add_subparsers(dest="config_command", required=True)
+    config_check = config_sub.add_parser(
+        "check", help="validate config + probe deps (nonzero exit on failure)"
+    )
+    config_check.add_argument(
+        "--no-probe", action="store_true", help="validate config only; skip dependency probes"
+    )
+    config_check.add_argument("--json", dest="json_output", action="store_true")
+
     p_sanitize = sub.add_parser("sanitize", help="show BEFORE/AFTER sanitization for a prompt")
     p_sanitize.add_argument("text", help="prompt text to sanitize")
     p_sanitize.add_argument("--team-id", default="default")
@@ -674,6 +788,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "extensions":
         return _dispatch_extensions(args)
+
+    if args.command == "config":
+        return _dispatch_config(args)
 
     if args.command == "sanitize":
         try:

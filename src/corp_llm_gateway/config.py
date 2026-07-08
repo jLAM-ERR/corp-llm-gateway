@@ -26,7 +26,10 @@ import os
 import tomllib
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from corp_llm_gateway.settings import Settings
 
 _DEFAULT_PATHS: tuple[str, ...] = (
     "~/.corp-llm-gateway/config.toml",
@@ -73,6 +76,18 @@ def get_required(name: str) -> str:
             f"{_DEFAULT_PATHS[0]} (or $CORP_LLM_GATEWAY_CONFIG_FILE)"
         )
     return value
+
+
+def validate() -> Settings:
+    """Resolve + validate every key the app reads; raise ``ConfigError`` on failure.
+
+    Startup fail-fast delegating to :mod:`corp_llm_gateway.settings` (imported
+    lazily to keep this module's import graph dependency-free). Every key still
+    resolves through the chain above — settings feeds those values into pydantic.
+    """
+    from corp_llm_gateway import settings
+
+    return settings.validate()
 
 
 def get_table(prefix: str) -> dict[str, Any]:

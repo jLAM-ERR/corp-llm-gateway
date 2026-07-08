@@ -5,12 +5,18 @@
 #   /etc/corp-llm-gateway/config.toml       (server default)
 # Or point at any path via $CORP_LLM_GATEWAY_CONFIG_FILE.
 #
-# Every key here is the env-var name. Resolution order at runtime:
+# Every scalar key here is the env-var name. Resolution order at runtime:
 #   1. environment variable (env wins — existing deployments unaffected)
 #   2. value from this file
 #   3. caller-supplied default
 #
 # Set only the keys you want — anything you omit falls back to env / default.
+# `gateway-admin config check` validates this file + probes dependencies and
+# exits nonzero on a missing-required or malformed setting.
+#
+# This file enumerates EVERY key the gateway reads (settings.all_keys()). The
+# only knob NOT settable here is $CORP_LLM_GATEWAY_CONFIG_FILE itself — it
+# selects this file, so it can only come from the environment.
 
 # ── Laptop CLIs (corp-llm-gateway status, corp-llm-gateway-proxy) ────────────
 
@@ -18,78 +24,117 @@
 # CORP_GATEWAY_TOKEN_FILE   = "~/.corp-llm-gateway/token"
 # CORP_GATEWAY_LATEST_URL   = "https://git.corp.lan/.../raw/master/VERSION"
 
-# ── Inbound auth: token store backend (tokens/postgres_store.py) ─────────────
+# ── Corp LLM oracle endpoint / model ─────────────────────────────────────────
+#
+# CORP_LLM_ENDPOINT is REQUIRED. It has NO routable default — the code falls back
+# to the non-routable placeholder https://corp-llm.example/v1, which only fails on
+# the first gazetteer-hit request (a 503). `config check` / startup validation
+# refuses to run without it.
+# CORP_LLM_ENDPOINT         = "https://corp-llm.corp.lan/v1"
+# CORP_LLM_MODEL            = "GLM-5.1-AWQ"
+# CORP_LLM_AUTH_TOKEN       = "..."    # legacy oracle bearer read by gateway-admin
 
-# PostgresTokenStore is used when this DSN is set (requires the 'postgres' extra).
-# Without it, InMemoryTokenStore is used (dev/demo only — tokens lost on restart).
-# CORP_LLM_PG_DSN = "postgresql://gateway:gateway@postgres:5432/gateway"
+# ── Detection pipeline knobs ─────────────────────────────────────────────────
 
-# ── Server-side: corp vLLM auth provider (auth/factory.py) ───────────────────
-
-# CORP_LLM_AUTH_PROVIDER    = "noop"     # one of: noop | bearer | mtls | oidc | apikey
-
-# bearer:
-# CORP_LLM_BEARER_TOKEN     = "..."
-
-# mtls:
-# CORP_LLM_MTLS_CERT        = "/etc/corp-llm-gateway/client.crt"
-# CORP_LLM_MTLS_KEY         = "/etc/corp-llm-gateway/client.key"
-
-# oidc:
-# CORP_LLM_OIDC_ISSUER      = "https://keycloak.corp.lan/realms/corp"
-# CORP_LLM_OIDC_CLIENT_ID   = "corp-llm-gateway"
-# CORP_LLM_OIDC_CLIENT_SECRET = "..."
-
-# apikey:
-# CORP_LLM_API_KEY_HEADER   = "X-Api-Key"
-# CORP_LLM_API_KEY          = "..."
-
-# ── Audit sink selection (audit/factory.py) ─────────────────────────────────
-
-# CORP_AUDIT_SINK           = "stdout"   # one of: stdout | langfuse | list
-#   stdout   — one JSON record per line to the pod's stdout (Vector tails it).
-#   langfuse — POST records straight to Langfuse (needs the keys below).
-#   list     — in-memory buffer (tests only).
-
-# langfuse sink (only when CORP_AUDIT_SINK = "langfuse"):
-# CORP_LANGFUSE_URL         = "http://langfuse.corp.lan"
-# CORP_LANGFUSE_PUBLIC_KEY  = "pk-..."
-# CORP_LANGFUSE_SECRET_KEY  = "sk-..."
+# CORP_LLM_RULES_DIR        = "/etc/corp-llm-gateway/rules"   # per-team replace.md
+# CORP_LLM_LOCAL_FIRST      = "1"      # local-first cascade (regex+NER+gazetteer)
+# CORP_LLM_GAZETTEER        = "1"      # lemma-gazetteer detector
+# CORP_LLM_BLOCK_PAYLOADS   = "1"      # Stage 0 payload classifier (refuse-before-egress)
+# CORP_LLM_DLP_GUARD        = "1"      # Stage 5 DLP egress guard (re-scan sanitized request)
+# CORP_LLM_DLP_CANARIES     = "canary-abc,canary-def"   # comma-separated canary regexes
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #
-# A single text leaf larger than ~100 KB (Claude Code's file-context payloads
-# routinely are) used to be forwarded UNSANITIZED. CORP_LLM_OVERSIZE_POLICY now
-# governs what happens instead; the default fails closed.
+# A single text leaf larger than ~100 KB used to be forwarded UNSANITIZED (F1).
+# CORP_LLM_OVERSIZE_POLICY now governs what happens instead; the default fails
+# closed. One of: fail-closed | chunk | deliver-flag.
 #   fail-closed  — reject the request (HTTP 422) before egress. Safe default.
-#   chunk        — regex/checksum runs over the FULL text (unbounded-pattern
-#                  secrets cannot survive a chunk seam); only the size-bounded
-#                  NER pass is chunked into overlapping windows, then reassembled
-#                  (placeholder bijection preserved).
-#   deliver-flag — forward the original, but ONLY for a team listed in
-#                  CORP_LLM_OVERSIZE_DELIVER_TEAMS and ONLY when a full rescan —
-#                  the same detection the normal path runs (regex+checksum +
-#                  configured detectors + gazetteer + rules + the conditional
-#                  oracle) — is clean; otherwise it falls back to fail-closed.
-#                  A delivered leaf is audited with block_reason=oversize:delivered.
+#   chunk        — sliding-window chunk the leaf through the full cascade.
+#   deliver-flag — forward the original ONLY for a team listed below AND only
+#                  when a full rescan is clean; otherwise falls back to fail-closed.
 # CORP_LLM_OVERSIZE_POLICY        = "fail-closed"
 # CORP_LLM_OVERSIZE_DELIVER_TEAMS = "team-a,team-b"
 
 # ── Require NER — fail closed when a NER model is missing (detectors/dual_ner) ─
 #
-# The dual-NER stack (Natasha RU + spaCy EN) needs Python 3.12 + the [ner] extra
-# and a manually-installed en_core_web_md wheel. If a configured engine's model
-# is ABSENT at runtime it self-disables; by default the gateway then degrades to
-# no-NER (returns no findings) — fine for dev / the Python-3.14 graceful path,
-# but in production that silently forwards a PERSON/ORG only NER would redact.
-#
 #   true  — PRODUCTION default: a self-disabled NER engine fails the request
-#           CLOSED (503 E_NER_UNAVAILABLE) and /healthz/ready probes NER-loaded,
-#           so a pod missing the model falls out of the load balancer.
+#           CLOSED (503 E_NER_UNAVAILABLE) and /healthz/ready probes NER-loaded.
 #   false — dev / 3.14 graceful degradation (no NER, no 503). Code default.
+# CORP_LLM_REQUIRE_NER = "1"
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+# CORP_LLM_LOG_LEVEL        = "INFO"
+
+# ── Backends (unset → in-memory; dev/demo only, state lost on restart) ───────
+
+# CORP_LLM_PG_DSN is used for the token AND team-config stores (requires the
+# 'postgres' extra). REDIS_URL backs the per-conversation mapping store (Cache B).
+# CORP_LLM_PG_DSN           = "postgresql://gateway:gateway@postgres:5432/gateway"
+# REDIS_URL                 = "redis://cache.corp.lan:6379/0"
+
+# ── TLS to the corp LLM (corp_llm/client.py) ─────────────────────────────────
 #
-# Turn this ON in every prod profile / Helm values file that ships the NER model.
-# CORP_LLM_REQUIRE_NER = true
+# CORP_LLM_CA_BUNDLE: path to a PEM CA bundle — verify the corp-LLM cert against
+# an internal CA (verification stays ON). SSL_VERIFY = "false" disables
+# verification entirely (demo only). CA bundle takes precedence when both are set.
+# CORP_LLM_CA_BUNDLE        = "/etc/corp-llm-gateway/corp-ca.pem"
+# SSL_VERIFY                = "true"
+
+# ── Corp vLLM auth provider (auth/factory.py) ────────────────────────────────
+#
+# CORP_LLM_AUTH_PROVIDER selects the mode; each mode's keys become REQUIRED.
+# One of: noop | bearer | mtls | oidc | apikey.
+# CORP_LLM_AUTH_PROVIDER    = "noop"
+
+# bearer (requires CORP_LLM_BEARER_TOKEN):
+# CORP_LLM_BEARER_TOKEN     = "..."
+
+# mtls (requires CORP_LLM_MTLS_CERT + CORP_LLM_MTLS_KEY):
+# CORP_LLM_MTLS_CERT        = "/etc/corp-llm-gateway/client.crt"
+# CORP_LLM_MTLS_KEY         = "/etc/corp-llm-gateway/client.key"
+
+# oidc (requires CORP_LLM_OIDC_ISSUER + CORP_LLM_OIDC_CLIENT_ID + CORP_LLM_OIDC_CLIENT_SECRET):
+# CORP_LLM_OIDC_ISSUER      = "https://keycloak.corp.lan/realms/corp"
+# CORP_LLM_OIDC_CLIENT_ID   = "corp-llm-gateway"
+# CORP_LLM_OIDC_CLIENT_SECRET = "..."
+
+# apikey (requires CORP_LLM_API_KEY; header name defaults to X-Api-Key):
+# CORP_LLM_API_KEY_HEADER   = "X-Api-Key"
+# CORP_LLM_API_KEY          = "..."
+
+# ── Audit sink selection (audit/factory.py) ─────────────────────────────────
+#
+# CORP_AUDIT_SINK: stdout | langfuse | list. langfuse REQUIRES the three keys.
+# CORP_AUDIT_SINK           = "stdout"
+# CORP_LANGFUSE_URL         = "http://langfuse.corp.lan"
+# CORP_LANGFUSE_PUBLIC_KEY  = "pk-..."
+# CORP_LANGFUSE_SECRET_KEY  = "sk-..."
+
+# ── Operator RBAC for gateway-admin (auth/rbac.py) ───────────────────────────
+#
+# CORP_GATEWAY_RBAC = "0" bypasses RBAC (local dev). OIDC_KEY/ALG verify the
+# operator JWT; ADMIN_TOKEN supplies the JWT when --token is not passed.
+# CORP_GATEWAY_RBAC         = "1"
+# CORP_GATEWAY_OIDC_KEY     = "-----BEGIN PUBLIC KEY-----\n..."
+# CORP_GATEWAY_OIDC_ALG     = "RS256"
+# CORP_GATEWAY_ADMIN_TOKEN  = "eyJ..."
+
+# ── Providers guard (providers/registry.py) ──────────────────────────────────
+#
+# CORP_ALLOW_V2_PROVIDERS = "1" unlocks non-v1 providers (Bedrock/Gemini/Azure);
+# v1 allows only anthropic | openai (upstream) + corp-vllm (oracle).
+# CORP_ALLOW_V2_PROVIDERS   = "0"
+
+# ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────────
+#
+# Never-redact fixture values (so obvious test tokens survive sanitization).
+# CORP_LLM_TESTDATA_ALLOWLIST      = "sk-test-000,alice@example.com"
+# CORP_LLM_TESTDATA_ALLOWLIST_FILE = "/etc/corp-llm-gateway/testdata-allowlist.txt"
+
+# ── Demo stack only (docker compose) ─────────────────────────────────────────
+
+# DEMO_TEAM_TOKEN           = "demo-team-token"
 
 # ── Extensions & providers (nested tables, read via config.get_table) ────────
 #
