@@ -62,11 +62,16 @@
 # routinely are) used to be forwarded UNSANITIZED. CORP_LLM_OVERSIZE_POLICY now
 # governs what happens instead; the default fails closed.
 #   fail-closed  — reject the request (HTTP 422) before egress. Safe default.
-#   chunk        — split the leaf into overlapping windows, sanitize each through
-#                  the full cascade, reassemble (placeholder bijection preserved).
+#   chunk        — regex/checksum runs over the FULL text (unbounded-pattern
+#                  secrets cannot survive a chunk seam); only the size-bounded
+#                  NER pass is chunked into overlapping windows, then reassembled
+#                  (placeholder bijection preserved).
 #   deliver-flag — forward the original, but ONLY for a team listed in
-#                  CORP_LLM_OVERSIZE_DELIVER_TEAMS and ONLY when a full PII/DLP
-#                  rescan is clean; otherwise it falls back to fail-closed.
+#                  CORP_LLM_OVERSIZE_DELIVER_TEAMS and ONLY when a full rescan —
+#                  the same detection the normal path runs (regex+checksum +
+#                  configured detectors + gazetteer + rules + the conditional
+#                  oracle) — is clean; otherwise it falls back to fail-closed.
+#                  A delivered leaf is audited with block_reason=oversize:delivered.
 # CORP_LLM_OVERSIZE_POLICY        = "fail-closed"
 # CORP_LLM_OVERSIZE_DELIVER_TEAMS = "team-a,team-b"
 

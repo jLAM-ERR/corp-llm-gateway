@@ -289,6 +289,77 @@ async def test_oversize_deliver_flag_optin_dirty_blocks() -> None:
         await orch.sanitize(big, team_id="t1", conversation_id="c1")
 
 
+async def test_oversize_chunk_unbounded_secret_on_seam_fully_redacted() -> None:
+    """H1: an UNBOUNDED-pattern secret straddling a chunk seam is fully redacted.
+
+    JWT (`eyJ…`) and `sk-{32,}` have no length cap, so no fixed overlap can
+    contain them. With a tiny window/overlap that CANNOT hold either secret, the
+    full-text regex pass still matches them whole — nothing raw egresses.
+    """
+    client, _ = _client_returning_pairs([])  # oracle finds nothing; regex is full-text
+    window, overlap = 64, 16  # neither secret fits in a 64-char window
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=32,
+        oversize_policy=OVERSIZE_CHUNK,
+        chunk_window_chars=window,
+        chunk_overlap_chars=overlap,
+        local_detectors=[RegexChecksumDetector()],
+    )
+    jwt = "eyJ" + "A" * 300 + "." + "B" * 300 + "." + "C" * 300  # ~900 chars, unbounded
+    key = "sk-" + "d" * 60  # sk-{32,}, unbounded
+    text = "x" * 50 + " " + jwt + " mid " + key + " " + "y" * 50
+    result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+    assert jwt not in result.sanitized_text, "JWT leaked across a seam"
+    assert key not in result.sanitized_text, "long key leaked across a seam"
+    assert "C" * 50 not in result.sanitized_text, "raw JWT signature fragment egressed"
+    assert any(o == jwt for o, _ in result.pairs), "whole JWT not redacted as one pair"
+    assert any(o == key for o, _ in result.pairs), "whole key not redacted as one pair"
+    placeholders = [p for _, p in result.pairs]
+    assert len(placeholders) == len(set(placeholders)), "bijection: placeholders must be distinct"
+
+
+async def test_oversize_deliver_flag_oracle_only_finding_blocks() -> None:
+    """M2: an oracle-only finding (no regex/local/gazetteer/rule hit) fails closed.
+
+    Proves the deliver-flag rescan calls the oracle exactly as the normal path
+    would; without it a name only the oracle recognises would egress verbatim.
+    """
+    name = "Ivan Petrov"  # plain name: no regex/checksum floor match
+    client, captured = _client_returning_pairs([(name, "[NAME_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=10,
+        oversize_policy=OVERSIZE_DELIVER_FLAG,
+        oversize_deliver_teams=frozenset({"t1"}),
+    )
+    big = f"internal memo regarding {name} and the plan " + "z" * 30
+    with pytest.raises(OversizeContentError):
+        await orch.sanitize(big, team_id="t1", conversation_id="c1")
+    assert len(captured) == 1, "deliver-flag rescan must consult the oracle (M2)"
+
+
+async def test_oversize_deliver_flag_marks_result_block_reason() -> None:
+    """M1: a delivered oversize leaf carries the oversize:delivered marker."""
+    client, _ = _client_returning_pairs([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=10,
+        oversize_policy=OVERSIZE_DELIVER_FLAG,
+        oversize_deliver_teams=frozenset({"t1"}),
+    )
+    big = "the quick brown fox jumps over the lazy dog and then again"
+    result = await orch.sanitize(big, team_id="t1", conversation_id="c1")
+    assert result.skipped is True
+    assert result.block_reason == "oversize:delivered"
+
+
 # Length-descending substitution invariant ---------------------------------
 
 

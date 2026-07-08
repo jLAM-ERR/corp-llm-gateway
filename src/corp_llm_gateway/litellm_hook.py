@@ -399,6 +399,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 pairs=canonical_pairs,
                 cache_a_hit=result.cache_a_hit,
                 skipped=result.skipped,
+                block_reason=result.block_reason,
             )
 
         for i, msg in enumerate(messages):
@@ -559,11 +560,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             for result in results:
                 self._merge_into_state(state, result)
                 if result.skipped:
+                    # Reachable only via the opt-in oversize deliver-flag policy
+                    # (the old size-skip is gone — oversize now fails closed or
+                    # chunks by default). The original was delivered on purpose
+                    # after a clean full rescan; flagged for the audit trail.
                     logger.warning(
-                        "litellm_pre_call_system_sanitize_skipped_size request_id=%s "
-                        "content_bytes=%d",
+                        "litellm_pre_call_system_oversize_delivered request_id=%s "
+                        "content_bytes=%d block_reason=%s",
                         request_id,
                         system_bytes,
+                        result.block_reason,
                     )
             logger.info(
                 "litellm_pre_call_system_sanitize_done request_id=%s total_redaction_count=%d",
@@ -800,6 +806,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         state.redaction_count = len(state.placeholders)
         state.cache_a_hit = state.cache_a_hit or result.cache_a_hit
         state.mapping = StrategyResult(pairs=state.mapping.pairs + result.pairs)
+        # M1: surface an oversize deliver-flag egress in the audit record so an
+        # operator can find every delivered oversize original. Only the deliver
+        # path sets this; normal results leave it None.
+        if result.block_reason is not None:
+            state.block_reason = result.block_reason
 
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:

@@ -1536,6 +1536,43 @@ async def test_pre_call_oversize_message_chunk_policy_sanitizes() -> None:
     assert re.search(r"\[EMAIL_\d+\]", body), f"email not redacted: {body[:80]!r}"
 
 
+async def test_oversize_deliver_flag_marks_audit_block_reason() -> None:
+    """M1: a deliver-flag egress is marked oversize:delivered in the audit record."""
+    g, sink = _build_guardrail_oversize(
+        threshold=64, policy="deliver-flag", deliver_teams=frozenset({"t1"})
+    )
+    clean = "the quick brown fox jumps over the lazy dog and keeps running along here"
+    assert len(clean.encode("utf-8")) > 64
+    data = _data_with_token("tok-1", content=clean)
+    out = await g.pre_call(data)
+    assert out["messages"][0]["content"] == clean, "clean oversize leaf must be delivered"
+    start = time.time()
+    await g.async_log_success_event(
+        kwargs={"data": data},
+        response_obj={"choices": [{"message": {"content": "ok"}}]},
+        start_time=start,
+        end_time=start + 0.100,
+    )
+    assert len(sink.records) == 1
+    assert sink.records[0]["block_reason"] == "oversize:delivered"
+
+
+async def test_normal_request_audit_has_no_block_reason() -> None:
+    """M1 control: a normal zero/non-zero-redaction request carries no marker."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+    start = time.time()
+    await g.async_log_success_event(
+        kwargs={"data": data},
+        response_obj={"choices": [{"message": {"content": "ok [N1]"}}]},
+        start_time=start,
+        end_time=start + 0.100,
+    )
+    assert len(sink.records) == 1
+    assert "block_reason" not in sink.records[0]
+
+
 async def test_corp_llm_fails_on_second_segment_fails_closed_503() -> None:
     """M4 fail-closed: if corp-LLM succeeds on segment 1 then dies on segment 2,
     pre_call must raise GuardrailHttpException 503 E_CORP_LLM_DOWN.
