@@ -68,6 +68,12 @@ from corp_llm_gateway.sanitizer.placeholder import (
 from corp_llm_gateway.sanitizer.placeholder_allocator import (
     RequestPlaceholderAllocator,
 )
+from corp_llm_gateway.sanitizer.profile_orchestrator import (
+    PROFILE_ERRORS,
+    ProfileAwareOrchestrator,
+    ResolvedProfile,
+    passthrough_resolved,
+)
 from corp_llm_gateway.sanitizer.streaming import _json_string_escape, coerce_tool_index
 from corp_llm_gateway.tokens import (
     AuthError,
@@ -122,7 +128,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
     def __init__(
         self,
-        orchestrator: SanitizationOrchestrator,
+        orchestrator: SanitizationOrchestrator | ProfileAwareOrchestrator,
         auth_middleware: AuthMiddleware,
         audit_logger: AuditLogger,
         *,
@@ -332,6 +338,49 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         )
         self._req_state[request_id] = state
 
+        # D4: resolve the team's merged profile once per request. Empty
+        # profile_ids → passthrough (default policy, no fingerprint) == today.
+        # A misconfigured profile fails CLOSED — never fall through to
+        # un-profiled egress (invariant 6).
+        try:
+            resolved = await self._resolve_profile(ctx.team_id)
+        except PROFILE_ERRORS as exc:
+            self._record_failure(request_id, error_code="E_PROFILE_UNAVAILABLE")
+            logger.warning(
+                "litellm_pre_call_profile_unavailable request_id=%s team_id=%s exception=%s",
+                request_id,
+                ctx.team_id,
+                type(exc).__name__,
+            )
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                503,
+                "E_PROFILE_UNAVAILABLE",
+                "profile configuration unavailable",
+            ) from exc
+        state.profile_ids = resolved.profile_ids
+
+        # allowed_providers gate: the merged policy may restrict egress targets
+        # (None == unrestricted). Reject a banned provider before any content
+        # processing — a clean policy denial, no raw body.
+        allowed_providers = resolved.policy.allowed_providers
+        if allowed_providers is not None and provider not in allowed_providers:
+            state.block_reason = "provider:not_allowed"
+            self._record_failure(request_id, error_code="E_PROVIDER_BLOCKED")
+            logger.info(
+                "litellm_pre_call_provider_blocked request_id=%s provider=%s",
+                request_id,
+                provider,
+            )
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                403,
+                "E_PROVIDER_BLOCKED",
+                "request blocked: provider not allowed by policy",
+            )
+
         # One allocator per request. The corp-LLM numbers placeholders from
         # [LABEL_001] independently for each segment's sanitize() call, so
         # distinct originals across segments (e.g. a system-blob email and a
@@ -364,7 +413,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         # Stage 0: payload classifier — block config/log dumps before egress (R10/R11).
         # Runs after auth + _RequestState so the block carries user/team attribution.
-        if _config_get("CORP_LLM_BLOCK_PAYLOADS", "1") != "0":
+        # The merged profile policy can only ADD the block (monotone-tightening).
+        if _config_get("CORP_LLM_BLOCK_PAYLOADS", "1") != "0" or resolved.policy.block_payloads:
             _s0_texts: list[str] = []
             for _s0_msg in messages:
                 if isinstance(_s0_msg, dict):
@@ -394,7 +444,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 )
 
         async def sanitize_one(text: str) -> SanitizeResult:
-            result = await self._orch.sanitize(
+            # Route through the resolved inner orchestrator; it folds the D3
+            # profile fingerprint into Cache A (None for the no-profile case).
+            result = await resolved.sanitize(
                 text,
                 team_id=ctx.team_id,
                 conversation_id=request_id,
@@ -649,14 +701,27 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Defence-in-depth: catches canaries / raw secrets that survived the
         # primary sanitizer. Audit the block INLINE (idempotent) — litellm does
         # not fire the failure event for pre_call rejections; see Stage 0.
-        if _config_get("CORP_LLM_DLP_GUARD", "1") != "0":
+        # The merged profile policy can only ADD scanning: dlp_guard forces the
+        # stage on and canary_patterns are enforced on top of the base guard.
+        _s5_policy = resolved.policy
+        if (
+            _config_get("CORP_LLM_DLP_GUARD", "1") != "0"
+            or _s5_policy.dlp_guard
+            or _s5_policy.canary_patterns
+        ):
             _s5_texts: list[str] = []
             for _s5_msg in data.get("messages") or []:
                 if isinstance(_s5_msg, dict):
                     _s5_texts.extend(collect_text(_s5_msg.get("content")))
                     _s5_texts.extend(collect_tool_call_text(_s5_msg))
             _s5_texts.extend(collect_text(data.get("system")))
-            _s5_reason = self._dlp_guard.scan("\n".join(_s5_texts))
+            _s5_joined = "\n".join(_s5_texts)
+            _s5_reason = self._dlp_guard.scan(_s5_joined)
+            if _s5_reason is None and _s5_policy.canary_patterns:
+                _s5_reason = DlpEgressGuard(
+                    canary_patterns=list(_s5_policy.canary_patterns),
+                    secret_rescan=False,
+                ).scan(_s5_joined)
             if _s5_reason is not None:
                 state.block_reason = _s5_reason
                 self._record_failure(request_id, error_code="E_DLP_BLOCKED")
@@ -826,6 +891,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 error_code if error_code is not None else (state.error_code if state else None)
             ),
             block_reason=(state.block_reason if state else None),
+            profile_ids=(state.profile_ids if state else ()),
         )
         await self._audit.emit(event)
         logger.info(
@@ -899,6 +965,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:
             self._req_state[request_id].error_code = error_code
+
+    async def _resolve_profile(self, team_id: str) -> ResolvedProfile:
+        """Resolve the team's merged profile (policy + inner orchestrator + D3
+        fingerprint). A plain orchestrator has no profiles → the passthrough
+        resolution (default policy, no fingerprint) keeps today's behavior."""
+        orch = self._orch
+        if isinstance(orch, ProfileAwareOrchestrator):
+            return await orch.resolve(team_id)
+        return passthrough_resolved(orch)
 
 
 # ---- helpers --------------------------------------------------------------
@@ -1043,6 +1118,7 @@ class _RequestState:
         "mapping",
         "model",
         "placeholders",
+        "profile_ids",
         "provider",
         "redaction_count",
         "request_id",
@@ -1074,6 +1150,9 @@ class _RequestState:
         self.mapping = mapping
         self.error_code: str | None = None
         self.block_reason: str | None = None
+        # Resolved profile layer-key (D4) — metadata for the audit trail; set
+        # after profile resolution in pre_call. Empty == no profile applied.
+        self.profile_ids: tuple[str, ...] = ()
 
 
 def _extract_headers(data: dict[str, Any]) -> dict[str, str]:
