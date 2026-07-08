@@ -518,3 +518,144 @@ async def test_rules_bijection_holds_in_gazetteer_nohit() -> None:
     assert len(placeholders) == len(set(placeholders)), "placeholder collision"
     assert "[CONFIDENTIAL_PROJECT]" in result.sanitized_text
     assert "[INTERNAL_HOST]" in result.sanitized_text
+
+
+# ---------------------------------------------------------------------------
+# D3 (SECURITY-CRITICAL): Cache-A profile fingerprint — cross-profile bleed
+# ---------------------------------------------------------------------------
+
+_D3_TEXT = "Deploy Sistema to prod"
+_D3_SECRET = "Sistema"
+
+
+def _permissive_orch(store: InMemoryMappingStore) -> SanitizationOrchestrator:
+    """Orchestrator whose profile redacts NOTHING (oracle returns no pairs)."""
+    client, _ = _client_returning_pairs([])
+    return SanitizationOrchestrator(client, store, _StaticRulesLoader(Rules(rules=())))
+
+
+def _strict_orch(store: InMemoryMappingStore) -> tuple[SanitizationOrchestrator, list[dict]]:
+    """Orchestrator whose profile MUST redact _D3_SECRET (local detector finds it)."""
+    client, captured = _client_returning_pairs([])
+    idx = _D3_TEXT.index(_D3_SECRET)
+    detector = _StaticFindingDetector(
+        [Finding(_D3_SECRET, "PRODUCT", idx, idx + len(_D3_SECRET), 0.95)]
+    )
+    orch = SanitizationOrchestrator(
+        client,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        local_detectors=[detector],
+    )
+    return orch, captured
+
+
+def _profile_fp(profile_ids: tuple[str, ...]) -> str:
+    from corp_llm_gateway.profiles import (
+        PolicyKnobs,
+        ProfileBundle,
+        bundle_fingerprint,
+    )
+    from corp_llm_gateway.sanitizer.allowlist import Allowlist
+
+    return bundle_fingerprint(
+        ProfileBundle(
+            detectors=(),
+            gazetteer=None,
+            rules=Rules(rules=()),
+            allowlist=Allowlist(()),
+            policy=PolicyKnobs(),
+            profile_ids=profile_ids,
+        )
+    )
+
+
+async def test_cross_profile_cache_bleed_without_fingerprint() -> None:
+    """REPRO: same team+rules+text, two profiles, ONE shared store, NO fingerprint.
+
+    A permissive profile seeds Cache A with an un-redacted result; a strict
+    profile that MUST redact _D3_SECRET then hits that entry and egresses the
+    raw term — a cross-jurisdiction leak (this is the bug D3 closes).
+    """
+    store = InMemoryMappingStore()
+    permissive = _permissive_orch(store)
+    strict, _ = _strict_orch(store)
+
+    r_perm = await permissive.sanitize(_D3_TEXT, team_id="t1", conversation_id="c-perm")
+    assert _D3_SECRET in r_perm.sanitized_text, "permissive profile leaves the term as-is"
+
+    r_strict = await strict.sanitize(_D3_TEXT, team_id="t1", conversation_id="c-strict")
+    assert r_strict.cache_a_hit is True, "strict request wrongly reuses the permissive entry"
+    assert _D3_SECRET in r_strict.sanitized_text, "LEAK: term that must be redacted egressed"
+
+
+async def test_profile_fingerprint_prevents_cross_profile_reuse() -> None:
+    """FIX: distinct profile fingerprints → distinct Cache-A keys → no bleed."""
+    store = InMemoryMappingStore()
+    permissive = _permissive_orch(store)
+    strict, _ = _strict_orch(store)
+
+    fp_permissive = _profile_fp(("us-base",))
+    fp_strict = _profile_fp(("ru-152fz",))
+    assert fp_permissive != fp_strict
+
+    r_perm = await permissive.sanitize(
+        _D3_TEXT, team_id="t1", conversation_id="c-perm", profile_fingerprint=fp_permissive
+    )
+    assert _D3_SECRET in r_perm.sanitized_text
+
+    r_strict = await strict.sanitize(
+        _D3_TEXT, team_id="t1", conversation_id="c-strict", profile_fingerprint=fp_strict
+    )
+    assert r_strict.cache_a_hit is False, "different fingerprint must miss the permissive entry"
+    assert _D3_SECRET not in r_strict.sanitized_text, "strict profile redacts the term"
+    assert any(o == _D3_SECRET for o, _ in r_strict.pairs)
+
+
+async def test_same_profile_fingerprint_preserves_cache_hit() -> None:
+    """Dedup still works: same fingerprint + same text → Cache-A hit, oracle called once."""
+    store = InMemoryMappingStore()
+    strict, captured = _strict_orch(store)
+    fp = _profile_fp(("ru-152fz",))
+
+    r1 = await strict.sanitize(_D3_TEXT, team_id="t1", conversation_id="c1", profile_fingerprint=fp)
+    r2 = await strict.sanitize(_D3_TEXT, team_id="t1", conversation_id="c2", profile_fingerprint=fp)
+    assert r1.cache_a_hit is False
+    assert r2.cache_a_hit is True, "same profile + text must dedup"
+    assert r2.sanitized_text == r1.sanitized_text
+    assert _D3_SECRET not in r2.sanitized_text
+    assert len(captured) == 1, "cache A must save the second corp-LLM call"
+
+
+async def test_none_fingerprint_is_byte_identical_to_legacy_key() -> None:
+    """Back-compat: a None fingerprint yields exactly today's content hash."""
+    from corp_llm_gateway.sanitizer.orchestrator import _content_hash
+
+    rules = Rules(rules=(Rule("alice", "[N1]"),))
+    assert _content_hash("t1", rules, "x") == _content_hash("t1", rules, "x", None)
+
+
+async def test_content_hash_folds_fingerprint_into_key() -> None:
+    """A profile fingerprint changes the Cache-A key; distinct fps stay distinct."""
+    from corp_llm_gateway.sanitizer.orchestrator import _content_hash
+
+    rules = Rules(rules=())
+    base = _content_hash("t1", rules, "x")
+    fp_a = _content_hash("t1", rules, "x", "fpA")
+    fp_b = _content_hash("t1", rules, "x", "fpB")
+    assert fp_a != base, "a fingerprint must not collide with the no-profile key"
+    assert fp_a != fp_b, "different fingerprints must not collide"
+    assert fp_a == _content_hash("t1", rules, "x", "fpA"), "same inputs must be stable"
+
+
+async def test_none_fingerprint_preserves_dedup_behavior() -> None:
+    """Default (None) fingerprint keeps the pre-D3 shared-dedup behavior intact."""
+    client, captured = _client_returning_pairs([("alice", "[N1]")])
+    orch = SanitizationOrchestrator(
+        client, InMemoryMappingStore(), _StaticRulesLoader(Rules(rules=()))
+    )
+    r1 = await orch.sanitize("hello alice", team_id="t1", conversation_id="c1")
+    r2 = await orch.sanitize("hello alice", team_id="t1", conversation_id="c2")
+    assert r1.cache_a_hit is False
+    assert r2.cache_a_hit is True
+    assert len(captured) == 1

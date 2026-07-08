@@ -5,6 +5,8 @@ import pytest
 import pytest_asyncio
 from fakeredis import aioredis as fakeredis_aio
 
+from corp_llm_gateway.rules.models import Rules
+from corp_llm_gateway.sanitizer.orchestrator import _content_hash
 from corp_llm_gateway.storage import (
     InMemoryMappingStore,
     MappingStore,
@@ -62,6 +64,53 @@ async def test_dedup_isolation_across_hashes(store: MappingStore) -> None:
     await store.set_dedup("h-b", b, ttl_seconds=10)
     assert await store.get_dedup("h-a") == a
     assert await store.get_dedup("h-b") == b
+
+
+# Cache A — D3 profile-fingerprint isolation (both backends) -----------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_isolated_across_profile_fingerprints(store: MappingStore) -> None:
+    """A profile fingerprint folded into the key isolates cross-profile results.
+
+    Same team/rules/text, two profiles: the permissive (empty) mapping and the
+    strict (redacting) mapping never collide, so a strict request cannot be
+    served the permissive result (the D3 cross-jurisdiction bleed).
+    """
+    rules = Rules(rules=())
+    key_us = _content_hash("t1", rules, "Deploy Sistema", "fp-us-base")
+    key_ru = _content_hash("t1", rules, "Deploy Sistema", "fp-ru-152fz")
+    assert key_us != key_ru
+
+    us_map = PlaceholderMapping(pairs=())
+    ru_map = PlaceholderMapping(pairs=(("Sistema", "[PRODUCT_001]"),))
+    await store.set_dedup(key_us, us_map, ttl_seconds=10)
+    await store.set_dedup(key_ru, ru_map, ttl_seconds=10)
+
+    assert await store.get_dedup(key_ru) == ru_map
+    assert await store.get_dedup(key_us) == us_map
+
+
+@pytest.mark.asyncio
+async def test_dedup_shared_within_same_profile_fingerprint(store: MappingStore) -> None:
+    """Same profile fingerprint re-derives the identical key → dedup still hits."""
+    rules = Rules(rules=())
+    key = _content_hash("t1", rules, "Deploy Sistema", "fp-ru-152fz")
+    mapping = PlaceholderMapping(pairs=(("Sistema", "[PRODUCT_001]"),))
+    await store.set_dedup(key, mapping, ttl_seconds=10)
+    assert _content_hash("t1", rules, "Deploy Sistema", "fp-ru-152fz") == key
+    assert await store.get_dedup(key) == mapping
+
+
+@pytest.mark.asyncio
+async def test_dedup_none_fingerprint_matches_legacy_key(store: MappingStore) -> None:
+    """A None fingerprint keys the SAME entry as the pre-D3 (no-arg) call."""
+    rules = Rules(rules=())
+    legacy = _content_hash("t1", rules, "Deploy Sistema")
+    assert _content_hash("t1", rules, "Deploy Sistema", None) == legacy
+    mapping = PlaceholderMapping(pairs=())
+    await store.set_dedup(legacy, mapping, ttl_seconds=10)
+    assert await store.get_dedup(_content_hash("t1", rules, "Deploy Sistema", None)) == mapping
 
 
 # Cache B — per-conversation mapping ----------------------------------------

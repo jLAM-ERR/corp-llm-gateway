@@ -139,7 +139,13 @@ class SanitizationOrchestrator:
         *,
         team_id: str,
         conversation_id: str,
+        profile_fingerprint: str | None = None,
     ) -> SanitizeResult:
+        # profile_fingerprint distinguishes the resolved profile bundle in the
+        # SHARED Cache-A key (D3): two requests with identical team/rules/text but
+        # different profiles must NOT reuse each other's sanitization, or a
+        # RU-152FZ redaction can bleed to a US request. None == no profile ==
+        # today's behavior (byte-identical content hash).
         content_bytes = len(text.encode("utf-8"))
         logger.info(
             "sanitize_start team_id=%s conversation_id=%s content_bytes=%d",
@@ -164,7 +170,7 @@ class SanitizationOrchestrator:
             len(rules.rules),
         )
 
-        content_hash = _content_hash(team_id, rules, text)
+        content_hash = _content_hash(team_id, rules, text, profile_fingerprint)
 
         cached = await self._mapping_store.get_dedup(content_hash)
         if cached is not None:
@@ -571,7 +577,12 @@ def _build_system_prompt(rules: Rules) -> str:
     return "\n".join(lines)
 
 
-def _content_hash(team_id: str, rules: Rules, text: str) -> str:
+def _content_hash(
+    team_id: str,
+    rules: Rules,
+    text: str,
+    profile_fingerprint: str | None = None,
+) -> str:
     h = hashlib.sha256()
     h.update(team_id.encode("utf-8"))
     h.update(b"\x1f")
@@ -582,6 +593,11 @@ def _content_hash(team_id: str, rules: Rules, text: str) -> str:
         h.update(b"\x1f")
     h.update(b"\x1d")
     h.update(text.encode("utf-8"))
+    # Fold the profile fingerprint ONLY when present: a None fingerprint leaves
+    # the digest byte-identical to the pre-D3 key (full back-compat).
+    if profile_fingerprint is not None:
+        h.update(b"\x1c")
+        h.update(profile_fingerprint.encode("utf-8"))
     return h.hexdigest()
 
 

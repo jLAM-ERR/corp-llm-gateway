@@ -26,7 +26,7 @@ from corp_llm_gateway.profiles.manifest import (
     verify_signature,
 )
 from corp_llm_gateway.profiles.registry import DETECTOR_REGISTRY, build_detectors
-from corp_llm_gateway.profiles.resolver import ProfileResolver
+from corp_llm_gateway.profiles.resolver import ProfileResolver, bundle_fingerprint
 
 __all__ = [
     "DETECTOR_REGISTRY",
@@ -47,6 +47,7 @@ __all__ = [
     "StubProfileLoader",
     "build_bundle",
     "build_detectors",
+    "bundle_fingerprint",
     "compute_content_hash",
     "parse_manifest",
     "read_layer_source",
