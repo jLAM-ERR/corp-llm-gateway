@@ -86,6 +86,14 @@ KEYS: tuple[Key, ...] = (
     Key("CORP_LLM_OVERSIZE_POLICY", default="fail-closed", help="oversize-leaf policy (F1)"),
     Key("CORP_LLM_OVERSIZE_DELIVER_TEAMS", default="", help="teams allowed deliver-flag"),
     Key("CORP_LLM_REQUIRE_NER", flag=True, default="0", help="fail closed when NER absent (F2)"),
+    # Choices validated by normalize_oracle_trigger (see _check_oracle_trigger),
+    # not the generic choice check, because sampled:<pct> is not a fixed literal.
+    Key(
+        "CORP_LLM_ORACLE_TRIGGER",
+        default="gazetteer_hit",
+        help="when the conditional oracle runs (F3): "
+        "gazetteer_hit | any_local_finding | sampled:<pct> | always",
+    ),
     Key("CORP_LLM_LOG_LEVEL", default="INFO", help="log level"),
     # ── Backends ─────────────────────────────────────────────────────────────
     Key("CORP_LLM_PG_DSN", secret=True, help="Postgres DSN; unset → in-memory stores"),
@@ -251,6 +259,15 @@ def _check_oversize(values: Mapping[str, str | None], problems: list[str]) -> No
         problems.append(f"CORP_LLM_OVERSIZE_POLICY: {exc}")
 
 
+def _check_oracle_trigger(values: Mapping[str, str | None], problems: list[str]) -> None:
+    from corp_llm_gateway.sanitizer.orchestrator import normalize_oracle_trigger
+
+    try:
+        normalize_oracle_trigger(values.get("CORP_LLM_ORACLE_TRIGGER"))
+    except ValueError as exc:
+        problems.append(f"CORP_LLM_ORACLE_TRIGGER: {exc}")
+
+
 def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) -> bool:
     """Validate required-endpoint + choices with pydantic. Returns False if absent.
 
@@ -298,6 +315,7 @@ def validate() -> Settings:
         _check_choices(values, problems)
     _check_conditional(values, problems)
     _check_oversize(values, problems)
+    _check_oracle_trigger(values, problems)
     if problems:
         raise ConfigError(list(dict.fromkeys(problems)))
     return Settings(values=values)

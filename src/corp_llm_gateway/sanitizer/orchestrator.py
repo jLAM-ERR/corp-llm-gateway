@@ -60,7 +60,65 @@ _MAX_ENTITY_CHARS = 8192 + 128
 _DEFAULT_CHUNK_OVERLAP_CHARS = _MAX_ENTITY_CHARS
 _DEFAULT_CHUNK_WINDOW_CHARS = 4 * _MAX_ENTITY_CHARS
 
+# CORP_LLM_ORACLE_TRIGGER values (F3). Govern when the CONDITIONAL oracle runs on
+# a NO-gazetteer-hit leaf. A gazetteer hit ALWAYS runs the oracle regardless — the
+# trigger only widens the no-hit case. gazetteer_hit (default) keeps ADR-003
+# latency parity; the others backstop an incomplete local detection.
+ORACLE_TRIGGER_GAZETTEER_HIT = "gazetteer_hit"
+ORACLE_TRIGGER_ANY_LOCAL_FINDING = "any_local_finding"
+ORACLE_TRIGGER_ALWAYS = "always"
+_ORACLE_TRIGGER_SAMPLED_PREFIX = "sampled:"
+_ORACLE_TRIGGER_FIXED = frozenset(
+    {ORACLE_TRIGGER_GAZETTEER_HIT, ORACLE_TRIGGER_ANY_LOCAL_FINDING, ORACLE_TRIGGER_ALWAYS}
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _parse_sample_pct(trigger: str) -> int:
+    """Extract the ``<pct>`` (0..100) from a canonical ``sampled:<pct>`` trigger."""
+    raw = trigger[len(_ORACLE_TRIGGER_SAMPLED_PREFIX) :]
+    try:
+        pct = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"invalid oracle trigger {trigger!r}; 'sampled:<pct>' needs an integer, got {raw!r}"
+        ) from None
+    if not 0 <= pct <= 100:
+        raise ValueError(f"invalid oracle trigger {trigger!r}; pct must be 0..100, got {pct}")
+    return pct
+
+
+def normalize_oracle_trigger(value: str | None) -> str:
+    """Validate CORP_LLM_ORACLE_TRIGGER; unset/empty → gazetteer_hit. Unknown → ValueError.
+
+    Canonical forms: ``gazetteer_hit`` | ``any_local_finding`` | ``always`` |
+    ``sampled:<pct>`` where ``<pct>`` is an integer 0..100.
+    """
+    trigger = (value or ORACLE_TRIGGER_GAZETTEER_HIT).strip().lower()
+    if trigger in _ORACLE_TRIGGER_FIXED:
+        return trigger
+    if trigger.startswith(_ORACLE_TRIGGER_SAMPLED_PREFIX):
+        return f"{_ORACLE_TRIGGER_SAMPLED_PREFIX}{_parse_sample_pct(trigger)}"
+    raise ValueError(
+        f"invalid oracle trigger {value!r}; expected one of "
+        f"{sorted(_ORACLE_TRIGGER_FIXED)} or 'sampled:<pct>' (pct 0..100)"
+    )
+
+
+def _sample_selected(seed: str, pct: int) -> bool:
+    """Deterministic per-request sample: True for ~``pct``% of distinct seeds.
+
+    Seeds from a stable SHA-256 of the seed string (conversation_id + content),
+    NEVER a PRNG or clock — a given request always resolves the same way (F3), so
+    the sampled fraction is reproducible and auditable.
+    """
+    if pct <= 0:
+        return False
+    if pct >= 100:
+        return True
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % 100 < pct
 
 
 def _rules_pairs(rules: Rules, text: str) -> tuple[tuple[str, str], ...]:
@@ -105,6 +163,7 @@ class SanitizationOrchestrator:
         local_detectors: list[PIIDetector] | None = None,
         gazetteer: Gazetteer | None = None,
         allowlist: Allowlist | None = None,
+        oracle_trigger: str = ORACLE_TRIGGER_GAZETTEER_HIT,
     ) -> None:
         self._corp_llm = corp_llm
         self._mapping_store = mapping_store
@@ -129,6 +188,14 @@ class SanitizationOrchestrator:
         self._chunk_local = LocalDetectionPass(chunk_detectors) if chunk_detectors else None
         self._gazetteer = gazetteer
         self._allowlist = allowlist
+        # F3: how widely the conditional oracle fires on a no-gazetteer-hit leaf.
+        # Default gazetteer_hit preserves latency parity (oracle skipped on no hit).
+        self._oracle_trigger = normalize_oracle_trigger(oracle_trigger)
+        self._oracle_sample_pct = (
+            _parse_sample_pct(self._oracle_trigger)
+            if self._oracle_trigger.startswith(_ORACLE_TRIGGER_SAMPLED_PREFIX)
+            else None
+        )
         # Deterministic regex+checksum detector used both for the deliver-flag
         # rescan and for the full-text (seam-independent) pass in chunk mode.
         self._regex_checksum = RegexChecksumDetector()
@@ -251,20 +318,32 @@ class SanitizationOrchestrator:
         """
         local_pass = self._chunk_local if chunked else self._local
         if self._gazetteer is not None:
-            # DP-4: run gazetteer + local first; oracle is conditional on a gazetteer hit.
+            # DP-4 + F3: run gazetteer + local first. The oracle is CONDITIONAL — a
+            # gazetteer hit always runs it; CORP_LLM_ORACLE_TRIGGER may widen the
+            # no-hit case (any_local_finding | sampled:<pct> | always).
             gaz_findings = await self._gazetteer.detect(text)
             local_findings = await local_pass.findings(text) if local_pass is not None else []
             combined = _deduplicate(local_findings + gaz_findings)
             # Rules are top-priority: computed once, applied in both sub-branches.
             rules_pairs = _rules_pairs(rules, text)
             rule_origins = {o for o, _ in rules_pairs}
-            if gaz_findings:
+            oracle_runs = self._oracle_should_run(
+                gaz_findings=gaz_findings,
+                local_findings=local_findings,
+                rules_pairs=rules_pairs,
+                conversation_id=conversation_id,
+                text=text,
+            )
+            if oracle_runs:
                 logger.info(
-                    "sanitize_branch=gazetteer_hit oracle=yes "
-                    "team_id=%s conversation_id=%s gaz_hits=%d",
+                    "sanitize_branch=gazetteer oracle=yes trigger=%s gaz_hit=%s "
+                    "team_id=%s conversation_id=%s gaz_hits=%d local_findings=%d",
+                    self._oracle_trigger,
+                    bool(gaz_findings),
                     team_id,
                     conversation_id,
                     len(gaz_findings),
+                    len(local_findings),
                 )
                 logger.info(
                     "sanitize_corp_llm_call_start team_id=%s conversation_id=%s",
@@ -283,10 +362,11 @@ class SanitizationOrchestrator:
                 merged_pairs = _merge_local(rules_pairs + oracle_kept, combined)
                 _emit_gazetteer_proposal(oracle_result.pairs, combined, team_id, conversation_id)
             else:
-                # No gazetteer hit → rules still apply; oracle skipped.
+                # Oracle skipped → rules still apply; local findings merged.
                 logger.info(
-                    "sanitize_branch=gazetteer_nohit oracle=skipped "
+                    "sanitize_branch=gazetteer oracle=skipped trigger=%s "
                     "team_id=%s conversation_id=%s local_findings=%d",
+                    self._oracle_trigger,
                     team_id,
                     conversation_id,
                     len(local_findings),
@@ -349,6 +429,33 @@ class SanitizationOrchestrator:
         if self._allowlist is not None:
             result = StrategyResult(pairs=self._allowlist.filter_pairs(result.pairs))
         return result
+
+    def _oracle_should_run(
+        self,
+        *,
+        gaz_findings: list[Finding],
+        local_findings: list[Finding],
+        rules_pairs: tuple[tuple[str, str], ...],
+        conversation_id: str,
+        text: str,
+    ) -> bool:
+        """Decide whether the conditional oracle runs for THIS leaf (F3 trigger).
+
+        A gazetteer hit ALWAYS runs the oracle (ADR-003 baseline). The
+        CORP_LLM_ORACLE_TRIGGER knob only widens the no-hit case: ``gazetteer_hit``
+        keeps today's skip (latency parity); ``any_local_finding`` backstops a
+        rules/regex/NER hit; ``sampled:<pct>`` runs a deterministic fraction;
+        ``always`` runs every leaf.
+        """
+        if gaz_findings:
+            return True
+        if self._oracle_sample_pct is not None:
+            return _sample_selected(f"{conversation_id}\x1f{text}", self._oracle_sample_pct)
+        if self._oracle_trigger == ORACLE_TRIGGER_ALWAYS:
+            return True
+        if self._oracle_trigger == ORACLE_TRIGGER_ANY_LOCAL_FINDING:
+            return bool(local_findings or rules_pairs)
+        return False  # gazetteer_hit
 
     async def _handle_oversize(
         self,
@@ -477,7 +584,7 @@ class SanitizationOrchestrator:
         finding also blocks the egress (M2). Any finding fails closed; a clean scan
         delivers the original, flagged distinctly for the audit trail (M1).
         """
-        findings = await self._scan_findings(text, rules)
+        findings = await self._scan_findings(text, rules, conversation_id=conversation_id)
         if findings:
             logger.warning(
                 "sanitize_oversize_deliver_blocked team_id=%s conversation_id=%s "
@@ -501,7 +608,9 @@ class SanitizationOrchestrator:
             text, (), cache_a_hit=False, skipped=True, block_reason=OVERSIZE_DELIVERED_REASON
         )
 
-    async def _scan_findings(self, text: str, rules: Rules) -> list[Finding]:
+    async def _scan_findings(
+        self, text: str, rules: Rules, *, conversation_id: str
+    ) -> list[Finding]:
         # Always-on deterministic floor: regex+checksum runs regardless of which
         # local detectors are configured (defence-in-depth for the opt-in path).
         findings: list[Finding] = list(await self._regex_checksum.detect(text))
@@ -509,17 +618,30 @@ class SanitizationOrchestrator:
         if self._gazetteer is not None:
             gaz_findings = list(await self._gazetteer.detect(text))
             findings.extend(gaz_findings)
+        local_findings: list[Finding] = []
         if self._local is not None:
-            findings.extend(await self._local.findings(text))
-        for pattern, _ in _rules_pairs(rules, text):
+            local_findings = await self._local.findings(text)
+            findings.extend(local_findings)
+        rules_pairs = _rules_pairs(rules, text)
+        for pattern, _ in rules_pairs:
             findings.append(
                 Finding(text=pattern, label="RULE", start=0, end=len(pattern), score=1.0)
             )
         # M2: mirror the normal path's conditional oracle so an oracle-only finding
         # (no regex/local/gazetteer/rule hit) also blocks a deliver-flag egress.
-        # Identical trigger to `_detect`: the oracle runs unless a gazetteer is
-        # configured and produced no hit.
-        oracle_runs = bool(gaz_findings) if self._gazetteer is not None else True
+        # Identical F3 trigger to `_detect`; no gazetteer configured → legacy
+        # always-on oracle.
+        oracle_runs = (
+            self._oracle_should_run(
+                gaz_findings=gaz_findings,
+                local_findings=local_findings,
+                rules_pairs=rules_pairs,
+                conversation_id=conversation_id,
+                text=text,
+            )
+            if self._gazetteer is not None
+            else True
+        )
         if oracle_runs:
             oracle_result = await self._call_corp_llm(text, rules)
             findings.extend(

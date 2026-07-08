@@ -115,6 +115,18 @@ def oversize_policy() -> str:
     return normalize_oversize_policy(get("CORP_LLM_OVERSIZE_POLICY"))
 
 
+def oracle_trigger() -> str:
+    """Resolve ``CORP_LLM_ORACLE_TRIGGER`` (F3 conditional-oracle broadening).
+
+    One of ``gazetteer_hit`` (default — ADR-003 latency parity) | ``any_local_finding``
+    | ``sampled:<pct>`` | ``always``. Unset/empty → ``gazetteer_hit``; an unknown
+    value raises ``ValueError``.
+    """
+    from corp_llm_gateway.sanitizer.orchestrator import normalize_oracle_trigger
+
+    return normalize_oracle_trigger(get("CORP_LLM_ORACLE_TRIGGER"))
+
+
 _TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 _PROD_ENVS: frozenset[str] = frozenset({"prod", "production"})

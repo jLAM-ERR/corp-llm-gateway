@@ -17,8 +17,9 @@ import pytest
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.payload import OversizeContentError
-from corp_llm_gateway.rules import Gazetteer, Rules, RulesLoader
+from corp_llm_gateway.rules import Gazetteer, Rule, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.orchestrator import _sample_selected, normalize_oracle_trigger
 from corp_llm_gateway.storage import InMemoryMappingStore
 
 
@@ -435,3 +436,308 @@ async def test_gazetteer_without_local_detectors_nohit() -> None:
     assert call_count[0] == 0
     assert result.pairs == ()
     assert result.sanitized_text == "Nothing here."
+
+
+# ---------------------------------------------------------------------------
+# F3: CORP_LLM_ORACLE_TRIGGER — broaden the conditional oracle
+# ---------------------------------------------------------------------------
+
+
+class _RuleLoader(RulesLoader):
+    def __init__(self, rules: Rules) -> None:
+        self._rules = rules
+
+    async def load(self, team_id: str) -> Rules:
+        return self._rules
+
+
+# ── default (gazetteer_hit) — latency parity, no behavior change ─────────────
+
+
+async def test_trigger_default_is_gazetteer_hit_local_does_not_wake_oracle() -> None:
+    """No oracle_trigger passed → default gazetteer_hit: a local finding on a
+    no-gazetteer-hit leaf does NOT wake the oracle (ADR-003 latency parity)."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    email = Finding("bob@example.com", "EMAIL", 6, 21, 0.95)
+    client, call_count = _client_with_counter([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        local_detectors=[_StaticFindingDetector([email])],
+    )
+    result = await orch.sanitize("hello bob@example.com here", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 0
+    assert "bob@example.com" not in result.sanitized_text  # local still applied
+
+
+# ── any_local_finding — backstop an incomplete local detection ───────────────
+
+
+async def test_trigger_any_local_finding_local_wakes_oracle() -> None:
+    """any_local_finding: a local (regex/NER) finding on a no-gaz-hit leaf wakes the oracle."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    email = Finding("bob@example.com", "EMAIL", 6, 21, 0.95)
+    client, call_count = _client_with_counter([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        local_detectors=[_StaticFindingDetector([email])],
+        oracle_trigger="any_local_finding",
+    )
+    result = await orch.sanitize("hello bob@example.com here", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 1
+    assert "bob@example.com" not in result.sanitized_text
+
+
+async def test_trigger_any_local_finding_rule_wakes_oracle() -> None:
+    """any_local_finding: a matched rule (no gaz hit, no local detector) wakes the oracle."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    rules = Rules(rules=(Rule("widget", "[WIDGET]"),))
+    client, call_count = _client_with_counter([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _RuleLoader(rules),
+        gazetteer=gaz,
+        oracle_trigger="any_local_finding",
+    )
+    await orch.sanitize("the widget is broken", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 1
+
+
+async def test_trigger_any_local_finding_clean_skips_oracle() -> None:
+    """any_local_finding: nothing fired (no gaz/local/rule) → oracle still skipped."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    client, call_count = _client_with_counter([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        oracle_trigger="any_local_finding",
+    )
+    await orch.sanitize("nothing sensitive at all", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 0
+
+
+async def test_trigger_any_local_finding_bijection_holds() -> None:
+    """any_local_finding: local + oracle both contribute on a no-gaz-hit leaf; bijection holds."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    email = Finding("alice@corp.lan", "EMAIL", 5, 19, 0.95)
+    client, _ = _client_with_counter([("Bob Jones", "[PERSON_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        local_detectors=[_StaticFindingDetector([email])],
+        oracle_trigger="any_local_finding",
+    )
+    text = "mail alice@corp.lan and Bob Jones now"
+    result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+    originals = [o for o, _ in result.pairs]
+    placeholders = [p for _, p in result.pairs]
+    assert len(originals) == len(set(originals)), "duplicate original"
+    assert len(placeholders) == len(set(placeholders)), "placeholder collision"
+    assert "alice@corp.lan" not in result.sanitized_text
+    assert "Bob Jones" not in result.sanitized_text
+
+
+# ── always — oracle on every leaf ────────────────────────────────────────────
+
+
+async def test_trigger_always_calls_on_clean_request() -> None:
+    """always: the oracle runs even on a clean no-gaz-hit leaf."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    client, call_count = _client_with_counter([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        oracle_trigger="always",
+    )
+    await orch.sanitize("nothing here at all", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 1
+
+
+# ── gazetteer hit always runs the oracle regardless of trigger ───────────────
+
+
+@pytest.mark.parametrize("trigger", ["gazetteer_hit", "any_local_finding", "sampled:0", "always"])
+async def test_trigger_gaz_hit_always_runs_oracle(trigger: str) -> None:
+    """A gazetteer hit runs the oracle under EVERY trigger (baseline preserved)."""
+    gaz = Gazetteer({"AML": "REGULATED"})
+    client, call_count = _client_with_counter([("AML", "[REGULATED_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        oracle_trigger=trigger,
+    )
+    await orch.sanitize("AML review", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 1
+
+
+# ── sampled:<pct> — deterministic per-request sampling ───────────────────────
+
+
+async def test_trigger_sampled_deterministic_same_request() -> None:
+    """sampled:50: the SAME request (fresh cache each time) yields the SAME decision."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    text = "some neutral content for sampling"
+    counts: list[int] = []
+    for _ in range(2):
+        client, call_count = _client_with_counter([])
+        orch = SanitizationOrchestrator(
+            client,
+            InMemoryMappingStore(),
+            _StaticRulesLoader(),
+            gazetteer=gaz,
+            oracle_trigger="sampled:50",
+        )
+        await orch.sanitize(text, team_id="t1", conversation_id="conv-xyz")
+        counts.append(call_count[0])
+    assert counts[0] == counts[1], "same request must resolve to the same sampling decision"
+
+
+async def test_trigger_sampled_half_of_varied_set() -> None:
+    """sampled:50: over a varied set of no-hit requests, ~half wake the oracle."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    n = 200
+    selected = 0
+    for i in range(n):
+        client, call_count = _client_with_counter([])
+        orch = SanitizationOrchestrator(
+            client,
+            InMemoryMappingStore(),
+            _StaticRulesLoader(),
+            gazetteer=gaz,
+            oracle_trigger="sampled:50",
+        )
+        await orch.sanitize(f"neutral content {i}", team_id="t1", conversation_id=f"conv-{i}")
+        selected += call_count[0]
+    assert 0.3 * n <= selected <= 0.7 * n
+
+
+async def test_trigger_sampled_zero_never_calls() -> None:
+    """sampled:0 behaves like gazetteer_hit on a no-hit leaf: oracle never runs."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    client, call_count = _client_with_counter([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        oracle_trigger="sampled:0",
+    )
+    await orch.sanitize("plain neutral text", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 0
+
+
+async def test_trigger_sampled_hundred_always_calls() -> None:
+    """sampled:100 behaves like always on a no-hit leaf: oracle always runs."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    client, call_count = _client_with_counter([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        oracle_trigger="sampled:100",
+    )
+    await orch.sanitize("plain neutral text", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 1
+
+
+# ── deliver-flag rescan honors the same trigger (M2 mirror) ──────────────────
+
+
+async def test_trigger_always_widens_deliver_flag_rescan() -> None:
+    """always: the deliver-flag rescan consults the oracle even with a gazetteer + no hit."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    name = "Ivan Petrov"  # no regex/gaz/rule hit — only the oracle recognises it
+    client, call_count = _client_with_counter([(name, "[NAME_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        oracle_trigger="always",
+        size_threshold_bytes=10,
+        oversize_policy="deliver-flag",
+        oversize_deliver_teams=frozenset({"t1"}),
+    )
+    big = f"memo about {name} " + "z" * 40
+    with pytest.raises(OversizeContentError):
+        await orch.sanitize(big, team_id="t1", conversation_id="c1")
+    assert call_count[0] == 1
+
+
+async def test_trigger_gazetteer_hit_deliver_flag_skips_oracle_on_nohit() -> None:
+    """Default gazetteer_hit: the deliver-flag rescan skips the oracle on a no-hit leaf
+    (the F3 gap that widening the trigger closes)."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    client, call_count = _client_with_counter([("Ivan Petrov", "[NAME_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        size_threshold_bytes=10,
+        oversize_policy="deliver-flag",
+        oversize_deliver_teams=frozenset({"t1"}),
+    )
+    big = "memo about Ivan Petrov " + "z" * 40
+    result = await orch.sanitize(big, team_id="t1", conversation_id="c1")
+    assert call_count[0] == 0
+    assert result.block_reason == "oversize:delivered"
+
+
+# ── normalize + sampling primitives ──────────────────────────────────────────
+
+
+def test_normalize_oracle_trigger_canonical_forms() -> None:
+    assert normalize_oracle_trigger(None) == "gazetteer_hit"
+    assert normalize_oracle_trigger("") == "gazetteer_hit"
+    assert normalize_oracle_trigger("  ALWAYS ") == "always"
+    assert normalize_oracle_trigger("Any_Local_Finding") == "any_local_finding"
+    assert normalize_oracle_trigger("sampled:25") == "sampled:25"
+    assert normalize_oracle_trigger("SAMPLED:0") == "sampled:0"
+    assert normalize_oracle_trigger("sampled:100") == "sampled:100"
+
+
+@pytest.mark.parametrize(
+    "bad", ["bogus", "sampled:", "sampled:abc", "sampled:-1", "sampled:101", "sample:50"]
+)
+def test_normalize_oracle_trigger_rejects_bad(bad: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_oracle_trigger(bad)
+
+
+def test_orchestrator_rejects_bad_trigger() -> None:
+    client, _ = _client_with_counter([])
+    with pytest.raises(ValueError):
+        SanitizationOrchestrator(
+            client,
+            InMemoryMappingStore(),
+            _StaticRulesLoader(),
+            oracle_trigger="nope",
+        )
+
+
+def test_sample_selected_bounds_and_deterministic() -> None:
+    assert _sample_selected("abc", 0) is False
+    assert _sample_selected("abc", 100) is True
+    assert _sample_selected("seed-1", 50) == _sample_selected("seed-1", 50)
+
+
+def test_sample_selected_distribution_is_uniform() -> None:
+    n = 1000
+    hits = sum(_sample_selected(f"seed-{i}", 50) for i in range(n))
+    assert 0.4 * n <= hits <= 0.6 * n

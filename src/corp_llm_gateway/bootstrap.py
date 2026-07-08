@@ -151,6 +151,7 @@ def _build_orchestrator(
         local_detectors=local_detectors,
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),
+        oracle_trigger=config.oracle_trigger(),
     )
 
 

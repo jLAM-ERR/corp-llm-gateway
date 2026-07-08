@@ -62,6 +62,17 @@
 #   false — dev / 3.14 graceful degradation (no NER, no 503). Code default.
 # CORP_LLM_REQUIRE_NER = "1"
 
+# ── Oracle trigger — when the conditional LLM oracle runs (orchestrator.py, F3) ─
+#
+# The oracle runs on a gazetteer hit; this knob widens the NO-hit case (a gaz hit
+# always calls the oracle regardless). One of:
+#   gazetteer_hit      — DEFAULT. Oracle only on a gazetteer hit (latency parity).
+#   any_local_finding  — also call when a rule/regex/NER fired (backstops local misses).
+#   sampled:<pct>      — deterministic per-request sample of no-hit requests (pct 0..100,
+#                        seeded from conversation_id + content — reproducible, not random).
+#   always             — call the oracle on every request.
+# CORP_LLM_ORACLE_TRIGGER = "gazetteer_hit"
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 # CORP_LLM_LOG_LEVEL        = "INFO"
