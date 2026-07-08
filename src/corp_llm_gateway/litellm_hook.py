@@ -283,6 +283,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         )
 
         data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
+        # The corp token arrives duplicated across every header-bearing location
+        # and some providers forward proxy_server_request.headers upstream, so
+        # strip it from ALL of them, not just data["headers"] (invariant 4).
+        _strip_corp_token_everywhere(data)
         logger.info(
             "litellm_pre_call_corp_token_stripped request_id=%s",
             request_id,
@@ -981,9 +985,14 @@ def _resolve_request_data(kwargs: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# The internal corp auth header — never egress it (invariant 4, M1-14).
+_CORP_AUTH_HEADER_LOWER = AuthMiddleware.HEADER_NAME.lower()
+
 # Inbound HTTP wire-level headers that must NOT be forwarded to upstream
 # LLMs by any provider. Mostly hop-by-hop or request-scoped values that
-# describe the LiteLLM proxy's own connection from the client.
+# describe the LiteLLM proxy's own connection from the client. Includes
+# x-corp-auth as defense-in-depth; the unconditional strip below is the
+# primary guard. Never add `authorization` here — BYOK passthrough (invariant 3).
 _WIRE_HEADERS_TO_DROP = frozenset(
     {
         "host",
@@ -996,6 +1005,7 @@ _WIRE_HEADERS_TO_DROP = frozenset(
         "x-forwarded-proto",
         "x-forwarded-host",
         "x-real-ip",
+        _CORP_AUTH_HEADER_LOWER,
     }
 )
 
@@ -1006,6 +1016,23 @@ def _drop_wire_headers(headers: Any) -> None:
     for key in list(headers):
         if isinstance(key, str) and key.lower() in _WIRE_HEADERS_TO_DROP:
             del headers[key]
+
+
+def _drop_corp_token(headers: Any) -> None:
+    if not isinstance(headers, dict):
+        return
+    for key in list(headers):
+        if isinstance(key, str) and key.lower() == _CORP_AUTH_HEADER_LOWER:
+            del headers[key]
+
+
+def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
+    """Remove the corp token from every header dict litellm may forward upstream."""
+    _drop_corp_token(data.get("headers"))
+    for bucket_key in ("proxy_server_request", "metadata", "litellm_metadata"):
+        bucket = data.get(bucket_key)
+        if isinstance(bucket, dict):
+            _drop_corp_token(bucket.get("headers"))
 
 
 class _RequestState:

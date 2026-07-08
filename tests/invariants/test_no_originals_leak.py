@@ -1006,3 +1006,106 @@ async def test_fence_lang_tag_value_redacted_before_egress(
     await guardrail.audit(data, None, start_time=now, end_time=now, status="ok")  # type: ignore[attr-defined]
     assert len(sink.records) == 1
     assert _haystack_contains_any_original(json.dumps(sink.records[0])) is None
+
+
+# (v-bis) F6: the internal corp token (X-Corp-Auth) must not survive in ANY forwarded
+# header location after pre_call — not just data["headers"]. Some providers forward
+# proxy_server_request.headers / metadata headers upstream, so a strip that only rewrote
+# data["headers"] egressed the token (invariant 4 / M1-14 forwarded-headers surface (v)).
+# The BYOK Authorization header must still pass through untouched (invariant 3). ---------
+
+_CORP_TOKEN = "super-secret-corp-tok-f6"
+
+
+def _header_strip_guardrail() -> tuple[object, ListSink]:
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+
+    def _empty_pairs_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": '{"pairs": []}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_empty_pairs_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token=_CORP_TOKEN,
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+    )
+    return guardrail, sink
+
+
+@pytest.mark.asyncio
+async def test_corp_token_never_egresses_from_any_forwarded_header(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M1-14 surface (v): X-Corp-Auth is stripped from data["headers"],
+    proxy_server_request.headers, metadata.headers, and litellm_metadata.headers;
+    the BYOK Authorization header survives; the token never hits a log line."""
+    guardrail, _ = _header_strip_guardrail()
+    byok = "Bearer byok-developer-key"
+    hdrs = {"X-Corp-Auth": _CORP_TOKEN, "Authorization": byok}
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": dict(hdrs),
+        "proxy_server_request": {"headers": dict(hdrs)},
+        "metadata": {"headers": dict(hdrs)},
+        "litellm_metadata": {"headers": dict(hdrs)},
+    }
+    with caplog.at_level(logging.DEBUG):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    forwarded_header_dicts = [
+        out["headers"],
+        out["proxy_server_request"]["headers"],
+        out["metadata"]["headers"],
+        out["litellm_metadata"]["headers"],
+    ]
+    for loc in forwarded_header_dicts:
+        serialized = json.dumps(loc)
+        assert _CORP_TOKEN not in serialized, "corp token egressed in a forwarded header"
+        assert not any(k.lower() == "x-corp-auth" for k in loc), "X-Corp-Auth survived a strip"
+        assert byok in serialized, "BYOK Authorization dropped (invariant 3 violation)"
+
+    assert _CORP_TOKEN not in caplog.text, "corp token leaked into a log line (invariant 4)"
