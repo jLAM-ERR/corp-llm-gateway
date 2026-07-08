@@ -1,0 +1,7 @@
+# Division X — tighter division policy, layered over ru-152fz.
+name = "division-x"
+extends = ["ru-152fz"]
+
+[policy]
+size_threshold_bytes = 65536
+allowed_providers = ["anthropic"]
