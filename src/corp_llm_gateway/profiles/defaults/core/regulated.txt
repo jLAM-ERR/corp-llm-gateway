@@ -1,0 +1,29 @@
+# Gateway-level defaults — not legal advice. Ops team curates and extends.
+# ПОД/ФТ (Russian AML/CFT terms) and international equivalents.
+ПОД/ФТ
+легализация доходов
+отмывание денег
+отмывание
+финансирование терроризма
+финансирование экстремизма
+115-ФЗ
+ФАТФ
+Росфинмониторинг
+бенефициарный владелец
+конечный бенефициар
+подозрительная операция
+необычная сделка
+AML
+CFT
+money laundering
+terrorist financing
+beneficial owner
+suspicious activity
+suspicious transaction
+FATF
+FinCEN
+SAR
+KYC
+know your customer
+anti-money laundering
+counter financing of terrorism

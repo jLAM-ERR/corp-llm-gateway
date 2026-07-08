@@ -1,0 +1,15 @@
+# RU 152-ФЗ personal-data regime, layered over core.
+name = "ru-152fz"
+extends = ["core"]
+detectors = ["regex_checksum", "dual_ner"]
+# Advisory only — not part of the manifest schema; parse_manifest ignores it and
+# no code path reads it yet (drives residency selection at deploy level later).
+data_residency = "ru"
+
+[policy]
+block_payloads = true
+dlp_guard = true
+oracle_mode = "any_local_finding"
+
+[policy.fail_policy]
+pre_pass_down = "fail-closed"

@@ -1,0 +1,2 @@
+# RU 152-ФЗ profile — synthetic test values that must pass through un-redacted.
+test@example.com

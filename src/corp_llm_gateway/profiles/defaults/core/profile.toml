@@ -1,0 +1,6 @@
+# Core bundle — today's gateway defaults (term files copied from rules/defaults/).
+name = "core"
+detectors = ["regex_checksum"]
+
+[policy]
+size_threshold_bytes = 102400
