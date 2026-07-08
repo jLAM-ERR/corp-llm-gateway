@@ -259,7 +259,7 @@ What SIEM should monitor (per plan M3-9):
 | Signal | Meaning |
 |---|---|
 | `audit_drop > 0` | A NEVER field reached the audit pipeline — a leak/regression attempt; investigate immediately |
-| Fail-closed `503`s | `E_CORP_LLM_DOWN`, `E_REDIS_DOWN`, S3/Vector-buffer fail-closed, etc. (availability + possible attack) |
+| Fail-closed `503`s | `E_CORP_LLM_DOWN`, `E_NER_UNAVAILABLE`, `E_REDIS_DOWN`, S3/Vector-buffer fail-closed, etc. (availability + possible attack) |
 | `litellm_pre_call_input_placeholder_literal_detected` | A user typed `[LABEL_NNN]` literals — possible sanitizer probing |
 | Redaction anomalies | Redaction spike (3σ), bypass denials, auth-failure bursts |
 
@@ -306,8 +306,9 @@ of truth** — do not add ad-hoc fail-open paths):
 
 | Component | Behavior |
 |---|---|
-| `corpLlmDown` | **fail-closed** (503) |
+| `corpLlmDown` | **fail-closed** (503 `E_CORP_LLM_DOWN`) |
 | `prePassDown` | **continue** (corp-LLM only; metric increments) |
+| `nerUnavailable` (when `CORP_LLM_REQUIRE_NER`) | **fail-closed** (503 `E_NER_UNAVAILABLE`) — a configured NER model is absent (F2); `/healthz/ready` also probes NER-loaded so the pod leaves the LB. Knob **off** → dev / Python-3.14 graceful path (no NER, no 503) |
 | `redisClusterDown` | **fail-closed** (503) |
 | `postgresDown` | **fail-closed** (503) |
 | `vectorBufferFull` | **fail-closed** (503) by default; team may opt `audit_buffer_full=continue` |

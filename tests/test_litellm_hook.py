@@ -11,7 +11,8 @@ import pytest
 
 from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
-from corp_llm_gateway.detectors import RegexChecksumDetector
+from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
+from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
@@ -35,6 +36,13 @@ from tests.sanitizer.test_streaming import (
 class _StaticRules(RulesLoader):
     async def load(self, team_id: str) -> Rules:
         return Rules(rules=())
+
+
+class _RaisingNerEngine(PIIDetector):
+    """A NER engine whose model/deps are absent — raises like the real ones do."""
+
+    async def detect(self, text: str) -> list[Finding]:
+        raise RuntimeError("ner deps absent")
 
 
 def _corp_llm_returning(pairs: list[tuple[str, str]]) -> CorpLlmClient:
@@ -377,6 +385,58 @@ async def test_pre_call_corp_llm_down_does_not_forward_content() -> None:
     # The raise short-circuits the upstream call; the original content
     # was never handed back as a sanitized payload.
     assert data["messages"][0]["content"] == "my secret is hunter2"
+
+
+def _guardrail_with_ner(dual: DualNerDetector) -> CorpLlmGuardrail:
+    # Reuse the oversize helper with a huge threshold (no leaf is oversize) to
+    # get an orchestrator whose local cascade includes the injected NER.
+    g, _ = _build_guardrail_oversize(threshold=10_000_000, local_detectors=[dual])
+    return g
+
+
+async def test_pre_call_ner_required_but_absent_returns_503_not_500() -> None:
+    """F2 fail-closed (M4): when CORP_LLM_REQUIRE_NER is on and a configured NER
+    engine's model is absent, pre_call must map the NerUnavailableError to a
+    503 E_NER_UNAVAILABLE — NOT let it escape as a generic 500."""
+    dual = DualNerDetector(require_ner=True, engines=[_RaisingNerEngine(), _RaisingNerEngine()])
+    g = _guardrail_with_ner(dual)
+    data = _data_with_token("tok-1", content="ping John Smith")
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 503
+    assert ei.value.error_code == "E_NER_UNAVAILABLE"
+
+
+async def test_pre_call_ner_required_but_absent_on_system_returns_503() -> None:
+    """Same fail-closed path on the system field (empty message → system scan)."""
+    dual = DualNerDetector(require_ner=True, engines=[_RaisingNerEngine(), _RaisingNerEngine()])
+    g = _guardrail_with_ner(dual)
+    data = _data_with_token("tok-1", content="", system="owner John Smith")
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 503
+    assert ei.value.error_code == "E_NER_UNAVAILABLE"
+
+
+async def test_pre_call_ner_required_but_absent_does_not_forward_content() -> None:
+    dual = DualNerDetector(require_ner=True, engines=[_RaisingNerEngine(), _RaisingNerEngine()])
+    g = _guardrail_with_ner(dual)
+    data = _data_with_token("tok-1", content="ping John Smith")
+    with pytest.raises(GuardrailHttpException):
+        await g.pre_call(data)
+    # Fail-closed: the request is rejected, never forwarded with the original.
+    assert data["messages"][0]["content"] == "ping John Smith"
+
+
+async def test_pre_call_ner_not_required_stays_on_dev_graceful_path() -> None:
+    """require-ner OFF: absent NER degrades to [] (the documented F2 fail-open,
+    intentional only for dev / Python 3.14). Request proceeds — no 503."""
+    dual = DualNerDetector(require_ner=False, engines=[_RaisingNerEngine(), _RaisingNerEngine()])
+    g = _guardrail_with_ner(dual)
+    data = _data_with_token("tok-1", content="ping John Smith")
+    result = await g.pre_call(data)  # no exception
+    # No rule/regex/gazetteer hit and NER degraded → content unchanged (egresses).
+    assert result["messages"][0]["content"] == "ping John Smith"
 
 
 async def test_pre_call_handles_proxy_server_request_headers_shape() -> None:

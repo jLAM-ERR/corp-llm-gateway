@@ -100,6 +100,26 @@ def oversize_policy() -> str:
     return normalize_oversize_policy(get("CORP_LLM_OVERSIZE_POLICY"))
 
 
+_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+
+def require_ner() -> bool:
+    """Whether a self-disabled NER engine must fail the request CLOSED (M4/F2).
+
+    ``CORP_LLM_REQUIRE_NER`` truthy → production fail-closed: a configured NER
+    engine whose model/deps are absent raises ``NerUnavailableError`` (mapped to
+    503 ``E_NER_UNAVAILABLE`` at the hook) instead of silently returning no
+    findings and letting a PERSON/ORG egress. Unset/false → the dev /
+    Python-3.14 graceful-degradation path (no NER, returns ``[]``).
+
+    Default **off** so the local 3.14 suite keeps the graceful path; prod
+    profiles / Helm set it on. The knob — not silent absence — distinguishes
+    "expected-absent" (fail-closed) from "genuinely not configured" (dev).
+    """
+    value = get("CORP_LLM_REQUIRE_NER", "0")
+    return value is not None and value.strip().lower() in _TRUTHY
+
+
 def corp_llm_verify() -> bool | str:
     """``verify`` value for the corp-LLM httpx client (TLS to the corp LLM).
 

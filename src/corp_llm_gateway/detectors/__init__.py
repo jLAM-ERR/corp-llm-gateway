@@ -1,5 +1,5 @@
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
-from corp_llm_gateway.detectors.dual_ner import DualNerDetector
+from corp_llm_gateway.detectors.dual_ner import DualNerDetector, NerUnavailableError
 from corp_llm_gateway.detectors.ner_en import EnNerDetector
 from corp_llm_gateway.detectors.ner_ru import RuNerDetector
 
@@ -13,6 +13,7 @@ __all__ = [
     "DualNerDetector",
     "EnNerDetector",
     "Finding",
+    "NerUnavailableError",
     "OpenaiPrivacyFilterDetector",
     "PIIDetector",
     "PresidioDetector",

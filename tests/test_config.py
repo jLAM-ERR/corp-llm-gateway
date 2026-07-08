@@ -111,6 +111,32 @@ def test_corp_llm_verify_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> No
     assert config.corp_llm_verify() is True
 
 
+def test_require_ner_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default off so the dev / Python-3.14 graceful path stays (F2/A2)."""
+    monkeypatch.delenv("CORP_LLM_REQUIRE_NER", raising=False)
+    assert config.require_ner() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "Yes", "on"])
+def test_require_ner_truthy_values(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_LLM_REQUIRE_NER", value)
+    assert config.require_ner() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
+def test_require_ner_falsey_values(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_LLM_REQUIRE_NER", value)
+    assert config.require_ner() is False
+
+
+def test_require_ner_reads_from_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("CORP_LLM_REQUIRE_NER = true\n")
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("CORP_LLM_REQUIRE_NER", raising=False)
+    assert config.require_ner() is True
+
+
 def test_get_table_reads_nested_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = tmp_path / "config.toml"
     cfg.write_text(
