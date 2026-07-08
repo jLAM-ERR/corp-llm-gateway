@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}-litellm
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    model_list:
+      # The corp vLLM exposes a single model; rewrite every inbound model name
+      # to it. `hosted_vllm/` keeps the legacy /chat/completions wire shape the
+      # corp ingress accepts. api_base / api_key resolve from the pod env
+      # (endpoint from the deployment, auth token from the Secret).
+      - model_name: "*"
+        litellm_params:
+          model: {{ printf "hosted_vllm/%s" .Values.corpLlm.model | quote }}
+          api_base: "os.environ/CORP_LLM_ENDPOINT"
+          api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
+          max_tokens: {{ .Values.corpLlm.maxTokens }}
+    litellm_settings:
+      # Production composition root (task B1). litellm imports this module-level
+      # INSTANCE and calls the guardrail hooks on it; the class itself would fail
+      # ("missing self"). This is the load-bearing wiring of the whole chart.
+      callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+      # Drop modern Anthropic params the corp vLLM rejects rather than 400-ing.
+      drop_params: true
+      # Emit AuditEvent JSON as single-line records for the Vector sidecar.
+      json_logs: true

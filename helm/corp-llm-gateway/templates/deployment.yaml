@@ -5,7 +5,9 @@ metadata:
   labels:
     {{- include "corp-llm-gateway.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "corp-llm-gateway.selectorLabels" . | nindent 6 }}
@@ -14,10 +16,21 @@ spec:
       labels:
         {{- include "corp-llm-gateway.selectorLabels" . | nindent 8 }}
     spec:
+      serviceAccountName: {{ include "corp-llm-gateway.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: litellm
-          image: "ghcr.io/berriai/litellm:v{{ .Values.litellm.versionPin }}"
+          # The gateway server image (litellm proxy + guardrail callback), NOT
+          # stock berriai/litellm — the stock image never loads the guardrail.
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           ports:
             - name: http
               containerPort: 4000
@@ -27,6 +40,35 @@ spec:
               value: {{ .Values.corpLlm.authProvider | quote }}
             - name: CORP_LLM_ENDPOINT
               value: {{ .Values.corpLlm.endpoint | quote }}
+            - name: CORP_LLM_MODEL
+              value: {{ .Values.corpLlm.model | quote }}
+            - name: CORP_AUDIT_SINK
+              value: {{ .Values.audit.sink | quote }}
+            - name: CORP_LANGFUSE_URL
+              value: {{ .Values.audit.sinks.langfuse.endpoint | quote }}
+            - name: CORP_LLM_LOCAL_FIRST
+              value: {{ .Values.guardrail.localFirst | quote }}
+            - name: CORP_LLM_GAZETTEER
+              value: {{ .Values.guardrail.gazetteer | quote }}
+            - name: CORP_LLM_RULES_DIR
+              value: {{ .Values.guardrail.rulesDir | quote }}
+            {{- if .Values.caBundle.enabled }}
+            # httpx (oracle client) reads CORP_LLM_CA_BUNDLE; litellm's aiohttp
+            # reads SSL_CERT_FILE — both point at the mounted internal-CA bundle.
+            - name: CORP_LLM_CA_BUNDLE
+              value: {{ printf "%s/ca-bundle.pem" .Values.caBundle.mountPath | quote }}
+            - name: SSL_CERT_FILE
+              value: {{ printf "%s/ca-bundle.pem" .Values.caBundle.mountPath | quote }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "corp-llm-gateway.secretName" . }}
+          startupProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
           livenessProbe:
             httpGet:
               path: /healthz/live
@@ -37,6 +79,15 @@ spec:
               path: /healthz/ready
               port: http
             initialDelaySeconds: 5
+          volumeMounts:
+            - name: litellm-config
+              mountPath: /etc/litellm
+              readOnly: true
+            {{- if .Values.caBundle.enabled }}
+            - name: ca-bundle
+              mountPath: {{ .Values.caBundle.mountPath }}
+              readOnly: true
+            {{- end }}
           resources:
             requests:
               cpu: "1"
@@ -47,11 +98,36 @@ spec:
         - name: vector
           image: "timberio/vector:0.40.0-alpine"
           args: ["--config", "/etc/vector/vector.yaml"]
+          # The log shipper reads the node's pod logs; it must run as root to read
+          # /var/log/pods (a standard log-agent requirement) while the gateway
+          # container above stays non-root.
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: VECTOR_SELF_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # Langfuse (${LANGFUSE_*}) + S3 (AWS_*) sink creds come from the Secret.
+          envFrom:
+            - secretRef:
+                name: {{ include "corp-llm-gateway.secretName" . }}
           volumeMounts:
             - name: vector-config
               mountPath: /etc/vector
             - name: vector-buffer
               mountPath: /var/lib/vector
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
           resources:
             requests:
               cpu: "200m"
@@ -60,9 +136,23 @@ spec:
               cpu: "1"
               memory: "1Gi"
       volumes:
+        - name: litellm-config
+          configMap:
+            name: {{ include "corp-llm-gateway.fullname" . }}-litellm
         - name: vector-config
           configMap:
             name: {{ include "corp-llm-gateway.fullname" . }}-vector
         - name: vector-buffer
           emptyDir:
             sizeLimit: {{ .Values.audit.vector.bufferGb }}Gi
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+        - name: varlog
+          hostPath:
+            path: /var/log
+        {{- if .Values.caBundle.enabled }}
+        - name: ca-bundle
+          secret:
+            secretName: {{ .Values.caBundle.existingSecret | default (printf "%s-ca" (include "corp-llm-gateway.fullname" .)) }}
+        {{- end }}

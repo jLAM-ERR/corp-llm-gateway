@@ -1,0 +1,45 @@
+# Staging overrides — apply with: helm upgrade -f values-staging.yaml
+# Referenced by the README + docs/ops/runbook.md. Sits between the dev defaults
+# (values.yaml — controls OFF) and prod (values-prod.yaml — controls ON).
+
+replicaCount: 2
+
+image:
+  tag: "staging"
+
+corpLlm:
+  endpoint: "https://corp-llm.staging.corp.lan/v1"
+
+# Secrets come from an external-secrets/Vault-managed Secret in staging, never
+# from committed values.
+existingSecret: "corp-llm-gateway-staging-env"
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Exercise the scrape path in staging ahead of B4 emitting the series.
+metrics:
+  enabled: true
+
+audit:
+  sinks:
+    langfuse:
+      endpoint: "http://langfuse.staging.corp.lan"
+
+networkPolicy:
+  enabled: true
+  upstreamCidrs:
+    - "104.18.0.0/16"
+  corpInternalCidrs:
+    - "10.0.0.0/8"
+
+coreDnsSinkhole:
+  enabled: true
+  zone: staging.corp.lan
