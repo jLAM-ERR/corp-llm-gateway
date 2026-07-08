@@ -117,6 +117,20 @@ async def test_replace_md_path_round_trip(store: TeamConfigStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_profile_ids_round_trip(store: TeamConfigStore) -> None:
+    await store.upsert(_team("t1", profile_ids=("core", "ru-152fz", "division-x")))
+    got = await store.get("t1")
+    assert got.profile_ids == ("core", "ru-152fz", "division-x")
+
+
+@pytest.mark.asyncio
+async def test_profile_ids_default_round_trip(store: TeamConfigStore) -> None:
+    await store.upsert(_team("t1"))
+    got = await store.get("t1")
+    assert got.profile_ids == ()
+
+
+@pytest.mark.asyncio
 async def test_fail_policy_defaults_round_trip(store: TeamConfigStore) -> None:
     await store.upsert(_team("t1"))
     got = await store.get("t1")

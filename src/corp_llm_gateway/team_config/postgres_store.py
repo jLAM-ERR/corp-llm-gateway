@@ -25,7 +25,10 @@ _SCHEMA_SQL = Path(__file__).parent / "schema.sql"
 _asyncpg_mod: types.ModuleType | None = None
 _asyncpg_tried = False
 
-_COLUMNS = "team_id, name, replace_md_path, retention_hot_days, retention_cold_years, fail_policy"
+_COLUMNS = (
+    "team_id, name, replace_md_path, profile_ids, "
+    "retention_hot_days, retention_cold_years, fail_policy"
+)
 
 
 def _get_asyncpg() -> types.ModuleType | None:
@@ -71,6 +74,7 @@ def _row_to_team_config(row: Any) -> TeamConfig:
         team_id=row["team_id"],
         name=row["name"],
         replace_md_path=row["replace_md_path"],
+        profile_ids=tuple(row["profile_ids"] or ()),
         retention_hot_days=row["retention_hot_days"],
         retention_cold_years=row["retention_cold_years"],
         fail_policy=_fail_policy_from_json(row["fail_policy"]),
@@ -130,12 +134,13 @@ class PostgresTeamConfigStore(TeamConfigStore):
             await conn.execute(
                 """
                 INSERT INTO team_config
-                    (team_id, name, replace_md_path,
+                    (team_id, name, replace_md_path, profile_ids,
                      retention_hot_days, retention_cold_years, fail_policy)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                VALUES ($1, $2, $3, $4::text[], $5, $6, $7::jsonb)
                 ON CONFLICT (team_id) DO UPDATE SET
                     name                 = EXCLUDED.name,
                     replace_md_path      = EXCLUDED.replace_md_path,
+                    profile_ids          = EXCLUDED.profile_ids,
                     retention_hot_days   = EXCLUDED.retention_hot_days,
                     retention_cold_years = EXCLUDED.retention_cold_years,
                     fail_policy          = EXCLUDED.fail_policy
@@ -143,6 +148,7 @@ class PostgresTeamConfigStore(TeamConfigStore):
                 config.team_id,
                 config.name,
                 config.replace_md_path,
+                list(config.profile_ids),
                 config.retention_hot_days,
                 config.retention_cold_years,
                 _fail_policy_to_json(config.fail_policy),

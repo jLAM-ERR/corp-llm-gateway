@@ -24,6 +24,7 @@ def test_team_config_defaults() -> None:
     assert cfg.retention_hot_days == DEFAULT_RETENTION_HOT_DAYS
     assert cfg.retention_cold_years == DEFAULT_RETENTION_COLD_YEARS
     assert cfg.replace_md_path is None
+    assert cfg.profile_ids == ()
     assert cfg.fail_policy == FailPolicyOverrides()
 
 

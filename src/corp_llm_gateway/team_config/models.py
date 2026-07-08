@@ -30,6 +30,9 @@ class TeamConfig:
     team_id: str
     name: str
     replace_md_path: str | None = None
+    # Ordered profile set this team selects (resolver expands `extends`).
+    # Empty == today's behavior: no profile layers.
+    profile_ids: tuple[str, ...] = ()
     retention_hot_days: int = DEFAULT_RETENTION_HOT_DAYS
     retention_cold_years: int = DEFAULT_RETENTION_COLD_YEARS
     fail_policy: FailPolicyOverrides = field(default_factory=FailPolicyOverrides)

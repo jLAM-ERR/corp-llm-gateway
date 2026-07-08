@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS team_config (
     team_id              TEXT PRIMARY KEY,
     name                 TEXT NOT NULL,
     replace_md_path      TEXT,
+    profile_ids          TEXT[] NOT NULL DEFAULT '{}'::text[],
     retention_hot_days   INTEGER NOT NULL DEFAULT 90,
     retention_cold_years INTEGER NOT NULL DEFAULT 7,
     fail_policy          JSONB NOT NULL DEFAULT '{}'::jsonb,
