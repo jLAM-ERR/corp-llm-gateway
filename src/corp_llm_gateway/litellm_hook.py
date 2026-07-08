@@ -36,6 +36,7 @@ from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
 from corp_llm_gateway.payload.classifier import classify_block
+from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.sanitizer import (
     SanitizationOrchestrator,
     SanitizeResult,
@@ -929,10 +930,7 @@ def _extract_headers(data: dict[str, Any]) -> dict[str, str]:
 
 
 def _detect_provider(data: dict[str, Any]) -> Provider:
-    model = str(data.get("model") or "")
-    if model.startswith("claude") or "anthropic" in model.lower():
-        return "anthropic"
-    return "openai"
+    return detect_provider(str(data.get("model") or ""))
 
 
 def _classify_auth_error(exc: AuthError) -> str:
