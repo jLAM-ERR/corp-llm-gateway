@@ -5,7 +5,6 @@ from corp_llm_gateway.team_config import (
     DEFAULT_RETENTION_HOT_DAYS,
     FailPolicyOverrides,
     InMemoryTeamConfigStore,
-    PostgresTeamConfigStore,
     TeamConfig,
     TeamNotFoundError,
 )
@@ -95,22 +94,5 @@ async def test_per_team_fail_policy_overrides_persist() -> None:
     assert cfg.fail_policy.audit_buffer_full == "continue"
 
 
-# Postgres stub --------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_postgres_get_stub_raises() -> None:
-    with pytest.raises(NotImplementedError):
-        await PostgresTeamConfigStore("postgres://x").get("t1")
-
-
-@pytest.mark.asyncio
-async def test_postgres_upsert_stub_raises() -> None:
-    with pytest.raises(NotImplementedError):
-        await PostgresTeamConfigStore("postgres://x").upsert(_team())
-
-
-@pytest.mark.asyncio
-async def test_postgres_list_stub_raises() -> None:
-    with pytest.raises(NotImplementedError):
-        await PostgresTeamConfigStore("postgres://x").list_all()
+# PostgresTeamConfigStore is contract-tested against the in-memory store in
+# tests/team_config/test_postgres_store.py (Postgres cases skip without asyncpg).

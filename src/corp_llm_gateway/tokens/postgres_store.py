@@ -154,6 +154,23 @@ class PostgresTokenStore(TokenStore):
             )
         return int(status.split()[-1])
 
+    async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+        pool = await self._get_pool()
+        select = (
+            "SELECT corp_token, user_id, team_id, scopes, "
+            "issued_at, expires_at, revoked_at FROM corp_tokens"
+        )
+        async with pool.acquire() as conn:
+            rows: Any
+            if user_id is None:
+                rows = await conn.fetch(f"{select} ORDER BY issued_at DESC")
+            else:
+                rows = await conn.fetch(
+                    f"{select} WHERE user_id = $1 ORDER BY issued_at DESC",
+                    user_id,
+                )
+        return tuple(_row_to_token_info(r) for r in rows)
+
     async def close(self) -> None:
         """Close the connection pool; no-op if pool was never created."""
         if self._pool is not None:

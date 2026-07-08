@@ -1,10 +1,14 @@
+import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from corp_llm_gateway.cli.admin import main
 from corp_llm_gateway.extensions import Extension, ExtensionRegistry, ExtensionSpec
 from corp_llm_gateway.healthz import HealthStatus
+from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
+from corp_llm_gateway.tokens import InMemoryTokenStore, TokenInfo
 
 
 @pytest.fixture(autouse=True)
@@ -41,36 +45,244 @@ def _register_fake(registry: ExtensionRegistry, *, healthy: bool, fail_policy: s
     registry.register(spec, lambda: _FakeExt(spec, healthy=healthy))
 
 
-def test_team_create(capsys: pytest.CaptureFixture[str]) -> None:
+# ---------------------------------------------------------------------------
+# team / token — store-backed verbs (in-memory store injected)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def team_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTeamConfigStore:
+    store = InMemoryTeamConfigStore()
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._team_store", lambda: store)
+    return store
+
+
+@pytest.fixture
+def token_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTokenStore:
+    store = InMemoryTokenStore()
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._token_store", lambda: store)
+    return store
+
+
+def _token_info(corp_token: str, user_id: str = "alice") -> TokenInfo:
+    now = datetime.now(UTC)
+    return TokenInfo(
+        corp_token=corp_token,
+        user_id=user_id,
+        team_id="t1",
+        scopes=("read",),
+        issued_at=now,
+        expires_at=now + timedelta(days=30),
+    )
+
+
+def test_team_create_persists(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
     rc = main(["team", "create", "--team-id", "t1", "--name", "Team One"])
     assert rc == 0
-    assert "team.create team_id=t1 name=Team One" in capsys.readouterr().out
+    assert "team created: t1" in capsys.readouterr().out
+    assert asyncio.run(team_store.get("t1")).name == "Team One"
 
 
-def test_team_set_rules(capsys: pytest.CaptureFixture[str]) -> None:
-    rc = main(["team", "set-rules", "--team-id", "t1", "--from-file", "rules.md"])
+def test_team_create_duplicate_errors(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asyncio.run(team_store.upsert(TeamConfig(team_id="t1", name="Existing")))
+    rc = main(["team", "create", "--team-id", "t1", "--name", "Dup"])
+    assert rc == 2
+    assert "already exists" in capsys.readouterr().err
+
+
+def test_team_set_rules_updates_path(team_store: InMemoryTeamConfigStore) -> None:
+    asyncio.run(team_store.upsert(TeamConfig(team_id="t1", name="One")))
+    rc = main(["team", "set-rules", "--team-id", "t1", "--from-file", "/etc/rules/t1.md"])
     assert rc == 0
-    assert "team.set_rules team_id=t1 from_file=rules.md" in capsys.readouterr().out
+    assert asyncio.run(team_store.get("t1")).replace_md_path == "/etc/rules/t1.md"
 
 
-def test_team_set_retention_defaults(capsys: pytest.CaptureFixture[str]) -> None:
-    rc = main(["team", "set-retention", "--team-id", "t1"])
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "team.set_retention team_id=t1 hot_days=90 cold_years=7" in out
+def test_team_set_rules_unknown_team(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["team", "set-rules", "--team-id", "ghost", "--from-file", "r.md"])
+    assert rc == 2
+    assert "unknown team" in capsys.readouterr().err
 
 
-def test_team_set_retention_overrides(capsys: pytest.CaptureFixture[str]) -> None:
+def test_team_set_retention_persists(team_store: InMemoryTeamConfigStore) -> None:
+    asyncio.run(team_store.upsert(TeamConfig(team_id="t1", name="One")))
     rc = main(["team", "set-retention", "--team-id", "t1", "--hot-days", "30", "--cold-years", "1"])
     assert rc == 0
+    cfg = asyncio.run(team_store.get("t1"))
+    assert cfg.retention_hot_days == 30
+    assert cfg.retention_cold_years == 1
+
+
+def test_team_list_renders(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asyncio.run(team_store.upsert(TeamConfig(team_id="t1", name="One")))
+    asyncio.run(team_store.upsert(TeamConfig(team_id="t2", name="Two")))
+    rc = main(["team", "list"])
+    assert rc == 0
     out = capsys.readouterr().out
-    assert "team.set_retention team_id=t1 hot_days=30 cold_years=1" in out
+    assert "TEAM_ID" in out
+    assert "t1" in out and "t2" in out
 
 
-def test_token_revoke(capsys: pytest.CaptureFixture[str]) -> None:
+def test_team_list_json(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asyncio.run(team_store.upsert(TeamConfig(team_id="t1", name="One")))
+    rc = main(["team", "list", "--json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data[0]["team_id"] == "t1"
+    assert data[0]["fail_policy"]["audit_buffer_full"] == "fail-closed"
+
+
+def test_team_list_empty(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["team", "list"])
+    assert rc == 0
+    assert "no teams configured" in capsys.readouterr().out
+
+
+def test_team_show(team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]) -> None:
+    asyncio.run(team_store.upsert(TeamConfig(team_id="t1", name="One", replace_md_path="/r.md")))
+    rc = main(["team", "show", "--team-id", "t1"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "team_id: t1" in out
+    assert "/r.md" in out
+
+
+def test_team_show_unknown(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["team", "show", "--team-id", "ghost"])
+    assert rc == 2
+    assert "unknown team" in capsys.readouterr().err
+
+
+def test_token_issue_persists(
+    token_store: InMemoryTokenStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["token", "issue", "--user", "alice", "--team", "t1", "--scopes", "read,write"])
+    assert rc == 0
+    assert "token: ct_" in capsys.readouterr().out
+    tokens = asyncio.run(token_store.list_tokens("alice"))
+    assert len(tokens) == 1
+    assert tokens[0].team_id == "t1"
+    assert tokens[0].scopes == ("read", "write")
+
+
+def test_token_issue_json(
+    token_store: InMemoryTokenStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["token", "issue", "--user", "alice", "--team", "t1", "--json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["user_id"] == "alice"
+    assert data["corp_token"].startswith("ct_")
+
+
+def test_token_revoke_actually_revokes(
+    token_store: InMemoryTokenStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    token_store.upsert(_token_info("ct-1", user_id="alice"))
     rc = main(["token", "revoke", "--user", "alice"])
     assert rc == 0
-    assert "token.revoke user=alice" in capsys.readouterr().out
+    assert "revoked 1 token(s) for user=alice" in capsys.readouterr().out
+    got = asyncio.run(token_store.lookup("ct-1"))
+    assert got is not None and got.revoked_at is not None
+
+
+def test_token_list_masks_secret(
+    token_store: InMemoryTokenStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    token_store.upsert(_token_info("ct_supersecretvalue", user_id="alice"))
+    rc = main(["token", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "ct_supersecretvalue" not in out  # full secret never printed
+    assert "secretvalue" not in out
+
+
+def test_token_list_filters_by_user(
+    token_store: InMemoryTokenStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    token_store.upsert(_token_info("ct-a", user_id="alice"))
+    token_store.upsert(_token_info("ct-b", user_id="bob"))
+    rc = main(["token", "list", "--user", "alice"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "bob" not in out
+
+
+def test_token_list_empty(
+    token_store: InMemoryTokenStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["token", "list"])
+    assert rc == 0
+    assert "no tokens issued" in capsys.readouterr().out
+
+
+# team / token — RBAC (mutations gated, reads ungated) ----------------------
+
+
+def test_team_create_rbac_enforced(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", "1")  # override autouse bypass
+    monkeypatch.delenv("CORP_GATEWAY_ADMIN_TOKEN", raising=False)
+    rc = main(["team", "create", "--team-id", "t1", "--name", "X"])
+    assert rc == 2
+    assert "gateway:operator" in capsys.readouterr().err
+
+
+def test_token_revoke_rbac_enforced(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", "1")
+    monkeypatch.delenv("CORP_GATEWAY_ADMIN_TOKEN", raising=False)
+    rc = main(["token", "revoke", "--user", "alice"])
+    assert rc == 2
+    assert "gateway:operator" in capsys.readouterr().err
+
+
+def test_team_list_read_verb_skips_rbac(
+    team_store: InMemoryTeamConfigStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", "1")  # enforce; read verb must still run
+    assert main(["team", "list"]) == 0
+
+
+def test_token_list_read_verb_skips_rbac(
+    token_store: InMemoryTokenStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", "1")
+    assert main(["token", "list"]) == 0
+
+
+def test_team_backend_not_configured_errors(
+    hermetic_gateway_config: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # No CORP_LLM_PG_DSN and no injected store: fail clearly, never fake success.
+    rc = main(["team", "create", "--team-id", "t1", "--name", "X"])
+    assert rc == 2
+    assert "CORP_LLM_PG_DSN" in capsys.readouterr().err
+
+
+def test_token_backend_not_configured_errors(
+    hermetic_gateway_config: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["token", "list"])
+    assert rc == 2
+    assert "CORP_LLM_PG_DSN" in capsys.readouterr().err
 
 
 def test_missing_required_arg_errors(capsys: pytest.CaptureFixture[str]) -> None:

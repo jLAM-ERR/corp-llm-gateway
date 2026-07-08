@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -15,6 +16,8 @@ from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.storage import InMemoryMappingStore
+from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
+from corp_llm_gateway.tokens import InMemoryTokenStore
 
 _SECRET = "test-rbac-secret-key-for-hs256-gate"  # ≥32 bytes per RFC 7518 §3.2
 _ALG = "HS256"
@@ -102,12 +105,14 @@ def test_wrong_signature_denied(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_team_create_with_operator_token_returns_0(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._team_store", lambda: InMemoryTeamConfigStore())
     token = _make_token(roles=["gateway:operator"])
     rc = main(["--token", token, "team", "create", "--team-id", "t1", "--name", "Team One"])
     assert rc == 0
-    assert "team.create" in capsys.readouterr().out
+    assert "team created: t1" in capsys.readouterr().out
 
 
 def test_team_create_without_operator_role_returns_2(
@@ -138,12 +143,16 @@ def test_team_set_retention_without_token_returns_2(
 
 
 def test_team_set_retention_with_operator_token_returns_0(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    store = InMemoryTeamConfigStore()
+    asyncio.run(store.upsert(TeamConfig(team_id="t1", name="One")))
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._team_store", lambda: store)
     token = _make_token(roles=["gateway:operator"])
     rc = main(["--token", token, "team", "set-retention", "--team-id", "t1"])
     assert rc == 0
-    assert "team.set_retention" in capsys.readouterr().out
+    assert "retention" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +161,14 @@ def test_team_set_retention_with_operator_token_returns_0(
 
 
 def test_token_revoke_with_operator_token_returns_0(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._token_store", lambda: InMemoryTokenStore())
     token = _make_token(roles=["gateway:operator"])
     rc = main(["--token", token, "token", "revoke", "--user", "alice"])
     assert rc == 0
-    assert "token.revoke" in capsys.readouterr().out
+    assert "revoked" in capsys.readouterr().out
 
 
 def test_token_revoke_without_role_returns_2_no_side_effect(
@@ -260,6 +271,7 @@ def test_rbac_disabled_allows_without_token(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("CORP_GATEWAY_RBAC", "0")
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._team_store", lambda: InMemoryTeamConfigStore())
     rc = main(["team", "create", "--team-id", "t1", "--name", "Dev Team"])
     assert rc == 0
-    assert "team.create" in capsys.readouterr().out
+    assert "team created" in capsys.readouterr().out
