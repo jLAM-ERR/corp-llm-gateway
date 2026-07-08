@@ -155,7 +155,10 @@ class CorpLlmClient:
             ) from exc
 
         if resp.status_code >= 400:
-            raise CorpLlmHttpError(f"corp-llm returned {resp.status_code}: {resp.text[:500]}")
+            # Never embed resp.text: a corp-LLM error body may echo the RAW,
+            # pre-sanitization request back, which would then ride the exception
+            # chain into logs/audit (F8). Status code only.
+            raise CorpLlmHttpError(f"corp-llm returned {resp.status_code}")
         return ChatCompletionResponse(raw=resp.json())
 
     async def aclose(self) -> None:

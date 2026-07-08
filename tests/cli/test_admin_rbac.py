@@ -1,16 +1,24 @@
-"""RBAC enforcement tests for gateway-admin mutating commands."""
+"""RBAC enforcement tests for gateway-admin mutating commands.
+
+Operator-token signing uses RS256 (F11), so tests that need a valid token pull
+the ``make_token`` fixture, which skips when ``cryptography`` (the 'oidc' extra)
+is absent. No-token / bypass / sanitize paths run everywhere. Pure
+``verify_operator`` unit tests live in ``tests/auth/test_rbac.py``.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import time
+from collections.abc import Callable, Iterator
+from typing import Any
 
 import httpx
 import jwt
 import pytest
 
-from corp_llm_gateway.auth.rbac import OperatorDenied, verify_operator
+from corp_llm_gateway import config
 from corp_llm_gateway.cli.admin import main
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.rules import Rules, RulesLoader
@@ -19,84 +27,71 @@ from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
 from corp_llm_gateway.tokens import InMemoryTokenStore
 
-_SECRET = "test-rbac-secret-key-for-hs256-gate"  # ≥32 bytes per RFC 7518 §3.2
-_ALG = "HS256"
+_AUDIENCE = "corp-llm-gateway"
+_ISSUER = "https://keycloak.corp.lan/realms/corp"
 
-
-def _make_token(
-    roles: list[str] | None = None,
-    flat_roles: list[str] | None = None,
-    scope: str | None = None,
-    exp_offset: int = 3600,
-) -> str:
-    payload: dict[str, object] = {"sub": "test-user", "exp": int(time.time()) + exp_offset}
-    if roles is not None:
-        payload["realm_access"] = {"roles": roles}
-    if flat_roles is not None:
-        payload["roles"] = flat_roles
-    if scope is not None:
-        payload["scope"] = scope
-    return jwt.encode(payload, _SECRET, algorithm=_ALG)
+MakeToken = Callable[..., str]
 
 
 @pytest.fixture(autouse=True)
-def _jwt_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CORP_GATEWAY_OIDC_KEY", _SECRET)
-    monkeypatch.setenv("CORP_GATEWAY_OIDC_ALG", _ALG)
+def _rbac_env(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    empty = tmp_path / "config.toml"
+    empty.write_text("")
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(empty))
     monkeypatch.setenv("CORP_GATEWAY_RBAC", "1")
+    for name in (
+        "CORP_GATEWAY_OIDC_KEY",
+        "CORP_GATEWAY_OIDC_AUDIENCE",
+        "CORP_GATEWAY_OIDC_ISSUER",
+        "CORP_GATEWAY_ADMIN_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config.reset_cache()
+    yield
+    config.reset_cache()
 
 
-# ---------------------------------------------------------------------------
-# verify_operator unit tests
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def make_token(_rbac_env: None, monkeypatch: pytest.MonkeyPatch) -> MakeToken:
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
 
-
-def test_operator_via_realm_access_roles_allowed() -> None:
-    verify_operator(_make_token(roles=["gateway:operator"]))
-
-
-def test_operator_via_flat_roles_allowed() -> None:
-    verify_operator(_make_token(flat_roles=["gateway:operator"]))
-
-
-def test_operator_via_scope_string_allowed() -> None:
-    verify_operator(_make_token(scope="openid gateway:operator profile"))
-
-
-def test_missing_role_denied() -> None:
-    with pytest.raises(OperatorDenied):
-        verify_operator(_make_token(roles=["some:other-role"]))
-
-
-def test_empty_roles_denied() -> None:
-    with pytest.raises(OperatorDenied):
-        verify_operator(_make_token(roles=[]))
-
-
-def test_empty_token_denied() -> None:
-    with pytest.raises(OperatorDenied):
-        verify_operator("")
-
-
-def test_malformed_token_denied() -> None:
-    with pytest.raises(OperatorDenied):
-        verify_operator("not.a.valid.jwt")
-
-
-def test_expired_token_denied() -> None:
-    with pytest.raises(OperatorDenied):
-        verify_operator(_make_token(roles=["gateway:operator"], exp_offset=-10))
-
-
-def test_wrong_signature_denied(monkeypatch: pytest.MonkeyPatch) -> None:
-    # token signed with a different key (also ≥32 bytes)
-    token = jwt.encode(
-        {"sub": "u", "realm_access": {"roles": ["gateway:operator"]}, "exp": int(time.time()) + 60},
-        "different-secret-key-that-is-long-enough",
-        algorithm=_ALG,
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    pub_pem = (
+        key.public_key()
+        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        .decode()
     )
-    with pytest.raises(OperatorDenied):
-        verify_operator(token)
+    monkeypatch.setenv("CORP_GATEWAY_OIDC_KEY", pub_pem)
+    monkeypatch.setenv("CORP_GATEWAY_OIDC_AUDIENCE", _AUDIENCE)
+    monkeypatch.setenv("CORP_GATEWAY_OIDC_ISSUER", _ISSUER)
+
+    def _make(
+        roles: list[str] | None = None,
+        flat_roles: list[str] | None = None,
+        scope: str | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "sub": "test-user",
+            "exp": int(time.time()) + 3600,
+            "aud": _AUDIENCE,
+            "iss": _ISSUER,
+        }
+        if roles is not None:
+            payload["realm_access"] = {"roles": roles}
+        if flat_roles is not None:
+            payload["roles"] = flat_roles
+        if scope is not None:
+            payload["scope"] = scope
+        return jwt.encode(payload, priv_pem, algorithm="RS256")
+
+    return _make
 
 
 # ---------------------------------------------------------------------------
@@ -105,20 +100,22 @@ def test_wrong_signature_denied(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_team_create_with_operator_token_returns_0(
+    make_token: MakeToken,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr("corp_llm_gateway.cli.admin._team_store", lambda: InMemoryTeamConfigStore())
-    token = _make_token(roles=["gateway:operator"])
+    token = make_token(roles=["gateway:operator"])
     rc = main(["--token", token, "team", "create", "--team-id", "t1", "--name", "Team One"])
     assert rc == 0
     assert "team created: t1" in capsys.readouterr().out
 
 
 def test_team_create_without_operator_role_returns_2(
+    make_token: MakeToken,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    token = _make_token(roles=["developer"])
+    token = make_token(roles=["developer"])
     rc = main(["--token", token, "team", "create", "--team-id", "t1", "--name", "Team One"])
     assert rc == 2
     captured = capsys.readouterr()
@@ -143,13 +140,14 @@ def test_team_set_retention_without_token_returns_2(
 
 
 def test_team_set_retention_with_operator_token_returns_0(
+    make_token: MakeToken,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     store = InMemoryTeamConfigStore()
     asyncio.run(store.upsert(TeamConfig(team_id="t1", name="One")))
     monkeypatch.setattr("corp_llm_gateway.cli.admin._team_store", lambda: store)
-    token = _make_token(roles=["gateway:operator"])
+    token = make_token(roles=["gateway:operator"])
     rc = main(["--token", token, "team", "set-retention", "--team-id", "t1"])
     assert rc == 0
     assert "retention" in capsys.readouterr().out
@@ -161,20 +159,22 @@ def test_team_set_retention_with_operator_token_returns_0(
 
 
 def test_token_revoke_with_operator_token_returns_0(
+    make_token: MakeToken,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr("corp_llm_gateway.cli.admin._token_store", lambda: InMemoryTokenStore())
-    token = _make_token(roles=["gateway:operator"])
+    token = make_token(roles=["gateway:operator"])
     rc = main(["--token", token, "token", "revoke", "--user", "alice"])
     assert rc == 0
     assert "revoked" in capsys.readouterr().out
 
 
 def test_token_revoke_without_role_returns_2_no_side_effect(
+    make_token: MakeToken,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    token = _make_token(roles=[])
+    token = make_token(roles=[])
     rc = main(["--token", token, "token", "revoke", "--user", "alice"])
     assert rc == 2
     captured = capsys.readouterr()
@@ -196,9 +196,10 @@ def test_token_revoke_missing_token_returns_2(
 
 
 def test_denial_message_contains_no_raw_token(
+    make_token: MakeToken,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    bad_token = _make_token(roles=["auditor"])
+    bad_token = make_token(roles=["auditor"])
     rc = main(["--token", bad_token, "team", "create", "--team-id", "t1", "--name", "x"])
     assert rc == 2
     captured = capsys.readouterr()

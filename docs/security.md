@@ -254,6 +254,17 @@ The NEVER-fields gate exists in **two** places — the in-process
 record containing any NEVER key is **dropped**; per plan M3-3 this increments an
 `audit_drop` metric that **should raise a SIEM alert** (M3-9).
 
+**Recursion asymmetry (F10).** The in-process gate is the **primary** defense and
+is **recursive** — it walks nested dicts and lists, so a NEVER key smuggled under
+a benign field (e.g. `{"debug": {"mapping": …}}`) is caught before any record is
+written to stdout (and therefore before Vector ever sees it). The Vector VRL gate
+is **flat** — `!exists(.field)` inspects **top-level** keys only. A fully
+recursive VRL walk is not cleanly expressible (closures can't accumulate across
+`for_each`, and a `flatten()`+`filter()` rewrite is unverifiable without a Vector
+runtime in CI), so the Vector filter stays a top-level backstop while the
+recursive in-proc walk carries the nested case. See the configmap comment above
+`enforce_audit_schema`.
+
 What SIEM should monitor (per plan M3-9):
 
 | Signal | Meaning |
@@ -327,7 +338,7 @@ fall-through, single-audit-sink-down) and per-team override columns.
 | M1-9 | **Length-descending substitution** (forward + reverse) | `placeholder.py`, `litellm_hook.py` |
 | — | **Per-request placeholder bijection** (same original → one token; distinct originals → distinct tokens) | `placeholder_allocator.py` |
 | — | **Depth-guard fail-closed** (`_MAX_JSON_DEPTH=64` → `400 E_BAD_REQUEST` on sanitize) | `content_blocks.py`, `litellm_hook.py` |
-| — | **NEVER gate, in-process + Vector** (defense in depth) | `audit/invariants.py` + Vector VRL |
+| — | **NEVER gate, in-process (recursive, primary) + Vector (flat backstop)** (defense in depth) | `audit/invariants.py` + Vector VRL |
 
 ## 10. Forensic breadcrumbs (incident investigation)
 
@@ -365,3 +376,37 @@ by construction; if one appears to, that is an M1-14 regression.
 **(a) and (c) are fixed; (d) is correct by design.** The only remaining open item
 is **(b)** — wiring the SIEM sink (gated on the SIEM target). See
 [`remaining-steps.md`](remaining-steps.md).
+
+## 12. GA security hardening (F8–F11)
+
+Low-severity hardening landed for GA (plan Task A8):
+
+| # | Fix | Where |
+|---|---|---|
+| F8 | `CorpLlmHttpError` on a `>=400` corp-LLM response carries the **status code only** — never `resp.text`. A corp-LLM error body may echo the RAW, pre-sanitization request; embedding it would ride the exception chain into logs/audit (an M1-14 surface: exception traces). | `corp_llm/client.py` |
+| F9 | `corp_llm_verify()` **refuses `SSL_VERIFY=false` when `CORP_ENV=prod`** (raises at resolution). Disabling TLS verification on the corp-LLM call — which carries raw user content — is a demo-only convenience; in prod, pin an internal CA via `CORP_LLM_CA_BUNDLE` instead (CA bundle keeps verification ON and is still honored in prod). | `config.py` |
+| F10 | In-proc NEVER-gate made **recursive** (see §6). | `audit/invariants.py` |
+| F11 | Operator RBAC JWT verification **pinned to RS256** with **`aud`/`iss` verification** and empty-key rejection (see below). | `auth/rbac.py` |
+
+### F11 — RBAC RS256 + aud/iss (BREAKING CHANGE)
+
+`verify_operator` (gateway-admin RBAC) previously decoded the operator JWT with
+the caller-configured `CORP_GATEWAY_OIDC_ALG` and **no** audience/issuer check. An
+`HS256` algorithm with an empty or leaked symmetric key made an operator token
+**forgeable**. Now:
+
+- Verification is **pinned to `algorithms=["RS256"]`** — an `HS256` (or `none`)
+  token is rejected. **`CORP_GATEWAY_OIDC_ALG` is no longer honored.**
+- `aud` and `iss` are **required and verified** against
+  `CORP_GATEWAY_OIDC_AUDIENCE` / `CORP_GATEWAY_OIDC_ISSUER`. A missing/mismatched
+  claim, or unset expected value, is rejected (fail-closed, per the M4 matrix).
+- An **empty `CORP_GATEWAY_OIDC_KEY`** is rejected (no signature to verify).
+
+**Migration.** Any deployment relying on `HS256` operator tokens **stops
+validating** and every operator call is denied until it switches to
+RS256-signed tokens and sets `CORP_GATEWAY_OIDC_AUDIENCE` +
+`CORP_GATEWAY_OIDC_ISSUER` to the Keycloak values. `CORP_GATEWAY_RBAC=0` still
+bypasses RBAC for local dev. RS256 verification needs the `cryptography` package
+(the `oidc` extra); without it `verify_operator` raises a clear `RuntimeError`
+rather than falling back to a weaker algorithm. The dev-facing upgrade note
+belongs in `docs/ops/upgrade.md` (plan Task B8).
