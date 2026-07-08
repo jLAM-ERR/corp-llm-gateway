@@ -96,7 +96,7 @@ sinks:
   langfuse:
     type: http
     inputs: ["to_langfuse_schema"]
-    uri: "http://langfuse-web:3000/api/public/ingestion"
+    uri: "${CORP_LANGFUSE_URL:-http://langfuse-web:3000}/api/public/ingestion"
     method: "post"
     encoding:
       codec: "text"

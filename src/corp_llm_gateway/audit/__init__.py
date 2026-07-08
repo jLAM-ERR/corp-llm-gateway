@@ -1,4 +1,10 @@
 from corp_llm_gateway.audit.event import AuditEvent
+from corp_llm_gateway.audit.factory import (
+    SinkExtension,
+    get_sink,
+    register_sink,
+    sink_name_for,
+)
 from corp_llm_gateway.audit.invariants import (
     NEVER_FIELDS,
     NeverFieldPresentError,
@@ -21,8 +27,12 @@ __all__ = [
     "ListSink",
     "NeverFieldPresentError",
     "Sink",
+    "SinkExtension",
     "StdoutSink",
     "assert_no_never_fields",
+    "get_sink",
     "lifecycle_configuration",
     "lifecycle_rule_for",
+    "register_sink",
+    "sink_name_for",
 ]

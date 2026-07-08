@@ -21,6 +21,7 @@ import httpx
 from corp_llm_gateway.audit.event import AuditEvent
 from corp_llm_gateway.audit.invariants import assert_no_never_fields
 from corp_llm_gateway.audit.sinks import Sink
+from corp_llm_gateway.healthz import HealthStatus
 
 
 class LangfuseIngestionError(Exception):
@@ -71,6 +72,22 @@ class LangfuseSink(Sink):
             raise LangfuseIngestionError(
                 f"langfuse ingestion {resp.status_code}: {resp.text[:300]}"
             )
+
+    async def health(self) -> HealthStatus:
+        """Cheap liveness probe against Langfuse's public health endpoint.
+
+        Reuses the sink's own AsyncClient — the extension registry caches this
+        live instance (audit/factory.py), so polling never opens a new client.
+        """
+        try:
+            resp = await self._http.get(
+                f"{self._base_url}/api/public/health", timeout=self._timeout
+            )
+        except httpx.HTTPError as exc:
+            return HealthStatus(False, f"langfuse_unreachable:{type(exc).__name__}")
+        if resp.status_code >= 500:
+            return HealthStatus(False, f"langfuse_http_{resp.status_code}")
+        return HealthStatus(True, "langfuse_ok")
 
     async def aclose(self) -> None:
         if self._owned_http:

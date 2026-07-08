@@ -46,6 +46,9 @@ audit:
   sinks:
     langfuse:
       enabled: true
+      # Config-only Langfuse endpoint (C2). Vector templates its ingestion URI
+      # from this; the in-process LangfuseSink reads CORP_LANGFUSE_URL.
+      endpoint: "http://langfuse.corp.lan"
     s3:
       enabled: true
       bucket: corp-audit

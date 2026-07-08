@@ -43,3 +43,15 @@
 # apikey:
 # CORP_LLM_API_KEY_HEADER   = "X-Api-Key"
 # CORP_LLM_API_KEY          = "..."
+
+# ── Audit sink selection (audit/factory.py) ─────────────────────────────────
+
+# CORP_AUDIT_SINK           = "stdout"   # one of: stdout | langfuse | list
+#   stdout   — one JSON record per line to the pod's stdout (Vector tails it).
+#   langfuse — POST records straight to Langfuse (needs the keys below).
+#   list     — in-memory buffer (tests only).
+
+# langfuse sink (only when CORP_AUDIT_SINK = "langfuse"):
+# CORP_LANGFUSE_URL         = "http://langfuse.corp.lan"
+# CORP_LANGFUSE_PUBLIC_KEY  = "pk-..."
+# CORP_LANGFUSE_SECRET_KEY  = "sk-..."

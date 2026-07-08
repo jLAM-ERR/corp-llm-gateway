@@ -26,6 +26,10 @@ MANAGED_ENV: tuple[str, ...] = (
     "CORP_LLM_OIDC_ISSUER",
     "CORP_LLM_OIDC_CLIENT_ID",
     "CORP_LLM_OIDC_CLIENT_SECRET",
+    "CORP_AUDIT_SINK",
+    "CORP_LANGFUSE_URL",
+    "CORP_LANGFUSE_PUBLIC_KEY",
+    "CORP_LANGFUSE_SECRET_KEY",
     "DEMO_TEAM_TOKEN",
     "CORP_LLM_GATEWAY_CONFIG_FILE",
     # decoy aliases (must be ignored):

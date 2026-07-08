@@ -129,7 +129,7 @@ data:
       langfuse:
         type: http
         inputs: [to_langfuse]
-        uri: "http://langfuse.corp.lan/api/public/ingestion"
+        uri: "{{ .Values.audit.sinks.langfuse.endpoint }}/api/public/ingestion"
         method: post
         auth:
           strategy: basic

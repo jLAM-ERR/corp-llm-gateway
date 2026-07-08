@@ -18,6 +18,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 
 from corp_llm_gateway import config
+from corp_llm_gateway.audit import StdoutSink
 from corp_llm_gateway.bootstrap import build_guardrail
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.storage import InMemoryMappingStore
@@ -81,6 +82,9 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
     return build_guardrail(
         auth_middleware=_demo_auth(),
         mapping_store=InMemoryMappingStore(),
+        # Demo tails the pod's stdout via Vector; keep StdoutSink regardless of
+        # any CORP_AUDIT_SINK in the demo env.
+        sink=StdoutSink(),
         max_output_tokens_cap=_DEMO_MAX_OUTPUT_TOKENS,
         # hosted_vllm forwards proxy_server_request headers (incl. Host:
         # 127.0.0.1:4000) to the corp ingress, which 503s the unknown vhost.

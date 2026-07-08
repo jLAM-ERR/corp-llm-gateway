@@ -26,11 +26,12 @@ from pathlib import Path
 import httpx
 
 from corp_llm_gateway import config
-from corp_llm_gateway.audit import AuditLogger, StdoutSink
+from corp_llm_gateway.audit import AuditLogger, Sink, get_sink, register_sink, sink_name_for
 from corp_llm_gateway.auth import get_auth_provider
 from corp_llm_gateway.corp_llm import CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import PIIDetector
+from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.rules import (
     CachedRulesLoader,
@@ -161,19 +162,29 @@ def build_guardrail(
     mapping_store: MappingStore | None = None,
     corp_llm: CorpLlmClient | None = None,
     dlp_guard: DlpEgressGuard | None = None,
+    sink: Sink | None = None,
     max_output_tokens_cap: int | None = None,
     strip_inbound_headers_to_upstream: bool = False,
 ) -> CorpLlmGuardrail:
     """Assemble a `CorpLlmGuardrail` from config, with optional dep overrides.
 
     Overrides let the demo inject in-memory backends; when omitted, each backend
-    is selected from config (Postgres/Redis when configured, else in-memory).
+    is selected from config (Postgres/Redis when configured, else in-memory) and
+    the audit sink from `CORP_AUDIT_SINK` via `get_sink()`.
+
+    The active sink is registered in the extension REGISTRY (cached live
+    instance) and `validate_api_version` runs here — inside the lazy build, never
+    at import — so a version-incompatible extension is refused before the
+    guardrail serves any traffic.
     """
     auth = auth_middleware if auth_middleware is not None else make_auth_middleware()
     store = mapping_store if mapping_store is not None else build_mapping_store()
     client = corp_llm if corp_llm is not None else build_corp_llm_client()
     orchestrator = _build_orchestrator(client, store)
-    audit_logger = AuditLogger(StdoutSink(), gateway_version=gateway_version())
+    active_sink = sink if sink is not None else get_sink()
+    register_sink(REGISTRY, active_sink, sink_name_for(active_sink))
+    REGISTRY.validate_api_version(EXTENSION_API_VERSION)
+    audit_logger = AuditLogger(active_sink, gateway_version=gateway_version())
     return CorpLlmGuardrail(
         orchestrator,
         auth,
