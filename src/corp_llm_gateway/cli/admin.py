@@ -1,18 +1,20 @@
 """gateway-admin — operator CLI for the corp LLM gateway.
 
-The ``team`` / ``token`` subcommands are still skeletons (M2-5): they print
-the action that would be taken; the Postgres-facing implementations land
-alongside M2-1..M2-4. The ``sanitize`` subcommand is a real implementation —
-it runs the live three-tier sanitizer against the corp LLM and prints the
-before/after redaction (useful for the demo walkthrough).
+The ``team`` and ``token`` subcommands are Postgres-backed (config key
+``CORP_LLM_PG_DSN``); read verbs (``list`` / ``show``) run ungated, mutating
+verbs (``create`` / ``set-*`` / ``issue`` / ``revoke``) require the
+``gateway:operator`` claim. The ``sanitize`` subcommand runs the live three-tier
+sanitizer against the corp LLM and prints the before/after redaction.
 """
 
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import json
 import sys
 from collections.abc import Sequence
+from datetime import timedelta
 from typing import Any, cast, get_args
 
 from corp_llm_gateway import config, extensions, providers
@@ -25,6 +27,19 @@ from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator, SanitizeResult
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.storage import InMemoryMappingStore
+from corp_llm_gateway.team_config import (
+    PostgresTeamConfigStore,
+    TeamConfig,
+    TeamConfigStore,
+    TeamNotFoundError,
+)
+from corp_llm_gateway.tokens import (
+    DEFAULT_TOKEN_TTL_DAYS,
+    OidcClaims,
+    PostgresTokenStore,
+    TokenIssuer,
+    TokenStore,
+)
 
 
 class _NoTeamRules(RulesLoader):
@@ -287,6 +302,271 @@ def _dispatch_extensions(args: argparse.Namespace) -> int:
     return _ext_disable(registry, args.ref, team=args.team)
 
 
+# ── team / token stores ──────────────────────────────────────────────────────
+
+
+def _team_store() -> TeamConfigStore:
+    dsn = config.get("CORP_LLM_PG_DSN")
+    if not dsn:
+        raise RuntimeError(
+            "team management requires Postgres: set CORP_LLM_PG_DSN "
+            "and install the 'postgres' extra"
+        )
+    return PostgresTeamConfigStore(dsn)
+
+
+def _token_store() -> TokenStore:
+    dsn = config.get("CORP_LLM_PG_DSN")
+    if not dsn:
+        raise RuntimeError(
+            "token management requires Postgres: set CORP_LLM_PG_DSN "
+            "and install the 'postgres' extra"
+        )
+    return PostgresTokenStore(dsn)
+
+
+async def _aclose(store: object) -> None:
+    close = getattr(store, "close", None)
+    if close is not None:
+        await close()
+
+
+def _mask_token(token: str) -> str:
+    return f"{token[:8]}…" if len(token) > 8 else token
+
+
+def _team_to_dict(cfg: TeamConfig) -> dict[str, Any]:
+    return {
+        "team_id": cfg.team_id,
+        "name": cfg.name,
+        "replace_md_path": cfg.replace_md_path,
+        "retention_hot_days": cfg.retention_hot_days,
+        "retention_cold_years": cfg.retention_cold_years,
+        "fail_policy": {
+            "pre_pass_down": cfg.fail_policy.pre_pass_down,
+            "audit_sink_down": cfg.fail_policy.audit_sink_down,
+            "audit_buffer_full": cfg.fail_policy.audit_buffer_full,
+        },
+    }
+
+
+async def _team_create(store: TeamConfigStore, args: argparse.Namespace) -> int:
+    try:
+        await store.get(args.team_id)
+    except TeamNotFoundError:
+        pass
+    else:
+        print(f"error: team {args.team_id!r} already exists", file=sys.stderr)
+        return 2
+    await store.upsert(TeamConfig(team_id=args.team_id, name=args.name))
+    print(f"team created: {args.team_id}")
+    return 0
+
+
+async def _team_set_rules(store: TeamConfigStore, args: argparse.Namespace) -> int:
+    try:
+        cfg = await store.get(args.team_id)
+    except TeamNotFoundError:
+        print(f"error: unknown team {args.team_id!r}", file=sys.stderr)
+        return 2
+    await store.upsert(dataclasses.replace(cfg, replace_md_path=args.from_file))
+    print(f"team {args.team_id}: replace.md -> {args.from_file}")
+    return 0
+
+
+async def _team_set_retention(store: TeamConfigStore, args: argparse.Namespace) -> int:
+    try:
+        cfg = await store.get(args.team_id)
+    except TeamNotFoundError:
+        print(f"error: unknown team {args.team_id!r}", file=sys.stderr)
+        return 2
+    await store.upsert(
+        dataclasses.replace(
+            cfg,
+            retention_hot_days=args.hot_days,
+            retention_cold_years=args.cold_years,
+        )
+    )
+    print(f"team {args.team_id}: retention hot_days={args.hot_days} cold_years={args.cold_years}")
+    return 0
+
+
+async def _team_list(store: TeamConfigStore, args: argparse.Namespace) -> int:
+    teams = sorted(await store.list_all(), key=lambda t: t.team_id)
+    if args.json_output:
+        print(json.dumps([_team_to_dict(t) for t in teams]))
+        return 0
+    if not teams:
+        print("no teams configured")
+        return 0
+    rows: list[tuple[str, ...]] = [("TEAM_ID", "NAME", "HOT_DAYS", "COLD_YEARS", "REPLACE_MD")]
+    rows += [
+        (
+            t.team_id,
+            t.name,
+            str(t.retention_hot_days),
+            str(t.retention_cold_years),
+            t.replace_md_path or "-",
+        )
+        for t in teams
+    ]
+    _print_table(rows)
+    return 0
+
+
+async def _team_show(store: TeamConfigStore, args: argparse.Namespace) -> int:
+    try:
+        cfg = await store.get(args.team_id)
+    except TeamNotFoundError:
+        print(f"error: unknown team {args.team_id!r}", file=sys.stderr)
+        return 2
+    data = _team_to_dict(cfg)
+    if args.json_output:
+        print(json.dumps(data))
+        return 0
+    for key, value in data.items():
+        if isinstance(value, dict):
+            rendered = ", ".join(f"{k}={v}" for k, v in value.items())
+        else:
+            rendered = "-" if value is None else str(value)
+        print(f"{key}: {rendered}")
+    return 0
+
+
+async def _run_team(store: TeamConfigStore, args: argparse.Namespace) -> int:
+    try:
+        if args.team_command == "create":
+            return await _team_create(store, args)
+        if args.team_command == "set-rules":
+            return await _team_set_rules(store, args)
+        if args.team_command == "set-retention":
+            return await _team_set_retention(store, args)
+        if args.team_command == "list":
+            return await _team_list(store, args)
+        return await _team_show(store, args)
+    finally:
+        await _aclose(store)
+
+
+def _dispatch_team(args: argparse.Namespace) -> int:
+    if args.team_command in ("create", "set-rules", "set-retention"):
+        rbac_rc = _enforce_rbac(args)
+        if rbac_rc is not None:
+            return rbac_rc
+    try:
+        store = _team_store()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return asyncio.run(_run_team(store, args))
+    except (RuntimeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+async def _token_issue(store: TokenStore, args: argparse.Namespace) -> int:
+    scopes = tuple(s for s in (args.scopes or "").split(",") if s)
+
+    # The operator is the trust anchor (RBAC-gated above), so the verifier just
+    # echoes the CLI-provided claims; the sentinel satisfies issue()'s non-empty
+    # precondition on the (here unused) OIDC token.
+    async def _verify(_oidc_token: str) -> OidcClaims:
+        return OidcClaims(user_id=args.user, team_id=args.team, scopes=scopes)
+
+    issuer = TokenIssuer(store, _verify, ttl=timedelta(days=args.ttl_days))
+    result = await issuer.issue("operator-cli")
+    if args.json_output:
+        print(
+            json.dumps(
+                {
+                    "corp_token": result.corp_token,
+                    "user_id": args.user,
+                    "team_id": args.team,
+                    "scopes": list(scopes),
+                    "expires_at": result.expires_at.isoformat(),
+                }
+            )
+        )
+        return 0
+    print(f"issued corp token for user={args.user} team={args.team}")
+    print(f"token: {result.corp_token}")
+    print(f"expires: {result.expires_at.isoformat()}")
+    return 0
+
+
+async def _token_revoke(store: TokenStore, args: argparse.Namespace) -> int:
+    revoked = await store.revoke_user(args.user)
+    print(f"revoked {revoked} token(s) for user={args.user}")
+    return 0
+
+
+async def _token_list(store: TokenStore, args: argparse.Namespace) -> int:
+    tokens = await store.list_tokens(args.user)
+    if args.json_output:
+        print(
+            json.dumps(
+                [
+                    {
+                        "token": _mask_token(t.corp_token),
+                        "user_id": t.user_id,
+                        "team_id": t.team_id,
+                        "scopes": list(t.scopes),
+                        "expires_at": t.expires_at.isoformat(),
+                        "revoked": t.revoked_at is not None,
+                    }
+                    for t in tokens
+                ]
+            )
+        )
+        return 0
+    if not tokens:
+        print("no tokens issued")
+        return 0
+    rows: list[tuple[str, ...]] = [("TOKEN", "USER", "TEAM", "SCOPES", "EXPIRES", "REVOKED")]
+    rows += [
+        (
+            _mask_token(t.corp_token),
+            t.user_id,
+            t.team_id,
+            ",".join(t.scopes) or "-",
+            t.expires_at.date().isoformat(),
+            "yes" if t.revoked_at is not None else "no",
+        )
+        for t in tokens
+    ]
+    _print_table(rows)
+    return 0
+
+
+async def _run_token(store: TokenStore, args: argparse.Namespace) -> int:
+    try:
+        if args.token_command == "issue":
+            return await _token_issue(store, args)
+        if args.token_command == "revoke":
+            return await _token_revoke(store, args)
+        return await _token_list(store, args)
+    finally:
+        await _aclose(store)
+
+
+def _dispatch_token(args: argparse.Namespace) -> int:
+    if args.token_command in ("issue", "revoke"):
+        rbac_rc = _enforce_rbac(args)
+        if rbac_rc is not None:
+            return rbac_rc
+    try:
+        store = _token_store()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return asyncio.run(_run_token(store, args))
+    except (RuntimeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gateway-admin")
     parser.add_argument(
@@ -315,11 +595,29 @@ def build_parser() -> argparse.ArgumentParser:
     team_set_retention.add_argument("--hot-days", type=int, default=90)
     team_set_retention.add_argument("--cold-years", type=int, default=7)
 
+    team_list = team_sub.add_parser("list", help="list configured teams")
+    team_list.add_argument("--json", dest="json_output", action="store_true")
+
+    team_show = team_sub.add_parser("show", help="show one team's config")
+    team_show.add_argument("--team-id", required=True)
+    team_show.add_argument("--json", dest="json_output", action="store_true")
+
     p_token = sub.add_parser("token", help="manage corp tokens")
     token_sub = p_token.add_subparsers(dest="token_command", required=True)
 
+    token_issue = token_sub.add_parser("issue", help="issue a corp token for a user")
+    token_issue.add_argument("--user", required=True)
+    token_issue.add_argument("--team", required=True)
+    token_issue.add_argument("--scopes", default="", help="comma-separated scopes")
+    token_issue.add_argument("--ttl-days", type=int, default=DEFAULT_TOKEN_TTL_DAYS)
+    token_issue.add_argument("--json", dest="json_output", action="store_true")
+
     token_revoke = token_sub.add_parser("revoke", help="revoke a corp token")
     token_revoke.add_argument("--user", required=True)
+
+    token_list = token_sub.add_parser("list", help="list issued corp tokens (masked)")
+    token_list.add_argument("--user", default=None, help="filter by user id")
+    token_list.add_argument("--json", dest="json_output", action="store_true")
 
     p_ext = sub.add_parser("extensions", help="inspect and manage registered extensions")
     ext_sub = p_ext.add_subparsers(dest="ext_command", required=True)
@@ -363,28 +661,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "team":
-        rbac_rc = _enforce_rbac(args)
-        if rbac_rc is not None:
-            return rbac_rc
-        if args.team_command == "create":
-            print(f"team.create team_id={args.team_id} name={args.name}")
-            return 0
-        if args.team_command == "set-rules":
-            print(f"team.set_rules team_id={args.team_id} from_file={args.from_file}")
-            return 0
-        if args.team_command == "set-retention":
-            print(
-                f"team.set_retention team_id={args.team_id} "
-                f"hot_days={args.hot_days} cold_years={args.cold_years}"
-            )
-            return 0
+        return _dispatch_team(args)
 
-    if args.command == "token" and args.token_command == "revoke":
-        rbac_rc = _enforce_rbac(args)
-        if rbac_rc is not None:
-            return rbac_rc
-        print(f"token.revoke user={args.user}")
-        return 0
+    if args.command == "token":
+        return _dispatch_token(args)
 
     if args.command == "extensions":
         return _dispatch_extensions(args)

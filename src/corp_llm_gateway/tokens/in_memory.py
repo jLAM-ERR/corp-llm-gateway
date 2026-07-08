@@ -30,3 +30,8 @@ class InMemoryTokenStore(TokenStore):
                 )
                 count += 1
         return count
+
+    async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+        return tuple(
+            info for info in self._tokens.values() if user_id is None or info.user_id == user_id
+        )

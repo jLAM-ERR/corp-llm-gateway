@@ -9,3 +9,6 @@ class TokenStore(ABC):
 
     @abstractmethod
     async def revoke_user(self, user_id: str) -> int: ...
+
+    @abstractmethod
+    async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]: ...
