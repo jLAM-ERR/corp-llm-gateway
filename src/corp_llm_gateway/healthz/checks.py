@@ -73,3 +73,33 @@ class SanitizationCheck(HealthCheck):
         except Exception as exc:
             return HealthStatus(False, f"sanitization_error:{type(exc).__name__}")
         return HealthStatus(ok, "sanitization_ok" if ok else "sanitization_failed")
+
+
+class ExtensionsCheck(HealthCheck):
+    """`/healthz/extensions` — deep-check aggregating registered-extension health.
+
+    Like `SanitizationCheck`, this is a deep-check and is deliberately NOT wired
+    into `/healthz/ready`: a flapping audit sink or tracing exporter is
+    observability, not a serve/don't-serve signal, so it must never yo-yo the
+    pod out of the load balancer (M4 fail-policy matrix).
+
+    Healthy iff every registered extension reports healthy. The detail names the
+    unhealthy extensions and flags `degraded` (some down) vs `unhealthy` (all
+    down); an empty registry is healthy.
+    """
+
+    def __init__(self, health_all: Callable[[], Awaitable[dict[str, HealthStatus]]]) -> None:
+        self._health_all = health_all
+
+    async def check(self) -> HealthStatus:
+        try:
+            report = await self._health_all()
+        except Exception as exc:
+            return HealthStatus(False, f"extensions_error:{type(exc).__name__}")
+        if not report:
+            return HealthStatus(True, "no_extensions")
+        down = sorted(name for name, status in report.items() if not status.healthy)
+        if not down:
+            return HealthStatus(True, f"extensions_ok:{len(report)}")
+        label = "unhealthy" if len(down) == len(report) else "degraded"
+        return HealthStatus(False, f"{label}: {', '.join(down)}")
