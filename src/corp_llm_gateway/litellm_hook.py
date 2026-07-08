@@ -49,6 +49,7 @@ from corp_llm_gateway.sanitizer import (
 )
 from corp_llm_gateway.sanitizer.content_blocks import (
     ContentTooDeepError,
+    UnsanitizableToolArgumentsError,
     collect_text,
     collect_tool_call_text,
     desanitize_content,
@@ -67,6 +68,7 @@ from corp_llm_gateway.sanitizer.placeholder import (
 from corp_llm_gateway.sanitizer.placeholder_allocator import (
     RequestPlaceholderAllocator,
 )
+from corp_llm_gateway.sanitizer.streaming import _json_string_escape, coerce_tool_index
 from corp_llm_gateway.tokens import (
     AuthError,
     AuthMiddleware,
@@ -456,6 +458,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "E_BAD_REQUEST",
                     "request content nesting too deep",
                 ) from exc
+            except UnsanitizableToolArgumentsError as exc:
+                # Fail closed: a tool-call arguments shape we cannot scan must not egress.
+                self._record_failure(request_id, error_code="E_BAD_REQUEST")
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    400,
+                    "E_BAD_REQUEST",
+                    "unsupported tool-call arguments shape",
+                ) from exc
             except OversizeContentError as exc:
                 # F1: fail-closed on an oversize leaf. Never forward the original.
                 state.block_reason = "oversize:blocked"
@@ -698,6 +710,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         dict_desanitizer = StreamingDesanitizer(state.mapping)
         # Dict path: OpenAI tool_calls[].function.arguments deltas (F4), per index.
         dict_tool_calls = OpenAiToolCallDesanitizer(state.mapping)
+        # Dict path: legacy OpenAI function_call.arguments deltas (singular).
+        dict_function_call = StreamingDesanitizer(state.mapping, escape=_json_string_escape)
         chunk_count = 0
         async for chunk in response:
             chunk_count += 1
@@ -705,13 +719,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 for out_chunk in sse.feed(chunk):
                     yield out_chunk
             elif isinstance(chunk, dict):
-                chunk = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
+                chunk, had_tc = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
+                chunk, had_fc = _desanitize_chunk_function_call(chunk, dict_function_call)
                 text = _extract_chunk_text(chunk)
                 if text is None:
                     yield chunk
                     continue
                 out = dict_desanitizer.feed(text)
-                if out:
+                # Held-back/empty content must not drop a tool_call/function_call
+                # riding in the same delta (its id/name/args would be lost).
+                if out or had_tc or had_fc:
                     yield _replace_chunk_text(chunk, out)
             else:
                 yield chunk
@@ -725,6 +742,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Flush any held-back tool_calls arguments tails.
         for tc_index, tc_tail in dict_tool_calls.flush():
             yield _make_tool_call_chunk(tc_index, tc_tail)
+        # Flush any held-back legacy function_call arguments tail.
+        fc_tail = dict_function_call.flush()
+        if fc_tail:
+            yield _make_function_call_chunk(fc_tail)
         logger.info(
             "litellm_post_call_stream_desanitize_done request_id=%s chunk_count=%d",
             request_id,
@@ -1112,34 +1133,64 @@ def _make_tool_call_chunk(index: int, arguments: str) -> dict[str, Any]:
     }
 
 
+def _make_function_call_chunk(arguments: str) -> dict[str, Any]:
+    return {"choices": [{"delta": {"function_call": {"arguments": arguments}}}]}
+
+
 def _desanitize_chunk_tool_calls(
     chunk: dict[str, Any], desanitizer: OpenAiToolCallDesanitizer
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
     """Rewrite placeholders in an OpenAI dict chunk's tool_calls argument deltas.
 
-    Returns the original chunk unchanged when it carries no tool_calls deltas."""
+    Returns ``(chunk, had_tool_calls)`` — ``had_tool_calls`` tells the caller to
+    keep emitting the chunk even when its content is held back. A garbage index is
+    skipped rather than crashing the stream."""
     choices = chunk.get("choices")
     if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
-        return chunk
+        return chunk, False
     delta = choices[0].get("delta")
     if not isinstance(delta, dict) or not isinstance(delta.get("tool_calls"), list):
-        return chunk
+        return chunk, False
     new_calls: list[Any] = []
     changed = False
     for tc in delta["tool_calls"]:
         fn = tc.get("function") if isinstance(tc, dict) else None
         if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-            idx = int(tc.get("index", 0))
+            idx = coerce_tool_index(tc.get("index", 0))
+            if idx is None:
+                new_calls.append(tc)
+                continue
             rewritten = desanitizer.feed(idx, fn["arguments"])
             new_calls.append({**tc, "function": {**fn, "arguments": rewritten}})
             changed = True
         else:
             new_calls.append(tc)
     if not changed:
-        return chunk
+        return chunk, False
     new_delta = {**delta, "tool_calls": new_calls}
     new_first = {**choices[0], "delta": new_delta}
-    return {**chunk, "choices": [new_first, *choices[1:]]}
+    return {**chunk, "choices": [new_first, *choices[1:]]}, True
+
+
+def _desanitize_chunk_function_call(
+    chunk: dict[str, Any], desanitizer: StreamingDesanitizer
+) -> tuple[dict[str, Any], bool]:
+    """Rewrite placeholders in an OpenAI dict chunk's legacy function_call args delta.
+
+    Returns ``(chunk, had_function_call)``."""
+    choices = chunk.get("choices")
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+        return chunk, False
+    delta = choices[0].get("delta")
+    if not isinstance(delta, dict):
+        return chunk, False
+    fc = delta.get("function_call")
+    if not isinstance(fc, dict) or not isinstance(fc.get("arguments"), str):
+        return chunk, False
+    rewritten = desanitizer.feed(fc["arguments"])
+    new_delta = {**delta, "function_call": {**fc, "arguments": rewritten}}
+    new_first = {**choices[0], "delta": new_delta}
+    return {**chunk, "choices": [new_first, *choices[1:]]}, True
 
 
 def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:

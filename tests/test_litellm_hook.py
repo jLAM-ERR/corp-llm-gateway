@@ -957,6 +957,265 @@ async def test_post_call_stream_openai_tool_calls_sse_desanitized() -> None:
     assert json.loads(args_out) == {"who": "alice"}
 
 
+# ---- OpenAI dict-shaped tool_call arguments (A3 review — F4 leak) -----------
+
+
+def _assistant_dict_args_msg(arguments: dict | list, *, name: str = "save") -> dict:
+    """A tool-call-only assistant message whose function.arguments is ALREADY a
+    dict/list (not a JSON string) — a shape some clients/providers emit."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}
+        ],
+    }
+
+
+async def test_pre_call_tool_calls_dict_arguments_sanitized() -> None:
+    """A3 review: dict-shaped function.arguments has its string leaves sanitized
+    (stays a dict; non-str scalars untouched)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="do it", model="gpt-4o")
+    data["messages"].append(_assistant_dict_args_msg({"user": "hi alice", "id": 7}))
+    out = await g.pre_call(data)
+
+    new_args = out["messages"][1]["tool_calls"][0]["function"]["arguments"]
+    assert new_args == {"user": "hi [N1]", "id": 7}
+    assert "alice" not in json.dumps(out["messages"][1])
+
+
+async def test_pre_call_tool_calls_dict_arguments_secret_caught_by_dlp() -> None:
+    """A3 review repro: an sk- secret in DICT-shaped arguments is rescanned by Stage 5.
+
+    Pre-fix, collect_tool_call_text skipped non-str arguments, so the secret was
+    neither sanitized nor DLP-scanned and egressed raw.
+    """
+    g, _ = _build_guardrail([])  # oracle redacts nothing → DLP is the backstop
+    secret = "sk-" + "a" * 40
+    data = _data_with_token("tok-1", content="hello", model="gpt-4o")
+    data["messages"].append(_assistant_dict_args_msg({"key": secret}))
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+
+
+async def test_post_call_unary_dict_arguments_desanitized() -> None:
+    """A3 review: placeholders in dict-shaped response arguments are restored."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": {"who": "[N1]"}},
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    out = await g.post_call_unary(data, response)
+
+    new_args = out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    assert new_args == {"who": "alice"}
+
+
+async def test_pre_call_tool_calls_unrecognized_scalar_arguments_fails_closed() -> None:
+    """A3 review: a genuinely unrecognized arguments shape (bare scalar) fails closed
+    rather than egressing un-scanned."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi", model="gpt-4o")
+    data["messages"].append(_assistant_dict_args_msg(1234))  # type: ignore[arg-type]
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_BAD_REQUEST"
+
+
+# ---- Streaming tool_calls edge cases (A3 review) ---------------------------
+
+
+def _chunk_tool_args(chunk: dict) -> str:
+    return "".join(
+        tc["function"]["arguments"] for tc in (chunk["choices"][0]["delta"].get("tool_calls") or [])
+    )
+
+
+async def test_post_call_stream_mixed_content_and_tool_calls_dict() -> None:
+    """A3 review: a dict delta carrying content:'' AND tool_calls must keep the
+    tool_calls (id/name/arguments) — the held-back content must not drop them."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    await g.pre_call(data)
+
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": '{"who": "[N1]"}'},
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    ids: list[str] = []
+    args_out = ""
+    async for out in g.post_call_stream(data, _async_iter([chunk])):
+        for tc in out["choices"][0]["delta"].get("tool_calls") or []:
+            if tc.get("id"):
+                ids.append(tc["id"])
+            args_out += tc["function"].get("arguments", "")
+    assert ids == ["c1"], "tool_call id/name dropped by held-back content"
+    assert json.loads(args_out) == {"who": "alice"}
+
+
+async def test_post_call_stream_mixed_content_and_tool_calls_sse() -> None:
+    """A3 review: same as above for the raw-SSE path — content:'' must not drop
+    the tool_calls in the same delta."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    await g.pre_call(data)
+
+    delta = {
+        "content": "",
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "f", "arguments": '{"who": "[N1]"}'},
+            }
+        ],
+    }
+    sse_in = [
+        ("data: " + json.dumps({"choices": [{"delta": delta}]}) + "\n\n").encode(),
+        b"data: [DONE]\n\n",
+    ]
+    ids: list[str] = []
+    args_out = ""
+    async for chunk in g.post_call_stream(data, _async_iter(sse_in)):
+        for line in chunk.decode().splitlines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                continue
+            for tc in json.loads(payload)["choices"][0]["delta"].get("tool_calls") or []:
+                if tc.get("id"):
+                    ids.append(tc["id"])
+                args_out += tc["function"].get("arguments", "")
+    assert ids == ["c1"], "tool_call id/name dropped by held-back content (SSE)"
+    assert json.loads(args_out) == {"who": "alice"}
+
+
+async def test_post_call_stream_legacy_function_call_desanitized_dict() -> None:
+    """A3 review: streamed legacy delta.function_call.arguments fragments are
+    desanitized (dict path) — placeholders must not leak to the client."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    await g.pre_call(data)
+
+    chunks_in = [
+        {"choices": [{"delta": {"function_call": {"name": "f", "arguments": ""}}}]},
+        {"choices": [{"delta": {"function_call": {"arguments": '{"who": "[N'}}}]},
+        {"choices": [{"delta": {"function_call": {"arguments": '1]"}'}}}]},
+    ]
+    args_out = ""
+    async for out in g.post_call_stream(data, _async_iter(chunks_in)):
+        fc = out["choices"][0]["delta"].get("function_call") or {}
+        args_out += fc.get("arguments", "")
+    assert json.loads(args_out) == {"who": "alice"}
+
+
+async def test_post_call_stream_legacy_function_call_desanitized_sse() -> None:
+    """A3 review: streamed legacy function_call.arguments is desanitized (SSE path)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    await g.pre_call(data)
+
+    def _ev(fc: dict) -> bytes:
+        return (
+            "data: " + json.dumps({"choices": [{"delta": {"function_call": fc}}]}) + "\n\n"
+        ).encode()
+
+    sse_in = [
+        _ev({"name": "f", "arguments": ""}),
+        _ev({"arguments": '{"who": "[N'}),
+        _ev({"arguments": '1]"}'}),
+        b"data: [DONE]\n\n",
+    ]
+    args_out = ""
+    async for chunk in g.post_call_stream(data, _async_iter(sse_in)):
+        for line in chunk.decode().splitlines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                continue
+            fc = json.loads(payload)["choices"][0]["delta"].get("function_call") or {}
+            args_out += fc.get("arguments", "")
+    assert json.loads(args_out) == {"who": "alice"}
+
+
+async def test_post_call_stream_parallel_tool_calls_per_index_reassembly() -> None:
+    """A3 review: interleaved tool_calls (index 0 and 1), each with a split
+    placeholder, reassemble per index (state machine keyed by tool_calls[].index)."""
+    g, _ = _build_guardrail([("alice", "[N1]"), ("bob", "[N2]")])
+    data = _data_with_token("tok-1", content="hi alice and bob", model="gpt-4o")
+    await g.pre_call(data)
+
+    chunks_in = [
+        _tc_delta_chunk("", index=0, first=True),
+        _tc_delta_chunk("", index=1, first=True),
+        _tc_delta_chunk('{"a": "[N', index=0),
+        _tc_delta_chunk('{"b": "[N', index=1),
+        _tc_delta_chunk('1]"}', index=0),
+        _tc_delta_chunk('2]"}', index=1),
+    ]
+    by_index: dict[int, str] = {}
+    async for out in g.post_call_stream(data, _async_iter(chunks_in)):
+        for tc in out["choices"][0]["delta"].get("tool_calls") or []:
+            by_index[tc["index"]] = by_index.get(tc["index"], "") + tc["function"]["arguments"]
+    assert json.loads(by_index[0]) == {"a": "alice"}
+    assert json.loads(by_index[1]) == {"b": "bob"}
+
+
+async def test_post_call_stream_tool_calls_bad_index_does_not_crash() -> None:
+    """A3 review: a garbage tool_call index must be skipped, not crash the stream —
+    subsequent legit content still desanitizes."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    await g.pre_call(data)
+
+    chunks_in = [
+        {"choices": [{"delta": {"tool_calls": [{"index": None, "function": {"arguments": "x"}}]}}]},
+        {"choices": [{"delta": {"content": "hi [N1]"}}]},
+    ]
+    content_out = ""
+    async for out in g.post_call_stream(data, _async_iter(chunks_in)):
+        delta = out["choices"][0]["delta"]
+        if isinstance(delta.get("content"), str):
+            content_out += delta["content"]
+    assert "alice" in content_out
+
+
 # ---- Audit -----------------------------------------------------------------
 
 

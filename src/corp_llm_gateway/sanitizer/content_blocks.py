@@ -26,6 +26,13 @@ class ContentTooDeepError(Exception):
     pass
 
 
+class UnsanitizableToolArgumentsError(Exception):
+    """A tool-call ``arguments`` value has a shape we cannot scan (not str/dict/list).
+
+    Raised instead of silently passing it through — this surface egresses to the
+    upstream provider, so an unrecognized shape fails closed."""
+
+
 async def _sanitize_json(
     value: Any, sanitize_one: SanitizeOne, _depth: int = 0
 ) -> tuple[Any, list[Any]]:
@@ -134,6 +141,45 @@ def _collect_arguments_text(arguments: str) -> list[str]:
     return _collect_json_text(parsed)
 
 
+async def _sanitize_tool_arguments(
+    arguments: Any, sanitize_one: SanitizeOne
+) -> tuple[Any, list[Any]]:
+    """Sanitize a tool-call ``arguments`` value of any shape.
+
+    The OpenAI spec says ``arguments`` is a JSON-encoded string, but some clients
+    send an already-parsed dict/list. Handle str via the arguments-string path and
+    dict/list via the same recursion as ``tool_use.input``. ``None``/absent is no
+    data; any other shape (bare scalar) is unrecognized and fails closed."""
+    if isinstance(arguments, str):
+        return await _sanitize_arguments(arguments, sanitize_one)
+    if isinstance(arguments, (dict, list)):
+        return await _sanitize_json(arguments, sanitize_one)
+    if arguments is None:
+        return arguments, []
+    raise UnsanitizableToolArgumentsError(type(arguments).__name__)
+
+
+def _desanitize_tool_arguments(arguments: Any, reverse: ReverseOne) -> Any:
+    """Reverse placeholders in a tool-call ``arguments`` value of any shape."""
+    if isinstance(arguments, str):
+        return _desanitize_arguments(arguments, reverse)
+    if isinstance(arguments, (dict, list)):
+        return _desanitize_json(arguments, reverse)
+    return arguments
+
+
+def _collect_tool_arguments_text(arguments: Any) -> list[str]:
+    """Collect the string leaves of a tool-call ``arguments`` value of any shape.
+
+    Mirrors ``_sanitize_tool_arguments`` so the Stage-0/Stage-5 pre-scan sees
+    exactly what will be sanitized."""
+    if isinstance(arguments, str):
+        return _collect_arguments_text(arguments)
+    if isinstance(arguments, (dict, list)):
+        return _collect_json_text(arguments)
+    return []
+
+
 def message_has_tool_calls(message: dict[str, Any]) -> bool:
     """True if a chat message carries OpenAI ``tool_calls`` or legacy ``function_call``."""
     return isinstance(message.get("tool_calls"), list) or isinstance(
@@ -154,16 +200,16 @@ async def sanitize_tool_calls(
         new_calls: list[Any] = []
         for call in tool_calls:
             fn = call.get("function") if isinstance(call, dict) else None
-            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-                new_args, r = await _sanitize_arguments(fn["arguments"], sanitize_one)
+            if isinstance(fn, dict) and "arguments" in fn:
+                new_args, r = await _sanitize_tool_arguments(fn["arguments"], sanitize_one)
                 new_calls.append({**call, "function": {**fn, "arguments": new_args}})
                 results.extend(r)
             else:
                 new_calls.append(call)
         new_message["tool_calls"] = new_calls
     fc = message.get("function_call")
-    if isinstance(fc, dict) and isinstance(fc.get("arguments"), str):
-        new_args, r = await _sanitize_arguments(fc["arguments"], sanitize_one)
+    if isinstance(fc, dict) and "arguments" in fc:
+        new_args, r = await _sanitize_tool_arguments(fc["arguments"], sanitize_one)
         new_message["function_call"] = {**fc, "arguments": new_args}
         results.extend(r)
     return new_message, results
@@ -196,17 +242,17 @@ def desanitize_tool_calls(message: dict[str, Any], reverse: ReverseOne) -> dict[
         new_calls: list[Any] = []
         for call in tool_calls:
             fn = call.get("function") if isinstance(call, dict) else None
-            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-                new_args = _desanitize_arguments(fn["arguments"], reverse)
+            if isinstance(fn, dict) and "arguments" in fn:
+                new_args = _desanitize_tool_arguments(fn["arguments"], reverse)
                 new_calls.append({**call, "function": {**fn, "arguments": new_args}})
             else:
                 new_calls.append(call)
         new_message["tool_calls"] = new_calls
     fc = message.get("function_call")
-    if isinstance(fc, dict) and isinstance(fc.get("arguments"), str):
+    if isinstance(fc, dict) and "arguments" in fc:
         new_message["function_call"] = {
             **fc,
-            "arguments": _desanitize_arguments(fc["arguments"], reverse),
+            "arguments": _desanitize_tool_arguments(fc["arguments"], reverse),
         }
     return new_message
 
@@ -218,11 +264,11 @@ def collect_tool_call_text(message: dict[str, Any]) -> list[str]:
     if isinstance(tool_calls, list):
         for call in tool_calls:
             fn = call.get("function") if isinstance(call, dict) else None
-            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-                out.extend(_collect_arguments_text(fn["arguments"]))
+            if isinstance(fn, dict) and "arguments" in fn:
+                out.extend(_collect_tool_arguments_text(fn["arguments"]))
     fc = message.get("function_call")
-    if isinstance(fc, dict) and isinstance(fc.get("arguments"), str):
-        out.extend(_collect_arguments_text(fc["arguments"]))
+    if isinstance(fc, dict) and "arguments" in fc:
+        out.extend(_collect_tool_arguments_text(fc["arguments"]))
     return out
 
 

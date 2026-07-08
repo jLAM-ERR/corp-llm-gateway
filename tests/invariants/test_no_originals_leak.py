@@ -822,3 +822,84 @@ async def test_openai_tool_call_raw_secret_in_arguments_blocked_and_no_leak(
     assert _haystack_contains_any_original(serialized) is None, "original in audit record"
     assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
     assert secret not in serialized and secret not in caplog.text, "secret leaked into a surface"
+
+
+# (xi) DICT-shaped tool_call arguments (A3 review): the same guarantees hold when
+# function.arguments is an already-parsed dict, not a JSON string --------------
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_call_dict_arguments_sanitized_never_leaks_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Corpus originals in a DICT-shaped arguments value are redacted before egress
+    and leak via no forwarded content, log line, or audit record."""
+    guardrail, sink = _tool_call_guardrail(_redacted_pairs())
+    args = {f"f{i}": orig for i, orig in enumerate(ORIGINAL_CORPUS)}
+    data = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "call the tool"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "save", "arguments": args},
+                    }
+                ],
+            },
+        ],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    forwarded = json.dumps(out["messages"])
+    assert _haystack_contains_any_original(forwarded) is None, "original egressed in dict args"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+
+    now = datetime.now(UTC)
+    await guardrail.audit(data, None, start_time=now, end_time=now, status="ok")  # type: ignore[attr-defined]
+    assert len(sink.records) == 1
+    assert _haystack_contains_any_original(json.dumps(sink.records[0])) is None
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_call_raw_secret_in_dict_arguments_blocked_and_no_leak(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raw sk- secret in DICT-shaped arguments is caught by Stage-5 DLP (no bypass),
+    and no original leaks via exception, log, or audit."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _tool_call_guardrail(())  # oracle redacts nothing → DLP is the backstop
+    secret = "sk-" + "A" * 40
+    args = {"note": ORIGINAL_CORPUS[0], "key": secret}
+    data = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": args}}
+                ],
+            },
+        ],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+
+    now = datetime.now(UTC)
+    await guardrail.audit(data, None, start_time=now, end_time=now, status="failed")  # type: ignore[attr-defined]
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert _haystack_contains_any_original(serialized) is None, "original in audit record"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+    assert secret not in serialized and secret not in caplog.text, "secret leaked into a surface"
