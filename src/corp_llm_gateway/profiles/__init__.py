@@ -13,6 +13,12 @@ from corp_llm_gateway.profiles.file_loader import (
     build_bundle,
     read_layer_source,
 )
+from corp_llm_gateway.profiles.lint import (
+    BundleLintError,
+    discover_profiles,
+    lint_bundle,
+    lint_root,
+)
 from corp_llm_gateway.profiles.manifest import (
     MAX_EXTENDS_DEPTH,
     ProfileCycleError,
@@ -31,6 +37,7 @@ from corp_llm_gateway.profiles.resolver import ProfileResolver, bundle_fingerpri
 __all__ = [
     "DETECTOR_REGISTRY",
     "MAX_EXTENDS_DEPTH",
+    "BundleLintError",
     "CachedProfileLoader",
     "FileProfileLoader",
     "LayerSource",
@@ -49,6 +56,9 @@ __all__ = [
     "build_detectors",
     "bundle_fingerprint",
     "compute_content_hash",
+    "discover_profiles",
+    "lint_bundle",
+    "lint_root",
     "parse_manifest",
     "read_layer_source",
     "resolve_extends",
