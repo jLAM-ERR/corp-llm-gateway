@@ -34,6 +34,8 @@ from corp_llm_gateway import config
 # Literals; test_settings pins them equal so the two paths cannot drift.
 AUTH_PROVIDERS: tuple[str, ...] = ("noop", "bearer", "mtls", "oidc", "apikey")
 AUDIT_SINKS: tuple[str, ...] = ("stdout", "langfuse", "list")
+METRICS_EXPORTERS: tuple[str, ...] = ("noop", "prometheus")
+TRACING_EXPORTERS: tuple[str, ...] = ("noop",)
 
 _FLAG_FALSE: frozenset[str] = frozenset({"0", "false", "no", "off", ""})
 
@@ -168,6 +170,19 @@ KEYS: tuple[Key, ...] = (
     Key("CORP_GATEWAY_ADMIN_TOKEN", secret=True, default="", help="operator JWT for gateway-admin"),
     # ── Providers (providers/registry.py) ────────────────────────────────────
     Key("CORP_ALLOW_V2_PROVIDERS", flag=True, default="0", help="allow non-v1 providers"),
+    # ── Metrics / tracing exporters (metrics/) ───────────────────────────────
+    Key(
+        "CORP_METRICS_EXPORTER",
+        default="noop",
+        choices=METRICS_EXPORTERS,
+        help="metrics exporter: noop (default) | prometheus (needs the [metrics] extra)",
+    ),
+    Key(
+        "CORP_TRACING_EXPORTER",
+        default="noop",
+        choices=TRACING_EXPORTERS,
+        help="tracing exporter (reserved): noop",
+    ),
     # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────
     Key("CORP_LLM_TESTDATA_ALLOWLIST", default="", help="inline never-redact test values"),
     Key("CORP_LLM_TESTDATA_ALLOWLIST_FILE", default="", help="never-redact test values file"),
@@ -283,13 +298,21 @@ def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) 
     class _Model(pydantic.BaseModel):
         model_config = pydantic.ConfigDict(extra="ignore")
 
-        # Keep these Literals in sync with AUTH_PROVIDERS / AUDIT_SINKS.
+        # Keep these Literals in sync with AUTH_PROVIDERS / AUDIT_SINKS /
+        # METRICS_EXPORTERS / TRACING_EXPORTERS.
         CORP_LLM_ENDPOINT: str
         CORP_LLM_AUTH_PROVIDER: Literal["noop", "bearer", "mtls", "oidc", "apikey"] = "noop"
         CORP_AUDIT_SINK: Literal["stdout", "langfuse", "list"] = "stdout"
+        CORP_METRICS_EXPORTER: Literal["noop", "prometheus"] = "noop"
+        CORP_TRACING_EXPORTER: Literal["noop"] = "noop"
 
     payload: dict[str, str] = {k: v for k, v in values.items() if v is not None}
-    for selector in ("CORP_LLM_AUTH_PROVIDER", "CORP_AUDIT_SINK"):
+    for selector in (
+        "CORP_LLM_AUTH_PROVIDER",
+        "CORP_AUDIT_SINK",
+        "CORP_METRICS_EXPORTER",
+        "CORP_TRACING_EXPORTER",
+    ):
         if selector in payload:
             payload[selector] = payload[selector].strip().lower()
     try:

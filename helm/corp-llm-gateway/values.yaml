@@ -174,8 +174,12 @@ podDisruptionBudget:
   minAvailable: 1
 
 metrics:
-  # ServiceMonitor scraping /metrics. Default OFF — the series ship in task B4;
-  # this stays inert until then.
+  # ServiceMonitor scraping /metrics. The app emits the alert-referenced series
+  # (corp_llm_gateway_blocked_requests_total, gateway_failure, request-latency)
+  # only when the prometheus exporter is selected. Default OFF: enable this AND
+  # set exporter=prometheus together to feed the shipped alert rules.
   enabled: false
+  # In-app metrics exporter → CORP_METRICS_EXPORTER: noop | prometheus.
+  exporter: noop
   path: /metrics
   interval: 30s

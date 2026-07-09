@@ -137,6 +137,16 @@
 # v1 allows only anthropic | openai (upstream) + corp-vllm (oracle).
 # CORP_ALLOW_V2_PROVIDERS   = "0"
 
+# ── Metrics & tracing exporters (metrics/) ───────────────────────────────────
+#
+# CORP_METRICS_EXPORTER selects the metrics backend: noop (default — emits
+# nothing) or prometheus (needs the [metrics] extra; exposes /metrics with
+# corp_llm_gateway_blocked_requests_total, gateway_failure, and
+# corp_llm_gateway_request_latency_seconds — the series the shipped alerts +
+# runbook reference). CORP_TRACING_EXPORTER is reserved (noop only for now).
+# CORP_METRICS_EXPORTER     = "noop"
+# CORP_TRACING_EXPORTER     = "noop"
+
 # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────────
 #
 # Never-redact fixture values (so obvious test tokens survive sanitization).
