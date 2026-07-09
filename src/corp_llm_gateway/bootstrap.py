@@ -33,6 +33,8 @@ from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import PIIDetector
 from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+from corp_llm_gateway.metrics import get_exporter
+from corp_llm_gateway.profiles import FileProfileLoader, ProfileBundle, ProfileResolver
 from corp_llm_gateway.rules import (
     CachedRulesLoader,
     FileRulesLoader,
@@ -44,6 +46,10 @@ from corp_llm_gateway.rules import (
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.allowlist import Allowlist
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
+from corp_llm_gateway.sanitizer.profile_orchestrator import (
+    ProfileAwareOrchestrator,
+    build_inner_orchestrator,
+)
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import (
     InMemoryTeamConfigStore,
@@ -57,6 +63,8 @@ _DIST_NAME = "corp-llm-gateway"
 _DEFAULT_ENDPOINT = "https://corp-llm.example/v1"
 _DEFAULT_MODEL = "GLM-5.1-AWQ"
 _DEFAULT_RULES_DIR = "/etc/corp-llm-gateway/rules"
+# Shipped profile bundles (core / ru-152fz / division-x); CORP_PROFILE_ROOT overrides.
+_DEFAULT_PROFILE_ROOT = Path(__file__).parent / "profiles" / "defaults"
 _FALSEY = frozenset({"0", "false", "False", "FALSE"})
 
 _log = logging.getLogger(__name__)
@@ -132,6 +140,12 @@ def build_corp_llm_client() -> CorpLlmClient:
     )
 
 
+def _deliver_teams() -> frozenset[str]:
+    """Teams allowed the oversize deliver-flag (shared by core + profile inners)."""
+    raw_teams = config.get("CORP_LLM_OVERSIZE_DELIVER_TEAMS", "") or ""
+    return frozenset(t.strip() for t in raw_teams.split(",") if t.strip())
+
+
 def _build_orchestrator(
     corp_llm: CorpLlmClient, mapping_store: MappingStore
 ) -> SanitizationOrchestrator:
@@ -140,18 +154,54 @@ def _build_orchestrator(
     )
     gazetteer = Gazetteer.from_defaults() if _flag("CORP_LLM_GAZETTEER") else None
     rules_dir = config.get("CORP_LLM_RULES_DIR", _DEFAULT_RULES_DIR) or _DEFAULT_RULES_DIR
-    raw_teams = config.get("CORP_LLM_OVERSIZE_DELIVER_TEAMS", "") or ""
-    deliver_teams = frozenset(t.strip() for t in raw_teams.split(",") if t.strip())
     return SanitizationOrchestrator(
         corp_llm,
         mapping_store,
         _RulesLoader(rules_dir),
         oversize_policy=config.oversize_policy(),
-        oversize_deliver_teams=deliver_teams,
+        oversize_deliver_teams=_deliver_teams(),
         local_detectors=local_detectors,
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),
         oracle_trigger=config.oracle_trigger(),
+    )
+
+
+def _build_profile_wrapper(
+    core: SanitizationOrchestrator,
+    *,
+    corp_llm: CorpLlmClient,
+    mapping_store: MappingStore,
+    team_store: TeamConfigStore,
+) -> ProfileAwareOrchestrator:
+    """Wrap the core orchestrator so a team's selected profile bundle is activated.
+
+    A team with NO ``profile_ids`` resolves to passthrough — the core orchestrator
+    with no fingerprint — so no-profile traffic is byte-identical to today (D4). A
+    team that selects a profile gets one inner orchestrator per resolved layer-key,
+    built by ``build_inner`` over the SHARED corp-LLM client + mapping store (Cache A)
+    + a base ``replace.md`` loader. Construction does no I/O (the loader just holds
+    a path; resolution/reads happen lazily on the first profiled request).
+    """
+    root = config.get("CORP_PROFILE_ROOT") or str(_DEFAULT_PROFILE_ROOT)
+    resolver = ProfileResolver(FileProfileLoader(Path(root)))
+    rules_dir = config.get("CORP_LLM_RULES_DIR", _DEFAULT_RULES_DIR) or _DEFAULT_RULES_DIR
+    base_rules_loader = _RulesLoader(rules_dir)
+    oversize_policy = config.oversize_policy()
+    deliver_teams = _deliver_teams()
+
+    def build_inner(bundle: ProfileBundle) -> SanitizationOrchestrator:
+        return build_inner_orchestrator(
+            bundle,
+            corp_llm=corp_llm,
+            mapping_store=mapping_store,
+            base_rules_loader=base_rules_loader,
+            oversize_policy=oversize_policy,
+            oversize_deliver_teams=deliver_teams,
+        )
+
+    return ProfileAwareOrchestrator(
+        core, team_store=team_store, resolver=resolver, build_inner=build_inner
     )
 
 
@@ -166,6 +216,7 @@ def build_guardrail(
     auth_middleware: AuthMiddleware | None = None,
     mapping_store: MappingStore | None = None,
     corp_llm: CorpLlmClient | None = None,
+    team_config_store: TeamConfigStore | None = None,
     dlp_guard: DlpEgressGuard | None = None,
     sink: Sink | None = None,
     max_output_tokens_cap: int | None = None,
@@ -177,6 +228,11 @@ def build_guardrail(
     is selected from config (Postgres/Redis when configured, else in-memory) and
     the audit sink from `CORP_AUDIT_SINK` via `get_sink()`.
 
+    The core orchestrator is wrapped in a `ProfileAwareOrchestrator` (D4): a team
+    with no `profile_ids` passes through to the core unchanged; a team that selects
+    a bundle gets its merged profile applied. The metrics exporter comes from
+    `get_exporter()` (B4) — default noop, so the metrics surface is opt-in.
+
     The active sink is registered in the extension REGISTRY (cached live
     instance) and `validate_api_version` runs here — inside the lazy build, never
     at import — so a version-incompatible extension is refused before the
@@ -185,7 +241,11 @@ def build_guardrail(
     auth = auth_middleware if auth_middleware is not None else make_auth_middleware()
     store = mapping_store if mapping_store is not None else build_mapping_store()
     client = corp_llm if corp_llm is not None else build_corp_llm_client()
-    orchestrator = _build_orchestrator(client, store)
+    team_store = team_config_store if team_config_store is not None else build_team_config_store()
+    core = _build_orchestrator(client, store)
+    orchestrator = _build_profile_wrapper(
+        core, corp_llm=client, mapping_store=store, team_store=team_store
+    )
     active_sink = sink if sink is not None else get_sink()
     register_sink(REGISTRY, active_sink, sink_name_for(active_sink))
     REGISTRY.validate_api_version(EXTENSION_API_VERSION)
@@ -197,6 +257,7 @@ def build_guardrail(
         max_output_tokens_cap=max_output_tokens_cap,
         strip_inbound_headers_to_upstream=strip_inbound_headers_to_upstream,
         dlp_guard=dlp_guard if dlp_guard is not None else _build_dlp_guard(),
+        metrics=get_exporter(),
     )
 
 

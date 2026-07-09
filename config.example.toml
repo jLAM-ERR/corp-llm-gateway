@@ -24,6 +24,13 @@
 # CORP_GATEWAY_TOKEN_FILE   = "~/.corp-llm-gateway/token"
 # CORP_GATEWAY_LATEST_URL   = "https://git.corp.lan/.../raw/master/VERSION"
 
+# ── Deployment environment ───────────────────────────────────────────────────
+#
+# CORP_ENV marks the deployment. "prod"/"production" arms production guards —
+# e.g. F9 refuses SSL_VERIFY=false on the corp-LLM call. Anything else (or unset)
+# is treated as non-prod (dev/demo/staging).
+# CORP_ENV                  = "prod"
+
 # ── Corp LLM oracle endpoint / model ─────────────────────────────────────────
 #
 # CORP_LLM_ENDPOINT is REQUIRED. It has NO routable default — the code falls back
@@ -124,18 +131,31 @@
 
 # ── Operator RBAC for gateway-admin (auth/rbac.py) ───────────────────────────
 #
-# CORP_GATEWAY_RBAC = "0" bypasses RBAC (local dev). OIDC_KEY/ALG verify the
-# operator JWT; ADMIN_TOKEN supplies the JWT when --token is not passed.
-# CORP_GATEWAY_RBAC         = "1"
-# CORP_GATEWAY_OIDC_KEY     = "-----BEGIN PUBLIC KEY-----\n..."
-# CORP_GATEWAY_OIDC_ALG     = "RS256"
-# CORP_GATEWAY_ADMIN_TOKEN  = "eyJ..."
+# CORP_GATEWAY_RBAC = "0" bypasses RBAC (local dev). The operator JWT is verified
+# pinned to RS256 (F11): OIDC_KEY is the RS256 PUBLIC key; OIDC_AUDIENCE/ISSUER are
+# the expected aud/iss claims (both REQUIRED to verify). ADMIN_TOKEN supplies the
+# JWT when --token is not passed. (CORP_GATEWAY_OIDC_ALG is gone — RS256 is pinned.)
+# CORP_GATEWAY_RBAC           = "1"
+# CORP_GATEWAY_OIDC_KEY       = "-----BEGIN PUBLIC KEY-----\n..."
+# CORP_GATEWAY_OIDC_AUDIENCE  = "corp-llm-gateway"
+# CORP_GATEWAY_OIDC_ISSUER    = "https://keycloak.corp.lan/realms/corp"
+# CORP_GATEWAY_ADMIN_TOKEN    = "eyJ..."
 
 # ── Providers guard (providers/registry.py) ──────────────────────────────────
 #
 # CORP_ALLOW_V2_PROVIDERS = "1" unlocks non-v1 providers (Bedrock/Gemini/Azure);
 # v1 allows only anthropic | openai (upstream) + corp-vllm (oracle).
 # CORP_ALLOW_V2_PROVIDERS   = "0"
+
+# ── Profiles (profiles/) ─────────────────────────────────────────────────────
+#
+# CORP_PROFILE_ROOT points the profile loader at a bundle directory; unset → the
+# shipped defaults (core / ru-152fz / division-x under profiles/defaults). A team
+# selects profile_ids in its TeamConfig; no selection = today's behavior.
+# CORP_PROFILE_REQUIRE_SIGNATURE = "1" fails closed unless a bundle is signed —
+# gated on the offline PKI decision, so it currently refuses at load when set.
+# CORP_PROFILE_ROOT              = "/etc/corp-llm-gateway/profiles"
+# CORP_PROFILE_REQUIRE_SIGNATURE = "0"
 
 # ── Metrics & tracing exporters (metrics/) ───────────────────────────────────
 #

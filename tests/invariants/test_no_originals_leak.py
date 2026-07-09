@@ -1080,7 +1080,8 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """M1-14 surface (v): X-Corp-Auth is stripped from data["headers"],
-    proxy_server_request.headers, metadata.headers, and litellm_metadata.headers;
+    proxy_server_request.headers, metadata.headers, litellm_metadata.headers, and
+    litellm_params.metadata.headers (litellm's logging-metadata dict, F6 completeness);
     the BYOK Authorization header survives; the token never hits a log line."""
     guardrail, _ = _header_strip_guardrail()
     byok = "Bearer byok-developer-key"
@@ -1092,6 +1093,7 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
         "proxy_server_request": {"headers": dict(hdrs)},
         "metadata": {"headers": dict(hdrs)},
         "litellm_metadata": {"headers": dict(hdrs)},
+        "litellm_params": {"metadata": {"headers": dict(hdrs)}},
     }
     with caplog.at_level(logging.DEBUG):
         out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
@@ -1101,6 +1103,7 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
         out["proxy_server_request"]["headers"],
         out["metadata"]["headers"],
         out["litellm_metadata"]["headers"],
+        out["litellm_params"]["metadata"]["headers"],
     ]
     for loc in forwarded_header_dicts:
         serialized = json.dumps(loc)

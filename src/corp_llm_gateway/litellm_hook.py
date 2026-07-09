@@ -1118,12 +1118,27 @@ def _drop_corp_token(headers: Any) -> None:
 
 
 def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
-    """Remove the corp token from every header dict litellm may forward upstream."""
+    """Remove the corp token from every header dict litellm may forward OR log.
+
+    Covers ``data["headers"]`` plus the ``headers`` sub-dict of
+    proxy_server_request / metadata / litellm_metadata (locations litellm forwards
+    upstream), AND ``litellm_params["metadata"]["headers"]``. That last one is
+    litellm's logging-metadata dict — the same dict ``_scatter`` threads the
+    request id through and litellm hands to log callbacks — so a corp token
+    mirrored there would reach the audit/logging pipeline, which invariant 4
+    forbids. ``_drop_corp_token`` only removes ``x-corp-auth``; the developer's
+    BYOK ``Authorization`` header is left untouched (invariant 3).
+    """
     _drop_corp_token(data.get("headers"))
     for bucket_key in ("proxy_server_request", "metadata", "litellm_metadata"):
         bucket = data.get(bucket_key)
         if isinstance(bucket, dict):
             _drop_corp_token(bucket.get("headers"))
+    lparams = data.get("litellm_params")
+    if isinstance(lparams, dict):
+        meta = lparams.get("metadata")
+        if isinstance(meta, dict):
+            _drop_corp_token(meta.get("headers"))
 
 
 class _RequestState:

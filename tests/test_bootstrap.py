@@ -11,8 +11,15 @@ import pytest
 from corp_llm_gateway import bootstrap, config
 from corp_llm_gateway.audit import StdoutSink
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
+from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.profile_orchestrator import ProfileAwareOrchestrator
 from corp_llm_gateway.storage import InMemoryMappingStore, RedisMappingStore
-from corp_llm_gateway.team_config import InMemoryTeamConfigStore, PostgresTeamConfigStore
+from corp_llm_gateway.team_config import (
+    InMemoryTeamConfigStore,
+    PostgresTeamConfigStore,
+    TeamConfig,
+)
 from corp_llm_gateway.tokens import InMemoryTokenStore
 
 
@@ -29,7 +36,8 @@ def test_build_guardrail_returns_guardrail_with_in_memory_backends() -> None:
 
     assert isinstance(guardrail, CorpLlmGuardrail)
     assert isinstance(guardrail._auth._store, InMemoryTokenStore)
-    assert isinstance(guardrail._orch._mapping_store, InMemoryMappingStore)
+    # _orch is now the ProfileAwareOrchestrator wrapper; the core carries the store.
+    assert isinstance(guardrail._orch._core._mapping_store, InMemoryMappingStore)
 
 
 def test_module_level_guardrail_is_importable_instance() -> None:
@@ -82,6 +90,61 @@ def test_audit_sink_is_stdout() -> None:
     guardrail = bootstrap.build_guardrail()
 
     assert isinstance(guardrail._audit._sink, StdoutSink)
+
+
+# ── B4: metrics exporter wired (default noop) ────────────────────────────────
+
+
+def test_build_guardrail_carries_metrics_exporter_noop_by_default() -> None:
+    # B4 follow-up: build_guardrail wires get_exporter(); default is noop, so
+    # nothing is emitted (zero behavior change) but the seam is live.
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail._metrics, MetricsExporter)
+    assert isinstance(guardrail._metrics, NoopExporter)
+
+
+# ── D4: profiles activated in the composition root ───────────────────────────
+
+
+def test_build_guardrail_wraps_orchestrator_in_profile_aware() -> None:
+    # D4 follow-up: _orch is the ProfileAwareOrchestrator wrapping the core.
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail._orch, ProfileAwareOrchestrator)
+    assert isinstance(guardrail._orch._core, SanitizationOrchestrator)
+
+
+async def test_no_profile_team_passes_through_to_core_unchanged() -> None:
+    # Back-compat: a team with no profile_ids resolves to the CORE orchestrator
+    # with no fingerprint — byte-identical to pre-D4 behavior.
+    guardrail = bootstrap.build_guardrail()
+
+    resolved = await guardrail._orch.resolve("team-with-no-profiles")
+
+    assert resolved.orchestrator is guardrail._orch._core
+    assert resolved.fingerprint is None
+    assert resolved.profile_ids == ()
+
+
+async def test_team_with_sealed_default_profile_resolves_and_applies() -> None:
+    # A team selecting the shipped division-x bundle composes [core, ru-152fz,
+    # division-x] and applies its tightened merged policy through a DISTINCT inner
+    # orchestrator — proving profiles are live end-to-end from build_guardrail.
+    team_store = InMemoryTeamConfigStore()
+    await team_store.upsert(
+        TeamConfig(team_id="div-team", name="Division X", profile_ids=("division-x",))
+    )
+    guardrail = bootstrap.build_guardrail(team_config_store=team_store)
+
+    resolved = await guardrail._orch.resolve("div-team")
+
+    assert resolved.profile_ids == ("core", "ru-152fz", "division-x")
+    assert resolved.fingerprint is not None
+    assert resolved.orchestrator is not guardrail._orch._core
+    # division-x tightens the merged policy — proves the bundle is applied + merged.
+    assert resolved.policy.allowed_providers == frozenset({"anthropic"})
+    assert resolved.policy.size_threshold_bytes == 65536
 
 
 # ── backend selection by config ──────────────────────────────────────────────
@@ -193,7 +256,7 @@ async def test_demo_shim_yields_in_memory_deps_and_working_guardrail() -> None:
 
     assert isinstance(guardrail, CorpLlmGuardrail)
     assert isinstance(guardrail._auth._store, InMemoryTokenStore)
-    assert isinstance(guardrail._orch._mapping_store, InMemoryMappingStore)
+    assert isinstance(guardrail._orch._core._mapping_store, InMemoryMappingStore)
     assert isinstance(guardrail._audit._sink, StdoutSink)
 
     ctx = await guardrail._auth.authenticate("demo-team-token")
