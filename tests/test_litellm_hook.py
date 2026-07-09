@@ -521,6 +521,25 @@ async def test_pre_call_strips_corp_token_case_insensitive_all_locations() -> No
         assert loc["authorization"] == "Bearer byok"
 
 
+async def test_pre_call_strips_corp_token_from_litellm_params_metadata_headers() -> None:
+    """F6 completeness: litellm_params["metadata"] is litellm's logging-metadata dict
+    (fed to log callbacks + threaded by _scatter); a corp token mirrored into its
+    `headers` must be stripped (invariant 4) while BYOK Authorization survives (3)."""
+    g, _ = _build_guardrail()
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+        "litellm_params": {
+            "metadata": {"headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"}}
+        },
+    }
+    out = await g.pre_call(data)
+    hdrs = out["litellm_params"]["metadata"]["headers"]
+    assert not any(k.lower() == "x-corp-auth" for k in hdrs)
+    assert hdrs["Authorization"] == "Bearer byok"
+
+
 async def test_pre_call_request_id_stable_across_calls_on_same_data() -> None:
     g, _ = _build_guardrail()
     data = _data_with_token("tok-1")

@@ -68,6 +68,8 @@ KEYS: tuple[Key, ...] = (
     Key("CORP_GATEWAY_URL", default="https://gateway.corp.lan", help="gateway base URL"),
     Key("CORP_GATEWAY_TOKEN_FILE", default="~/.corp-llm-gateway/token", help="corp token path"),
     Key("CORP_GATEWAY_LATEST_URL", default=_DEFAULT_LATEST_URL, help="latest-version URL"),
+    # ── Deployment environment ───────────────────────────────────────────────
+    Key("CORP_ENV", default="", help="deployment marker; 'prod'/'production' arms F9 guards"),
     # ── Corp LLM oracle endpoint / model ─────────────────────────────────────
     Key(
         "CORP_LLM_ENDPOINT",
@@ -165,11 +167,20 @@ KEYS: tuple[Key, ...] = (
     ),
     # ── Operator RBAC (auth/rbac.py) ─────────────────────────────────────────
     Key("CORP_GATEWAY_RBAC", flag=True, default="1", help="enforce gateway:operator RBAC"),
-    Key("CORP_GATEWAY_OIDC_KEY", secret=True, default="", help="RBAC JWT verification key"),
-    Key("CORP_GATEWAY_OIDC_ALG", default="RS256", help="RBAC JWT algorithm"),
+    Key("CORP_GATEWAY_OIDC_KEY", secret=True, default="", help="RBAC JWT RS256 public key (F11)"),
+    Key("CORP_GATEWAY_OIDC_AUDIENCE", default="", help="expected RBAC JWT audience (aud); F11"),
+    Key("CORP_GATEWAY_OIDC_ISSUER", default="", help="expected RBAC JWT issuer (iss); F11"),
     Key("CORP_GATEWAY_ADMIN_TOKEN", secret=True, default="", help="operator JWT for gateway-admin"),
     # ── Providers (providers/registry.py) ────────────────────────────────────
     Key("CORP_ALLOW_V2_PROVIDERS", flag=True, default="0", help="allow non-v1 providers"),
+    # ── Profiles (profiles/) ─────────────────────────────────────────────────
+    Key("CORP_PROFILE_ROOT", default="", help="profile bundle root dir; unset → shipped defaults"),
+    Key(
+        "CORP_PROFILE_REQUIRE_SIGNATURE",
+        flag=True,
+        default="0",
+        help="fail closed unless a profile is signed (D6; gated on offline PKI)",
+    ),
     # ── Metrics / tracing exporters (metrics/) ───────────────────────────────
     Key(
         "CORP_METRICS_EXPORTER",
@@ -305,6 +316,11 @@ def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) 
         CORP_AUDIT_SINK: Literal["stdout", "langfuse", "list"] = "stdout"
         CORP_METRICS_EXPORTER: Literal["noop", "prometheus"] = "noop"
         CORP_TRACING_EXPORTER: Literal["noop"] = "noop"
+        # Free-form optional keys — typed into the validated surface, no choice constraint.
+        CORP_ENV: str = ""
+        CORP_GATEWAY_OIDC_AUDIENCE: str = ""
+        CORP_GATEWAY_OIDC_ISSUER: str = ""
+        CORP_PROFILE_ROOT: str = ""
 
     payload: dict[str, str] = {k: v for k, v in values.items() if v is not None}
     for selector in (

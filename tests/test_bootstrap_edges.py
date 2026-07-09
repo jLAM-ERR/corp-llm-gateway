@@ -137,7 +137,8 @@ def test_redis_set_postgres_absent_selects_mixed_backends(
 
     guardrail = bootstrap.build_guardrail()
 
-    assert isinstance(guardrail._orch._mapping_store, RedisMappingStore)
+    # _orch is the ProfileAwareOrchestrator wrapper; the core carries the backend.
+    assert isinstance(guardrail._orch._core._mapping_store, RedisMappingStore)
     assert isinstance(guardrail._auth._store, InMemoryTokenStore)
     assert isinstance(bootstrap.build_team_config_store(), InMemoryTeamConfigStore)
 
@@ -169,7 +170,7 @@ def test_empty_string_backend_config_falls_back_to_in_memory_and_defaults(
 
     guardrail = bootstrap.build_guardrail()
 
-    assert isinstance(guardrail._orch._mapping_store, InMemoryMappingStore)
+    assert isinstance(guardrail._orch._core._mapping_store, InMemoryMappingStore)
     assert isinstance(guardrail._auth._store, InMemoryTokenStore)
     assert isinstance(bootstrap.build_team_config_store(), InMemoryTeamConfigStore)
     # Empty endpoint/model don't produce a broken client.
@@ -195,14 +196,14 @@ def test_local_first_flag_toggles_local_detectors(
 
     guardrail = bootstrap.build_guardrail()
 
-    assert (guardrail._orch._local is not None) is local_enabled
+    assert (guardrail._orch._core._local is not None) is local_enabled
 
 
 def test_gazetteer_flag_off_disables_gazetteer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CORP_LLM_GAZETTEER", "0")
     config.reset_cache()
 
-    assert bootstrap.build_guardrail()._orch._gazetteer is None
+    assert bootstrap.build_guardrail()._orch._core._gazetteer is None
 
 
 # ── config source: no direct os.environ, decoys ignored ──────────────────────
@@ -258,7 +259,7 @@ def test_demo_backends_ignore_prod_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     guardrail = _demo_guardrail._build_demo_guardrail()
 
-    assert isinstance(guardrail._orch._mapping_store, InMemoryMappingStore)
+    assert isinstance(guardrail._orch._core._mapping_store, InMemoryMappingStore)
     assert isinstance(guardrail._auth._store, InMemoryTokenStore)
 
 
