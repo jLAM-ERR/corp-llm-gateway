@@ -37,6 +37,9 @@ postgres = ["asyncpg>=0.29"]
 # JWT verification for RBAC enforcement (gateway-admin operator claims).
 # [crypto] pulls `cryptography` — required: RBAC is pinned to RS256 (F11).
 oidc = ["pyjwt[crypto]>=2.8"]
+# Prometheus metrics exporter (serves /metrics). Optional — default exporter is
+# noop, so the base install stays lean and emits nothing.
+metrics = ["prometheus-client>=0.20"]
 # CPU-only NER stack (torch-free). Install natasha + slovnet from PyPI.
 # en_core_web_md is NOT on PyPI by package name — install via its wheel URL:
 #   pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl
@@ -68,3 +71,9 @@ addopts = "-ra --strict-markers"
 python_version = "3.12"
 strict = true
 files = ["src"]
+
+# prometheus-client is the optional [metrics] extra; keep mypy clean whether or
+# not it is installed in the checking environment (lazy-imported at call sites).
+[[tool.mypy.overrides]]
+module = ["prometheus_client.*"]
+ignore_missing_imports = true

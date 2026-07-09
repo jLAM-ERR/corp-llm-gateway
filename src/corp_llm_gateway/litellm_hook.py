@@ -36,6 +36,7 @@ from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
 from corp_llm_gateway.detectors import NerUnavailableError
+from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.payload.size_threshold import OversizeContentError
 from corp_llm_gateway.providers import detect_provider
@@ -135,6 +136,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         max_output_tokens_cap: int | None = None,
         strip_inbound_headers_to_upstream: bool = False,
         dlp_guard: DlpEgressGuard | None = None,
+        metrics: MetricsExporter | None = None,
     ) -> None:
         # Best-effort super().__init__ — when litellm is installed this
         # initializes CustomLogger's internal state; when it isn't
@@ -158,6 +160,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # vhost. Off by default to preserve existing behaviour.
         self._strip_inbound_headers_to_upstream = strip_inbound_headers_to_upstream
         self._dlp_guard = dlp_guard if dlp_guard is not None else DlpEgressGuard()
+        # Pluggable metrics exporter (B4). Default Noop = nothing emitted; a
+        # PrometheusExporter (config-selected in the composition root) exposes the
+        # block/failure/latency series the shipped alerts + runbook reference.
+        self._metrics = metrics if metrics is not None else NoopExporter()
         # Per-request state. Keyed by request_id; cleared in post_call.
         self._req_state: dict[str, _RequestState] = {}
         # Idempotency guard for audit(): litellm does NOT fire
@@ -368,6 +374,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if allowed_providers is not None and provider not in allowed_providers:
             state.block_reason = "provider:not_allowed"
             self._record_failure(request_id, error_code="E_PROVIDER_BLOCKED")
+            self._metrics.record_block("provider:not_allowed")
             logger.info(
                 "litellm_pre_call_provider_blocked request_id=%s provider=%s",
                 request_id,
@@ -425,6 +432,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             if _s0_reason is not None:
                 state.block_reason = _s0_reason
                 self._record_failure(request_id, error_code="E_POLICY_BLOCKED")
+                self._metrics.record_block(_s0_reason)
                 logger.info(
                     "litellm_pre_call_blocked request_id=%s block_reason=%s",
                     request_id,
@@ -528,6 +536,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 # F1: fail-closed on an oversize leaf. Never forward the original.
                 state.block_reason = "oversize:blocked"
                 self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
+                self._metrics.record_block("oversize:blocked")
                 logger.info(
                     "litellm_pre_call_oversize_blocked request_id=%s message_index=%d "
                     "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
@@ -631,6 +640,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 # F1: fail-closed on an oversize system leaf. Never forward the original.
                 state.block_reason = "oversize:blocked"
                 self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
+                self._metrics.record_block("oversize:blocked")
                 logger.info(
                     "litellm_pre_call_oversize_blocked request_id=%s field=system "
                     "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
@@ -725,6 +735,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             if _s5_reason is not None:
                 state.block_reason = _s5_reason
                 self._record_failure(request_id, error_code="E_DLP_BLOCKED")
+                self._metrics.record_block(_s5_reason)
                 logger.info(
                     "litellm_egress_blocked request_id=%s block_reason=%s",
                     request_id,
@@ -868,6 +879,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             latency_ms = max(0, int(delta.total_seconds() * 1000))
         else:
             latency_ms = max(0, int(delta * 1000))
+        # Once-per-request (audit() is deduped above) request-latency observation.
+        self._metrics.observe_request_latency(latency_ms / 1000.0, status=status)
         prompt_tokens, completion_tokens = _extract_token_counts(response)
 
         event = AuditEvent(
@@ -965,6 +978,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:
             self._req_state[request_id].error_code = error_code
+        # gateway_failure{component} — the single failure choke point. Fires even
+        # when no _RequestState exists yet (e.g. an auth failure before state is built).
+        self._metrics.record_failure(_failure_component(error_code))
 
     async def _resolve_profile(self, team_id: str) -> ResolvedProfile:
         """Resolve the team's merged profile (policy + inner orchestrator + D3
@@ -1177,6 +1193,29 @@ def _classify_auth_error(exc: AuthError) -> str:
     if name == "InvalidTokenError":
         return "E_TOKEN_INVALID"
     return "E_AUTH"
+
+
+# error_code → coarse component for the gateway_failure{component} series. The
+# runbook queries component="corp_llm"/"pre_pass"; unmapped codes fall back to "other".
+_FAILURE_COMPONENT: dict[str, str] = {
+    "E_CORP_LLM_DOWN": "corp_llm",
+    "E_NER_UNAVAILABLE": "ner",
+    "E_PROFILE_UNAVAILABLE": "profile",
+    "E_MISSING_TOKEN": "auth",
+    "E_TOKEN_EXPIRED": "auth",
+    "E_TOKEN_REVOKED": "auth",
+    "E_TOKEN_INVALID": "auth",
+    "E_AUTH": "auth",
+    "E_PROVIDER_BLOCKED": "provider",
+    "E_POLICY_BLOCKED": "policy",
+    "E_OVERSIZE_BLOCKED": "oversize",
+    "E_DLP_BLOCKED": "dlp",
+    "E_BAD_REQUEST": "request",
+}
+
+
+def _failure_component(error_code: str) -> str:
+    return _FAILURE_COMPONENT.get(error_code, "other")
 
 
 def _extract_chunk_text(chunk: Any) -> str | None:
