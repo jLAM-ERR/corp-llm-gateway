@@ -1,5 +1,6 @@
 # Core bundle — today's gateway defaults (term files copied from rules/defaults/).
 name = "core"
+content_hash = "e704538887496a2cdd49c004de49219354396393b7e1684c0a5242930880d6cd"
 detectors = ["regex_checksum"]
 
 [policy]

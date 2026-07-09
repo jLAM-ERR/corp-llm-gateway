@@ -11,6 +11,7 @@ from corp_llm_gateway.profiles.file_loader import (
     FileProfileLoader,
     LayerSource,
     build_bundle,
+    content_hash_for_dir,
     read_layer_source,
 )
 from corp_llm_gateway.profiles.lint import (
@@ -58,6 +59,7 @@ __all__ = [
     "build_detectors",
     "bundle_fingerprint",
     "compute_content_hash",
+    "content_hash_for_dir",
     "discover_profiles",
     "lint_bundle",
     "lint_root",

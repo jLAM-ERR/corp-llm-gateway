@@ -76,7 +76,7 @@ def read_layer_source(root: Path, profile_id: str) -> LayerSource:
     term_categories = _read_terms(profile_dir, manifest.gazetteer_dirs)
     allowlist_originals = _read_allowlist(profile_dir)
     if manifest.content_hash is not None:
-        verify_integrity(manifest, _content_hash_for_dir(profile_dir))
+        verify_integrity(manifest, content_hash_for_dir(profile_dir))
     return LayerSource(
         profile_id=profile_id,
         manifest=manifest,
@@ -163,7 +163,7 @@ def _read_allowlist(profile_dir: Path) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _content_hash_for_dir(profile_dir: Path) -> str:
+def content_hash_for_dir(profile_dir: Path) -> str:
     """Hash every data file under the profile dir except profile.toml itself
     (which carries the declared hash — excluding it avoids self-reference)."""
     parts: list[tuple[str, bytes]] = []
@@ -171,3 +171,7 @@ def _content_hash_for_dir(profile_dir: Path) -> str:
         if path.is_file() and path.name != "profile.toml":
             parts.append((str(path.relative_to(profile_dir)), path.read_bytes()))
     return compute_content_hash(parts)
+
+
+# Back-compat alias for pre-existing importers (tests reference the private name).
+_content_hash_for_dir = content_hash_for_dir

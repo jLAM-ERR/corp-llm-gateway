@@ -324,6 +324,8 @@ of truth** — do not add ad-hoc fail-open paths):
 | `postgresDown` | **fail-closed** (503) |
 | `vectorBufferFull` | **fail-closed** (503) by default; team may opt `audit_buffer_full=continue` |
 | `s3SinkDown` | **fail-closed** (503) — S3 is the durable sink |
+| `profileUnavailable` (D4, when `profile_ids` set) | **fail-closed** (503 `E_PROFILE_UNAVAILABLE`) — a team's resolved profile bundle is missing or malformed; never fall through to un-profiled egress (invariant 6). Empty `profile_ids` → passthrough (no profile resolution, no 503) |
+| `providerBlocked` (D4) | **block** (403 `E_PROVIDER_BLOCKED`) — the merged `allowed_providers` policy rejects the upstream target; a clean policy denial before any content processing, no raw body |
 
 See plan §M4 for the full matrix (Redis transient retry, Cache A/C miss
 fall-through, single-audit-sink-down) and per-team override columns.

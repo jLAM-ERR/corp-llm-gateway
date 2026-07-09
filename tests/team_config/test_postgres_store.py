@@ -147,3 +147,48 @@ async def test_fail_policy_overrides_round_trip(store: TeamConfigStore) -> None:
     await store.upsert(_team("t1", fail_policy=overrides))
     got = await store.get("t1")
     assert got.fail_policy == overrides
+
+
+# Postgres-only: init_schema migrates a pre-D2 table (no profile_ids column) ---
+
+_PRE_D2_TEAM_CONFIG = """
+CREATE TABLE team_config (
+    team_id              TEXT PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    replace_md_path      TEXT,
+    retention_hot_days   INTEGER NOT NULL DEFAULT 90,
+    retention_cold_years INTEGER NOT NULL DEFAULT 7,
+    fail_policy          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+
+
+@pytest.mark.asyncio
+async def test_init_schema_adds_profile_ids_to_preexisting_table() -> None:
+    """A DB created before D2 lacks profile_ids; init_schema must ADD it, not
+    error, so the store's SELECT/upsert of profile_ids works after upgrade."""
+    pytest.importorskip("asyncpg", reason="PostgresTeamConfigStore requires the 'postgres' extra")
+    from corp_llm_gateway.team_config.postgres_store import PostgresTeamConfigStore
+
+    store = PostgresTeamConfigStore(_DEMO_PG_DSN)
+    try:
+        pool = await store._get_pool()
+    except Exception as exc:
+        await store.close()
+        pytest.skip(f"Postgres unreachable: {exc}")
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS team_config CASCADE")
+            await conn.execute(_PRE_D2_TEAM_CONFIG)
+        # The migration runs here; without ADD COLUMN IF NOT EXISTS the later
+        # upsert would raise UndefinedColumnError on profile_ids.
+        await store.init_schema()
+        await store.upsert(_team("t1", profile_ids=("core", "ru-152fz")))
+        got = await store.get("t1")
+        assert got.profile_ids == ("core", "ru-152fz")
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS team_config CASCADE")
+        await store.close()
