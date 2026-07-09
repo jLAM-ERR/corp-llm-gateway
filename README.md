@@ -8,7 +8,7 @@ Replaces the per-laptop `data-sanitizer` Claude Code plugin (which only covered 
 
 ## Status
 
-v1 — the local-first detection cascade + compliance pack are implemented; pre-GA. See [`CHANGELOG.md`](CHANGELOG.md), [`docs/requirements-compliance.md`](docs/requirements-compliance.md), and the design plan [`docs/plans/20260507-external-sanitizer-gateway-v1.md`](docs/plans/20260507-external-sanitizer-gateway-v1.md). Non-negotiable success criterion: **zero confirmed leak incidents** in the 90 days post-GA.
+GA-ready. Implemented: the local-first detection cascade, a full security-hardening pass (11 leak-surface fixes, each repro-first — oversize, NER fail-open, OpenAI `tool_calls`, segmenter coverage, header stripping, dev-proxy, TLS/RBAC), the country / division / regulatory-regime **plugin / profile** layer (declarative bundles + in-tree detector registry, cross-jurisdiction cache isolation), and the operational surfaces (composition root, real `gateway-admin`, production Helm chart that deploys the guardrail image, pluggable metrics, served healthz, ops docs). See the GA plan [`docs/plans/20260708-ga-readiness-security-extensibility.md`](docs/plans/20260708-ga-readiness-security-extensibility.md), [`docs/security.md`](docs/security.md), and [`docs/requirements-compliance.md`](docs/requirements-compliance.md). Non-negotiable success criterion: **zero confirmed leak incidents** in the 90 days post-GA.
 
 ## Table of contents
 
@@ -147,23 +147,29 @@ The demo's live rules file is `docker/demo-litellm/rules/demo-team.md`. Full spe
 
 ```
 src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engine)
-  auth/                 corp-LLM auth provider (Noop default; Bearer/mTLS/OIDC stubs)
-  audit/                AuditEvent + Logger + Sinks + retention generator + NEVER-fields gate
-  cli/                  gateway-admin (operators), corp-llm-gateway status (devs), proxy
+  auth/                 corp-LLM auth provider (Noop default; Bearer/mTLS/OIDC) + factory
+  audit/                AuditEvent + Logger + Sinks + factory + retention generator + NEVER-fields gate
+  bootstrap.py          production composition root — build_guardrail() from config; lazy `guardrail` singleton
+  cli/                  gateway-admin (team/token/extensions/config check), corp-llm-gateway status, proxy
+  config.py/settings.py config loader (env→file→default) + typed single-source-of-truth registry + validate()
   corp_llm/             httpx client speaking vLLM /v1/chat/completions
-  detectors/            PIIDetector + ShadowDetector + RegexChecksumDetector + DualNerDetector
-  healthz/              live / ready / sanitization deep-check
-  payload/              size threshold + gzip + per-team quota
-  rules/                replace.md parser + cached file loader
-  sanitizer/            local-first engine + StreamingDesanitizer + DLP guard + orchestrator
+  detectors/            PIIDetector + RegexChecksumDetector + DualNerDetector (RU+EN); fail-closed on missing NER
+  extensions/           ExtensionRegistry (audit-sink / provider / detector / … kinds); fail-closed register + api-version gate
+  healthz/              live / ready / sanitization / extensions checks + ASGI server (build_health_router)
+  metrics/              pluggable exporter (noop / prometheus) — blocked_requests_total + gateway_failure
+  payload/              size threshold + gzip + per-team quota + oversize policy
+  profiles/             plugin bundles: ProfileBundle/PolicyKnobs + resolver + DETECTOR_REGISTRY + hash-integrity + defaults/
+  providers/            ProviderRegistry + executable v1-guard (anthropic / openai / corp-vllm)
+  rules/                replace.md parser + gazetteer + cached file loader
+  sanitizer/            local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator
   storage/              MappingStore (in-memory + Redis)
-  team_config/          TeamConfig + store
-  tokens/               schema.sql + AuthMiddleware + TokenIssuer
-  litellm_hook.py       CorpLlmGuardrail — LiteLLM callback adapter
-helm/corp-llm-gateway/  Helm chart (deployment, service, configmap, NetworkPolicy, CoreDNS sinkhole)
-docs/                   plan + audit-schema + ops/* + rbac-matrix + integration docs
+  team_config/          TeamConfig (+ profile_ids) + store (in-memory + Postgres) + schema.sql
+  tokens/               schema.sql + AuthMiddleware + TokenIssuer + stores
+  litellm_hook.py       CorpLlmGuardrail — LiteLLM callback adapter (incl. OpenAI tool_calls + streaming)
+helm/corp-llm-gateway/  Helm chart (gateway image + guardrail callback, Secret, HPA/PDB/SA, ServiceMonitor, config-check initContainer, NetworkPolicy, CoreDNS sinkhole)
+docs/                   plans + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles) + rbac-matrix + adr/*
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                  pytest, pytest-asyncio mode=auto (546 tests, ~16s)
+tests/                  pytest, pytest-asyncio mode=auto (~1392 passed / 91 skipped; 3.14 graceful NER, full on 3.12/CI)
 ```
 
 ## Developer quickstart (laptop)
@@ -288,7 +294,7 @@ and is independent of the CI compose at `docker-compose.yml`.
 |---|---|---|
 | `corp-llm-gateway status` | dev | laptop diagnostics — token present, gateway live, version, update check |
 | `corp-llm-gateway-proxy` | dev | localhost header-injecting proxy (Pattern 3) |
-| `gateway-admin` | operator | team CRUD, retention config, token issue / revoke |
+| `gateway-admin` | operator | `team` CRUD + retention, `token` issue/revoke/list, `extensions` list/inspect/health/enable, `config check` |
 
 Entry points are wired via `pyproject.toml`'s `[project.scripts]`. The `gateway-admin` CLI runs against the production deployment (typically via `kubectl exec`).
 
@@ -369,7 +375,7 @@ Requires Python 3.12+.
 ```bash
 pip install -e ".[dev]"
 pre-commit install
-PYTHONPATH=src .venv/bin/pytest tests/ -q     # 546 tests, ~16s
+PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~1392 passed / 91 skipped, ~23s (3.14 graceful NER; full NER + RS256 crypto on 3.12/CI)
 PYTHONPATH=src .venv/bin/ruff check src tests
 ```
 

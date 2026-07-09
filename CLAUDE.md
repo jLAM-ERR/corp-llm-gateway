@@ -17,24 +17,38 @@ in the 90 days post-GA.
 
 ```
 src/corp_llm_gateway/
-  auth/         CorpLlmAuthProvider (Noop default; Bearer/mTLS/OIDC stubs)
-  audit/        AuditEvent + Logger + Sinks + retention generator
-  cli/          gateway-admin (operators) + corp-llm-gateway status (devs)
+  auth/         CorpLlmAuthProvider (Noop default; Bearer/mTLS/OIDC) + get_auth_provider factory
+  audit/        AuditEvent + Logger + Sinks + get_sink factory + retention generator + NEVER-fields gate
+  bootstrap.py  production composition root: build_guardrail() from config; lazy PEP-562 `guardrail` singleton
+                (the LiteLLM callback target — importing the module is side-effect-free)
+  cli/          gateway-admin (operators: team/token/extensions/config check) + corp-llm-gateway status (devs) + proxy
+  config.py     env → $CORP_LLM_GATEWAY_CONFIG_FILE → ~/.config → /etc → default loader; get/get_required/get_table/validate
   corp_llm/     httpx client speaking vLLM /v1/chat/completions
-  detectors/    PIIDetector + ShadowDetector
-  healthz/      live / ready / sanitization deep-check
-  payload/      size threshold + gzip + per-team quota
-  rules/        replace.md parser + cached file loader
-  sanitizer/    Three-tier strategies + engine + StreamingDesanitizer + orchestrator
+  detectors/    PIIDetector + regex_checksum + dual_ner (RU Natasha + EN spaCy); NerUnavailableError (fail-closed)
+  extensions/   ExtensionRegistry + ExtensionSpec (kind/api_version/fail_policy); fail-closed register; api-version gate
+  healthz/      live / ready / sanitization / extensions checks + ASGI server (build_health_router, serves /healthz/* + /internal/issue-token)
+  metrics/      MetricsExporter (noop default / prometheus); emits blocked_requests_total{block_reason} + gateway_failure{component}
+  payload/      size threshold + gzip + per-team quota + oversize policy (fail-closed default)
+  profiles/     plugin bundles — ProfileBundle/PolicyKnobs(merge) + loaders/resolver + DETECTOR_REGISTRY + manifest (hash-integrity) + defaults/
+  providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
+  rules/        replace.md parser + gazetteer + cached file loader
+  sanitizer/    local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator (live profiles)
+  settings.py   single source of truth (typed KEYS registry + validate()); config.py delegates; backs `config check`
   storage/      MappingStore (in-memory + Redis)
-  team_config/  TeamConfig + store
-  tokens/       schema.sql + AuthMiddleware + TokenIssuer
-  litellm_hook.py  CorpLlmGuardrail — LiteLLM callback adapter (M1-7)
-helm/corp-llm-gateway/   Helm chart (deployment, service, configmap, NetworkPolicy, CoreDNS sinkhole)
-docs/                    plan + audit-schema + security + ops/* + rbac-matrix + replace-md-authoring + remaining-steps
+  team_config/  TeamConfig (+ profile_ids) + store (in-memory + Postgres) + schema.sql
+  tokens/       schema.sql + AuthMiddleware + TokenIssuer + stores
+  litellm_hook.py  CorpLlmGuardrail — LiteLLM callback adapter (sanitize/desanitize incl. OpenAI tool_calls + streaming)
+helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret + HPA/PDB/SA + ServiceMonitor + config-check
+                          initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
+docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto
+tests/                   pytest, pytest-asyncio mode=auto (~1392 passed / 91 skipped on 3.14; full NER + RS256 crypto run on 3.12/CI)
 ```
+
+The GA-readiness / security / extensibility build is `docs/plans/20260708-ga-readiness-security-extensibility.md`
+(profiles/extensions/metrics/settings/bootstrap all landed there). Key new seams (see the `safe-extension-registry`
++ `lazy-entrypoint-singleton` skills): `extensions/` and `providers/` are keyed registries; `profiles/` is the
+data-bundle plugin layer; `bootstrap.build_guardrail()` wires everything from config.
 
 ## Request lifecycle (read once, then you understand the engine)
 
