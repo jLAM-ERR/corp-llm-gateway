@@ -29,6 +29,8 @@ Revisions list: `helm history gw`. Default Helm keeps the last 10.
 
 The fail-policy matrix in the plan (M4) is the source of truth for what "should" happen on each component failure. When reality disagrees, that's the bug.
 
+Metrics note: the alert series `gateway_failure{component}` and `corp_llm_gateway_blocked_requests_total{block_reason}` are emitted by the metrics module (plan task B4) and scraped via the ServiceMonitor. Until B4 lands, the same conditions surface in the gateway's structured logs — grep `error_code=` (e.g. `E_CORP_LLM_DOWN`, `E_NER_UNAVAILABLE`, `E_OVERSIZE_BLOCKED`, `E_DLP_BLOCKED`) and `block_reason=` (`litellm_pre_call_blocked` / `litellm_egress_blocked`).
+
 ### Corp-LLM unreachable
 
 Symptom: `gateway_failure{component="corp_llm"}` rises; requests return 503 with `error_code="E_CORP_LLM_DOWN"`.
@@ -40,15 +42,25 @@ Action:
 2. If yes: page corp-LLM team. The gateway will recover automatically when corp-LLM recovers.
 3. If no: investigate gateway-side connectivity (NetworkPolicy, DNS).
 
-### Pre-pass engine crashed
+### Detection cascade degraded
 
-Symptom: `gateway_failure{component="pre_pass"}` rises; requests succeed but slower (corp-LLM-only path).
+There is no separate pre-pass Deployment. Detection runs **in-process** inside
+the gateway pod (local-first cascade — regex+checksum, dual-NER, gazetteer — per
+ADR-003); the corp-LLM oracle is only a conditional fallback. Two failure modes:
 
-Behavior: continue (per matrix).
+- **NER model absent/self-disabled.** With `CORP_LLM_REQUIRE_NER=1` (prod) this
+  fails **closed**: requests return 503 `E_NER_UNAVAILABLE` (not a silent slow
+  path). `/healthz/ready` also goes red on the NER probe. Fix the NER stack (the
+  `ner` extra + model wheels) and the pod recovers. With the flag off (dev) NER
+  degrades silently to no findings — do not run prod that way.
+- **Oracle (corp-LLM) unreachable.** Surfaces as `E_CORP_LLM_DOWN` — see the
+  section above.
 
 Action:
-1. Scale pre-pass replicas: `kubectl scale -n corp-llm-gateway deploy/pre-pass --replicas=2`.
-2. Investigate underlying CPU pod (OOM? worker crash? unusually large payload exceeding the M1-11 threshold?).
+1. Add detection capacity by scaling the **gateway** Deployment (it runs
+   detection in-process), not a pre-pass pod: `kubectl scale -n corp-llm-gateway deploy/gw --replicas=N`, or enable/raise the HPA (`autoscaling` in values.yaml).
+2. Investigate the pod (OOM? NER model load failure? unusually large payload —
+   the M1-11 size threshold / `CORP_LLM_OVERSIZE_POLICY` governs those).
 
 ### Redis cluster down
 

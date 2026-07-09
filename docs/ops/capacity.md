@@ -1,6 +1,6 @@
 # Capacity sizing
 
-Plan ref: M4-8 (Vector buffer), M0-10 (pre-pass CPU pod), M1-11
+Plan ref: M4-8 (Vector buffer), M0-10 (in-process CPU detection), M1-11
 (per-team Cache A quotas), risks-table corp-LLM rows.
 
 ## Workload assumptions
@@ -31,17 +31,25 @@ Numbers are pessimistic point-estimates. Real usage is bursty; budget for 10× b
 
 SIEM alert at 50% buffer fill (M3-9) gates the bump decision.
 
-## Pre-pass engine (M0-10)
+## In-process detection (M0-10)
 
-CPU-only — corp k8s has no GPU pods. The pre-pass model runs on CPU; latency is mitigated by horizontal scale-out and the M1-11 content-size threshold.
+CPU-only — corp k8s has no GPU pods. There is **no separate pre-pass pod**:
+detection (regex+checksum, dual-NER, gazetteer) runs **in-process inside the
+gateway pod** as a local-first cascade (ADR-003, ~6 ms p50 on CPU); the corp-LLM
+oracle is only a conditional fallback. Latency is mitigated by horizontal
+scale-out (more gateway replicas / HPA) and the M1-11 content-size threshold.
+The orphaned `prePass:` block in `values.yaml` is vestigial — it wires no pod.
 
-| Phase | Concurrent calls (est.) | CPU sizing |
+Sizing below is per **gateway** pod (which also runs the LiteLLM proxy), driven
+by the `autoscaling` HPA in `values.yaml`:
+
+| Phase | Concurrent calls (est.) | Gateway pod sizing |
 |---|---|---|
-| Phase 0–1 | ≤ 5 | 1 replica × (2 vCPU, 8 GB) |
-| Phase 2 | ≤ 25 | 2 replicas × (4 vCPU, 16 GB), autoscale to 4 if p95 > 500 ms |
-| Phase 3 | ≤ 200 | 4 replicas × (4 vCPU, 16 GB), autoscale to 12 |
+| Phase 0–1 | ≤ 5 | 1–2 pods × (2 vCPU, 8 GB) |
+| Phase 2 | ≤ 25 | 2 pods × (4 vCPU, 16 GB), autoscale to 4 if p95 > 500 ms |
+| Phase 3 | ≤ 200 | 4 pods × (4 vCPU, 16 GB), autoscale to 12 |
 
-Benchmark output (when M0-10 actually runs against real content) gates these numbers; this table is a placeholder for first-day deploy. If CPU latency makes the 4 s p99 budget infeasible, mitigate first by lowering the M1-11 content-size threshold from 100 KB to 25 KB so the largest payloads bypass sanitization rather than spending the budget.
+Benchmark output (when M0-10 runs against real content) gates these numbers; this table is a placeholder for first-day deploy. If CPU latency makes the 4 s p99 budget infeasible, mitigate first by lowering the M1-11 content-size threshold from 100 KB to 25 KB so the largest payloads bypass sanitization rather than spending the budget.
 
 ## Corp-LLM throughput floor
 
