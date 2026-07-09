@@ -7,7 +7,7 @@
 ### Деплой новой версии
 
 1. Пометьте релиз тегом: `git tag v0.x.y && git push origin v0.x.y`.
-2. CI собирает wheel и Helm-артефакты на теге.
+2. GitHub Actions собирает и публикует образ шлюза на теге (`.github/workflows/build-image.yml`). Wheel и Helm-чарт пока собираются локально (эти CI-джобы ещё не портированы).
 3. Примените в staging: `helm upgrade --install gw helm/corp-llm-gateway -f values-staging.yaml --version v0.x.y`.
 4. Дождитесь зелёного `/healthz/ready` на всех 3 pod'ах.
 5. Запустите deep-check: `curl https://gateway-staging.corp.lan/healthz/sanitization`.

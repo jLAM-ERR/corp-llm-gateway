@@ -280,7 +280,7 @@ PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~1392 passed / 91 skipped, ~23s 
 PYTHONPATH=src .venv/bin/ruff check src tests
 ```
 
-Conventions, invariants, and "things NOT to do" are pinned in [`CLAUDE.md`](CLAUDE.md). CI is CI (`the CI config`).
+Conventions, invariants, and "things NOT to do" are pinned in [`CLAUDE.md`](CLAUDE.md). CI is GitHub Actions (`.github/workflows/`).
 
 ## Built on
 

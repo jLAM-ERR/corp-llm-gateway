@@ -39,7 +39,10 @@ TRACING_EXPORTERS: tuple[str, ...] = ("noop",)
 
 _FLAG_FALSE: frozenset[str] = frozenset({"0", "false", "no", "off", ""})
 
-_DEFAULT_LATEST_URL = "https://git.corp.lan/.../raw/master/VERSION"
+# Placeholder default, overridden per deployment (like CORP_GATEWAY_URL). Points
+# at the gateway's own version endpoint so the check works on the restricted
+# network; ops set the real host via config.
+_DEFAULT_LATEST_URL = "https://gateway.corp.lan/version"
 
 
 def _as_flag(value: str | None) -> bool:

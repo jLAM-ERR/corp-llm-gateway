@@ -17,10 +17,10 @@ Assess whether corp-llm-gateway is a *deployable product* an operator can instal
 3. **Deployment** — `helm/corp-llm-gateway/` + `Dockerfile*`. Does the chart run the gateway image with the guardrail callback (`corp_llm_gateway.bootstrap.guardrail`) or stock LiteLLM? Secrets, resource limits, HPA/PDB, probes (`/healthz/*`), NetworkPolicy, Vector source (`kubernetes_logs` not `stdin`), values-staging. CPU-only (no GPU).
 4. **Observability** — `healthz/` served or just classes? Metrics emitted (do `siem-alerts.yaml`/runbook metric names exist in code)? `/metrics`, ServiceMonitor, dashboards, runbooks in `docs/ops/`.
 5. **Docs** — `docs/` + `docs/ops/` + `docs/remaining-steps.md`. Install/prereqs/secret-contract, config reference, admin-CLI reference, troubleshooting, upgrade/migration.
-6. **Packaging** — `pyproject.toml` (`[project.scripts]`, extras), `scripts/install.sh`, `the CI config` (does CI build+publish the image/chart, or only the wheel?).
+6. **Packaging** — `pyproject.toml` (`[project.scripts]`, extras), `scripts/install.sh`, `.github/workflows/` (does CI build+publish the image/chart, or only the wheel?).
 
 ## Grounding rules
-Cite exact `file:line`. Be specific to THIS repo — no generic "add monitoring". Respect conventions: default branch `master`, CI is internal git host, interface-registry pattern (ABC in `<module>/<base>.py` → impls → `__init__.py` re-export). Distinguish "class exists but nothing serves/consumes it" from "missing entirely" — that gap recurs here.
+Cite exact `file:line`. Be specific to THIS repo — no generic "add monitoring". Respect conventions: default branch `master`, CI is GitHub Actions, interface-registry pattern (ABC in `<module>/<base>.py` → impls → `__init__.py` re-export). Distinguish "class exists but nothing serves/consumes it" from "missing entirely" — that gap recurs here.
 
 ## Output
 - **Current state** (2–3 sentences: how mature, library-vs-product).

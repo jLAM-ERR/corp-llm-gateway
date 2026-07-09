@@ -36,7 +36,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--latest-version-url",
         default=config.get(
             "CORP_GATEWAY_LATEST_URL",
-            "https://git.corp.lan/.../raw/master/VERSION",
+            "https://gateway.corp.lan/version",
         ),
         help="URL returning the latest version string",
     )

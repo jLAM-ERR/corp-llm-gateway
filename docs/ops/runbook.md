@@ -7,7 +7,7 @@ Plan ref: M8-2.
 ### Deploying a new version
 
 1. Tag the release: `git tag v0.x.y && git push origin v0.x.y`.
-2. CI builds the wheel and Helm artifacts on the tag.
+2. GitHub Actions builds and publishes the gateway image on the tag (`.github/workflows/build-image.yml`). The wheel and Helm chart are built locally for now (those CI jobs are not yet ported).
 3. Apply to staging: `helm upgrade --install gw helm/corp-llm-gateway -f values-staging.yaml --version v0.x.y`.
 4. Wait for `/healthz/ready` green on all 3 pods.
 5. Run the deep-check: `curl https://gateway-staging.corp.lan/healthz/sanitization`.

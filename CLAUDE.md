@@ -113,7 +113,7 @@ docker compose run --rm e2e pytest -q tests/e2e
 - Python 3.12+, mypy strict, ruff for lint+format
 - Async-first (LiteLLM hooks are async); pytest-asyncio mode = "auto"
 - Default branch: `master` (NOT main)
-- CI: CI (`the CI config`); NOT other CI
+- CI: GitHub Actions (`.github/workflows/`)
 - httpx for HTTP, Redis via `redis.asyncio`, fakeredis for tests
 - First-time setup: `pip install -e ".[dev]" && pre-commit install`
 - CI lint runs both `ruff check` AND `ruff format --check` — running only
@@ -199,9 +199,9 @@ follow the established interface-registry pattern:
 ## Things NOT to do
 
 - Don't rename `master` to `main`.
-- Don't add `a non-standard CI config` — CI stays on internal git host (`the CI config`).
-  Git hosting IS internal git host (`git.corp.lan`); that split
-  is intentional, not a migration artefact.
+- Don't re-introduce CI (`the CI config`) — CI is GitHub Actions
+  (`.github/workflows/`) and git hosting is GitHub. internal git host was fully removed;
+  re-adding it undoes that migration.
 - Don't add GPU deps.
 - Don't introduce a non-OpenAI/Anthropic provider in v1 (Bedrock /
   Gemini / Azure are explicit v2).

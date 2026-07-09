@@ -1,7 +1,7 @@
-# CODEOWNERS — see https://docs.github.com/articles/about-code-owners
+# GitHub CODEOWNERS — see https://docs.github.com/articles/about-code-owners
 # Required-approval sections (e.g. [Security][1]) can be added once project roles are mapped.
 # Team handles below (@corp/compliance, @corp/ops, @corp/security-eng) are PLACEHOLDERS —
-# the DRI wires the real team handles once project roles are mapped.
+# the DRI wires the real GitHub team handles once project roles are mapped.
 
 * @jlam-err
 
@@ -15,7 +15,7 @@
 /src/corp_llm_gateway/sanitizer/  @jlam-err
 
 # Review split (plan D6): profile *data* vs detector *code*, enforced by tooling
-# not convention. internal git host lets a later match override an earlier one, so the code
+# not convention. GitHub lets a later match override an earlier one, so the code
 # carve-outs below win over the profiles/ data rule.
 
 # Profile data bundles (profile.toml, term lists, replace.md, allowlists) —

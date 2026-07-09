@@ -10,7 +10,7 @@ RUN python -m build --wheel
 
 FROM python:3.12-slim AS runtime
 LABEL org.opencontainers.image.title="corp-llm-gateway" \
-      org.opencontainers.image.source="https://git.corp.lan/.../corp-llm-gateway"
+      org.opencontainers.image.source="https://github.com/jLAM-ERR/corp-llm-gateway"
 
 # Minimal runtime — gateway is loaded by LiteLLM as a Python callback.
 RUN useradd --create-home --shell /bin/bash app

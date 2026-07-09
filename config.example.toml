@@ -22,7 +22,7 @@
 
 # CORP_GATEWAY_URL          = "https://gateway.corp.lan"
 # CORP_GATEWAY_TOKEN_FILE   = "~/.corp-llm-gateway/token"
-# CORP_GATEWAY_LATEST_URL   = "https://git.corp.lan/.../raw/master/VERSION"
+# CORP_GATEWAY_LATEST_URL   = "https://gateway.corp.lan/version"
 
 # ── Deployment environment ───────────────────────────────────────────────────
 #
