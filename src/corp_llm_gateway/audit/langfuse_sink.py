@@ -122,6 +122,12 @@ def _event_to_record(event: AuditEvent) -> dict[str, Any]:
         record["pre_pass_latency_ms"] = event.pre_pass_latency_ms
     if event.audit_buffer_full is not None:
         record["audit_buffer_full"] = event.audit_buffer_full
+    # Mirror AuditLogger._serialize (the Vector path) so the direct-to-Langfuse
+    # path carries the same policy metadata. Metadata, not NEVER fields.
+    if event.profile_ids:
+        record["profile_ids"] = list(event.profile_ids)
+    if event.jurisdiction is not None:
+        record["jurisdiction"] = event.jurisdiction
     return record
 
 
@@ -137,6 +143,21 @@ def _records_to_batch(records: list[dict[str, Any]]) -> dict[str, Any]:
     for record in records:
         trace_id = str(record.get("request_id", uuid.uuid4()))
         ts = str(record.get("timestamp", ""))
+        metadata: dict[str, Any] = {
+            "team_id": record.get("team_id"),
+            "redaction_count": record.get("redaction_count", 0),
+            "cache_a_hit": record.get("cache_a_hit", False),
+            "finding_label_counts": record.get("finding_label_counts", {}),
+            "gateway_version": record.get("gateway_version"),
+            "status": record.get("status"),
+            "error_code": record.get("error_code"),
+        }
+        # Surface the profile metadata into the trace so the direct path reaches
+        # Langfuse with the same "which policy applied" fact as the Vector path.
+        if record.get("profile_ids"):
+            metadata["profile_ids"] = record["profile_ids"]
+        if record.get("jurisdiction") is not None:
+            metadata["jurisdiction"] = record["jurisdiction"]
         events.append(
             {
                 "id": str(uuid.uuid4()),
@@ -146,15 +167,7 @@ def _records_to_batch(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "id": trace_id,
                     "name": "corp-llm-gateway",
                     "userId": record.get("user_id"),
-                    "metadata": {
-                        "team_id": record.get("team_id"),
-                        "redaction_count": record.get("redaction_count", 0),
-                        "cache_a_hit": record.get("cache_a_hit", False),
-                        "finding_label_counts": record.get("finding_label_counts", {}),
-                        "gateway_version": record.get("gateway_version"),
-                        "status": record.get("status"),
-                        "error_code": record.get("error_code"),
-                    },
+                    "metadata": metadata,
                     "tags": [f"team:{record.get('team_id')}", f"provider:{record.get('provider')}"],
                 },
             }

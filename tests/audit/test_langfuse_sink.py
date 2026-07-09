@@ -133,6 +133,35 @@ async def test_error_code_in_trace_metadata_when_failed() -> None:
     assert trace["metadata"]["status"] == "failed"
 
 
+# profile metadata mirror (D7 — matches AuditLogger._serialize / Vector path) --
+
+
+async def test_profile_ids_and_jurisdiction_in_trace_metadata() -> None:
+    sink, captured = _capturing_sink()
+    await sink.write_event(_event(profile_ids=("core", "ru-152fz"), jurisdiction="ru"))
+    body = json.loads(captured[0].content)
+    trace = next(e for e in body["batch"] if e["type"] == "trace-create")["body"]
+    assert trace["metadata"]["profile_ids"] == ["core", "ru-152fz"]
+    assert trace["metadata"]["jurisdiction"] == "ru"
+
+
+async def test_profile_metadata_absent_when_not_set() -> None:
+    sink, captured = _capturing_sink()
+    await sink.write_event(_event())
+    body = json.loads(captured[0].content)
+    trace = next(e for e in body["batch"] if e["type"] == "trace-create")["body"]
+    assert "profile_ids" not in trace["metadata"]
+    assert "jurisdiction" not in trace["metadata"]
+
+
+async def test_profile_ids_pass_never_field_gate() -> None:
+    # profile_ids / jurisdiction are metadata, not NEVER fields — write_event
+    # runs assert_no_never_fields and must not raise.
+    sink, captured = _capturing_sink()
+    await sink.write_event(_event(profile_ids=("division-x",), jurisdiction="ru"))
+    assert len(captured) == 1
+
+
 # write() generic Sink interface --------------------------------------------
 
 

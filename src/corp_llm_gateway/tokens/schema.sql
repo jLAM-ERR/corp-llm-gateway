@@ -29,12 +29,18 @@ CREATE TABLE IF NOT EXISTS team_config (
     team_id              TEXT PRIMARY KEY,
     name                 TEXT NOT NULL,
     replace_md_path      TEXT,
+    profile_ids          TEXT[] NOT NULL DEFAULT '{}'::text[],
     retention_hot_days   INTEGER NOT NULL DEFAULT 90,
     retention_cold_years INTEGER NOT NULL DEFAULT 7,
     fail_policy          JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Migration: converge a team_config created before D2 (profile_ids added later).
+-- Idempotent, so it is safe whether this file or team_config/schema.sql ran first.
+ALTER TABLE team_config
+    ADD COLUMN IF NOT EXISTS profile_ids TEXT[] NOT NULL DEFAULT '{}'::text[];
 
 -- Trigger: keep team_config.updated_at fresh.
 CREATE OR REPLACE FUNCTION set_updated_at() RETURNS TRIGGER AS $$
