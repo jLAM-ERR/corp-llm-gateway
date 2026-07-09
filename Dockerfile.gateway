@@ -14,13 +14,53 @@ COPY src/ ./src/
 RUN python -m build --wheel
 
 FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
-# Install onto the litellm base with the server extras so the proxy can import
-# `corp_llm_gateway.bootstrap.guardrail`. [metrics] is deliberately omitted —
-# that extra ships in task B4; adding it here breaks the build until then.
-# The RU/EN NER models are NOT pulled by [ner] (en_core_web_md is a wheel URL,
-# see pyproject) — install the model layer separately when NER must be non-degraded.
+# Install onto the litellm base so the proxy can import
+# `corp_llm_gateway.bootstrap.guardrail`. NER_PROFILE selects how much of the
+# sanitizing (NER) stack is baked in:
+#   base   — [ner] libs (Natasha RU + spaCy EN) but NO downloaded models. The
+#            default, for build environments that cannot reach github.com to fetch
+#            the spaCy model wheel (or that supply models out-of-band). spaCy EN
+#            degrades to the regex floor at runtime.
+#   ru-en  — full bilingual: [ner] libs + the en_core_web_md model wheel, so BOTH
+#            RU (Natasha, models bundled) and EN (spaCy) run non-degraded.
+#   en     — EN only: spaCy + en_core_web_md, WITHOUT the RU (natasha/slovnet)
+#            stack — a smaller image for non-RU deployments; RU input degrades to
+#            the regex floor.
+# The GitHub Actions build (.github/workflows/build-image.yml) publishes the ru-en
+# and en variants — it runs on cloud runners that CAN reach github.com for the
+# model wheel. [metrics] is intentionally left out of every profile to stay lean.
+# Build-time knobs so the SAME Dockerfile builds both internet-connected (the
+# GitHub Actions build, defaults below) and air-gapped/corp-mirror (ops override
+# every knob to point at corp storage — Nexus/Artifactory/JFrog). Prod stays a
+# self-contained image: nothing is fetched at deploy or runtime.
+#   PIP_INDEX_URL    — corp PyPI mirror for the libraries; empty = public PyPI.
+#   EN_MODEL_VERSION — spaCy EN model version to bake (the NER-version knob; bump
+#                      it + rebuild to ship a new NER version as a new image tag).
+#   EN_MODEL_URL     — full wheel URL for the EN model; empty = derive the public
+#                      github release URL from EN_MODEL_VERSION. Set it to the
+#                      corp-storage URL when the build host cannot reach github.com.
+ARG NER_PROFILE=base
+ARG PIP_INDEX_URL=
+ARG EN_MODEL_VERSION=3.8.0
+ARG EN_MODEL_URL=
 COPY --from=build /build/dist/*.whl /tmp/
-RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[ner,postgres,oidc]" && rm -f /tmp/*.whl
+RUN set -eux; \
+    whl="$(ls /tmp/*.whl)"; \
+    pip_idx=""; \
+    if [ -n "${PIP_INDEX_URL}" ]; then pip_idx="--index-url ${PIP_INDEX_URL}"; fi; \
+    en_model="${EN_MODEL_URL:-https://github.com/explosion/spacy-models/releases/download/en_core_web_md-${EN_MODEL_VERSION}/en_core_web_md-${EN_MODEL_VERSION}-py3-none-any.whl}"; \
+    case "${NER_PROFILE}" in \
+      base)  pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" ;; \
+      ru-en) pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" "${en_model}"; \
+             python -c "import spacy, natasha; spacy.load('en_core_web_md'); print('NER ru-en OK')" ;; \
+      en)    pip install --no-cache-dir ${pip_idx} "${whl}[postgres,oidc]" "spacy>=3.8,<3.9" "${en_model}"; \
+             python -c "import spacy; spacy.load('en_core_web_md'); print('NER en OK')" ;; \
+      *)     echo "unknown NER_PROFILE=${NER_PROFILE} (want: base|ru-en|en)" >&2; exit 1 ;; \
+    esac; \
+    rm -f /tmp/*.whl
+# Record what got baked so ops can audit the running image with `docker inspect`.
+LABEL org.corp-llm-gateway.ner-profile="${NER_PROFILE}" \
+      org.corp-llm-gateway.en-model-version="${EN_MODEL_VERSION}"
 
 # The pod mounts the litellm proxy config (with the guardrail callback) here via
 # the configmap-litellm.yaml ConfigMap.
