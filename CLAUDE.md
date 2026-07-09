@@ -48,7 +48,9 @@ tests/                   pytest, pytest-asyncio mode=auto (~1392 passed / 91 ski
 The GA-readiness / security / extensibility build is `docs/plans/20260708-ga-readiness-security-extensibility.md`
 (profiles/extensions/metrics/settings/bootstrap all landed there). Key new seams (see the `safe-extension-registry`
 + `lazy-entrypoint-singleton` skills): `extensions/` and `providers/` are keyed registries; `profiles/` is the
-data-bundle plugin layer; `bootstrap.build_guardrail()` wires everything from config.
+data-bundle plugin layer; `bootstrap.build_guardrail()` wires everything from config. Contributor how-to for
+all of these seams (detector / sink / metrics / provider / profile, with the three extension styles):
+`docs/extending.md`.
 
 ## Request lifecycle (read once, then you understand the engine)
 

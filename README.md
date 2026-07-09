@@ -18,6 +18,7 @@ Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances
 - [Operator quickstart (k8s)](#operator-quickstart-k8s)
 - [Team rules (`replace.md`)](#team-rules-replacemd)
 - [Identity & token flow](#identity--token-flow)
+- [Extending the gateway](#extending-the-gateway)
 - [Development](#development)
 - [Built on](#built-on)
 
@@ -251,6 +252,22 @@ Full spec and authoring tips: [`docs/replace-md-authoring.md`](docs/replace-md-a
 **Conversation identity** — the gateway mints `conversation_id` per HTTP request (equal to the request UUID). Cache A (content-keyed dedup) works; Cache B (per-conversation mapping) is written but not yet reused across sibling requests, because no harness supplies a stable session ID. Behavior and how to wire a real session ID: [`docs/conversation-id.md`](docs/conversation-id.md).
 
 Who can do what (devs / team leads / operators / security): [`docs/rbac-matrix.md`](docs/rbac-matrix.md).
+
+## Extending the gateway
+
+Extensions are **in-tree and declarative** — a data bundle (a profile) layered over the core plus a closed set of security-reviewed algorithms selected **by name**. The gateway never loads third-party code on the egress path (air-gapped, CODEOWNERS-audited, hash-sealed, fail-closed), so adding capability is a small reviewable change, not a runtime plugin.
+
+| Extension | Style | You add |
+|---|---|---|
+| **Detector** | in-tree name registry | `detectors/<name>.py` (`PIIDetector`) + one `DETECTOR_REGISTRY` line + select by name in a profile |
+| **Provider** | in-tree name registry | a `ProviderSpec` in `register_builtins` (v1 = anthropic/openai/corp-vllm; v2 behind `CORP_ALLOW_V2_PROVIDERS`) |
+| **Audit sink / metrics** | config factory | an ABC impl + one factory-dict entry; select via `CORP_AUDIT_SINK` / `CORP_METRICS_EXPORTER` |
+| **Auth provider** | config factory | a `_PROVIDER_FACTORIES` entry; select via `CORP_LLM_AUTH_PROVIDER` |
+| **Profile bundle** (country / division / regime) | declarative data | author `profile.toml` + term files, reseal — see [`docs/ops/profiles.md`](docs/ops/profiles.md) |
+
+Worked example — **add a detector**: (1) `src/corp_llm_gateway/detectors/my_rule.py` implementing `PIIDetector` (`async detect(text) -> list[Finding]`); (2) re-export in `detectors/__init__.py`; (3) one line in `DETECTOR_REGISTRY` (`profiles/registry.py`); (4) a contract test in `tests/detectors/`; (5) select it in a profile's `detectors = [...]` and reseal.
+
+Full per-surface guide (sinks, providers, the extensions registry, safety rules, CODEOWNERS): [`docs/extending.md`](docs/extending.md).
 
 ## Development
 

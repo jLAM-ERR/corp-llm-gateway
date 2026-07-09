@@ -20,6 +20,7 @@
 - [Быстрый старт для оператора (k8s)](#быстрый-старт-для-оператора-k8s)
 - [Правила команды (`replace.md`)](#правила-команды-replacemd)
 - [Идентификация и поток токена](#идентификация-и-поток-токена)
+- [Расширение шлюза](#расширение-шлюза)
 - [Разработка](#разработка)
 - [На чём построено](#на-чём-построено)
 
@@ -253,6 +254,22 @@ CLI оператора, обычно запускается через `kubectl 
 **Идентификация диалога** — шлюз выпускает `conversation_id` на каждый HTTP-запрос (равен UUID запроса). Cache A (дедуп по содержимому) работает; Cache B (per-conversation маппинг) пишется, но пока не переиспользуется между родственными запросами, потому что ни один харнесс не поставляет стабильный session ID. Поведение и как подключить настоящий session ID: [`docs/conversation-id.md`](docs/conversation-id.ru.md).
 
 Кто что может (разработчики / тимлиды / операторы / безопасность): [`docs/rbac-matrix.md`](docs/rbac-matrix.ru.md).
+
+## Расширение шлюза
+
+Расширения **in-tree и декларативны** — бандл данных (профиль), слоями наложенный на ядро, плюс закрытый набор прошедших security-ревью алгоритмов, выбираемых **по имени**. Шлюз никогда не загружает сторонний код на egress-пути (air-gapped, ревью CODEOWNERS, hash-запечатано, fail-closed), поэтому добавление возможности — небольшое проверяемое изменение, а не runtime-плагин.
+
+| Расширение | Стиль | Что вы добавляете |
+|---|---|---|
+| **Детектор** | in-tree name registry | `detectors/<name>.py` (`PIIDetector`) + одна строка `DETECTOR_REGISTRY` + выбор по имени в профиле |
+| **Провайдер** | in-tree name registry | `ProviderSpec` в `register_builtins` (v1 = anthropic/openai/corp-vllm; v2 за `CORP_ALLOW_V2_PROVIDERS`) |
+| **Sink аудита / метрики** | config factory | реализация ABC + одна запись в фабричном словаре; выбор через `CORP_AUDIT_SINK` / `CORP_METRICS_EXPORTER` |
+| **Провайдер аутентификации** | config factory | запись в `_PROVIDER_FACTORIES`; выбор через `CORP_LLM_AUTH_PROVIDER` |
+| **Бандл профиля** (страна / подразделение / режим) | декларативные данные | составить `profile.toml` + файлы терминов, пере-запечатать — см. [`docs/ops/profiles.md`](docs/ops/profiles.md) |
+
+Пример — **добавить детектор**: (1) `src/corp_llm_gateway/detectors/my_rule.py`, реализующий `PIIDetector` (`async detect(text) -> list[Finding]`); (2) ре-экспорт в `detectors/__init__.py`; (3) одна строка в `DETECTOR_REGISTRY` (`profiles/registry.py`); (4) контракт-тест в `tests/detectors/`; (5) выбрать в `detectors = [...]` профиля и пере-запечатать.
+
+Полное руководство по каждому seam (sinks, провайдеры, реестр расширений, правила безопасности, CODEOWNERS): [`docs/extending.md`](docs/extending.ru.md).
 
 ## Разработка
 
