@@ -14,6 +14,7 @@ from corp_llm_gateway.profiles import (
     ProfileIntegrityError,
     ProfileLoader,
     ProfileNotFoundError,
+    ProfileParseError,
     ProfileResolver,
 )
 from corp_llm_gateway.profiles.file_loader import _content_hash_for_dir
@@ -62,6 +63,33 @@ async def test_load_single_profile_bundle(tmp_path: Path) -> None:
     assert bundle.gazetteer is not None
     findings = await bundle.gazetteer.detect("we ship alphaterm today")
     assert any(f.label == "PRODUCT" for f in findings)
+
+
+async def test_load_equals_separator_replace_md(tmp_path: Path) -> None:
+    # '=' is the canonical separator (arrow above still works for back-compat).
+    _write_profile(
+        tmp_path,
+        "core",
+        toml='name = "core"\n',
+        replace_md="- `alice` = `[N1]`\n",
+    )
+    bundle = await FileProfileLoader(tmp_path).load("core")
+    assert bundle.rules.rules[0].pattern == "alice"
+    assert bundle.rules.rules[0].replacement == "[N1]"
+
+
+async def test_load_malformed_replace_md_raises_profile_error(tmp_path: Path) -> None:
+    # A profile replace.md that fails to parse must surface as a ProfileParseError
+    # (in PROFILE_ERRORS) so the hook fails closed via E_PROFILE_UNAVAILABLE + audit,
+    # rather than escaping as an unclassified RulesParseError.
+    _write_profile(
+        tmp_path,
+        "core",
+        toml='name = "core"\n',
+        replace_md="!!! not a rule\n",
+    )
+    with pytest.raises(ProfileParseError, match="invalid replace"):
+        await FileProfileLoader(tmp_path).load("core")
 
 
 async def test_load_no_optional_files(tmp_path: Path) -> None:

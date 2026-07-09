@@ -20,6 +20,7 @@ from corp_llm_gateway.profiles.base import (
     ProfileBundle,
     ProfileLoader,
     ProfileNotFoundError,
+    ProfileParseError,
 )
 from corp_llm_gateway.profiles.manifest import (
     ProfileManifest,
@@ -29,6 +30,7 @@ from corp_llm_gateway.profiles.manifest import (
 )
 from corp_llm_gateway.profiles.registry import build_detectors
 from corp_llm_gateway.rules.gazetteer import Gazetteer, load_terms
+from corp_llm_gateway.rules.loader import RulesParseError
 from corp_llm_gateway.rules.models import Rules
 from corp_llm_gateway.rules.parser import parse
 from corp_llm_gateway.sanitizer.allowlist import Allowlist
@@ -139,7 +141,12 @@ def _read_rules(profile_dir: Path) -> Rules:
     path = profile_dir / "replace.md"
     if not path.is_file():
         return Rules(rules=())
-    return parse(path.read_text(encoding="utf-8"))
+    try:
+        return parse(path.read_text(encoding="utf-8"))
+    except RulesParseError as exc:
+        # Classify as a profile error so it hits the hook's fail-closed
+        # E_PROFILE_UNAVAILABLE path (+ audit), not an unclassified escape.
+        raise ProfileParseError(f"invalid replace.md in {profile_dir.name!r}: {exc}") from exc
 
 
 def _read_terms(profile_dir: Path, gazetteer_dirs: tuple[str, ...]) -> dict[str, str]:

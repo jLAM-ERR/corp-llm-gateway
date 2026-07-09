@@ -1,6 +1,6 @@
 # RU 152-ФЗ personal-data regime, layered over core.
 name = "ru-152fz"
-content_hash = "be8f12bd57033f58a65a34e2bea9fed04ef2a0a9b78f0de59ee73f47e28947c3"
+content_hash = "223747b50a114d622a16e049282f63f3c479cd6c23e16c2d8a3b6fc0fc16d3f2"
 extends = ["core"]
 detectors = ["regex_checksum", "dual_ner"]
 # Advisory only — not part of the manifest schema; parse_manifest ignores it and

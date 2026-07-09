@@ -11,7 +11,8 @@ from corp_llm_gateway.rules import (
 
 
 async def test_loads_team_file(tmp_path: Path) -> None:
-    (tmp_path / "team-a.md").write_text("- alice → [N1]\n", encoding="utf-8")
+    # '=' is the canonical separator.
+    (tmp_path / "team-a.md").write_text("- alice = [N1]\n", encoding="utf-8")
     rules = await FileRulesLoader(tmp_path).load("team-a")
     assert rules == Rules(rules=(Rule("alice", "[N1]"),))
 
@@ -19,6 +20,15 @@ async def test_loads_team_file(tmp_path: Path) -> None:
 async def test_unknown_team_raises(tmp_path: Path) -> None:
     with pytest.raises(RulesNotFoundError, match="team-zz"):
         await FileRulesLoader(tmp_path).load("team-zz")
+
+
+async def test_malformed_team_file_fails_closed(tmp_path: Path) -> None:
+    # A parse failure must propagate (fail-closed), not silently yield empty rules.
+    from corp_llm_gateway.rules import RulesParseError
+
+    (tmp_path / "team-a.md").write_text("!!! not a rule\n", encoding="utf-8")
+    with pytest.raises(RulesParseError):
+        await FileRulesLoader(tmp_path).load("team-a")
 
 
 async def test_team_file_isolation(tmp_path: Path) -> None:

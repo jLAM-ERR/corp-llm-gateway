@@ -236,12 +236,12 @@ CLI оператора, обычно запускается через `kubectl 
 
 Каждая команда ведёт файл `replace.md` по пути `<rules-dir>/<team_id>.md`. Эти правила выполняются **первыми** в локальном каскаде и **переопределяют** авто-детекцию — указанный здесь термин заменяется всегда, независимо от того, что нашли детекторы.
 
-Формат — одно правило на строку, разделитель `→` (U+2192), **а не** ASCII `->`; правила применяются длиннейшими вперёд (инвариант #5):
+Формат — одно правило на строку, разделитель `=` (легаси `→` U+2192 по-прежнему принимается); правила применяются длиннейшими вперёд (инвариант #5). Оборачивайте в кавычки любое значение, содержащее `=`:
 
 ```markdown
-- `Project Polaris` → `[CONFIDENTIAL_PROJECT]`
-- `acme-internal-crm.corp.lan` → `[INTERNAL_HOST]`
-- `dr.smith@partnerlab.com` → `[PARTNER_CONTACT]`
+- `Project Polaris` = `[CONFIDENTIAL_PROJECT]`
+- `acme-internal-crm.corp.lan` = `[INTERNAL_HOST]`
+- `dr.smith@partnerlab.com` = `[PARTNER_CONTACT]`
 ```
 
 Полная спецификация и советы по написанию: [`docs/replace-md-authoring.md`](docs/replace-md-authoring.ru.md).

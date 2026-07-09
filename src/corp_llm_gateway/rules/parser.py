@@ -6,8 +6,8 @@ from corp_llm_gateway.rules.models import Rule, Rules
 _RULE_RE = re.compile(
     r"""^
     \s*-\s*                       # bullet
-    (?:`(?P<orig_q>[^`]+)`|(?P<orig>[^\s→][^→]*?))
-    \s*→\s*
+    (?:`(?P<orig_q>[^`]+)`|(?P<orig>[^\s=→`][^=→]*?))   # bare orig: no leading `, no separator char
+    \s*[=→]\s*                                          # separator: '=' (canonical) or '→' (legacy)
     (?:`(?P<rep_q>[^`]+)`|(?P<rep>[^\s].*?))
     \s*$""",
     re.VERBOSE,
@@ -23,8 +23,8 @@ def parse(text: str) -> Rules:
             continue
         if stripped.startswith("#") or stripped.startswith("<!--"):
             continue
-        if "->" in stripped and "→" not in stripped:
-            raise RulesParseError(f"line {line_no}: use em-dash separator → (U+2192), not ascii ->")
+        if "->" in stripped and "=" not in stripped and "→" not in stripped:
+            raise RulesParseError(f"line {line_no}: use '=' (or '→') as separator, not ascii '->'")
         m = _RULE_RE.match(line)
         if not m:
             raise RulesParseError(f"line {line_no}: not a valid rule: {line!r}")

@@ -17,18 +17,21 @@ One rule per line. The grammar is strict — invalid lines reject with
 the line number.
 
 ```
-- ORIGINAL → REPLACEMENT
+- ORIGINAL = REPLACEMENT
 ```
 
 Notes:
 
-- The separator is the em-dash `→` (U+2192), **not** ASCII `->`.
-  ASCII `->` is rejected explicitly so two visually-similar formats
-  cannot coexist.
+- The separator is `=`. The legacy em-dash `→` (U+2192) is still
+  accepted, so existing files keep working. Bare ASCII `->` is not a
+  separator and errors at load time.
+- **Quote any value containing `=`** in backticks — inside backticks the
+  `=` is content, not the separator. A value containing a colon does
+  **not** need quoting; only `=` (and the legacy `→`) are special.
 - ORIGINAL and REPLACEMENT may be wrapped in backticks for clarity:
 
   ```
-  - `Project Polaris` → `[CONFIDENTIAL_PROJECT]`
+  - `Project Polaris` = `[CONFIDENTIAL_PROJECT]`
   ```
 
 - Lines starting with `#` are comments. So are lines starting with
@@ -42,14 +45,14 @@ Notes:
 # Team X replace.md
 # Owner: alice@corp.lan
 
-- `Project Polaris` → `[CONFIDENTIAL_PROJECT]`
-- `Acme-Internal-CRM` → `[INTERNAL_TOOL]`
-- `dr.smith@partnerlab.com` → `[PARTNER_CONTACT]`
-- `BadgeID-XYZ-12345` → `[BADGE_ID]`
+- `Project Polaris` = `[CONFIDENTIAL_PROJECT]`
+- `Acme-Internal-CRM` = `[INTERNAL_TOOL]`
+- `dr.smith@partnerlab.com` = `[PARTNER_CONTACT]`
+- `BadgeID-XYZ-12345` = `[BADGE_ID]`
 
-# Hostnames
-- `db-prod-13.corp.internal` → `[INTERNAL_HOST]`
-- `db-prod-14.corp.internal` → `[INTERNAL_HOST]`
+# Hostnames (colons are fine unquoted)
+- `db-prod-13.corp.internal` = `[INTERNAL_HOST]`
+- `redis-prod:6379` = `[INTERNAL_HOST]`
 ```
 
 ## Live updates
@@ -65,7 +68,7 @@ without traffic loss).
 
 ## Authoring tips
 
-- **Be specific**. `- foo → [BAR]` will replace every `foo` in every
+- **Be specific**. `- foo = [BAR]` will replace every `foo` in every
   request. If `foo` appears legitimately in many contexts, the
   replacement breaks them.
 - **Order doesn't matter for correctness**, but the engine sorts
@@ -81,7 +84,8 @@ without traffic loss).
 
 | Mistake | Effect | Fix |
 |---|---|---|
-| Used `->` instead of `→` | Parse error at load time | Replace with em-dash |
+| Used bare `->` | Parse error at load time | Use `=` (legacy `→` also works) |
+| Bare value contains `=` | Mis-splits at the `=` | Wrap the value in backticks |
 | Pattern is too short or generic | Many false positives | Add quotes + more context |
 | Multiple rules with same pattern | Last one wins | Don't do it |
 | Comment line missing `#` prefix | Treated as a rule, parse fails | Add `#` |

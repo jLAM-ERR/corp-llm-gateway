@@ -1,6 +1,6 @@
 # Division X — tighter division policy, layered over ru-152fz.
 name = "division-x"
-content_hash = "ad6e76a6a4c2e05fac3866eac9b0af12f8199ca760773ace49aaf21fc2ca2856"
+content_hash = "6c915ed384ea186996201d4c312ebb991762007c3f3c6694a6034e95cf10eab1"
 extends = ["ru-152fz"]
 
 [policy]

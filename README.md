@@ -2,9 +2,7 @@
 
 **English** · [Русский](README.ru.md)
 
-Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances and Anthropic / OpenAI before it leaves the corp boundary.
-
-Replaces the per-laptop `data-sanitizer` Claude Code plugin (which only covered user prompts) with a centrally-enforced, auditable, multi-provider gateway.
+Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances and Anthropic/OpenAI before it leaves the corp boundary.
 
 ## Status
 
@@ -236,12 +234,12 @@ Ongoing operations after install — incident playbook, fail-policy matrix, scal
 
 Each team maintains a `replace.md` file at `<rules-dir>/<team_id>.md`. These rules run **first** in the local cascade and **override** auto-detection — a term listed here is always replaced, regardless of what the detectors find.
 
-Format — one rule per line, separator `→` (U+2192), **not** ASCII `->`; rules apply longest-first (invariant #5):
+Format — one rule per line, separator `=` (the legacy `→` U+2192 is still accepted); rules apply longest-first (invariant #5). Quote any value containing `=`:
 
 ```markdown
-- `Project Polaris` → `[CONFIDENTIAL_PROJECT]`
-- `acme-internal-crm.corp.lan` → `[INTERNAL_HOST]`
-- `dr.smith@partnerlab.com` → `[PARTNER_CONTACT]`
+- `Project Polaris` = `[CONFIDENTIAL_PROJECT]`
+- `acme-internal-crm.corp.lan` = `[INTERNAL_HOST]`
+- `dr.smith@partnerlab.com` = `[PARTNER_CONTACT]`
 ```
 
 Full spec and authoring tips: [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md).
