@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "corp-llm-gateway"
-version = "0.0.2"
+version = "1.0.0"
 description = "Corporate LLM gateway with sanitization guardrail (LiteLLM-based)"
 readme = "README.md"
 requires-python = ">=3.12"

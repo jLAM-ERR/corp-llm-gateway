@@ -5,7 +5,32 @@
 
 ---
 
-## [Unreleased] — цикл local-first детекции (2026-06-30)
+## [Unreleased]
+
+## [1.0.0] — GA (2026-07-09)
+
+Первый GA-релиз — **цикл local-first детекции** (ниже) плюс сборка **GA-readiness /
+безопасность и расширяемость**. Некомпромиссный критерий: ноль подтверждённых инцидентов утечки
+за 90 дней после GA.
+
+### Добавлено — GA-readiness, безопасность и расширяемость
+- **Слой плагинов / профилей** — декларативные бандлы `profiles/` (страна / подразделение / режим),
+  монотонно-ужесточающий `PolicyKnobs.merge`, hash-запечатанная целостность, SHA-256 изоляция кэша
+  между юрисдикциями, выбор через `TeamConfig.profile_ids`.
+- **Seam-ы расширений** — keyed-реестры `extensions/` + `providers/` (fail-closed регистрация +
+  гейт api-version; v1 anthropic / openai / corp-vllm, v2 за гейтом), `DETECTOR_REGISTRY`,
+  подключаемый экспортер метрик, composition root `bootstrap.build_guardrail()`; руководство
+  контрибьютора `docs/extending.md`.
+- **Укрепление безопасности** — 11 repro-first исправлений поверхностей утечки (oversize + NER
+  fail-closed, OpenAI `tool_calls` + streaming, покрытие сегментатора, срезание `X-Corp-Auth` во всех
+  расположениях заголовка, host-pin dev-прокси, тело ошибки, TLS/RBAC, рекурсивный NEVER-гейт,
+  RS256 + aud/iss).
+- **Ops** — реальный `gateway-admin` (team / token / extensions / config check), production Helm-чарт
+  (образ guardrail + callback, config-check initContainer, NetworkPolicy, CoreDNS sinkhole),
+  обслуживаемый healthz, ops-документация.
+- **`replace.md`** — `=` теперь канонический разделитель правил (легаси `→` по-прежнему парсится).
+
+### Цикл local-first детекции (2026-06-30)
 
 > План: `docs/plans/20260630-bilingual-local-first-detection.md`
 > ADR: `docs/adr/ADR-003-ner-orchestration.md` — hand-roll dual-NER (Natasha RU + spaCy EN)

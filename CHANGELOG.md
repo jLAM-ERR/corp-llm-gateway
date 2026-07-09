@@ -5,7 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased] — local-first detection cycle (2026-06-30)
+## [Unreleased]
+
+## [1.0.0] — GA (2026-07-09)
+
+The first GA release — the **local-first detection cycle** (below) plus the **GA-readiness /
+security & extensibility** build. Non-negotiable criterion: zero confirmed leak incidents in the
+90 days post-GA.
+
+### Added — GA-readiness, security & extensibility
+- **Plugin / profile layer** — declarative `profiles/` bundles (country / division / regime),
+  monotone-tightening `PolicyKnobs.merge`, hash-sealed integrity, SHA-256 cross-jurisdiction cache
+  isolation, `TeamConfig.profile_ids` selection.
+- **Extension seams** — keyed `extensions/` + `providers/` registries (fail-closed register +
+  api-version gate; v1 anthropic / openai / corp-vllm, v2 gated), `DETECTOR_REGISTRY`, pluggable
+  metrics exporter, `bootstrap.build_guardrail()` composition root; contributor guide
+  `docs/extending.md`.
+- **Security hardening** — 11 repro-first leak-surface fixes (oversize + NER fail-closed, OpenAI
+  `tool_calls` + streaming, segmenter coverage, `X-Corp-Auth` stripping across all header locations,
+  dev-proxy host-pin, error-body, TLS/RBAC, recursive NEVER-gate, RS256 + aud/iss).
+- **Ops** — real `gateway-admin` (team / token / extensions / config check), production Helm chart
+  (guardrail image + callback, config-check initContainer, NetworkPolicy, CoreDNS sinkhole), served
+  healthz, ops docs.
+- **`replace.md`** — `=` is now the canonical rule separator (legacy `→` still parsed).
+
+### Local-first detection cycle (2026-06-30)
 
 > Plan: `docs/plans/20260630-bilingual-local-first-detection.md`
 > ADR: `docs/adr/ADR-003-ner-orchestration.md` — hand-roll dual-NER (Natasha RU + spaCy EN)

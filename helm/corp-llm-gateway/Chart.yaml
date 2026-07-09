@@ -2,8 +2,8 @@ apiVersion: v2
 name: corp-llm-gateway
 description: Corporate LLM gateway with sanitization guardrail
 type: application
-version: 0.0.2
-appVersion: "0.0.2"
+version: 1.0.0
+appVersion: "1.0.0"
 maintainers:
   - name: dri_am
     email: corp-internal@corp.lan
