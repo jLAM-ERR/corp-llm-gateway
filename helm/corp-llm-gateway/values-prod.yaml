@@ -14,3 +14,22 @@ networkPolicy:
 coreDnsSinkhole:
   enabled: true
   zone: corp.lan
+
+# Prod-safe non-secret config, rendered as env on the gateway container and the
+# config-check initContainer. Secrets (PG DSN, Redis URL, OIDC public key, …)
+# come from the Secret / existingSecret — NEVER set them here.
+config:
+  # Enables the F9 guard: refuses SSL_VERIFY=false on the raw-content oracle call.
+  CORP_ENV: prod
+  # Fail CLOSED when NER self-disables — without this a PERSON/ORG can egress (F2).
+  CORP_LLM_REQUIRE_NER: "1"
+  # RS256 operator-token (RBAC) verification. PLACEHOLDERS — the DRI MUST set the
+  # real aud/iss before GA; until then every RBAC-gated mutation is denied.
+  CORP_GATEWAY_OIDC_AUDIENCE: "REPLACE_ME__oidc_audience"
+  CORP_GATEWAY_OIDC_ISSUER: "REPLACE_ME__oidc_issuer"
+
+# Feed the shipped Prometheus alert series: enabled renders the ServiceMonitor;
+# exporter maps to CORP_METRICS_EXPORTER on the gateway container.
+metrics:
+  enabled: true
+  exporter: prometheus

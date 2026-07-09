@@ -97,6 +97,15 @@ failPolicy:
   vectorBufferFull: "fail-closed"
   s3SinkDown: "fail-closed"
 
+# Non-secret config env passthrough. Each key/value is rendered as an `env` entry
+# on the gateway container AND the config-check initContainer. Use it for the
+# non-secret CORP_* knobs that deployment.yaml does not template explicitly —
+# CORP_ENV, CORP_LLM_REQUIRE_NER, CORP_LLM_ORACLE_TRIGGER, CORP_LLM_OVERSIZE_POLICY,
+# CORP_GATEWAY_OIDC_AUDIENCE / CORP_GATEWAY_OIDC_ISSUER, … (see values-prod.yaml
+# and docs/ops/configuration.md). Secrets go in `secret:` / `existingSecret`,
+# NEVER here. Empty by default so dev renders unchanged.
+config: {}
+
 # Set to the name of an external (Vault / external-secrets) Secret to source the
 # sensitive env contract from it. When set, the chart renders no Secret and the
 # `secret:` map below is ignored. Leave empty to have the chart manage the Secret.
@@ -161,6 +170,15 @@ startupProbe:
   # (failureThreshold x periodSeconds) before liveness takes over.
   failureThreshold: 30
   periodSeconds: 10
+
+# Pod-start config gate: an initContainer runs `gateway-admin config check` so a
+# misconfigured deploy fails at pod start, not on the first request. Default args
+# validate config only (`--no-probe`); the readiness deep-check already gates on
+# live dependency reachability. Drop `--no-probe` to also block start on
+# unreachable PG / Redis / corp-LLM.
+configCheck:
+  enabled: true
+  args: ["--no-probe"]
 
 autoscaling:
   enabled: false

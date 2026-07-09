@@ -23,6 +23,34 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.configCheck.enabled }}
+      initContainers:
+        # Fail fast on a misconfigured deploy: run `gateway-admin config check`
+        # at pod start instead of 503-ing on the first request. Same image + env
+        # + Secret as the gateway container. Default args `--no-probe` validate
+        # config only; the readiness deep-check gates on live dependency health.
+        - name: config-check
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["gateway-admin", "config", "check"]
+          {{- with .Values.configCheck.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            {{- include "corp-llm-gateway.gatewayEnv" . | nindent 12 }}
+          envFrom:
+            - secretRef:
+                name: {{ include "corp-llm-gateway.secretName" . }}
+          {{- if .Values.caBundle.enabled }}
+          volumeMounts:
+            - name: ca-bundle
+              mountPath: {{ .Values.caBundle.mountPath }}
+              readOnly: true
+          {{- end }}
+      {{- end }}
       containers:
         - name: litellm
           # The gateway server image (litellm proxy + guardrail callback), NOT
@@ -36,30 +64,7 @@ spec:
               containerPort: 4000
               protocol: TCP
           env:
-            - name: CORP_LLM_AUTH_PROVIDER
-              value: {{ .Values.corpLlm.authProvider | quote }}
-            - name: CORP_LLM_ENDPOINT
-              value: {{ .Values.corpLlm.endpoint | quote }}
-            - name: CORP_LLM_MODEL
-              value: {{ .Values.corpLlm.model | quote }}
-            - name: CORP_AUDIT_SINK
-              value: {{ .Values.audit.sink | quote }}
-            - name: CORP_LANGFUSE_URL
-              value: {{ .Values.audit.sinks.langfuse.endpoint | quote }}
-            - name: CORP_LLM_LOCAL_FIRST
-              value: {{ .Values.guardrail.localFirst | quote }}
-            - name: CORP_LLM_GAZETTEER
-              value: {{ .Values.guardrail.gazetteer | quote }}
-            - name: CORP_LLM_RULES_DIR
-              value: {{ .Values.guardrail.rulesDir | quote }}
-            {{- if .Values.caBundle.enabled }}
-            # httpx (oracle client) reads CORP_LLM_CA_BUNDLE; litellm's aiohttp
-            # reads SSL_CERT_FILE — both point at the mounted internal-CA bundle.
-            - name: CORP_LLM_CA_BUNDLE
-              value: {{ printf "%s/ca-bundle.pem" .Values.caBundle.mountPath | quote }}
-            - name: SSL_CERT_FILE
-              value: {{ printf "%s/ca-bundle.pem" .Values.caBundle.mountPath | quote }}
-            {{- end }}
+            {{- include "corp-llm-gateway.gatewayEnv" . | nindent 12 }}
           envFrom:
             - secretRef:
                 name: {{ include "corp-llm-gateway.secretName" . }}
