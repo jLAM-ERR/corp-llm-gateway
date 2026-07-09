@@ -8,31 +8,18 @@ Replaces the per-laptop `data-sanitizer` Claude Code plugin (which only covered 
 
 ## Status
 
-GA-ready. Implemented: the local-first detection cascade, a full security-hardening pass (11 leak-surface fixes, each repro-first — oversize, NER fail-open, OpenAI `tool_calls`, segmenter coverage, header stripping, dev-proxy, TLS/RBAC), the country / division / regulatory-regime **plugin / profile** layer (declarative bundles + in-tree detector registry, cross-jurisdiction cache isolation), and the operational surfaces (composition root, real `gateway-admin`, production Helm chart that deploys the guardrail image, pluggable metrics, served healthz, ops docs). See the GA plan [`docs/plans/20260708-ga-readiness-security-extensibility.md`](docs/plans/20260708-ga-readiness-security-extensibility.md), [`docs/security.md`](docs/security.md), and [`docs/requirements-compliance.md`](docs/requirements-compliance.md). Non-negotiable success criterion: **zero confirmed leak incidents** in the 90 days post-GA.
+**GA-ready.** Landed: the local-first detection cascade, a full security-hardening pass (11 repro-first leak-surface fixes — oversize, NER fail-open, OpenAI `tool_calls`, segmenter coverage, header stripping, dev-proxy, TLS/RBAC), the country / division / regulatory-regime **profile-plugin** layer (declarative bundles + in-tree detector registry + cross-jurisdiction cache isolation), and the operational surfaces (composition root, real `gateway-admin`, production Helm chart, pluggable metrics, served healthz, ops docs). Non-negotiable success criterion: **zero confirmed leak incidents** in the 90 days post-GA.
 
 ## Table of contents
 
 - [Overview](#overview)
-- [Architecture](#architecture)
 - [Features](#features)
-- [Team rules (`replace.md`)](#team-rules-replacemd)
+- [Architecture](#architecture)
 - [Repo layout](#repo-layout)
 - [Developer quickstart (laptop)](#developer-quickstart-laptop)
-  - [Install](#install)
-  - [Verify](#verify)
-  - [Day-to-day use](#day-to-day-use)
-  - [Token rotation](#token-rotation)
 - [Operator quickstart (k8s)](#operator-quickstart-k8s)
-  - [What gets deployed](#what-gets-deployed)
-  - [Install / upgrade](#install--upgrade)
-  - [Health checks](#health-checks)
-  - [Day-2 ops](#day-2-ops)
-- [Demo (laptop)](#demo-laptop)
-- [CLIs](#clis)
-- [Configuration (Helm values)](#configuration-helm-values)
-- [Conversation identity](#conversation-identity)
-- [`X-Corp-Auth` token flow](#x-corp-auth-token-flow)
-- [Documentation index](#documentation-index)
+- [Team rules (`replace.md`)](#team-rules-replacemd)
+- [Identity & token flow](#identity--token-flow)
 - [Development](#development)
 - [Built on](#built-on)
 
@@ -44,58 +31,6 @@ A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. 
 |---|---|---|
 | `X-Corp-Auth` | `~/.corp-llm-gateway/token` (laptop) | corp identity / team resolution; **stripped** before egress |
 | `Authorization: Bearer …` | dev's Anthropic / OpenAI key | BYOK passthrough; forwarded **untouched** |
-
-Full per-request data flow: see the [Architecture](#architecture) diagram below.
-
-## Architecture
-
-Architecture B (assemble best-of-breed): single custom Python guardrail plugged into LiteLLM proxy; everything else (audit pipeline, auth, observability) is open-source operated.
-
-```mermaid
-flowchart TD
-    Dev["Claude Code (laptop)"]
-    Dev -->|"POST /v1/chat/completions<br/>X-Corp-Auth + Authorization:Bearer"| S0
-
-    subgraph gw["LiteLLM proxy · CorpLlmGuardrail (corp k8s)"]
-        S0["Stage 0 · payload classifier"]
-        S0 -->|"config / log hit"| B0(["HTTP 422  block_reason"])
-        S0 -->|pass| RULES
-
-        subgraph lc["Local-first cascade — ~6 ms p50 on CPU"]
-            RULES["1. replace.md rules  (per-team, length-sorted, OVERRIDES detection)"]
-            --> RX["2. regex + checksum  (ИНН · КПП · ОГРН · БИК · JWT · IP · secrets)"]
-            --> NER["3. dual-NER run-both-union  (Natasha RU + spaCy en_core_web_md EN)"]
-            --> GZ["4. lemma-gazetteer  (products · ПОД-ФТ · markings)"]
-            --> SEG["5. code-identifier splitter"]
-        end
-
-        SEG -->|"gazetteer hit"| ORC["LLM oracle — corp vLLM  (conditional · ~7–15 s)"]
-        SEG -->|"no hit"| DLP
-        ORC --> DLP["Stage 5 · DLP egress guard"]
-        DLP -->|"canary / secret leak"| B5(["HTTP 422  block_reason"])
-    end
-
-    DLP -->|clean| UP["Anthropic / OpenAI  (Authorization:Bearer untouched)"]
-    UP --> DS["post_call · StreamingDesanitizer  (placeholders longest-first)"]
-    DS --> AUD["audit · Vector → Langfuse + S3 + SIEM  (NEVER-fields gate)"]
-    DS -->|"originals restored"| Dev
-```
-
-Request lifecycle:
-
-1. **Stage 0** — payload classifier: `.env`, kubeconfig, log-dump signatures → HTTP 422 `block_reason`; upstream never called.
-2. **Local-first cascade** (deterministic, ~6 ms p50 on CPU):
-   - `replace.md` per-team rules (length-sorted, OVERRIDES auto-detection)
-   - regex + checksum: ИНН / КПП / ОГРН / БИК / СНИЛС / р-счёт, JWT, PEM, `sk-` / `AKIA` / `ghp_`, IPv4/6, internal hostnames
-   - dual-NER run-both-union: Natasha/Slovnet (RU) + spaCy `en_core_web_md` (EN) — bilingual ФИО / org / geo
-   - lemma-gazetteer: product code-names, regulated ПОД-ФТ terms, confidentiality markings
-   - code-identifier splitter: `CompanynameabcService`-style camel/snake identifiers in code
-3. **LLM oracle** (conditional fallback): invoked only on a deterministic gazetteer hit; adds Tier-2 coverage for unmarked know-how. Latency ~7–15 s vs ~6 ms local. Two-venv reality: Python 3.12 = full NER; Python 3.14 = graceful degradation (NER imports are lazy, `[ner]` optional extra).
-4. **Stage 5 DLP egress guard**: independent second-layer re-scan of the sanitized outbound payload for canary strings and high-confidence secrets; blocks any survivor.
-5. **post_call**: `StreamingDesanitizer` rebuilds originals from the per-conversation mapping (placeholders sorted longest-first — invariant #5).
-6. **audit**: Vector → Langfuse + S3 + SIEM with NEVER-fields gate.
-
-Full architecture in the [v1 plan](docs/plans/20260507-external-sanitizer-gateway-v1.md).
 
 ## Features
 
@@ -115,33 +50,19 @@ Full architecture in the [v1 plan](docs/plans/20260507-external-sanitizer-gatewa
 
 ### Auth & compliance
 
-- **X-Corp-Auth + Postgres token store** — `AuthMiddleware` validates tokens against `PostgresTokenStore` (asyncpg); 60 s revocation propagation upper bound
+- **X-Corp-Auth + Postgres token store** — `AuthMiddleware` validates tokens against `PostgresTokenStore` (asyncpg); 60 s revocation-propagation upper bound
 - **`gateway:operator` RBAC** — admin CLI commands gated on JWT claim `gateway:operator`; verified via PyJWT against Keycloak realm roles
 - **Audit pipeline** — rich `AuditEvent` schema (ALWAYS / CONDITIONAL field tiers) + NEVER-fields gate: the logger refuses records containing `mapping`, `original`, or `credentials`
 - **SIEM sink** — Vector HTTP sink with inherited NEVER-gate + Helm alerts (`AuditVectorDropHigh`, `LeakAttemptDetected`)
-- **Egress lockdown** — `NetworkPolicy` (pod egress constrained to upstream + corp CIDRs) + CoreDNS sinkhole (blocks direct `api.anthropic.com` / `api.openai.com` resolution from the cluster), both enabled in `helm/.../values-prod.yaml`
+- **Egress lockdown** — `NetworkPolicy` (pod egress constrained to upstream + corp CIDRs) + CoreDNS sinkhole (blocks direct `api.anthropic.com` / `api.openai.com` resolution from the cluster), both enabled in `values-prod.yaml`
 
-**Compliance:** ✅ 11 / 🟡 3 / ⚪ 1 vs the 15 ИБ requirements — see [`docs/requirements-compliance.md`](docs/requirements-compliance.md).
+Detection maps to the corp ИБ requirement set: structural-entity checksums, marked-confidentiality and ПОД-ФТ gazetteers, secret patterns, and config/log egress blocks. The Tier-1 (deterministic) vs Tier-2 (best-effort oracle) split is documented in [`docs/security.md`](docs/security.md).
 
-## Team rules (`replace.md`)
+## Architecture
 
-Each team maintains a `replace.md` file at `<rules-dir>/<team_id>.md`. These rules run **first** in the local cascade and **override** auto-detection — a term listed here is always replaced, regardless of what the detectors find.
+**Architecture B — assemble best-of-breed.** One custom Python guardrail (`CorpLlmGuardrail`) plugged into a LiteLLM proxy; audit, auth, and observability are operated open-source, not built in-house. Each request runs a deterministic local-first cascade (~6 ms p50 on CPU) — payload classifier → `replace.md` rules → regex+checksum → dual-NER → lemma-gazetteer → code-splitter — with the corp vLLM oracle called only on a gazetteer hit, then a DLP egress guard before upstream.
 
-Format — one rule per line:
-
-```
-- `ORIGINAL` → `REPLACEMENT`
-```
-
-The separator is `→` (U+2192), **not** ASCII `->`. Rules are applied longest-first (invariant #5). Example:
-
-```markdown
-- `Project Polaris` → `[CONFIDENTIAL_PROJECT]`
-- `acme-internal-crm.corp.lan` → `[INTERNAL_HOST]`
-- `dr.smith@partnerlab.com` → `[PARTNER_CONTACT]`
-```
-
-The demo's live rules file is `docker/demo-litellm/rules/demo-team.md`. Full spec and authoring tips: [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md).
+**→ Full diagram and request lifecycle: [`docs/architecture.md`](docs/architecture.md).**
 
 ## Repo layout
 
@@ -167,7 +88,7 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
   tokens/               schema.sql + AuthMiddleware + TokenIssuer + stores
   litellm_hook.py       CorpLlmGuardrail — LiteLLM callback adapter (incl. OpenAI tool_calls + streaming)
 helm/corp-llm-gateway/  Helm chart (gateway image + guardrail callback, Secret, HPA/PDB/SA, ServiceMonitor, config-check initContainer, NetworkPolicy, CoreDNS sinkhole)
-docs/                   plans + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles) + rbac-matrix + adr/*
+docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
 tests/                  pytest, pytest-asyncio mode=auto (~1392 passed / 91 skipped; 3.14 graceful NER, full on 3.12/CI)
 ```
@@ -212,7 +133,7 @@ Three integration patterns depending on your harness — full recipes in [`docs/
 | Cursor / Continue | app's custom-header settings field | localhost proxy |
 | `curl`, raw scripts | `--header 'X-Corp-Auth: …'` | localhost proxy |
 
-Localhost proxy (Pattern 3) is universal — it injects `X-Corp-Auth` per request and re-reads the token file every call, so token rotation takes effect immediately:
+The localhost proxy (Pattern 3, `corp-llm-gateway-proxy`) is universal — it injects `X-Corp-Auth` per request and re-reads the token file every call, so token rotation takes effect immediately:
 
 ```bash
 corp-llm-gateway-proxy --listen 127.0.0.1:9999 --upstream https://gateway.corp.lan
@@ -227,7 +148,11 @@ Tokens expire every 30 days. With the default Pattern 1 setup, the value is read
 - **Pattern 1 / 2:** open a new shell (or restart the harness).
 - **Pattern 3 (proxy):** nothing — the next request picks up the new token automatically.
 
-To rotate manually before expiry, re-run `install.sh`. Full token-flow lifecycle, freshness model, and failure-mode mapping: [`docs/x-corp-auth.md`](docs/x-corp-auth.md).
+To rotate manually before expiry, re-run `install.sh`.
+
+### Try the demo
+
+A parallel demo stack shows the full round-trip — redaction, audit pipeline lit up in Langfuse, fail-closed posture — on your laptop: `scripts/demo.sh up` (watch the flow with `scripts/demo.sh logs`). Setup, prompt set, and troubleshooting: [`docs/demo.md`](docs/demo.md).
 
 ## Operator quickstart (k8s)
 
@@ -256,13 +181,11 @@ helm upgrade --install gw helm/corp-llm-gateway \
 # wait for readiness across all replicas
 kubectl -n corp-llm-gateway rollout status deploy/gateway
 
-# deep sanitization check
+# deep sanitization check, then promote to prod against values-prod.yaml
 curl https://gateway-staging.corp.lan/healthz/sanitization
-
-# promote to prod against values-prod.yaml
 ```
 
-Rollback: `helm rollback gw <revision>` (Helm keeps the last 10). Full release flow + rollback in [`docs/ops/runbook.md`](docs/ops/runbook.md).
+Rollback: `helm rollback gw <revision>` (Helm keeps the last 10). Full release flow: [`docs/ops/upgrade.md`](docs/ops/upgrade.md).
 
 ### Health checks
 
@@ -270,35 +193,9 @@ Rollback: `helm rollback gw <revision>` (Helm keeps the last 10). Full release f
 |---|---|---|
 | `/healthz/live` | k8s livenessProbe | process up |
 | `/healthz/ready` | k8s readinessProbe | dependencies (Redis, Postgres, corp-LLM) reachable |
-| `/healthz/sanitization` | post-deploy smoke | end-to-end pre→post round-trip with redactable string |
+| `/healthz/sanitization` | post-deploy smoke | end-to-end pre→post round-trip with a redactable string |
 
-### Day-2 ops
-
-Source of truth: [`docs/ops/runbook.md`](docs/ops/runbook.md) (incident playbook, fail-policy matrix, common operations like `gateway-admin team create`, `gateway-admin token revoke`, kubectl one-liners).
-
-Capacity sizing per phase (Phase 0 alpha → Phase 3 GA at 1000 devs / 50 RPS aggregate): [`docs/ops/capacity.md`](docs/ops/capacity.md).
-
-## Demo (laptop)
-
-For a guided ~15-min walkthrough of the gateway end-to-end — request round-trip,
-audit pipeline lit up in Langfuse, fail-closed posture — bring up the parallel
-demo stack: `scripts/demo.sh up`. To watch the redaction flow as it happens, run
-`scripts/demo.sh logs` (tails the LiteLLM container filtered to the
-sanitize/desanitize flow + audit). Full setup, prompt set, and troubleshooting
-in [`docs/demo.md`](docs/demo.md). The demo stack lives in `docker-compose.demo.yml`
-and is independent of the CI compose at `docker-compose.yml`.
-
-## CLIs
-
-| Command | Audience | Purpose |
-|---|---|---|
-| `corp-llm-gateway status` | dev | laptop diagnostics — token present, gateway live, version, update check |
-| `corp-llm-gateway-proxy` | dev | localhost header-injecting proxy (Pattern 3) |
-| `gateway-admin` | operator | `team` CRUD + retention, `token` issue/revoke/list, `extensions` list/inspect/health/enable, `config check` |
-
-Entry points are wired via `pyproject.toml`'s `[project.scripts]`. The `gateway-admin` CLI runs against the production deployment (typically via `kubectl exec`).
-
-## Configuration (Helm values)
+### Configuration (Helm values)
 
 Defaults in [`helm/corp-llm-gateway/values.yaml`](helm/corp-llm-gateway/values.yaml). Most-touched keys:
 
@@ -306,67 +203,56 @@ Defaults in [`helm/corp-llm-gateway/values.yaml`](helm/corp-llm-gateway/values.y
 |---|---|---|
 | `replicaCount` | `3` | gateway pods (3 = redis-quorum-friendly) |
 | `litellm.versionPin` | `1.40` | LiteLLM image tag — bump only after staging upgrade gate |
-| `corpLlm.endpoint` | `""` | URL of the corp vLLM that powers the pre-pass redaction |
+| `corpLlm.endpoint` | `""` | URL of the corp vLLM that powers the pre-pass redaction oracle |
 | `corpLlm.authProvider` | `"noop"` | switch to a real provider when corp-LLM gains auth (config-only, no code change) |
 | `guardrail.contentSizeThresholdBytes` | `102400` | M1-11 oversize-skip threshold |
 | `guardrail.cacheA.ttlSeconds` | `36000` | content-keyed dedup TTL |
-| `guardrail.cacheA.perTeamQuotaBytes` | `1 GiB` | per-team Cache A budget |
 | `guardrail.cacheB.slidingTtlSeconds` | `3600` | per-conversation mapping TTL (sliding) |
-| `audit.vector.bufferGb` | `5` | on-pod Vector disk buffer |
 | `audit.sinks.{langfuse,s3,siem}.enabled` | all `true` | toggle individual audit sinks |
-| `token.ttlDays` | `30` | corp-token validity |
-| `token.revocationCacheSeconds` | `60` | upper bound on revocation propagation |
-| `failPolicy.*` | see file | per-component fail-closed / continue posture (M4 matrix) |
-| `coreDnsSinkhole.enabled` | `false` | block direct upstream resolution from the cluster |
-| `networkPolicy.enabled` | `false` | constrain pod egress |
+| `token.ttlDays` / `token.revocationCacheSeconds` | `30` / `60` | corp-token validity / revocation-propagation upper bound |
+| `failPolicy.*` | see file | per-component fail-closed / continue posture (M4 matrix) — the **source of truth**, no ad-hoc fail-open paths in code |
+| `coreDnsSinkhole.enabled` / `networkPolicy.enabled` | `false` | egress lockdown (enabled in `values-prod.yaml`) |
 
-The fail-policy keys are the **source of truth** — no ad-hoc fail-open paths in code.
+Every value also has a TOML property-file fallback (`$CORP_LLM_GATEWAY_CONFIG_FILE` → `~/.corp-llm-gateway/config.toml` → `/etc/corp-llm-gateway/config.toml`, resolved after env vars). Full key reference: [`docs/ops/configuration.md`](docs/ops/configuration.md); template: [`config.example.toml`](config.example.toml).
 
-### Property file fallback (TOML)
+### Admin CLI (`gateway-admin`)
 
-Every env var the app reads (`CORP_LLM_AUTH_PROVIDER`, `CORP_LLM_BEARER_TOKEN`, `CORP_GATEWAY_URL`, `CORP_GATEWAY_TOKEN_FILE`, …) can also be supplied from a TOML file. Resolution order is: env var → file → caller default — so existing deployments are unchanged. The file is searched at the first existing path of:
+Operator CLI, typically run via `kubectl exec` against the deployment. Gated on the `gateway:operator` JWT claim.
 
-1. `$CORP_LLM_GATEWAY_CONFIG_FILE`
-2. `~/.corp-llm-gateway/config.toml` (laptop default)
-3. `/etc/corp-llm-gateway/config.toml` (server default)
+| Command group | Purpose |
+|---|---|
+| `gateway-admin team …` | team create / update / list + retention config |
+| `gateway-admin token …` | issue / revoke / list corp tokens |
+| `gateway-admin extensions …` | list / inspect / health / enable registered extensions |
+| `gateway-admin config check` | validate resolved config against the typed settings registry |
 
-Keys are flat and use the env-var names verbatim:
+Full reference: [`docs/ops/admin-cli.md`](docs/ops/admin-cli.md).
 
-```toml
-CORP_GATEWAY_URL          = "https://gateway.corp.lan"
-CORP_GATEWAY_TOKEN_FILE   = "~/.corp-llm-gateway/token"
-CORP_LLM_AUTH_PROVIDER    = "bearer"
-CORP_LLM_BEARER_TOKEN     = "..."
+### Day-2 ops
+
+Ongoing operations after install — incident playbook, fail-policy matrix, scaling, and routine admin tasks — live in the runbook: [`docs/ops/runbook.md`](docs/ops/runbook.md). Capacity sizing per rollout phase (alpha → GA at 1000 devs / 50 RPS aggregate): [`docs/ops/capacity.md`](docs/ops/capacity.md).
+
+## Team rules (`replace.md`)
+
+Each team maintains a `replace.md` file at `<rules-dir>/<team_id>.md`. These rules run **first** in the local cascade and **override** auto-detection — a term listed here is always replaced, regardless of what the detectors find.
+
+Format — one rule per line, separator `→` (U+2192), **not** ASCII `->`; rules apply longest-first (invariant #5):
+
+```markdown
+- `Project Polaris` → `[CONFIDENTIAL_PROJECT]`
+- `acme-internal-crm.corp.lan` → `[INTERNAL_HOST]`
+- `dr.smith@partnerlab.com` → `[PARTNER_CONTACT]`
 ```
 
-Full template with every supported key: [`config.example.toml`](config.example.toml). Loader source: `src/corp_llm_gateway/config.py`.
+Full spec and authoring tips: [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md).
 
-## Conversation identity
+## Identity & token flow
 
-Today the gateway mints `conversation_id` per HTTP request (it equals the request UUID). Cache A (content-keyed dedup) works; Cache B (per-conversation mapping store) is written but never reused across sibling requests because no harness or proxy supplies a stable session ID yet. Full behavior, consequences, and how to wire a real session ID are in [`docs/conversation-id.md`](docs/conversation-id.md).
+**`X-Corp-Auth` token** — the corp token lives at `~/.corp-llm-gateway/token` (issued by `install.sh` via Keycloak device flow, 30-day TTL, `0600`). It is sent on every request for identity/team resolution and **stripped before egress** — never forwarded upstream, never logged. The value is read once at shell/harness start, except under the Pattern-3 proxy which re-reads it per request. Full lifecycle (storage, freshness per pattern, failure modes): [`docs/x-corp-auth.md`](docs/x-corp-auth.md).
 
-## `X-Corp-Auth` token flow
+**Conversation identity** — the gateway mints `conversation_id` per HTTP request (equal to the request UUID). Cache A (content-keyed dedup) works; Cache B (per-conversation mapping) is written but not yet reused across sibling requests, because no harness supplies a stable session ID. Behavior and how to wire a real session ID: [`docs/conversation-id.md`](docs/conversation-id.md).
 
-The corp token lives on disk at `~/.corp-llm-gateway/token` (issued by `install.sh` via Keycloak device flow, 30-day TTL, `0600`). The header is sent on **every** HTTP request from the harness, but the *value* is typically read **once** — at shell init (Pattern 1) or harness start (Pattern 2) — so token rotation usually requires a fresh shell. The optional localhost proxy (Pattern 3) re-reads the file per request and makes rotation take effect on the next call. Full lifecycle (storage, freshness per pattern, what the gateway does with the header, common failure modes) is in [`docs/x-corp-auth.md`](docs/x-corp-auth.md). Per-harness setup recipes remain in [`docs/harness-integration.md`](docs/harness-integration.md).
-
-## Documentation index
-
-| Doc | What's inside |
-|---|---|
-| [`docs/plans/20260507-external-sanitizer-gateway-v1.md`](docs/plans/20260507-external-sanitizer-gateway-v1.md) | v1 plan (current rev in header) — single source of architectural truth |
-| [`docs/plans/20260630-bilingual-local-first-detection.md`](docs/plans/20260630-bilingual-local-first-detection.md) | local-first detection cycle plan (DP-0…DP-9, CP-1…CP-4) |
-| [`docs/requirements-compliance.md`](docs/requirements-compliance.md) | ИБ requirements compliance matrix — ✅ 11 / 🟡 3 / ⚪ 1 vs 15 requirements |
-| [`docs/adr/ADR-003-ner-orchestration.md`](docs/adr/ADR-003-ner-orchestration.md) | ADR: hand-roll dual-NER (Natasha RU + spaCy EN) over Presidio/DeepPavlov || [`docs/harness-integration.md`](docs/harness-integration.md) | per-harness setup recipes (Claude Code, Codex, Cursor, …) |
-| [`docs/x-corp-auth.md`](docs/x-corp-auth.md) | corp token lifecycle, per-pattern freshness, failure modes |
-| [`docs/conversation-id.md`](docs/conversation-id.md) | `conversation_id` behavior today + how to wire a real session ID |
-| [`docs/audit-schema.md`](docs/audit-schema.md) | audit event schema + ALWAYS / CONDITIONAL / NEVER field classification |
-| [`docs/security.md`](docs/security.md) | sanitization coverage, audit-pipeline guarantees, SIEM / Langfuse handling, known config gaps |
-| [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md) | how to write per-team `replace.md` rules files |
-| [`docs/rbac-matrix.md`](docs/rbac-matrix.md) | who can do what (devs / team leads / operators / security) |
-| [`docs/remaining-steps.md`](docs/remaining-steps.md) | running checklist of v1 work left |
-| [`docs/ops/runbook.md`](docs/ops/runbook.md) | release, rollback, incident playbook, common ops |
-| [`docs/ops/capacity.md`](docs/ops/capacity.md) | sizing per rollout phase (alpha → GA) |
-| [`docs/adr/`](docs/adr/) | architecture decision records |
+Who can do what (devs / team leads / operators / security): [`docs/rbac-matrix.md`](docs/rbac-matrix.md).
 
 ## Development
 
@@ -379,14 +265,14 @@ PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~1392 passed / 91 skipped, ~23s 
 PYTHONPATH=src .venv/bin/ruff check src tests
 ```
 
-Conventions, invariants, and "things NOT to do" are pinned in [`CLAUDE.md`](CLAUDE.md). Default branch is `master`. CI is CI (`the CI config`).
+Conventions, invariants, and "things NOT to do" are pinned in [`CLAUDE.md`](CLAUDE.md). CI is CI (`the CI config`).
 
 ## Built on
 
 Open-source components this gateway assembles (Architecture B — best-of-breed):
 
 - **Proxy & serving** — [LiteLLM](https://github.com/BerriAI/litellm) (multi-provider proxy + guardrail hooks) · [vLLM](https://github.com/vllm-project/vllm) (backs the corp pre-pass oracle)
-- **Bilingual NER & morphology** — RU: [Natasha](https://github.com/natasha/natasha) · [Slovnet](https://github.com/natasha/slovnet) · [Navec](https://github.com/natasha/navec) · [Razdel](https://github.com/natasha/razdel) · [pymorphy3](https://pypi.org/project/pymorphy3/); EN: [spaCy](https://spacy.io) + [`en_core_web_md`](https://spacy.io/models/en). Alternatives weighed in [ADR-003](docs/adr/ADR-003-ner-orchestration.md): [Presidio](https://github.com/microsoft/presidio), [DeepPavlov](https://github.com/deeppavlov/DeepPavlov)
+- **Bilingual NER & morphology** — RU: [Natasha](https://github.com/natasha/natasha) · [Slovnet](https://github.com/natasha/slovnet) · [Navec](https://github.com/natasha/navec) · [Razdel](https://github.com/natasha/razdel) · [pymorphy3](https://pypi.org/project/pymorphy3/); EN: [spaCy](https://spacy.io) + [`en_core_web_md`](https://spacy.io/models/en). Alternatives ([Presidio](https://github.com/microsoft/presidio), [DeepPavlov](https://github.com/deeppavlov/DeepPavlov)) were evaluated and rejected for CPU latency
 - **State & storage** — [Redis](https://redis.io) (mapping / dedup caches) · [PostgreSQL](https://www.postgresql.org) via [asyncpg](https://github.com/MagicStack/asyncpg) (token store)
 - **Audit & observability** — [Vector](https://vector.dev) → [Langfuse](https://langfuse.com) + S3 + SIEM
 - **Delivery & clients** — [Helm](https://helm.sh) (chart) · [CoreDNS](https://coredns.io) (egress sinkhole) · [httpx](https://www.python-httpx.org) (corp-LLM client)

@@ -31,3 +31,14 @@ helm/*/Chart.lock
 crt/*.pem
 crt/*.crt
 !crt/README.md
+
+# Internal research, decision records, and benchmarks — maintainer / product-owner only.
+# Kept on disk locally, excluded from the published tree (see README: only public docs are linked).
+docs/adr/
+docs/plans/
+docs/requirements-compliance.md
+docs/remaining-steps.md
+scripts/bench_local_first.py
+# Research / benchmark virtualenvs (NER bench + DeepPavlov comparison)
+.venv-bench/
+.venv-dp/
