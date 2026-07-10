@@ -172,7 +172,7 @@
 - `docs/replace-md-authoring.md`, `docs/rbac-matrix.md`, ADR-001 (interface-registry).
 - `docs/security.md` — покрытие sanitization, гарантии конвейера аудита, известные пробелы в конфигурации.
 - Резервный TOML property-файл для всех переменных окружения (`config.py`, `config.example.toml`).
-- Создано зеркало internal git host (`corp-llm-gateway`); open Q#1 закрыт.
+- Создано внутреннее git-зеркало; open Q#1 закрыт.
 
 ### Исправлено
 

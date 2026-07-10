@@ -199,9 +199,8 @@ follow the established interface-registry pattern:
 ## Things NOT to do
 
 - Don't rename `master` to `main`.
-- Don't re-introduce CI (`the CI config`) — CI is GitHub Actions
-  (`.github/workflows/`) and git hosting is GitHub. internal git host was fully removed;
-  re-adding it undoes that migration.
+- CI is GitHub Actions (`.github/workflows/`); git hosting is GitHub. Keep CI on
+  GitHub Actions — don't add other CI systems.
 - Don't add GPU deps.
 - Don't introduce a non-OpenAI/Anthropic provider in v1 (Bedrock /
   Gemini / Azure are explicit v2).

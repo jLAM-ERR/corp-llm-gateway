@@ -173,7 +173,7 @@ security & extensibility** build. Non-negotiable criterion: zero confirmed leak 
 - `docs/replace-md-authoring.md`, `docs/rbac-matrix.md`, ADR-001 (interface-registry).
 - `docs/security.md` — sanitization coverage, audit-pipeline guarantees, known config gaps.
 - TOML property-file fallback for all env vars (`config.py`, `config.example.toml`).
-- internal mirror created (`corp-llm-gateway`); open Q#1 closed.
+- Internal git mirror created; open Q#1 closed.
 
 ### Fixed
 
