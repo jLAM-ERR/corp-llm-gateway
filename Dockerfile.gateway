@@ -14,6 +14,8 @@ COPY src/ ./src/
 RUN python -m build --wheel
 
 FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
+# This base's /app/.venv is a uv venv with NO pip — ensurepip bootstraps it
+# below before installing the wheel (mirrors docker/demo-litellm/Dockerfile:13-18).
 # Install onto the litellm base so the proxy can import
 # `corp_llm_gateway.bootstrap.guardrail`. NER_PROFILE selects how much of the
 # sanitizing (NER) stack is baked in:
@@ -49,14 +51,17 @@ RUN set -eux; \
     pip_idx=""; \
     if [ -n "${PIP_INDEX_URL}" ]; then pip_idx="--index-url ${PIP_INDEX_URL}"; fi; \
     en_model="${EN_MODEL_URL:-https://github.com/explosion/spacy-models/releases/download/en_core_web_md-${EN_MODEL_VERSION}/en_core_web_md-${EN_MODEL_VERSION}-py3-none-any.whl}"; \
+    py=/app/.venv/bin/python; \
+    "$py" -m ensurepip --upgrade; \
     case "${NER_PROFILE}" in \
-      base)  pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" ;; \
-      ru-en) pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" "${en_model}"; \
-             python -c "import spacy, natasha; spacy.load('en_core_web_md'); print('NER ru-en OK')" ;; \
-      en)    pip install --no-cache-dir ${pip_idx} "${whl}[postgres,oidc]" "spacy>=3.8,<3.9" "${en_model}"; \
-             python -c "import spacy; spacy.load('en_core_web_md'); print('NER en OK')" ;; \
+      base)  "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" ;; \
+      ru-en) "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" "${en_model}"; \
+             "$py" -c "import spacy, natasha; spacy.load('en_core_web_md'); print('NER ru-en OK')" ;; \
+      en)    "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[postgres,oidc]" "spacy>=3.8,<3.9" "${en_model}"; \
+             "$py" -c "import spacy; spacy.load('en_core_web_md'); print('NER en OK')" ;; \
       *)     echo "unknown NER_PROFILE=${NER_PROFILE} (want: base|ru-en|en)" >&2; exit 1 ;; \
     esac; \
+    "$py" -c "import corp_llm_gateway.bootstrap; print('gateway bootstrap import OK')"; \
     rm -f /tmp/*.whl
 # Record what got baked so ops can audit the running image with `docker inspect`.
 LABEL org.corp-llm-gateway.ner-profile="${NER_PROFILE}" \
