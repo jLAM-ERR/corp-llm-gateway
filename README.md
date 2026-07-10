@@ -291,3 +291,14 @@ Open-source components this gateway assembles (Architecture B — best-of-breed)
 - **State & storage** — [Redis](https://redis.io) (mapping / dedup caches) · [PostgreSQL](https://www.postgresql.org) via [asyncpg](https://github.com/MagicStack/asyncpg) (token store)
 - **Audit & observability** — [Vector](https://vector.dev) → [Langfuse](https://langfuse.com) + S3 + SIEM
 - **Delivery & clients** — [Helm](https://helm.sh) (chart) · [CoreDNS](https://coredns.io) (egress sinkhole) · [httpx](https://www.python-httpx.org) (corp-LLM client)
+
+## License
+
+Copyright (c) 2026 Artem Likhomanenko.
+
+The gateway **core** (this repository) is licensed under the
+[Apache License 2.0](LICENSE) — free for all use, including
+commercial. **Enterprise plugins, prebuilt enterprise distributions,
+and commercial support** are separate proprietary offerings — see
+[`LEGAL/COMMERCIAL-LICENSING.md`](LEGAL/COMMERCIAL-LICENSING.md).
+Contributions are accepted under [`LEGAL/CLA.md`](LEGAL/CLA.md).
