@@ -182,3 +182,40 @@ def test_normal_relative_path_proxies_with_corp_auth_and_byok(
     sent = {k.lower(): v for k, v in req.headers.items()}
     assert sent["x-corp-auth"] == CORP_TOKEN
     assert sent["authorization"] == BYOK
+
+
+def test_query_string_preserved_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, opener = _drive("/v1/chat?stream=true", tmp_path, monkeypatch)
+    assert len(opener.requests) == 1
+    req = opener.requests[0]
+    split = urlsplit(req.full_url)
+    assert split.hostname == "gateway.corp.lan"
+    assert split.query == "stream=true"
+
+
+def test_upstream_base_with_path_prefix_joins_correctly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = tmp_path / "token"
+    token.write_text(CORP_TOKEN)
+    opener = _RecordingOpener()
+    monkeypatch.setattr(proxy, "_OPENER", opener)
+    handler = _make_handler("/v1/x", token, upstream="https://gw/prefix")
+    handler._handle()
+    assert len(opener.requests) == 1
+    req = opener.requests[0]
+    split = urlsplit(req.full_url)
+    assert split.hostname == "gw"
+    assert split.path == "/prefix/v1/x"
+
+
+def test_hostile_relative_targets_forwarded_with_host_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for hostile_path in ("/..//evil.example/x", "/%2F%2Fevil.example"):
+        _, opener = _drive(hostile_path, tmp_path, monkeypatch)
+        assert len(opener.requests) == 1
+        req = opener.requests[0]
+        split = urlsplit(req.full_url)
+        assert split.hostname == "gateway.corp.lan"
+        assert hostile_path.lstrip("/") in split.path

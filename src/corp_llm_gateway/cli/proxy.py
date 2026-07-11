@@ -23,7 +23,7 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 from corp_llm_gateway import config
@@ -90,16 +90,20 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         body = self._read_body()
 
-        # The request target is client-controlled. An absolute-form
-        # ("http://host/…") or protocol-relative ("//host/…") target would
-        # otherwise steer the injected corp token + BYOK key to an attacker
-        # host; the upstream host must come from config alone, never the target.
+        # The request target is client-controlled. Reject absolute-form
+        # ("http://host/…") and protocol-relative ("//host/…") targets outright,
+        # then rebuild the upstream URL from parts so the client target can only
+        # ever occupy the path+query components — scheme and netloc come from
+        # config alone, never from the request line.
         requested = urlsplit(self.path)
         if requested.scheme or requested.netloc:
             self._send_error(403, "proxy target must be a relative path")
             return
-        upstream_url = urljoin(self.upstream_base.rstrip("/") + "/", self.path.lstrip("/"))
         base = urlsplit(self.upstream_base)
+        path = base.path.rstrip("/") + "/" + requested.path.lstrip("/")
+        upstream_url = urlunsplit((base.scheme, base.netloc, path, requested.query, ""))
+        # Belt-and-suspenders: unreachable by construction (scheme+netloc are
+        # config-pinned above), retained as defense-in-depth per F7/A6.
         target = urlsplit(upstream_url)
         if (target.scheme, target.hostname, target.port) != (
             base.scheme,
