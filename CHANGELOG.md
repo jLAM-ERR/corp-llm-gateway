@@ -5,8 +5,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
-
 ## [1.0.0] — GA (2026-07-09)
 
 The first GA release — the **local-first detection cycle** (below) plus the **GA-readiness /
@@ -28,6 +26,9 @@ security & extensibility** build. Non-negotiable criterion: zero confirmed leak 
   (guardrail image + callback, config-check initContainer, NetworkPolicy, CoreDNS sinkhole), served
   healthz, ops docs.
 - **`replace.md`** — `=` is now the canonical rule separator (legacy `→` still parsed).
+- **Release tooling** — shared `scripts/release/{gates,ship,cut-rc}.sh` delivery scripts,
+  `github-release` workflow (auto GitHub Release on `v*` tags, `--prerelease` for rc),
+  `docs/ops/release.md`, least-privilege `dco.yml` permissions (closes CodeQL alert #1).
 
 ### Local-first detection cycle (2026-06-30)
 
@@ -89,6 +90,8 @@ security & extensibility** build. Non-negotiable criterion: zero confirmed leak 
 - Audit for Stage-0/Stage-5 blocks now emitted inline via `async_log_failure_event` (idempotent);
   `block_reason` appears in all audit sinks including Langfuse.
 - Pre_call rejections (auth failure, bad request, corp-LLM-down) all audited inline.
+- Dev-proxy upstream URL now rebuilt with `urlunsplit` — scheme+netloc pinned from config,
+  client target confined to path+query; closes CodeQL `py/full-ssrf` alert #2 (critical).
 
 ---
 

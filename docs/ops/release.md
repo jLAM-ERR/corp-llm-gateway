@@ -53,6 +53,15 @@ batch on the release branch until you're ready to cut a candidate.
   `:latest-en` image tags forward (the `build-image.yml` guard only enables
   `latest` when the tag name has no `-`).
 
+## Changelog
+
+There is no `[Unreleased]` section. Every notable PR adds its bullet directly
+under the upcoming version's heading (e.g. `[1.0.0]`) in the same PR that
+lands the change. Cutting an rc never touches `CHANGELOG.md` — the per-rc
+delta is the auto-generated GitHub Release notes between tags (see
+`github-release` below). The GA tag's Release page may later swap the
+generated notes for the curated section via `gh release edit --notes-file`.
+
 ## Delivery loop
 
 Four steps, run in order:
