@@ -8,6 +8,9 @@ name: build-gateway-image
 #             -> ghcr.io/<owner>/corp-llm-gateway:<version>-en / :latest-en
 # The model wheel is fetched from github.com at build time, so this runs on GitHub
 # Actions cloud runners (which have outbound internet) rather than an air-gapped build.
+# Images are multi-arch (linux/amd64 + linux/arm64 — Apple Silicon laptops / arm k8s
+# nodes). The arm64 leg runs under QEMU emulation on the x86_64 runner (no native
+# arm64 GitHub-hosted runner in use); slower, but acceptable at tag-push cadence.
 
 on:
   push:
@@ -37,6 +40,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +52,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -80,7 +87,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.gateway
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           # LITELLM_VERSION pins the base for reproducible release images
           # (Dockerfile default 'main-stable' floats); demo-stack-validated.
           build-args: |
