@@ -1112,3 +1112,85 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
         assert byok in serialized, "BYOK Authorization dropped (invariant 3 violation)"
 
     assert _CORP_TOKEN not in caplog.text, "corp token leaked into a log line (invariant 4)"
+
+
+# (xiii) system-field coverage (M1-14 gap): pre_call's data["system"] branches
+# (litellm_hook.py:616-708 — sanitize start/done + oversize fail-closed) were not
+# exercised by any test in this file; only the messages branches were pinned. -------
+
+
+@pytest.mark.asyncio
+async def test_system_field_sanitized_and_never_leaks_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Corpus originals in data["system"] (plain-string form) are redacted before
+    egress; the outbound system field and every log line are original-free."""
+    guardrail, _ = _tool_call_guardrail(_redacted_pairs())
+    system_text = "\n".join(ORIGINAL_CORPUS)
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "system": system_text,
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    assert _haystack_contains_any_original(out["system"]) is None, "original egressed in system"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+    assert "tok-inv" not in caplog.text, "corp token leaked into log line"
+
+
+@pytest.mark.asyncio
+async def test_system_field_block_list_sanitized_no_leak(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Corpus originals in data["system"] as a list of Anthropic text blocks are
+    redacted by the content walker (content_blocks.py:359/381); outbound system and
+    log lines are original-free."""
+    guardrail, _ = _tool_call_guardrail(_redacted_pairs())
+    system_blocks = [{"type": "text", "text": orig} for orig in ORIGINAL_CORPUS]
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "system": system_blocks,
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    forwarded = json.dumps(out["system"])
+    assert _haystack_contains_any_original(forwarded) is None, "original egressed in system blocks"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+    assert "tok-inv" not in caplog.text, "corp token leaked into log line"
+
+
+@pytest.mark.asyncio
+async def test_system_field_oversize_blocks_and_never_leaks_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An oversize data["system"] carrying every corpus original is fail-closed
+    (litellm_hook.py:639-657) and never leaks via exception, log, or audit. The
+    message loop (litellm_hook.py:480, runs BEFORE the system branch) sees only a
+    benign leaf so it can't green-light the wrong branch."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _oversize_guardrail()
+    big_system = "\n".join(ORIGINAL_CORPUS) + " " + "x" * 64  # > 32 bytes; carries all originals
+    data = {
+        "model": "claude",
+        # Empty content is skipped by the message loop (litellm_hook.py:487) before
+        # it ever calls sanitize_one — this guardrail's mock transport forbids any
+        # oracle call, so a non-empty leaf here would wrongly hit the assertion.
+        "messages": [{"role": "user", "content": ""}],
+        "system": big_system,
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+    assert "field=system" in caplog.text
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert _haystack_contains_any_original(serialized) is None, "original in audit record"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
