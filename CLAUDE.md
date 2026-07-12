@@ -40,7 +40,7 @@ src/corp_llm_gateway/
   litellm_hook.py  CorpLlmGuardrail — LiteLLM callback adapter (sanitize/desanitize incl. OpenAI tool_calls + streaming)
 helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret + HPA/PDB/SA + ServiceMonitor + config-check
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
-docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity) + rbac-matrix + adr/*
+docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
 tests/                   pytest, pytest-asyncio mode=auto (~1392 passed / 91 skipped on 3.14; full NER + RS256 crypto run on 3.12/CI)
 ```
