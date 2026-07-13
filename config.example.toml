@@ -184,6 +184,16 @@
 # CORP_LLM_TESTDATA_ALLOWLIST      = "sk-test-000,alice@example.com"
 # CORP_LLM_TESTDATA_ALLOWLIST_FILE = "/etc/corp-llm-gateway/testdata-allowlist.txt"
 
+# ── Solo/local dev auth seam (tokens/middleware.py) ──────────────────────────
+#
+# CORP_LLM_DEV_TEAM_TOKEN is DEV-ONLY: when set, `make_auth_middleware()` seeds
+# an in-memory X-Corp-Auth token mapped to team "local-dev" — a working auth
+# path for the solo/local compose quickstart with no Postgres/token-issuance
+# setup. Ignored WITH A WARNING LOG (never the token value) when
+# CORP_LLM_PG_DSN is set (a real token store is configured) or CORP_ENV is
+# prod/production (double guard) — never seed real deployments.
+# CORP_LLM_DEV_TEAM_TOKEN   = "local-dev-token"
+
 # ── Demo stack only (docker compose) ─────────────────────────────────────────
 
 # DEMO_TEAM_TOKEN           = "demo-team-token"

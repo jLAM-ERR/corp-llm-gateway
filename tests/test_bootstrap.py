@@ -20,7 +20,7 @@ from corp_llm_gateway.team_config import (
     PostgresTeamConfigStore,
     TeamConfig,
 )
-from corp_llm_gateway.tokens import InMemoryTokenStore
+from corp_llm_gateway.tokens import InMemoryTokenStore, InvalidTokenError, MissingTokenError
 
 
 @pytest.fixture(autouse=True)
@@ -242,6 +242,60 @@ def test_build_guardrail_selects_postgres_token_store(monkeypatch: pytest.Monkey
     guardrail = bootstrap.build_guardrail()
 
     assert isinstance(guardrail._auth._store, PostgresTokenStore)
+
+
+# ── CORP_LLM_DEV_TEAM_TOKEN: solo-mode auth path (Task 4) ────────────────────
+
+
+async def test_dev_team_token_seeds_local_dev_team(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_LLM_DEV_TEAM_TOKEN", "solo-dev-token")
+
+    guardrail = bootstrap.build_guardrail()
+    ctx = await guardrail._auth.authenticate("solo-dev-token")
+
+    assert ctx.team_id == "local-dev"
+    assert isinstance(guardrail._auth._store, InMemoryTokenStore)
+
+
+async def test_dev_team_token_unset_store_stays_empty() -> None:
+    # Byte-identical to pre-Task-4 behavior: no token seeded, nothing to authenticate.
+    guardrail = bootstrap.build_guardrail()
+
+    with pytest.raises(MissingTokenError):
+        await guardrail._auth.authenticate(None)
+    with pytest.raises(InvalidTokenError):
+        await guardrail._auth.authenticate("anything")
+
+
+def test_dev_team_token_ignored_when_pg_dsn_set(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    pytest.importorskip("asyncpg", reason="PostgresTokenStore requires the 'postgres' extra")
+    from corp_llm_gateway.tokens import PostgresTokenStore
+
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    monkeypatch.setenv("CORP_LLM_DEV_TEAM_TOKEN", "solo-dev-token")
+    caplog.set_level(logging.WARNING, logger="corp_llm_gateway.tokens.middleware")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail._auth._store, PostgresTokenStore)
+    assert "CORP_LLM_PG_DSN" in caplog.text
+    assert "solo-dev-token" not in caplog.text
+
+
+def test_dev_team_token_ignored_when_corp_env_prod(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("CORP_ENV", "prod")
+    monkeypatch.setenv("CORP_LLM_DEV_TEAM_TOKEN", "solo-dev-token")
+    caplog.set_level(logging.WARNING, logger="corp_llm_gateway.tokens.middleware")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail._auth._store, InMemoryTokenStore)
+    assert "CORP_ENV" in caplog.text
+    assert "solo-dev-token" not in caplog.text
 
 
 # ── config-only: no os.environ at call sites ─────────────────────────────────

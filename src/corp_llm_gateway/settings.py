@@ -209,6 +209,15 @@ KEYS: tuple[Key, ...] = (
     # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────
     Key("CORP_LLM_TESTDATA_ALLOWLIST", default="", help="inline never-redact test values"),
     Key("CORP_LLM_TESTDATA_ALLOWLIST_FILE", default="", help="never-redact test values file"),
+    # ── Solo/local dev auth seam (tokens/middleware.py) ──────────────────────
+    Key(
+        "CORP_LLM_DEV_TEAM_TOKEN",
+        secret=True,
+        default="",
+        help="DEV-ONLY: seeds an in-memory X-Corp-Auth token for team 'local-dev' "
+        "(solo/local compose quickstart, no Postgres); ignored with a warning "
+        "when CORP_LLM_PG_DSN is set or CORP_ENV is prod/production",
+    ),
     # ── Demo (docker compose only) ───────────────────────────────────────────
     Key("DEMO_TEAM_TOKEN", default="demo-team-token", help="demo-stack team token"),
 )
