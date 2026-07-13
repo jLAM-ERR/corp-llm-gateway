@@ -71,6 +71,14 @@ matters.
 
 ## Install flow
 
+litellm resolves `litellm_settings.callbacks` as a **file path** relative to
+the mounted config dir, not a package import — so the chart projects a
+delegating shim (`corp_llm_gateway/bootstrap.py`) into the same ConfigMap as
+`config.yaml` via `configMap.items`, and the litellm container boots without
+further action. If you see `ImportError: Could not import guardrail from
+corp_llm_gateway.bootstrap` at litellm startup, you're on a chart version
+from before this fix.
+
 1. **Apply the DB schema** (once per database) — see `upgrade.md`. Both
    `tokens/schema.sql` and `team_config/schema.sql` are idempotent.
 
