@@ -14,7 +14,7 @@ from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
-from corp_llm_gateway.rules import Rules, RulesLoader
+from corp_llm_gateway.rules import Gazetteer, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import (
@@ -190,6 +190,36 @@ def _build_guardrail_oversize(
         oversize_policy=policy,
         oversize_deliver_teams=deliver_teams,
         local_detectors=local_detectors,
+    )
+    sink = ListSink()
+    return (
+        CorpLlmGuardrail(
+            orch, AuthMiddleware(token_store), AuditLogger(sink, gateway_version="0.0.1")
+        ),
+        sink,
+    )
+
+
+def _build_guardrail_oracle_disabled(gazetteer: Gazetteer) -> tuple[CorpLlmGuardrail, ListSink]:
+    """A guardrail with NO corp-LLM client at all — the oracle switched off."""
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    orch = SanitizationOrchestrator(
+        None,
+        InMemoryMappingStore(),
+        _StaticRules(),
+        gazetteer=gazetteer,
+        oracle_enabled=False,
     )
     sink = ListSink()
     return (
@@ -385,6 +415,20 @@ async def test_pre_call_corp_llm_down_does_not_forward_content() -> None:
     # The raise short-circuits the upstream call; the original content
     # was never handed back as a sanitized payload.
     assert data["messages"][0]["content"] == "my secret is hunter2"
+
+
+async def test_pre_call_oracle_disabled_gazetteer_hit_sanitizes_without_oracle() -> None:
+    """Contrast with test_pre_call_corp_llm_down_fails_closed_503: with the oracle
+    switched off (no corp-LLM client at all — not merely unreachable), a
+    gazetteer-hit-style request must still sanitize successfully. It must NOT
+    raise 503 E_CORP_LLM_DOWN, because no oracle call is ever attempted."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    g, _ = _build_guardrail_oracle_disabled(gaz)
+    data = _data_with_token("tok-1", content="We are working on Project Polaris this sprint.")
+
+    result = await g.pre_call(data)
+
+    assert "Project Polaris" not in result["messages"][0]["content"]
 
 
 def _guardrail_with_ner(dual: DualNerDetector) -> CorpLlmGuardrail:

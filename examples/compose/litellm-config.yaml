@@ -1,0 +1,30 @@
+model_list:
+  # Wildcard routing (https://docs.litellm.ai/docs/proxy/configs#provider-specific-wildcard-routing):
+  # a client-requested "claude-3-5-sonnet-20241022" matches "claude-*" and
+  # forwards to "anthropic/claude-3-5-sonnet-20241022"; same idea for "gpt-*".
+  #
+  # BYOK note (see README.md "BYOK in local mode" — SPIKE finding): these
+  # native anthropic/openai providers build their OWN upstream auth header
+  # from `api_key` below. They do NOT forward the client's own Authorization
+  # header — that only happens for the corp-vLLM `hosted_vllm/` route (see
+  # docker/demo-litellm/litellm-config.yaml). So `api_key` here is ONE
+  # shared key for this whole gateway instance, not a per-developer key.
+  # Set ANTHROPIC_API_KEY / OPENAI_API_KEY in `.env` — never hardcode a
+  # real key in this file.
+  - model_name: "claude-*"
+    litellm_params:
+      model: "anthropic/claude-*"
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+  - model_name: "gpt-*"
+    litellm_params:
+      model: "openai/gpt-*"
+      api_key: "os.environ/OPENAI_API_KEY"
+litellm_settings:
+  # Reference a module-level INSTANCE (`guardrail`), not the class — litellm's
+  # get_instance_fn calls methods on whatever object lives at the path; a
+  # class fails ("missing self"). See docker/demo-litellm/litellm-config.yaml.
+  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+  # Claude Code sends modern Anthropic params some upstream models don't
+  # accept yet; drop unsupported params rather than 400-ing the request.
+  drop_params: true
+  json_logs: true

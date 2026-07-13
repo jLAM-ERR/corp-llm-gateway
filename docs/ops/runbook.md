@@ -42,6 +42,15 @@ Action:
 2. If yes: page corp-LLM team. The gateway will recover automatically when corp-LLM recovers.
 3. If no: investigate gateway-side connectivity (NetworkPolicy, DNS).
 
+**Not the same as local mode.** `CORP_LLM_ORACLE_ENABLED=0` (solo/local-mode
+gateways, `examples/compose/`) is a deliberate config choice, not this
+incident — no oracle call is ever attempted, so there's no `E_CORP_LLM_DOWN`
+to page on. Local-first cascade findings (regex+checksum, dual-NER,
+gazetteer, splitter) still apply; only the oracle's refinement pass is
+absent. Don't page corp-LLM for a pod that was never configured to call it —
+check `CORP_LLM_ORACLE_ENABLED` first if `E_CORP_LLM_DOWN` is unexpectedly
+absent from an otherwise-live gateway's logs.
+
 ### Detection cascade degraded
 
 There is no separate pre-pass Deployment. Detection runs **in-process** inside

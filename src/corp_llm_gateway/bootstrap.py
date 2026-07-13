@@ -50,6 +50,7 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     ProfileAwareOrchestrator,
     build_inner_orchestrator,
 )
+from corp_llm_gateway.settings import NO_OP_SANITIZER_MESSAGE, ConfigError, parse_flag
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import (
     InMemoryTeamConfigStore,
@@ -65,13 +66,14 @@ _DEFAULT_MODEL = "GLM-5.1-AWQ"
 _DEFAULT_RULES_DIR = "/etc/corp-llm-gateway/rules"
 # Shipped profile bundles (core / ru-152fz / division-x); CORP_PROFILE_ROOT overrides.
 _DEFAULT_PROFILE_ROOT = Path(__file__).parent / "profiles" / "defaults"
-_FALSEY = frozenset({"0", "false", "False", "FALSE"})
 
 _log = logging.getLogger(__name__)
 
 
 def _flag(name: str, default: str = "1") -> bool:
-    return (config.get(name, default) or default) not in _FALSEY
+    # Delegates to settings.parse_flag so bootstrap and settings.validate() can
+    # never disagree on what counts as falsy (off/no/0/false/"" — case-insensitive).
+    return parse_flag(config.get(name, default))
 
 
 def gateway_version() -> str:
@@ -147,7 +149,7 @@ def _deliver_teams() -> frozenset[str]:
 
 
 def _build_orchestrator(
-    corp_llm: CorpLlmClient, mapping_store: MappingStore
+    corp_llm: CorpLlmClient | None, mapping_store: MappingStore, *, oracle_enabled: bool
 ) -> SanitizationOrchestrator:
     local_detectors: list[PIIDetector] | None = (
         [RegexChecksumDetector(), DualNerDetector()] if _flag("CORP_LLM_LOCAL_FIRST") else None
@@ -164,15 +166,17 @@ def _build_orchestrator(
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),
         oracle_trigger=config.oracle_trigger(),
+        oracle_enabled=oracle_enabled,
     )
 
 
 def _build_profile_wrapper(
     core: SanitizationOrchestrator,
     *,
-    corp_llm: CorpLlmClient,
+    corp_llm: CorpLlmClient | None,
     mapping_store: MappingStore,
     team_store: TeamConfigStore,
+    oracle_enabled: bool,
 ) -> ProfileAwareOrchestrator:
     """Wrap the core orchestrator so a team's selected profile bundle is activated.
 
@@ -198,6 +202,7 @@ def _build_profile_wrapper(
             base_rules_loader=base_rules_loader,
             oversize_policy=oversize_policy,
             oversize_deliver_teams=deliver_teams,
+            oracle_enabled=oracle_enabled,
         )
 
     return ProfileAwareOrchestrator(
@@ -240,11 +245,29 @@ def build_guardrail(
     """
     auth = auth_middleware if auth_middleware is not None else make_auth_middleware()
     store = mapping_store if mapping_store is not None else build_mapping_store()
-    client = corp_llm if corp_llm is not None else build_corp_llm_client()
+    oracle_enabled = _flag("CORP_LLM_ORACLE_ENABLED")
+    # settings.validate() is not called on this path — the Helm initContainer
+    # runs full `config check` before pods start, but compose/demo/bare-litellm
+    # boots skip it — so the no-op-sanitizer floor is re-checked here. Fires
+    # regardless of an explicit `corp_llm` override: a caller-supplied client
+    # does not restore the missing local-first floor.
+    if not oracle_enabled and not _flag("CORP_LLM_LOCAL_FIRST"):
+        raise ConfigError([NO_OP_SANITIZER_MESSAGE])
+    if corp_llm is not None:
+        client = corp_llm
+    elif oracle_enabled:
+        client = build_corp_llm_client()
+    else:
+        client = None
+        _log.info("bootstrap oracle_enabled=false — local-first only")
     team_store = team_config_store if team_config_store is not None else build_team_config_store()
-    core = _build_orchestrator(client, store)
+    core = _build_orchestrator(client, store, oracle_enabled=oracle_enabled)
     orchestrator = _build_profile_wrapper(
-        core, corp_llm=client, mapping_store=store, team_store=team_store
+        core,
+        corp_llm=client,
+        mapping_store=store,
+        team_store=team_store,
+        oracle_enabled=oracle_enabled,
     )
     active_sink = sink if sink is not None else get_sink()
     register_sink(REGISTRY, active_sink, sink_name_for(active_sink))

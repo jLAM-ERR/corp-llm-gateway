@@ -741,3 +741,89 @@ def test_sample_selected_distribution_is_uniform() -> None:
     n = 1000
     hits = sum(_sample_selected(f"seed-{i}", 50) for i in range(n))
     assert 0.4 * n <= hits <= 0.6 * n
+
+
+# ---------------------------------------------------------------------------
+# CORP_LLM_ORACLE_ENABLED — oracle-off gate (Task 2)
+# ---------------------------------------------------------------------------
+
+
+async def test_oracle_disabled_gazetteer_hit_skips_oracle_local_findings_applied() -> None:
+    """oracle_enabled=False: a gazetteer hit must NOT call the oracle; the
+    gazetteer/local findings are still sanitized (inverted
+    test_gazetteer_hit_calls_oracle)."""
+    gaz = Gazetteer({"Project Polaris": "PRODUCT"})
+    client, call_count = _client_with_counter([("Project Polaris", "[PRODUCT_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        oracle_enabled=False,
+    )
+    result = await orch.sanitize(
+        "We are working on Project Polaris this sprint.",
+        team_id="t1",
+        conversation_id="c1",
+    )
+    assert call_count[0] == 0, "oracle must NOT be called when disabled"
+    assert "Project Polaris" not in result.sanitized_text
+    assert any("PRODUCT" in p for _, p in result.pairs)
+
+
+async def test_oracle_disabled_trigger_always_still_zero_calls() -> None:
+    """oracle_enabled=False wins over CORP_LLM_ORACLE_TRIGGER=always: still 0 calls."""
+    gaz = Gazetteer({"AML": "REGULATED"})
+    client, call_count = _client_with_counter([("AML", "[REGULATED_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(),
+        gazetteer=gaz,
+        oracle_trigger="always",
+        oracle_enabled=False,
+    )
+    result = await orch.sanitize("AML review", team_id="t1", conversation_id="c1")
+    assert call_count[0] == 0, "oracle_enabled=False must win over oracle_trigger=always"
+    assert "AML" not in result.sanitized_text
+
+
+def test_oracle_enabled_requires_client() -> None:
+    """Construction fails fast: oracle_enabled=True (default) with no client is a
+    programming error, not a config error."""
+    with pytest.raises(ValueError):
+        SanitizationOrchestrator(
+            None,
+            InMemoryMappingStore(),
+            _StaticRulesLoader(),
+        )
+
+
+async def test_oracle_disabled_local_pass_branch_applies_replace_md_rules() -> None:
+    """local_pass branch (no gazetteer), oracle disabled: replace.md rules no
+    longer arrive via the oracle round-trip, so they must be applied directly —
+    not silently dropped."""
+    rules = Rules(rules=(Rule("Zephyr Ledger", "[CONFIDENTIAL_PROJECT]"),))
+    email = Finding("bob@example.com", "EMAIL", 22, 38, 0.95)
+    client, call_count = _client_with_counter([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _RuleLoader(rules),
+        local_detectors=[_StaticFindingDetector([email])],
+        oracle_enabled=False,
+        # no gazetteer → local_pass branch
+    )
+    result = await orch.sanitize(
+        "Migrating Zephyr Ledger, contact bob@example.com",
+        team_id="t1",
+        conversation_id="c1",
+    )
+    assert call_count[0] == 0, "oracle must NOT be called when disabled"
+    assert "Zephyr Ledger" not in result.sanitized_text
+    assert "[CONFIDENTIAL_PROJECT]" in result.sanitized_text
+    assert "bob@example.com" not in result.sanitized_text
+    originals = [o for o, _ in result.pairs]
+    placeholders = [p for _, p in result.pairs]
+    assert len(originals) == len(set(originals)), "duplicate original in pairs"
+    assert len(placeholders) == len(set(placeholders)), "placeholder collision"

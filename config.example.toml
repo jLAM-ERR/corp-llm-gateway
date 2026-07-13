@@ -33,13 +33,24 @@
 
 # ── Corp LLM oracle endpoint / model ─────────────────────────────────────────
 #
-# CORP_LLM_ENDPOINT is REQUIRED. It has NO routable default — the code falls back
-# to the non-routable placeholder https://corp-llm.example/v1, which only fails on
-# the first gazetteer-hit request (a 503). `config check` / startup validation
-# refuses to run without it.
+# CORP_LLM_ENDPOINT is required WHEN CORP_LLM_ORACLE_ENABLED=1 (the default). It
+# has NO routable default — the code falls back to the non-routable placeholder
+# https://corp-llm.example/v1, which only fails on the first gazetteer-hit
+# request (a 503). `config check` / startup validation refuses to run without
+# it while the oracle is enabled.
 # CORP_LLM_ENDPOINT         = "https://corp-llm.corp.lan/v1"
 # CORP_LLM_MODEL            = "GLM-5.1-AWQ"
 # CORP_LLM_AUTH_TOKEN       = "..."    # legacy oracle bearer read by gateway-admin
+
+# CORP_LLM_ORACLE_ENABLED: "1" (default) calls the corp-LLM oracle as the
+# conditional fallback after the local-first cascade. Set to "0" for solo/local
+# mode — no corp vLLM needed, CORP_LLM_ENDPOINT can stay unset. Oracle off
+# REQUIRES CORP_LLM_LOCAL_FIRST=1 (its default); disabling both refuses to boot
+# as a no-op sanitizer.
+#   Local-mode example:
+#     CORP_LLM_ORACLE_ENABLED = "0"
+#     # CORP_LLM_ENDPOINT omitted — not required with the oracle off
+# CORP_LLM_ORACLE_ENABLED   = "1"
 
 # ── Detection pipeline knobs ─────────────────────────────────────────────────
 
@@ -172,6 +183,16 @@
 # Never-redact fixture values (so obvious test tokens survive sanitization).
 # CORP_LLM_TESTDATA_ALLOWLIST      = "sk-test-000,alice@example.com"
 # CORP_LLM_TESTDATA_ALLOWLIST_FILE = "/etc/corp-llm-gateway/testdata-allowlist.txt"
+
+# ── Solo/local dev auth seam (tokens/middleware.py) ──────────────────────────
+#
+# CORP_LLM_DEV_TEAM_TOKEN is DEV-ONLY: when set, `make_auth_middleware()` seeds
+# an in-memory X-Corp-Auth token mapped to team "local-dev" — a working auth
+# path for the solo/local compose quickstart with no Postgres/token-issuance
+# setup. Ignored WITH A WARNING LOG (never the token value) when
+# CORP_LLM_PG_DSN is set (a real token store is configured) or CORP_ENV is
+# prod/production (double guard) — never seed real deployments.
+# CORP_LLM_DEV_TEAM_TOKEN   = "local-dev-token"
 
 # ── Demo stack only (docker compose) ─────────────────────────────────────────
 

@@ -1,0 +1,53 @@
+# corp-llm-gateway local-mode quickstart. See README.md for the 5-minute
+# walkthrough (compose up → client config → what local mode does/doesn't
+# detect → enabling the oracle).
+#
+# Runs the published GHCR image as a local sanitizing proxy in front of
+# Anthropic/OpenAI, oracle (corp vLLM) switched OFF — no corp
+# infrastructure required.
+
+services:
+  gateway:
+    # `-en` = EN-only NER (smaller image, no RU stack); the published default
+    # variant is `ru-en` (bilingual RU+EN) — drop `-en` from the tag for that.
+    # requires v1.0.0-rc.5 or newer (first image containing the local-mode
+    # switch); check
+    # https://github.com/jLAM-ERR/corp-llm-gateway/pkgs/container/corp-llm-gateway
+    # for the latest tag.
+    image: ghcr.io/jlam-err/corp-llm-gateway:1.0.0-rc.5-en
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm-config.yaml:/etc/litellm/config.yaml:ro
+      # litellm resolves litellm_settings.callbacks as a FILE PATH relative to
+      # the config directory, not a package import (confirmed live against
+      # this exact image's litellm — see README.md "Why the extra bootstrap.py
+      # mount"). Same technique as docker-compose.demo.yml.
+      - ../../src/corp_llm_gateway/bootstrap.py:/etc/litellm/corp_llm_gateway/bootstrap.py:ro
+    environment:
+      CORP_LLM_ORACLE_ENABLED: "0"
+      CORP_LLM_DEV_TEAM_TOKEN: ${CORP_LLM_DEV_TEAM_TOKEN}
+      CORP_AUDIT_SINK: stdout
+      # Gateway-side shared key(s) — see README.md "BYOK in local mode".
+      # Native anthropic/openai routing can't forward a per-developer key;
+      # set the real value(s) in `.env`, never here.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    # depends_on:
+    #   redis:
+    #     condition: service_healthy
+
+  # ---- Optional: durable per-conversation mapping store (Cache B) ----
+  # Default storage is in-memory — mapping is lost on `docker compose down`,
+  # which breaks post_call de-sanitization for any request still in flight
+  # across a restart. Uncomment this service AND add
+  # `REDIS_URL: redis://redis:6379/0` to the `gateway` environment above (plus
+  # the `depends_on` block) to make the mapping store survive restarts.
+  # redis:
+  #   image: redis:8-alpine
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 5
+  #   command: redis-server --appendonly yes

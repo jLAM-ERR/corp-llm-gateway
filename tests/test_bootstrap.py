@@ -14,13 +14,14 @@ from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.profile_orchestrator import ProfileAwareOrchestrator
+from corp_llm_gateway.settings import ConfigError
 from corp_llm_gateway.storage import InMemoryMappingStore, RedisMappingStore
 from corp_llm_gateway.team_config import (
     InMemoryTeamConfigStore,
     PostgresTeamConfigStore,
     TeamConfig,
 )
-from corp_llm_gateway.tokens import InMemoryTokenStore
+from corp_llm_gateway.tokens import InMemoryTokenStore, InvalidTokenError, MissingTokenError
 
 
 @pytest.fixture(autouse=True)
@@ -147,6 +148,165 @@ async def test_team_with_sealed_default_profile_resolves_and_applies() -> None:
     assert resolved.policy.size_threshold_bytes == 65536
 
 
+# ── CORP_LLM_ORACLE_ENABLED: local mode boots without corp-LLM (Task 3) ──────
+
+
+def test_oracle_disabled_build_guardrail_skips_client_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No CORP_LLM_ENDPOINT set (hermetic_gateway_config clears it) — must not be
+    # required when the oracle is off.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+
+    def _fail_if_called() -> None:
+        raise AssertionError("build_corp_llm_client must not run when the oracle is disabled")
+
+    monkeypatch.setattr(bootstrap, "build_corp_llm_client", _fail_if_called)
+
+    guardrail = bootstrap.build_guardrail()
+
+    core = guardrail._orch._core
+    assert core._corp_llm is None
+    assert core._oracle_enabled is False
+
+
+def test_oracle_disabled_logs_one_info_at_build_time(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    caplog.set_level(logging.INFO, logger="corp_llm_gateway.bootstrap")
+
+    bootstrap.build_guardrail()
+
+    assert "oracle_enabled=false" in caplog.text
+
+
+async def test_oracle_disabled_profiled_team_inner_orchestrator_has_no_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A team WITH profile_ids (ProfileAwareOrchestrator inner path) in local
+    mode: the inner orchestrator is also client-less; sanitization still runs
+    via the profile's own gazetteer (division-x extends core's markings.txt)."""
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    team_store = InMemoryTeamConfigStore()
+    await team_store.upsert(
+        TeamConfig(team_id="div-team", name="Division X", profile_ids=("division-x",))
+    )
+    guardrail = bootstrap.build_guardrail(team_config_store=team_store)
+
+    resolved = await guardrail._orch.resolve("div-team")
+
+    assert resolved.orchestrator is not guardrail._orch._core
+    assert resolved.orchestrator._corp_llm is None
+    assert resolved.orchestrator._oracle_enabled is False
+
+    result = await resolved.sanitize(
+        "Marked Confidential — internal review only.",
+        team_id="div-team",
+        conversation_id="c1",
+    )
+    assert "Confidential" not in result.sanitized_text
+
+
+# ── flag parsing must not fork between settings.validate() and bootstrap ────
+
+
+@pytest.mark.parametrize("falsy", ["off", "no", "0", "false", "OFF"])
+def test_oracle_falsy_spellings_disable_oracle_without_endpoint(
+    monkeypatch: pytest.MonkeyPatch, falsy: str
+) -> None:
+    # Regression: settings._as_flag treats off/no/0/false (any case) as falsy;
+    # bootstrap._flag must agree, or CORP_LLM_ORACLE_ENABLED=off passes
+    # validation as disabled but build_guardrail still builds an oracle client.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", falsy)
+
+    def _fail_if_called() -> None:
+        raise AssertionError("build_corp_llm_client must not run when the oracle is disabled")
+
+    monkeypatch.setattr(bootstrap, "build_corp_llm_client", _fail_if_called)
+
+    guardrail = bootstrap.build_guardrail()
+
+    core = guardrail._orch._core
+    assert core._corp_llm is None
+    assert core._oracle_enabled is False
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
+def test_oracle_truthy_spellings_enable_oracle_and_build_client(
+    monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", truthy)
+    calls = 0
+    real = bootstrap.build_corp_llm_client
+
+    def counting() -> object:
+        nonlocal calls
+        calls += 1
+        return real()
+
+    monkeypatch.setattr(bootstrap, "build_corp_llm_client", counting)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert calls == 1, "the oracle client must be built when the flag is truthy"
+    assert guardrail._orch._core._oracle_enabled is True
+
+
+# ── no-op-sanitizer floor: build_guardrail must not skip this even though it
+# never calls settings.validate() (Helm's config-check initContainer does; this
+# covers compose/demo/bare-litellm boots) ────────────────────────────────────
+
+
+@pytest.mark.parametrize("local_first_off", ["0", "off"])
+def test_oracle_off_and_local_first_off_raises_config_error_naming_both_keys(
+    monkeypatch: pytest.MonkeyPatch, local_first_off: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", local_first_off)
+
+    with pytest.raises(ConfigError) as exc_info:
+        bootstrap.build_guardrail()
+
+    message = str(exc_info.value)
+    assert "CORP_LLM_ORACLE_ENABLED" in message
+    assert "CORP_LLM_LOCAL_FIRST" in message
+
+
+def test_oracle_off_and_local_first_default_on_builds_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CORP_LLM_LOCAL_FIRST defaults to on; oracle-off alone must not trip the guard.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail, CorpLlmGuardrail)
+
+
+def test_oracle_off_and_local_first_off_raises_even_with_corp_llm_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A caller-supplied client does not restore the missing local-first floor —
+    # the guard must fire regardless of the `corp_llm` DI override.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", "0")
+
+    with pytest.raises(ConfigError):
+        bootstrap.build_guardrail(corp_llm=object())
+
+
+def test_oracle_default_on_and_local_first_off_builds_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Oracle backstop (default-on) covers the missing local-first floor — unchanged.
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", "0")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail, CorpLlmGuardrail)
+
+
 # ── backend selection by config ──────────────────────────────────────────────
 
 
@@ -182,6 +342,60 @@ def test_build_guardrail_selects_postgres_token_store(monkeypatch: pytest.Monkey
     guardrail = bootstrap.build_guardrail()
 
     assert isinstance(guardrail._auth._store, PostgresTokenStore)
+
+
+# ── CORP_LLM_DEV_TEAM_TOKEN: solo-mode auth path (Task 4) ────────────────────
+
+
+async def test_dev_team_token_seeds_local_dev_team(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_LLM_DEV_TEAM_TOKEN", "solo-dev-token")
+
+    guardrail = bootstrap.build_guardrail()
+    ctx = await guardrail._auth.authenticate("solo-dev-token")
+
+    assert ctx.team_id == "local-dev"
+    assert isinstance(guardrail._auth._store, InMemoryTokenStore)
+
+
+async def test_dev_team_token_unset_store_stays_empty() -> None:
+    # Byte-identical to pre-Task-4 behavior: no token seeded, nothing to authenticate.
+    guardrail = bootstrap.build_guardrail()
+
+    with pytest.raises(MissingTokenError):
+        await guardrail._auth.authenticate(None)
+    with pytest.raises(InvalidTokenError):
+        await guardrail._auth.authenticate("anything")
+
+
+def test_dev_team_token_ignored_when_pg_dsn_set(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    pytest.importorskip("asyncpg", reason="PostgresTokenStore requires the 'postgres' extra")
+    from corp_llm_gateway.tokens import PostgresTokenStore
+
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    monkeypatch.setenv("CORP_LLM_DEV_TEAM_TOKEN", "solo-dev-token")
+    caplog.set_level(logging.WARNING, logger="corp_llm_gateway.tokens.middleware")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail._auth._store, PostgresTokenStore)
+    assert "CORP_LLM_PG_DSN" in caplog.text
+    assert "solo-dev-token" not in caplog.text
+
+
+def test_dev_team_token_ignored_when_corp_env_prod(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("CORP_ENV", "prod")
+    monkeypatch.setenv("CORP_LLM_DEV_TEAM_TOKEN", "solo-dev-token")
+    caplog.set_level(logging.WARNING, logger="corp_llm_gateway.tokens.middleware")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail._auth._store, InMemoryTokenStore)
+    assert "CORP_ENV" in caplog.text
+    assert "solo-dev-token" not in caplog.text
 
 
 # ── config-only: no os.environ at call sites ─────────────────────────────────

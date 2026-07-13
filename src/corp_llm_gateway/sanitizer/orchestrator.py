@@ -148,7 +148,7 @@ def default_sanitizer() -> CorpLlmSanitizer:
 class SanitizationOrchestrator:
     def __init__(
         self,
-        corp_llm: CorpLlmClient,
+        corp_llm: CorpLlmClient | None,
         mapping_store: MappingStore,
         rules_loader: RulesLoader,
         *,
@@ -164,8 +164,15 @@ class SanitizationOrchestrator:
         gazetteer: Gazetteer | None = None,
         allowlist: Allowlist | None = None,
         oracle_trigger: str = ORACLE_TRIGGER_GAZETTEER_HIT,
+        oracle_enabled: bool = True,
     ) -> None:
+        if oracle_enabled and corp_llm is None:
+            raise ValueError(
+                "oracle_enabled=True requires a corp_llm client; pass "
+                "oracle_enabled=False for a client-less (local-first only) orchestrator"
+            )
         self._corp_llm = corp_llm
+        self._oracle_enabled = oracle_enabled
         self._mapping_store = mapping_store
         self._rules_loader = rules_loader
         self._sanitizer = sanitizer or default_sanitizer()
@@ -237,7 +244,9 @@ class SanitizationOrchestrator:
             len(rules.rules),
         )
 
-        content_hash = _content_hash(team_id, rules, text, profile_fingerprint)
+        content_hash = _content_hash(
+            team_id, rules, text, profile_fingerprint, self._oracle_enabled
+        )
 
         cached = await self._mapping_store.get_dedup(content_hash)
         if cached is not None:
@@ -375,39 +384,65 @@ class SanitizationOrchestrator:
             result = StrategyResult(pairs=merged_pairs)
 
         elif local_pass is not None:
-            # DP-3 path: oracle always on, local merged additively.
-            logger.info(
-                "sanitize_branch=local_pass oracle=yes team_id=%s conversation_id=%s",
-                team_id,
-                conversation_id,
-            )
-            logger.info(
-                "sanitize_corp_llm_call_start team_id=%s conversation_id=%s",
-                team_id,
-                conversation_id,
-            )
-            result = await self._call_corp_llm(text, rules)
-            logger.info(
-                "sanitize_corp_llm_call_done team_id=%s conversation_id=%s pairs=%d",
-                team_id,
-                conversation_id,
-                len(result.pairs),
-            )
-            local_findings = await local_pass.findings(text)
-            merged_pairs = _merge_local(result.pairs, local_findings)
+            if self._oracle_enabled:
+                # DP-3 path: oracle always on, local merged additively. Rules reach
+                # the pairs via the oracle round-trip (system prompt lists them,
+                # the oracle tool-calls them back) — unchanged call sequence.
+                logger.info(
+                    "sanitize_branch=local_pass oracle=yes team_id=%s conversation_id=%s",
+                    team_id,
+                    conversation_id,
+                )
+                logger.info(
+                    "sanitize_corp_llm_call_start team_id=%s conversation_id=%s",
+                    team_id,
+                    conversation_id,
+                )
+                oracle_result = await self._call_corp_llm(text, rules)
+                logger.info(
+                    "sanitize_corp_llm_call_done team_id=%s conversation_id=%s pairs=%d",
+                    team_id,
+                    conversation_id,
+                    len(oracle_result.pairs),
+                )
+                local_findings = await local_pass.findings(text)
+                base_pairs = oracle_result.pairs
+            else:
+                # Oracle disabled: rules no longer arrive via the oracle round-trip —
+                # apply replace.md rules directly, same precedence as the gazetteer
+                # branch's oracle-skipped case (rules are the base; local findings
+                # merge in after, per _merge_local's dedup-by-origin rules).
+                rules_pairs = _rules_pairs(rules, text)
+                local_findings = await local_pass.findings(text)
+                logger.info(
+                    "sanitize_branch=local_pass oracle=disabled team_id=%s conversation_id=%s "
+                    "rule_matches=%d",
+                    team_id,
+                    conversation_id,
+                    len(rules_pairs),
+                )
+                base_pairs = rules_pairs
+            merged_pairs = _merge_local(base_pairs, local_findings)
             logger.info(
                 "sanitize_local_pass team_id=%s conversation_id=%s "
                 "oracle_pairs=%d local_findings=%d merged_pairs=%d",
                 team_id,
                 conversation_id,
-                len(result.pairs),
+                len(base_pairs),
                 len(local_findings),
                 len(merged_pairs),
             )
             result = StrategyResult(pairs=merged_pairs)
 
         else:
-            # Legacy path: oracle only.
+            # Legacy path: oracle only. Unreachable via config once Task-1 validation
+            # is in place (oracle off requires local-first on) — defense in depth.
+            if not self._oracle_enabled:
+                raise RuntimeError(
+                    "oracle disabled (CORP_LLM_ORACLE_ENABLED=0) but this orchestrator "
+                    "has no local detection configured — nothing left to sanitize with; "
+                    "pass local_detectors and/or a gazetteer, or enable the oracle"
+                )
             logger.info(
                 "sanitize_branch=oracle_only team_id=%s conversation_id=%s",
                 team_id,
@@ -447,6 +482,8 @@ class SanitizationOrchestrator:
         rules/regex/NER hit; ``sampled:<pct>`` runs a deterministic fraction;
         ``always`` runs every leaf.
         """
+        if not self._oracle_enabled:
+            return False
         if gaz_findings:
             return True
         if self._oracle_sample_pct is not None:
@@ -640,7 +677,7 @@ class SanitizationOrchestrator:
                 text=text,
             )
             if self._gazetteer is not None
-            else True
+            else self._oracle_enabled
         )
         if oracle_runs:
             oracle_result = await self._call_corp_llm(text, rules)
@@ -651,6 +688,7 @@ class SanitizationOrchestrator:
         return findings
 
     async def _call_corp_llm(self, text: str, rules: Rules) -> StrategyResult:
+        assert self._corp_llm is not None  # construction invariant: oracle_enabled needs a client
         system_prompt = _build_system_prompt(rules)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -704,6 +742,7 @@ def _content_hash(
     rules: Rules,
     text: str,
     profile_fingerprint: str | None = None,
+    oracle_enabled: bool | None = None,
 ) -> str:
     h = hashlib.sha256()
     h.update(team_id.encode("utf-8"))
@@ -720,6 +759,12 @@ def _content_hash(
     if profile_fingerprint is not None:
         h.update(b"\x1c")
         h.update(profile_fingerprint.encode("utf-8"))
+    # Fold the oracle mode so a cache entry written with the oracle OFF can't be
+    # replayed after the oracle is turned back ON (and vice versa) — an oracle
+    # re-enable must not silently skip oracle-only findings until the TTL expires.
+    if oracle_enabled is not None:
+        h.update(b"\x1b")
+        h.update(b"oracle:1" if oracle_enabled else b"oracle:0")
     return h.hexdigest()
 
 
