@@ -50,7 +50,7 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     ProfileAwareOrchestrator,
     build_inner_orchestrator,
 )
-from corp_llm_gateway.settings import parse_flag
+from corp_llm_gateway.settings import NO_OP_SANITIZER_MESSAGE, ConfigError, parse_flag
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import (
     InMemoryTeamConfigStore,
@@ -246,6 +246,13 @@ def build_guardrail(
     auth = auth_middleware if auth_middleware is not None else make_auth_middleware()
     store = mapping_store if mapping_store is not None else build_mapping_store()
     oracle_enabled = _flag("CORP_LLM_ORACLE_ENABLED")
+    # settings.validate() is not called on this path — the Helm initContainer
+    # runs full `config check` before pods start, but compose/demo/bare-litellm
+    # boots skip it — so the no-op-sanitizer floor is re-checked here. Fires
+    # regardless of an explicit `corp_llm` override: a caller-supplied client
+    # does not restore the missing local-first floor.
+    if not oracle_enabled and not _flag("CORP_LLM_LOCAL_FIRST"):
+        raise ConfigError([NO_OP_SANITIZER_MESSAGE])
     if corp_llm is not None:
         client = corp_llm
     elif oracle_enabled:

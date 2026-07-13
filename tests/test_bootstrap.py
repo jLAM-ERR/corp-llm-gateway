@@ -14,6 +14,7 @@ from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.profile_orchestrator import ProfileAwareOrchestrator
+from corp_llm_gateway.settings import ConfigError
 from corp_llm_gateway.storage import InMemoryMappingStore, RedisMappingStore
 from corp_llm_gateway.team_config import (
     InMemoryTeamConfigStore,
@@ -250,6 +251,60 @@ def test_oracle_truthy_spellings_enable_oracle_and_build_client(
 
     assert calls == 1, "the oracle client must be built when the flag is truthy"
     assert guardrail._orch._core._oracle_enabled is True
+
+
+# ── no-op-sanitizer floor: build_guardrail must not skip this even though it
+# never calls settings.validate() (Helm's config-check initContainer does; this
+# covers compose/demo/bare-litellm boots) ────────────────────────────────────
+
+
+@pytest.mark.parametrize("local_first_off", ["0", "off"])
+def test_oracle_off_and_local_first_off_raises_config_error_naming_both_keys(
+    monkeypatch: pytest.MonkeyPatch, local_first_off: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", local_first_off)
+
+    with pytest.raises(ConfigError) as exc_info:
+        bootstrap.build_guardrail()
+
+    message = str(exc_info.value)
+    assert "CORP_LLM_ORACLE_ENABLED" in message
+    assert "CORP_LLM_LOCAL_FIRST" in message
+
+
+def test_oracle_off_and_local_first_default_on_builds_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CORP_LLM_LOCAL_FIRST defaults to on; oracle-off alone must not trip the guard.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail, CorpLlmGuardrail)
+
+
+def test_oracle_off_and_local_first_off_raises_even_with_corp_llm_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A caller-supplied client does not restore the missing local-first floor —
+    # the guard must fire regardless of the `corp_llm` DI override.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", "0")
+
+    with pytest.raises(ConfigError):
+        bootstrap.build_guardrail(corp_llm=object())
+
+
+def test_oracle_default_on_and_local_first_off_builds_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Oracle backstop (default-on) covers the missing local-first floor — unchanged.
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", "0")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert isinstance(guardrail, CorpLlmGuardrail)
 
 
 # ── backend selection by config ──────────────────────────────────────────────

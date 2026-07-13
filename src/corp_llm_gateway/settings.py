@@ -339,6 +339,15 @@ def _check_oracle_endpoint(values: Mapping[str, str | None], problems: list[str]
         )
 
 
+# Shared with bootstrap.build_guardrail(), which enforces the same invariant
+# inline (non-k8s boot paths never run `validate()`); keep one message string.
+NO_OP_SANITIZER_MESSAGE = (
+    "CORP_LLM_ORACLE_ENABLED=0 requires CORP_LLM_LOCAL_FIRST=1 — oracle disabled requires "
+    "the local-first cascade (regex+checksum+NER floor); gazetteer/rules alone are "
+    "insufficient without the oracle backstop"
+)
+
+
 def _check_no_op_sanitizer(values: Mapping[str, str | None], problems: list[str]) -> None:
     """Refuse to boot as a no-op sanitizer: oracle off requires the local-first floor.
 
@@ -349,11 +358,7 @@ def _check_no_op_sanitizer(values: Mapping[str, str | None], problems: list[str]
         return
     if _as_flag(values.get("CORP_LLM_LOCAL_FIRST")):
         return
-    problems.append(
-        "CORP_LLM_ORACLE_ENABLED=0 requires CORP_LLM_LOCAL_FIRST=1 — oracle disabled requires "
-        "the local-first cascade (regex+checksum+NER floor); gazetteer/rules alone are "
-        "insufficient without the oracle backstop"
-    )
+    problems.append(NO_OP_SANITIZER_MESSAGE)
 
 
 def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) -> bool:
