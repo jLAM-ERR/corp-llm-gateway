@@ -318,6 +318,7 @@ of truth** — do not add ad-hoc fail-open paths):
 | Component | Behavior |
 |---|---|
 | `corpLlmDown` | **fail-closed** (503 `E_CORP_LLM_DOWN`) |
+| `oracleDisabled` (`CORP_LLM_ORACLE_ENABLED=0`) | **continue by config** — local-first cascade only, no oracle call ever attempted; boot **refused** (`ConfigError`) if `CORP_LLM_LOCAL_FIRST` is also off (no-op-sanitizer guard) |
 | `prePassDown` | **continue** (corp-LLM only; metric increments) |
 | `nerUnavailable` (when `CORP_LLM_REQUIRE_NER`) | **fail-closed** (503 `E_NER_UNAVAILABLE`) — a configured NER model is absent (F2); `/healthz/ready` also probes NER-loaded so the pod leaves the LB. Knob **off** → dev / Python-3.14 graceful path (no NER, no 503) |
 | `redisClusterDown` | **fail-closed** (503) |
@@ -329,6 +330,14 @@ of truth** — do not add ad-hoc fail-open paths):
 
 See plan §M4 for the full matrix (Redis transient retry, Cache A/C miss
 fall-through, single-audit-sink-down) and per-team override columns.
+
+`oracleDisabled` is a deliberate operator choice (solo/local-mode gateways —
+see `examples/compose/`), not a failure: with the oracle off, the
+deterministic local-first cascade (replace.md, regex+checksum, dual-NER,
+gazetteer, splitter) is the whole detection story and Stage 0/Stage 5 are
+unaffected. `CORP_LLM_ORACLE_ENABLED=0` with `CORP_LLM_LOCAL_FIRST=0` refuses
+to boot rather than run with no deterministic floor at all — see
+`docs/plans/20260713-oracle-toggle-compose-quickstart.md`.
 
 ## 9. Invariants — never weaken these
 

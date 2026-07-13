@@ -15,6 +15,7 @@ Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances
 - [Architecture](#architecture)
 - [Repo layout](#repo-layout)
 - [Developer quickstart (laptop)](#developer-quickstart-laptop)
+- [Run locally (docker compose)](#run-locally-docker-compose)
 - [Operator quickstart (k8s)](#operator-quickstart-k8s)
 - [Team rules (`replace.md`)](#team-rules-replacemd)
 - [Identity & token flow](#identity--token-flow)
@@ -152,6 +153,28 @@ To rotate manually before expiry, re-run `install.sh`.
 ### Try the demo
 
 A parallel demo stack shows the full round-trip — redaction, audit pipeline lit up in Langfuse, fail-closed posture — on your laptop: `scripts/demo.sh up` (watch the flow with `scripts/demo.sh logs`). Setup, prompt set, and troubleshooting: [`docs/demo.md`](docs/demo.md).
+
+## Run locally (docker compose)
+
+No corp vLLM, no Kubernetes: `CORP_LLM_ORACLE_ENABLED=0` runs the gateway as
+a local sanitizing proxy in front of Anthropic/OpenAI directly, using the
+published GHCR image. The local-first cascade (regex+checksum, bilingual
+NER, gazetteer, splitter) still runs on every request — only the LLM
+oracle's refinement pass is skipped. BYOK is a shared gateway-side key in
+this mode, not per-developer (native anthropic/openai routing can't forward
+a client's own key — see the compose README for the full finding).
+
+Requires the published image at `≥ v1.0.0-rc.5` (the first tag with the
+oracle switch) — or build locally: `docker build -f Dockerfile.gateway
+--build-arg NER_PROFILE=en -t corp-llm-gateway:local .`
+
+```bash
+cd examples/compose && cp .env.example .env   # fill in a dev token + provider key(s)
+docker compose up -d
+```
+
+Full walkthrough, the BYOK finding, and the oracle re-enable path:
+[`examples/compose/README.md`](examples/compose/README.md).
 
 ## Operator quickstart (k8s)
 

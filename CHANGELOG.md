@@ -11,6 +11,19 @@ The first GA release — the **local-first detection cycle** (below) plus the **
 security & extensibility** build. Non-negotiable criterion: zero confirmed leak incidents in the
 90 days post-GA.
 
+### Added — Local mode (oracle on/off switch + compose quickstart)
+- **`CORP_LLM_ORACLE_ENABLED`** — on/off switch for the LLM oracle (corp vLLM). Off = local-first
+  cascade only (replace.md, regex+checksum, dual-NER, gazetteer, splitter); no oracle call ever
+  attempted, `CORP_LLM_ENDPOINT` no longer required. Refuses to boot as a no-op sanitizer if
+  `CORP_LLM_LOCAL_FIRST` is also off.
+- **`CORP_LLM_DEV_TEAM_TOKEN`** — dev-only seam that seeds a working `X-Corp-Auth` token for team
+  `local-dev` in the in-memory token store; ignored (with a warning) when a Postgres DSN or
+  `CORP_ENV=prod` is set.
+- **`examples/compose/`** — docker-compose quickstart running the published GHCR image as a local
+  sanitizing proxy in front of Anthropic/OpenAI with the oracle off; documents the BYOK trade-off
+  of native anthropic/openai routing (gateway-side shared key, not per-developer passthrough).
+  (first published image: v1.0.0-rc.5)
+
 ### Added — GA-readiness, security & extensibility
 - **Plugin / profile layer** — declarative `profiles/` bundles (country / division / regime),
   monotone-tightening `PolicyKnobs.merge`, hash-sealed integrity, SHA-256 cross-jurisdiction cache
