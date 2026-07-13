@@ -184,7 +184,9 @@ def test_empty_string_backend_config_falls_back_to_in_memory_and_defaults(
         ("false", False),
         ("False", False),
         ("1", True),
-        ("", True),  # empty → default "1" (on)
+        # empty string parses falsy (settings._as_flag semantics, unified with
+        # bootstrap._flag) — matches settings.validate(), not "fall back to default".
+        ("", False),
         ("yes", True),
     ],
 )

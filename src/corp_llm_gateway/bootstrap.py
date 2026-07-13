@@ -50,6 +50,7 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     ProfileAwareOrchestrator,
     build_inner_orchestrator,
 )
+from corp_llm_gateway.settings import parse_flag
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import (
     InMemoryTeamConfigStore,
@@ -65,13 +66,14 @@ _DEFAULT_MODEL = "GLM-5.1-AWQ"
 _DEFAULT_RULES_DIR = "/etc/corp-llm-gateway/rules"
 # Shipped profile bundles (core / ru-152fz / division-x); CORP_PROFILE_ROOT overrides.
 _DEFAULT_PROFILE_ROOT = Path(__file__).parent / "profiles" / "defaults"
-_FALSEY = frozenset({"0", "false", "False", "FALSE"})
 
 _log = logging.getLogger(__name__)
 
 
 def _flag(name: str, default: str = "1") -> bool:
-    return (config.get(name, default) or default) not in _FALSEY
+    # Delegates to settings.parse_flag so bootstrap and settings.validate() can
+    # never disagree on what counts as falsy (off/no/0/false/"" — case-insensitive).
+    return parse_flag(config.get(name, default))
 
 
 def gateway_version() -> str:

@@ -244,7 +244,9 @@ class SanitizationOrchestrator:
             len(rules.rules),
         )
 
-        content_hash = _content_hash(team_id, rules, text, profile_fingerprint)
+        content_hash = _content_hash(
+            team_id, rules, text, profile_fingerprint, self._oracle_enabled
+        )
 
         cached = await self._mapping_store.get_dedup(content_hash)
         if cached is not None:
@@ -740,6 +742,7 @@ def _content_hash(
     rules: Rules,
     text: str,
     profile_fingerprint: str | None = None,
+    oracle_enabled: bool | None = None,
 ) -> str:
     h = hashlib.sha256()
     h.update(team_id.encode("utf-8"))
@@ -756,6 +759,12 @@ def _content_hash(
     if profile_fingerprint is not None:
         h.update(b"\x1c")
         h.update(profile_fingerprint.encode("utf-8"))
+    # Fold the oracle mode so a cache entry written with the oracle OFF can't be
+    # replayed after the oracle is turned back ON (and vice versa) — an oracle
+    # re-enable must not silently skip oracle-only findings until the TTL expires.
+    if oracle_enabled is not None:
+        h.update(b"\x1b")
+        h.update(b"oracle:1" if oracle_enabled else b"oracle:0")
     return h.hexdigest()
 
 

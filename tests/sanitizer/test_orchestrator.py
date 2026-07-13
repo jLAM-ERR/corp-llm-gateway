@@ -672,6 +672,20 @@ async def test_content_hash_folds_fingerprint_into_key() -> None:
     assert fp_a == _content_hash("t1", rules, "x", "fpA"), "same inputs must be stable"
 
 
+async def test_content_hash_folds_oracle_mode_into_key() -> None:
+    """P1 fix: the oracle enabled/disabled bit changes the Cache-A key."""
+    from corp_llm_gateway.sanitizer.orchestrator import _content_hash
+
+    rules = Rules(rules=())
+    legacy = _content_hash("t1", rules, "x")
+    on = _content_hash("t1", rules, "x", None, True)
+    off = _content_hash("t1", rules, "x", None, False)
+    assert on != off, "oracle on vs off must not collide"
+    assert on != legacy, "an explicit oracle bit must not collide with the untagged legacy key"
+    assert off != legacy, "an explicit oracle bit must not collide with the untagged legacy key"
+    assert on == _content_hash("t1", rules, "x", None, True), "same inputs must be stable"
+
+
 async def test_none_fingerprint_preserves_dedup_behavior() -> None:
     """Default (None) fingerprint keeps the pre-D3 shared-dedup behavior intact."""
     client, captured = _client_returning_pairs([("alice", "[N1]")])
@@ -683,3 +697,38 @@ async def test_none_fingerprint_preserves_dedup_behavior() -> None:
     assert r1.cache_a_hit is False
     assert r2.cache_a_hit is True
     assert len(captured) == 1
+
+
+# Cache A — oracle mode must not be replayed across a toggle (P1 fix) -------
+
+
+async def test_oracle_mode_change_invalidates_cache_a_entry() -> None:
+    """An entry written with the oracle OFF must not be reused once the oracle
+    is re-enabled — reuse would silently skip an oracle-only finding."""
+    store = InMemoryMappingStore()
+    detector = RegexChecksumDetector()  # finds nothing in the test text below
+
+    off = SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        local_detectors=[detector],
+        oracle_enabled=False,
+    )
+    client, captured = _client_returning_pairs([("Project Nightingale", "[PRODUCT_001]")])
+    on = SanitizationOrchestrator(
+        client,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        local_detectors=[detector],
+        oracle_enabled=True,
+    )
+
+    text = "Deploy Project Nightingale to prod."
+    r_off = await off.sanitize(text, team_id="t1", conversation_id="c-off")
+    assert r_off.pairs == (), "oracle disabled + no local finding → nothing redacted"
+
+    r_on = await on.sanitize(text, team_id="t1", conversation_id="c-on")
+    assert r_on.cache_a_hit is False, "oracle mode change must miss the oracle-off cache entry"
+    assert "Project Nightingale" not in r_on.sanitized_text
+    assert len(captured) == 1, "the oracle must actually run once re-enabled"

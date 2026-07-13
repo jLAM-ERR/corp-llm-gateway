@@ -207,6 +207,51 @@ async def test_oracle_disabled_profiled_team_inner_orchestrator_has_no_client(
     assert "Confidential" not in result.sanitized_text
 
 
+# ── flag parsing must not fork between settings.validate() and bootstrap ────
+
+
+@pytest.mark.parametrize("falsy", ["off", "no", "0", "false", "OFF"])
+def test_oracle_falsy_spellings_disable_oracle_without_endpoint(
+    monkeypatch: pytest.MonkeyPatch, falsy: str
+) -> None:
+    # Regression: settings._as_flag treats off/no/0/false (any case) as falsy;
+    # bootstrap._flag must agree, or CORP_LLM_ORACLE_ENABLED=off passes
+    # validation as disabled but build_guardrail still builds an oracle client.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", falsy)
+
+    def _fail_if_called() -> None:
+        raise AssertionError("build_corp_llm_client must not run when the oracle is disabled")
+
+    monkeypatch.setattr(bootstrap, "build_corp_llm_client", _fail_if_called)
+
+    guardrail = bootstrap.build_guardrail()
+
+    core = guardrail._orch._core
+    assert core._corp_llm is None
+    assert core._oracle_enabled is False
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
+def test_oracle_truthy_spellings_enable_oracle_and_build_client(
+    monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", truthy)
+    calls = 0
+    real = bootstrap.build_corp_llm_client
+
+    def counting() -> object:
+        nonlocal calls
+        calls += 1
+        return real()
+
+    monkeypatch.setattr(bootstrap, "build_corp_llm_client", counting)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert calls == 1, "the oracle client must be built when the flag is truthy"
+    assert guardrail._orch._core._oracle_enabled is True
+
+
 # ── backend selection by config ──────────────────────────────────────────────
 
 

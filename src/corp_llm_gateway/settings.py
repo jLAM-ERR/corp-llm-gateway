@@ -55,6 +55,12 @@ def _as_flag(value: str | None) -> bool:
     return value.strip().lower() not in _FLAG_FALSE
 
 
+def parse_flag(value: str | None) -> bool:
+    """Public seam for :func:`_as_flag` — the single source of truth other
+    modules (e.g. ``bootstrap.py``) must reuse so flag parsing never forks."""
+    return _as_flag(value)
+
+
 @dataclass(frozen=True)
 class Key:
     """One config key: how to resolve, whether it's required, and how to check it."""
