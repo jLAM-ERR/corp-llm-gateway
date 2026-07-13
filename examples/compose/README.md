@@ -123,9 +123,13 @@ real installed package, so this is a one-file mount, not a full source
 checkout.
 
 This is a litellm-proxy-wide behavior, not specific to local mode — the
-production Helm chart's `deployment.yaml` currently mounts only the
-ConfigMap (no matching shim file), which is worth a follow-up check against
-a real cluster.
+production Helm chart hits the same lookup. As of this fix, the chart's
+litellm ConfigMap carries a second key with the same delegating shim, and
+the `litellm-config` volume uses `configMap.items` to project it to
+`corp_llm_gateway/bootstrap.py` alongside `config.yaml` under `/etc/litellm`,
+so a cluster deploy of the published image boots the same way this compose
+example does. See `helm/corp-llm-gateway/templates/configmap-litellm.yaml`
+and `deployment.yaml`, and the render asserts in `tests/helm/`.
 
 ## Enabling the oracle
 

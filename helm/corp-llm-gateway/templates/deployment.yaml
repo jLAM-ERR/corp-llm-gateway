@@ -142,8 +142,16 @@ spec:
               memory: "1Gi"
       volumes:
         - name: litellm-config
+          # items: litellm resolves callbacks as a file under the config dir, so the
+          # shim must land at corp_llm_gateway/bootstrap.py; both keys are listed
+          # because configMap.items projection is selective (unlisted keys vanish).
           configMap:
             name: {{ include "corp-llm-gateway.fullname" . }}-litellm
+            items:
+              - key: config.yaml
+                path: config.yaml
+              - key: bootstrap.py
+                path: corp_llm_gateway/bootstrap.py
         - name: vector-config
           configMap:
             name: {{ include "corp-llm-gateway.fullname" . }}-vector

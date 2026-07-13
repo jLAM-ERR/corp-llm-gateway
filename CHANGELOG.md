@@ -105,6 +105,10 @@ security & extensibility** build. Non-negotiable criterion: zero confirmed leak 
 - Pre_call rejections (auth failure, bad request, corp-LLM-down) all audited inline.
 - Dev-proxy upstream URL now rebuilt with `urlunsplit` — scheme+netloc pinned from config,
   client target confined to path+query; closes CodeQL `py/full-ssrf` alert #2 (critical).
+- Helm chart now projects the litellm callback shim (`configMap.items`) into the mounted
+  `/etc/litellm` dir alongside `config.yaml`, so a cluster deploy of the published GHCR image
+  boots instead of failing with `ImportError: Could not import guardrail` (litellm resolves
+  `callbacks:` as a file path, not a package import); render-tested in `tests/helm/`.
 
 ---
 
