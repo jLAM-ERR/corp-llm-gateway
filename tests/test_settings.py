@@ -52,6 +52,7 @@ def test_all_keys_contains_core_and_new_knobs() -> None:
         "CORP_LLM_REQUIRE_NER",
         "CORP_LLM_TESTDATA_ALLOWLIST",
         "CORP_LLM_TESTDATA_ALLOWLIST_FILE",
+        "CORP_LLM_ORACLE_ENABLED",
     } <= keys
 
 
@@ -88,6 +89,57 @@ def test_validate_reports_every_problem_at_once(
     joined = "\n".join(exc.value.problems)
     assert "CORP_LLM_ENDPOINT" in joined
     assert "CORP_LLM_OVERSIZE_POLICY" in joined
+
+
+# ── validate(): oracle enabled switch (local mode) ──────────────────────────
+
+
+def test_validate_ok_with_oracle_disabled_and_no_endpoint(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    result = config.validate()
+    assert isinstance(result, Settings)
+    assert result.flag("CORP_LLM_ORACLE_ENABLED") is False
+    assert not result["CORP_LLM_ENDPOINT"]
+
+
+def test_validate_fails_when_oracle_and_local_first_both_disabled(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", "0")
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_LLM_ORACLE_ENABLED" in joined
+    assert "CORP_LLM_LOCAL_FIRST" in joined
+    # the no-op-sanitizer failure must not also demand an endpoint.
+    assert "CORP_LLM_ENDPOINT" not in joined
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
+def test_validate_still_requires_endpoint_when_oracle_enabled(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    # regression: required_when is exact-match and would silently miss these
+    # lenient truthy spellings — the dedicated check uses _as_flag instead.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", truthy)
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+    assert any("CORP_LLM_ENDPOINT" in p for p in exc.value.problems)
+
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    assert isinstance(config.validate(), Settings)
+
+
+@pytest.mark.parametrize("falsy", ["0", "false", "off"])
+def test_validate_lenient_falsy_forms_disable_oracle(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, falsy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", falsy)
+    result = config.validate()
+    assert result.flag("CORP_LLM_ORACLE_ENABLED") is False
 
 
 # ── validate(): malformed choices ────────────────────────────────────────────

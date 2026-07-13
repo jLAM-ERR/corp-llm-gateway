@@ -10,9 +10,12 @@ types/validates.
 
 ``validate()`` is the startup fail-fast — it refuses to serve traffic with a
 missing-required or malformed setting. Notably it hard-fails on an unset
-``CORP_LLM_ENDPOINT``, which otherwise silently defaults to a non-routable
-placeholder and only surfaces as a 503 on the first gazetteer-hit request
-(``bootstrap.py`` only warns).
+``CORP_LLM_ENDPOINT`` when the oracle is enabled (``CORP_LLM_ORACLE_ENABLED``,
+default on), which otherwise silently defaults to a non-routable placeholder
+and only surfaces as a 503 on the first gazetteer-hit request (``bootstrap.py``
+only warns). With the oracle disabled, no endpoint is required — local-first
+only (solo/local mode) — but ``CORP_LLM_LOCAL_FIRST`` must then be on, else
+validation refuses to boot as a no-op sanitizer.
 
 pydantic is the authoritative validator when importable (prod / CI 3.12); the
 package must also import on 3.14 where pydantic is absent (the NER
@@ -76,7 +79,7 @@ KEYS: tuple[Key, ...] = (
     # ── Corp LLM oracle endpoint / model ─────────────────────────────────────
     Key(
         "CORP_LLM_ENDPOINT",
-        required=True,
+        required=False,
         help="corp vLLM base URL (…/v1); required — no routable default",
     ),
     Key("CORP_LLM_MODEL", default="GLM-5.1-AWQ", help="oracle model name"),
@@ -100,6 +103,12 @@ KEYS: tuple[Key, ...] = (
         default="gazetteer_hit",
         help="when the conditional oracle runs (F3): "
         "gazetteer_hit | any_local_finding | sampled:<pct> | always",
+    ),
+    Key(
+        "CORP_LLM_ORACLE_ENABLED",
+        flag=True,
+        default="1",
+        help="enable the corp-LLM oracle; off = local-first cascade only (solo/local mode)",
     ),
     Key("CORP_LLM_LOG_LEVEL", default="INFO", help="log level"),
     # ── Backends ─────────────────────────────────────────────────────────────
@@ -297,6 +306,41 @@ def _check_oracle_trigger(values: Mapping[str, str | None], problems: list[str])
         problems.append(f"CORP_LLM_ORACLE_TRIGGER: {exc}")
 
 
+def _check_oracle_endpoint(values: Mapping[str, str | None], problems: list[str]) -> None:
+    """CORP_LLM_ENDPOINT is required only when the oracle is enabled.
+
+    Deliberately plain-Python (not pydantic field logic, not ``required_when``):
+    ``required_when`` is exact-match string equality, while the oracle flag
+    parses leniently via :func:`_as_flag` — using it here would let
+    ``true``/``yes``/``on`` silently skip the requirement.
+    """
+    if not _as_flag(values.get("CORP_LLM_ORACLE_ENABLED")):
+        return
+    key = _BY_NAME["CORP_LLM_ENDPOINT"]
+    if not values.get(key.name):
+        problems.append(
+            f"{key.name}: required — set the env var or add it to the config file "
+            f"($CORP_LLM_GATEWAY_CONFIG_FILE / ~/.corp-llm-gateway/config.toml). {key.help}"
+        )
+
+
+def _check_no_op_sanitizer(values: Mapping[str, str | None], problems: list[str]) -> None:
+    """Refuse to boot as a no-op sanitizer: oracle off requires the local-first floor.
+
+    Gazetteer/rules alone are not a deterministic detection floor without either
+    the local-first cascade (regex+checksum+NER) or the oracle backstop.
+    """
+    if _as_flag(values.get("CORP_LLM_ORACLE_ENABLED")):
+        return
+    if _as_flag(values.get("CORP_LLM_LOCAL_FIRST")):
+        return
+    problems.append(
+        "CORP_LLM_ORACLE_ENABLED=0 requires CORP_LLM_LOCAL_FIRST=1 — oracle disabled requires "
+        "the local-first cascade (regex+checksum+NER floor); gazetteer/rules alone are "
+        "insufficient without the oracle backstop"
+    )
+
+
 def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) -> bool:
     """Validate required-endpoint + choices with pydantic. Returns False if absent.
 
@@ -314,7 +358,9 @@ def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) 
 
         # Keep these Literals in sync with AUTH_PROVIDERS / AUDIT_SINKS /
         # METRICS_EXPORTERS / TRACING_EXPORTERS.
-        CORP_LLM_ENDPOINT: str
+        # Endpoint requiredness is conditional on the oracle switch (see
+        # _check_oracle_endpoint below) — relaxed here so local mode can boot.
+        CORP_LLM_ENDPOINT: str = ""
         CORP_LLM_AUTH_PROVIDER: Literal["noop", "bearer", "mtls", "oidc", "apikey"] = "noop"
         CORP_AUDIT_SINK: Literal["stdout", "langfuse", "list"] = "stdout"
         CORP_METRICS_EXPORTER: Literal["noop", "prometheus"] = "noop"
@@ -358,6 +404,8 @@ def validate() -> Settings:
     _check_conditional(values, problems)
     _check_oversize(values, problems)
     _check_oracle_trigger(values, problems)
+    _check_oracle_endpoint(values, problems)
+    _check_no_op_sanitizer(values, problems)
     if problems:
         raise ConfigError(list(dict.fromkeys(problems)))
     return Settings(values=values)
