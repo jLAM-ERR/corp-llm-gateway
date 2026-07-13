@@ -343,6 +343,30 @@ async def test_oversize_deliver_flag_oracle_only_finding_blocks() -> None:
     assert len(captured) == 1, "deliver-flag rescan must consult the oracle (M2)"
 
 
+async def test_oversize_deliver_flag_oracle_disabled_local_finding_blocks_no_oracle_call() -> None:
+    """oracle_enabled=False: the deliver-flag rescan skips the oracle entirely but
+    still fails closed on a LOCAL finding (oracle-off mirror of
+    test_oversize_deliver_flag_oracle_only_finding_blocks — local findings still
+    apply, they just aren't backstopped by the oracle)."""
+    email = "leak@corp.example"
+    detector = _StaticFindingDetector([Finding(email, "EMAIL", 0, len(email), 0.95)])
+    client, captured = _client_returning_pairs([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(Rules(rules=())),
+        size_threshold_bytes=10,
+        oversize_policy=OVERSIZE_DELIVER_FLAG,
+        oversize_deliver_teams=frozenset({"t1"}),
+        local_detectors=[detector],
+        oracle_enabled=False,
+    )
+    big = f"{email} plus some extra padding " + "z" * 30
+    with pytest.raises(OversizeContentError):
+        await orch.sanitize(big, team_id="t1", conversation_id="c1")
+    assert len(captured) == 0, "oracle must NOT be called when disabled"
+
+
 async def test_oversize_deliver_flag_marks_result_block_reason() -> None:
     """M1: a delivered oversize leaf carries the oversize:delivered marker."""
     client, _ = _client_returning_pairs([])
