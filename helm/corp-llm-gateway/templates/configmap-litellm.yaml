@@ -26,3 +26,11 @@ data:
       drop_params: true
       # Emit AuditEvent JSON as single-line records for the Vector sidecar.
       json_logs: true
+  bootstrap.py: |
+    # litellm resolves litellm_settings.callbacks as a FILE under the config dir
+    # (<config-dir>/corp_llm_gateway/bootstrap.py) — it never falls back to a
+    # package import. This shim satisfies that lookup and delegates to the real
+    # corp_llm_gateway.bootstrap installed in the image's site-packages, so the
+    # chart never drifts from the wheel. Verified against litellm 1.85.0, the
+    # version shipped in ghcr.io/jlam-err/corp-llm-gateway:1.0.0-rc.5-en (`pip show litellm`).
+    from corp_llm_gateway.bootstrap import guardrail  # noqa: F401
