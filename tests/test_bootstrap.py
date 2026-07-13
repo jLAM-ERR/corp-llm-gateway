@@ -147,6 +147,66 @@ async def test_team_with_sealed_default_profile_resolves_and_applies() -> None:
     assert resolved.policy.size_threshold_bytes == 65536
 
 
+# ── CORP_LLM_ORACLE_ENABLED: local mode boots without corp-LLM (Task 3) ──────
+
+
+def test_oracle_disabled_build_guardrail_skips_client_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No CORP_LLM_ENDPOINT set (hermetic_gateway_config clears it) — must not be
+    # required when the oracle is off.
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+
+    def _fail_if_called() -> None:
+        raise AssertionError("build_corp_llm_client must not run when the oracle is disabled")
+
+    monkeypatch.setattr(bootstrap, "build_corp_llm_client", _fail_if_called)
+
+    guardrail = bootstrap.build_guardrail()
+
+    core = guardrail._orch._core
+    assert core._corp_llm is None
+    assert core._oracle_enabled is False
+
+
+def test_oracle_disabled_logs_one_info_at_build_time(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    caplog.set_level(logging.INFO, logger="corp_llm_gateway.bootstrap")
+
+    bootstrap.build_guardrail()
+
+    assert "oracle_enabled=false" in caplog.text
+
+
+async def test_oracle_disabled_profiled_team_inner_orchestrator_has_no_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A team WITH profile_ids (ProfileAwareOrchestrator inner path) in local
+    mode: the inner orchestrator is also client-less; sanitization still runs
+    via the profile's own gazetteer (division-x extends core's markings.txt)."""
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    team_store = InMemoryTeamConfigStore()
+    await team_store.upsert(
+        TeamConfig(team_id="div-team", name="Division X", profile_ids=("division-x",))
+    )
+    guardrail = bootstrap.build_guardrail(team_config_store=team_store)
+
+    resolved = await guardrail._orch.resolve("div-team")
+
+    assert resolved.orchestrator is not guardrail._orch._core
+    assert resolved.orchestrator._corp_llm is None
+    assert resolved.orchestrator._oracle_enabled is False
+
+    result = await resolved.sanitize(
+        "Marked Confidential — internal review only.",
+        team_id="div-team",
+        conversation_id="c1",
+    )
+    assert "Confidential" not in result.sanitized_text
+
+
 # ── backend selection by config ──────────────────────────────────────────────
 
 

@@ -80,7 +80,7 @@ KEYS: tuple[Key, ...] = (
     Key(
         "CORP_LLM_ENDPOINT",
         required=False,
-        help="corp vLLM base URL (…/v1); required — no routable default",
+        help="corp vLLM base URL (…/v1); required when the oracle is enabled — no routable default",
     ),
     Key("CORP_LLM_MODEL", default="GLM-5.1-AWQ", help="oracle model name"),
     Key("CORP_LLM_AUTH_TOKEN", secret=True, default="", help="legacy oracle bearer token"),

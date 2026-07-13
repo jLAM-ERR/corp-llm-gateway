@@ -147,7 +147,7 @@ def _deliver_teams() -> frozenset[str]:
 
 
 def _build_orchestrator(
-    corp_llm: CorpLlmClient, mapping_store: MappingStore
+    corp_llm: CorpLlmClient | None, mapping_store: MappingStore, *, oracle_enabled: bool
 ) -> SanitizationOrchestrator:
     local_detectors: list[PIIDetector] | None = (
         [RegexChecksumDetector(), DualNerDetector()] if _flag("CORP_LLM_LOCAL_FIRST") else None
@@ -164,15 +164,17 @@ def _build_orchestrator(
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),
         oracle_trigger=config.oracle_trigger(),
+        oracle_enabled=oracle_enabled,
     )
 
 
 def _build_profile_wrapper(
     core: SanitizationOrchestrator,
     *,
-    corp_llm: CorpLlmClient,
+    corp_llm: CorpLlmClient | None,
     mapping_store: MappingStore,
     team_store: TeamConfigStore,
+    oracle_enabled: bool,
 ) -> ProfileAwareOrchestrator:
     """Wrap the core orchestrator so a team's selected profile bundle is activated.
 
@@ -198,6 +200,7 @@ def _build_profile_wrapper(
             base_rules_loader=base_rules_loader,
             oversize_policy=oversize_policy,
             oversize_deliver_teams=deliver_teams,
+            oracle_enabled=oracle_enabled,
         )
 
     return ProfileAwareOrchestrator(
@@ -240,11 +243,22 @@ def build_guardrail(
     """
     auth = auth_middleware if auth_middleware is not None else make_auth_middleware()
     store = mapping_store if mapping_store is not None else build_mapping_store()
-    client = corp_llm if corp_llm is not None else build_corp_llm_client()
+    oracle_enabled = _flag("CORP_LLM_ORACLE_ENABLED")
+    if corp_llm is not None:
+        client = corp_llm
+    elif oracle_enabled:
+        client = build_corp_llm_client()
+    else:
+        client = None
+        _log.info("bootstrap oracle_enabled=false — local-first only")
     team_store = team_config_store if team_config_store is not None else build_team_config_store()
-    core = _build_orchestrator(client, store)
+    core = _build_orchestrator(client, store, oracle_enabled=oracle_enabled)
     orchestrator = _build_profile_wrapper(
-        core, corp_llm=client, mapping_store=store, team_store=team_store
+        core,
+        corp_llm=client,
+        mapping_store=store,
+        team_store=team_store,
+        oracle_enabled=oracle_enabled,
     )
     active_sink = sink if sink is not None else get_sink()
     register_sink(REGISTRY, active_sink, sink_name_for(active_sink))

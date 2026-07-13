@@ -108,7 +108,7 @@ class _LayeredRulesLoader(RulesLoader):
 def build_inner_orchestrator(
     bundle: ProfileBundle,
     *,
-    corp_llm: CorpLlmClient,
+    corp_llm: CorpLlmClient | None,
     mapping_store: MappingStore,
     base_rules_loader: RulesLoader,
     sanitizer: CorpLlmSanitizer | None = None,
@@ -116,13 +116,16 @@ def build_inner_orchestrator(
     cache_b_ttl_seconds: int = _DEFAULT_CACHE_B_TTL_SECONDS,
     oversize_policy: str = OVERSIZE_FAIL_CLOSED,
     oversize_deliver_teams: frozenset[str] = frozenset(),
+    oracle_enabled: bool = True,
 ) -> SanitizationOrchestrator:
     """Construct the inner orchestrator for one resolved bundle.
 
     Maps the bundle's detectors/gazetteer/rules/allowlist/policy onto the
     unchanged ``SanitizationOrchestrator`` constructor and shares the corp-LLM
     client + mapping store (Cache A) with every other profile — the per-profile
-    fingerprint keeps their shared Cache-A entries apart (D3).
+    fingerprint keeps their shared Cache-A entries apart (D3). ``oracle_enabled``
+    mirrors the core orchestrator's switch (CORP_LLM_ORACLE_ENABLED) — a
+    disabled oracle means every profile's inner orchestrator is also client-less.
     """
     return SanitizationOrchestrator(
         corp_llm,
@@ -137,6 +140,7 @@ def build_inner_orchestrator(
         local_detectors=list(bundle.detectors) or None,
         gazetteer=bundle.gazetteer,
         allowlist=bundle.allowlist,
+        oracle_enabled=oracle_enabled,
     )
 
 
