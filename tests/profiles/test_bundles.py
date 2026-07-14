@@ -184,7 +184,11 @@ async def test_worked_example_allowlisted_value_passes_through() -> None:
         profile_fingerprint=bundle_fingerprint(bundle),
     )
     assert "test@example.com" in result.sanitized_text
-    assert result.pairs == ()
+    # Assert the allowlisted value specifically, not zero-findings overall:
+    # natasha (RU NER) false-positives «сегодня» as PERSON on some models,
+    # which is unrelated to the allowlist behavior under test.
+    redacted_originals = [original for original, _ in result.pairs]
+    assert "test@example.com" not in redacted_originals
 
 
 # merged PolicyKnobs: most-restrictive-wins ---------------------------------

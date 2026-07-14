@@ -116,8 +116,10 @@ docker compose run --rm e2e pytest -q tests/e2e
 - CI: GitHub Actions (`.github/workflows/`)
 - httpx for HTTP, Redis via `redis.asyncio`, fakeredis for tests
 - First-time setup: `pip install -e ".[dev]" && pre-commit install`
-- CI lint runs both `ruff check` AND `ruff format --check` — running only
-  `ruff check` locally can still leave you with a CI format failure
+- `.github/workflows/ci.yml` gates every PR: a lint job (`ruff check` AND
+  `ruff format --check` — running only `ruff check` locally can still leave
+  you with a CI format failure) and a test job running the full pytest suite
+  on Python 3.12 with the `ner`/`postgres`/`oidc` extras + helm render tests
 
 ## CLI entry points
 
