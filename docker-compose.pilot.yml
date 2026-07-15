@@ -1,0 +1,364 @@
+# PILOT — laptop / air-gapped walkthrough stack. A parallel of the demo stack
+# (docker-compose.demo.yml), isolated below via a distinct compose project
+# `name:` so it never shares volumes, networks, or container names with demo.
+# Host ports are the same as demo, so run ONE of the two stacks at a time.
+# Vector reads container stdout via the Docker socket. Production (helm/) uses a
+# sidecar tailing a file. Do NOT copy this socket-mount pattern to k8s manifests.
+name: corp-llm-gateway-pilot
+
+# Corp-proxy passthrough. On networks that force internet egress through an
+# HTTP(S) proxy, set HTTP_PROXY / HTTPS_PROXY / NO_PROXY in your SHELL (or a
+# project-root `.env` — NOT `.env.pilot`, whose env_file values would lose to the
+# `environment:` block below) before `docker compose ... build/up`. All keys are
+# inert when unset. NO_PROXY MUST list the intra-stack DNS names and the corp LLM
+# host so internal traffic bypasses the proxy — extend it for your own upstream.
+# Lowercase keys map from the SAME uppercase source var, so an operator sets only
+# HTTP_PROXY / HTTPS_PROXY / NO_PROXY and every HTTP client (pip/httpx/aiohttp,
+# which vary in which case they read) sees the proxy.
+x-proxy-build-args: &proxy-build-args
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  NO_PROXY: ${NO_PROXY:-}
+  http_proxy: ${HTTP_PROXY:-}
+  https_proxy: ${HTTPS_PROXY:-}
+  no_proxy: ${NO_PROXY:-}
+
+x-proxy-runtime-env: &proxy-runtime-env
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,redis,postgres,corp-llm.corp.lan}
+  http_proxy: ${HTTP_PROXY:-}
+  https_proxy: ${HTTPS_PROXY:-}
+  no_proxy: ${NO_PROXY:-localhost,127.0.0.1,redis,postgres,corp-llm.corp.lan}
+
+services:
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - gateway-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    command: redis-server --appendonly yes
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - gateway-postgres-data:/var/lib/postgresql/data
+      - ./src/corp_llm_gateway/tokens/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  litellm:
+    # Demo image = litellm v1.85 + the `ner` extra baked in (see
+    # docker/demo-litellm/Dockerfile) so bilingual NER runs instead of degrading.
+    build:
+      context: .
+      dockerfile: docker/pilot-litellm/Dockerfile
+      args:
+        # *_PROXY (predefined) + internal PyPI mirror + spaCy model URL. All empty
+        # by default => open-internet build. Proxy CA comes from crt/proxy-ca.crt.
+        <<: *proxy-build-args
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+        PIP_PROXY: ${PIP_PROXY:-}
+        EN_MODEL_URL: ${EN_MODEL_URL:-}
+    image: corp-llm-gateway-pilot-litellm:local
+    # No published host port — the gateway is reached ONLY via nginx (single entry
+    # point, :8080). litellm still listens on :4000 INSIDE the container, which is
+    # what the nginx upstream and the internal healthcheck use.
+    volumes:
+      - ./src:/pkg/src:ro
+      - ./pyproject.toml:/pkg/pyproject.toml:ro
+      - ./README.md:/pkg/README.md:ro
+      - ./docker/demo-litellm/litellm-config.yaml:/etc/litellm/config.yaml:ro
+      # litellm resolves config-yaml `callbacks` as a file path under the
+      # config dir, not via importlib — so make the entry-point hook
+      # visible at /etc/litellm/corp_llm_gateway/litellm_hook.py.
+      - ./src/corp_llm_gateway/litellm_hook.py:/etc/litellm/corp_llm_gateway/litellm_hook.py:ro
+      # litellm registers config-yaml callbacks as the literal object at
+      # that import path. A class object fails ("missing self") — it
+      # needs to be a module-level INSTANCE. _demo_guardrail.guardrail
+      # is that instance.
+      - ./src/corp_llm_gateway/_demo_guardrail.py:/etc/litellm/corp_llm_gateway/_demo_guardrail.py:ro
+      - ./docker/demo-litellm/rules:/etc/corp-llm-gateway/rules:ro
+      - ./crt:/etc/corp-llm-gateway/crt:ro
+    environment:
+      # Proxy egress for the startup `pip install -e /pkg` (PyPI). The corp LLM
+      # upstream + redis/postgres are in NO_PROXY so they stay direct.
+      <<: *proxy-runtime-env
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
+      CORP_LLM_AUTH_PROVIDER: noop
+      # If the corp LLM presents a cert signed by an internal CA, drop that CA
+      # chain at ./crt/corp-ca-bundle.pem (operator-provided, git-ignored — see
+      # crt/README.md). We mount ./crt and trust it so TLS to the corp LLM is
+      # VERIFIED on BOTH paths that reach it. Both point at the SAME combined
+      # bundle `command` builds at /tmp/corp-ca-bundle.pem (certifi public roots
+      # + the corporate CA chain IF present) — which ALWAYS exists:
+      #  - our CorpLlmClient (httpx) verifies against CORP_LLM_CA_BUNDLE;
+      #  - litellm's hosted_vllm upstream uses aiohttp, whose default SSL context
+      #    honours SSL_CERT_FILE (not certifi).
+      # NOTE: CORP_LLM_CA_BUNDLE must NOT point at the raw ./crt file directly —
+      # config.corp_llm_verify() hands the path to httpx verbatim, and httpx/ssl
+      # raise FileNotFoundError at client construction (crashing startup) when the
+      # operator dropped no corp-ca-bundle.pem. The combined /tmp bundle is always
+      # present, so the demo falls back to public roots when no corp CA is given.
+      CORP_LLM_CA_BUNDLE: /tmp/corp-ca-bundle.pem
+      SSL_CERT_FILE: /tmp/corp-ca-bundle.pem
+      # NOTE: do NOT enable LITELLM_MASTER_KEY / UI auth here. Once it's
+      # set, litellm intercepts the Authorization header on every API
+      # endpoint and rejects anything that isn't one of its own virtual
+      # keys — which breaks the BYOK / Claude Code subscription flow that
+      # is the whole point of this gateway (CLAUDE.md invariant #3).
+    env_file: .env.pilot
+    entrypoint: sh
+    command:
+      - "-c"
+      - "python3 -m ensurepip --upgrade >/dev/null 2>&1 && python3 -m pip install --no-cache-dir -e /pkg --quiet && { cat \"$(python3 -c 'import certifi; print(certifi.where())')\"; if [ -f /etc/corp-llm-gateway/crt/corp-ca-bundle.pem ]; then cat /etc/corp-llm-gateway/crt/corp-ca-bundle.pem; fi; } > /tmp/corp-ca-bundle.pem && exec litellm --config /etc/litellm/config.yaml --port 4000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The litellm image has no curl/wget; use Python stdlib.
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness',timeout=2).status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nginx:
+    # Single public entry point in front of BOTH gateway web apps:
+    #   :8080 → litellm:4000      (gateway API + admin UI /ui)
+    #   :3000 → langfuse-web:3000 (Langfuse observability UI)
+    # No proxy env: nginx only talks to the internal services over the compose
+    # network, so egress never routes through a corp proxy here.
+    image: nginx:1.27-alpine
+    container_name: corp-llm-gateway-pilot-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-8080}:80"
+      - "${NGINX_LANGFUSE_PORT:-3000}:3000"
+    volumes:
+      - ./docker/pilot-nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    # Only litellm is a hard start dependency — the langfuse :3000 server block
+    # uses a runtime resolver, so nginx boots as soon as the gateway path is ready
+    # and serves langfuse once langfuse-web comes up (no coupling to its slower
+    # clickhouse-migration startup).
+    depends_on:
+      litellm:
+        condition: service_healthy
+    env_file: .env.pilot
+    healthcheck:
+      # Proxies through to litellm, so this validates nginx AND the upstream.
+      # nginx:alpine ships busybox wget.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health/liveliness"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  vector:
+    image: timberio/vector:0.53.0-alpine
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker/demo-vector/vector.yaml:/etc/vector/vector.yaml:ro
+    env_file: .env.pilot
+    command: --config /etc/vector/vector.yaml
+    depends_on:
+      litellm:
+        condition: service_healthy
+      langfuse-web:
+        condition: service_healthy
+    healthcheck:
+      # Vector image has no curl; API endpoint enabled in vector.yaml.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8686/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the `langfuse` bucket. Langfuse v3 doesn't auto-create.
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >-
+      sh -c "mc alias set demo http://minio:9000 minioadmin minioadmin
+      && mc mb --ignore-existing demo/langfuse"
+    restart: "no"
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    # No published host port — reached ONLY via nginx (single entry point, :3000).
+    # langfuse-web still listens on :3000 INSIDE the container, which is what the
+    # nginx upstream, vector's ingestion sink, and the internal healthcheck use.
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      NEXTAUTH_SECRET: demo-secret-key-change-in-production
+      NEXTAUTH_URL: http://localhost:3000
+      SALT: demo-salt-change-in-production
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: langfuse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # Pin a password-less connection string. In Langfuse (redis.ts) this takes
+      # precedence over REDIS_HOST/REDIS_PORT/REDIS_AUTH, so it also overrides any
+      # stale/inherited REDIS_AUTH a recreated container might still carry. The
+      # shared `redis` runs without `requirepass`; sending an AUTH otherwise fails
+      # with "ERR AUTH <password> called without any password configured".
+      REDIS_CONNECTION_STRING: redis://redis:6379/0
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      TELEMETRY_ENABLED: "false"
+      # Headless init — must match scripts/demo.sh seed_langfuse() values.
+      # Per langfuse docs: do NOT double-quote LANGFUSE_INIT_* values.
+      LANGFUSE_INIT_ORG_ID: demo-org
+      LANGFUSE_INIT_ORG_NAME: Demo Org
+      LANGFUSE_INIT_PROJECT_ID: demo-project
+      LANGFUSE_INIT_PROJECT_NAME: demo-team
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-demo-00000000-0000-0000-0000-000000000001
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-demo-00000000-0000-0000-0000-000000000002
+      LANGFUSE_INIT_USER_EMAIL: demo@corp.lan
+      LANGFUSE_INIT_USER_NAME: Demo User
+      LANGFUSE_INIT_USER_PASSWORD: demo-password-12345
+    healthcheck:
+      # langfuse-web binds to eth0, not 127.0.0.1; no curl in the image.
+      test: ["CMD-SHELL", "wget -q --spider http://$(hostname):3000/api/public/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      SALT: demo-salt-change-in-production
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: langfuse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # Pin a password-less connection string. In Langfuse (redis.ts) this takes
+      # precedence over REDIS_HOST/REDIS_PORT/REDIS_AUTH, so it also overrides any
+      # stale/inherited REDIS_AUTH a recreated container might still carry. The
+      # shared `redis` runs without `requirepass`; sending an AUTH otherwise fails
+      # with "ERR AUTH <password> called without any password configured".
+      REDIS_CONNECTION_STRING: redis://redis:6379/0
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      TELEMETRY_ENABLED: "false"
+    healthcheck:
+      # Worker binds to eth0:3030 and serves /api/health; no curl in image.
+      test: ["CMD-SHELL", "wget -q --spider http://$(hostname):3030/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  langfuse-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse:26.3-jammy
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: langfuse
+    healthcheck:
+      test:
+        - "CMD"
+        - "clickhouse-client"
+        - "--user=langfuse"
+        - "--password=langfuse"
+        - "--query=SELECT 1"
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    ports:
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  gateway-postgres-data:
+  gateway-redis-data:
+  langfuse-postgres-data:
+  langfuse-clickhouse-data:
+  minio-data:

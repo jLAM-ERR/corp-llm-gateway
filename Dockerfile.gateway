@@ -13,7 +13,27 @@ COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN python -m build --wheel
 
-FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
+FROM docker.litellm.ai/berriai/litellm:${LITELLM_VERSION}
+
+# ── Air-gapped / re-signing-proxy CA (empty/absent => open-internet build) ────
+# If internet egress goes through a re-signing (TLS-intercepting) proxy, build-time
+# pip must trust the proxy's root CA instead of skipping TLS. Drop it at
+# crt/proxy-ca.crt (git-ignored; see crt/README.md). crt/ is COPYed whole (always
+# present — has README.md), so the build ALSO works with NO CA: append is skipped
+# and stock certifi stays. pip ships its own vendored certifi, so we point PIP_CERT
+# at the bundle we appended the CA to. Same mechanism as docker/pilot-litellm/Dockerfile.
+COPY crt/ /tmp/proxy-crt/
+RUN set -eux; \
+    certbundle="$(python -c 'import certifi; print(certifi.where())')"; \
+    if [ -f /tmp/proxy-crt/proxy-ca.crt ]; then \
+        cat /tmp/proxy-crt/proxy-ca.crt >> "$certbundle"; \
+    fi; \
+    mkdir -p /etc/corp-llm-gateway; \
+    cp "$certbundle" /etc/corp-llm-gateway/ca-bundle.pem; \
+    rm -rf /tmp/proxy-crt
+ENV PIP_CERT=/etc/corp-llm-gateway/ca-bundle.pem \
+    REQUESTS_CA_BUNDLE=/etc/corp-llm-gateway/ca-bundle.pem
+
 # Install onto the litellm base so the proxy can import
 # `corp_llm_gateway.bootstrap.guardrail`. NER_PROFILE selects how much of the
 # sanitizing (NER) stack is baked in:
@@ -34,6 +54,9 @@ FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
 # every knob to point at corp storage — Nexus/Artifactory/JFrog). Prod stays a
 # self-contained image: nothing is fetched at deploy or runtime.
 #   PIP_INDEX_URL    — corp PyPI mirror for the libraries; empty = public PyPI.
+#   PIP_TRUSTED_HOST — mirror host to trust when it serves plain HTTP or a cert
+#                      outside the proxy CA; empty = none.
+#   PIP_PROXY        — dedicated proxy node for pip only; empty = generic *_PROXY.
 #   EN_MODEL_VERSION — spaCy EN model version to bake (the NER-version knob; bump
 #                      it + rebuild to ship a new NER version as a new image tag).
 #   EN_MODEL_URL     — full wheel URL for the EN model; empty = derive the public
@@ -41,13 +64,17 @@ FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
 #                      corp-storage URL when the build host cannot reach github.com.
 ARG NER_PROFILE=base
 ARG PIP_INDEX_URL=
+ARG PIP_TRUSTED_HOST=
+ARG PIP_PROXY=
 ARG EN_MODEL_VERSION=3.8.0
 ARG EN_MODEL_URL=
 COPY --from=build /build/dist/*.whl /tmp/
 RUN set -eux; \
     whl="$(ls /tmp/*.whl)"; \
     pip_idx=""; \
-    if [ -n "${PIP_INDEX_URL}" ]; then pip_idx="--index-url ${PIP_INDEX_URL}"; fi; \
+    if [ -n "${PIP_INDEX_URL}" ]; then pip_idx="${pip_idx} --index-url ${PIP_INDEX_URL}"; fi; \
+    if [ -n "${PIP_TRUSTED_HOST}" ]; then pip_idx="${pip_idx} --trusted-host ${PIP_TRUSTED_HOST}"; fi; \
+    if [ -n "${PIP_PROXY}" ]; then pip_idx="${pip_idx} --proxy ${PIP_PROXY}"; fi; \
     en_model="${EN_MODEL_URL:-https://github.com/explosion/spacy-models/releases/download/en_core_web_md-${EN_MODEL_VERSION}/en_core_web_md-${EN_MODEL_VERSION}-py3-none-any.whl}"; \
     case "${NER_PROFILE}" in \
       base)  pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" ;; \
