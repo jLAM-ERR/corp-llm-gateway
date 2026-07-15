@@ -1,3 +1,15 @@
+# Corp-proxy passthrough for the image builds below (each does `pip install`,
+# reaching PyPI). Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY in the shell (or a
+# project-root `.env`) before `docker compose build`; inert when unset. Runtime
+# for this stack is fully internal (mocks), so no runtime proxy env is wired.
+x-proxy-build-args: &proxy-build-args
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  NO_PROXY: ${NO_PROXY:-}
+  http_proxy: ${HTTP_PROXY:-}
+  https_proxy: ${HTTPS_PROXY:-}
+  no_proxy: ${NO_PROXY:-}
+
 services:
   redis:
     image: redis:7-alpine
@@ -25,6 +37,8 @@ services:
   corp-llm-mock:
     build:
       context: ./docker/corp-llm-mock
+      args:
+        <<: *proxy-build-args
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8000/healthz/live\").status==200 else 1)'"]
       interval: 2s
@@ -34,6 +48,8 @@ services:
   langfuse-mock:
     build:
       context: ./docker/langfuse-mock
+      args:
+        <<: *proxy-build-args
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:3000/api/public/health\").status==200 else 1)'"]
       interval: 2s
@@ -44,6 +60,8 @@ services:
     build:
       context: .
       dockerfile: docker/e2e/Dockerfile
+      args:
+        <<: *proxy-build-args
     depends_on:
       redis:
         condition: service_healthy

@@ -94,6 +94,11 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 `CORP_LLM_CA_BUNDLE` takes precedence over `SSL_VERIFY`. With `CORP_ENV=prod`,
 `SSL_VERIFY=false` raises at startup (F9) — set a CA bundle instead.
 
+Running behind a corporate egress proxy (incl. a re-signing/TLS-intercepting one)
+or an internal PyPI mirror? See [air-gapped.md](air-gapped.md) for the
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, `PIP_INDEX_URL`/`PIP_TRUSTED_HOST`/`PIP_PROXY`,
+`EN_MODEL_URL` build/runtime knobs and the `crt/proxy-ca.crt` proxy-CA convention.
+
 ### corp-LLM auth provider (`auth/factory.py`)
 
 | Key | Purpose | Default | Required |

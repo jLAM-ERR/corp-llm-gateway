@@ -26,6 +26,7 @@ helm/*/charts/
 helm/*/Chart.lock
 
 .env.demo
+.env.pilot
 
 # operator-provided corp CA bundle — never commit real internal PKI material
 crt/*.pem
