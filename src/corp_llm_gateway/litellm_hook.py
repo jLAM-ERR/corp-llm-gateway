@@ -64,8 +64,10 @@ from corp_llm_gateway.sanitizer.content_blocks import (
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.sanitizer.placeholder import (
+    add_unwrapped_response_aliases,
     apply_pairs,
     find_placeholder_literals,
+    find_unwrapped_placeholder_literals,
     placeholder_family,
 )
 from corp_llm_gateway.sanitizer.placeholder_allocator import (
@@ -459,15 +461,20 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # user already typed literally in the input — otherwise the user's literal
         # is reversed to the original, and it can be a sanitizer-probing attempt.
         input_literals: list[str] = []
+        input_unwrapped_literals: set[str] = set()
         for _m in messages:
             if isinstance(_m, dict):
                 for _seg in collect_text(_m.get("content")):
                     input_literals.extend(find_placeholder_literals(_seg))
+                    input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
                 for _seg in collect_tool_call_text(_m):
                     input_literals.extend(find_placeholder_literals(_seg))
+                    input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
         for _prompt_field in ("system", "instructions"):
             for _seg in collect_text(data.get(_prompt_field)):
                 input_literals.extend(find_placeholder_literals(_seg))
+                input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
+        state.response_alias_exclusions = input_unwrapped_literals
         if input_literals:
             allocator.forbid(input_literals)
             logger.warning(
@@ -845,21 +852,23 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 yield chunk
             return
 
+        response_mapping = _response_mapping(state)
         logger.info(
-            "litellm_post_call_stream_desanitize_start request_id=%s pairs=%d",
+            "litellm_post_call_stream_desanitize_start request_id=%s pairs=%d aliases=%d",
             request_id,
             len(state.mapping.pairs),
+            len(response_mapping.pairs) - len(state.mapping.pairs),
         )
         # SSE bytes/str path: Anthropic passthrough emits raw SSE events.
-        sse = SseStreamDesanitizer(state.mapping)
+        sse = SseStreamDesanitizer(response_mapping)
         # Dict path: OpenAI-dict chunks use the classic feed/flush interface.
-        dict_desanitizer = StreamingDesanitizer(state.mapping)
+        dict_desanitizer = StreamingDesanitizer(response_mapping)
         # Dict path: OpenAI tool_calls[].function.arguments deltas (F4), per index.
-        dict_tool_calls = OpenAiToolCallDesanitizer(state.mapping)
+        dict_tool_calls = OpenAiToolCallDesanitizer(response_mapping)
         # Dict path: legacy OpenAI function_call.arguments deltas (singular).
-        dict_function_call = StreamingDesanitizer(state.mapping, escape=_json_string_escape)
+        dict_function_call = StreamingDesanitizer(response_mapping, escape=_json_string_escape)
         # Responses API path: typed Pydantic ``response.*`` events.
-        responses_desanitizer = ResponsesStreamDesanitizer(state.mapping)
+        responses_desanitizer = ResponsesStreamDesanitizer(response_mapping)
         chunk_count = 0
         async for chunk in response:
             chunk_count += 1
@@ -920,12 +929,14 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 "no_state" if state is None else "no_mapping",
             )
             return response
+        response_mapping = _response_mapping(state)
         logger.info(
-            "litellm_post_call_unary_desanitize request_id=%s pairs=%d",
+            "litellm_post_call_unary_desanitize request_id=%s pairs=%d aliases=%d",
             request_id,
             len(state.mapping.pairs),
+            len(response_mapping.pairs) - len(state.mapping.pairs),
         )
-        return _apply_reverse_to_response(response, state.mapping)
+        return _apply_reverse_to_response(response, response_mapping)
 
     async def audit(
         self,
@@ -1291,6 +1302,7 @@ class _RequestState:
         "provider",
         "redaction_count",
         "request_id",
+        "response_alias_exclusions",
         "team_id",
         "user_id",
     )
@@ -1317,11 +1329,22 @@ class _RequestState:
         self.placeholders = placeholders
         self.cache_a_hit = cache_a_hit
         self.mapping = mapping
+        self.response_alias_exclusions: set[str] = set()
         self.error_code: str | None = None
         self.block_reason: str | None = None
         # Resolved profile layer-key (D4) — metadata for the audit trail; set
         # after profile resolution in pre_call. Empty == no profile applied.
         self.profile_ids: tuple[str, ...] = ()
+
+
+def _response_mapping(state: _RequestState) -> StrategyResult:
+    """Mapping used only on model output, including safe bracketless aliases."""
+    return StrategyResult(
+        pairs=add_unwrapped_response_aliases(
+            state.mapping.pairs,
+            forbidden=state.response_alias_exclusions,
+        )
+    )
 
 
 def _extract_headers(data: dict[str, Any]) -> dict[str, str]:
