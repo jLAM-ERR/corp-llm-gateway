@@ -38,6 +38,15 @@ Notes:
   `<!--` (HTML-style for editors that render markdown).
 - Blank lines are ignored.
 - Whitespace around tokens is stripped.
+- Matching is case-insensitive. Lowercase source/replacement pairs preserve the
+  input's case style, so `kdir = companynameabc` maps `KdirService` to
+  `CompanynameabcService` and can be restored exactly.
+- A source made of one word matches at an identifier boundary and may have an
+  identifier suffix. It matches `KdirService`, but does not replace the `kdir`
+  characters inside `mkdir`.
+- Multi-word and punctuation-bearing sources use whole-phrase boundaries.
+- Longer dictionary rules win on overlap, and dictionary spans override
+  overlapping NER/oracle findings.
 
 ## Example file
 
@@ -68,8 +77,8 @@ without traffic loss).
 
 ## Authoring tips
 
-- **Be specific**. `- foo = [BAR]` will replace every `foo` in every
-  request. If `foo` appears legitimately in many contexts, the
+- **Be specific**. `- foo = [BAR]` will replace `foo` case-insensitively at
+  identifier boundaries in every request. If `foo` appears legitimately in many contexts, the
   replacement breaks them.
 - **Order doesn't matter for correctness**, but the engine sorts
   patterns by descending length before replacement (M1-9 invariant)

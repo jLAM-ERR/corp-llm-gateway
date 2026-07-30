@@ -121,9 +121,92 @@ def _sample_selected(seed: str, pct: int) -> bool:
     return int.from_bytes(digest[:8], "big") % 100 < pct
 
 
+@dataclass(frozen=True)
+class _MatchedRule:
+    start: int
+    end: int
+    original: str
+    replacement: str
+
+
+def _rule_pattern(source: str) -> re.Pattern[str]:
+    """Compile the same case-insensitive phrase/identifier semantics as ru-llm-proxy."""
+    escaped = re.escape(source)
+    if re.fullmatch(r"\w+", source, re.UNICODE):
+        # A single word is an identifier prefix: KdirService matches, mkdir does not.
+        expression = rf"(?<![^\W_]){escaped}"
+    else:
+        left = r"(?<!\w)" if source[:1].isalnum() or source.startswith("_") else ""
+        right = r"(?!\w)" if source[-1:].isalnum() or source.endswith("_") else ""
+        expression = f"{left}{escaped}{right}"
+    return re.compile(expression, re.IGNORECASE | re.UNICODE)
+
+
+def _rule_replacement(source: str, replacement: str, original: str) -> str:
+    """Preserve code-friendly case for lowercase deterministic substitutions."""
+    if source != source.casefold() or replacement != replacement.casefold():
+        return replacement
+    if original.isupper():
+        return replacement.upper()
+    if original.istitle():
+        return replacement.title()
+    if original[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def _rule_matches(rules: Rules, text: str) -> tuple[_MatchedRule, ...]:
+    """Return non-overlapping literal-rule matches, longest configured rule first."""
+    selected: list[_MatchedRule] = []
+    occupied: list[tuple[int, int]] = []
+    ordered = sorted(enumerate(rules.rules), key=lambda item: (-len(item[1].pattern), item[0]))
+    for _, rule in ordered:
+        for match in _rule_pattern(rule.pattern).finditer(text):
+            start, end = match.span()
+            if any(start < used_end and end > used_start for used_start, used_end in occupied):
+                continue
+            original = text[start:end]
+            selected.append(
+                _MatchedRule(
+                    start=start,
+                    end=end,
+                    original=original,
+                    replacement=_rule_replacement(rule.pattern, rule.replacement, original),
+                )
+            )
+            occupied.append((start, end))
+    return tuple(sorted(selected, key=lambda item: item.start))
+
+
 def _rules_pairs(rules: Rules, text: str) -> tuple[tuple[str, str], ...]:
-    """Return (pattern, replacement) pairs from rules whose pattern appears in text."""
-    return tuple((r.pattern, r.replacement) for r in rules.rules if r.pattern in text)
+    """Return unique actual-text/replacement pairs for deterministic team rules."""
+    return tuple(
+        dict.fromkeys((match.original, match.replacement) for match in _rule_matches(rules, text))
+    )
+
+
+def _filter_findings_overlapping_rules(
+    findings: list[Finding], rule_matches: tuple[_MatchedRule, ...]
+) -> list[Finding]:
+    return [
+        finding
+        for finding in findings
+        if not any(
+            finding.start < match.end and finding.end > match.start for match in rule_matches
+        )
+    ]
+
+
+def _original_overlaps_rule(
+    text: str, original: str, rule_matches: tuple[_MatchedRule, ...]
+) -> bool:
+    for occurrence in re.finditer(re.escape(original), text):
+        if any(
+            occurrence.start() < match.end and occurrence.end() > match.start
+            for match in rule_matches
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -326,16 +409,20 @@ class SanitizationOrchestrator:
         full-text in `_sanitize_chunked`, so it is not repeated per chunk — H1).
         """
         local_pass = self._chunk_local if chunked else self._local
+        rule_matches = _rule_matches(rules, text)
+        rules_pairs = tuple(
+            dict.fromkeys((match.original, match.replacement) for match in rule_matches)
+        )
         if self._gazetteer is not None:
             # DP-4 + F3: run gazetteer + local first. The oracle is CONDITIONAL — a
             # gazetteer hit always runs it; CORP_LLM_ORACLE_TRIGGER may widen the
             # no-hit case (any_local_finding | sampled:<pct> | always).
             gaz_findings = await self._gazetteer.detect(text)
             local_findings = await local_pass.findings(text) if local_pass is not None else []
-            combined = _deduplicate(local_findings + gaz_findings)
+            combined = _filter_findings_overlapping_rules(
+                _deduplicate(local_findings + gaz_findings), rule_matches
+            )
             # Rules are top-priority: computed once, applied in both sub-branches.
-            rules_pairs = _rules_pairs(rules, text)
-            rule_origins = {o for o, _ in rules_pairs}
             oracle_runs = self._oracle_should_run(
                 gaz_findings=gaz_findings,
                 local_findings=local_findings,
@@ -366,8 +453,12 @@ class SanitizationOrchestrator:
                     conversation_id,
                     len(oracle_result.pairs),
                 )
-                # Exclude oracle pairs whose origin a rule already covers; rules go first.
-                oracle_kept = tuple((o, p) for o, p in oracle_result.pairs if o not in rule_origins)
+                # Exclude every oracle span overlapping a deterministic rule.
+                oracle_kept = tuple(
+                    (original, replacement)
+                    for original, replacement in oracle_result.pairs
+                    if not _original_overlaps_rule(text, original, rule_matches)
+                )
                 merged_pairs = _merge_local(rules_pairs + oracle_kept, combined)
                 _emit_gazetteer_proposal(oracle_result.pairs, combined, team_id, conversation_id)
             else:
@@ -385,9 +476,9 @@ class SanitizationOrchestrator:
 
         elif local_pass is not None:
             if self._oracle_enabled:
-                # DP-3 path: oracle always on, local merged additively. Rules reach
-                # the pairs via the oracle round-trip (system prompt lists them,
-                # the oracle tool-calls them back) — unchanged call sequence.
+                # DP-3 path: oracle always on. Rules are applied directly (decision 3)
+                # rather than only via the oracle round-trip, so deterministic rule
+                # application never depends on the oracle honoring the system prompt.
                 logger.info(
                     "sanitize_branch=local_pass oracle=yes team_id=%s conversation_id=%s",
                     team_id,
@@ -406,13 +497,18 @@ class SanitizationOrchestrator:
                     len(oracle_result.pairs),
                 )
                 local_findings = await local_pass.findings(text)
-                base_pairs = oracle_result.pairs
+                oracle_kept = tuple(
+                    (original, replacement)
+                    for original, replacement in oracle_result.pairs
+                    if not _original_overlaps_rule(text, original, rule_matches)
+                )
+                local_kept = _filter_findings_overlapping_rules(local_findings, rule_matches)
+                base_pairs = rules_pairs + oracle_kept
+                merged_pairs = _merge_local(base_pairs, local_kept)
             else:
-                # Oracle disabled: rules no longer arrive via the oracle round-trip —
-                # apply replace.md rules directly, same precedence as the gazetteer
-                # branch's oracle-skipped case (rules are the base; local findings
-                # merge in after, per _merge_local's dedup-by-origin rules).
-                rules_pairs = _rules_pairs(rules, text)
+                # Oracle disabled: same direct rule application as the enabled arm
+                # above, just without an oracle round-trip to merge on top — rule
+                # handling is now uniform across oracle-on/oracle-off.
                 local_findings = await local_pass.findings(text)
                 logger.info(
                     "sanitize_branch=local_pass oracle=disabled team_id=%s conversation_id=%s "
@@ -421,8 +517,9 @@ class SanitizationOrchestrator:
                     conversation_id,
                     len(rules_pairs),
                 )
+                local_kept = _filter_findings_overlapping_rules(local_findings, rule_matches)
                 base_pairs = rules_pairs
-            merged_pairs = _merge_local(base_pairs, local_findings)
+                merged_pairs = _merge_local(base_pairs, local_kept)
             logger.info(
                 "sanitize_local_pass team_id=%s conversation_id=%s "
                 "oracle_pairs=%d local_findings=%d merged_pairs=%d",
@@ -453,13 +550,19 @@ class SanitizationOrchestrator:
                 team_id,
                 conversation_id,
             )
-            result = await self._call_corp_llm(text, rules)
+            oracle_result = await self._call_corp_llm(text, rules)
             logger.info(
                 "sanitize_corp_llm_call_done team_id=%s conversation_id=%s pairs=%d",
                 team_id,
                 conversation_id,
-                len(result.pairs),
+                len(oracle_result.pairs),
             )
+            oracle_kept = tuple(
+                (original, replacement)
+                for original, replacement in oracle_result.pairs
+                if not _original_overlaps_rule(text, original, rule_matches)
+            )
+            result = StrategyResult(pairs=rules_pairs + oracle_kept)
 
         if self._allowlist is not None:
             result = StrategyResult(pairs=self._allowlist.filter_pairs(result.pairs))
@@ -659,10 +762,19 @@ class SanitizationOrchestrator:
         if self._local is not None:
             local_findings = await self._local.findings(text)
             findings.extend(local_findings)
-        rules_pairs = _rules_pairs(rules, text)
-        for pattern, _ in rules_pairs:
+        rule_matches = _rule_matches(rules, text)
+        rules_pairs = tuple(
+            dict.fromkeys((match.original, match.replacement) for match in rule_matches)
+        )
+        for match in rule_matches:
             findings.append(
-                Finding(text=pattern, label="RULE", start=0, end=len(pattern), score=1.0)
+                Finding(
+                    text=match.original,
+                    label="RULE",
+                    start=match.start,
+                    end=match.end,
+                    score=1.0,
+                )
             )
         # M2: mirror the normal path's conditional oracle so an oracle-only finding
         # (no regex/local/gazetteer/rule hit) also blocks a deliver-flag egress.
