@@ -1,0 +1,15 @@
+# Overlay for docker-compose.demo.yml. It keeps the existing sanitization
+# helper (CORP_LLM_ENDPOINT) but sends the sanitized request to the ChatGPT
+# Codex subscription endpoint using the OAuth headers supplied by Codex.
+
+services:
+  litellm:
+    build:
+      context: .
+      dockerfile: docker/chatgpt-codex/Dockerfile
+    image: corp-llm-gateway-chatgpt-codex:local
+    volumes:
+      - ./docker/chatgpt-codex/litellm-config.yaml:/etc/litellm/config.yaml:ro
+    environment:
+      CORP_LLM_FORWARD_CHATGPT_AUTH: "1"
+      CHATGPT_CODEX_API_BASE: ${CHATGPT_CODEX_API_BASE:-https://chatgpt.com/backend-api/codex}

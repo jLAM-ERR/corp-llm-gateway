@@ -72,7 +72,9 @@ services:
       #    bundle (certifi public roots + the corporate CA chain IF present) and
       #    SSL_CERT_FILE points at it. When the bundle is absent the demo falls
       #    back to public roots only (enough for the mock + public providers).
-      CORP_LLM_CA_BUNDLE: /etc/corp-llm-gateway/crt/corp-ca-bundle.pem
+      # The command below always creates this combined bundle from certifi and
+      # appends the optional corporate CA when it is mounted.
+      CORP_LLM_CA_BUNDLE: /tmp/corp-ca-bundle.pem
       SSL_CERT_FILE: /tmp/corp-ca-bundle.pem
       # NOTE: do NOT enable LITELLM_MASTER_KEY / UI auth here. Once it's
       # set, litellm intercepts the Authorization header on every API

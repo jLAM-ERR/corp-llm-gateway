@@ -221,6 +221,7 @@ def build_guardrail(
     sink: Sink | None = None,
     max_output_tokens_cap: int | None = None,
     strip_inbound_headers_to_upstream: bool = False,
+    forward_chatgpt_auth: bool = False,
 ) -> CorpLlmGuardrail:
     """Assemble a `CorpLlmGuardrail` from config, with optional dep overrides.
 
@@ -256,6 +257,7 @@ def build_guardrail(
         audit_logger,
         max_output_tokens_cap=max_output_tokens_cap,
         strip_inbound_headers_to_upstream=strip_inbound_headers_to_upstream,
+        forward_chatgpt_auth=forward_chatgpt_auth,
         dlp_guard=dlp_guard if dlp_guard is not None else _build_dlp_guard(),
         metrics=get_exporter(),
     )

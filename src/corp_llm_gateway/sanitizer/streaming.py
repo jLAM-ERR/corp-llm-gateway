@@ -4,7 +4,9 @@ import codecs
 import json
 import re
 from collections.abc import AsyncIterable, AsyncIterator, Callable
+from typing import Any
 
+from corp_llm_gateway.sanitizer.content_blocks import desanitize_responses_payload
 from corp_llm_gateway.sanitizer.placeholder import sort_placeholders_by_descending_length
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
 
@@ -107,6 +109,182 @@ class OpenAiToolCallDesanitizer:
                 out.append((idx, tail))
         self._by_index.clear()
         return out
+
+
+_RESPONSES_DELTA_EVENTS: dict[str, tuple[str, bool]] = {
+    "response.output_text.delta": ("delta", False),
+    "response.reasoning_summary_text.delta": ("delta", False),
+    "response.reasoning_text.delta": ("delta", False),
+    "response.refusal.delta": ("delta", False),
+    "response.function_call_arguments.delta": ("delta", True),
+    "response.custom_tool_call_input.delta": ("delta", True),
+}
+_RESPONSES_DONE_EVENTS: dict[str, tuple[str, str]] = {
+    "response.output_text.done": ("text", "response.output_text.delta"),
+    "response.reasoning_summary_text.done": (
+        "text",
+        "response.reasoning_summary_text.delta",
+    ),
+    "response.reasoning_text.done": ("text", "response.reasoning_text.delta"),
+    "response.refusal.done": ("refusal", "response.refusal.delta"),
+    "response.function_call_arguments.done": (
+        "arguments",
+        "response.function_call_arguments.delta",
+    ),
+    "response.custom_tool_call_input.done": (
+        "input",
+        "response.custom_tool_call_input.delta",
+    ),
+}
+_RESPONSES_EVENT_ID_FIELDS = (
+    "item_id",
+    "output_index",
+    "content_index",
+    "summary_index",
+    "sequence_number",
+)
+
+
+class ResponsesStreamDesanitizer:
+    """De-sanitize typed OpenAI Responses API stream events.
+
+    LiteLLM yields Pydantic event objects for ``/v1/responses``. Text and tool
+    arguments can split a placeholder over several ``*.delta`` events, so each
+    logical output field gets its own hold-back buffer. Synthetic tail events
+    are emitted as JSON strings; LiteLLM's proxy serializer wraps them in SSE.
+    """
+
+    def __init__(self, mapping: StrategyResult) -> None:
+        self._mapping = mapping
+        by_placeholder = {placeholder: original for original, placeholder in mapping.pairs}
+        self._placeholders = tuple(sort_placeholders_by_descending_length(by_placeholder))
+        self._by_placeholder = by_placeholder
+        self._streams: dict[tuple[Any, ...], StreamingDesanitizer] = {}
+        self._metadata: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+    def feed(self, chunk: Any) -> list[Any]:
+        payload = _responses_event_payload(chunk)
+        if payload is None:
+            return [chunk]
+        event_type = payload.get("type")
+        if not isinstance(event_type, str):
+            return [chunk]
+
+        delta_spec = _RESPONSES_DELTA_EVENTS.get(event_type)
+        if delta_spec is not None:
+            field, json_escape = delta_spec
+            value = payload.get(field)
+            if not isinstance(value, str):
+                return [chunk]
+            key = self._stream_key(event_type, payload)
+            stream = self._streams.get(key)
+            if stream is None:
+                stream = StreamingDesanitizer(
+                    self._mapping,
+                    escape=_json_string_escape if json_escape else None,
+                )
+                self._streams[key] = stream
+                self._metadata[key] = self._event_metadata(payload)
+            rewritten = stream.feed(value)
+            if not rewritten:
+                return []
+            return [_restore_responses_event(chunk, {**payload, field: rewritten})]
+
+        done_spec = _RESPONSES_DONE_EVENTS.get(event_type)
+        if done_spec is not None:
+            field, delta_type = done_spec
+            out: list[Any] = []
+            key = self._stream_key(delta_type, payload)
+            stream = self._streams.pop(key, None)
+            metadata = self._metadata.pop(key, self._event_metadata(payload))
+            if stream is not None:
+                tail = stream.flush()
+                if tail:
+                    out.append(
+                        json.dumps(
+                            {"type": delta_type, **metadata, "delta": tail},
+                            ensure_ascii=False,
+                        )
+                    )
+            rewritten = desanitize_responses_payload(payload, self._reverse)
+            out.append(_restore_responses_event(chunk, rewritten))
+            return out
+
+        # ``response.completed`` and ``response.output_item.done`` duplicate the
+        # assembled output. Rewrite their nested text too so clients that consume
+        # only terminal events never see placeholders.
+        if event_type in {
+            "response.completed",
+            "response.incomplete",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.content_part.added",
+            "response.content_part.done",
+        }:
+            rewritten = desanitize_responses_payload(payload, self._reverse)
+            return [_restore_responses_event(chunk, rewritten)]
+        return [chunk]
+
+    def flush(self) -> list[str]:
+        out: list[str] = []
+        for key, stream in list(self._streams.items()):
+            tail = stream.flush()
+            if tail:
+                event_type = str(key[0])
+                out.append(
+                    json.dumps(
+                        {
+                            "type": event_type,
+                            **self._metadata.get(key, {}),
+                            "delta": tail,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+        self._streams.clear()
+        self._metadata.clear()
+        return out
+
+    def _reverse(self, text: str) -> str:
+        for placeholder in self._placeholders:
+            text = text.replace(placeholder, self._by_placeholder[placeholder])
+        return text
+
+    @staticmethod
+    def _event_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+        return {field: payload[field] for field in _RESPONSES_EVENT_ID_FIELDS if field in payload}
+
+    @staticmethod
+    def _stream_key(event_type: str, payload: dict[str, Any]) -> tuple[Any, ...]:
+        return (event_type, *(payload.get(field) for field in _RESPONSES_EVENT_ID_FIELDS[:-1]))
+
+
+def _responses_event_payload(chunk: Any) -> dict[str, Any] | None:
+    if isinstance(chunk, dict):
+        return dict(chunk)
+    model_dump = getattr(chunk, "model_dump", None)
+    if callable(model_dump):
+        try:
+            payload = model_dump(mode="python", exclude_none=False)
+        except TypeError:
+            payload = model_dump(exclude_none=False)
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _restore_responses_event(original: Any, payload: dict[str, Any]) -> Any:
+    if isinstance(original, dict):
+        return payload
+    validator = getattr(type(original), "model_validate", None)
+    if callable(validator):
+        try:
+            return validator(payload)
+        except Exception:
+            pass
+    copier = getattr(original, "model_copy", None)
+    if callable(copier):
+        return copier(update=payload, deep=True)
+    return payload
 
 
 class SseStreamDesanitizer:
@@ -342,11 +520,11 @@ class SseStreamDesanitizer:
                         for tc in delta["tool_calls"]:
                             fn = tc.get("function") if isinstance(tc, dict) else None
                             if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-                                idx = coerce_tool_index(tc.get("index", 0))
-                                if idx is None:
+                                tool_idx = coerce_tool_index(tc.get("index", 0))
+                                if tool_idx is None:
                                     new_calls.append(tc)
                                     continue
-                                rewritten = self._openai_tool_calls.feed(idx, fn["arguments"])
+                                rewritten = self._openai_tool_calls.feed(tool_idx, fn["arguments"])
                                 new_calls.append({**tc, "function": {**fn, "arguments": rewritten}})
                             else:
                                 new_calls.append(tc)
@@ -425,7 +603,7 @@ def _boundary_from(event_text: str) -> str:
     return m.group(0) if m else "\n\n"
 
 
-def _rebuild_event(original_event: str, new_obj: dict, boundary: str) -> str:
+def _rebuild_event(original_event: str, new_obj: dict[str, Any], boundary: str) -> str:
     """Reconstruct an SSE event preserving any ``event:`` line, rewriting ``data:``."""
     lines = original_event.rstrip("\r\n").splitlines()
     out_lines: list[str] = []
