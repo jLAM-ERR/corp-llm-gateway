@@ -492,6 +492,69 @@ async def test_rule_wins_over_local_finding_in_gazetteer_nohit() -> None:
     assert not any("PERSON" in p for _, p in result.pairs)
 
 
+async def test_rules_match_case_insensitively_and_preserve_identifier_case() -> None:
+    rules = Rules(
+        rules=(
+            Rule("kdir", "companynameabc"),
+            Rule("betadirect", "companynameabd"),
+            Rule("beta direct", "company name abe"),
+            Rule("zephyr ledger", "confidential project acn"),
+        )
+    )
+    client, captured = _client_returning_pairs([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        gazetteer=Gazetteer({}),
+    )
+
+    result = await orch.sanitize(
+        "mkdir -p KdirService1; BetadirectClient; beta direct; Zephyr Ledger zephyr leDger",
+        team_id="t1",
+        conversation_id="c1",
+    )
+
+    assert len(captured) == 0
+    assert result.sanitized_text == (
+        "mkdir -p CompanynameabcService1; CompanynameabdClient; company name abe; "
+        "Confidential Project Acn confidential project acn"
+    )
+    assert "mkdir" in result.sanitized_text
+    assert "companynameabc" not in result.sanitized_text.split(" ", 1)[0]
+
+
+async def test_rule_spans_win_over_overlapping_local_findings() -> None:
+    text = "Betadirect работает в Zephyr Ledger"
+    rules = Rules(
+        rules=(
+            Rule("betadirect", "companynameabd"),
+            Rule("zephyr ledger", "confidential project acn"),
+        )
+    )
+    local_findings = [
+        Finding("Betadirect работает в", "ORG", 0, len("Betadirect работает в"), 0.99),
+        Finding("Zephyr", "LOCATION", text.index("Zephyr"), text.index("Zephyr") + 6, 0.99),
+    ]
+    client, captured = _client_returning_pairs([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        gazetteer=Gazetteer({}),
+        local_detectors=[_StaticFindingDetector(local_findings)],
+    )
+
+    result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+
+    assert len(captured) == 0
+    assert result.sanitized_text == "Companynameabd работает в Confidential Project Acn"
+    assert result.pairs == (
+        ("Betadirect", "Companynameabd"),
+        ("Zephyr Ledger", "Confidential Project Acn"),
+    )
+
+
 async def test_rules_bijection_holds_in_gazetteer_nohit() -> None:
     """Multiple rules in no-hit branch: unique originals + unique placeholders."""
     gaz = Gazetteer({})
