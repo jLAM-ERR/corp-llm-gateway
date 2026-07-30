@@ -2,6 +2,8 @@ import re
 from collections.abc import Iterable
 
 _PLACEHOLDER_FIND_RE = re.compile(r"\[[A-Z][A-Z0-9_]*_\d{3,}\]")
+_UNWRAPPED_PLACEHOLDER_FIND_RE = re.compile(r"(?<!\[)\b[A-Z][A-Z0-9_]*_[A-Z0-9_]+\b(?!\])")
+_RESPONSE_ALIAS_RE = re.compile(r"^\[(?P<alias>[A-Z][A-Z0-9_]*_[A-Z0-9_]+)\]$")
 
 
 def find_placeholder_literals(text: str) -> list[str]:
@@ -9,6 +11,46 @@ def find_placeholder_literals(text: str) -> list[str]:
     (e.g. a user who typed '[EMAIL_001]' in their prompt). Used to forbid
     a real redaction from reusing a token the user typed verbatim."""
     return _PLACEHOLDER_FIND_RE.findall(text)
+
+
+def find_unwrapped_placeholder_literals(text: str) -> list[str]:
+    """Bare placeholder-like tokens already present in request input.
+
+    Models commonly remove square brackets from generated placeholders when
+    placing them inside code identifiers or file names. Existing bare tokens
+    are tracked so reverse aliases never rewrite a user-supplied literal.
+    """
+    return _UNWRAPPED_PLACEHOLDER_FIND_RE.findall(text)
+
+
+def add_unwrapped_response_aliases(
+    pairs: Iterable[tuple[str, str]],
+    *,
+    forbidden: Iterable[str] = (),
+) -> tuple[tuple[str, str], ...]:
+    """Add response-only aliases for bracket-stripped placeholders.
+
+    ``[LOCATION_007]`` is not a valid identifier, so a model may emit
+    ``LOCATION_007`` in a class or file name. The alias lets the reverse pass
+    restore that mutation while preserving explicit mappings and any bare
+    token that was already present in the request.
+    """
+    original_pairs = tuple(pairs)
+    blocked = set(forbidden)
+    claimed = {placeholder: original for original, placeholder in original_pairs}
+    expanded = list(original_pairs)
+
+    for original, placeholder in original_pairs:
+        match = _RESPONSE_ALIAS_RE.fullmatch(placeholder)
+        if match is None:
+            continue
+        alias = match.group("alias")
+        if alias == original or alias in blocked or alias in claimed:
+            continue
+        expanded.append((original, alias))
+        claimed[alias] = original
+
+    return tuple(expanded)
 
 
 def sort_placeholders_by_descending_length(placeholders: Iterable[str]) -> list[str]:

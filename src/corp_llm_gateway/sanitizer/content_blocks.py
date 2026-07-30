@@ -526,6 +526,7 @@ _RESPONSES_TEXT_FIELDS = frozenset(
         "arguments",
         "content",
         "delta",
+        "input",
         "output",
         "reasoning",
         "refusal",

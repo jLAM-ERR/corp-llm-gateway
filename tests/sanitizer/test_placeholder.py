@@ -1,6 +1,8 @@
 from corp_llm_gateway.sanitizer.placeholder import (
+    add_unwrapped_response_aliases,
     apply_pairs,
     find_placeholder_literals,
+    find_unwrapped_placeholder_literals,
     sort_placeholders_by_descending_length,
 )
 
@@ -54,3 +56,40 @@ def test_find_placeholder_literals_multiple_real_tokens() -> None:
     assert "[EMAIL_001]" in result
     assert "[API_KEY_002]" in result
     assert len(result) == 2
+
+
+def test_find_unwrapped_placeholder_literals_ignores_bracketed_tokens() -> None:
+    text = "LOCATION_007 [LOCATION_008] PARTNER_CODENAME and ordinary words"
+    assert find_unwrapped_placeholder_literals(text) == [
+        "LOCATION_007",
+        "PARTNER_CODENAME",
+    ]
+
+
+def test_add_unwrapped_response_aliases_for_code_identifiers() -> None:
+    pairs = add_unwrapped_response_aliases([("KdirCorpCalculatorService", "[LOCATION_007]")])
+    assert pairs == (
+        ("KdirCorpCalculatorService", "[LOCATION_007]"),
+        ("KdirCorpCalculatorService", "LOCATION_007"),
+    )
+
+
+def test_add_unwrapped_response_aliases_preserves_input_literal() -> None:
+    pairs = add_unwrapped_response_aliases(
+        [("KdirCorpCalculatorService", "[LOCATION_007]")],
+        forbidden={"LOCATION_007"},
+    )
+    assert pairs == (("KdirCorpCalculatorService", "[LOCATION_007]"),)
+
+
+def test_add_unwrapped_response_aliases_does_not_override_explicit_mapping() -> None:
+    pairs = add_unwrapped_response_aliases(
+        [
+            ("KdirCorpCalculatorService", "[LOCATION_007]"),
+            ("literal", "LOCATION_007"),
+        ]
+    )
+    assert pairs == (
+        ("KdirCorpCalculatorService", "[LOCATION_007]"),
+        ("literal", "LOCATION_007"),
+    )
