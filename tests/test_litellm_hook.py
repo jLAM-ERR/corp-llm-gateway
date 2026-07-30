@@ -850,6 +850,128 @@ async def test_post_call_stream_responses_events_restore_split_placeholder() -> 
     )
 
 
+async def test_post_call_stream_responses_restores_bracket_stripped_identifier() -> None:
+    """Models drop placeholder brackets when generating identifiers and paths."""
+    original = "KdirCorpCalculatorService"
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")])
+    data = {
+        "model": "gpt-5.6-luna",
+        "input": f"Create class {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+    events = [
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Create class LOCA",
+        },
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "TION_007",
+        },
+        {
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "Create class LOCATION_007",
+        },
+        {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "tool_1",
+            "output_index": 1,
+            "delta": "*** Add File: LOCATION_",
+        },
+        {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "tool_1",
+            "output_index": 1,
+            "delta": "007.cs",
+        },
+        {
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "tool_1",
+            "output_index": 1,
+            "input": "*** Add File: LOCATION_007.cs",
+        },
+    ]
+
+    out: list[Any] = []
+    async for chunk in g.post_call_stream(data, _async_iter(events)):
+        out.append(json.loads(chunk) if isinstance(chunk, str) else chunk)
+
+    text_deltas = "".join(
+        event["delta"] for event in out if event["type"] == "response.output_text.delta"
+    )
+    tool_deltas = "".join(
+        event["delta"] for event in out if event["type"] == "response.custom_tool_call_input.delta"
+    )
+    assert text_deltas == f"Create class {original}"
+    assert tool_deltas == f"*** Add File: {original}.cs"
+    assert (
+        next(event for event in out if event["type"] == "response.output_text.done")["text"]
+        == f"Create class {original}"
+    )
+    assert (
+        next(event for event in out if event["type"] == "response.custom_tool_call_input.done")[
+            "input"
+        ]
+        == f"*** Add File: {original}.cs"
+    )
+
+
+async def test_post_call_unary_restores_bracket_stripped_identifier() -> None:
+    original = "KdirCorpCalculatorService"
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")])
+    data = {
+        "model": "gpt-5.6-luna",
+        "input": f"Create class {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+    response = {
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Created LOCATION_007"}],
+            },
+            {
+                "type": "custom_tool_call",
+                "input": "*** Add File: LOCATION_007.cs",
+            },
+        ]
+    }
+
+    out = await g.post_call_unary(data, response)
+
+    assert out["output"][0]["content"][0]["text"] == f"Created {original}"
+    assert out["output"][1]["input"] == f"*** Add File: {original}.cs"
+
+
+async def test_post_call_does_not_restore_user_supplied_bare_placeholder() -> None:
+    original = "KdirCorpCalculatorService"
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")])
+    data = {
+        "model": "gpt-5.6-luna",
+        "input": f"Keep literal LOCATION_007 and create {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+
+    out = await g.post_call_unary(
+        data,
+        {"output": [{"type": "message", "content": [{"text": "LOCATION_007"}]}]},
+    )
+
+    assert out["output"][0]["content"][0]["text"] == "LOCATION_007"
+
+
 async def test_post_call_stream_anthropic_sse_bytes_placeholder_restored() -> None:
     """Anthropic SSE bytes: placeholder split across deltas is restored, framing intact."""
     g, _ = _build_guardrail([("user@example.com", "[EMAIL_001]")])
