@@ -258,7 +258,7 @@ Ongoing operations after install — incident playbook, fail-policy matrix, scal
 
 Each team maintains a `replace.md` file at `<rules-dir>/<team_id>.md`. These rules run **first** in the local cascade and **override** auto-detection — a term listed here is always replaced, regardless of what the detectors find.
 
-Format — one rule per line, separator `=` (the legacy `→` U+2192 is still accepted); rules apply longest-first (invariant #5). Quote any value containing `=`:
+Format — one rule per line, separator `=` (the legacy `→` U+2192 is still accepted); rules apply case-insensitively and longest-first (invariant #5). A single-word source also matches an identifier prefix (`kdir` → `KdirService`) but not the middle of an unrelated word (`mkdir`). Deterministic rule spans override overlapping NER/oracle findings. Quote any value containing `=`:
 
 ```markdown
 - `Project Polaris` = `[CONFIDENTIAL_PROJECT]`
