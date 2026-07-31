@@ -747,6 +747,85 @@ async def test_pre_call_strips_corp_token_from_headers() -> None:
     assert out["headers"]["Authorization"] == "Bearer byok"
 
 
+# ---- defects #3/#4: header declassification + corp-token strip completeness --
+
+
+async def test_pre_call_secret_fields_raw_headers_not_declassified_into_data_headers() -> None:
+    """secret_fields.raw_headers carries credentials litellm deliberately keeps
+    out of logs and upstream request snapshots (Cookie, X-Internal-Credential).
+    The auth-header merge that reads it must not leak those into data["headers"],
+    which litellm DOES forward and log (defect #3)."""
+    g, _ = _build_guardrail()
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hi"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+        "secret_fields": {
+            "raw_headers": {
+                "X-Corp-Auth": "tok-1",
+                "Cookie": "session=secret",
+                "X-Internal-Credential": "cred",
+            }
+        },
+    }
+    out = await g.pre_call(data)
+    assert "Cookie" not in out["headers"], "secret_fields.raw_headers declassified"
+    assert "X-Internal-Credential" not in out["headers"]
+    assert out["headers"]["Authorization"] == "Bearer byok"
+
+
+async def test_pre_call_strips_corp_token_from_litellm_params_proxy_server_request() -> None:
+    """`_extract_auth_headers` reads litellm_params.proxy_server_request.headers
+    for auth, so the strip must cover it too, or the corp token authenticates the
+    request and then survives into the dict litellm hands to log callbacks
+    (defect #4, invariant 4)."""
+    g, _ = _build_guardrail()
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hi"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+        "litellm_params": {
+            "proxy_server_request": {
+                "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"}
+            }
+        },
+    }
+    out = await g.pre_call(data)
+    proxy_headers = out["litellm_params"]["proxy_server_request"]["headers"]
+    assert "X-Corp-Auth" not in proxy_headers
+    assert proxy_headers["Authorization"] == "Bearer byok"
+
+
+def test_extract_headers_write_path_matches_release_semantics() -> None:
+    """The WRITE-path `_extract_headers` (data["headers"] at pre_call ~:312) must
+    stay byte-identical to release/1.0.x: first non-empty of data["headers"] then
+    proxy_server_request, unwrapping a nested "headers" key — no merge across
+    buckets. Verified against `git show release/1.0.x:src/corp_llm_gateway/litellm_hook.py`."""
+    from corp_llm_gateway.litellm_hook import _extract_headers
+
+    # data["headers"] wins even when other buckets carry MORE headers -- no merge.
+    assert _extract_headers(
+        {
+            "headers": {"Authorization": "Bearer byok"},
+            "proxy_server_request": {"headers": {"Cookie": "session=secret"}},
+            "secret_fields": {"raw_headers": {"X-Internal-Credential": "cred"}},
+        }
+    ) == {"Authorization": "Bearer byok"}
+
+    # data["headers"] empty/missing falls back to proxy_server_request, unwrapping
+    # its own nested "headers" key.
+    assert _extract_headers(
+        {"proxy_server_request": {"headers": {"Authorization": "Bearer byok"}}}
+    ) == {"Authorization": "Bearer byok"}
+
+    # proxy_server_request without a nested "headers" key IS the header dict itself.
+    assert _extract_headers({"proxy_server_request": {"Authorization": "Bearer byok"}}) == {
+        "Authorization": "Bearer byok"
+    }
+
+    assert _extract_headers({}) == {}
+
+
 async def test_pre_call_replaces_message_content_with_sanitized() -> None:
     g, _ = _build_guardrail([("alice", "[NAME_001]")])
     data = _data_with_token("tok-1", content="hello alice")

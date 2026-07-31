@@ -278,7 +278,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 )
                 data["max_tokens"] = self._max_output_tokens_cap
 
-        inbound_headers = _extract_headers(data)
+        inbound_headers = _extract_auth_headers(data)
         try:
             ctx = await self._auth.authenticate_headers(inbound_headers)
         except MissingTokenError:
@@ -1286,12 +1286,14 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
 
     Covers ``data["headers"]`` plus the ``headers`` sub-dict of
     proxy_server_request / metadata / litellm_metadata (locations litellm forwards
-    upstream), AND ``litellm_params["metadata"]["headers"]``. That last one is
+    upstream), AND ``litellm_params["metadata"]["headers"]`` /
+    ``litellm_params["proxy_server_request"]["headers"]``. The former is
     litellm's logging-metadata dict — the same dict ``_scatter`` threads the
     request id through and litellm hands to log callbacks — so a corp token
     mirrored there would reach the audit/logging pipeline, which invariant 4
-    forbids. ``_drop_corp_token`` only removes ``x-corp-auth``; the developer's
-    BYOK ``Authorization`` header is left untouched (invariant 3).
+    forbids. The rule: every bucket ``_extract_auth_headers`` reads for auth must
+    be strippable here too. ``_drop_corp_token`` only removes ``x-corp-auth``;
+    the developer's BYOK ``Authorization`` header is left untouched (invariant 3).
     """
     _drop_corp_token(data.get("headers"))
     for bucket_key in ("proxy_server_request", "metadata", "litellm_metadata"):
@@ -1303,6 +1305,9 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
         meta = lparams.get("metadata")
         if isinstance(meta, dict):
             _drop_corp_token(meta.get("headers"))
+        proxy_request = lparams.get("proxy_server_request")
+        if isinstance(proxy_request, dict):
+            _drop_corp_token(proxy_request.get("headers"))
     secret_fields = data.get("secret_fields")
     if isinstance(secret_fields, dict):
         _drop_corp_token(secret_fields.get("raw_headers"))
@@ -1428,13 +1433,37 @@ def _response_mapping(state: _RequestState) -> StrategyResult:
 
 
 def _extract_headers(data: dict[str, Any]) -> dict[str, str]:
-    """Merge the header copies LiteLLM exposes to callbacks.
+    """Byte-identical to release/1.0.x's ``_extract_headers`` — the WRITE path.
+
+    Used ONLY to compute what gets written back to ``data["headers"]``
+    (litellm forwards/logs that bucket). An allowlist projection here would
+    risk dropping BYOK ``Authorization`` (invariant 3), ``anthropic-version``,
+    or whatever ``_drop_wire_headers`` deliberately preserves, so this stays
+    exactly release's "first non-empty bucket" logic rather than the merge
+    ``_extract_auth_headers`` below does for auth resolution.
+    """
+    raw = data.get("headers") or data.get("proxy_server_request") or {}
+    if isinstance(raw, dict):
+        if "headers" in raw and isinstance(raw["headers"], dict):
+            return {str(k): str(v) for k, v in raw["headers"].items()}
+        return {str(k): str(v) for k, v in raw.items()}
+    return {}
+
+
+def _extract_auth_headers(data: dict[str, Any]) -> dict[str, str]:
+    """Merge the header copies LiteLLM exposes to callbacks, for AUTH ONLY.
 
     Recent LiteLLM releases keep proxy credentials in ``data["headers"]`` but
     retain the client Authorization header under ``proxy_server_request`` or
     logging metadata. Reading only the first non-empty bucket loses OAuth. The
     merge is case-insensitive so a later, more complete wire-request copy
     replaces an earlier normalized copy instead of creating duplicate headers.
+
+    Used ONLY by ``authenticate_headers`` and ``_chatgpt_upstream_headers`` —
+    NEVER for the ``data["headers"]`` write path (see ``_extract_headers``
+    above), because litellm deliberately excludes some of these buckets
+    (``secret_fields.raw_headers``) from logs and upstream request snapshots;
+    writing the merge back there would declassify them.
     """
     buckets: list[Any] = [data.get("headers")]
     for key in ("metadata", "litellm_metadata", "proxy_server_request"):
