@@ -1925,7 +1925,7 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
                 # dict, which never carries pydantic private attrs litellm
                 # relies on — `_hidden_params` (cost tracking), and the sibling
                 # `_response_headers`/`_response_ms` (x-litellm-* headers,
-                # litellm/types/utils.py:2057-2059) — model_dump omits all
+                # litellm/types/utils.py:1989-1991 in pinned 1.94.1) — model_dump omits all
                 # three (confirmed against the real litellm.ModelResponse).
                 # model_copy() (the other branch below) doesn't have this
                 # problem — it copies the existing instance instead of
