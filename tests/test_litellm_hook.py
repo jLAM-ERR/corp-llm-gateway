@@ -3839,6 +3839,26 @@ async def test_pre_call_oversize_document_source_data_repro_blocked() -> None:
     assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
 
 
+async def test_pre_call_oversize_unmanaged_input_fails_closed_before_scanning() -> None:
+    """Round-4 IMPORTANT 6: the unmanaged (embeddings/etc.) DLP/Stage-0 scan
+    joined and regex-scanned the WHOLE input with no size gate — the same
+    threshold policy the managed (messages) path enforces via sanitize_one
+    must also apply here, blocking BEFORE the expensive scan runs."""
+    from corp_llm_gateway.payload import DEFAULT_THRESHOLD_BYTES
+
+    padding = "x" * (DEFAULT_THRESHOLD_BYTES + 1)
+    g, _ = _build_guardrail()
+    data = {
+        "model": "text-embedding-3-small",
+        "input": padding,
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data, call_type="embedding")
+    assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+
+
 async def test_pre_call_oversize_message_chunk_policy_sanitizes() -> None:
     """chunk policy at the hook level: an oversize leaf's email is redacted, not leaked."""
     email = "chunky@corp.example"

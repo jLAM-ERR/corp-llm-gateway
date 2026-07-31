@@ -38,7 +38,7 @@ from corp_llm_gateway.corp_llm import CorpLlmHttpError
 from corp_llm_gateway.detectors import NerUnavailableError
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.payload.classifier import classify_block
-from corp_llm_gateway.payload.size_threshold import OversizeContentError
+from corp_llm_gateway.payload.size_threshold import OversizeContentError, should_skip_sanitization
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.sanitizer import (
     OpenAiToolCallDesanitizer,
@@ -553,7 +553,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 # (embeddings/moderations/pass-through) never gets `input`
                 # rewritten, but a config/secret dump there must still be
                 # visible to the pre-egress classifier, not just the DLP guard.
-                _s0_texts.extend(collect_raw_text_leaves(data.get("input")))
+                _s0_unmanaged_texts = collect_raw_text_leaves(data.get("input"))
+                await self._guard_unmanaged_input_size(
+                    request_id, state, data, resolved, _s0_unmanaged_texts
+                )
+                _s0_texts.extend(_s0_unmanaged_texts)
             for _prompt_field in ("system", "instructions"):
                 _s0_texts.extend(collect_text(data.get(_prompt_field)))
             _s0_reason = classify_block("\n".join(_s0_texts))
@@ -835,7 +839,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 # `input` rewritten, but it must still be visible to this
                 # scan — an unmanaged call_type must not become a DLP blind
                 # spot just because its content is never sanitized.
-                _s5_texts.extend(collect_raw_text_leaves(data.get("input")))
+                _s5_unmanaged_texts = collect_raw_text_leaves(data.get("input"))
+                await self._guard_unmanaged_input_size(
+                    request_id, state, data, resolved, _s5_unmanaged_texts
+                )
+                _s5_texts.extend(_s5_unmanaged_texts)
             for _prompt_field in ("system", "instructions"):
                 _s5_texts.extend(collect_text(data.get(_prompt_field)))
             _s5_joined = "\n".join(_s5_texts)
@@ -1245,6 +1253,42 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # gateway_failure{component} — the single failure choke point. Fires even
         # when no _RequestState exists yet (e.g. an auth failure before state is built).
         self._metrics.record_failure(_failure_component(error_code))
+
+    async def _guard_unmanaged_input_size(
+        self,
+        request_id: str,
+        state: _RequestState,
+        data: dict[str, Any],
+        resolved: ResolvedProfile,
+        texts: list[str],
+    ) -> None:
+        """F1 parity for the unmanaged (embeddings/moderations/pass-through/
+        speech) scan path: `sanitize_one` never runs for this content (it is
+        never rewritten by design), so its internal oversize check never
+        runs either. Without this, Stage 0/Stage 5 joined and regex-scanned
+        an unbounded blob on the event loop. Same threshold + fail-closed
+        policy as the managed path, applied BEFORE the expensive scan."""
+        threshold = resolved.policy.size_threshold_bytes
+        content_bytes = sum(len(t.encode("utf-8")) for t in texts)
+        if not should_skip_sanitization(content_bytes, threshold_bytes=threshold):
+            return
+        state.block_reason = "oversize:blocked"
+        self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
+        self._metrics.record_block("oversize:blocked")
+        logger.info(
+            "litellm_pre_call_oversize_blocked request_id=%s field=unmanaged_input "
+            "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
+            request_id,
+            content_bytes,
+            threshold,
+        )
+        _now = datetime.now(UTC)
+        await self.audit(data, None, _now, _now, status="failed")
+        raise GuardrailHttpException(
+            422,
+            "E_OVERSIZE_BLOCKED",
+            "request blocked: oversize content",
+        )
 
     async def _resolve_profile(self, team_id: str) -> ResolvedProfile:
         """Resolve the team's merged profile (policy + inner orchestrator + D3
