@@ -295,18 +295,19 @@ def _restore_responses_event(original: Any, payload: dict[str, Any]) -> Any:
     if callable(validator):
         try:
             return validator(payload)
-        except Exception:
-            # Minor: must not silently fall through to an unvalidated
-            # model_copy() — the exact degradation litellm_hook.py's
-            # _apply_reverse_to_response deliberately refuses (Task 12).
-            # Log the exception TYPE only (no event content) and hand back
-            # the untouched original event rather than an object we never
-            # checked is well-formed.
+        except Exception as exc:
+            # Must not silently fall through to an unvalidated model_copy() —
+            # the exact degradation litellm_hook.py's _apply_reverse_to_response
+            # deliberately refuses. `payload` here is already DESANITIZED (the
+            # original is restored), so `exc_info=True` must never be used: a
+            # real pydantic ValidationError embeds the offending `input_value`
+            # in its own message, which would put the original on pod stdout
+            # (M1-14). Log only the exception TYPE and a stable error_code.
             logger.warning(
                 "streaming_responses_event_reconstruct_failed "
-                "event_type=%s error_code=E_RESPONSE_RECONSTRUCT_FAILED",
+                "event_type=%s exception_type=%s error_code=E_RESPONSE_RECONSTRUCT_FAILED",
                 type(original).__name__,
-                exc_info=True,
+                type(exc).__name__,
             )
             return original
     copier = getattr(original, "model_copy", None)

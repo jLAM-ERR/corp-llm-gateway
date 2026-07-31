@@ -631,6 +631,19 @@ class _FakeResponsesEventValidateFails(_FakeResponsesEvent):
         )
 
 
+class _FakeResponsesEventValidateFailsWithPayloadInMessage(_FakeResponsesEvent):
+    """Stands in for a real pydantic ValidationError, whose message embeds
+    the offending `input_value` — i.e. the payload that failed to validate,
+    which at this call site is the already-DESANITIZED (original-bearing)
+    event dict."""
+
+    @classmethod
+    def model_validate(
+        cls, payload: dict[str, Any]
+    ) -> "_FakeResponsesEventValidateFailsWithPayloadInMessage":
+        raise ValueError(f"1 validation error for Foo\n  input_value={payload!r}")
+
+
 def test_responses_stream_event_reconstruct_failure_does_not_bypass_validation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -650,6 +663,27 @@ def test_responses_stream_event_reconstruct_failure_does_not_bypass_validation(
 
     assert out == [event]
     assert "reconstruct_failed" in caplog.text.lower()
+
+
+def test_responses_stream_event_reconstruct_failure_log_has_no_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M1-14: the reconstruct-failure log must never carry the original —
+    the payload at this point is already desanitized, so a real pydantic
+    ValidationError (which embeds the offending `input_value` in its own
+    message) must not be logged with its exception details."""
+    import logging
+
+    d = ResponsesStreamDesanitizer(_mapping(("Ivanov", "[NAME_001]")))
+    event = _FakeResponsesEventValidateFailsWithPayloadInMessage(
+        "response.completed", output=[{"content": "hi [NAME_001]"}]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        out = d.feed(event)
+
+    assert out == [event]
+    assert "Ivanov" not in caplog.text
 
 
 def test_responses_stream_event_reconstruct_success_still_restores() -> None:
