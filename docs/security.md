@@ -46,15 +46,27 @@ pre-scan sees exactly what will be sanitized.
 | `tool_use.input` | String **leaves** of the input JSON tree, recursively; dict **keys** (tool-arg names) are preserved; non-str scalars pass through |
 | `document` block | `title`, `context`; `source.data` when `source.type == "text"`; `source.content` recursively when `source.type == "content"` |
 | Anthropic top-level `system` | The whole field (string or block list) |
-| OpenAI multimodal content parts | `text` parts (text blocks in the list); other part types pass through |
+| OpenAI multimodal content parts | `text`/`input_text`/`output_text`/`reasoning_text`/`summary_text` (the `text` value) and `refusal` blocks (the `refusal` value) |
+| `server_tool_use` / `mcp_tool_use` blocks | Their `input`, recursively (same JSON-tree scan as `tool_use.input`) |
+| `web_search_tool_result` / `code_execution_tool_result` / `mcp_tool_result` blocks | Their `content`, recursively as an arbitrary JSON tree (string leaves regardless of key name) — `encrypted_content` keys are protected (see below) |
+| `search_result` block | `title` and `content` (recursively re-enters `sanitize_content`, like `tool_result`) |
+| A Responses `input` item (`custom_tool_call`, `reasoning`, `function_call_output`, …) | Every field the response-side field registry (`_RESPONSES_TEXT_FIELDS`) also reverses — `input`, `summary`, `refusal`, `arguments` (JSON-parsed), `output` (JSON tree, only for `function_call_output`/`custom_tool_call_output` items) — via `sanitize_responses_item`/`collect_responses_item_text`, applied per item |
+| Chat-Completions-shaped `tool_calls`/`function_call` on a Responses item | `function.arguments` / `arguments`, same as the `messages` shape |
+| A bare string element of `data["input"]` (not a dict) | The whole string, same as top-level string content |
 
 ### Not sanitized / deferred
 
 | Shape | Why it is acceptable / status |
 |---|---|
 | `document` `source` with `type` `base64` / `url` | Binary or out-of-scope content; left untouched (deliberate) |
-| `image` / `image_url` blocks | Binary payload or a low-risk URL; passed through |
+| `image` / `image_url` / `input_image` blocks | Binary payload or a low-risk URL; passed through |
+| `input_file` / `file` blocks | Binary attachment reference (`file_data`/`file_id`/`filename`); passed through — filenames are not currently scanned |
+| `input_audio` / `output_audio` blocks | Base64 audio; passed through |
+| `container_upload` block | A file-id reference only, no text; passed through |
 | `thinking` / `redacted_thinking` blocks | **Intentionally** passed through unmodified — Anthropic signs thinking blocks and rejects modified ones on multi-turn replay, so they must never be rewritten; the model only ever sees placeholders anyway (no original reaches them). Correct by design, not a gap. |
+| `encrypted_content` (any key inside a JSON tree we scan, e.g. `web_search_result.encrypted_content`) | Same signed-content reasoning as `thinking`; excluded from `_sanitize_json`/`_desanitize_json`/`_collect_json_text` by key name |
+| `computer_call_output.output` | A base64 screenshot; scanning it would trip the oversize policy on ordinary screenshots, so `output` is only scanned for `function_call_output`/`custom_tool_call_output` items |
+| A genuinely unrecognized block `type` | **Fails closed**: `_sanitize_block` raises `UnsanitizableContentBlockError` (mapped to 400 `E_BAD_REQUEST`) rather than silently forwarding an unscanned block. The allowlist above must be extended for any new provider block shape before it can egress. |
 
 Response-side de-sanitization (the reverse path) restores originals in streamed
 and unary **text**, **`tool_use` input** (`input_json_delta`, JSON-escaped so the
