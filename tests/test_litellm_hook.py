@@ -733,6 +733,23 @@ async def test_async_pre_call_hook_threads_call_type_to_embeddings_gate() -> Non
     assert out["input"] == "alice@corp.example"
 
 
+async def test_pre_call_unrecognized_call_type_still_sanitizes_input() -> None:
+    """A call_type this gateway doesn't recognize (e.g. litellm's
+    `/v1/responses/compact` route, call_type="acompact_responses") must NOT
+    default to unmanaged pass-through: only a call_type explicitly known to
+    carry non-Responses `input` (embeddings, moderations) may skip
+    sanitization. Everything else — including one this gateway has never
+    seen — must fail closed and get the full `input` treatment."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "contact alice",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data, call_type="acompact_responses")
+    assert out["input"] == "contact [NAME_001]"
+
+
 async def test_pre_call_codex_profile_oracle_disabled_applies_rules_directly() -> None:
     """Codex profile (forward_chatgpt_auth=True) + oracle disabled: a replace.md
     rule reaches the Responses `input` field through the local_pass branch's
