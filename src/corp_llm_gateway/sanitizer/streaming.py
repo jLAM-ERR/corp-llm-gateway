@@ -16,31 +16,6 @@ logger = logging.getLogger(__name__)
 # Regex that matches a complete SSE event boundary (two consecutive newlines).
 _SSE_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
 
-# MAJOR 3 fix: a bare-alias reverse match's trailing boundary
-# (`(?![A-Za-z0-9_])`, see placeholder.build_reverse_substituter) is a
-# zero-width lookahead — on a partial (not-yet-final) buffer, "nothing here
-# yet" satisfies it exactly like "definitely nothing here", so `[NAME_001]`'s
-# bare alias `NAME_001` sitting at the buffer's current tail gets finalized
-# even though the next chunk could still extend it into `NAME_001Suffix`
-# (which must NOT match). The `max_len - 1` hold-back only protects
-# BRACKETED placeholders (they need their literal closing `]`, so a partial
-# one simply can't match yet); it does nothing for this zero-width case.
-#
-# Fix: during `feed()` (never at the final `flush()`, where end-of-buffer IS
-# the true end of text), pad the buffer with one synthetic identifier
-# character before running the reverse substitution, then strip it back off.
-# Any bare-alias match whose real end coincides with the buffer's current
-# end now sees an `[A-Za-z0-9_]` character immediately after it — the
-# lookahead correctly fails, deferring that match to a later feed() call (or
-# flush()) once genuine trailing context has arrived. A lowercase letter is
-# safe to use as the sentinel: it satisfies `[A-Za-z0-9_]` (so it poisons the
-# lookahead) but can never appear inside a real alias literal (aliases are
-# `_RESPONSE_ALIAS_RE`-shaped: uppercase/digits/underscore only), so it can
-# never combine with buffered text to fabricate a match that wasn't already
-# fully present. Bracketed-placeholder substitution (plain `str.replace`) is
-# unaffected either way — it never inspects trailing context.
-_STREAM_FEED_SENTINEL = "x"
-
 
 class StreamingDesanitizer:
     """Stateful de-sanitizer for SSE streaming chunks.
@@ -51,7 +26,7 @@ class StreamingDesanitizer:
     in-flight placeholder of up to `max_placeholder_length` is fully visible
     when its closing bytes arrive (or, for a bare alias/rule replacement with
     no brackets, so a complete match sitting at the buffer's tail can be held
-    whole while its trailing boundary is confirmed — see MAJOR 3/5).
+    whole while its trailing boundary is confirmed).
 
     Replacement order is length-descending (M1-9) so a longer placeholder
     can't be shadowed by a shorter prefix-match one.
@@ -80,9 +55,10 @@ class StreamingDesanitizer:
 
         # `max_len` (not `max_len - 1`): a bare (non-bracketed) placeholder text
         # up to `max_len` chars can now be DEFERRED whole (see
-        # _STREAM_FEED_SENTINEL) rather than merely partial, so the held
-        # region must fit a fully-matched, max_len-long occurrence starting
-        # at the buffer's tail, not just an in-flight partial one.
+        # placeholder.build_reverse_substituter's `final` parameter) rather
+        # than merely partial, so the held region must fit a fully-matched,
+        # max_len-long occurrence starting at the buffer's tail, not just an
+        # in-flight partial one.
         hold = self._max_len
         if len(self._buffer) <= hold:
             return ""
@@ -108,12 +84,7 @@ class StreamingDesanitizer:
             yield tail
 
     def _replace_all(self, text: str, *, final: bool) -> str:
-        if final:
-            return self._reverse(text)
-        # Not the final flush: pad so a trailing bare-alias lookahead can't be
-        # satisfied by mere end-of-buffer (see _STREAM_FEED_SENTINEL above).
-        padded = self._reverse(text + _STREAM_FEED_SENTINEL)
-        return padded[: -len(_STREAM_FEED_SENTINEL)]
+        return self._reverse(text, final=final)
 
 
 class OpenAiToolCallDesanitizer:
