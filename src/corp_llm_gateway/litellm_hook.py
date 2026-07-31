@@ -1716,7 +1716,19 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
                 try:
                     return validator(rewritten)
                 except Exception:
-                    pass
+                    # The rewritten payload failed to validate back into its own
+                    # type. Falling through to model_copy() would bypass that
+                    # validation entirely and return an object we never checked
+                    # is well-formed. Surface the failure instead of degrading
+                    # quietly: log it and hand back the untouched (still
+                    # validated, just not desanitized) original response.
+                    logger.warning(
+                        "litellm_post_call_response_reconstruct_failed "
+                        "response_type=%s error_code=E_RESPONSE_RECONSTRUCT_FAILED",
+                        type(response).__name__,
+                        exc_info=True,
+                    )
+                    return response
             copier = getattr(response, "model_copy", None)
             if callable(copier):
                 return copier(update=rewritten, deep=True)
