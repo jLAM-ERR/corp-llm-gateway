@@ -515,15 +515,21 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # is reversed to the original, and it can be a sanitizer-probing attempt.
         input_literals: list[str] = []
         input_unwrapped_literals: set[str] = set()
+        # Minor: response_alias_exclusions is only ever read by _response_mapping
+        # when include_bare_aliases is True (forward_chatgpt_auth on) — skip the
+        # extra find_unwrapped_placeholder_literals scan over every segment when
+        # the flag is off, since the result would never be used.
         for _m in messages:
             if isinstance(_m, (dict, str)):
                 for _seg in _item_text(_m):
                     input_literals.extend(find_placeholder_literals(_seg))
-                    input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
+                    if self._forward_chatgpt_auth:
+                        input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
         for _prompt_field in ("system", "instructions"):
             for _seg in collect_text(data.get(_prompt_field)):
                 input_literals.extend(find_placeholder_literals(_seg))
-                input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
+                if self._forward_chatgpt_auth:
+                    input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
         state.response_alias_exclusions = input_unwrapped_literals
         if input_literals:
             allocator.forbid(input_literals)
