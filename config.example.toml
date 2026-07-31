@@ -60,6 +60,7 @@
 # CORP_LLM_BLOCK_PAYLOADS   = "1"      # Stage 0 payload classifier (refuse-before-egress)
 # CORP_LLM_DLP_GUARD        = "1"      # Stage 5 DLP egress guard (re-scan sanitized request)
 # CORP_LLM_DLP_CANARIES     = "canary-abc,canary-def"   # comma-separated canary regexes
+# CORP_LLM_FORWARD_CHATGPT_AUTH = "0"  # opt-in allowlisted Codex OAuth forwarding
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #

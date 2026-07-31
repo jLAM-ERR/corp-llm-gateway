@@ -137,6 +137,7 @@ def _build_guardrail(
     *,
     valid_token: str = "tok-1",
     corp_llm: CorpLlmClient | None = None,
+    forward_chatgpt_auth: bool = False,
 ) -> tuple[CorpLlmGuardrail, ListSink]:
     pairs = pairs if pairs is not None else []
     token_store = InMemoryTokenStore()
@@ -159,7 +160,15 @@ def _build_guardrail(
     )
     sink = ListSink()
     audit_logger = AuditLogger(sink, gateway_version="0.0.1")
-    return CorpLlmGuardrail(orch, auth, audit_logger), sink
+    return (
+        CorpLlmGuardrail(
+            orch,
+            auth,
+            audit_logger,
+            forward_chatgpt_auth=forward_chatgpt_auth,
+        ),
+        sink,
+    )
 
 
 def _build_guardrail_oversize(
@@ -256,6 +265,136 @@ async def test_pre_call_missing_token_rejected() -> None:
         await g.pre_call({"messages": [], "headers": {}})
     assert ei.value.status_code == 401
     assert ei.value.error_code == "E_MISSING_TOKEN"
+
+
+async def test_pre_call_sanitizes_responses_input_instructions_and_tool_output() -> None:
+    g, _ = _build_guardrail(pairs=[("Kdir", "[ORG_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Implement KdirService"}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "KdirService.cs",
+            },
+        ],
+        "instructions": "Work with KdirService",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+
+    out = await g.pre_call(data)
+
+    assert out["input"][0]["content"][0]["text"] == "Implement [ORG_001]Service"
+    assert out["input"][1]["output"] == "[ORG_001]Service.cs"
+    assert out["instructions"] == "Work with [ORG_001]Service"
+    assert "messages" not in out
+
+
+async def test_pre_call_chatgpt_auth_bridge_forwards_only_required_headers() -> None:
+    g, _ = _build_guardrail(forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "metadata": {"gateway": "internal"},
+        "headers": {
+            "X-Corp-Auth": "tok-1",
+            "Authorization": "Bearer oauth-value",
+            "ChatGPT-Account-Id": "account-id",
+            "Originator": "codex_cli_rs",
+            "Session-Id": "session-id",
+            "Thread-Id": "thread-id",
+            "X-Codex-Beta-Features": "feature",
+            "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+            "X-OpenAI-Unrelated": "do-not-forward",
+            "Host": "127.0.0.1:4000",
+            "X-Unrelated": "do-not-forward",
+        },
+    }
+
+    out = await g.pre_call(data)
+    upstream = {key.lower(): value for key, value in out["extra_headers"].items()}
+
+    assert out["api_key"] == "oauth-value"
+    assert "authorization" not in upstream
+    assert upstream["chatgpt-account-id"] == "account-id"
+    assert upstream["originator"] == "codex_cli_rs"
+    assert upstream["session-id"] == "session-id"
+    assert upstream["thread-id"] == "thread-id"
+    assert upstream["x-codex-beta-features"] == "feature"
+    assert upstream["x-openai-internal-codex-responses-lite"] == "true"
+    assert "x-corp-auth" not in upstream
+    assert "host" not in upstream
+    assert "x-unrelated" not in upstream
+    assert "x-openai-unrelated" not in upstream
+    assert "metadata" not in out
+    assert out["litellm_metadata"]["_corp_gateway_request_id"]
+
+
+async def test_pre_call_chatgpt_auth_bridge_merges_litellm_header_buckets() -> None:
+    g, _ = _build_guardrail(forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "headers": {"X-Corp-Auth": "tok-1"},
+        "proxy_server_request": {
+            "headers": {
+                "authorization": "Bearer oauth-value",
+                "chatgpt-account-id": "account-id",
+            }
+        },
+    }
+
+    out = await g.pre_call(data)
+    upstream = {key.lower(): value for key, value in out["extra_headers"].items()}
+
+    assert out["api_key"] == "oauth-value"
+    assert "authorization" not in upstream
+    assert upstream["chatgpt-account-id"] == "account-id"
+    assert "x-corp-auth" not in upstream
+
+
+async def test_pre_call_chatgpt_auth_bridge_reads_litellm_secret_headers() -> None:
+    g, _ = _build_guardrail(forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "headers": {"X-Corp-Auth": "tok-1"},
+        "secret_fields": {
+            "raw_headers": {
+                "Authorization": "Bearer oauth-value",
+                "ChatGPT-Account-Id": "account-id",
+                "X-Corp-Auth": "tok-1",
+            }
+        },
+    }
+
+    out = await g.pre_call(data)
+    upstream = {key.lower(): value for key, value in out["extra_headers"].items()}
+
+    assert out["api_key"] == "oauth-value"
+    assert "authorization" not in upstream
+    assert upstream["chatgpt-account-id"] == "account-id"
+    assert "x-corp-auth" not in upstream
+    assert "X-Corp-Auth" not in out["secret_fields"]["raw_headers"]
+
+
+async def test_pre_call_chatgpt_auth_bridge_requires_bearer() -> None:
+    g, _ = _build_guardrail(forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "headers": {"X-Corp-Auth": "tok-1"},
+    }
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+
+    assert ei.value.status_code == 401
+    assert ei.value.error_code == "E_PROVIDER_AUTH"
 
 
 async def test_pre_call_invalid_token_rejected() -> None:
@@ -654,6 +793,63 @@ async def test_post_call_stream_openai_dict_gpt4o_contract() -> None:
     assert out_text == "hello alice world"
 
 
+async def test_post_call_stream_responses_events_restore_split_placeholder() -> None:
+    from litellm.types.llms.openai import (
+        OutputTextDeltaEvent,
+        OutputTextDoneEvent,
+        ResponsesAPIStreamEvents,
+    )
+
+    g, _ = _build_guardrail([("Kdir", "[ORG_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "Implement KdirService",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+    events = [
+        OutputTextDeltaEvent(
+            type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA,
+            item_id="item_1",
+            output_index=0,
+            content_index=0,
+            delta="Result [ORG_",
+        ),
+        OutputTextDeltaEvent(
+            type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA,
+            item_id="item_1",
+            output_index=0,
+            content_index=0,
+            delta="001]Service",
+        ),
+        OutputTextDoneEvent(
+            type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE,
+            item_id="item_1",
+            output_index=0,
+            content_index=0,
+            text="Result [ORG_001]Service",
+        ),
+    ]
+
+    out: list[Any] = []
+    async for chunk in g.post_call_stream(data, _async_iter(events)):
+        out.append(chunk)
+
+    deltas: list[str] = []
+    done_text = ""
+    for chunk in out:
+        payload = json.loads(chunk) if isinstance(chunk, str) else chunk.model_dump()
+        if payload["type"] == "response.output_text.delta":
+            deltas.append(payload["delta"])
+        elif payload["type"] == "response.output_text.done":
+            done_text = payload["text"]
+    assert "".join(deltas) == "Result KdirService"
+    assert done_text == "Result KdirService"
+    assert "[ORG_001]" not in json.dumps(
+        [json.loads(item) if isinstance(item, str) else item.model_dump() for item in out]
+    )
+
+
 async def test_post_call_stream_anthropic_sse_bytes_placeholder_restored() -> None:
     """Anthropic SSE bytes: placeholder split across deltas is restored, framing intact."""
     g, _ = _build_guardrail([("user@example.com", "[EMAIL_001]")])
@@ -724,6 +920,37 @@ async def test_post_call_unary_reverses_placeholder() -> None:
     response = {"choices": [{"message": {"role": "assistant", "content": "hello [N1]!"}}]}
     out = await g.post_call_unary(data, response)
     assert out["choices"][0]["message"]["content"] == "hello alice!"
+
+
+async def test_post_call_unary_reverses_responses_output_and_preserves_encrypted() -> None:
+    g, _ = _build_guardrail([("Kdir", "[ORG_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "Implement KdirService",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+    response = {
+        "id": "resp_1",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Created [ORG_001]Service"}],
+            },
+            {
+                "type": "function_call",
+                "name": "write_file",
+                "arguments": '{"path":"[ORG_001]Service.cs"}',
+            },
+            {"type": "reasoning", "encrypted_content": "[ORG_001]"},
+        ],
+    }
+
+    out = await g.post_call_unary(data, response)
+
+    assert out["output"][0]["content"][0]["text"] == "Created KdirService"
+    assert json.loads(out["output"][1]["arguments"])["path"] == "KdirService.cs"
+    assert out["output"][2]["encrypted_content"] == "[ORG_001]"
 
 
 async def test_post_call_unary_no_state_returns_unchanged() -> None:

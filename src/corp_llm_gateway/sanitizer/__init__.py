@@ -14,6 +14,7 @@ from corp_llm_gateway.sanitizer.strategies import (
 )
 from corp_llm_gateway.sanitizer.streaming import (
     OpenAiToolCallDesanitizer,
+    ResponsesStreamDesanitizer,
     SseStreamDesanitizer,
     StreamingDesanitizer,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "JsonStrategy",
     "OpenAiToolCallDesanitizer",
     "RegexStrategy",
+    "ResponsesStreamDesanitizer",
     "SanitizationOrchestrator",
     "SanitizeResult",
     "SanitizerStrategy",

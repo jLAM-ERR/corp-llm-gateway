@@ -1,0 +1,13 @@
+# Install as ~/.codex/chatgpt-codex.config.toml and run `codex --profile chatgpt-codex`.
+model = "gpt-5.6-sol"
+model_provider = "corp-chatgpt-codex"
+
+[model_providers.corp-chatgpt-codex]
+name = "Corp Gateway / ChatGPT Codex"
+base_url = "http://127.0.0.1:4000/v1"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+
+[model_providers.corp-chatgpt-codex.http_headers]
+X-Corp-Auth = "demo-team-token"

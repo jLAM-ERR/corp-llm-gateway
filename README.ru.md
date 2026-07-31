@@ -132,6 +132,9 @@ corp-llm-gateway status  # → token_present=yes, live=yes, healthy=yes
 | Cursor / Continue | поле кастомных заголовков в настройках приложения | localhost-прокси |
 | `curl`, сырые скрипты | `--header 'X-Corp-Auth: …'` | localhost-прокси |
 
+Для работы Codex через подписку ChatGPT используйте отдельный Responses-профиль:
+[`docs/chatgpt-codex.ru.md`](docs/chatgpt-codex.ru.md).
+
 Localhost-прокси (Паттерн 3, `corp-llm-gateway-proxy`) универсален — он инъецирует `X-Corp-Auth` в каждый запрос и перечитывает файл токена при каждом вызове, поэтому ротация токена вступает в силу немедленно:
 
 ```bash

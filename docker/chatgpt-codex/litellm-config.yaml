@@ -1,0 +1,19 @@
+model_list:
+  # Preserve the model selected by Codex (for example gpt-5.6-sol) while
+  # switching the provider to the ChatGPT subscription Responses endpoint.
+  - model_name: "*"
+    litellm_params:
+      model: "openai/*"
+      api_base: "os.environ/CHATGPT_CODEX_API_BASE"
+      # OpenAIConfig requires a configured startup value. The guardrail
+      # replaces it with a per-request api_key derived from Codex OAuth before
+      # LiteLLM builds the upstream Authorization header.
+      api_key: "oauth-passthrough-placeholder"
+
+litellm_settings:
+  callbacks: ["corp_llm_gateway._demo_guardrail.guardrail"]
+  drop_params: true
+  json_logs: true
+
+router_settings:
+  set_verbose: false

@@ -89,6 +89,7 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         # hosted_vllm forwards proxy_server_request headers (incl. Host:
         # 127.0.0.1:4000) to the corp ingress, which 503s the unknown vhost.
         strip_inbound_headers_to_upstream=True,
+        forward_chatgpt_auth=((config.get("CORP_LLM_FORWARD_CHATGPT_AUTH", "0") or "0") == "1"),
     )
 
 

@@ -181,9 +181,16 @@ def _collect_tool_arguments_text(arguments: Any) -> list[str]:
 
 
 def message_has_tool_calls(message: dict[str, Any]) -> bool:
-    """True if a chat message carries OpenAI ``tool_calls`` or legacy ``function_call``."""
-    return isinstance(message.get("tool_calls"), list) or isinstance(
+    """True when a chat/Responses item carries sanitizable tool data."""
+    if isinstance(message.get("tool_calls"), list) or isinstance(
         message.get("function_call"), dict
+    ):
+        return True
+    item_type = message.get("type")
+    if item_type == "function_call" and "arguments" in message:
+        return True
+    return item_type in {"function_call_output", "custom_tool_call_output"} and (
+        "output" in message
     )
 
 
@@ -211,6 +218,18 @@ async def sanitize_tool_calls(
     if isinstance(fc, dict) and "arguments" in fc:
         new_args, r = await _sanitize_tool_arguments(fc["arguments"], sanitize_one)
         new_message["function_call"] = {**fc, "arguments": new_args}
+        results.extend(r)
+
+    # Responses API represents calls and their outputs as top-level input
+    # items instead of message-level ``tool_calls``.
+    item_type = message.get("type")
+    if item_type == "function_call" and "arguments" in message:
+        new_args, r = await _sanitize_tool_arguments(message["arguments"], sanitize_one)
+        new_message["arguments"] = new_args
+        results.extend(r)
+    elif item_type in {"function_call_output", "custom_tool_call_output"} and ("output" in message):
+        new_output, r = await _sanitize_json(message["output"], sanitize_one)
+        new_message["output"] = new_output
         results.extend(r)
     return new_message, results
 
@@ -254,6 +273,11 @@ def desanitize_tool_calls(message: dict[str, Any], reverse: ReverseOne) -> dict[
             **fc,
             "arguments": _desanitize_tool_arguments(fc["arguments"], reverse),
         }
+    item_type = message.get("type")
+    if item_type == "function_call" and "arguments" in message:
+        new_message["arguments"] = _desanitize_tool_arguments(message["arguments"], reverse)
+    elif item_type in {"function_call_output", "custom_tool_call_output"} and ("output" in message):
+        new_message["output"] = _desanitize_json(message["output"], reverse)
     return new_message
 
 
@@ -269,6 +293,11 @@ def collect_tool_call_text(message: dict[str, Any]) -> list[str]:
     fc = message.get("function_call")
     if isinstance(fc, dict) and "arguments" in fc:
         out.extend(_collect_tool_arguments_text(fc["arguments"]))
+    item_type = message.get("type")
+    if item_type == "function_call" and "arguments" in message:
+        out.extend(_collect_tool_arguments_text(message["arguments"]))
+    elif item_type in {"function_call_output", "custom_tool_call_output"} and ("output" in message):
+        out.extend(_collect_json_text(message["output"]))
     return out
 
 
@@ -282,7 +311,7 @@ async def _sanitize_block(
     live in exactly one place.
     """
     block_type = block.get("type")
-    if block_type == "text" and isinstance(block.get("text"), str):
+    if block_type in {"text", "input_text", "output_text"} and isinstance(block.get("text"), str):
         result = await sanitize_one(block["text"])
         return {**block, "text": result.sanitized_text}, [result]
     if block_type == "tool_result" and "content" in block:
@@ -330,7 +359,7 @@ def _desanitize_block(block: dict[str, Any], reverse: ReverseOne) -> dict[str, A
     Shared by the list-item path and the bare-dict path.
     """
     block_type = block.get("type")
-    if block_type == "text" and isinstance(block.get("text"), str):
+    if block_type in {"text", "input_text", "output_text"} and isinstance(block.get("text"), str):
         return {**block, "text": reverse(block["text"])}
     if block_type == "tool_result" and "content" in block:
         return {**block, "content": desanitize_content(block["content"], reverse)}
@@ -410,7 +439,9 @@ def collect_text(content: Any) -> list[str]:
             if not isinstance(item, dict):
                 continue
             block_type = item.get("type")
-            if block_type == "text" and isinstance(item.get("text"), str):
+            if block_type in {"text", "input_text", "output_text"} and isinstance(
+                item.get("text"), str
+            ):
                 out.append(item["text"])
             elif block_type == "tool_result" and "content" in item:
                 out.extend(collect_text(item["content"]))
@@ -431,7 +462,9 @@ def collect_text(content: Any) -> list[str]:
         return out
     if isinstance(content, dict):
         block_type = content.get("type")
-        if block_type == "text" and isinstance(content.get("text"), str):
+        if block_type in {"text", "input_text", "output_text"} and isinstance(
+            content.get("text"), str
+        ):
             return [content["text"]]
         if block_type == "tool_result" and "content" in content:
             return collect_text(content["content"])
@@ -440,19 +473,19 @@ def collect_text(content: Any) -> list[str]:
         if block_type == "tool_use" and "input" in content:
             return _collect_json_text(content["input"])
         if block_type == "document":
-            out: list[str] = []
+            document_text: list[str] = []
             for fld in ("title", "context"):
                 v = content.get(fld)
                 if isinstance(v, str) and v:
-                    out.append(v)
+                    document_text.append(v)
             src = content.get("source")
             if isinstance(src, dict):
                 stype = src.get("type")
                 if stype == "text" and isinstance(src.get("data"), str):
-                    out.append(src["data"])
+                    document_text.append(src["data"])
                 elif stype == "content" and "content" in src:
-                    out.extend(collect_text(src["content"]))
-            return out
+                    document_text.extend(collect_text(src["content"]))
+            return document_text
         return []
     return []
 
@@ -486,3 +519,58 @@ def desanitize_content(
 
     # Genuinely unknown non-dict/non-str/non-list → pass through unchanged.
     return content
+
+
+_RESPONSES_TEXT_FIELDS = frozenset(
+    {
+        "arguments",
+        "content",
+        "delta",
+        "output",
+        "reasoning",
+        "refusal",
+        "summary",
+        "text",
+        "transcript",
+    }
+)
+_RESPONSES_OPAQUE_FIELDS = frozenset({"encrypted_content"})
+
+
+def desanitize_responses_payload(
+    value: Any,
+    reverse: ReverseOne,
+    *,
+    _field: str | None = None,
+    _depth: int = 0,
+) -> Any:
+    """Reverse placeholders in OpenAI Responses API output shapes.
+
+    Responses objects carry user-visible text in nested ``output``/``content``
+    items and tool arguments rather than Chat Completions ``choices``. Structural
+    identifiers and signed ``encrypted_content`` are deliberately left untouched.
+    """
+    if _depth > _MAX_JSON_DEPTH:
+        return value
+    if _field in _RESPONSES_OPAQUE_FIELDS:
+        return value
+    if isinstance(value, str):
+        if _field == "arguments":
+            return _desanitize_arguments(value, reverse)
+        return reverse(value) if _field in _RESPONSES_TEXT_FIELDS else value
+    if isinstance(value, list):
+        return [
+            desanitize_responses_payload(item, reverse, _field=_field, _depth=_depth + 1)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: desanitize_responses_payload(
+                item,
+                reverse,
+                _field=str(key),
+                _depth=_depth + 1,
+            )
+            for key, item in value.items()
+        }
+    return value
