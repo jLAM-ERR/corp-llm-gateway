@@ -2091,6 +2091,47 @@ async def test_post_call_unary_real_litellm_model_response_preserves_hidden_para
     assert out._hidden_params == {"x-litellm-key": "team-a-key-hash"}
 
 
+class _RestoredWithReadOnlyHiddenParams:
+    """Stands in for a validated object where `_hidden_params` exists (so
+    `hasattr` is True) but can't be reassigned — simulates any failure while
+    restoring litellm's private response attrs after a successful
+    `model_validate`."""
+
+    def __init__(self, choices: list[dict[str, Any]]) -> None:
+        self.choices = choices
+
+    @property
+    def _hidden_params(self) -> dict[str, Any]:
+        return {}
+
+
+class _FakeChatModelResponseHiddenParamsRestoreFails(_FakeChatModelResponse):
+    @classmethod
+    def model_validate(cls, payload: dict[str, Any]) -> "_RestoredWithReadOnlyHiddenParams":
+        return _RestoredWithReadOnlyHiddenParams(payload["choices"])
+
+
+async def test_post_call_unary_hidden_params_restore_failure_keeps_desanitized_response() -> None:
+    """A failure restoring litellm's private response attrs onto the newly
+    validated object must not discard the already-validated,
+    already-desanitized `restored` object and fall back to the
+    still-placeholdered original — that is the exact silent degradation the
+    reconstruction-failure path above deliberately refuses."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = _FakeChatModelResponseHiddenParamsRestoreFails(
+        [{"message": {"role": "assistant", "content": "hello [N1]!"}}]
+    )
+    response._hidden_params = {"x-litellm-key": "abc"}
+
+    out = await g.post_call_unary(data, response)
+
+    assert isinstance(out, _RestoredWithReadOnlyHiddenParams)
+    assert out.choices[0]["message"]["content"] == "hello alice!"
+
+
 async def test_post_call_unary_response_reconstruct_failure_does_not_bypass_validation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

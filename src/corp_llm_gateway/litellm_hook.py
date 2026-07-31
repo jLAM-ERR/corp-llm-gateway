@@ -1825,20 +1825,6 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
             if callable(validator):
                 try:
                     restored = validator(rewritten)
-                    # MAJOR 8: model_validate() builds a BRAND NEW instance from
-                    # the dumped dict, which never carries pydantic private
-                    # attrs like litellm's `_hidden_params` (model_dump omits
-                    # them; confirmed against the real litellm.ModelResponse).
-                    # The proxy reads `_hidden_params` for cost tracking and
-                    # x-litellm-* response headers, so losing it here would
-                    # silently break that on the DEFAULT (flag-off) path.
-                    # model_copy() (the other branch below) doesn't have this
-                    # problem — it copies the existing instance rather than
-                    # reconstructing one, so private attrs survive naturally.
-                    hidden_params = getattr(response, "_hidden_params", None)
-                    if hidden_params is not None and hasattr(restored, "_hidden_params"):
-                        restored._hidden_params = hidden_params
-                    return restored
                 except Exception:
                     # The rewritten payload failed to validate back into its own
                     # type. Falling through to model_copy() would bypass that
@@ -1853,6 +1839,27 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
                         exc_info=True,
                     )
                     return response
+                # model_validate() builds a BRAND NEW instance from the dumped
+                # dict, which never carries pydantic private attrs litellm
+                # relies on — `_hidden_params` (cost tracking), and the sibling
+                # `_response_headers`/`_response_ms` (x-litellm-* headers,
+                # litellm/types/utils.py:2057-2059) — model_dump omits all
+                # three (confirmed against the real litellm.ModelResponse).
+                # model_copy() (the other branch below) doesn't have this
+                # problem — it copies the existing instance instead of
+                # reconstructing one, so private attrs survive naturally.
+                # Restoring them here is deliberately OUTSIDE the reconstruction
+                # try/except above: a failure restoring one of these must not
+                # discard the already-validated, already-desanitized `restored`
+                # object and fall back to the still-placeholdered original —
+                # that would be the exact silent degradation the reconstruction
+                # failure path above refuses.
+                for _attr in ("_hidden_params", "_response_headers", "_response_ms"):
+                    _value = getattr(response, _attr, None)
+                    if _value is not None and hasattr(restored, _attr):
+                        with contextlib.suppress(Exception):
+                            setattr(restored, _attr, _value)
+                return restored
             copier = getattr(response, "model_copy", None)
             if callable(copier):
                 return copier(update=rewritten, deep=True)
