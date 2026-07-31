@@ -259,7 +259,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         Failures are mapped to GuardrailHttpException with stable
         error_code so post-call audit can attribute the failure.
 
-        *call_type*: litellm's per-endpoint call type (MAJOR 6). `data["input"]`
+        *call_type*: litellm's per-endpoint call type. `data["input"]`
         means something completely different across endpoints — a Responses
         API items list, but ALSO the raw text/tokens `/v1/embeddings` and
         `/v1/moderations` send. Without this, both got routed through the
@@ -583,9 +583,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             )
             if not result.pairs:
                 return result
-            # MAJOR 5: rule-derived originals (case-insensitive matches sharing
-            # one CONFIGURED replacement) are exempt from the bijection re-mint
-            # — an operator-configured replacement is intentionally many-to-one.
+            # Rule-derived originals (case-insensitive matches sharing one
+            # CONFIGURED replacement) are exempt from the bijection re-mint —
+            # an operator-configured replacement is intentionally many-to-one.
             canonical_pairs = allocator.remap(
                 result.pairs, exempt_from_bijection=result.rule_originals
             )
@@ -1465,7 +1465,7 @@ _NON_CHAT_INPUT_CALL_TYPES = frozenset(
 def _request_items(data: dict[str, Any], call_type: str | None = None) -> tuple[Any, str]:
     """Return a mutable message-like view for Chat Completions or Responses.
 
-    MAJOR 6: `data["input"]` is NOT unique to chat/Responses — `/v1/embeddings`
+    `data["input"]` is NOT unique to chat/Responses — `/v1/embeddings`
     and `/v1/moderations` also carry an `input` field, but it means raw
     text/tokens to embed or score, not a Responses items list. Gate the
     Responses `input` interpretation on `call_type` so those endpoints are
