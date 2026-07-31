@@ -7,6 +7,20 @@ _UNWRAPPED_PLACEHOLDER_FIND_RE = re.compile(r"(?<!\[)\b[A-Z][A-Z0-9_]*_[A-Z0-9_]
 _RESPONSE_ALIAS_RE = re.compile(r"^\[(?P<alias>[A-Z][A-Z0-9_]*_[A-Z0-9_]+)\]$")
 
 
+class StaleSpanError(ValueError):
+    """A pre-selected replacement span is invalid or no longer matches the
+    source text (e.g. a stale Cache-A/allocator remap).
+
+    Fails closed (M4 fail-policy matrix): `litellm_hook.py` maps this to a
+    stable `error_code` (via the `error_code` class attribute) plus an audit
+    record and `gateway_failure{component}` metric, instead of letting a bare
+    exception escape as a generic 500. Subclasses ValueError so existing
+    `except ValueError` / `pytest.raises(ValueError)` call sites keep working.
+    """
+
+    error_code = "E_SPAN_INVALID"
+
+
 @dataclass(frozen=True)
 class AppliedSpan:
     """One original-text range selected for forward substitution."""
@@ -146,16 +160,16 @@ def apply_spans(
     cursor = 0
     for span in ordered:
         if span.start < cursor or span.start < 0 or span.end <= span.start or span.end > len(text):
-            raise ValueError(
+            raise StaleSpanError(
                 f"invalid or overlapping applied span: start={span.start} end={span.end}"
             )
         if text[span.start : span.end] != span.original:
-            raise ValueError(
+            raise StaleSpanError(
                 f"applied span does not match source text: start={span.start} end={span.end}"
             )
         selected_replacement = by_original.get(span.original)
         if selected_replacement is None:
-            raise ValueError(
+            raise StaleSpanError(
                 f"missing replacement for applied span: start={span.start} end={span.end}"
             )
         out.append(text[cursor : span.start])
