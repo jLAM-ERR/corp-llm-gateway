@@ -51,3 +51,36 @@ def test_extra_headers_field_is_never_allowed() -> None:
         assert_no_never_fields(
             {"request_id": "r1", "extra_headers": {"ChatGPT-Account-Id": "acct-1"}}
         )
+
+
+def test_api_key_field_is_never_allowed_at_top_level() -> None:
+    # The Codex auth bridge writes the developer's ChatGPT OAuth bearer to
+    # data["api_key"] (litellm_hook.py) — a new raw-credential surface.
+    with pytest.raises(NeverFieldPresentError, match="api_key"):
+        assert_no_never_fields({"request_id": "r1", "api_key": "sk-oauth-secret"})
+
+
+def test_api_key_field_nested_under_benign_field_is_caught() -> None:
+    with pytest.raises(NeverFieldPresentError, match="api_key"):
+        assert_no_never_fields({"request_id": "r1", "debug": {"api_key": "sk-oauth-secret"}})
+
+
+def test_finding_label_counts_detector_labels_pass_the_gate() -> None:
+    """Regression pin: finding_label_counts maps a detector LABEL (API_KEY, JWT,
+    PASSWORD, ...) to a count — those keys are data, not schema field names, and
+    must not be matched against NEVER_FIELDS."""
+    assert_no_never_fields({"request_id": "r1", "finding_label_counts": {"API_KEY": 3, "JWT": 1}})
+
+
+def test_never_field_nested_as_value_inside_finding_label_counts_is_still_caught() -> None:
+    """finding_label_counts' declared type is dict[str, int], so this shape can't
+    occur in practice — the test pins the gate's VALUE walk, not the schema: a
+    NEVER key nested one level deeper must still be caught, proving the
+    data-keyed-field carve-out doesn't blind the walk to its subtree."""
+    with pytest.raises(NeverFieldPresentError, match="authorization"):
+        assert_no_never_fields(
+            {
+                "request_id": "r1",
+                "finding_label_counts": {"API_KEY": {"authorization": "Bearer x"}},
+            }
+        )

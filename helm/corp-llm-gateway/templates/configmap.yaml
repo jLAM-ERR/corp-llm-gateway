@@ -62,6 +62,7 @@ data:
           !exists(.x_corp_auth) &&
           !exists(."X-Corp-Auth") &&
           !exists(.corp_token) &&
+          !exists(.api_key) &&
           !exists(.authorization) &&
           !exists(.Authorization) &&
           !exists(.cookie) &&

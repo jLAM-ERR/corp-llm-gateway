@@ -1208,10 +1208,10 @@ async def test_system_field_oversize_blocks_and_never_leaks_original(
 # (xiv) Codex OAuth bridge: data["api_key"] carries the developer's ChatGPT
 # subscription bearer (litellm_hook.py). It is not an AuditEvent attribute, so
 # the audit layer already can't emit it — this pins that the current code path
-# never puts it in an audit record or a log line. `api_key` is NOT added to
-# NEVER_FIELDS (see the Task 7 report: the regex_checksum detector's "API_KEY"
-# finding-label family collides case-insensitively with it inside the
-# legitimate `finding_label_counts` field).
+# never puts it in an audit record or a log line. `api_key` IS a NEVER field
+# (audit/invariants.py); the DATA_KEYED_FIELDS carve-out there keeps that
+# consistent with the regex_checksum detector's "API_KEY" finding-label family
+# inside the legitimate `finding_label_counts` field (see tests/audit/test_invariants.py).
 
 _CHATGPT_OAUTH_TOKEN = "oauth-secret-token-f7"
 
