@@ -1594,8 +1594,8 @@ async def test_sanitize_mcp_call_output_is_scanned() -> None:
     }
     new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
     assert new_item["output"] == "[ORG_001] response"
-    # "name"/"server_label" are scanned too (not fixed enums) but have no
-    # match here — only "output" actually redacts.
+    # "name"/"server_label" are structural (never scanned) — only "output" is.
+    assert new_item["server_label"] == "s1"
     assert len([r for r in results if r.pairs]) == 1
 
 
@@ -1643,24 +1643,30 @@ async def test_sanitize_responses_item_structural_fields_never_scanned() -> None
     assert results == []
 
 
-async def test_sanitize_responses_item_chat_shaped_name_field_is_scanned() -> None:
-    """`message.name` is caller-supplied free text (a chat-shaped item mixed
-    into Responses `input`, which this walker explicitly handles), not a
-    fixed enum — it must not be excluded as a structural identifier."""
-    item = {"type": "message", "role": "user", "name": "acme-bot", "content": "hi"}
+async def test_sanitize_responses_item_chat_shaped_name_field_is_structural() -> None:
+    """Round-4 IMPORTANT 4: `name`/`server_label` reverted to structural.
+    `data["tools"]` (function/MCP declarations) is never sanitized anywhere
+    in `litellm_hook.py`, so rewriting a `function_call.name` or `mcp_call.
+    server_label` inside `input` desyncs it from its own (untouched) tool
+    declaration and the provider rejects the request. Matches this
+    codebase's existing pattern elsewhere (`_sanitize_message_tool_calls_
+    field` also never rewrites `function.name`): tool/server identifiers are
+    structural, not free text, everywhere, not just here."""
+    item = {"type": "message", "role": "user", "name": "acme-bot", "content": "acme says hi"}
     new_item, _ = await sanitize_responses_item(item, _sanitize_one_redact_acme)
-    assert new_item["name"] == "[ORG_001]-bot"
+    assert new_item["name"] == "acme-bot"
+    assert new_item["content"] == "[ORG_001] says hi"
 
 
-def test_collect_responses_item_text_chat_shaped_name_field() -> None:
+def test_collect_responses_item_text_chat_shaped_name_field_is_structural() -> None:
     item = {"type": "message", "role": "user", "name": "acme-bot", "content": "hi"}
-    assert "acme-bot" in collect_responses_item_text(item)
+    assert "acme-bot" not in collect_responses_item_text(item)
 
 
-async def test_sanitize_responses_item_mcp_server_label_is_scanned() -> None:
-    """mcp_call/mcp_list_tools `server_label` is developer-chosen free text
-    that can carry an internal corp name — exactly what replace.md rules
-    target — not a fixed provider enum."""
+async def test_sanitize_responses_item_mcp_server_label_is_structural() -> None:
+    """mcp_call/mcp_list_tools `server_label` correlates a call item back to
+    its `tools` declaration by exact value — rewriting only the `input` side
+    would break that correlation, so it stays structural like `type`/`id`."""
     item = {
         "type": "mcp_call",
         "id": "mcp_1",
@@ -1668,9 +1674,9 @@ async def test_sanitize_responses_item_mcp_server_label_is_scanned() -> None:
         "output": "ok",
     }
     new_item, _ = await sanitize_responses_item(item, _sanitize_one_redact_acme)
-    assert new_item["server_label"] == "[ORG_001]-internal-mcp"
+    assert new_item["server_label"] == "acme-internal-mcp"
 
 
-def test_collect_responses_item_text_mcp_server_label() -> None:
+def test_collect_responses_item_text_mcp_server_label_is_structural() -> None:
     item = {"type": "mcp_list_tools", "id": "t1", "server_label": "acme-internal-mcp"}
-    assert "acme-internal-mcp" in collect_responses_item_text(item)
+    assert "acme-internal-mcp" not in collect_responses_item_text(item)
