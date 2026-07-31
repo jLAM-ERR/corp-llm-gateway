@@ -1042,7 +1042,11 @@ async def test_sanitize_unknown_block_type_preserves_signature_verbatim() -> Non
     assert new_block["payload"] == "[REDACTED]"
 
     assert desanitize_content(new_block, lambda text: text)["signature"] == sig
-    assert collect_text(block) == ["raw secret"]
+    # Round-4 nit: opaque for REWRITING (must round-trip byte-identical) need
+    # not mean invisible to Stage 0/Stage 5 SCANNING — a signature is small
+    # (unlike a binary image field), so surfacing it costs nothing and closes
+    # a blind spot a canary/secret could otherwise hide behind.
+    assert set(collect_text(block)) == {"raw secret", sig}
 
 
 async def test_sanitize_known_opaque_block_types_still_pass_through() -> None:
@@ -1080,9 +1084,9 @@ async def test_sanitize_responses_item_custom_tool_call_input() -> None:
     new_item, results = await sanitize_responses_item(item, mock_sanitize)
     assert new_item["input"] == "*** Add File: x\n+KEY=[SECRET_001]"
     assert new_item["call_id"] == "call_1"
-    # "name" is scanned too (not a fixed enum) but has no match here — only
-    # "input" actually redacts.
-    assert len([r for r in results if r.pairs]) == 1
+    # "name" is structural (never scanned) — only "input" is, so exactly one
+    # field routed through sanitize_one at all (not just one that redacted).
+    assert len(results) == 1
 
 
 async def test_sanitize_responses_item_reasoning_summary() -> None:
@@ -1117,9 +1121,9 @@ async def test_sanitize_responses_item_function_call_arguments_json() -> None:
     }
     new_item, results = await sanitize_responses_item(item, mock_sanitize)
     assert json.loads(new_item["arguments"]) == {"to": "[E1]"}
-    # "name" is scanned too (not a fixed enum) but has no match here — only
-    # "arguments" actually redacts.
-    assert len([r for r in results if r.pairs]) == 1
+    # "name" is structural (never scanned) — only "arguments" is, so exactly
+    # one field routed through sanitize_one at all (not just one that redacted).
+    assert len(results) == 1
 
 
 async def test_sanitize_responses_item_function_call_output() -> None:
@@ -1594,9 +1598,11 @@ async def test_sanitize_mcp_call_output_is_scanned() -> None:
     }
     new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
     assert new_item["output"] == "[ORG_001] response"
-    # "name"/"server_label" are structural (never scanned) — only "output" is.
+    # "name"/"server_label" are structural (never scanned) — only "output" is,
+    # so exactly one field routed through sanitize_one at all (not just one
+    # that redacted).
     assert new_item["server_label"] == "s1"
-    assert len([r for r in results if r.pairs]) == 1
+    assert len(results) == 1
 
 
 def test_collect_responses_item_text_mcp_call_output() -> None:

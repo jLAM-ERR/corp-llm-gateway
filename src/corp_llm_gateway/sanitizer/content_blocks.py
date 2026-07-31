@@ -657,9 +657,16 @@ def _collect_block_text(block: dict[str, Any]) -> list[str]:
     if block_type in _OPAQUE_BLOCK_TYPES:
         return []
     # Mirror _sanitize_block's fail-safe generic scan for an unrecognized type.
+    # NOTE: intentionally narrower than _sanitize_block's rewrite exclusion
+    # (_BLOCK_FALLBACK_OPAQUE_KEYS) — "signature" is opaque only for
+    # REWRITING (must round-trip byte-identical for Anthropic's signature
+    # check), not for scanning; it is small (unlike a binary image field), so
+    # surfacing it to Stage 0/Stage 5 costs nothing and closes a blind spot a
+    # canary/secret could otherwise hide behind. "encrypted_content" stays
+    # excluded here too: it is genuinely ciphertext, not plaintext to scan.
     fallback_text: list[str] = []
     for key, value in block.items():
-        if key == "type" or key in _BLOCK_FALLBACK_OPAQUE_KEYS:
+        if key == "type" or key in _JSON_OPAQUE_KEYS:
             continue
         fallback_text.extend(_collect_json_text(value, 1))
     return fallback_text
@@ -726,6 +733,13 @@ _RESPONSES_BLOCK_LIST_FIELDS = frozenset({"content", "summary"})
 # exactly one or two item types here would silently leave every other item
 # type's binary/text fields un-DLP'd, the same defect class as the
 # field-registry gap this registry itself replaces.
+#
+# Unlike the block-level "signature" field (_collect_block_text), these stay
+# excluded from SCANNING too, not just rewriting: they hold multi-KB/MB
+# base64 binary blobs by design, so feeding them into Stage 0/Stage 5's
+# regex scan would reintroduce the exact oversize/event-loop cost this
+# registry exists to dodge, for a field where a DLP match is vanishingly
+# unlikely (binary bytes, not plaintext) anyway.
 _RESPONSES_OPAQUE_ITEM_FIELDS: dict[str, frozenset[str]] = {
     "computer_call_output": frozenset({"output"}),
     "image_generation_call": frozenset({"result"}),
