@@ -548,6 +548,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             for _s0_msg in messages:
                 if isinstance(_s0_msg, (dict, str)):
                     _s0_texts.extend(_item_text(_s0_msg))
+            if request_shape == "unmanaged" and "input" in data:
+                # Same blind spot Stage 5 already closed: a non-chat call_type
+                # (embeddings/moderations/pass-through) never gets `input`
+                # rewritten, but a config/secret dump there must still be
+                # visible to the pre-egress classifier, not just the DLP guard.
+                _s0_texts.extend(collect_raw_text_leaves(data.get("input")))
             for _prompt_field in ("system", "instructions"):
                 _s0_texts.extend(collect_text(data.get(_prompt_field)))
             _s0_reason = classify_block("\n".join(_s0_texts))

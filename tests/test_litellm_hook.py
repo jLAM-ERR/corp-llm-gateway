@@ -4670,6 +4670,28 @@ async def test_stage0_disabled_by_flag_allows_through() -> None:
         _cfg_module.reset_cache()
 
 
+async def test_stage0_scans_unmanaged_call_type_input_too() -> None:
+    """Round-4 IMPORTANT 5: Stage 0 iterated only `messages` (empty for an
+    unmanaged call_type), so a config/secret dump posted to /v1/embeddings
+    was never blocked, while identical text in `messages` would be."""
+    g, _ = _build_guardrail()
+    env_content = (
+        "DATABASE_URL=postgres://admin:pass@db.corp.lan/prod\n"
+        "SECRET_KEY=supersecretvalue\n"
+        "DEBUG=False\n"
+        "REDIS_URL=redis://cache.corp.lan\n"
+        "LOG_LEVEL=ERROR\n"
+    )
+    data = {
+        "model": "text-embedding-3-small",
+        "input": env_content,
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data, call_type="embedding")
+    assert ei.value.error_code == "E_POLICY_BLOCKED"
+
+
 # ---- Stage 5 DLP egress guard -----------------------------------------------
 
 
