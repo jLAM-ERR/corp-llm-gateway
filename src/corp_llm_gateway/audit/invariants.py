@@ -81,10 +81,16 @@ def _walk_values_only(node: Any) -> None:
     """Walk a DATA_KEYED_FIELDS value: its own keys are detector-label data, so
     skip matching them against NEVER_FIELDS — but still walk every value with
     the normal `_walk`, so a NEVER key nested one level deeper is still caught.
+
+    Only THIS immediate key layer is exempt. A list found directly as the
+    data-keyed field's value hands its items to the normal `_walk` (not back
+    to `_walk_values_only`) — otherwise a NEVER key nested under that list
+    would be exempted from key matching at every depth below it, not just
+    this one level.
     """
     if isinstance(node, Mapping):
         for value in node.values():
             _walk(value)
     elif isinstance(node, (list, tuple)):
         for item in node:
-            _walk_values_only(item)
+            _walk(item)
