@@ -579,6 +579,101 @@ async def test_rule_spans_win_over_overlapping_local_findings() -> None:
     )
 
 
+async def test_oracle_mapping_preserves_non_overlapping_occurrence_and_cache_hit() -> None:
+    """A rule overlap must not discard the same oracle original elsewhere."""
+    text = "Alice Smith met Alice"
+    rules = Rules(rules=(Rule("Alice Smith", "[CONTRACTOR_001]"),))
+    client, captured = _client_returning_pairs([("Alice", "[PERSON_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+    )
+
+    first = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+    cached = await orch.sanitize(text, team_id="t1", conversation_id="c2")
+
+    assert first.sanitized_text == "[CONTRACTOR_001] met [PERSON_001]"
+    assert first.pairs == (
+        ("Alice Smith", "[CONTRACTOR_001]"),
+        ("Alice", "[PERSON_001]"),
+    )
+    assert cached.sanitized_text == first.sanitized_text
+    assert cached.pairs == first.pairs
+    assert cached.applied_spans == first.applied_spans
+    assert cached.cache_a_hit is True
+    assert len(captured) == 1
+
+
+async def test_fully_rule_covered_oracle_pair_is_not_stored() -> None:
+    rules = Rules(rules=(Rule("Alice Smith", "[CONTRACTOR_001]"),))
+    client, _ = _client_returning_pairs([("Alice", "[PERSON_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+    )
+
+    result = await orch.sanitize("Alice Smith", team_id="t1", conversation_id="c1")
+
+    assert result.sanitized_text == "[CONTRACTOR_001]"
+    assert result.pairs == (("Alice Smith", "[CONTRACTOR_001]"),)
+
+
+async def test_shorter_rule_span_wins_over_longer_oracle_original() -> None:
+    rules = Rules(rules=(Rule("Alice", "[EMPLOYEE_001]"),))
+    client, _ = _client_returning_pairs([("Alice Smith", "[PERSON_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+    )
+
+    result = await orch.sanitize("Alice Smith", team_id="t1", conversation_id="c1")
+
+    assert result.sanitized_text == "[EMPLOYEE_001] Smith"
+    assert result.pairs == (("Alice", "[EMPLOYEE_001]"),)
+
+
+async def test_rule_replacement_is_not_rescanned_by_oracle_pair() -> None:
+    rules = Rules(rules=(Rule("Alice Smith", "AliceAlias"),))
+    client, _ = _client_returning_pairs([("Alice", "[PERSON_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+    )
+
+    result = await orch.sanitize(
+        "Alice Smith met Alice and Alice", team_id="t1", conversation_id="c1"
+    )
+
+    assert result.sanitized_text == "AliceAlias met [PERSON_001] and [PERSON_001]"
+
+
+async def test_oracle_rule_overlap_is_span_aware_in_chunked_path() -> None:
+    text = "Alice Smith met Alice"
+    rules = Rules(rules=(Rule("Alice Smith", "[CONTRACTOR_001]"),))
+    client, _ = _client_returning_pairs([("Alice", "[PERSON_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        size_threshold_bytes=1,
+        oversize_policy=OVERSIZE_CHUNK,
+        chunk_window_chars=16,
+        chunk_overlap_chars=8,
+    )
+
+    result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+
+    assert result.sanitized_text == "[CONTRACTOR_001] met [PERSON_001]"
+    assert result.pairs == (
+        ("Alice Smith", "[CONTRACTOR_001]"),
+        ("Alice", "[PERSON_001]"),
+    )
+
+
 async def test_rules_bijection_holds_in_gazetteer_nohit() -> None:
     """Multiple rules in no-hit branch: unique originals + unique placeholders."""
     gaz = Gazetteer({})
@@ -714,12 +809,24 @@ async def test_same_profile_fingerprint_preserves_cache_hit() -> None:
     assert len(captured) == 1, "cache A must save the second corp-LLM call"
 
 
-async def test_none_fingerprint_is_byte_identical_to_legacy_key() -> None:
-    """Back-compat: a None fingerprint yields exactly today's content hash."""
+async def test_none_fingerprint_omits_profile_discriminator() -> None:
+    """An omitted fingerprint and explicit None share the no-profile key."""
     from corp_llm_gateway.sanitizer.orchestrator import _content_hash
 
     rules = Rules(rules=(Rule("alice", "[N1]"),))
     assert _content_hash("t1", rules, "x") == _content_hash("t1", rules, "x", None)
+
+
+def test_content_hash_includes_cache_algorithm_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from corp_llm_gateway.sanitizer import orchestrator
+
+    rules = Rules(rules=(Rule("alice", "[N1]"),))
+    current = orchestrator._content_hash("t1", rules, "x")
+    monkeypatch.setattr(orchestrator, "_CACHE_A_ALGORITHM_VERSION", b"previous-version")
+
+    assert orchestrator._content_hash("t1", rules, "x") != current
 
 
 async def test_content_hash_folds_fingerprint_into_key() -> None:

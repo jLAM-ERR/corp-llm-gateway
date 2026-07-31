@@ -1,9 +1,19 @@
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 _PLACEHOLDER_FIND_RE = re.compile(r"\[[A-Z][A-Z0-9_]*_\d{3,}\]")
 _UNWRAPPED_PLACEHOLDER_FIND_RE = re.compile(r"(?<!\[)\b[A-Z][A-Z0-9_]*_[A-Z0-9_]+\b(?!\])")
 _RESPONSE_ALIAS_RE = re.compile(r"^\[(?P<alias>[A-Z][A-Z0-9_]*_[A-Z0-9_]+)\]$")
+
+
+@dataclass(frozen=True)
+class AppliedSpan:
+    """One original-text range selected for forward substitution."""
+
+    start: int
+    end: int
+    original: str
 
 
 def find_placeholder_literals(text: str) -> list[str]:
@@ -71,11 +81,50 @@ def apply_pairs(text: str, pairs: Iterable[tuple[str, str]]) -> str:
     Longer originals are substituted first so a shorter original that is a
     substring of a longer one cannot partially corrupt it. This is the forward
     counterpart to :func:`sort_placeholders_by_descending_length` (reverse
-    path) and mirrors ``orchestrator._apply_pairs``.
+    path). Span-aware orchestrators use :func:`apply_spans`; this remains the
+    fallback for legacy/custom sanitizers without span metadata.
     """
     for original, placeholder in sorted(pairs, key=lambda p: -len(p[0])):
         text = text.replace(original, placeholder)
     return text
+
+
+def apply_spans(
+    text: str,
+    spans: Iterable[AppliedSpan],
+    pairs: Iterable[tuple[str, str]],
+) -> str:
+    """Apply a preselected, non-overlapping replacement plan in one pass.
+
+    Replacements are read from *pairs* by original so request-level placeholder
+    canonicalization can reuse the exact spans without rescanning or chaining.
+    """
+    by_original: dict[str, str] = {}
+    for original, replacement in pairs:
+        by_original.setdefault(original, replacement)
+
+    ordered = sorted(spans, key=lambda span: (span.start, span.end))
+    out: list[str] = []
+    cursor = 0
+    for span in ordered:
+        if span.start < cursor or span.start < 0 or span.end <= span.start or span.end > len(text):
+            raise ValueError(
+                f"invalid or overlapping applied span: start={span.start} end={span.end}"
+            )
+        if text[span.start : span.end] != span.original:
+            raise ValueError(
+                f"applied span does not match source text: start={span.start} end={span.end}"
+            )
+        selected_replacement = by_original.get(span.original)
+        if selected_replacement is None:
+            raise ValueError(
+                f"missing replacement for applied span: start={span.start} end={span.end}"
+            )
+        out.append(text[cursor : span.start])
+        out.append(selected_replacement)
+        cursor = span.end
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 _PLACEHOLDER_LABEL_RE = re.compile(r"^\[(?P<family>.+)_(?P<index>\d+)\]$")
