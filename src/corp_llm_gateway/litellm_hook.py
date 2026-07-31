@@ -1432,20 +1432,25 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
     return selected
 
 
-# litellm.types.utils.CallTypes values for chat/Responses-shaped requests —
-# the only ones where `data["input"]`/`data["messages"]` are conversational
-# text this gateway should sanitize (MAJOR 6). Everything else (embedding,
-# moderation, image_generation, transcription, rerank, ...) must pass through
-# untouched: their `input`/similar fields are not chat content.
-_CHAT_OR_RESPONSES_CALL_TYPES = frozenset(
+# litellm.types.utils.CallTypes values whose `input` field means raw
+# text/tokens to embed or score, NOT a Responses items list. This is a
+# DENYLIST, not an allowlist: `data["input"]` is treated as Responses-shaped
+# (and sanitized) by default, for every call_type not named here — including
+# `None` and any call_type this gateway has never seen (e.g. litellm's
+# `/v1/responses/compact` route, "acompact_responses", which is a real
+# Responses-input endpoint but isn't a member of litellm's own CallTypes
+# enum). A positive allowlist here previously defaulted every unrecognized
+# call_type to unmanaged pass-through, egressing a real Responses `input`
+# items list unsanitized. Only endpoints confirmed to repurpose `input` for
+# non-conversational data are listed; the cost of over-sanitizing some other
+# unlisted endpoint is a bug report, the cost of under-sanitizing one is a
+# leak.
+_NON_CHAT_INPUT_CALL_TYPES = frozenset(
     {
-        "completion",
-        "acompletion",
-        "text_completion",
-        "atext_completion",
-        "responses",
-        "aresponses",
-        "anthropic_messages",
+        "embedding",
+        "aembedding",
+        "moderation",
+        "amoderation",
     }
 )
 
@@ -1462,7 +1467,7 @@ def _request_items(data: dict[str, Any], call_type: str | None = None) -> tuple[
     if "messages" in data:
         messages = data.get("messages")
         return ([] if messages is None else messages), "messages"
-    if call_type is not None and call_type not in _CHAT_OR_RESPONSES_CALL_TYPES:
+    if call_type in _NON_CHAT_INPUT_CALL_TYPES:
         return [], "unmanaged"
     if "input" not in data:
         return [], "messages"
