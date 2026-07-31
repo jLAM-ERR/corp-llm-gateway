@@ -129,6 +129,20 @@ def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> Callable[[str
     Every reverse site (unary response, Anthropic/OpenAI SSE streaming,
     Responses SSE streaming) must build its reverse function through this
     helper so the boundary rule is enforced uniformly.
+
+    The returned callable also accepts ``protected_prefix`` (default ``0``):
+    the number of leading characters of ``text`` that must never be consumed
+    by a bare-alias match, even though they're still visible to its LEADING
+    lookbehind. A streaming caller that truncates its buffer needs one real
+    character of true left context to correctly resolve the boundary check
+    for a bare alias sitting at the buffer's new start (see
+    ``streaming.StreamingDesanitizer._replace_all``); prepending that
+    character makes it visible to the lookbehind without letting a match
+    retroactively consume text that was already emitted to the client.
+    Bracketed placeholders need no such guard — an exact ``[FAMILY_NNN]``
+    substring is always caught (or definitively absent) using only the text
+    present in a single buffer BEFORE any truncation, so it can never survive
+    un-replaced only to combine with later text at the truncation point.
     """
     by_placeholder: dict[str, str] = {}
     for original, placeholder in pairs:
@@ -142,23 +156,28 @@ def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> Callable[[str
             pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(placeholder)}(?![A-Za-z0-9_])")
             entries.append((placeholder, replacement, pattern))
 
-    def _reverse(text: str, *, final: bool = True) -> str:
+    def _reverse(text: str, *, final: bool = True, protected_prefix: int = 0) -> str:
         for placeholder, replacement, pattern in entries:
             if pattern is None:
                 text = text.replace(placeholder, replacement)
                 continue
-            if final:
+            if final and protected_prefix == 0:
                 text = pattern.sub(lambda _m, r=replacement: r, text)
                 continue
-            # Not the final flush: a match whose end lands exactly at the
-            # buffer's current end can't yet be told apart from one a later
-            # chunk could still extend past the boundary — defer it (leave
-            # it unmatched here) instead of finalizing.
+            # Not the final flush, or a protected prefix is in play: a match
+            # whose end lands exactly at the buffer's current end can't yet be
+            # told apart from one a later chunk could still extend past the
+            # boundary — defer it (leave it unmatched here) instead of
+            # finalizing. A match starting inside `protected_prefix` is text
+            # already emitted to the client — never replace it, regardless of
+            # `final`.
             pieces: list[str] = []
             cursor = 0
             end = len(text)
             for m in pattern.finditer(text):
-                if m.end() == end:
+                if m.start() < protected_prefix:
+                    continue
+                if not final and m.end() == end:
                     break
                 pieces.append(text[cursor : m.start()])
                 pieces.append(replacement)

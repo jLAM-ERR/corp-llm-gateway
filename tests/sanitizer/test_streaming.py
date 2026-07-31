@@ -310,6 +310,35 @@ def test_bare_alias_ending_in_hold_back_sentinel_char_restored_in_one_feed() -> 
     assert out == "see ProjectPhoenix here"
 
 
+# ---- Round-4 CRITICAL 3: the LEADING boundary is defeated by truncation ----
+
+
+def test_bare_alias_leading_boundary_survives_buffer_truncation_across_chunks() -> None:
+    """Exact review repro. One-shot correctly leaves `XNAME_001` untouched (the
+    anchor's leading lookbehind sees `X`, an identifier char, right before the
+    alias). Split so the `X` gets flushed out of the buffer (truncated away)
+    before the alias itself is re-scanned in a later feed() — losing that
+    context must not make the anchor wrongly accept the match."""
+    d = StreamingDesanitizer(_mapping(("John Smith", "[NAME_001]"), ("John Smith", "NAME_001")))
+    out = d.feed("class XNAME_001 x")
+    out += d.feed(" rest")
+    out += d.flush()
+    assert out == "class XNAME_001 x rest"
+
+
+def test_bare_alias_leading_boundary_still_restores_at_real_word_boundary_after_truncation() -> (
+    None
+):
+    """Positive control: same truncation-inducing split, but the character
+    preceding the alias is a genuine non-identifier boundary — the fix must
+    not become over-conservative and block a legitimate restoration."""
+    d = StreamingDesanitizer(_mapping(("John Smith", "[NAME_001]"), ("John Smith", "NAME_001")))
+    out = d.feed("class NAME_001 x")
+    out += d.feed(" rest")
+    out += d.flush()
+    assert out == "class John Smith x rest"
+
+
 # Streaming async iterator interface ----------------------------------------
 
 

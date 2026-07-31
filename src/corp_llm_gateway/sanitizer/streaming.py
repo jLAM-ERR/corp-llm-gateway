@@ -41,6 +41,14 @@ class StreamingDesanitizer:
         self._max_len = max((len(placeholder) for _, placeholder in mapping.pairs), default=0)
         self._buffer = ""
         self._flushed = False
+        # The one real character immediately preceding `self._buffer`, kept
+        # only to give the bare-alias LEADING boundary lookbehind a true
+        # answer once truncation has dropped that character out of the
+        # buffer itself. Never re-emitted, never itself replaced (see
+        # `_replace_all`'s `protected_prefix`). Empty at true start-of-stream,
+        # where "nothing precedes" is the correct (not merely apparent)
+        # answer.
+        self._left_context = ""
 
     def feed(self, chunk: str) -> str:
         if self._flushed:
@@ -69,6 +77,7 @@ class StreamingDesanitizer:
             return ""
         safe = self._buffer[:-hold]
         self._buffer = self._buffer[-hold:]
+        self._left_context = safe[-1]
         return safe
 
     def flush(self) -> str:
@@ -89,7 +98,10 @@ class StreamingDesanitizer:
             yield tail
 
     def _replace_all(self, text: str, *, final: bool) -> str:
-        return self._reverse(text, final=final)
+        prefix_len = len(self._left_context)
+        combined = self._left_context + text
+        result = self._reverse(combined, final=final, protected_prefix=prefix_len)
+        return result[prefix_len:]
 
 
 class OpenAiToolCallDesanitizer:
