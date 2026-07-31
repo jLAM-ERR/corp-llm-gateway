@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 
 from corp_llm_gateway import config
 from corp_llm_gateway.audit import StdoutSink
-from corp_llm_gateway.bootstrap import build_guardrail
+from corp_llm_gateway.bootstrap import _flag, build_guardrail
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
@@ -89,7 +89,9 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         # hosted_vllm forwards proxy_server_request headers (incl. Host:
         # 127.0.0.1:4000) to the corp ingress, which 503s the unknown vhost.
         strip_inbound_headers_to_upstream=True,
-        forward_chatgpt_auth=((config.get("CORP_LLM_FORWARD_CHATGPT_AUTH", "0") or "0") == "1"),
+        # settings.parse_flag is the single flag parser (true/yes/on/1, case-insensitive);
+        # a raw `== "1"` here would silently reject those spellings.
+        forward_chatgpt_auth=_flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0"),
     )
 
 
