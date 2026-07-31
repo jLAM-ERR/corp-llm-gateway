@@ -1652,6 +1652,90 @@ async def test_post_call_unary_no_state_returns_unchanged() -> None:
     assert out == response
 
 
+# ---- Task 12: _apply_reverse_to_response model_dump/validate/copy broadening
+
+
+class _FakeChatModelResponse:
+    """Duck-typed stand-in for litellm's Pydantic Chat Completions
+    ``ModelResponse`` (pydantic isn't installed in this venv). Mirrors the
+    ``model_dump``/``model_validate``/``model_copy`` trio
+    ``_apply_reverse_to_response`` relies on, since litellm hands
+    ``post_call_unary`` a real object rather than a dict in some code paths."""
+
+    def __init__(self, choices: list[dict[str, Any]]) -> None:
+        self.choices = choices
+
+    def model_dump(self, mode: str = "python", exclude_none: bool = False) -> dict[str, Any]:
+        return {"choices": self.choices}
+
+    @classmethod
+    def model_validate(cls, payload: dict[str, Any]) -> "_FakeChatModelResponse":
+        return cls(payload["choices"])
+
+    def model_copy(self, *, update: dict[str, Any], deep: bool = True) -> "_FakeChatModelResponse":
+        return _FakeChatModelResponse(update.get("choices", self.choices))
+
+
+class _FakeChatModelResponseValidateFails(_FakeChatModelResponse):
+    @classmethod
+    def model_validate(cls, payload: dict[str, Any]) -> "_FakeChatModelResponseValidateFails":
+        raise ValueError("simulated reconstruction failure")
+
+
+async def test_post_call_unary_non_model_response_passes_through_unchanged_like_release() -> None:
+    """release/1.0.x returned any non-str/non-dict response unchanged — an
+    object with no ``model_dump`` still does, matching that baseline exactly."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = 12345
+    out = await g.post_call_unary(data, response)
+    assert out is response
+
+
+async def test_post_call_unary_reverses_chat_completions_model_response_object() -> None:
+    """Decision (Task 12): keep the broadening. litellm can hand
+    ``post_call_unary`` a real Pydantic ``ModelResponse`` object instead of a
+    dict — release's str/dict-only branch left that case un-desanitized
+    (safe, but broken). ``desanitize_responses_payload`` is field-name-keyed
+    (``content``/``arguments`` are shared with Chat Completions), so reusing it
+    here is not Responses-specific and correctly restores this shape too."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = _FakeChatModelResponse(
+        [{"message": {"role": "assistant", "content": "hello [N1]!"}}]
+    )
+    out = await g.post_call_unary(data, response)
+
+    assert isinstance(out, _FakeChatModelResponse)
+    assert out.choices[0]["message"]["content"] == "hello alice!"
+
+
+async def test_post_call_unary_response_reconstruct_failure_does_not_bypass_validation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``model_validate`` failure must not silently fall through to an
+    unvalidated ``model_copy`` — it must surface (logged) and fall back to the
+    untouched, still-valid original response rather than an unchecked object."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = _FakeChatModelResponseValidateFails(
+        [{"message": {"role": "assistant", "content": "hello [N1]!"}}]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        out = await g.post_call_unary(data, response)
+
+    assert out is response
+    assert "litellm_post_call_response_reconstruct_failed" in caplog.text
+    assert "E_RESPONSE_RECONSTRUCT_FAILED" in caplog.text
+
+
 # ---- New task tests (tasks 2 & 4) -------------------------------------------
 
 
