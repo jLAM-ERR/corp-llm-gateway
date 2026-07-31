@@ -827,3 +827,29 @@ async def test_oracle_disabled_local_pass_branch_applies_replace_md_rules() -> N
     placeholders = [p for _, p in result.pairs]
     assert len(originals) == len(set(originals)), "duplicate original in pairs"
     assert len(placeholders) == len(set(placeholders)), "placeholder collision"
+
+
+async def test_oracle_enabled_local_pass_branch_applies_replace_md_rules_directly() -> None:
+    """local_pass branch (no gazetteer), oracle enabled (decision 3): a replace.md
+    rule is redacted even when the oracle's own tool-call response never echoes
+    it back — deterministic rule application must not depend on the oracle
+    honoring the system prompt."""
+    rules = Rules(rules=(Rule("Zephyr Ledger", "[CONFIDENTIAL_PROJECT]"),))
+    # Oracle is called (enabled) but its response omits the rule's origin entirely.
+    client, call_count = _client_with_counter([("bob", "[PERSON_001]")])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _RuleLoader(rules),
+        local_detectors=[_StaticFindingDetector([])],
+        # oracle_enabled defaults to True; no gazetteer → local_pass branch
+    )
+    result = await orch.sanitize(
+        "Migrating Zephyr Ledger to new stack", team_id="t1", conversation_id="c1"
+    )
+    assert call_count[0] == 1, "oracle must be called when enabled"
+    assert ("Zephyr Ledger", "[CONFIDENTIAL_PROJECT]") in result.pairs
+    assert "[CONFIDENTIAL_PROJECT]" in result.sanitized_text
+    assert "Zephyr Ledger" not in result.sanitized_text
+    originals = [o for o, _ in result.pairs]
+    assert len(originals) == len(set(originals)), "duplicate original in pairs"

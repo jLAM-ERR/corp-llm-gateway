@@ -856,6 +856,27 @@ async def test_content_hash_folds_oracle_mode_into_key() -> None:
     assert on == _content_hash("t1", rules, "x", None, True), "same inputs must be stable"
 
 
+def test_content_hash_discriminates_on_both_oracle_mode_and_algorithm_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both Task 2 discriminators are orthogonal and both live: oracle_enabled keys
+    the detection mode, _CACHE_A_ALGORITHM_VERSION invalidates Cache-A across the
+    substitution-semantics change. Neither discriminator subsumes the other."""
+    from corp_llm_gateway.sanitizer import orchestrator
+
+    rules = Rules(rules=())
+    on_v1 = orchestrator._content_hash("t1", rules, "x", None, True)
+    off_v1 = orchestrator._content_hash("t1", rules, "x", None, False)
+    assert on_v1 != off_v1, "oracle mode must discriminate at a fixed algorithm version"
+
+    monkeypatch.setattr(orchestrator, "_CACHE_A_ALGORITHM_VERSION", b"previous-version")
+    on_v2 = orchestrator._content_hash("t1", rules, "x", None, True)
+    off_v2 = orchestrator._content_hash("t1", rules, "x", None, False)
+    assert on_v2 != off_v2, "oracle mode must discriminate at a different algorithm version too"
+    assert on_v1 != on_v2, "algorithm version must discriminate at a fixed oracle mode"
+    assert off_v1 != off_v2, "algorithm version must discriminate at a fixed oracle mode"
+
+
 async def test_none_fingerprint_preserves_dedup_behavior() -> None:
     """Default (None) fingerprint keeps the pre-D3 shared-dedup behavior intact."""
     client, captured = _client_returning_pairs([("alice", "[N1]")])

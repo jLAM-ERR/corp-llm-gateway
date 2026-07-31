@@ -559,9 +559,11 @@ class SanitizationOrchestrator:
                 base_pairs = rules_pairs + oracle_result.pairs
                 merged_pairs = _merge_local(base_pairs, local_kept)
             else:
-                # Oracle disabled: same direct rule application as the enabled arm
-                # above, just without an oracle round-trip to merge on top — rule
-                # handling is now uniform across oracle-on/oracle-off.
+                # Oracle disabled: rules no longer arrive via the oracle round-trip —
+                # apply replace.md rules directly (rules_pairs, already computed
+                # above), same precedence as the gazetteer branch's oracle-skipped
+                # case (rules are the base; local findings merge in after, per
+                # _merge_local's dedup-by-origin rules).
                 local_findings = await local_pass.findings(text)
                 logger.info(
                     "sanitize_branch=local_pass oracle=disabled team_id=%s conversation_id=%s "
@@ -570,9 +572,8 @@ class SanitizationOrchestrator:
                     conversation_id,
                     len(rules_pairs),
                 )
-                local_kept = _filter_findings_overlapping_rules(local_findings, rule_matches)
                 base_pairs = rules_pairs
-                merged_pairs = _merge_local(base_pairs, local_kept)
+                merged_pairs = _merge_local(base_pairs, local_findings)
             logger.info(
                 "sanitize_local_pass team_id=%s conversation_id=%s "
                 "oracle_pairs=%d local_findings=%d merged_pairs=%d",
