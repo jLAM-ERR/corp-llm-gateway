@@ -198,7 +198,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         data: dict[str, Any],
         call_type: str,
     ) -> dict[str, Any]:
-        return await self.pre_call(data)
+        return await self.pre_call(data, call_type=call_type)
 
     async def async_post_call_streaming_iterator_hook(
         self,
@@ -244,7 +244,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
     # ---- Pure logic (unit-testable without LiteLLM) -----------------------
 
-    async def pre_call(self, data: dict[str, Any]) -> dict[str, Any]:
+    async def pre_call(
+        self, data: dict[str, Any], *, call_type: str | None = None
+    ) -> dict[str, Any]:
         """Sanitize a request body in-place; return the mutated dict.
 
         If `max_output_tokens_cap` was passed to __init__, clamp the
@@ -255,10 +257,19 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         Order: auth → strip corp token → sanitize messages → return.
         Failures are mapped to GuardrailHttpException with stable
         error_code so post-call audit can attribute the failure.
+
+        *call_type*: litellm's per-endpoint call type (MAJOR 6). `data["input"]`
+        means something completely different across endpoints — a Responses
+        API items list, but ALSO the raw text/tokens `/v1/embeddings` and
+        `/v1/moderations` send. Without this, both got routed through the
+        Responses item walker: embeddings got vectorized on placeholder text,
+        moderation got scored on redacted text. `None` (every existing direct
+        `pre_call()` call site/test) preserves today's behavior; only the real
+        `async_pre_call_hook` wiring supplies a call_type.
         """
         request_id = self._ensure_request_id(data)
         model = str(data.get("model") or "unknown")
-        raw_messages, request_shape = _request_items(data)
+        raw_messages, request_shape = _request_items(data, call_type)
         message_count = len(raw_messages) if isinstance(raw_messages, list) else 0
         logger.info(
             "litellm_pre_call_received request_id=%s model=%s message_count=%d",
@@ -802,7 +813,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             or _s5_policy.canary_patterns
         ):
             _s5_texts: list[str] = []
-            _s5_messages, _ = _request_items(data)
+            _s5_messages, _ = _request_items(data, call_type)
             for _s5_msg in _s5_messages or []:
                 if isinstance(_s5_msg, (dict, str)):
                     _s5_texts.extend(_item_text(_s5_msg))
@@ -1415,11 +1426,38 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
     return selected
 
 
-def _request_items(data: dict[str, Any]) -> tuple[Any, str]:
-    """Return a mutable message-like view for Chat Completions or Responses."""
+# litellm.types.utils.CallTypes values for chat/Responses-shaped requests —
+# the only ones where `data["input"]`/`data["messages"]` are conversational
+# text this gateway should sanitize (MAJOR 6). Everything else (embedding,
+# moderation, image_generation, transcription, rerank, ...) must pass through
+# untouched: their `input`/similar fields are not chat content.
+_CHAT_OR_RESPONSES_CALL_TYPES = frozenset(
+    {
+        "completion",
+        "acompletion",
+        "text_completion",
+        "atext_completion",
+        "responses",
+        "aresponses",
+        "anthropic_messages",
+    }
+)
+
+
+def _request_items(data: dict[str, Any], call_type: str | None = None) -> tuple[Any, str]:
+    """Return a mutable message-like view for Chat Completions or Responses.
+
+    MAJOR 6: `data["input"]` is NOT unique to chat/Responses — `/v1/embeddings`
+    and `/v1/moderations` also carry an `input` field, but it means raw
+    text/tokens to embed or score, not a Responses items list. Gate the
+    Responses `input` interpretation on `call_type` so those endpoints are
+    left untouched (matching release, which had no `input` handling at all).
+    """
     if "messages" in data:
         messages = data.get("messages")
         return ([] if messages is None else messages), "messages"
+    if call_type is not None and call_type not in _CHAT_OR_RESPONSES_CALL_TYPES:
+        return [], "unmanaged"
     if "input" not in data:
         return [], "messages"
     response_input = data.get("input")
@@ -1429,6 +1467,8 @@ def _request_items(data: dict[str, Any]) -> tuple[Any, str]:
 
 
 def _store_request_items(data: dict[str, Any], items: list[Any], shape: str) -> None:
+    if shape == "unmanaged":
+        return
     if shape == "messages":
         data["messages"] = items
     elif shape == "input_string":

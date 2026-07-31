@@ -628,6 +628,98 @@ async def test_pre_call_responses_bare_string_input_element_is_sanitized() -> No
     assert out["input"][0] == "leak [SECRET_001] here"
 
 
+# ---- MAJOR 6: pre_call must gate the `input` handling on call_type ---------
+
+
+async def test_pre_call_embeddings_input_string_passes_through_untouched() -> None:
+    """Exact review repro: /v1/embeddings' `input` is raw text to vectorize,
+    not a Responses items list — release left it untouched; sanitizing it
+    would vectorize on placeholder text instead of the real text."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+    data = {
+        "model": "text-embedding-3-small",
+        "input": "alice@corp.example",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data, call_type="embedding")
+    assert out["input"] == "alice@corp.example"
+    assert "messages" not in out
+
+
+async def test_pre_call_moderations_input_list_passes_through_untouched() -> None:
+    """Exact review repro: /v1/moderations' `input` is a list of raw strings
+    to score, not Responses items — moderation scoring must see the real
+    text, not a redacted one."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]"), ("bob", "[NAME_002]")])
+    data = {
+        "model": "omni-moderation-latest",
+        "input": ["alice", "bob"],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data, call_type="moderation")
+    assert out["input"] == ["alice", "bob"]
+    assert "messages" not in out
+
+
+async def test_pre_call_amoderation_call_type_also_passes_through() -> None:
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+    data = {
+        "model": "omni-moderation-latest",
+        "input": "alice",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data, call_type="amoderation")
+    assert out["input"] == "alice"
+
+
+async def test_pre_call_responses_call_type_still_sanitizes_input() -> None:
+    """The gate must not become a blanket pass-through: a real Responses
+    call_type still gets the full `input` treatment."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "contact alice",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data, call_type="responses")
+    assert out["input"] == "contact [NAME_001]"
+
+
+async def test_pre_call_completion_call_type_still_sanitizes_messages() -> None:
+    """Chat Completions call types must be unaffected by the gate."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+    data = _data_with_token("tok-1", content="contact alice")
+    out = await g.pre_call(data, call_type="completion")
+    assert out["messages"][0]["content"] == "contact [NAME_001]"
+
+
+async def test_pre_call_no_call_type_defaults_to_todays_behavior() -> None:
+    """Every existing direct pre_call() call site (no call_type argument)
+    must keep sanitizing `input` exactly as before — only the real
+    async_pre_call_hook wiring supplies a call_type."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "contact alice",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data)
+    assert out["input"] == "contact [NAME_001]"
+
+
+async def test_async_pre_call_hook_threads_call_type_to_embeddings_gate() -> None:
+    """Wiring test: the real litellm entry point must pass call_type through,
+    not just the pure-logic pre_call() method."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+    data = {
+        "model": "text-embedding-3-small",
+        "input": "alice@corp.example",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.async_pre_call_hook(None, None, data, "embedding")
+    assert out["input"] == "alice@corp.example"
+
+
 async def test_pre_call_codex_profile_oracle_disabled_applies_rules_directly() -> None:
     """Codex profile (forward_chatgpt_auth=True) + oracle disabled: a replace.md
     rule reaches the Responses `input` field through the local_pass branch's
