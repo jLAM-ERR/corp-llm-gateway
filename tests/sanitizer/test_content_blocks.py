@@ -1060,7 +1060,9 @@ async def test_sanitize_responses_item_custom_tool_call_input() -> None:
     new_item, results = await sanitize_responses_item(item, mock_sanitize)
     assert new_item["input"] == "*** Add File: x\n+KEY=[SECRET_001]"
     assert new_item["call_id"] == "call_1"
-    assert len(results) == 1
+    # "name" is scanned too (not a fixed enum) but has no match here — only
+    # "input" actually redacts.
+    assert len([r for r in results if r.pairs]) == 1
 
 
 async def test_sanitize_responses_item_reasoning_summary() -> None:
@@ -1095,7 +1097,9 @@ async def test_sanitize_responses_item_function_call_arguments_json() -> None:
     }
     new_item, results = await sanitize_responses_item(item, mock_sanitize)
     assert json.loads(new_item["arguments"]) == {"to": "[E1]"}
-    assert len(results) == 1
+    # "name" is scanned too (not a fixed enum) but has no match here — only
+    # "arguments" actually redacts.
+    assert len([r for r in results if r.pairs]) == 1
 
 
 async def test_sanitize_responses_item_function_call_output() -> None:
@@ -1570,7 +1574,9 @@ async def test_sanitize_mcp_call_output_is_scanned() -> None:
     }
     new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
     assert new_item["output"] == "[ORG_001] response"
-    assert len(results) == 1
+    # "name"/"server_label" are scanned too (not fixed enums) but have no
+    # match here — only "output" actually redacts.
+    assert len([r for r in results if r.pairs]) == 1
 
 
 def test_collect_responses_item_text_mcp_call_output() -> None:
@@ -1615,3 +1621,36 @@ async def test_sanitize_responses_item_structural_fields_never_scanned() -> None
     new_item, results = await sanitize_responses_item(item, fail_if_called)
     assert new_item == item
     assert results == []
+
+
+async def test_sanitize_responses_item_chat_shaped_name_field_is_scanned() -> None:
+    """`message.name` is caller-supplied free text (a chat-shaped item mixed
+    into Responses `input`, which this walker explicitly handles), not a
+    fixed enum — it must not be excluded as a structural identifier."""
+    item = {"type": "message", "role": "user", "name": "acme-bot", "content": "hi"}
+    new_item, _ = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert new_item["name"] == "[ORG_001]-bot"
+
+
+def test_collect_responses_item_text_chat_shaped_name_field() -> None:
+    item = {"type": "message", "role": "user", "name": "acme-bot", "content": "hi"}
+    assert "acme-bot" in collect_responses_item_text(item)
+
+
+async def test_sanitize_responses_item_mcp_server_label_is_scanned() -> None:
+    """mcp_call/mcp_list_tools `server_label` is developer-chosen free text
+    that can carry an internal corp name — exactly what replace.md rules
+    target — not a fixed provider enum."""
+    item = {
+        "type": "mcp_call",
+        "id": "mcp_1",
+        "server_label": "acme-internal-mcp",
+        "output": "ok",
+    }
+    new_item, _ = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert new_item["server_label"] == "[ORG_001]-internal-mcp"
+
+
+def test_collect_responses_item_text_mcp_server_label() -> None:
+    item = {"type": "mcp_list_tools", "id": "t1", "server_label": "acme-internal-mcp"}
+    assert "acme-internal-mcp" in collect_responses_item_text(item)

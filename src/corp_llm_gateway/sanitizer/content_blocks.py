@@ -730,11 +730,14 @@ def _is_opaque_item_field(item_type: object, field: str) -> bool:
 # from the generic default scan below so it isn't wasting a sanitize_one()
 # call per item on values that can never carry user content, and so "type"
 # (the routing discriminator every caller inspects) can never be rewritten.
-# "name"/"server_label"/"container_id" are provider- or config-chosen
-# identifiers (a tool name from the caller's fixed tool schema, an MCP server
-# label, a code-interpreter container id) — not text the model or user typed.
+# "container_id" is a code-interpreter container reference, not text the
+# model or user typed. "name" and "server_label" are deliberately NOT here:
+# a chat-shaped item mixed into `input` carries a caller-supplied
+# `message.name`, and an `mcp_call`/`mcp_list_tools` `server_label` is
+# developer-chosen free text that can carry an internal corp name — both are
+# exactly what replace.md rules target, so both must go through the scan.
 _RESPONSES_STRUCTURAL_FIELDS = frozenset(
-    {"type", "id", "call_id", "status", "role", "name", "server_label", "container_id"}
+    {"type", "id", "call_id", "status", "role", "container_id"}
 )
 
 
