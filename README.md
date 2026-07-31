@@ -133,6 +133,8 @@ Three integration patterns depending on your harness — full recipes in [`docs/
 | Cursor / Continue | app's custom-header settings field | localhost proxy |
 | `curl`, raw scripts | `--header 'X-Corp-Auth: …'` | localhost proxy |
 
+To run Codex against a ChatGPT subscription (OAuth, no OpenAI API key) instead of a static provider key, use the separate Responses profile: [`docs/chatgpt-codex.md`](docs/chatgpt-codex.md).
+
 The localhost proxy (Pattern 3, `corp-llm-gateway-proxy`) is universal — it injects `X-Corp-Auth` per request and re-reads the token file every call, so token rotation takes effect immediately:
 
 ```bash
@@ -258,7 +260,7 @@ Ongoing operations after install — incident playbook, fail-policy matrix, scal
 
 Each team maintains a `replace.md` file at `<rules-dir>/<team_id>.md`. These rules run **first** in the local cascade and **override** auto-detection — a term listed here is always replaced, regardless of what the detectors find.
 
-Format — one rule per line, separator `=` (the legacy `→` U+2192 is still accepted); rules apply case-insensitively and longest-first (invariant #5). A single-word source also matches an identifier prefix (`kdir` → `KdirService`) but not the middle of an unrelated word (`mkdir`). Deterministic rule spans override overlapping NER/oracle findings. Quote any value containing `=`:
+Format — one rule per line, separator `=` (the legacy `→` U+2192 is still accepted). Matching is a plain case-insensitive substring test, for a single-word source or a multi-word phrase alike — there is no identifier-boundary requirement, so `kdir = [X]` also matches the `kdir` inside `mkdir`, not just `KdirService`. On overlap, the **longer span wins**, whether it's a rule or a NER/oracle finding — a rule no longer automatically overrides a longer overlapping finding (it still wins on an identical span). Both of these are behavior changes from an earlier release; see [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md) before assuming an existing rule still matches only where it used to. Quote any value containing `=`:
 
 ```markdown
 - `Project Polaris` = `[CONFIDENTIAL_PROJECT]`

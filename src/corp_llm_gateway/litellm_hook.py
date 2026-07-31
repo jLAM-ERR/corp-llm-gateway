@@ -1512,8 +1512,9 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
 # `speech`/`aspeech` (POST /v1/audio/speech): `input` is the plain text to
 # synthesize. There is no reverse path for an audio response — a redacted
 # `input` would make the synthesized speech say the placeholder token aloud,
-# permanently (verified against pinned litellm 1.94.1's
-# proxy_server.py:9440, `call_type="aspeech"`).
+# permanently (verified against a real litellm 1.94.1 install in a scratch
+# venv — proxy_server.py:9440, `call_type="aspeech"`; the repo itself pins
+# `litellm>=1.40,<2.0` and ships 1.85.0/1.89.3, not 1.94.1).
 #
 # `pass_through_endpoint` (litellm's admin-configured arbitrary passthrough,
 # e.g. proxying to Voyage AI): the body shape is entirely backend-defined and
@@ -1925,8 +1926,9 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
                 # dict, which never carries pydantic private attrs litellm
                 # relies on — `_hidden_params` (cost tracking), and the sibling
                 # `_response_headers`/`_response_ms` (x-litellm-* headers,
-                # litellm/types/utils.py:1989-1991 in pinned 1.94.1) — model_dump omits all
-                # three (confirmed against the real litellm.ModelResponse).
+                # litellm/types/utils.py:1989-1991, checked against a real
+                # litellm 1.94.1 install) — model_dump omits all three
+                # (confirmed against the real litellm.ModelResponse).
                 # model_copy() (the other branch below) doesn't have this
                 # problem — it copies the existing instance instead of
                 # reconstructing one, so private attrs survive naturally.

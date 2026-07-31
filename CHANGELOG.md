@@ -42,6 +42,29 @@ security & extensibility** build. Non-negotiable criterion: zero confirmed leak 
 - **Release tooling** — shared `scripts/release/{gates,ship,cut-rc}.sh` delivery scripts,
   `github-release` workflow (auto GitHub Release on `v*` tags, `--prerelease` for rc),
   `docs/ops/release.md`, least-privilege `dco.yml` permissions (closes CodeQL alert #1).
+- **ChatGPT Codex Responses profile** (opt-in, `CORP_LLM_FORWARD_CHATGPT_AUTH`) — OpenAI
+  Responses API sanitize/desanitize coverage (`input`/`instructions`, `custom_tool_call`,
+  `reasoning.summary[]`, `local_shell_call`, `mcp_call`, function-call arguments, streaming
+  events including a placeholder split across SSE chunks) and a header bridge that forwards
+  the developer's live ChatGPT subscription OAuth to the Codex backend instead of a static
+  provider key. Wired into `bootstrap.build_guardrail()`, so the flag is honored in every
+  deployment (Helm/k8s included), not just the docker-compose demo overlay. See
+  `docs/chatgpt-codex.md`.
+
+### Changed — `replace.md` rule-matching semantics (behavior change for every existing dictionary)
+
+- **Case-insensitive substring matching, no identifier-boundary anchor.** A `replace.md` rule
+  now matches as a plain case-insensitive substring, for a single-word source or a multi-word
+  phrase alike — `kdir = [X]` also matches the `kdir` inside `mkdir`, not just `KdirService`.
+  An earlier release anchored single-word sources to an identifier boundary; that anchor is
+  dropped, so upgrading widens matches on existing dictionaries. See
+  `docs/replace-md-authoring.md`.
+- **Longest-span-wins across rules and detector/NER/oracle findings.** On overlap, whichever
+  span is longer wins, regardless of whether it came from a `replace.md` rule or a local/oracle
+  finding — a rule no longer automatically overrides a longer overlapping finding (it still
+  wins on an identical span). Closes a redaction-reducing regression where a short rule
+  matching inside a longer finding could drop the finding's pair (and its Cache-B mapping)
+  entirely.
 
 ### Local-first detection cycle (2026-06-30)
 

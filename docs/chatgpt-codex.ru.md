@@ -83,6 +83,15 @@ codex exec --profile chatgpt-codex \
 - Профиль отклоняет запрос с `401 E_PROVIDER_AUTH`, если Codex не прислал
   корректный Bearer OAuth.
 
+## В продакшене
+
+`CORP_LLM_FORWARD_CHATGPT_AUTH` — обычный флаг из `settings.KEYS`:
+`bootstrap.build_guardrail()` резолвит его из окружения или TOML-конфига,
+как и любую другую настройку шлюза (см. [`config.example.toml`](../config.example.toml)),
+а не только из demo-overlay compose выше. Установка через Helm value / env
+var в k8s включает тот же header bridge на реальном кластере — без изменений
+кода.
+
 ## Диагностика
 
 ```bash
