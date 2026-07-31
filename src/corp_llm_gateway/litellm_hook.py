@@ -380,7 +380,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         messages = raw_messages
 
-        def _item_text(msg: dict[str, Any]) -> list[str]:
+        def _item_text(msg: dict[str, Any] | str) -> list[str]:
+            # A bare string element of the list (e.g. data["input"] = ["...", {...}])
+            # IS the text itself — not a dict to route by shape.
+            if isinstance(msg, str):
+                return [msg] if msg else []
             # Chat Completions/Anthropic messages stay on the item-type-keyed
             # walkers (unchanged behavior). Responses items (function_call,
             # custom_tool_call, reasoning, …) route through the field-name-keyed
@@ -478,7 +482,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         input_literals: list[str] = []
         input_unwrapped_literals: set[str] = set()
         for _m in messages:
-            if isinstance(_m, dict):
+            if isinstance(_m, (dict, str)):
                 for _seg in _item_text(_m):
                     input_literals.extend(find_placeholder_literals(_seg))
                     input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
@@ -501,7 +505,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if _config_get("CORP_LLM_BLOCK_PAYLOADS", "1") != "0" or resolved.policy.block_payloads:
             _s0_texts: list[str] = []
             for _s0_msg in messages:
-                if isinstance(_s0_msg, dict):
+                if isinstance(_s0_msg, (dict, str)):
                     _s0_texts.extend(_item_text(_s0_msg))
             for _prompt_field in ("system", "instructions"):
                 _s0_texts.extend(collect_text(data.get(_prompt_field)))
@@ -559,20 +563,25 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             )
 
         for i, msg in enumerate(messages):
-            if not isinstance(msg, dict):
+            if not isinstance(msg, (dict, str)):
                 continue
-            content = msg.get("content")
+            # A bare string element of the list (e.g. input=["leak here", {...}])
+            # IS the text itself — not a dict, but still sanitizable, not skippable.
+            content = msg.get("content") if isinstance(msg, dict) else msg
             content_empty = content is None or (isinstance(content, str) and not content)
             # A tool-call-only assistant message (content=None) still carries
             # sanitizable data in tool_calls[].function.arguments (F4) — process it.
             # Same for a Responses item with no "content" at all (function_call,
             # custom_tool_call, reasoning, …) — _item_text sees its other
             # text-bearing fields (arguments/output/input/summary/refusal).
-            has_sanitizable_data = (
-                message_has_tool_calls(msg)
-                if request_shape == "messages"
-                else bool(_item_text(msg))
-            )
+            if not isinstance(msg, dict):
+                has_sanitizable_data = False
+            elif request_shape == "messages":
+                has_sanitizable_data = message_has_tool_calls(msg)
+            else:
+                # any(), not bool(): _item_text can return [""] for an explicitly
+                # empty text field, which is truthy as a list but carries no data.
+                has_sanitizable_data = any(_item_text(msg))
             if content_empty and not has_sanitizable_data:
                 logger.info(
                     "litellm_pre_call_message_skipped request_id=%s "
@@ -589,9 +598,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 content_bytes = len(json.dumps(content).encode("utf-8"))
             else:
                 content_bytes = len(
-                    json.dumps(msg.get("tool_calls") or msg.get("function_call") or msg).encode(
-                        "utf-8"
-                    )
+                    json.dumps(
+                        msg.get("tool_calls") or msg.get("function_call") or msg, default=str
+                    ).encode("utf-8")
                 )
 
             logger.info(
@@ -599,11 +608,14 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 "message_index=%d role=%s content_bytes=%d",
                 request_id,
                 i,
-                str(msg.get("role") or "unknown"),
+                str(msg.get("role") or "unknown") if isinstance(msg, dict) else "unknown",
                 content_bytes,
             )
             try:
-                if request_shape == "messages":
+                if isinstance(msg, str):
+                    _str_result = await sanitize_one(msg)
+                    new_msg, results = _str_result.sanitized_text, [_str_result]
+                elif request_shape == "messages":
                     new_msg, results = await sanitize_message(msg, sanitize_one)
                 else:
                     new_msg, results = await sanitize_responses_item(msg, sanitize_one)
@@ -841,7 +853,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             _s5_texts: list[str] = []
             _s5_messages, _ = _request_items(data)
             for _s5_msg in _s5_messages or []:
-                if isinstance(_s5_msg, dict):
+                if isinstance(_s5_msg, (dict, str)):
                     _s5_texts.extend(_item_text(_s5_msg))
             for _prompt_field in ("system", "instructions"):
                 _s5_texts.extend(collect_text(data.get(_prompt_field)))

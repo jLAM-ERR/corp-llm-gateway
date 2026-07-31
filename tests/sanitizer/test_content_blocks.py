@@ -1127,7 +1127,10 @@ def test_collect_responses_item_text_empty_item() -> None:
 async def test_responses_registry_symmetry_sanitize_matches_desanitize() -> None:
     """Every field _RESPONSES_TEXT_FIELDS lists must be covered by BOTH
     sanitize_responses_item and desanitize_responses_payload — a field added to
-    only one side is exactly the class of bug defect #1 was."""
+    only one side is exactly the class of bug defect #1 was.
+
+    Uses ``type: function_call_output`` so the "output" field's item-type gate
+    (computer_call_output screenshots are deliberately NOT scanned) is satisfied."""
     from corp_llm_gateway.sanitizer.content_blocks import (
         _RESPONSES_OPAQUE_FIELDS,
         _RESPONSES_TEXT_FIELDS,
@@ -1135,6 +1138,7 @@ async def test_responses_registry_symmetry_sanitize_matches_desanitize() -> None
 
     fields = sorted(_RESPONSES_TEXT_FIELDS - _RESPONSES_OPAQUE_FIELDS)
     item = {field: f"ORIGINAL_{field}" for field in fields}
+    item["type"] = "function_call_output"
 
     async def mock_sanitize(text: str) -> MockSanitizeResult:
         return MockSanitizeResult(text.replace("ORIGINAL", "PLACEHOLDER"), pairs=())
@@ -1153,3 +1157,302 @@ async def test_responses_registry_symmetry_sanitize_matches_desanitize() -> None
     assert restored_fields == set(fields), (
         f"desanitize_responses_payload did not restore: {set(fields) - restored_fields}"
     )
+
+
+def test_responses_block_list_fields_are_registered_text_fields() -> None:
+    """A field routed through _RESPONSES_BLOCK_LIST_FIELDS (sanitize_content's
+    block-aware walker) but NOT also in _RESPONSES_TEXT_FIELDS would be sanitized
+    on egress and never restored on the response — desanitize_responses_payload
+    only reverses registered fields. This is the realistic drift the flat-string
+    symmetry test above can't catch (it never exercises the list/dict routing)."""
+    from corp_llm_gateway.sanitizer.content_blocks import (
+        _RESPONSES_BLOCK_LIST_FIELDS,
+        _RESPONSES_TEXT_FIELDS,
+    )
+
+    assert _RESPONSES_BLOCK_LIST_FIELDS <= _RESPONSES_TEXT_FIELDS
+
+
+async def test_responses_registry_symmetry_realistic_nested_shapes() -> None:
+    """Exercise the actual list/dict routing (content/summary block-lists,
+    output as a structured dict, arguments as JSON) instead of flat strings, so
+    drift in the ROUTING itself — not just the field-name set — is caught."""
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text.replace("acme", "[ORG_001]")
+        pairs = (("acme", "[ORG_001]"),) if "acme" in text else ()
+        return MockSanitizeResult(replaced, pairs=pairs)
+
+    # NOTE: "output" is spec'd as a plain string (matches OpenAI's
+    # function_call_output.output shape). A dict/list "output" with arbitrary
+    # tool-defined key names is handled by sanitize_responses_item's full-tree
+    # scan (MAJOR 4 fail-safe) but desanitize_responses_payload's field-name-gated
+    # recursion can't restore an unregistered nested key — that's a pre-existing,
+    # out-of-scope, non-leak asymmetry (wrong direction: a placeholder survives
+    # instead of an original leaking), not part of this fix.
+    item = {
+        "type": "function_call_output",
+        "content": [{"type": "input_text", "text": "acme content"}],
+        "summary": [{"type": "summary_text", "text": "acme summary"}],
+        "output": "acme output",
+        "input": "acme input",
+        "arguments": json.dumps({"q": "acme arguments"}),
+    }
+    sanitized, _ = await sanitize_responses_item(item, mock_sanitize)
+    assert sanitized["content"][0]["text"] == "[ORG_001] content"
+    assert sanitized["summary"][0]["text"] == "[ORG_001] summary"
+    assert sanitized["output"] == "[ORG_001] output"
+    assert sanitized["input"] == "[ORG_001] input"
+    assert json.loads(sanitized["arguments"]) == {"q": "[ORG_001] arguments"}
+
+    def reverse(text: str) -> str:
+        return text.replace("[ORG_001]", "acme")
+
+    restored = desanitize_responses_payload(sanitized, reverse)
+    assert restored["content"][0]["text"] == "acme content"
+    assert restored["summary"][0]["text"] == "acme summary"
+    assert restored["output"] == "acme output"
+    assert restored["input"] == "acme input"
+    assert json.loads(restored["arguments"]) == {"q": "acme arguments"}
+
+
+# ---- J: Critical 1 — real block types must not fail closed ------------------
+
+
+async def _sanitize_one_redact_acme(text: str) -> MockSanitizeResult:
+    replaced = text.replace("acme", "[ORG_001]")
+    pairs = (("acme", "[ORG_001]"),) if "acme" in text else ()
+    return MockSanitizeResult(replaced, pairs=pairs)
+
+
+async def test_sanitize_server_tool_use_input_is_scanned() -> None:
+    block = {
+        "type": "server_tool_use",
+        "id": "t1",
+        "name": "web_search",
+        "input": {"query": "acme"},
+    }
+    new_content, results = await sanitize_content([block], _sanitize_one_redact_acme)
+    assert new_content[0]["input"]["query"] == "[ORG_001]"
+    assert len(results) == 1
+
+
+async def test_sanitize_mcp_tool_use_input_is_scanned() -> None:
+    block = {"type": "mcp_tool_use", "id": "t1", "name": "fetch", "input": {"q": "acme"}}
+    new_content, results = await sanitize_content([block], _sanitize_one_redact_acme)
+    assert new_content[0]["input"]["q"] == "[ORG_001]"
+    assert len(results) == 1
+
+
+async def test_sanitize_web_search_tool_result_content_is_scanned() -> None:
+    block = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "t1",
+        "content": [{"type": "web_search_result", "url": "https://x", "title": "acme title"}],
+    }
+    new_content, results = await sanitize_content([block], _sanitize_one_redact_acme)
+    assert new_content[0]["content"][0]["title"] == "[ORG_001] title"
+    # _sanitize_json scans every string leaf: "type", "url", and "title".
+    assert len(results) == 3
+
+
+async def test_sanitize_web_search_tool_result_protects_encrypted_content() -> None:
+    """Anthropic signs encrypted_content for replay — must not be rewritten."""
+    block = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "t1",
+        "content": [{"type": "web_search_result", "encrypted_content": "acme-signed-blob"}],
+    }
+    new_content, _ = await sanitize_content([block], _sanitize_one_redact_acme)
+    assert new_content[0]["content"][0]["encrypted_content"] == "acme-signed-blob"
+
+
+async def test_sanitize_code_execution_tool_result_content_is_scanned() -> None:
+    block = {
+        "type": "code_execution_tool_result",
+        "tool_use_id": "t2",
+        "content": {"stdout": "acme output", "stderr": ""},
+    }
+    new_content, results = await sanitize_content([block], _sanitize_one_redact_acme)
+    assert new_content[0]["content"]["stdout"] == "[ORG_001] output"
+    # _sanitize_json scans every string leaf, including the sibling "stderr": "".
+    assert len(results) == 2
+
+
+async def test_sanitize_mcp_tool_result_content_is_scanned() -> None:
+    block = {
+        "type": "mcp_tool_result",
+        "tool_use_id": "t3",
+        "content": [{"type": "text", "text": "acme result"}],
+    }
+    new_content, results = await sanitize_content([block], _sanitize_one_redact_acme)
+    assert new_content[0]["content"][0]["text"] == "[ORG_001] result"
+    # _sanitize_json is not block-type-aware: it also scans the "type": "text"
+    # discriminator string (harmless — it just doesn't match "acme").
+    assert len(results) == 2
+
+
+async def test_sanitize_search_result_title_and_content_are_scanned() -> None:
+    block = {
+        "type": "search_result",
+        "title": "acme doc",
+        "source": "kb://doc1",
+        "content": [{"type": "text", "text": "acme body"}],
+    }
+    new_content, results = await sanitize_content([block], _sanitize_one_redact_acme)
+    assert new_content[0]["title"] == "[ORG_001] doc"
+    assert new_content[0]["content"][0]["text"] == "[ORG_001] body"
+    assert new_content[0]["source"] == "kb://doc1"
+    assert len(results) == 2
+
+
+async def test_sanitize_container_upload_passes_through_unchanged() -> None:
+    block = {"type": "container_upload", "file_id": "file_123"}
+
+    async def fail(text: str) -> MockSanitizeResult:
+        raise AssertionError("container_upload has no scannable text")
+
+    new_content, results = await sanitize_content([block], fail)
+    assert new_content[0] == block
+    assert results == []
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "input_image", "image_url": "https://example.com/x.png"},
+        {"type": "input_file", "file_id": "file_789", "filename": "report.pdf"},
+        {"type": "file", "file": {"file_id": "file_456", "filename": "notes.txt"}},
+        {"type": "input_audio", "input_audio": {"data": "base64==", "format": "wav"}},
+        {"type": "output_audio", "data": "base64=="},
+    ],
+)
+async def test_sanitize_opaque_openai_block_types_pass_through_unchanged(
+    block: dict[str, object],
+) -> None:
+    async def fail(text: str) -> MockSanitizeResult:
+        raise AssertionError(f"{block['type']} has no scannable text")
+
+    new_content, results = await sanitize_content([block], fail)
+    assert new_content[0] == block
+    assert results == []
+
+
+async def test_sanitize_still_fails_closed_on_genuinely_unknown_type() -> None:
+    """The widened allowlist must not become a blanket pass-through."""
+
+    async def fail(text: str) -> MockSanitizeResult:
+        raise AssertionError("should not be called")
+
+    with pytest.raises(UnsanitizableContentBlockError):
+        await sanitize_content([{"type": "some_future_block", "payload": "raw"}], fail)
+
+
+def test_unsanitizable_content_block_error_does_not_echo_block_type() -> None:
+    """M1-14 surface (iii): the exception message must not carry client-controlled
+    content (block_type is a client-supplied string, chained via `raise ... from
+    exc` into whatever eventually logs the traceback)."""
+    secret_type = "SECRET-token-abc123"
+    try:
+        import asyncio
+
+        async def fail(text: str) -> MockSanitizeResult:
+            raise AssertionError("should not be called")
+
+        asyncio.run(sanitize_content([{"type": secret_type}], fail))
+    except UnsanitizableContentBlockError as exc:
+        assert secret_type not in str(exc)
+    else:
+        raise AssertionError("expected UnsanitizableContentBlockError")
+
+
+# ---- K: Major 3 — tool_calls/function_call on a Responses item -------------
+
+
+async def test_sanitize_responses_item_covers_tool_calls_field() -> None:
+    """A Responses `input` item can carry Chat-Completions-shaped tool_calls —
+    dropped entirely by field-name-only registry lookup without this coverage."""
+    item = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "run", "arguments": json.dumps({"k": "acme"})},
+            }
+        ],
+    }
+    new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert json.loads(new_item["tool_calls"][0]["function"]["arguments"]) == {"k": "[ORG_001]"}
+    assert len(results) == 1
+
+
+def test_collect_responses_item_text_covers_tool_calls_field() -> None:
+    item = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "run", "arguments": '{"k":"v"}'}}
+        ],
+    }
+    assert collect_responses_item_text(item) == ["v"]
+
+
+async def test_sanitize_responses_item_covers_function_call_field() -> None:
+    """Legacy message.function_call (not the item-type `function_call`) on a
+    Responses item must also be covered."""
+    item = {
+        "role": "assistant",
+        "content": None,
+        "function_call": {"name": "run", "arguments": json.dumps({"k": "acme"})},
+    }
+    new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert json.loads(new_item["function_call"]["arguments"]) == {"k": "[ORG_001]"}
+    assert len(results) == 1
+
+
+# ---- L: Major 4 — non-string registry field must not be silently dropped ---
+
+
+async def test_sanitize_responses_item_dict_shaped_input_is_scanned() -> None:
+    """custom_tool_call.input off-spec as a dict must still be scanned, not
+    silently skipped (the exact defect #1 class, unpatched for non-str)."""
+    item = {"type": "custom_tool_call", "call_id": "c1", "input": {"cmd": "acme"}}
+    new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert new_item["input"] == {"cmd": "[ORG_001]"}
+    assert len(results) == 1
+
+
+def test_collect_responses_item_text_dict_shaped_input() -> None:
+    item = {"type": "custom_tool_call", "call_id": "c1", "input": {"cmd": "secret"}}
+    assert collect_responses_item_text(item) == ["secret"]
+
+
+async def test_sanitize_responses_item_bare_scalar_registry_field_fails_closed() -> None:
+    """A registered text field holding a bare scalar (not str/dict/list/None) is
+    a genuinely unrecognized shape — fail closed rather than silently drop it."""
+    item = {"type": "custom_tool_call", "call_id": "c1", "input": 12345}
+    with pytest.raises(UnsanitizableContentBlockError):
+        await sanitize_responses_item(item, _sanitize_one_redact_acme)
+
+
+# ---- M: "output" full-scan is gated to the item types that carry text ------
+
+
+async def test_sanitize_responses_item_computer_call_output_not_scanned() -> None:
+    """computer_call_output.output is a base64 screenshot — must not be pushed
+    through the sanitizer (oversize-policy trip risk on ordinary screenshots)."""
+
+    async def fail(text: str) -> MockSanitizeResult:
+        raise AssertionError("computer_call_output.output must not be scanned")
+
+    item = {"type": "computer_call_output", "call_id": "c1", "output": "base64screenshotdata"}
+    new_item, results = await sanitize_responses_item(item, fail)
+    assert new_item["output"] == "base64screenshotdata"
+    assert results == []
+
+
+def test_collect_responses_item_text_computer_call_output_not_collected() -> None:
+    item = {"type": "computer_call_output", "call_id": "c1", "output": "base64screenshotdata"}
+    assert collect_responses_item_text(item) == []

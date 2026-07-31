@@ -401,6 +401,185 @@ async def test_stage0_blocks_env_dump_in_responses_custom_tool_call_input() -> N
     assert ei.value.error_code == "E_POLICY_BLOCKED"
 
 
+# ---- Critical 1: new Anthropic/OpenAI block types must not 400 ------------
+
+
+async def test_pre_call_new_anthropic_and_chat_completion_block_types_sanitize_and_pass() -> None:
+    """Regression for the fail-closed widening breaking real production traffic
+    (server_tool_use/web_search/mcp/code_execution/search_result/container_upload
+    on the Anthropic `messages` shape) — must not raise, and text-bearing types
+    must actually get sanitized."""
+    g, _ = _build_guardrail([("acme", "[ORG_001]")])
+    data = {
+        "model": "claude-x",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "t1",
+                        "name": "web_search",
+                        "input": {"query": "acme"},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "t1",
+                        "content": [
+                            {"type": "web_search_result", "url": "https://x", "title": "acme"}
+                        ],
+                    },
+                    {
+                        "type": "code_execution_tool_result",
+                        "tool_use_id": "t2",
+                        "content": {"stdout": "acme output"},
+                    },
+                    {
+                        "type": "mcp_tool_use",
+                        "id": "t3",
+                        "name": "fetch",
+                        "input": {"q": "acme"},
+                    },
+                    {
+                        "type": "mcp_tool_result",
+                        "tool_use_id": "t3",
+                        "content": [{"type": "text", "text": "acme result"}],
+                    },
+                    {
+                        "type": "search_result",
+                        "title": "acme doc",
+                        "source": "kb://doc1",
+                        "content": [{"type": "text", "text": "acme body"}],
+                    },
+                    {"type": "container_upload", "file_id": "file_123"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "file", "file": {"file_id": "file_456", "filename": "notes.txt"}},
+                    {"type": "input_audio", "input_audio": {"data": "base64==", "format": "wav"}},
+                ],
+            },
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data)
+    serialized = json.dumps(out)
+    assert "acme" not in serialized, "text-bearing new block type leaked the original"
+    assert "file_123" in serialized, "opaque container_upload must pass through unchanged"
+    assert "file_456" in serialized, "opaque file attachment must pass through unchanged"
+
+
+async def test_pre_call_responses_input_image_and_input_file_blocks_pass_without_raising() -> None:
+    g, _ = _build_guardrail([])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "look at this"},
+                    {"type": "input_image", "image_url": "https://example.com/x.png"},
+                    {"type": "input_file", "file_id": "file_789", "filename": "report.pdf"},
+                ],
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data)
+    assert out["input"][0]["content"][1]["image_url"] == "https://example.com/x.png"
+    assert out["input"][0]["content"][2]["file_id"] == "file_789"
+
+
+async def test_pre_call_genuinely_unknown_block_type_still_fails_closed() -> None:
+    """The widened allowlist must not become a blanket pass-through."""
+    g, _ = _build_guardrail([])
+    data = {
+        "model": "claude-x",
+        "messages": [{"role": "assistant", "content": [{"type": "some_future_block_type"}]}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_BAD_REQUEST"
+
+
+# ---- Major 3: tool_calls on a Responses `input` item -----------------------
+
+
+async def test_pre_call_responses_input_item_tool_calls_field_is_sanitized() -> None:
+    """A Responses `input` item carrying Chat-Completions-shaped tool_calls (e.g.
+    a client mixing chat history into `input`) must still be sanitized — dropped
+    entirely by field-name-only registry lookup without this coverage."""
+    g, _ = _build_guardrail([("topsecretvalue", "[SECRET_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": '{"k":"topsecretvalue"}'},
+                    }
+                ],
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data)
+    assert "topsecretvalue" not in json.dumps(out), (
+        "tool_calls on a Responses item leaked the original"
+    )
+
+
+# ---- Major 4: non-string registry field must not be silently dropped ------
+
+
+async def test_pre_call_responses_custom_tool_call_dict_input_is_sanitized() -> None:
+    """custom_tool_call.input off-spec as a dict must be scanned, not silently
+    skipped (the exact defect #1 leak class, unpatched for the non-str case)."""
+    g, _ = _build_guardrail([("topsecretvalue", "[SECRET_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "c1",
+                "name": "apply_patch",
+                "input": {"cmd": "topsecretvalue"},
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data)
+    assert "topsecretvalue" not in json.dumps(out), (
+        "dict-shaped custom_tool_call.input leaked the original"
+    )
+
+
+# ---- Major 5: a bare string element of data["input"] ------------------------
+
+
+async def test_pre_call_responses_bare_string_input_element_is_sanitized() -> None:
+    """A bare string element inside data["input"] (not a dict) is text — it must
+    not bypass sanitize, Stage 0, and Stage 5 just because it isn't a dict."""
+    g, _ = _build_guardrail([("sk-corp-secret", "[SECRET_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            "leak sk-corp-secret here",
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data)
+    assert out["input"][0] == "leak [SECRET_001] here"
+
+
 async def test_pre_call_codex_profile_oracle_disabled_applies_rules_directly() -> None:
     """Codex profile (forward_chatgpt_auth=True) + oracle disabled: a replace.md
     rule reaches the Responses `input` field through the local_pass branch's
