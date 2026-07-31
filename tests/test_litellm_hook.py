@@ -1727,6 +1727,57 @@ async def test_post_call_unary_bracket_stripped_identifier_not_restored_when_cod
     assert out["output"][0]["content"][0]["text"] == "LOCATION_007"
 
 
+async def test_pre_call_skips_unwrapped_literal_scan_when_codex_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Minor: find_unwrapped_placeholder_literals's result (response_alias_
+    exclusions) is only ever read by _response_mapping when forward_chatgpt_auth
+    is on — the scan itself must not run when the flag is off."""
+    import corp_llm_gateway.litellm_hook as hook_module
+
+    calls: list[str] = []
+    original = hook_module.find_unwrapped_placeholder_literals
+
+    def _counting(text: str) -> list[str]:
+        calls.append(text)
+        return original(text)
+
+    monkeypatch.setattr(hook_module, "find_unwrapped_placeholder_literals", _counting)
+
+    g, _ = _build_guardrail([])  # forward_chatgpt_auth defaults to False
+    data = _data_with_token("tok-1", content="hello world", system="a system prompt")
+    await g.pre_call(data)
+
+    assert calls == []
+
+
+async def test_pre_call_runs_unwrapped_literal_scan_when_codex_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control: the scan must still run when the flag is on — the
+    skip above must not become a blanket disable."""
+    import corp_llm_gateway.litellm_hook as hook_module
+
+    calls: list[str] = []
+    original = hook_module.find_unwrapped_placeholder_literals
+
+    def _counting(text: str) -> list[str]:
+        calls.append(text)
+        return original(text)
+
+    monkeypatch.setattr(hook_module, "find_unwrapped_placeholder_literals", _counting)
+
+    g, _ = _build_guardrail([], forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello world",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+
+    assert calls == ["hello world"]
+
+
 async def test_post_call_stream_responses_bare_alias_does_not_corrupt_containing_identifier() -> (
     None
 ):
