@@ -1825,18 +1825,25 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
             if callable(validator):
                 try:
                     restored = validator(rewritten)
-                except Exception:
+                except Exception as exc:
                     # The rewritten payload failed to validate back into its own
                     # type. Falling through to model_copy() would bypass that
                     # validation entirely and return an object we never checked
                     # is well-formed. Surface the failure instead of degrading
                     # quietly: log it and hand back the untouched (still
                     # validated, just not desanitized) original response.
+                    # `rewritten` here is already DESANITIZED (originals
+                    # restored), so `exc_info=True` must never be used: a real
+                    # pydantic ValidationError embeds the offending
+                    # `input_value` in its own message, which would put the
+                    # original on pod stdout (M1-14). Log only the exception
+                    # TYPE and a stable error_code.
                     logger.warning(
                         "litellm_post_call_response_reconstruct_failed "
-                        "response_type=%s error_code=E_RESPONSE_RECONSTRUCT_FAILED",
+                        "response_type=%s exception_type=%s "
+                        "error_code=E_RESPONSE_RECONSTRUCT_FAILED",
                         type(response).__name__,
-                        exc_info=True,
+                        type(exc).__name__,
                     )
                     return response
                 # model_validate() builds a BRAND NEW instance from the dumped
