@@ -655,11 +655,23 @@ _RESPONSES_OPAQUE_FIELDS = frozenset({"encrypted_content"})
 # reasoning_text/summary_text/refusal) — reuse sanitize_content's block walker
 # instead of treating the field as a single text leaf.
 _RESPONSES_BLOCK_LIST_FIELDS = frozenset({"content", "summary"})
-# "output" is only a scannable JSON tree for these item types (JSON-string or
-# structured tool result). computer_call_output.output is a base64 screenshot —
-# scanning/oversize-checking it would trip the size-threshold policy on ordinary
-# screenshots, so it must NOT fall through to a generic text handler either.
-_FULL_SCAN_OUTPUT_ITEM_TYPES = frozenset({"function_call_output", "custom_tool_call_output"})
+# Item types whose "output" is a binary reference (a base64 screenshot), not
+# text — scanning/oversize-checking it would trip the size-threshold policy on
+# an ordinary screenshot. Every OTHER item type's "output" is scanned by the
+# default branch below (CRITICAL: this used to be an ALLOWLIST of exactly two
+# item types, which silently left local_shell_call_output.output/mcp_call.output
+# unscanned and un-DLP'd — the same defect class as the field-registry gap).
+_RESPONSES_OPAQUE_OUTPUT_ITEM_TYPES = frozenset({"computer_call_output"})
+# Fields that are structural identifiers/enums, never free text — excluded
+# from the generic default scan below so it isn't wasting a sanitize_one()
+# call per item on values that can never carry user content, and so "type"
+# (the routing discriminator every caller inspects) can never be rewritten.
+# "name"/"server_label"/"container_id" are provider- or config-chosen
+# identifiers (a tool name from the caller's fixed tool schema, an MCP server
+# label, a code-interpreter container id) — not text the model or user typed.
+_RESPONSES_STRUCTURAL_FIELDS = frozenset(
+    {"type", "id", "call_id", "status", "role", "name", "server_label", "container_id"}
+)
 
 
 async def sanitize_responses_item(
@@ -667,12 +679,19 @@ async def sanitize_responses_item(
 ) -> tuple[dict[str, Any], list[Any]]:
     """Sanitize one OpenAI Responses API item (an element of ``data["input"]``).
 
-    Field-name-keyed like ``desanitize_responses_payload`` — both consume the
-    same ``_RESPONSES_TEXT_FIELDS`` registry, so a field can't be added to one
-    side without covering the other (see the symmetry test). This covers every
-    item type uniformly (``message``, ``function_call``, ``function_call_output``,
-    ``custom_tool_call``, ``custom_tool_call_output``, ``reasoning``, …) instead
-    of enumerating item types one at a time.
+    Field-name-keyed like ``desanitize_responses_payload`` for the fields it
+    recognizes, but CRITICAL: a positive allowlist alone silently skips any
+    field name it doesn't happen to name — the exact class of bug defect #1
+    was (custom_tool_call.input/reasoning.summary), reproduced again after
+    that fix on local_shell_call.action.command, local_shell_call_output.output,
+    mcp_call.output, code_interpreter_call.code, none of which are enumerated
+    field names. So: known fields get their SPECIALIZED handler (JSON-string
+    arguments, the block-list walker, the output/screenshot gate); everything
+    else — including a field nobody has named here yet — gets the SAME generic
+    string-leaf scan _sanitize_json applies to an arbitrary JSON blob. Only
+    structural identifiers/enums (_RESPONSES_STRUCTURAL_FIELDS) and signed
+    opaque fields are excluded outright. This means a brand-new provider item
+    field can never bypass sanitization just by being unrecognized.
 
     Applied PER ITEM — ``data["input"]`` is already the item list, so this must
     never be called on the whole payload (that would re-walk "content"/"summary",
@@ -689,18 +708,30 @@ async def sanitize_responses_item(
     NOT wired into a block-type handler here — no audio shape is otherwise
     exercised in this codebase; it stays a desanitize(response)-only field until
     an audio-item test motivates the request-side handling.
+
+    NOTE: this widening is request-side (egress) only. ``desanitize_responses_
+    payload`` (the response/post_call walker) stays field-name-gated — a
+    placeholder the model echoes back through a newly-scanned field (e.g.
+    local_shell_call.action) may survive un-reversed to the client. That is the
+    same accepted, non-leak asymmetry already documented for
+    function_call_output.output's arbitrary tool-defined keys (a placeholder
+    surviving, never an original leaking) — see the discovered-follow-up note.
     """
     new_item, results = await _sanitize_message_tool_calls_field(item, sanitize_one)
     item_type = item.get("type")
     for field, value in item.items():
-        if field in _RESPONSES_OPAQUE_FIELDS or field in ("tool_calls", "function_call"):
+        if (
+            field in _RESPONSES_OPAQUE_FIELDS
+            or field in _RESPONSES_STRUCTURAL_FIELDS
+            or field in ("tool_calls", "function_call")
+        ):
             continue
         if field == "arguments":
             new_value, r = await _sanitize_tool_arguments(value, sanitize_one)
         elif field in _RESPONSES_BLOCK_LIST_FIELDS:
             new_value, r = await sanitize_content(value, sanitize_one)
         elif field == "output":
-            if item_type not in _FULL_SCAN_OUTPUT_ITEM_TYPES:
+            if item_type in _RESPONSES_OPAQUE_OUTPUT_ITEM_TYPES:
                 continue
             new_value, r = await _sanitize_json(value, sanitize_one)
         elif field in _RESPONSES_TEXT_FIELDS:
@@ -716,7 +747,15 @@ async def sanitize_responses_item(
                 # text field: fail closed rather than silently drop it — this is
                 # the same defect class as the missing-field-coverage leak.
                 raise UnsanitizableContentBlockError(f"{field}:{type(value).__name__}")
+        elif isinstance(value, str):
+            result = await sanitize_one(value)
+            new_value, r = result.sanitized_text, [result]
+        elif isinstance(value, (dict, list)):
+            new_value, r = await _sanitize_json(value, sanitize_one)
         else:
+            # Unregistered field holding a scalar (int/float/bool/None): not
+            # text-bearing, nothing to scan — matches _sanitize_json's own
+            # scalar-passthrough behavior for an arbitrary JSON leaf.
             continue
         new_item[field] = new_value
         results.extend(r)
@@ -725,19 +764,23 @@ async def sanitize_responses_item(
 
 def collect_responses_item_text(item: dict[str, Any]) -> list[str]:
     """Read-only mirror of ``sanitize_responses_item`` for the Stage-0/Stage-5
-    pre-scan — same field registry, same per-field routing, so the scan sees
-    exactly what will be sanitized."""
+    pre-scan — same routing, including the generic default-field scan, so the
+    scan sees exactly what will be sanitized."""
     out = _collect_message_tool_calls_field_text(item)
     item_type = item.get("type")
     for field, value in item.items():
-        if field in _RESPONSES_OPAQUE_FIELDS or field in ("tool_calls", "function_call"):
+        if (
+            field in _RESPONSES_OPAQUE_FIELDS
+            or field in _RESPONSES_STRUCTURAL_FIELDS
+            or field in ("tool_calls", "function_call")
+        ):
             continue
         if field == "arguments":
             out.extend(_collect_tool_arguments_text(value))
         elif field in _RESPONSES_BLOCK_LIST_FIELDS:
             out.extend(collect_text(value))
         elif field == "output":
-            if item_type not in _FULL_SCAN_OUTPUT_ITEM_TYPES:
+            if item_type in _RESPONSES_OPAQUE_OUTPUT_ITEM_TYPES:
                 continue
             out.extend(_collect_json_text(value))
         elif field in _RESPONSES_TEXT_FIELDS:
@@ -745,6 +788,10 @@ def collect_responses_item_text(item: dict[str, Any]) -> list[str]:
                 out.append(value)
             elif isinstance(value, (dict, list)):
                 out.extend(_collect_json_text(value))
+        elif isinstance(value, str):
+            out.append(value)
+        elif isinstance(value, (dict, list)):
+            out.extend(_collect_json_text(value))
     return out
 
 
