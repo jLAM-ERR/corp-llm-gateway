@@ -1938,9 +1938,21 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
                 # failure path above refuses.
                 for _attr in ("_hidden_params", "_response_headers", "_response_ms"):
                     _value = getattr(response, _attr, None)
-                    if _value is not None and hasattr(restored, _attr):
-                        with contextlib.suppress(Exception):
-                            setattr(restored, _attr, _value)
+                    if _value is None or not hasattr(restored, _attr):
+                        continue
+                    try:
+                        setattr(restored, _attr, _value)
+                    except Exception as _exc:
+                        # Surface the failure instead of degrading quietly —
+                        # `restored` (already validated + desanitized) is kept
+                        # either way; this is observability only, no fallback.
+                        logger.warning(
+                            "litellm_post_call_hidden_params_restore_failed "
+                            "response_type=%s attr=%s exception_type=%s",
+                            type(response).__name__,
+                            _attr,
+                            type(_exc).__name__,
+                        )
                 return restored
             copier = getattr(response, "model_copy", None)
             if callable(copier):

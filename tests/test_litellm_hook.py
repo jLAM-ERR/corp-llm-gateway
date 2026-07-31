@@ -2191,6 +2191,33 @@ async def test_post_call_unary_hidden_params_restore_failure_keeps_desanitized_r
     assert out.choices[0]["message"]["content"] == "hello alice!"
 
 
+async def test_post_call_unary_hidden_params_restore_failure_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round-4 IMPORTANT 9: the private-attr restore's `contextlib.suppress
+    (Exception)` swallowed a restore failure with no log or metric, three
+    lines below a comment saying "surface the failure instead of degrading
+    quietly" — inconsistent with the sibling reconstruct-failure path below
+    it, which does log. A failure here must still keep the desanitized
+    response (not discard it), but it must also be observable."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = _FakeChatModelResponseHiddenParamsRestoreFails(
+        [{"message": {"role": "assistant", "content": "hello [N1]!"}}]
+    )
+    response._hidden_params = {"x-litellm-key": "abc"}
+
+    with caplog.at_level(logging.WARNING):
+        out = await g.post_call_unary(data, response)
+
+    assert isinstance(out, _RestoredWithReadOnlyHiddenParams)
+    assert out.choices[0]["message"]["content"] == "hello alice!"
+    assert "litellm_post_call_hidden_params_restore_failed" in caplog.text
+    assert "attr=_hidden_params" in caplog.text
+
+
 async def test_post_call_unary_response_reconstruct_failure_does_not_bypass_validation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
