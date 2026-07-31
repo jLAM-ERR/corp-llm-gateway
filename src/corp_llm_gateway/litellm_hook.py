@@ -67,6 +67,7 @@ from corp_llm_gateway.sanitizer.content_blocks import (
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.sanitizer.placeholder import (
+    StaleSpanError,
     add_unwrapped_response_aliases,
     apply_pairs,
     apply_spans,
@@ -736,6 +737,28 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "E_NER_UNAVAILABLE",
                     "NER detector unavailable",
                 ) from exc
+            except StaleSpanError as exc:
+                # M4 fail-policy matrix: the pre-selected replacement span pool no
+                # longer matches this segment's text (e.g. a stale Cache-A/allocator
+                # remap). Fails closed — never forward content we can't safely
+                # reconstruct. Log the exception TYPE only; the message itself is
+                # already content-free (no original text) by construction.
+                logger.warning(
+                    "litellm_pre_call_stale_span request_id=%s message_index=%d "
+                    "error_code=%s exception=%s",
+                    request_id,
+                    i,
+                    exc.error_code,
+                    type(exc).__name__,
+                )
+                self._record_failure(request_id, error_code=exc.error_code)
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    500,
+                    exc.error_code,
+                    "internal sanitization error",
+                ) from exc
 
             messages[i] = new_msg
             # Merge every segment result; emit one done-log per MESSAGE (D).
@@ -914,6 +937,23 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 503,
                 "E_NER_UNAVAILABLE",
                 "NER detector unavailable",
+            ) from exc
+        except StaleSpanError as exc:
+            # M4 fail-policy matrix: same fail-closed mapping as the messages loop.
+            logger.warning(
+                "litellm_pre_call_stale_span request_id=%s field=%s error_code=%s exception=%s",
+                request_id,
+                prompt_field,
+                exc.error_code,
+                type(exc).__name__,
+            )
+            self._record_failure(request_id, error_code=exc.error_code)
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                500,
+                exc.error_code,
+                "internal sanitization error",
             ) from exc
         data[prompt_field] = new_system
         for result in results:
@@ -1560,6 +1600,7 @@ _FAILURE_COMPONENT: dict[str, str] = {
     "E_OVERSIZE_BLOCKED": "oversize",
     "E_DLP_BLOCKED": "dlp",
     "E_BAD_REQUEST": "request",
+    "E_SPAN_INVALID": "sanitize",
 }
 
 

@@ -16,6 +16,7 @@ from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.rules import Gazetteer, Rule, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.placeholder import StaleSpanError
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import (
     AuthMiddleware,
@@ -913,6 +914,78 @@ async def test_pre_call_collision_message_vs_tool_result() -> None:
     text_ph = re.search(r"\[EMAIL_\d+\]", blocks[0]["text"]).group(0)
     tr_ph = re.search(r"\[EMAIL_\d+\]", blocks[1]["content"]).group(0)
     assert text_ph != tr_ph, (text_ph, tr_ph)
+
+
+# ---- Task 14: apply_spans failure mapped into the M4 fail-policy matrix ----
+
+
+async def test_pre_call_stale_span_in_message_loop_maps_to_fail_policy_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """apply_spans raising StaleSpanError (e.g. a stale allocator remap) inside
+    the messages loop must fail closed with a stable error_code + audit record,
+    not escape as a generic 500."""
+    import corp_llm_gateway.litellm_hook as hook_module
+
+    def _raise_stale(*_args: object, **_kwargs: object) -> str:
+        raise StaleSpanError("applied span does not match source text: start=0 end=5")
+
+    monkeypatch.setattr(hook_module, "apply_spans", _raise_stale)
+
+    # Cross-block collision (both blocks handled inside the SAME messages-loop
+    # iteration) forces the allocator remap that triggers apply_spans.
+    g, sink = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content=[
+            {"type": "text", "text": "first a@corp.example"},
+            {"type": "text", "text": "second b@corp.example"},
+        ],
+    )
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_SPAN_INVALID"
+    assert ei.value.status_code == 500
+
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    assert rec["status"] == "failed"
+    assert rec["error_code"] == "E_SPAN_INVALID"
+    rec_json = json.dumps(rec)
+    assert "a@corp.example" not in rec_json
+    assert "b@corp.example" not in rec_json
+
+
+async def test_pre_call_stale_span_in_prompt_field_maps_to_fail_policy_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same fail-closed mapping via `_sanitize_prompt_field` (the ``system``/
+    ``instructions`` path), triggered by the cross-segment collision remap."""
+    import corp_llm_gateway.litellm_hook as hook_module
+
+    def _raise_stale(*_args: object, **_kwargs: object) -> str:
+        raise StaleSpanError("applied span does not match source text: start=0 end=5")
+
+    monkeypatch.setattr(hook_module, "apply_spans", _raise_stale)
+
+    g, sink = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1",
+        content="contact customer b@corp.example",
+        system="admin is a@corp.example",
+    )
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_SPAN_INVALID"
+    assert ei.value.status_code == 500
+
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    assert rec["status"] == "failed"
+    assert rec["error_code"] == "E_SPAN_INVALID"
+    rec_json = json.dumps(rec)
+    assert "a@corp.example" not in rec_json
+    assert "b@corp.example" not in rec_json
 
 
 async def test_post_call_stream_unmapped_placeholder_passes_through() -> None:
