@@ -1,6 +1,7 @@
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import Protocol
 
 _PLACEHOLDER_FIND_RE = re.compile(r"\[[A-Z][A-Z0-9_]*_\d{3,}\]")
 _UNWRAPPED_PLACEHOLDER_FIND_RE = re.compile(r"(?<!\[)\b[A-Z][A-Z0-9_]*_[A-Z0-9_]+\b(?!\])")
@@ -89,7 +90,33 @@ def sort_placeholders_by_descending_length(placeholders: Iterable[str]) -> list[
     return sorted(placeholders, key=lambda s: (-len(s), s))
 
 
-def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> Callable[[str], str]:
+def _constant_replacer(value: str) -> Callable[[re.Match[str]], str]:
+    """A `re.sub` replacement callable that always returns `value` verbatim.
+
+    Must be a callable, not `value` itself passed as `repl` — `re.sub`
+    interprets backslash escapes (`\\1`, `\\g<name>`) in a STRING repl, which
+    would corrupt/error on a replacement text that happens to contain a
+    literal backslash-digit sequence (e.g. a Windows path). A one-off lambda
+    per call (the previous `lambda _m, r=replacement: r` default-arg trick)
+    defeated mypy's inference; a named factory doesn't.
+    """
+    return lambda _m: value
+
+
+class ReverseSubstituter(Protocol):
+    """Callable shape returned by :func:`build_reverse_substituter`.
+
+    Callers that only ever pass one full, complete text (unary response,
+    Responses done/completed events) can still treat it as a plain
+    ``Callable[[str], str]`` — `final`/`protected_prefix` both default to the
+    one-shot-complete-text behavior. Only a streaming caller with an
+    in-flight buffer needs to pass them explicitly.
+    """
+
+    def __call__(self, text: str, *, final: bool = ..., protected_prefix: int = ...) -> str: ...
+
+
+def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> ReverseSubstituter:
     """Build the shared reverse (model-output → original) substitution function.
 
     Applies longest-placeholder-first (M1-9). A bracketed placeholder
@@ -162,7 +189,7 @@ def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> Callable[[str
                 text = text.replace(placeholder, replacement)
                 continue
             if final and protected_prefix == 0:
-                text = pattern.sub(lambda _m, r=replacement: r, text)
+                text = pattern.sub(_constant_replacer(replacement), text)
                 continue
             # Not the final flush, or a protected prefix is in play: a match
             # whose end lands exactly at the buffer's current end can't yet be

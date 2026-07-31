@@ -654,6 +654,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             elif content is not None:
                 content_bytes = len(json.dumps(content).encode("utf-8"))
             else:
+                # content is None only reachable via msg.get("content") above,
+                # i.e. msg is a dict (a bare string msg IS its own content, a
+                # str, caught by the first branch).
+                assert isinstance(msg, dict)
                 content_bytes = len(
                     json.dumps(
                         msg.get("tool_calls") or msg.get("function_call") or msg, default=str
@@ -668,6 +672,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 str(msg.get("role") or "unknown") if isinstance(msg, dict) else "unknown",
                 content_bytes,
             )
+            new_msg: str | dict[str, Any]
+            results: list[Any]
             try:
                 if isinstance(msg, str):
                     _str_result = await sanitize_one(msg)
