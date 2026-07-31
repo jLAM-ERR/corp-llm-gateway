@@ -453,12 +453,33 @@ async def _sanitize_block(
         # non-streaming). Streaming tool_use desanitization (input_json_delta) is
         # handled in streaming.py via SseStreamDesanitizer with JSON-string-escaping.
         return block, []
-    # Genuinely unrecognized block type: fail closed rather than egress an
-    # unscanned block (this is the fix for the reasoning/custom-tool-call defect
-    # class — a new block shape must be explicitly allowlisted above, not
-    # silently forwarded). Don't echo block_type (client-controlled) into the
-    # exception — it chains via `raise ... from exc` and could reach a trace.
-    raise UnsanitizableContentBlockError(type(block_type).__name__)
+    # MAJOR 4: a genuinely unrecognized block type used to fail CLOSED (raise
+    # here, 400 upstream). Anthropic/OpenAI ship several new block types a
+    # year (web_fetch_tool_result, bash_code_execution_tool_result,
+    # text_editor_code_execution_tool_result, code_execution_output, ...) —
+    # a hard 400 on every one of them 400s real production traffic, and
+    # multi-turn conversations replay these blocks verbatim in `messages`, so
+    # one poisons the whole conversation. Fail SAFE instead: scan the block's
+    # whole value tree for strings, the same generic recursion _sanitize_json
+    # applies to an arbitrary JSON blob. "type" is the routing discriminator
+    # (a provider enum, not user content) and is never rewritten; every other
+    # key — including one a future provider adds that we've never seen — is
+    # scanned, so nothing can silently egress unscanned. `_sanitize_block` is
+    # only ever called with a dict item (`sanitize_content`'s list/dict paths
+    # already gate on `isinstance(item, dict)`), so every value reaching here
+    # IS a scannable JSON tree — there is no "structurally unscannable" block
+    # left to hard-fail on; ContentTooDeepError still guards pathological
+    # nesting depth via `_sanitize_json`.
+    new_block: dict[str, Any] = {}
+    results: list[Any] = []
+    for key, value in block.items():
+        if key == "type" or key in _JSON_OPAQUE_KEYS:
+            new_block[key] = value
+            continue
+        new_value, sub_results = await _sanitize_json(value, sanitize_one, 1)
+        new_block[key] = new_value
+        results.extend(sub_results)
+    return new_block, results
 
 
 def _desanitize_block(block: dict[str, Any], reverse: ReverseOne) -> dict[str, Any]:
@@ -501,7 +522,16 @@ def _desanitize_block(block: dict[str, Any], reverse: ReverseOne) -> dict[str, A
                     "content": desanitize_content(src["content"], reverse),
                 }
         return new_block
-    return block
+    if block_type in _OPAQUE_BLOCK_TYPES:
+        return block
+    # Mirror _sanitize_block's fail-safe generic scan for an unrecognized type.
+    fallback_block: dict[str, Any] = {}
+    for key, value in block.items():
+        if key == "type" or key in _JSON_OPAQUE_KEYS:
+            fallback_block[key] = value
+        else:
+            fallback_block[key] = _desanitize_json(value, reverse, 1)
+    return fallback_block
 
 
 async def sanitize_content(
@@ -565,9 +595,9 @@ def collect_text(content: Any) -> list[str]:
 
 def _collect_block_text(block: dict[str, Any]) -> list[str]:
     """Read-only mirror of _sanitize_block's traversal (shared by the list-item
-    and bare-dict paths). Unlike _sanitize_block, an unrecognized block type
-    simply collects nothing here rather than raising — the fail-closed behavior
-    lives in the sanitize step; this is only the pre-scan."""
+    and bare-dict paths), including its fail-safe generic scan for an
+    unrecognized block type — Stage 0/Stage 5 must see exactly what
+    _sanitize_block will scan, not less."""
     block_type = block.get("type")
     text_field = _TEXT_BLOCK_FIELD.get(block_type) if isinstance(block_type, str) else None
     if text_field is not None and isinstance(block.get(text_field), str):
@@ -602,7 +632,15 @@ def _collect_block_text(block: dict[str, Any]) -> list[str]:
             elif stype == "content" and "content" in src:
                 document_text.extend(collect_text(src["content"]))
         return document_text
-    return []
+    if block_type in _OPAQUE_BLOCK_TYPES:
+        return []
+    # Mirror _sanitize_block's fail-safe generic scan for an unrecognized type.
+    fallback_text: list[str] = []
+    for key, value in block.items():
+        if key == "type" or key in _JSON_OPAQUE_KEYS:
+            continue
+        fallback_text.extend(_collect_json_text(value, 1))
+    return fallback_text
 
 
 def desanitize_content(

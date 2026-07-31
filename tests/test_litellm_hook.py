@@ -402,7 +402,7 @@ async def test_stage0_blocks_env_dump_in_responses_custom_tool_call_input() -> N
     assert ei.value.error_code == "E_POLICY_BLOCKED"
 
 
-# ---- Critical 1: new Anthropic/OpenAI block types must not 400 ------------
+# ---- MAJOR 4: new Anthropic/OpenAI block types must not 400 ----------------
 
 
 async def test_pre_call_new_anthropic_and_chat_completion_block_types_sanitize_and_pass() -> None:
@@ -472,6 +472,49 @@ async def test_pre_call_new_anthropic_and_chat_completion_block_types_sanitize_a
     assert "file_456" in serialized, "opaque file attachment must pass through unchanged"
 
 
+async def test_pre_call_newer_anthropic_block_types_sanitize_and_pass() -> None:
+    """MAJOR 4 exact repro: web-fetch-2025-09-10 and code-execution-2025-08-25
+    block types, replayed verbatim in `messages` on every follow-up turn, used
+    to 400 real production traffic. A dict block with no "type" key at all
+    must also be scanned, not rejected."""
+    g, _ = _build_guardrail([("acme", "[ORG_001]")])
+    data = {
+        "model": "claude-x",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "web_fetch_tool_result",
+                        "tool_use_id": "t1",
+                        "content": {"type": "web_fetch_result", "content": "acme fetched"},
+                    },
+                    {
+                        "type": "bash_code_execution_tool_result",
+                        "tool_use_id": "t2",
+                        "content": {"stdout": "acme output"},
+                    },
+                    {
+                        "type": "text_editor_code_execution_tool_result",
+                        "tool_use_id": "t3",
+                        "content": {"file_text": "acme file contents"},
+                    },
+                    {
+                        "type": "code_execution_output",
+                        "file_id": "file_1",
+                        "content": "acme stdout",
+                    },
+                    {"foo": "acme dict block with no type key"},
+                ],
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data)
+    serialized = json.dumps(out)
+    assert "acme" not in serialized, "newer block type leaked the original"
+
+
 async def test_pre_call_responses_input_image_and_input_file_blocks_pass_without_raising() -> None:
     g, _ = _build_guardrail([])
     data = {
@@ -493,17 +536,21 @@ async def test_pre_call_responses_input_image_and_input_file_blocks_pass_without
     assert out["input"][0]["content"][2]["file_id"] == "file_789"
 
 
-async def test_pre_call_genuinely_unknown_block_type_still_fails_closed() -> None:
-    """The widened allowlist must not become a blanket pass-through."""
+async def test_pre_call_genuinely_unknown_block_type_no_longer_fails_closed() -> None:
+    """MAJOR 4: inverted. A hard 400 on every unrecognized block type poisons
+    real production traffic (Anthropic/OpenAI ship new ones regularly, and
+    multi-turn conversations replay them verbatim), so this now scans
+    fail-safe instead of raising — see test_pre_call_new_anthropic_and_chat_
+    completion_block_types_sanitize_and_pass and the content_blocks.py unit
+    tests for the fail-safe scan itself."""
     g, _ = _build_guardrail([])
     data = {
         "model": "claude-x",
         "messages": [{"role": "assistant", "content": [{"type": "some_future_block_type"}]}],
         "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
     }
-    with pytest.raises(GuardrailHttpException) as ei:
-        await g.pre_call(data)
-    assert ei.value.error_code == "E_BAD_REQUEST"
+    out = await g.pre_call(data)
+    assert out["messages"][0]["content"][0] == {"type": "some_future_block_type"}
 
 
 # ---- Major 3: tool_calls on a Responses `input` item -----------------------
