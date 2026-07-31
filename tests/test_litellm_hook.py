@@ -298,6 +298,53 @@ async def test_pre_call_sanitizes_responses_input_instructions_and_tool_output()
     assert "messages" not in out
 
 
+async def test_pre_call_codex_profile_oracle_disabled_applies_rules_directly() -> None:
+    """Codex profile (forward_chatgpt_auth=True) + oracle disabled: a replace.md
+    rule reaches the Responses `input` field through the local_pass branch's
+    direct rule injection (decision 3), with no corp-LLM client at all."""
+    rules = Rules(rules=(Rule("Zephyr Ledger", "[CONFIDENTIAL_PROJECT]"),))
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    orch = SanitizationOrchestrator(
+        None,
+        InMemoryMappingStore(),
+        _StaticRules(rules),
+        local_detectors=[RegexChecksumDetector()],
+        oracle_enabled=False,
+    )
+    sink = ListSink()
+    g = CorpLlmGuardrail(
+        orch,
+        AuthMiddleware(token_store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+        forward_chatgpt_auth=True,
+    )
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Migrating Zephyr Ledger to new stack"}],
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+
+    out = await g.pre_call(data)
+
+    assert out["input"][0]["content"][0]["text"] == "Migrating [CONFIDENTIAL_PROJECT] to new stack"
+
+
 async def test_pre_call_chatgpt_auth_bridge_forwards_only_required_headers() -> None:
     g, _ = _build_guardrail(forward_chatgpt_auth=True)
     data = {
