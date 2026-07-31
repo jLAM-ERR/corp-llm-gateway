@@ -1461,6 +1461,11 @@ def _request_items(data: dict[str, Any], call_type: str | None = None) -> tuple[
     if "input" not in data:
         return [], "messages"
     response_input = data.get("input")
+    if response_input is None:
+        # Minor: an explicit `{"input": null}` used to reach the
+        # `isinstance(messages, list)` bad-request check below and 400 —
+        # release passed it through untouched. Nothing to sanitize either way.
+        return [], "unmanaged"
     if isinstance(response_input, str):
         return [{"role": "user", "content": response_input}], "input_string"
     return response_input, "input_list"
