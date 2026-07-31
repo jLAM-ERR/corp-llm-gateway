@@ -1,6 +1,10 @@
+import pytest
+
 from corp_llm_gateway.sanitizer.placeholder import (
+    AppliedSpan,
     add_unwrapped_response_aliases,
     apply_pairs,
+    apply_spans,
     find_placeholder_literals,
     find_unwrapped_placeholder_literals,
     sort_placeholders_by_descending_length,
@@ -25,6 +29,26 @@ def test_apply_pairs_empty_is_identity() -> None:
 
 def test_apply_pairs_replaces_all_occurrences() -> None:
     assert apply_pairs("a@x and a@x", [("a@x", "[E_001]")]) == "[E_001] and [E_001]"
+
+
+def test_apply_spans_uses_selected_occurrences_without_chaining() -> None:
+    text = "Alice Smith met Alice"
+    spans = (
+        AppliedSpan(0, 11, "Alice Smith"),
+        AppliedSpan(16, 21, "Alice"),
+    )
+    pairs = (
+        ("Alice Smith", "AliceAlias"),
+        ("Alice", "[PERSON_002]"),
+    )
+
+    assert apply_spans(text, spans, pairs) == "AliceAlias met [PERSON_002]"
+
+
+def test_apply_spans_rejects_stale_source_range() -> None:
+    with pytest.raises(ValueError, match="does not match source text") as exc_info:
+        apply_spans("Alice", (AppliedSpan(0, 5, "Bob"),), (("Bob", "[PERSON_001]"),))
+    assert "Bob" not in str(exc_info.value)
 
 
 def test_sort_placeholders_descending_length_stable() -> None:

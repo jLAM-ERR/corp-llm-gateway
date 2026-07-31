@@ -38,6 +38,7 @@ from corp_llm_gateway.sanitizer.engine import (
     CorpLlmSanitizer,
 )
 from corp_llm_gateway.sanitizer.local_pass import LocalDetectionPass
+from corp_llm_gateway.sanitizer.placeholder import AppliedSpan, apply_spans
 from corp_llm_gateway.sanitizer.placeholder_allocator import RequestPlaceholderAllocator
 from corp_llm_gateway.sanitizer.strategies import (
     FunctionCallStrategy,
@@ -45,9 +46,10 @@ from corp_llm_gateway.sanitizer.strategies import (
     RegexStrategy,
     StrategyResult,
 )
-from corp_llm_gateway.storage import MappingStore
+from corp_llm_gateway.storage import MappingStore, PlaceholderMapping
 
 _PLACEHOLDER_LABEL_RE = re.compile(r"^\[([A-Z_]+)_(\d+)\]$")
+_CACHE_A_ALGORITHM_VERSION = b"span-aware-v1"
 
 # Chunk overlap sizing (F1 chunk policy). Regex/checksum patterns are LINEAR and
 # now run over the FULL text (see `_sanitize_chunked`), so the overlap no longer
@@ -197,16 +199,69 @@ def _filter_findings_overlapping_rules(
     ]
 
 
-def _original_overlaps_rule(
-    text: str, original: str, rule_matches: tuple[_MatchedRule, ...]
-) -> bool:
-    for occurrence in re.finditer(re.escape(original), text):
-        if any(
-            occurrence.start() < match.end and occurrence.end() > match.start
+@dataclass(frozen=True)
+class _ReplacementPlan:
+    sanitized_text: str
+    pairs: tuple[tuple[str, str], ...]
+    spans: tuple[AppliedSpan, ...]
+
+
+def _plan_replacements(
+    text: str,
+    pairs: tuple[tuple[str, str], ...],
+    rule_matches: tuple[_MatchedRule, ...],
+    *,
+    active_rule_origins: frozenset[str] | None = None,
+) -> _ReplacementPlan:
+    """Select concrete replacement spans with deterministic rules first."""
+    unique_pairs: list[tuple[str, str]] = []
+    seen_originals: set[str] = set()
+    for original, replacement in pairs:
+        if not original or original in seen_originals:
+            continue
+        seen_originals.add(original)
+        unique_pairs.append((original, replacement))
+
+    pair_by_original = dict(unique_pairs)
+    if active_rule_origins is None:
+        available_pairs = set(unique_pairs)
+        active_rule_origins = frozenset(
+            match.original
             for match in rule_matches
-        ):
-            return True
-    return False
+            if (match.original, match.replacement) in available_pairs
+        )
+
+    selected: list[AppliedSpan] = []
+    occupied: list[tuple[int, int]] = []
+    for match in rule_matches:
+        if match.original not in active_rule_origins or match.original not in pair_by_original:
+            continue
+        selected.append(AppliedSpan(match.start, match.end, match.original))
+        occupied.append((match.start, match.end))
+
+    candidates: list[tuple[int, int, int, int, str]] = []
+    for pair_index, (original, _) in enumerate(unique_pairs):
+        if original in active_rule_origins:
+            continue
+        for occurrence in re.finditer(re.escape(original), text):
+            candidates.append(
+                (-len(original), pair_index, occurrence.start(), occurrence.end(), original)
+            )
+
+    for _, _, start, end, original in sorted(candidates):
+        if any(start < used_end and end > used_start for used_start, used_end in occupied):
+            continue
+        selected.append(AppliedSpan(start, end, original))
+        occupied.append((start, end))
+
+    spans = tuple(sorted(selected, key=lambda span: (span.start, span.end)))
+    used_originals = {span.original for span in spans}
+    used_pairs = tuple(pair for pair in unique_pairs if pair[0] in used_originals)
+    return _ReplacementPlan(
+        sanitized_text=apply_spans(text, spans, used_pairs),
+        pairs=used_pairs,
+        spans=spans,
+    )
 
 
 @dataclass(frozen=True)
@@ -219,6 +274,9 @@ class SanitizeResult:
     # distinguish a delivered oversize original from a normal zero-redaction
     # request (M1). None on every other path.
     block_reason: str | None = None
+    # Exact forward-substitution ranges, retained so request-level placeholder
+    # remapping can reproduce the same overlap decisions without global replace.
+    applied_spans: tuple[AppliedSpan, ...] = ()
 
 
 OVERSIZE_DELIVERED_REASON = "oversize:delivered"
@@ -294,8 +352,8 @@ class SanitizationOrchestrator:
         # profile_fingerprint distinguishes the resolved profile bundle in the
         # SHARED Cache-A key (D3): two requests with identical team/rules/text but
         # different profiles must NOT reuse each other's sanitization, or a
-        # RU-152FZ redaction can bleed to a US request. None == no profile ==
-        # today's behavior (byte-identical content hash).
+        # RU-152FZ redaction can bleed to a US request. None keeps the no-profile
+        # behavior within the current cache algorithm version.
         content_bytes = len(text.encode("utf-8"))
         logger.info(
             "sanitize_start team_id=%s conversation_id=%s content_bytes=%d",
@@ -319,32 +377,35 @@ class SanitizationOrchestrator:
             conversation_id,
             len(rules.rules),
         )
+        rule_matches = _rule_matches(rules, text)
 
         content_hash = _content_hash(team_id, rules, text, profile_fingerprint)
 
         cached = await self._mapping_store.get_dedup(content_hash)
         if cached is not None:
+            plan = _plan_replacements(text, cached.pairs, rule_matches)
             logger.info(
                 "sanitize_cache_a_hit team_id=%s conversation_id=%s content_hash=%s pairs=%d",
                 team_id,
                 conversation_id,
                 content_hash[:12],
-                len(cached.pairs),
+                len(plan.pairs),
             )
-            await self._record_conversation_mappings(conversation_id, cached.pairs)
+            await self._record_conversation_mappings(conversation_id, plan.pairs)
             logger.info(
                 "sanitize_cache_b_recorded team_id=%s conversation_id=%s "
                 "pairs=%d ttl=%d source=cache_a",
                 team_id,
                 conversation_id,
-                len(cached.pairs),
+                len(plan.pairs),
                 self._cache_b_ttl,
             )
             return SanitizeResult(
-                _apply_pairs(text, cached.pairs),
-                cached.pairs,
+                plan.sanitized_text,
+                plan.pairs,
                 cache_a_hit=True,
                 skipped=False,
+                applied_spans=plan.spans,
             )
 
         logger.info(
@@ -354,33 +415,36 @@ class SanitizationOrchestrator:
             content_hash[:12],
         )
 
-        result = await self._detect(text, rules, team_id=team_id, conversation_id=conversation_id)
+        detected = await self._detect(text, rules, team_id=team_id, conversation_id=conversation_id)
+        plan = _plan_replacements(text, detected.pairs, rule_matches)
+        mapping = PlaceholderMapping(pairs=plan.pairs)
 
-        await self._mapping_store.set_dedup(content_hash, result, ttl_seconds=self._cache_a_ttl)
+        await self._mapping_store.set_dedup(content_hash, mapping, ttl_seconds=self._cache_a_ttl)
         logger.info(
             "sanitize_cache_a_stored team_id=%s conversation_id=%s content_hash=%s ttl=%d pairs=%d",
             team_id,
             conversation_id,
             content_hash[:12],
             self._cache_a_ttl,
-            len(result.pairs),
+            len(plan.pairs),
         )
 
-        await self._record_conversation_mappings(conversation_id, result.pairs)
+        await self._record_conversation_mappings(conversation_id, plan.pairs)
         logger.info(
             "sanitize_cache_b_recorded team_id=%s conversation_id=%s "
             "pairs=%d ttl=%d source=corp_llm",
             team_id,
             conversation_id,
-            len(result.pairs),
+            len(plan.pairs),
             self._cache_b_ttl,
         )
 
         return SanitizeResult(
-            _apply_pairs(text, result.pairs),
-            result.pairs,
+            plan.sanitized_text,
+            plan.pairs,
             cache_a_hit=False,
             skipped=False,
+            applied_spans=plan.spans,
         )
 
     async def _detect(
@@ -444,13 +508,7 @@ class SanitizationOrchestrator:
                     conversation_id,
                     len(oracle_result.pairs),
                 )
-                # Exclude every oracle span overlapping a deterministic rule.
-                oracle_kept = tuple(
-                    (original, replacement)
-                    for original, replacement in oracle_result.pairs
-                    if not _original_overlaps_rule(text, original, rule_matches)
-                )
-                merged_pairs = _merge_local(rules_pairs + oracle_kept, combined)
+                merged_pairs = _merge_local(rules_pairs + oracle_result.pairs, combined)
                 _emit_gazetteer_proposal(oracle_result.pairs, combined, team_id, conversation_id)
             else:
                 # Oracle skipped → rules still apply; local findings merged.
@@ -485,13 +543,8 @@ class SanitizationOrchestrator:
                 len(oracle_result.pairs),
             )
             local_findings = await local_pass.findings(text)
-            oracle_kept = tuple(
-                (original, replacement)
-                for original, replacement in oracle_result.pairs
-                if not _original_overlaps_rule(text, original, rule_matches)
-            )
             local_kept = _filter_findings_overlapping_rules(local_findings, rule_matches)
-            merged_pairs = _merge_local(rules_pairs + oracle_kept, local_kept)
+            merged_pairs = _merge_local(rules_pairs + oracle_result.pairs, local_kept)
             logger.info(
                 "sanitize_local_pass team_id=%s conversation_id=%s "
                 "oracle_pairs=%d local_findings=%d merged_pairs=%d",
@@ -522,12 +575,7 @@ class SanitizationOrchestrator:
                 conversation_id,
                 len(oracle_result.pairs),
             )
-            oracle_kept = tuple(
-                (original, replacement)
-                for original, replacement in oracle_result.pairs
-                if not _original_overlaps_rule(text, original, rule_matches)
-            )
-            result = StrategyResult(pairs=rules_pairs + oracle_kept)
+            result = StrategyResult(pairs=rules_pairs + oracle_result.pairs)
 
         if self._allowlist is not None:
             result = StrategyResult(pairs=self._allowlist.filter_pairs(result.pairs))
@@ -632,12 +680,29 @@ class SanitizationOrchestrator:
         pairs: list[tuple[str, str]] = []
         seen_originals: set[str] = set()
 
-        def _absorb(candidate: tuple[tuple[str, str], ...]) -> None:
+        def _absorb(
+            candidate: tuple[tuple[str, str], ...],
+        ) -> tuple[tuple[str, str], ...]:
+            accepted: list[tuple[str, str]] = []
             for original, placeholder in allocator.remap(candidate):
                 if original in seen_originals:
                     continue
                 seen_originals.add(original)
-                pairs.append((original, placeholder))
+                pair = (original, placeholder)
+                pairs.append(pair)
+                accepted.append(pair)
+            return tuple(accepted)
+
+        # Rules establish both replacement priority and placeholder ownership
+        # before findings from the full-text and chunked detector passes.
+        global_rule_matches = _rule_matches(rules, text)
+        global_rule_pairs = tuple(
+            dict.fromkeys((match.original, match.replacement) for match in global_rule_matches)
+        )
+        if self._allowlist is not None:
+            global_rule_pairs = self._allowlist.filter_pairs(global_rule_pairs)
+        canonical_rule_pairs = _absorb(global_rule_pairs)
+        active_rule_origins = frozenset(original for original, _ in canonical_rule_pairs)
 
         # Full-text linear pass: unbounded secrets are matched whole regardless
         # of where a chunk seam falls.
@@ -653,6 +718,12 @@ class SanitizationOrchestrator:
             )
             _absorb(chunk_result.pairs)
         canonical = tuple(pairs)
+        plan = _plan_replacements(
+            text,
+            canonical,
+            global_rule_matches,
+            active_rule_origins=active_rule_origins,
+        )
         logger.info(
             "sanitize_oversize_chunked team_id=%s conversation_id=%s chunks=%d "
             "regex_findings=%d pairs=%d",
@@ -660,14 +731,15 @@ class SanitizationOrchestrator:
             conversation_id,
             chunk_count,
             len(full_regex_findings),
-            len(canonical),
+            len(plan.pairs),
         )
-        await self._record_conversation_mappings(conversation_id, canonical)
+        await self._record_conversation_mappings(conversation_id, plan.pairs)
         return SanitizeResult(
-            _apply_pairs(text, canonical),
-            canonical,
+            plan.sanitized_text,
+            plan.pairs,
             cache_a_hit=False,
             skipped=False,
+            applied_spans=plan.spans,
         )
 
     async def _deliver_oversize(
@@ -818,6 +890,11 @@ def _content_hash(
     profile_fingerprint: str | None = None,
 ) -> str:
     h = hashlib.sha256()
+    # Security-sensitive substitution semantics changed from pair-global replace
+    # to span-aware planning. Old Cache-A entries may have dropped a mapping, so
+    # they must not survive this algorithm version boundary.
+    h.update(_CACHE_A_ALGORITHM_VERSION)
+    h.update(b"\x1c")
     h.update(team_id.encode("utf-8"))
     h.update(b"\x1f")
     for rule in rules.rules:
@@ -827,19 +904,12 @@ def _content_hash(
         h.update(b"\x1f")
     h.update(b"\x1d")
     h.update(text.encode("utf-8"))
-    # Fold the profile fingerprint ONLY when present: a None fingerprint leaves
-    # the digest byte-identical to the pre-D3 key (full back-compat).
+    # Fold the profile fingerprint only when present: None adds no profile-specific
+    # discriminator within the current cache algorithm version.
     if profile_fingerprint is not None:
         h.update(b"\x1c")
         h.update(profile_fingerprint.encode("utf-8"))
     return h.hexdigest()
-
-
-def _apply_pairs(text: str, pairs: tuple[tuple[str, str], ...]) -> str:
-    sorted_pairs = sorted(pairs, key=lambda p: -len(p[0]))
-    for original, placeholder in sorted_pairs:
-        text = text.replace(original, placeholder)
-    return text
 
 
 def _iter_overlapping_chunks(text: str, window: int, overlap: int) -> Iterator[str]:

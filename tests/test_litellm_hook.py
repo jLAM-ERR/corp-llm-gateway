@@ -14,7 +14,7 @@ from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
-from corp_llm_gateway.rules import Rules, RulesLoader
+from corp_llm_gateway.rules import Rule, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import (
@@ -34,8 +34,11 @@ from tests.sanitizer.test_streaming import (
 
 
 class _StaticRules(RulesLoader):
+    def __init__(self, rules: Rules | None = None) -> None:
+        self._rules = rules or Rules(rules=())
+
     async def load(self, team_id: str) -> Rules:
-        return Rules(rules=())
+        return self._rules
 
 
 class _RaisingNerEngine(PIIDetector):
@@ -138,6 +141,7 @@ def _build_guardrail(
     valid_token: str = "tok-1",
     corp_llm: CorpLlmClient | None = None,
     forward_chatgpt_auth: bool = False,
+    rules: Rules | None = None,
 ) -> tuple[CorpLlmGuardrail, ListSink]:
     pairs = pairs if pairs is not None else []
     token_store = InMemoryTokenStore()
@@ -156,7 +160,7 @@ def _build_guardrail(
     orch = SanitizationOrchestrator(
         corp_llm if corp_llm is not None else _corp_llm_returning(pairs),
         InMemoryMappingStore(),
-        _StaticRules(),
+        _StaticRules(rules),
     )
     sink = ListSink()
     audit_logger = AuditLogger(sink, gateway_version="0.0.1")
@@ -2702,6 +2706,54 @@ async def test_substring_originals_longer_replaced_first_no_corruption() -> None
     assert out_text == "john.doe@corp.example / john", (
         f"reverse substitution corrupted: {out_text!r}"
     )
+
+
+async def test_rule_overlap_round_trip_survives_placeholder_canonicalization() -> None:
+    """Span decisions survive allocator remapping and reverse correctly."""
+    g, _ = _build_guardrail(
+        [
+            ("Alice", "[PERSON_001]"),
+            ("Bob", "[PERSON_001]"),
+        ],
+        rules=Rules(rules=(Rule("Alice Smith", "[CONTRACTOR_001]"),)),
+    )
+    data = _data_with_token(
+        "tok-1",
+        content="Alice Smith met Alice and Bob; marker [PERSON_001]",
+    )
+
+    out = await g.pre_call(data)
+    sanitized = out["messages"][0]["content"]
+    match = re.fullmatch(
+        r"\[CONTRACTOR_001\] met (\[PERSON_\d+\]) and (\[PERSON_\d+\]); "
+        r"marker \[PERSON_001\]",
+        sanitized,
+    )
+    assert match is not None, sanitized
+    alice_token, bob_token = match.groups()
+    assert alice_token != bob_token
+    assert "Alice" not in sanitized
+    assert "Bob" not in sanitized
+
+    chunks_in = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "content": (
+                            f"[CONTRACTOR_001] met {alice_token} and {bob_token}; "
+                            "marker [PERSON_001]"
+                        )
+                    }
+                }
+            ]
+        }
+    ]
+    restored = ""
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        restored += chunk["choices"][0]["delta"]["content"]
+
+    assert restored == "Alice Smith met Alice and Bob; marker [PERSON_001]"
 
 
 async def test_user_typed_placeholder_literal_preserved_not_collided(
