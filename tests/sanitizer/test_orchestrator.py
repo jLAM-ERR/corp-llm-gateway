@@ -1148,3 +1148,71 @@ async def test_sanitize_computes_rule_matches_only_once_per_request(
     assert calls == ["contact acme today"], (
         "rule_matches must be computed exactly once for the shared full text"
     )
+
+
+# ---- Critical 2: O(n^2) span selection blocks the event loop ---------------
+
+
+def test_non_overlapping_spans_overlap_and_add_boundary_conditions() -> None:
+    """Unit-level correctness of the replacement span tracker: empty, single,
+    touching-but-not-overlapping, and a genuine overlap."""
+    from corp_llm_gateway.sanitizer.orchestrator import _NonOverlappingSpans
+
+    spans = _NonOverlappingSpans()
+    assert spans.overlaps(0, 1) is False  # empty tracker: nothing occupied
+
+    spans.add(10, 20)
+    assert spans.overlaps(10, 20) is True  # identical span
+    assert spans.overlaps(0, 10) is False  # touches at the boundary, no overlap
+    assert spans.overlaps(20, 30) is False  # touches at the boundary, no overlap
+    assert spans.overlaps(5, 11) is True  # overlaps the start
+    assert spans.overlaps(19, 25) is True  # overlaps the end
+    assert spans.overlaps(12, 18) is True  # fully contained
+
+    spans.add(0, 10)
+    spans.add(20, 30)
+    assert spans.overlaps(9, 21) is True  # spans both neighbors
+    assert spans.overlaps(30, 40) is False  # past every accepted span
+
+
+def test_rule_matches_stays_within_budget_on_large_duplicate_heavy_text() -> None:
+    """CRITICAL 2 regression: a single short rule term repeated ~20k times in a
+    100 KiB leaf used to make `_rule_matches`' O(candidates x accepted) overlap
+    scan take multiple SYNCHRONOUS seconds (measured ~5s pre-fix on this exact
+    shape), blocking the asyncio event loop against a ~6ms p50 / 4s p99 budget
+    (CLAUDE.md — no GPU escape hatch). Generous 1s ceiling: pre-fix this test
+    fails by roughly 5x; post-fix it completes in tens of milliseconds."""
+    import time
+
+    from corp_llm_gateway.sanitizer.orchestrator import _rule_matches
+
+    text = ("corp " * 20400)[:101997]
+    rules = Rules(rules=(Rule("corp", "[C]"),))
+
+    start = time.perf_counter()
+    matches = _rule_matches(rules, text)
+    elapsed = time.perf_counter() - start
+
+    assert len(matches) > 10000
+    assert elapsed < 1.0, f"_rule_matches took {elapsed:.3f}s, budget is 1.0s"
+
+
+def test_plan_replacements_stays_within_budget_on_large_duplicate_heavy_text() -> None:
+    """Same CRITICAL 2 regression for `_plan_replacements`'s candidate-pool
+    selection (measured ~5.6s pre-fix on this exact shape)."""
+    import time
+
+    from corp_llm_gateway.sanitizer.orchestrator import _plan_replacements, _rule_matches
+
+    text = ("corp " * 20400)[:101997]
+    rules = Rules(rules=(Rule("corp", "[C]"),))
+    rule_matches = _rule_matches(rules, text)
+    pairs = tuple(dict.fromkeys((m.original, m.replacement) for m in rule_matches))
+
+    start = time.perf_counter()
+    plan = _plan_replacements(text, pairs, rule_matches)
+    elapsed = time.perf_counter() - start
+
+    assert len(plan.pairs) == 1
+    assert "corp" not in plan.sanitized_text
+    assert elapsed < 1.0, f"_plan_replacements took {elapsed:.3f}s, budget is 1.0s"
