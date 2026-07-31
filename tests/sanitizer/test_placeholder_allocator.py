@@ -107,6 +107,24 @@ def test_two_different_rules_sharing_one_configured_replacement_also_collapse() 
     assert out == (("Foobar", "PARTNER-A"),)
 
 
+def test_rule_exemption_does_not_collapse_onto_a_prior_non_rule_claimant() -> None:
+    """Round-4 CRITICAL 1 repro: a detector/oracle pair claims a placeholder
+    FIRST; a rule configured to use that exact same placeholder text must
+    still mint its own token rather than reusing the non-rule claim, even
+    though the incoming rule original is itself exempt."""
+    a = RequestPlaceholderAllocator()
+    seg1 = a.remap((("Globex Inc", "[ORG_001]"),))  # non-exempt oracle finding claims it first
+    seg2 = a.remap(
+        (("Acme", "[ORG_001]"),), exempt_from_bijection=frozenset({"Acme"})
+    )  # rule configured to the same literal text
+    assert seg1 == (("Globex Inc", "[ORG_001]"),)
+    assert seg2 == (("Acme", "[ORG_002]"),)
+    # a later case-variant of the SAME rule still collapses onto the rule's
+    # own resolved token, not the oracle's, regardless of arrival order
+    seg3 = a.remap((("ACME", "[ORG_001]"),), exempt_from_bijection=frozenset({"ACME"}))
+    assert seg3 == (("ACME", "[ORG_002]"),)
+
+
 def test_rule_exemption_never_bypasses_the_forbidden_literal_guard() -> None:
     """SECURITY: a placeholder the user typed literally must never be reused
     for a real redaction, even when the colliding original is rule-exempt —
