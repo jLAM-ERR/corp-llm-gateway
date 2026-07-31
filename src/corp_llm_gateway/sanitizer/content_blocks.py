@@ -492,8 +492,8 @@ async def _sanitize_block(
     # IS a scannable JSON tree — there is no "structurally unscannable" block
     # left to hard-fail on; ContentTooDeepError still guards pathological
     # nesting depth via `_sanitize_json`.
-    new_block: dict[str, Any] = {}
-    results: list[Any] = []
+    new_block = {}
+    results = []
     for key, value in block.items():
         if key == "type" or key in _BLOCK_FALLBACK_OPAQUE_KEYS:
             new_block[key] = value
