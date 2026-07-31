@@ -2025,6 +2025,19 @@ class _FakeChatModelResponseValidateFails(_FakeChatModelResponse):
         raise ValueError("simulated reconstruction failure")
 
 
+class _FakeChatModelResponseValidateFailsWithPayloadInMessage(_FakeChatModelResponse):
+    """Stands in for a real pydantic ValidationError, whose message embeds
+    the offending `input_value` — i.e. the payload that failed to validate,
+    which at this call site is the already-DESANITIZED (original-bearing)
+    response dict."""
+
+    @classmethod
+    def model_validate(
+        cls, payload: dict[str, Any]
+    ) -> "_FakeChatModelResponseValidateFailsWithPayloadInMessage":
+        raise ValueError(f"1 validation error for Foo\n  input_value={payload!r}")
+
+
 async def test_post_call_unary_non_model_response_passes_through_unchanged_like_release() -> None:
     """release/1.0.x returned any non-str/non-dict response unchanged — an
     object with no ``model_dump`` still does, matching that baseline exactly."""
@@ -2152,6 +2165,29 @@ async def test_post_call_unary_response_reconstruct_failure_does_not_bypass_vali
     assert out is response
     assert "litellm_post_call_response_reconstruct_failed" in caplog.text
     assert "E_RESPONSE_RECONSTRUCT_FAILED" in caplog.text
+
+
+async def test_post_call_unary_reconstruct_failure_log_has_no_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M1-14: the reconstruct-failure log must never carry the original — the
+    payload at that point is already desanitized, so a real pydantic
+    ValidationError (which embeds the offending `input_value` in its own
+    message) must not be logged with its exception details."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+    caplog.clear()  # only the post_call_unary reconstruct-failure log matters here
+
+    response = _FakeChatModelResponseValidateFailsWithPayloadInMessage(
+        [{"message": {"role": "assistant", "content": "hello [N1]!"}}]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        out = await g.post_call_unary(data, response)
+
+    assert out is response
+    assert "alice" not in caplog.text
 
 
 # ---- New task tests (tasks 2 & 4) -------------------------------------------
