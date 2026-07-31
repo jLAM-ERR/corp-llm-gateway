@@ -84,3 +84,18 @@ def test_never_field_nested_as_value_inside_finding_label_counts_is_still_caught
                 "finding_label_counts": {"API_KEY": {"authorization": "Bearer x"}},
             }
         )
+
+
+def test_never_field_nested_under_a_list_inside_data_keyed_field_is_still_caught() -> None:
+    """Minor: `_walk_values_only`'s list branch used to recurse into ITSELF
+    instead of the normal `_walk`, so a NEVER key nested under a list inside a
+    DATA_KEYED_FIELDS value was exempted from key matching at EVERY depth
+    below that list, not just the data-keyed field's own immediate key layer
+    (its docstring's promise)."""
+    with pytest.raises(NeverFieldPresentError, match="mapping"):
+        assert_no_never_fields(
+            {
+                "request_id": "r1",
+                "finding_label_counts": [{"mapping": "leaked-original"}],
+            }
+        )
