@@ -728,6 +728,35 @@ def test_responses_stream_event_reconstruct_success_still_restores() -> None:
     assert out[0].output[0]["content"] == "hi alice"
 
 
+class _FakeResponsesEventWithHiddenParams(_FakeResponsesEvent):
+    """model_dump() never includes pydantic PrivateAttr fields (mirrors the
+    real litellm.types.llms.openai.ResponseCompletedEvent._hidden_params) —
+    model_validate() on the dump builds a BRAND NEW instance whose private
+    attrs reset to this constructor default, losing whatever real value
+    litellm attached to the ORIGINAL instance at runtime."""
+
+    def __init__(self, type_: str, **fields: Any) -> None:
+        super().__init__(type_, **fields)
+        self._hidden_params: dict[str, Any] = {}
+
+
+def test_responses_stream_event_reconstruct_success_restores_hidden_params() -> None:
+    """Round-4 IMPORTANT 8: _restore_responses_event's successful
+    model_validate() path dropped _hidden_params — the same defect I9 fixed
+    at the unary _apply_reverse_to_response site, left at this sibling."""
+    d = ResponsesStreamDesanitizer(_mapping(("alice", "[NAME_001]")))
+    event = _FakeResponsesEventWithHiddenParams(
+        "response.completed", output=[{"content": "hi [NAME_001]"}]
+    )
+    event._hidden_params = {"response_cost": 0.05}
+
+    out = d.feed(event)
+
+    assert len(out) == 1
+    assert out[0].output[0]["content"] == "hi alice"
+    assert out[0]._hidden_params == {"response_cost": 0.05}
+
+
 # --- Minor: synthetic tail event must not replay a stale sequence_number ----
 
 

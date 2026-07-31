@@ -300,13 +300,16 @@ def _responses_event_payload(chunk: Any) -> dict[str, Any] | None:
     return None
 
 
+_RESPONSES_EVENT_PRIVATE_ATTRS = ("_hidden_params", "_response_headers", "_response_ms")
+
+
 def _restore_responses_event(original: Any, payload: dict[str, Any]) -> Any:
     if isinstance(original, dict):
         return payload
     validator = getattr(type(original), "model_validate", None)
     if callable(validator):
         try:
-            return validator(payload)
+            restored = validator(payload)
         except Exception as exc:
             # Must not silently fall through to an unvalidated model_copy() —
             # the exact degradation litellm_hook.py's _apply_reverse_to_response
@@ -322,6 +325,27 @@ def _restore_responses_event(original: Any, payload: dict[str, Any]) -> Any:
                 type(exc).__name__,
             )
             return original
+        # model_validate() builds a BRAND NEW instance from the dumped dict,
+        # which never carries pydantic private attrs (_hidden_params etc — see
+        # litellm_hook.py's _apply_reverse_to_response for the same restore on
+        # the unary response path). Restoring them is deliberately OUTSIDE the
+        # reconstruction try/except above: a failure here must not discard the
+        # already-validated, already-desanitized `restored` event.
+        for attr in _RESPONSES_EVENT_PRIVATE_ATTRS:
+            value = getattr(original, attr, None)
+            if value is None or not hasattr(restored, attr):
+                continue
+            try:
+                setattr(restored, attr, value)
+            except Exception as exc:
+                logger.warning(
+                    "streaming_responses_event_private_attr_restore_failed "
+                    "event_type=%s attr=%s exception_type=%s",
+                    type(original).__name__,
+                    attr,
+                    type(exc).__name__,
+                )
+        return restored
     copier = getattr(original, "model_copy", None)
     if callable(copier):
         return copier(update=payload, deep=True)
