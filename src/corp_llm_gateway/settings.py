@@ -97,6 +97,12 @@ KEYS: tuple[Key, ...] = (
     Key("CORP_LLM_BLOCK_PAYLOADS", flag=True, default="1", help="Stage 0 payload classifier"),
     Key("CORP_LLM_DLP_GUARD", flag=True, default="1", help="Stage 5 DLP egress guard"),
     Key("CORP_LLM_DLP_CANARIES", default="", help="comma-separated DLP canary regexes"),
+    Key(
+        "CORP_LLM_FORWARD_CHATGPT_AUTH",
+        flag=True,
+        default="0",
+        help="forward allowlisted Codex OAuth headers to ChatGPT backend",
+    ),
     # Choices validated by normalize_oversize_policy (see _check_oversize), not
     # the generic choice check, so the canonical error message is used once.
     Key("CORP_LLM_OVERSIZE_POLICY", default="fail-closed", help="oversize-leaf policy (F1)"),

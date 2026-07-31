@@ -27,7 +27,7 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -42,6 +42,7 @@ from corp_llm_gateway.payload.size_threshold import OversizeContentError
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.sanitizer import (
     OpenAiToolCallDesanitizer,
+    ResponsesStreamDesanitizer,
     SanitizationOrchestrator,
     SanitizeResult,
     SseStreamDesanitizer,
@@ -54,6 +55,7 @@ from corp_llm_gateway.sanitizer.content_blocks import (
     collect_text,
     collect_tool_call_text,
     desanitize_content,
+    desanitize_responses_payload,
     desanitize_tool_calls,
     message_has_tool_calls,
     sanitize_content,
@@ -135,6 +137,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         *,
         max_output_tokens_cap: int | None = None,
         strip_inbound_headers_to_upstream: bool = False,
+        forward_chatgpt_auth: bool = False,
         dlp_guard: DlpEgressGuard | None = None,
         metrics: MetricsExporter | None = None,
     ) -> None:
@@ -159,6 +162,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # `Host: 127.0.0.1:4000` and the corp ingress 503s on the unknown
         # vhost. Off by default to preserve existing behaviour.
         self._strip_inbound_headers_to_upstream = strip_inbound_headers_to_upstream
+        # Opt-in bridge for a Codex custom provider with
+        # ``requires_openai_auth = true``. LiteLLM consumes the client
+        # Authorization header at its proxy boundary, so copy only the headers
+        # required by the ChatGPT Codex backend into per-request extra_headers.
+        self._forward_chatgpt_auth = forward_chatgpt_auth
         self._dlp_guard = dlp_guard if dlp_guard is not None else DlpEgressGuard()
         # Pluggable metrics exporter (B4). Default Noop = nothing emitted; a
         # PrometheusExporter (config-selected in the composition root) exposes the
@@ -177,7 +185,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
     async def async_pre_call_hook(
         self,
-        user_api_key_dict: dict[str, Any] | None,
+        user_api_key_dict: Any,
         cache: Any,
         data: dict[str, Any],
         call_type: str,
@@ -186,17 +194,17 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
     async def async_post_call_streaming_iterator_hook(
         self,
-        user_api_key_dict: dict[str, Any] | None,
+        user_api_key_dict: Any,
         response: AsyncIterator[Any],
         request_data: dict[str, Any],
-    ) -> AsyncIterator[Any]:
+    ) -> AsyncGenerator[Any, None]:
         async for chunk in self.post_call_stream(request_data, response):
             yield chunk
 
     async def async_post_call_success_hook(
         self,
         data: dict[str, Any],
-        user_api_key_dict: dict[str, Any] | None,
+        user_api_key_dict: Any,
         response: Any,
     ) -> Any:
         # NOTE: litellm v1.85 dropped `cache` from this hook's signature
@@ -242,7 +250,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         """
         request_id = self._ensure_request_id(data)
         model = str(data.get("model") or "unknown")
-        raw_messages = data.get("messages") or []
+        raw_messages, request_shape = _request_items(data)
         message_count = len(raw_messages) if isinstance(raw_messages, list) else 0
         logger.info(
             "litellm_pre_call_received request_id=%s model=%s message_count=%d",
@@ -264,8 +272,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 )
                 data["max_tokens"] = self._max_output_tokens_cap
 
+        inbound_headers = _extract_headers(data)
         try:
-            ctx = await self._auth.authenticate_headers(_extract_headers(data))
+            ctx = await self._auth.authenticate_headers(inbound_headers)
         except MissingTokenError:
             logger.info(
                 "litellm_pre_call_auth_failed request_id=%s error_code=E_MISSING_TOKEN",
@@ -319,7 +328,51 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             if isinstance(md, dict):
                 _drop_wire_headers(md.get("headers"))
 
-        messages = data.get("messages") or []
+        if self._forward_chatgpt_auth:
+            try:
+                upstream_headers = _chatgpt_upstream_headers(inbound_headers)
+                authorization = next(
+                    value
+                    for name, value in upstream_headers.items()
+                    if name.lower() == "authorization"
+                )
+                # The OpenAI provider writes its configured api_key after
+                # extra_headers. Override that placeholder per request and let
+                # LiteLLM construct the upstream Authorization header.
+                data["api_key"] = authorization[7:].strip()
+                data["extra_headers"] = {
+                    name: value
+                    for name, value in upstream_headers.items()
+                    if name.lower() != "authorization"
+                }
+                # LiteLLM injects request/accounting metadata into every proxy
+                # call. The ChatGPT Codex backend rejects this otherwise valid
+                # Responses API parameter. Correlation remains available via
+                # the top-level and litellm_metadata request-id copies.
+                data.pop("metadata", None)
+            except ValueError:
+                self._record_failure(request_id, error_code="E_PROVIDER_AUTH")
+                logger.info(
+                    "litellm_pre_call_provider_auth_failed request_id=%s "
+                    "error_code=E_PROVIDER_AUTH",
+                    request_id,
+                )
+                _now = datetime.now(UTC)
+                await self.audit(
+                    data,
+                    None,
+                    _now,
+                    _now,
+                    status="failed",
+                    error_code="E_PROVIDER_AUTH",
+                )
+                raise GuardrailHttpException(
+                    401,
+                    "E_PROVIDER_AUTH",
+                    "missing or invalid OpenAI bearer authentication",
+                ) from None
+
+        messages = raw_messages
         if not isinstance(messages, list):
             logger.info(
                 "litellm_pre_call_bad_request request_id=%s error_code=E_BAD_REQUEST",
@@ -328,7 +381,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             self._record_failure(request_id, error_code="E_BAD_REQUEST")
             _now = datetime.now(UTC)
             await self.audit(data, None, _now, _now, status="failed", error_code="E_BAD_REQUEST")
-            raise GuardrailHttpException(400, "E_BAD_REQUEST", "messages must be a list")
+            raise GuardrailHttpException(
+                400,
+                "E_BAD_REQUEST",
+                "messages/input must be a list or input must be a string",
+            )
 
         provider = _detect_provider(data)
         state = _RequestState(
@@ -408,8 +465,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     input_literals.extend(find_placeholder_literals(_seg))
                 for _seg in collect_tool_call_text(_m):
                     input_literals.extend(find_placeholder_literals(_seg))
-        for _seg in collect_text(data.get("system")):
-            input_literals.extend(find_placeholder_literals(_seg))
+        for _prompt_field in ("system", "instructions"):
+            for _seg in collect_text(data.get(_prompt_field)):
+                input_literals.extend(find_placeholder_literals(_seg))
         if input_literals:
             allocator.forbid(input_literals)
             logger.warning(
@@ -427,7 +485,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 if isinstance(_s0_msg, dict):
                     _s0_texts.extend(collect_text(_s0_msg.get("content")))
                     _s0_texts.extend(collect_tool_call_text(_s0_msg))
-            _s0_texts.extend(collect_text(data.get("system")))
+            for _prompt_field in ("system", "instructions"):
+                _s0_texts.extend(collect_text(data.get(_prompt_field)))
             _s0_reason = classify_block("\n".join(_s0_texts))
             if _s0_reason is not None:
                 state.block_reason = _s0_reason
@@ -613,8 +672,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 len(msg_placeholders),
             )
 
-        # Sanitize system field if present and non-empty (E: truthy guard skips ""/[]).
-        system = data.get("system")
+        _store_request_items(data, messages, request_shape)
+
+        # Chat Completions uses ``system`` while Responses uses
+        # ``instructions``. They are mutually exclusive in the supported wire
+        # profiles, so route either through the same fail-closed path.
+        prompt_field = "system" if data.get("system") else "instructions"
+        system = data.get(prompt_field)
         if system:
             if isinstance(system, str):
                 system_bytes = len(system.encode("utf-8"))
@@ -686,7 +750,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "E_NER_UNAVAILABLE",
                     "NER detector unavailable",
                 ) from exc
-            data["system"] = new_system
+            data[prompt_field] = new_system
             for result in results:
                 self._merge_into_state(state, result)
                 if result.skipped:
@@ -720,11 +784,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             or _s5_policy.canary_patterns
         ):
             _s5_texts: list[str] = []
-            for _s5_msg in data.get("messages") or []:
+            _s5_messages, _ = _request_items(data)
+            for _s5_msg in _s5_messages or []:
                 if isinstance(_s5_msg, dict):
                     _s5_texts.extend(collect_text(_s5_msg.get("content")))
                     _s5_texts.extend(collect_tool_call_text(_s5_msg))
-            _s5_texts.extend(collect_text(data.get("system")))
+            for _prompt_field in ("system", "instructions"):
+                _s5_texts.extend(collect_text(data.get(_prompt_field)))
             _s5_joined = "\n".join(_s5_texts)
             _s5_reason = self._dlp_guard.scan(_s5_joined)
             if _s5_reason is None and _s5_policy.canary_patterns:
@@ -792,11 +858,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         dict_tool_calls = OpenAiToolCallDesanitizer(state.mapping)
         # Dict path: legacy OpenAI function_call.arguments deltas (singular).
         dict_function_call = StreamingDesanitizer(state.mapping, escape=_json_string_escape)
+        # Responses API path: typed Pydantic ``response.*`` events.
+        responses_desanitizer = ResponsesStreamDesanitizer(state.mapping)
         chunk_count = 0
         async for chunk in response:
             chunk_count += 1
             if isinstance(chunk, (bytes, str)):
                 for out_chunk in sse.feed(chunk):
+                    yield out_chunk
+            elif _is_responses_event(chunk):
+                for out_chunk in responses_desanitizer.feed(chunk):
                     yield out_chunk
             elif isinstance(chunk, dict):
                 chunk, had_tc = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
@@ -826,6 +897,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         fc_tail = dict_function_call.flush()
         if fc_tail:
             yield _make_function_call_chunk(fc_tail)
+        for responses_tail in responses_desanitizer.flush():
+            yield responses_tail
         logger.info(
             "litellm_post_call_stream_desanitize_done request_id=%s chunk_count=%d",
             request_id,
@@ -1139,6 +1212,71 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
         meta = lparams.get("metadata")
         if isinstance(meta, dict):
             _drop_corp_token(meta.get("headers"))
+    secret_fields = data.get("secret_fields")
+    if isinstance(secret_fields, dict):
+        _drop_corp_token(secret_fields.get("raw_headers"))
+
+
+_CHATGPT_HEADER_ALLOWLIST = frozenset(
+    {
+        "authorization",
+        "chatgpt-account-id",
+        "originator",
+        "session-id",
+        "thread-id",
+        "user-agent",
+        "x-openai-internal-codex-responses-lite",
+    }
+)
+
+
+def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
+    """Select Codex subscription headers without forwarding corp credentials."""
+    selected: dict[str, str] = {}
+    authorization: str | None = None
+    for name, value in inbound.items():
+        lower = name.lower()
+        if lower == _CORP_AUTH_HEADER_LOWER:
+            continue
+        if lower in _CHATGPT_HEADER_ALLOWLIST or lower.startswith("x-codex-"):
+            selected[name] = value
+        if lower == "authorization":
+            authorization = value
+    if authorization is None or not authorization.lower().startswith("bearer "):
+        raise ValueError("missing bearer authorization")
+    if not authorization[7:].strip() or "\n" in authorization or "\r" in authorization:
+        raise ValueError("invalid bearer authorization")
+    return selected
+
+
+def _request_items(data: dict[str, Any]) -> tuple[Any, str]:
+    """Return a mutable message-like view for Chat Completions or Responses."""
+    if "messages" in data:
+        messages = data.get("messages")
+        return ([] if messages is None else messages), "messages"
+    if "input" not in data:
+        return [], "messages"
+    response_input = data.get("input")
+    if isinstance(response_input, str):
+        return [{"role": "user", "content": response_input}], "input_string"
+    return response_input, "input_list"
+
+
+def _store_request_items(data: dict[str, Any], items: list[Any], shape: str) -> None:
+    if shape == "messages":
+        data["messages"] = items
+    elif shape == "input_string":
+        first = items[0] if items else {}
+        data["input"] = first.get("content", "") if isinstance(first, dict) else ""
+    else:
+        data["input"] = items
+
+
+def _is_responses_event(chunk: Any) -> bool:
+    if isinstance(chunk, dict):
+        return str(chunk.get("type") or "").startswith("response.")
+    event_type = getattr(chunk, "type", None)
+    return isinstance(event_type, str) and event_type.startswith("response.")
 
 
 class _RequestState:
@@ -1187,12 +1325,41 @@ class _RequestState:
 
 
 def _extract_headers(data: dict[str, Any]) -> dict[str, str]:
-    raw = data.get("headers") or data.get("proxy_server_request") or {}
-    if isinstance(raw, dict):
-        if "headers" in raw and isinstance(raw["headers"], dict):
-            return {str(k): str(v) for k, v in raw["headers"].items()}
-        return {str(k): str(v) for k, v in raw.items()}
-    return {}
+    """Merge the header copies LiteLLM exposes to callbacks.
+
+    Recent LiteLLM releases keep proxy credentials in ``data["headers"]`` but
+    retain the client Authorization header under ``proxy_server_request`` or
+    logging metadata. Reading only the first non-empty bucket loses OAuth. The
+    merge is case-insensitive so a later, more complete wire-request copy
+    replaces an earlier normalized copy instead of creating duplicate headers.
+    """
+    buckets: list[Any] = [data.get("headers")]
+    for key in ("metadata", "litellm_metadata", "proxy_server_request"):
+        bucket = data.get(key)
+        if isinstance(bucket, dict):
+            buckets.append(bucket.get("headers"))
+    litellm_params = data.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        metadata = litellm_params.get("metadata")
+        if isinstance(metadata, dict):
+            buckets.append(metadata.get("headers"))
+        proxy_request = litellm_params.get("proxy_server_request")
+        if isinstance(proxy_request, dict):
+            buckets.append(proxy_request.get("headers"))
+    secret_fields = data.get("secret_fields")
+    if isinstance(secret_fields, dict):
+        # LiteLLM 1.89 stores the unmodified HTTP headers here and explicitly
+        # excludes this object from logging and upstream request snapshots.
+        buckets.append(secret_fields.get("raw_headers"))
+
+    merged: dict[str, tuple[str, str]] = {}
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        for key, value in bucket.items():
+            name = str(key)
+            merged[name.lower()] = (name, str(value))
+    return dict(merged.values())
 
 
 def _detect_provider(data: dict[str, Any]) -> Provider:
@@ -1221,6 +1388,7 @@ _FAILURE_COMPONENT: dict[str, str] = {
     "E_TOKEN_REVOKED": "auth",
     "E_TOKEN_INVALID": "auth",
     "E_AUTH": "auth",
+    "E_PROVIDER_AUTH": "auth",
     "E_PROVIDER_BLOCKED": "provider",
     "E_POLICY_BLOCKED": "policy",
     "E_OVERSIZE_BLOCKED": "oversize",
@@ -1366,6 +1534,8 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
         return _reverse(response)
     if isinstance(response, dict):
         out = {**response}
+        if "output" in out or str(out.get("type") or "").startswith("response."):
+            out = desanitize_responses_payload(out, _reverse)
         choices = out.get("choices")
         if isinstance(choices, list):
             out["choices"] = [_reverse_choice(c, _reverse) for c in choices]
@@ -1373,6 +1543,23 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
         elif "content" in out and isinstance(out["content"], (str, list)):
             out["content"] = desanitize_content(out["content"], _reverse)
         return out
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            payload = model_dump(mode="python", exclude_none=False)
+        except TypeError:
+            payload = model_dump(exclude_none=False)
+        if isinstance(payload, dict):
+            rewritten = desanitize_responses_payload(payload, _reverse)
+            validator = getattr(type(response), "model_validate", None)
+            if callable(validator):
+                try:
+                    return validator(rewritten)
+                except Exception:
+                    pass
+            copier = getattr(response, "model_copy", None)
+            if callable(copier):
+                return copier(update=rewritten, deep=True)
     return response
 
 
