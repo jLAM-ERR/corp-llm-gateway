@@ -743,13 +743,24 @@ def _is_opaque_item_field(item_type: object, field: str) -> bool:
 # call per item on values that can never carry user content, and so "type"
 # (the routing discriminator every caller inspects) can never be rewritten.
 # "container_id" is a code-interpreter container reference, not text the
-# model or user typed. "name" and "server_label" are deliberately NOT here:
-# a chat-shaped item mixed into `input` carries a caller-supplied
-# `message.name`, and an `mcp_call`/`mcp_list_tools` `server_label` is
-# developer-chosen free text that can carry an internal corp name — both are
-# exactly what replace.md rules target, so both must go through the scan.
+# model or user typed.
+#
+# "name" and "server_label" are ALSO here, deliberately: `data["tools"]`
+# (the function/MCP tool declarations sent alongside `input`) is never
+# sanitized anywhere in litellm_hook.py, so a `function_call.name` or
+# `mcp_call`/`mcp_list_tools` `server_label` inside an `input` item
+# correlates to its own tool declaration by EXACT value. Rewriting only the
+# `input`-side occurrence desyncs it from the untouched declaration and the
+# provider rejects the request — a real regression a round-3 fix introduced
+# by widening the scan without also sanitizing `tools`. Reverted to
+# structural rather than sanitizing `tools` too: this matches the existing,
+# unchanged pattern for Chat-Completions-shaped tool calls elsewhere in this
+# same file (`_sanitize_message_tool_calls_field` rewrites only
+# `arguments`, never `function.name`) — one consistent rule (tool/server
+# identifiers are structural, not free text) instead of two different ones
+# depending on which API shape carries them.
 _RESPONSES_STRUCTURAL_FIELDS = frozenset(
-    {"type", "id", "call_id", "status", "role", "container_id"}
+    {"type", "id", "call_id", "status", "role", "container_id", "name", "server_label"}
 )
 
 
