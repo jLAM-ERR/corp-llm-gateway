@@ -230,6 +230,31 @@ def test_bare_alias_replaced_across_chunk_split_at_legitimate_word_boundary() ->
     assert out == f"const {filler} see SecretPlace done"
 
 
+def test_bare_alias_boundary_defeated_by_chunk_split_end_of_buffer() -> None:
+    """MAJOR 3: the exact review repro. Unary (whole text at once) correctly
+    leaves `NAME_001Suffix` untouched (the anchor's trailing lookahead sees
+    `S`, an identifier char, right after the alias). Split across a chunk
+    boundary so the alias's real end coincides with the CURRENT buffer's end,
+    end-of-buffer must NOT be treated as "definitely nothing follows" — a
+    later chunk can still extend it past the boundary."""
+    d = StreamingDesanitizer(_mapping(("Alice Smith", "[NAME_001]"), ("Alice Smith", "NAME_001")))
+    out = d.feed("class NAME_001")
+    out += d.feed("Suffix: pass")
+    out += d.flush()
+    assert out == "class NAME_001Suffix: pass"
+
+
+def test_bare_alias_boundary_respected_when_split_lands_on_real_word_boundary() -> None:
+    """Companion positive control: the same split point, but the next chunk
+    genuinely starts with a non-identifier character — the alias must still
+    be restored (the fix must not become over-conservative and never fire)."""
+    d = StreamingDesanitizer(_mapping(("Alice Smith", "[NAME_001]"), ("Alice Smith", "NAME_001")))
+    out = d.feed("class NAME_001")
+    out += d.feed(": pass")
+    out += d.flush()
+    assert out == "class Alice Smith: pass"
+
+
 # Streaming async iterator interface ----------------------------------------
 
 
