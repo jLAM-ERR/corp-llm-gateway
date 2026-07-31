@@ -53,7 +53,8 @@ transforms:
       !exists(.cookie) &&
       !exists(.Cookie) &&
       !exists(.set_cookie) &&
-      !exists(."Set-Cookie")
+      !exists(."Set-Cookie") &&
+      !exists(.extra_headers)
 
   # Keep ONLY events shaped like AuditEvent (StdoutSink output). Drop
   # litellm's own JSON wrappers, parse failures, and anything else.

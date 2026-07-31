@@ -16,6 +16,7 @@ NEVER_FIELDS: frozenset[str] = frozenset(
         "authorization",
         "cookie",
         "set_cookie",
+        "extra_headers",
     }
 )
 
