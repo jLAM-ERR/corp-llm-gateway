@@ -8,6 +8,7 @@ framework-free and unit-testable.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import logging
 import re
@@ -132,6 +133,45 @@ class _MatchedRule:
     replacement: str
 
 
+class _NonOverlappingSpans:
+    """Track accepted non-overlapping half-open ``[start, end)`` spans and
+    answer "does this candidate overlap an already-accepted span" without a
+    linear scan over every prior accepted span.
+
+    ``_rule_matches``/``_plan_replacements`` used to append accepted spans to
+    a plain list and check a NEW candidate with ``any(... for ... in
+    occupied)`` — O(accepted) per candidate, O(candidates^2) overall. Measured
+    on a single 100 KiB text leaf with one 4-char rule term (~20k matches):
+    ~5s of synchronous CPU, blocking the asyncio event loop against a ~6ms
+    p50 / 4s p99 budget (no GPU escape hatch — CLAUDE.md).
+
+    Spans are kept sorted by start, so bisect only has to inspect the two
+    immediate neighbors of the insertion point — any span farther away is,
+    by the non-overlapping invariant, guaranteed not to touch the candidate.
+    That turns the check into O(log k); the array insert to keep the list
+    sorted is a single C-level memmove (`list.insert`), not a Python-level
+    loop, so it stays fast in practice at the sizes this engine handles
+    (bounded by the payload size threshold / chunk window).
+    """
+
+    __slots__ = ("_ends", "_starts")
+
+    def __init__(self) -> None:
+        self._starts: list[int] = []
+        self._ends: list[int] = []
+
+    def overlaps(self, start: int, end: int) -> bool:
+        i = bisect.bisect_right(self._starts, start)
+        if i > 0 and self._ends[i - 1] > start:
+            return True
+        return i < len(self._starts) and self._starts[i] < end
+
+    def add(self, start: int, end: int) -> None:
+        i = bisect.bisect_right(self._starts, start)
+        self._starts.insert(i, start)
+        self._ends.insert(i, end)
+
+
 # Rule dictionaries are per-team and small (tens of patterns); recompiling one
 # on every _rule_matches call measured ~44 ms/call at 200 rules x 10.8 KB
 # against a ~6 ms p50 CPU budget (no GPU escape hatch — see CLAUDE.md). 4096
@@ -154,12 +194,12 @@ def _rule_pattern(source: str) -> re.Pattern[str]:
 def _rule_matches(rules: Rules, text: str) -> tuple[_MatchedRule, ...]:
     """Return non-overlapping literal-rule matches, longest configured rule first."""
     selected: list[_MatchedRule] = []
-    occupied: list[tuple[int, int]] = []
+    occupied = _NonOverlappingSpans()
     ordered = sorted(enumerate(rules.rules), key=lambda item: (-len(item[1].pattern), item[0]))
     for _, rule in ordered:
         for match in _rule_pattern(rule.pattern).finditer(text):
             start, end = match.span()
-            if any(start < used_end and end > used_start for used_start, used_end in occupied):
+            if occupied.overlaps(start, end):
                 continue
             original = text[start:end]
             selected.append(
@@ -170,7 +210,7 @@ def _rule_matches(rules: Rules, text: str) -> tuple[_MatchedRule, ...]:
                     replacement=rule.replacement,
                 )
             )
-            occupied.append((start, end))
+            occupied.add(start, end)
     return tuple(sorted(selected, key=lambda item: item.start))
 
 
@@ -239,14 +279,12 @@ def _plan_replacements(
             candidates.append((key, AppliedSpan(start, end, original)))
 
     selected: list[AppliedSpan] = []
-    occupied: list[tuple[int, int]] = []
+    occupied = _NonOverlappingSpans()
     for _, span in sorted(candidates, key=lambda item: item[0]):
-        if any(
-            span.start < used_end and span.end > used_start for used_start, used_end in occupied
-        ):
+        if occupied.overlaps(span.start, span.end):
             continue
         selected.append(span)
-        occupied.append((span.start, span.end))
+        occupied.add(span.start, span.end)
 
     spans = tuple(sorted(selected, key=lambda span: (span.start, span.end)))
     used_originals = {span.original for span in spans}
