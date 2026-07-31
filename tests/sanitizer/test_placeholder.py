@@ -166,6 +166,18 @@ def test_sort_placeholders_descending_length_with_aliases_present() -> None:
     ]
 
 
+def test_build_reverse_substituter_many_to_one_collision_prefers_first_original() -> None:
+    """When two different originals share one placeholder (an operator rule
+    replacement configured many-to-one, exempted from the allocator's
+    bijection), the reverse map must agree with the allocator's own
+    first-claim semantics (`RequestPlaceholderAllocator._by_placeholder.
+    setdefault` keeps the first original) — otherwise the SAME placeholder
+    restores to different text depending on iteration order, corrupting one
+    of the two forward occurrences."""
+    reverse = build_reverse_substituter([("Acme", "[COMPANY]"), ("Globex", "[COMPANY]")])
+    assert reverse("[COMPANY] acquired [COMPANY]") == "Acme acquired Acme"
+
+
 def test_build_reverse_substituter_length_descending_with_aliases_present() -> None:
     reverse = build_reverse_substituter(
         [
