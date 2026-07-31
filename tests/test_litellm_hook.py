@@ -707,6 +707,19 @@ async def test_pre_call_no_call_type_defaults_to_todays_behavior() -> None:
     assert out["input"] == "contact [NAME_001]"
 
 
+async def test_pre_call_explicit_null_input_passes_through_like_release() -> None:
+    """Minor: `{"input": null}` used to hit the isinstance(messages, list)
+    bad-request check and 400 — release passed an explicit null through."""
+    g, _ = _build_guardrail([])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": None,
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data, call_type="responses")
+    assert out["input"] is None
+
+
 async def test_async_pre_call_hook_threads_call_type_to_embeddings_gate() -> None:
     """Wiring test: the real litellm entry point must pass call_type through,
     not just the pure-logic pre_call() method."""
