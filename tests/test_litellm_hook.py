@@ -4692,6 +4692,22 @@ async def test_stage5_dlp_blocks_canary_in_local_shell_call_action_command() -> 
     assert ei.value.error_code == "E_DLP_BLOCKED"
 
 
+async def test_stage5_dlp_scans_unmanaged_call_type_input_without_rewriting() -> None:
+    """A non-chat endpoint (embeddings) never gets its `input` rewritten
+    (MAJOR 6's denylist), but Stage 5 must still SCAN it for canaries/raw
+    secrets — an unmanaged call_type must not become a DLP blind spot."""
+    canary = "DLP-CANARY-RAW-99999"
+    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    data = {
+        "model": "text-embedding-3-small",
+        "input": f"embed this {canary} please",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data, call_type="embedding")
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+
+
 async def test_pre_call_local_shell_call_action_command_is_sanitized() -> None:
     """CRITICAL 1 repro from the review, reproduced end-to-end through pre_call:
     a `local_shell_call` item's `action.command`/`action.env` must be scanned,

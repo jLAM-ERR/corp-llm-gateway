@@ -53,6 +53,7 @@ from corp_llm_gateway.sanitizer.content_blocks import (
     ContentTooDeepError,
     UnsanitizableContentBlockError,
     UnsanitizableToolArgumentsError,
+    collect_raw_text_leaves,
     collect_responses_item_text,
     collect_text,
     collect_tool_call_text,
@@ -819,10 +820,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             or _s5_policy.canary_patterns
         ):
             _s5_texts: list[str] = []
-            _s5_messages, _ = _request_items(data, call_type)
+            _s5_messages, _s5_shape = _request_items(data, call_type)
             for _s5_msg in _s5_messages or []:
                 if isinstance(_s5_msg, (dict, str)):
                     _s5_texts.extend(_item_text(_s5_msg))
+            if _s5_shape == "unmanaged" and "input" in data:
+                # A non-chat endpoint (embeddings/moderations) never gets its
+                # `input` rewritten, but it must still be visible to this
+                # scan — an unmanaged call_type must not become a DLP blind
+                # spot just because its content is never sanitized.
+                _s5_texts.extend(collect_raw_text_leaves(data.get("input")))
             for _prompt_field in ("system", "instructions"):
                 _s5_texts.extend(collect_text(data.get(_prompt_field)))
             _s5_joined = "\n".join(_s5_texts)

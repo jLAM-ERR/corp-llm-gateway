@@ -163,6 +163,16 @@ def _collect_json_text(value: Any, _depth: int = 0) -> list[str]:
     return []
 
 
+def collect_raw_text_leaves(value: Any) -> list[str]:
+    """Collect every string leaf from an arbitrary JSON-compatible value.
+
+    For content that isn't an item/message list at all (e.g. a non-chat
+    endpoint's `input`, a bare string or a list of strings/token-id arrays)
+    but must still be visible to a text-based scan such as Stage 5's DLP
+    egress guard even though it is never rewritten."""
+    return _collect_json_text(value)
+
+
 async def _sanitize_arguments(arguments: str, sanitize_one: SanitizeOne) -> tuple[str, list[Any]]:
     """Sanitize a JSON-encoded OpenAI ``function.arguments`` string.
 
