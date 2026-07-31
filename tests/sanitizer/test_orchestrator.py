@@ -578,7 +578,132 @@ async def test_rules_match_case_insensitively_and_apply_replacement_verbatim() -
     )
 
 
-async def test_rule_spans_win_over_overlapping_local_findings() -> None:
+# ---------------------------------------------------------------------------
+# Defect #5 — longest span wins across ONE pool of rules + findings (decision 1)
+# ---------------------------------------------------------------------------
+
+
+async def test_finding_wins_over_partially_overlapping_rule_gazetteer_branch() -> None:
+    """Mechanism (a): a finding partially overlapping a rule must not be
+    dropped outright — the LONGER span wins. Gazetteer no-hit branch, where the
+    now-deleted `_filter_findings_overlapping_rules` used to run."""
+    gaz = Gazetteer({})  # empty — never hits, oracle stays skipped
+    rules = Rules(rules=(Rule("Alice", "[EMPLOYEE_001]"),))
+    finding = Finding("Alice Smith", "PERSON", 8, 19, 0.9)
+    client, captured = _client_returning_pairs([])
+    orch = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        gazetteer=gaz,
+        local_detectors=[_StaticFindingDetector([finding])],
+    )
+
+    result = await orch.sanitize("Contact Alice Smith today", team_id="t1", conversation_id="c1")
+
+    assert len(captured) == 0, "no gazetteer hit → oracle must not be called"
+    assert result.sanitized_text == "Contact [PERSON_001] today"
+    assert "Smith" not in result.sanitized_text
+
+
+async def test_rule_no_longer_steals_span_from_longer_finding_oracle_disabled() -> None:
+    """Mechanism (b), reviewer's exact repro: `_plan_replacements` reserved every
+    rule span first and unconditionally, so a short rule matching INSIDE a
+    longer finding stole the span and the finding's pair vanished from
+    `used_pairs` — losing its Cache-B mapping entirely, not just its
+    redaction. Runs on the oracle-DISABLED arm, where no filter ever ran, so
+    this can't pass merely because `_filter_findings_overlapping_rules` is
+    gone — the span-ordering fix is what's under test. Real
+    `RegexChecksumDetector`, not a stub."""
+    rules = Rules(rules=(Rule("acme", "[COMPANY]"),))
+    orch = SanitizationOrchestrator(
+        None,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        local_detectors=[RegexChecksumDetector()],
+        oracle_enabled=False,
+    )
+
+    result = await orch.sanitize(
+        "escalate to ops@acme-corp.com please", team_id="t1", conversation_id="c1"
+    )
+
+    assert result.sanitized_text == "escalate to [EMAIL_001] please"
+    assert ("ops@acme-corp.com", "[EMAIL_001]") in result.pairs
+    assert "[COMPANY]" not in result.sanitized_text
+
+
+async def test_oracle_on_and_off_produce_identical_sanitized_output() -> None:
+    """The oracle toggle (F3) is a latency/availability knob; it must not change
+    local-detection outcomes. Pre-fix, the oracle-ON arm dropped an overlapping
+    finding BEFORE `_merge_local` (mechanism a) while oracle-OFF dropped it
+    AFTER (mechanism b) — same finding lost, but the discarded finding
+    consumed a placeholder number in one arm and not the other, so the
+    SURVIVING finding's label numbering diverged between the two arms."""
+    rules = Rules(rules=(Rule("Alice", "[EMPLOYEE_001]"),))
+    text = "Alice Smith met Bob"
+    findings = [
+        Finding("Alice Smith", "PERSON", 0, len("Alice Smith"), 0.9),
+        Finding("Bob", "PERSON", text.index("Bob"), text.index("Bob") + 3, 0.9),
+    ]
+
+    orch_off = SanitizationOrchestrator(
+        None,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        local_detectors=[_StaticFindingDetector(findings)],
+        oracle_enabled=False,
+    )
+    off = await orch_off.sanitize(text, team_id="t1", conversation_id="c1")
+
+    client, captured = _client_returning_pairs([])
+    orch_on = SanitizationOrchestrator(
+        client,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        local_detectors=[_StaticFindingDetector(findings)],
+    )
+    on = await orch_on.sanitize(text, team_id="t1", conversation_id="c2")
+
+    assert len(captured) == 1, "oracle must be called when enabled (no gazetteer configured)"
+    assert on.sanitized_text == off.sanitized_text
+    assert on.pairs == off.pairs
+
+
+async def test_cache_a_hit_reproduces_span_selection_bit_for_bit() -> None:
+    """The Cache-A hit path re-runs `_plan_replacements` with the already
+    used-pairs-filtered `cached.pairs`; span selection (and thus the
+    deterministic tiebreak) must reproduce the miss path exactly."""
+    rules = Rules(rules=(Rule("Alice", "[EMPLOYEE_001]"),))
+    text = "Alice Smith met Bob"
+    findings = [
+        Finding("Alice Smith", "PERSON", 0, len("Alice Smith"), 0.9),
+        Finding("Bob", "PERSON", text.index("Bob"), text.index("Bob") + 3, 0.9),
+    ]
+    orch = SanitizationOrchestrator(
+        None,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        local_detectors=[_StaticFindingDetector(findings)],
+        oracle_enabled=False,
+    )
+
+    miss = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+    hit = await orch.sanitize(text, team_id="t1", conversation_id="c2")
+
+    assert hit.cache_a_hit is True
+    assert miss.sanitized_text == "[PERSON_001] met [PERSON_002]"
+    assert hit.sanitized_text == miss.sanitized_text
+    assert hit.pairs == miss.pairs
+    assert hit.applied_spans == miss.applied_spans
+
+
+async def test_longer_local_finding_wins_over_overlapping_rule_span() -> None:
+    """Renamed from `test_rule_spans_win_over_overlapping_local_findings`
+    (decision 1 inverts the old "rules always win" policy): the ORG finding's
+    21-char span fully covers the 10-char "Betadirect" rule match, so the
+    finding now wins that span; the non-overlapping "Zephyr Ledger" rule is
+    unaffected."""
     text = "Betadirect работает в Zephyr Ledger"
     rules = Rules(
         rules=(
@@ -602,10 +727,10 @@ async def test_rule_spans_win_over_overlapping_local_findings() -> None:
     result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
 
     assert len(captured) == 0
-    assert result.sanitized_text == "companynameabd работает в confidential project acn"
+    assert result.sanitized_text == "[ORG_001] confidential project acn"
     assert result.pairs == (
-        ("Betadirect", "companynameabd"),
         ("Zephyr Ledger", "confidential project acn"),
+        ("Betadirect работает в", "[ORG_001]"),
     )
 
 
@@ -650,7 +775,11 @@ async def test_fully_rule_covered_oracle_pair_is_not_stored() -> None:
     assert result.pairs == (("Alice Smith", "[CONTRACTOR_001]"),)
 
 
-async def test_shorter_rule_span_wins_over_longer_oracle_original() -> None:
+async def test_longer_oracle_original_wins_over_shorter_rule_span() -> None:
+    """Renamed from `test_shorter_rule_span_wins_over_longer_oracle_original`
+    (decision 1): a longer oracle finding now beats a shorter, overlapping
+    rule — previously the rule won unconditionally regardless of span length
+    (defect #5, mechanism b)."""
     rules = Rules(rules=(Rule("Alice", "[EMPLOYEE_001]"),))
     client, _ = _client_returning_pairs([("Alice Smith", "[PERSON_001]")])
     orch = SanitizationOrchestrator(
@@ -661,8 +790,8 @@ async def test_shorter_rule_span_wins_over_longer_oracle_original() -> None:
 
     result = await orch.sanitize("Alice Smith", team_id="t1", conversation_id="c1")
 
-    assert result.sanitized_text == "[EMPLOYEE_001] Smith"
-    assert result.pairs == (("Alice", "[EMPLOYEE_001]"),)
+    assert result.sanitized_text == "[PERSON_001]"
+    assert result.pairs == (("Alice Smith", "[PERSON_001]"),)
 
 
 async def test_rule_replacement_is_not_rescanned_by_oracle_pair() -> None:

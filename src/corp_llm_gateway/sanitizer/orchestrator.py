@@ -166,25 +166,6 @@ def _rule_matches(rules: Rules, text: str) -> tuple[_MatchedRule, ...]:
     return tuple(sorted(selected, key=lambda item: item.start))
 
 
-def _rules_pairs(rules: Rules, text: str) -> tuple[tuple[str, str], ...]:
-    """Return unique actual-text/replacement pairs for deterministic team rules."""
-    return tuple(
-        dict.fromkeys((match.original, match.replacement) for match in _rule_matches(rules, text))
-    )
-
-
-def _filter_findings_overlapping_rules(
-    findings: list[Finding], rule_matches: tuple[_MatchedRule, ...]
-) -> list[Finding]:
-    return [
-        finding
-        for finding in findings
-        if not any(
-            finding.start < match.end and finding.end > match.start for match in rule_matches
-        )
-    ]
-
-
 @dataclass(frozen=True)
 class _ReplacementPlan:
     sanitized_text: str
@@ -199,7 +180,19 @@ def _plan_replacements(
     *,
     active_rule_origins: frozenset[str] | None = None,
 ) -> _ReplacementPlan:
-    """Select concrete replacement spans with deterministic rules first."""
+    """Select concrete replacement spans: longest span wins (M1-5/decision 1).
+
+    Rule matches and finding/oracle pair occurrences compete in ONE candidate
+    pool ordered by span length descending, so a rule can no longer steal a
+    span out from under a longer, genuinely-overlapping finding (defect #5).
+    Tiebreak on equal length: rule over finding, then lower start, then pair
+    index — deterministic so the Cache-A hit path (which re-runs this with the
+    already-filtered `cached.pairs`) reproduces the miss path bit-for-bit. An
+    equal-length tie at the IDENTICAL span can't actually reach this pool:
+    the same span of the same text is the same substring, which the
+    `seen_originals` dedup below already resolved (it keeps the first pair —
+    rule pairs precede oracle/finding pairs in the caller's `pairs` argument).
+    """
     unique_pairs: list[tuple[str, str]] = []
     seen_originals: set[str] = set()
     for original, replacement in pairs:
@@ -209,6 +202,7 @@ def _plan_replacements(
         unique_pairs.append((original, replacement))
 
     pair_by_original = dict(unique_pairs)
+    pair_index_by_original = {original: index for index, (original, _) in enumerate(unique_pairs)}
     if active_rule_origins is None:
         available_pairs = set(unique_pairs)
         active_rule_origins = frozenset(
@@ -217,28 +211,34 @@ def _plan_replacements(
             if (match.original, match.replacement) in available_pairs
         )
 
-    selected: list[AppliedSpan] = []
-    occupied: list[tuple[int, int]] = []
+    # (sort_key, span) candidates from ONE pool. sort_key =
+    # (-length, is_finding, start, pair_index) — rule (is_finding=0) beats
+    # finding (is_finding=1) at equal length, then lower start, then pair_index.
+    candidates: list[tuple[tuple[int, int, int, int], AppliedSpan]] = []
     for match in rule_matches:
         if match.original not in active_rule_origins or match.original not in pair_by_original:
             continue
-        selected.append(AppliedSpan(match.start, match.end, match.original))
-        occupied.append((match.start, match.end))
+        pair_index = pair_index_by_original[match.original]
+        key = (-(match.end - match.start), 0, match.start, pair_index)
+        candidates.append((key, AppliedSpan(match.start, match.end, match.original)))
 
-    candidates: list[tuple[int, int, int, int, str]] = []
     for pair_index, (original, _) in enumerate(unique_pairs):
         if original in active_rule_origins:
             continue
         for occurrence in re.finditer(re.escape(original), text):
-            candidates.append(
-                (-len(original), pair_index, occurrence.start(), occurrence.end(), original)
-            )
+            start, end = occurrence.start(), occurrence.end()
+            key = (-(end - start), 1, start, pair_index)
+            candidates.append((key, AppliedSpan(start, end, original)))
 
-    for _, _, start, end, original in sorted(candidates):
-        if any(start < used_end and end > used_start for used_start, used_end in occupied):
+    selected: list[AppliedSpan] = []
+    occupied: list[tuple[int, int]] = []
+    for _, span in sorted(candidates, key=lambda item: item[0]):
+        if any(
+            span.start < used_end and span.end > used_start for used_start, used_end in occupied
+        ):
             continue
-        selected.append(AppliedSpan(start, end, original))
-        occupied.append((start, end))
+        selected.append(span)
+        occupied.append((span.start, span.end))
 
     spans = tuple(sorted(selected, key=lambda span: (span.start, span.end)))
     used_originals = {span.original for span in spans}
@@ -469,9 +469,9 @@ class SanitizationOrchestrator:
             # no-hit case (any_local_finding | sampled:<pct> | always).
             gaz_findings = await self._gazetteer.detect(text)
             local_findings = await local_pass.findings(text) if local_pass is not None else []
-            combined = _filter_findings_overlapping_rules(
-                _deduplicate(local_findings + gaz_findings), rule_matches
-            )
+            # Findings are no longer dropped for overlapping a rule span (defect #5,
+            # mechanism a) — `_plan_replacements` decides the winner by span length.
+            combined = _deduplicate(local_findings + gaz_findings)
             # Rules are top-priority: computed once, applied in both sub-branches.
             oracle_runs = self._oracle_should_run(
                 gaz_findings=gaz_findings,
@@ -541,9 +541,8 @@ class SanitizationOrchestrator:
                     len(oracle_result.pairs),
                 )
                 local_findings = await local_pass.findings(text)
-                local_kept = _filter_findings_overlapping_rules(local_findings, rule_matches)
                 base_pairs = rules_pairs + oracle_result.pairs
-                merged_pairs = _merge_local(base_pairs, local_kept)
+                merged_pairs = _merge_local(base_pairs, local_findings)
             else:
                 # Oracle disabled: rules no longer arrive via the oracle round-trip —
                 # apply replace.md rules directly (rules_pairs, already computed
