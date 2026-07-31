@@ -4387,6 +4387,67 @@ async def test_stage5_dlp_blocks_canary_in_responses_custom_tool_call_input() ->
     assert ei.value.error_code == "E_DLP_BLOCKED"
 
 
+async def test_stage5_dlp_blocks_canary_in_local_shell_call_action_command() -> None:
+    """CRITICAL 1: local_shell_call.action.command is the Codex CLI shell tool —
+    the primary shape this profile exists to support. Previously
+    `collect_responses_item_text` had no field-name entry for `action`, so a
+    canary there egressed unblocked (identical shape already caught for
+    custom_tool_call.input above)."""
+    canary = "DLP-CANARY-RAW-99999"
+    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "local_shell_call",
+                "call_id": "call_1",
+                "status": "completed",
+                "action": {
+                    "type": "exec",
+                    "command": ["bash", "-lc", f"echo {canary}"],
+                    "env": {"TOKEN": canary},
+                },
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+
+
+async def test_pre_call_local_shell_call_action_command_is_sanitized() -> None:
+    """CRITICAL 1 repro from the review, reproduced end-to-end through pre_call:
+    a `local_shell_call` item's `action.command`/`action.env` must be scanned,
+    not silently forwarded because `action` isn't a registered field name.
+
+    NOTE: `desanitize_responses_payload` (the response walker) stays field-
+    name-gated for `action`/`command` — a pre-existing, documented, non-leak
+    asymmetry (placeholder survives instead of an original leaking; see the
+    content_blocks.py discovered-follow-up note), not part of this fix."""
+    g, _ = _build_guardrail([("acme-corp-secret", "[SECRET_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "local_shell_call",
+                "call_id": "call_1",
+                "status": "completed",
+                "action": {
+                    "type": "exec",
+                    "command": ["bash", "-lc", "echo acme-corp-secret"],
+                    "env": {"TOKEN": "acme-corp-secret"},
+                },
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data)
+    assert "acme-corp-secret" not in json.dumps(out), (
+        "local_shell_call.action.command/env leaked the original"
+    )
+
+
 async def test_stage5_dlp_disabled_by_flag_passes_through() -> None:
     """When CORP_LLM_DLP_GUARD=0 Stage 5 is skipped entirely."""
     import os

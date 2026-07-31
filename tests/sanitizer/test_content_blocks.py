@@ -1456,3 +1456,114 @@ async def test_sanitize_responses_item_computer_call_output_not_scanned() -> Non
 def test_collect_responses_item_text_computer_call_output_not_collected() -> None:
     item = {"type": "computer_call_output", "call_id": "c1", "output": "base64screenshotdata"}
     assert collect_responses_item_text(item) == []
+
+
+# ---- N: CRITICAL 1 — unregistered item fields must not silently pass -------
+
+
+async def test_sanitize_local_shell_call_action_command_and_env_is_scanned() -> None:
+    """local_shell_call is the Codex CLI shell tool — the primary shape this
+    profile exists to support. `action` is not a registered field name at all;
+    a pure allowlist skips it entirely (the exact defect #1 class, one level
+    deeper: an unregistered FIELD, not just an unregistered block type)."""
+    item = {
+        "type": "local_shell_call",
+        "call_id": "call_1",
+        "status": "completed",
+        "action": {
+            "type": "exec",
+            "command": ["bash", "-lc", "echo acme"],
+            "env": {"TOKEN": "acme"},
+        },
+    }
+    new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert new_item["action"]["command"] == ["bash", "-lc", "echo [ORG_001]"]
+    assert new_item["action"]["env"] == {"TOKEN": "[ORG_001]"}
+    assert new_item["call_id"] == "call_1"
+    assert new_item["status"] == "completed"
+    # Every string leaf under the unregistered "action" field is scanned by the
+    # generic recursive walker (nested "type":"exec", each command token, the
+    # env value) — only the two containing "acme" actually get redacted.
+    redacted = [r for r in results if r.pairs]
+    assert len(redacted) == 2
+
+
+def test_collect_responses_item_text_local_shell_call_action() -> None:
+    item = {
+        "type": "local_shell_call",
+        "call_id": "call_1",
+        "action": {"command": ["bash", "-lc", "echo secret"], "env": {"TOKEN": "secret"}},
+    }
+    assert set(collect_responses_item_text(item)) == {"bash", "-lc", "echo secret", "secret"}
+
+
+async def test_sanitize_local_shell_call_output_output_is_scanned() -> None:
+    """local_shell_call_output.output was excluded by the old "output" item-type
+    allowlist (only function_call_output/custom_tool_call_output were in it)."""
+    item = {"type": "local_shell_call_output", "call_id": "call_1", "output": "result: acme"}
+    new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert new_item["output"] == "result: [ORG_001]"
+    assert len(results) == 1
+
+
+def test_collect_responses_item_text_local_shell_call_output() -> None:
+    item = {"type": "local_shell_call_output", "call_id": "call_1", "output": "result: secret"}
+    assert collect_responses_item_text(item) == ["result: secret"]
+
+
+async def test_sanitize_mcp_call_output_is_scanned() -> None:
+    """mcp_call.output was excluded by the same "output" item-type allowlist gap."""
+    item = {
+        "type": "mcp_call",
+        "id": "mcp_1",
+        "name": "fetch",
+        "server_label": "s1",
+        "output": "acme response",
+    }
+    new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert new_item["output"] == "[ORG_001] response"
+    assert len(results) == 1
+
+
+def test_collect_responses_item_text_mcp_call_output() -> None:
+    item = {"type": "mcp_call", "id": "mcp_1", "output": "secret response"}
+    assert collect_responses_item_text(item) == ["secret response"]
+
+
+async def test_sanitize_code_interpreter_call_code_is_scanned() -> None:
+    """code_interpreter_call.code is a bare, entirely unregistered field name."""
+    item = {
+        "type": "code_interpreter_call",
+        "id": "ci_1",
+        "container_id": "cntr_1",
+        "code": "print('acme')",
+        "status": "completed",
+    }
+    new_item, results = await sanitize_responses_item(item, _sanitize_one_redact_acme)
+    assert new_item["code"] == "print('[ORG_001]')"
+    assert len(results) == 1
+
+
+def test_collect_responses_item_text_code_interpreter_call_code() -> None:
+    item = {"type": "code_interpreter_call", "id": "ci_1", "code": "print('secret')"}
+    assert collect_responses_item_text(item) == ["print('secret')"]
+
+
+async def test_sanitize_responses_item_structural_fields_never_scanned() -> None:
+    """type/id/call_id/status/role must never be rewritten — they are routing
+    identifiers, not user content, even though the default branch now scans
+    everything else it doesn't otherwise recognize."""
+
+    async def fail_if_called(text: str) -> MockSanitizeResult:
+        raise AssertionError(f"structural field must not be scanned: {text!r}")
+
+    item = {
+        "type": "local_shell_call",
+        "id": "id_1",
+        "call_id": "call_1",
+        "status": "completed",
+        "role": "assistant",
+    }
+    new_item, results = await sanitize_responses_item(item, fail_if_called)
+    assert new_item == item
+    assert results == []
