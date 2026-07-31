@@ -565,7 +565,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             )
             if not result.pairs:
                 return result
-            canonical_pairs = allocator.remap(result.pairs)
+            # MAJOR 5: rule-derived originals (case-insensitive matches sharing
+            # one CONFIGURED replacement) are exempt from the bijection re-mint
+            # — an operator-configured replacement is intentionally many-to-one.
+            canonical_pairs = allocator.remap(
+                result.pairs, exempt_from_bijection=result.rule_originals
+            )
             if canonical_pairs == result.pairs:
                 return result
             # Re-derive from the ORIGINAL segment using the exact selected spans.
@@ -583,6 +588,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 skipped=result.skipped,
                 block_reason=result.block_reason,
                 applied_spans=result.applied_spans,
+                rule_originals=result.rule_originals,
             )
 
         for i, msg in enumerate(messages):

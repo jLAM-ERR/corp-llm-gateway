@@ -44,9 +44,11 @@ class StreamingDesanitizer:
 
     Plan ref: M1-8. The corp-LLM proxy streams response chunks; placeholders
     may span chunk boundaries (e.g. `[NAME` in one chunk, `_001]` in the
-    next). We buffer the last `max_placeholder_length - 1` characters so any
+    next). We buffer the last `max_placeholder_length` characters so any
     in-flight placeholder of up to `max_placeholder_length` is fully visible
-    when its closing bytes arrive.
+    when its closing bytes arrive (or, for a bare alias/rule replacement with
+    no brackets, so a complete match sitting at the buffer's tail can be held
+    whole while its trailing boundary is confirmed — see MAJOR 3/5).
 
     Replacement order is length-descending (M1-9) so a longer placeholder
     can't be shadowed by a shorter prefix-match one.
@@ -73,7 +75,12 @@ class StreamingDesanitizer:
             self._buffer = ""
             return safe
 
-        hold = self._max_len - 1
+        # `max_len` (not `max_len - 1`): a bare (non-bracketed) placeholder text
+        # up to `max_len` chars can now be DEFERRED whole (see
+        # _STREAM_FEED_SENTINEL) rather than merely partial, so the held
+        # region must fit a fully-matched, max_len-long occurrence starting
+        # at the buffer's tail, not just an in-flight partial one.
+        hold = self._max_len
         if len(self._buffer) <= hold:
             return ""
         safe = self._buffer[:-hold]

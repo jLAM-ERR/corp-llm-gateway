@@ -230,6 +230,21 @@ def test_bare_alias_replaced_across_chunk_split_at_legitimate_word_boundary() ->
     assert out == f"const {filler} see SecretPlace done"
 
 
+def test_bare_no_bracket_sibling_placeholder_at_max_len_not_corrupted_in_one_feed() -> None:
+    """MAJOR 5 fallout: a bare (non-bracketed) placeholder with NO bracketed
+    sibling (an operator replace.md replacement, e.g. `PARTNER-A`) can be
+    exactly `max_len` chars long — the model-coined-alias mechanism always has
+    a 2-char-longer `[FAMILY_NNN]` sibling padding the hold-back window, but a
+    rule replacement has no such sibling. Fed whole in ONE feed() call
+    (immediately followed by flush(), i.e. genuinely nothing else coming),
+    the trailing occurrence's sentinel-deferral (MAJOR 3) must not let the
+    fixed-size hold-back window chop it mid-placeholder."""
+    d = StreamingDesanitizer(_mapping(("acme", "PARTNER-A")))
+    out = d.feed("PARTNER-A and PARTNER-A and PARTNER-A")
+    out += d.flush()
+    assert out == "acme and acme and acme"
+
+
 def test_bare_alias_boundary_defeated_by_chunk_split_end_of_buffer() -> None:
     """MAJOR 3: the exact review repro. Unary (whole text at once) correctly
     leaves `NAME_001Suffix` untouched (the anchor's trailing lookahead sees

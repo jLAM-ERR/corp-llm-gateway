@@ -219,6 +219,12 @@ class _ReplacementPlan:
     sanitized_text: str
     pairs: tuple[tuple[str, str], ...]
     spans: tuple[AppliedSpan, ...]
+    # Originals (of `pairs`) matched by a replace.md rule rather than a
+    # detector/oracle finding — threaded to SanitizeResult so the request-level
+    # RequestPlaceholderAllocator can exempt them from the bijection re-mint
+    # (MAJOR 5: case-insensitive rule matches sharing one configured
+    # replacement are a deliberate many-to-one mapping, not a collision).
+    rule_originals: frozenset[str] = frozenset()
 
 
 def _plan_replacements(
@@ -293,6 +299,7 @@ def _plan_replacements(
         sanitized_text=apply_spans(text, spans, used_pairs),
         pairs=used_pairs,
         spans=spans,
+        rule_originals=frozenset(active_rule_origins) & used_originals,
     )
 
 
@@ -309,6 +316,9 @@ class SanitizeResult:
     # Exact forward-substitution ranges, retained so request-level placeholder
     # remapping can reproduce the same overlap decisions without global replace.
     applied_spans: tuple[AppliedSpan, ...] = ()
+    # Originals (of `pairs`) matched by a replace.md rule — see
+    # RequestPlaceholderAllocator.remap's `exempt_from_bijection` (MAJOR 5).
+    rule_originals: frozenset[str] = frozenset()
 
 
 OVERSIZE_DELIVERED_REASON = "oversize:delivered"
@@ -447,6 +457,7 @@ class SanitizationOrchestrator:
                 cache_a_hit=True,
                 skipped=False,
                 applied_spans=plan.spans,
+                rule_originals=plan.rule_originals,
             )
 
         logger.info(
@@ -492,6 +503,7 @@ class SanitizationOrchestrator:
             cache_a_hit=False,
             skipped=False,
             applied_spans=plan.spans,
+            rule_originals=plan.rule_originals,
         )
 
     async def _detect(
@@ -764,19 +776,6 @@ class SanitizationOrchestrator:
         pairs: list[tuple[str, str]] = []
         seen_originals: set[str] = set()
 
-        def _absorb(
-            candidate: tuple[tuple[str, str], ...],
-        ) -> tuple[tuple[str, str], ...]:
-            accepted: list[tuple[str, str]] = []
-            for original, placeholder in allocator.remap(candidate):
-                if original in seen_originals:
-                    continue
-                seen_originals.add(original)
-                pair = (original, placeholder)
-                pairs.append(pair)
-                accepted.append(pair)
-            return tuple(accepted)
-
         # Rules establish both replacement priority and placeholder ownership
         # before findings from the full-text and chunked detector passes.
         global_rule_matches = _rule_matches(rules, text)
@@ -785,6 +784,28 @@ class SanitizationOrchestrator:
         )
         if self._allowlist is not None:
             global_rule_pairs = self._allowlist.filter_pairs(global_rule_pairs)
+        # MAJOR 5: case-insensitive rule matching can produce several
+        # differently-cased originals sharing one CONFIGURED replacement —
+        # exempt every rule-derived original from this allocator's bijection
+        # re-mint (computed once, before any _absorb call, since it only
+        # depends on the static `rules`, not on absorb order).
+        rule_exempt_originals = frozenset(original for original, _ in global_rule_pairs)
+
+        def _absorb(
+            candidate: tuple[tuple[str, str], ...],
+        ) -> tuple[tuple[str, str], ...]:
+            accepted: list[tuple[str, str]] = []
+            for original, placeholder in allocator.remap(
+                candidate, exempt_from_bijection=rule_exempt_originals
+            ):
+                if original in seen_originals:
+                    continue
+                seen_originals.add(original)
+                pair = (original, placeholder)
+                pairs.append(pair)
+                accepted.append(pair)
+            return tuple(accepted)
+
         canonical_rule_pairs = _absorb(global_rule_pairs)
         active_rule_origins = frozenset(original for original, _ in canonical_rule_pairs)
 
@@ -824,6 +845,7 @@ class SanitizationOrchestrator:
             cache_a_hit=False,
             skipped=False,
             applied_spans=plan.spans,
+            rule_originals=plan.rule_originals,
         )
 
     async def _deliver_oversize(

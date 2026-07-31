@@ -3801,6 +3801,28 @@ async def test_rule_overlap_round_trip_survives_placeholder_canonicalization() -
     assert restored == "Alice Smith met Alice and Bob; marker [PERSON_001]"
 
 
+async def test_case_insensitive_rule_matches_collapse_to_one_configured_token() -> None:
+    """MAJOR 5 exact review repro: rule `Acme = PARTNER-A`, matched
+    case-insensitively against `acme`/`ACME`/`Acme`, must ALL become the one
+    configured replacement — not three tokens, two of them minted and never
+    documented anywhere in the operator's dictionary."""
+    g, _ = _build_guardrail([], rules=Rules(rules=(Rule("Acme", "PARTNER-A"),)))
+    data = _data_with_token("tok-1", content="acme and ACME and Acme")
+
+    out = await g.pre_call(data)
+    sanitized = out["messages"][0]["content"]
+    assert sanitized == "PARTNER-A and PARTNER-A and PARTNER-A"
+
+    # Many-to-one is inherently lossy on reverse: one casing wins for every
+    # occurrence of the shared token. Which one wins is deterministic (the
+    # last-registered pair for that placeholder), not a leak either way.
+    restored = ""
+    chunks_in = [{"choices": [{"delta": {"content": sanitized}}]}]
+    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+        restored += chunk["choices"][0]["delta"]["content"]
+    assert restored == "Acme and Acme and Acme"
+
+
 async def test_user_typed_placeholder_literal_preserved_not_collided(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
