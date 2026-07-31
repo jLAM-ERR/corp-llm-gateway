@@ -144,19 +144,6 @@ def _rule_pattern(source: str) -> re.Pattern[str]:
     return re.compile(expression, re.IGNORECASE | re.UNICODE)
 
 
-def _rule_replacement(source: str, replacement: str, original: str) -> str:
-    """Preserve code-friendly case for lowercase deterministic substitutions."""
-    if source != source.casefold() or replacement != replacement.casefold():
-        return replacement
-    if original.isupper():
-        return replacement.upper()
-    if original.istitle():
-        return replacement.title()
-    if original[:1].isupper():
-        return replacement[:1].upper() + replacement[1:]
-    return replacement
-
-
 def _rule_matches(rules: Rules, text: str) -> tuple[_MatchedRule, ...]:
     """Return non-overlapping literal-rule matches, longest configured rule first."""
     selected: list[_MatchedRule] = []
@@ -173,7 +160,7 @@ def _rule_matches(rules: Rules, text: str) -> tuple[_MatchedRule, ...]:
                     start=start,
                     end=end,
                     original=original,
-                    replacement=_rule_replacement(rule.pattern, rule.replacement, original),
+                    replacement=rule.replacement,
                 )
             )
             occupied.append((start, end))

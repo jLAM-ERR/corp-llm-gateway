@@ -516,7 +516,7 @@ async def test_rule_wins_over_local_finding_in_gazetteer_nohit() -> None:
     assert not any("PERSON" in p for _, p in result.pairs)
 
 
-async def test_rules_match_case_insensitively_and_preserve_identifier_case() -> None:
+async def test_rules_match_case_insensitively_and_apply_replacement_verbatim() -> None:
     rules = Rules(
         rules=(
             Rule("kdir", "companynameabc"),
@@ -540,9 +540,10 @@ async def test_rules_match_case_insensitively_and_preserve_identifier_case() -> 
     )
 
     assert len(captured) == 0
+    # No case-preservation (decision 4): the configured replacement is used verbatim.
     assert result.sanitized_text == (
-        "mkdir -p CompanynameabcService1; CompanynameabdClient; company name abe; "
-        "Confidential Project Acn confidential project acn"
+        "mkdir -p companynameabcService1; companynameabdClient; company name abe; "
+        "confidential project acn confidential project acn"
     )
     assert "mkdir" in result.sanitized_text
     assert "companynameabc" not in result.sanitized_text.split(" ", 1)[0]
@@ -572,10 +573,10 @@ async def test_rule_spans_win_over_overlapping_local_findings() -> None:
     result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
 
     assert len(captured) == 0
-    assert result.sanitized_text == "Companynameabd работает в Confidential Project Acn"
+    assert result.sanitized_text == "companynameabd работает в confidential project acn"
     assert result.pairs == (
-        ("Betadirect", "Companynameabd"),
-        ("Zephyr Ledger", "Confidential Project Acn"),
+        ("Betadirect", "companynameabd"),
+        ("Zephyr Ledger", "confidential project acn"),
     )
 
 
