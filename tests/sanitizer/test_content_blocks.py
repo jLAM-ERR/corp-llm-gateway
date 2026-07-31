@@ -1485,6 +1485,27 @@ def test_collect_responses_item_text_computer_call_output_not_collected() -> Non
     assert collect_responses_item_text(item) == []
 
 
+async def test_sanitize_responses_item_image_generation_call_result_not_scanned() -> None:
+    """image_generation_call.result is a base64 image — the same binary-field
+    class as computer_call_output.output, but on a DIFFERENT item type and a
+    DIFFERENT field name. A registry keyed to exactly one item type/field
+    pair leaves every other one unguarded; a generic base64 field must be
+    excluded regardless of which item type carries it."""
+
+    async def fail(text: str) -> MockSanitizeResult:
+        raise AssertionError("image_generation_call.result must not be scanned")
+
+    item = {"type": "image_generation_call", "id": "img_1", "result": "base64pngdata"}
+    new_item, results = await sanitize_responses_item(item, fail)
+    assert new_item["result"] == "base64pngdata"
+    assert results == []
+
+
+def test_collect_responses_item_text_image_generation_call_result_not_collected() -> None:
+    item = {"type": "image_generation_call", "id": "img_1", "result": "base64pngdata"}
+    assert collect_responses_item_text(item) == []
+
+
 # ---- N: CRITICAL 1 — unregistered item fields must not silently pass -------
 
 

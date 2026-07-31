@@ -703,13 +703,29 @@ _RESPONSES_OPAQUE_FIELDS = frozenset({"encrypted_content"})
 # reasoning_text/summary_text/refusal) — reuse sanitize_content's block walker
 # instead of treating the field as a single text leaf.
 _RESPONSES_BLOCK_LIST_FIELDS = frozenset({"content", "summary"})
-# Item types whose "output" is a binary reference (a base64 screenshot), not
-# text — scanning/oversize-checking it would trip the size-threshold policy on
-# an ordinary screenshot. Every OTHER item type's "output" is scanned by the
-# default branch below (CRITICAL: this used to be an ALLOWLIST of exactly two
-# item types, which silently left local_shell_call_output.output/mcp_call.output
-# unscanned and un-DLP'd — the same defect class as the field-registry gap).
-_RESPONSES_OPAQUE_OUTPUT_ITEM_TYPES = frozenset({"computer_call_output"})
+# Registry of (item type -> field names) that are binary references (a
+# base64 screenshot/generated image), not text — scanning/oversize-checking
+# them would trip the size-threshold policy on ordinary binary content. A
+# single hard-coded item type here is not enough: the SAME binary-field
+# class shows up under different field names on different item types (e.g.
+# computer_call_output.output and image_generation_call.result), so every
+# entry must be named explicitly. Every OTHER item type's "output" (or any
+# other field) is still scanned by the default branch below (CRITICAL: this
+# used to be an ALLOWLIST of exactly two item types, which silently left
+# local_shell_call_output.output/mcp_call.output unscanned and un-DLP'd —
+# the same defect class as the field-registry gap).
+_RESPONSES_OPAQUE_ITEM_FIELDS: dict[str, frozenset[str]] = {
+    "computer_call_output": frozenset({"output"}),
+    "image_generation_call": frozenset({"result"}),
+}
+
+
+def _is_opaque_item_field(item_type: object, field: str) -> bool:
+    return isinstance(item_type, str) and field in _RESPONSES_OPAQUE_ITEM_FIELDS.get(
+        item_type, frozenset()
+    )
+
+
 # Fields that are structural identifiers/enums, never free text — excluded
 # from the generic default scan below so it isn't wasting a sanitize_one()
 # call per item on values that can never carry user content, and so "type"
@@ -772,6 +788,7 @@ async def sanitize_responses_item(
             field in _RESPONSES_OPAQUE_FIELDS
             or field in _RESPONSES_STRUCTURAL_FIELDS
             or field in ("tool_calls", "function_call")
+            or _is_opaque_item_field(item_type, field)
         ):
             continue
         if field == "arguments":
@@ -779,8 +796,6 @@ async def sanitize_responses_item(
         elif field in _RESPONSES_BLOCK_LIST_FIELDS:
             new_value, r = await sanitize_content(value, sanitize_one)
         elif field == "output":
-            if item_type in _RESPONSES_OPAQUE_OUTPUT_ITEM_TYPES:
-                continue
             new_value, r = await _sanitize_json(value, sanitize_one)
         elif field in _RESPONSES_TEXT_FIELDS:
             if isinstance(value, str):
@@ -821,6 +836,7 @@ def collect_responses_item_text(item: dict[str, Any]) -> list[str]:
             field in _RESPONSES_OPAQUE_FIELDS
             or field in _RESPONSES_STRUCTURAL_FIELDS
             or field in ("tool_calls", "function_call")
+            or _is_opaque_item_field(item_type, field)
         ):
             continue
         if field == "arguments":
@@ -828,8 +844,6 @@ def collect_responses_item_text(item: dict[str, Any]) -> list[str]:
         elif field in _RESPONSES_BLOCK_LIST_FIELDS:
             out.extend(collect_text(value))
         elif field == "output":
-            if item_type in _RESPONSES_OPAQUE_OUTPUT_ITEM_TYPES:
-                continue
             out.extend(_collect_json_text(value))
         elif field in _RESPONSES_TEXT_FIELDS:
             if isinstance(value, str):
