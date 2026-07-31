@@ -186,6 +186,50 @@ def test_partial_placeholder_at_stream_end_is_emitted_verbatim() -> None:
     assert out == "hello [NAME"
 
 
+# Defect #6: bare-alias boundary anchor, hold-back window sizing ------------
+
+
+def test_bare_alias_split_across_chunks_does_not_corrupt_containing_identifier() -> None:
+    """`MY_` and the alias arrive in separate feeds; the underscore boundary
+    context must survive the split so the anchor still blocks the match."""
+    d = StreamingDesanitizer(
+        _mapping(("SecretPlace", "[LOCATION_007]"), ("SecretPlace", "LOCATION_007"))
+    )
+    out = d.feed("const MY_")
+    out += d.feed("LOCATION_007 = 1;")
+    out += d.flush()
+    assert out == "const MY_LOCATION_007 = 1;"
+
+
+def test_bare_alias_boundary_char_survives_hold_back_flush_across_chunk_split() -> None:
+    """Pin that the hold-back window (`_max_len - 1`, sized off the longest
+    BRACKETED placeholder — 13 chars for `[LOCATION_007]`) actually retains
+    the one boundary character (`_`) the anchor needs, even once padding is
+    long enough to force an intermediate flush before the alias arrives."""
+    d = StreamingDesanitizer(
+        _mapping(("SecretPlace", "[LOCATION_007]"), ("SecretPlace", "LOCATION_007"))
+    )
+    filler = "x" * 40
+    out = d.feed(f"const {filler}MY_")
+    out += d.feed("LOCATION_007 = 1;")
+    out += d.flush()
+    assert out == f"const {filler}MY_LOCATION_007 = 1;"
+
+
+def test_bare_alias_replaced_across_chunk_split_at_legitimate_word_boundary() -> None:
+    """Positive control for the hold-back test above: a genuine stand-alone
+    bare alias, split across the same padded chunk boundary, must still be
+    restored — the anchor fix must not be over-conservative."""
+    d = StreamingDesanitizer(
+        _mapping(("SecretPlace", "[LOCATION_007]"), ("SecretPlace", "LOCATION_007"))
+    )
+    filler = "x" * 40
+    out = d.feed(f"const {filler} see ")
+    out += d.feed("LOCATION_007 done")
+    out += d.flush()
+    assert out == f"const {filler} see SecretPlace done"
+
+
 # Streaming async iterator interface ----------------------------------------
 
 

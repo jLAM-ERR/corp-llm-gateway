@@ -70,6 +70,7 @@ from corp_llm_gateway.sanitizer.placeholder import (
     add_unwrapped_response_aliases,
     apply_pairs,
     apply_spans,
+    build_reverse_substituter,
     find_placeholder_literals,
     find_unwrapped_placeholder_literals,
     placeholder_family,
@@ -955,7 +956,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 yield chunk
             return
 
-        response_mapping = _response_mapping(state)
+        response_mapping = _response_mapping(state, include_bare_aliases=self._forward_chatgpt_auth)
         logger.info(
             "litellm_post_call_stream_desanitize_start request_id=%s pairs=%d aliases=%d",
             request_id,
@@ -1032,7 +1033,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 "no_state" if state is None else "no_mapping",
             )
             return response
-        response_mapping = _response_mapping(state)
+        response_mapping = _response_mapping(state, include_bare_aliases=self._forward_chatgpt_auth)
         logger.info(
             "litellm_post_call_unary_desanitize request_id=%s pairs=%d aliases=%d",
             request_id,
@@ -1445,8 +1446,18 @@ class _RequestState:
         self.profile_ids: tuple[str, ...] = ()
 
 
-def _response_mapping(state: _RequestState) -> StrategyResult:
-    """Mapping used only on model output, including safe bracketless aliases."""
+def _response_mapping(state: _RequestState, *, include_bare_aliases: bool) -> StrategyResult:
+    """Mapping used only on model output, including safe bracketless aliases.
+
+    Bracketless aliases (defect #6) exist only to restore identifiers a
+    ChatGPT Codex model mangles by stripping placeholder brackets. Adding
+    them unconditionally, for every provider, is what made the corruption
+    ship on the default (non-Codex) path — so gate on the same flag that
+    enables the Codex bridge; Anthropic and OpenAI-chat responses then see
+    exactly ``state.mapping.pairs``, byte-identical to release/1.0.x.
+    """
+    if not include_bare_aliases:
+        return state.mapping
     return StrategyResult(
         pairs=add_unwrapped_response_aliases(
             state.mapping.pairs,
@@ -1677,13 +1688,7 @@ def _desanitize_chunk_function_call(
 
 
 def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
-    by_placeholder = {placeholder: original for original, placeholder in mapping.pairs}
-    sorted_placeholders = sorted(by_placeholder, key=lambda p: -len(p))
-
-    def _reverse(text: str) -> str:
-        for ph in sorted_placeholders:
-            text = text.replace(ph, by_placeholder[ph])
-        return text
+    _reverse = build_reverse_substituter(mapping.pairs)
 
     if isinstance(response, str):
         return _reverse(response)
