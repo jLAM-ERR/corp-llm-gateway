@@ -253,6 +253,51 @@ def test_oracle_truthy_spellings_enable_oracle_and_build_client(
     assert guardrail._orch._core._oracle_enabled is True
 
 
+# ── forward_chatgpt_auth: build_guardrail must resolve CORP_LLM_FORWARD_CHATGPT_AUTH
+# from config, not silently default to off (a real k8s deploy never passes the
+# kwarg explicitly, so the env var must be the thing that flips it) ─────────
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
+def test_forward_chatgpt_auth_truthy_spellings_enable_the_flag(
+    monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", truthy)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._forward_chatgpt_auth is True
+
+
+@pytest.mark.parametrize("falsy", ["0", "off", "no", "false", "OFF"])
+def test_forward_chatgpt_auth_falsy_spellings_disable_the_flag(
+    monkeypatch: pytest.MonkeyPatch, falsy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", falsy)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._forward_chatgpt_auth is False
+
+
+def test_forward_chatgpt_auth_unset_defaults_off() -> None:
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._forward_chatgpt_auth is False
+
+
+def test_forward_chatgpt_auth_explicit_argument_overrides_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit caller argument (e.g. the demo shim resolving its own copy)
+    # must win over whatever the env var says.
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
+
+    guardrail = bootstrap.build_guardrail(forward_chatgpt_auth=False)
+
+    assert guardrail._forward_chatgpt_auth is False
+
+
 # ── no-op-sanitizer floor: build_guardrail must not skip this even though it
 # never calls settings.validate() (Helm's config-check initContainer does; this
 # covers compose/demo/bare-litellm boots) ────────────────────────────────────

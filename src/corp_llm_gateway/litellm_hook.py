@@ -27,7 +27,7 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -752,112 +752,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         _store_request_items(data, messages, request_shape)
 
-        # Chat Completions uses ``system`` while Responses uses
-        # ``instructions``. They are mutually exclusive in the supported wire
-        # profiles, so route either through the same fail-closed path.
-        prompt_field = "system" if data.get("system") else "instructions"
-        system = data.get(prompt_field)
-        if system:
-            if isinstance(system, str):
-                system_bytes = len(system.encode("utf-8"))
-            else:
-                system_bytes = len(json.dumps(system).encode("utf-8"))
-            logger.info(
-                "litellm_pre_call_system_sanitize_start request_id=%s content_bytes=%d",
-                request_id,
-                system_bytes,
-            )
-            try:
-                new_system, results = await sanitize_content(system, sanitize_one)
-            except ContentTooDeepError as exc:
-                self._record_failure(request_id, error_code="E_BAD_REQUEST")
-                _now = datetime.now(UTC)
-                await self.audit(data, None, _now, _now, status="failed")
-                raise GuardrailHttpException(
-                    400,
-                    "E_BAD_REQUEST",
-                    "request content nesting too deep",
-                ) from exc
-            except UnsanitizableContentBlockError as exc:
-                # Fail closed: an unrecognized content block type must not egress unscanned.
-                self._record_failure(request_id, error_code="E_BAD_REQUEST")
-                _now = datetime.now(UTC)
-                await self.audit(data, None, _now, _now, status="failed")
-                raise GuardrailHttpException(
-                    400,
-                    "E_BAD_REQUEST",
-                    "unsupported content block type",
-                ) from exc
-            except OversizeContentError as exc:
-                # F1: fail-closed on an oversize system leaf. Never forward the original.
-                state.block_reason = "oversize:blocked"
-                self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
-                self._metrics.record_block("oversize:blocked")
-                logger.info(
-                    "litellm_pre_call_oversize_blocked request_id=%s field=system "
-                    "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
-                    request_id,
-                    exc.content_bytes,
-                    exc.threshold_bytes,
-                )
-                _now = datetime.now(UTC)
-                await self.audit(data, None, _now, _now, status="failed")
-                raise GuardrailHttpException(
-                    422,
-                    "E_OVERSIZE_BLOCKED",
-                    "request blocked: oversize content",
-                ) from exc
-            except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
-                logger.warning(
-                    "litellm_pre_call_corp_llm_failed request_id=%s "
-                    "field=system error_code=E_CORP_LLM_DOWN exception=%s",
-                    request_id,
-                    type(exc).__name__,
-                )
-                self._record_failure(request_id, error_code="E_CORP_LLM_DOWN")
-                _now = datetime.now(UTC)
-                await self.audit(data, None, _now, _now, status="failed")
-                raise GuardrailHttpException(
-                    503,
-                    "E_CORP_LLM_DOWN",
-                    "corp sanitization LLM unavailable",
-                ) from exc
-            except NerUnavailableError as exc:
-                # F2 fail-closed (M4): required NER unavailable on the system field.
-                logger.warning(
-                    "litellm_pre_call_ner_unavailable request_id=%s "
-                    "field=system error_code=E_NER_UNAVAILABLE exception=%s",
-                    request_id,
-                    type(exc).__name__,
-                )
-                self._record_failure(request_id, error_code="E_NER_UNAVAILABLE")
-                _now = datetime.now(UTC)
-                await self.audit(data, None, _now, _now, status="failed")
-                raise GuardrailHttpException(
-                    503,
-                    "E_NER_UNAVAILABLE",
-                    "NER detector unavailable",
-                ) from exc
-            data[prompt_field] = new_system
-            for result in results:
-                self._merge_into_state(state, result)
-                if result.skipped:
-                    # Reachable only via the opt-in oversize deliver-flag policy
-                    # (the old size-skip is gone — oversize now fails closed or
-                    # chunks by default). The original was delivered on purpose
-                    # after a clean full rescan; flagged for the audit trail.
-                    logger.warning(
-                        "litellm_pre_call_system_oversize_delivered request_id=%s "
-                        "content_bytes=%d block_reason=%s",
-                        request_id,
-                        system_bytes,
-                        result.block_reason,
-                    )
-            logger.info(
-                "litellm_pre_call_system_sanitize_done request_id=%s total_redaction_count=%d",
-                request_id,
-                state.redaction_count,
-            )
+        # Chat Completions uses ``system`` while Responses uses ``instructions``.
+        # A well-formed request carries at most one, but nothing rejects a
+        # payload carrying both — sanitize whichever are present rather than
+        # picking one via a ternary (defect #2: the other egressed raw).
+        for prompt_field in ("system", "instructions"):
+            await self._sanitize_prompt_field(data, prompt_field, request_id, state, sanitize_one)
 
         # Stage 5: DLP egress guard — re-scan the SANITIZED outbound request.
         # Defence-in-depth: catches canaries / raw secrets that survived the
@@ -913,6 +813,129 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             len(state.placeholders),
         )
         return data
+
+    async def _sanitize_prompt_field(
+        self,
+        data: dict[str, Any],
+        prompt_field: str,
+        request_id: str,
+        state: _RequestState,
+        sanitize_one: Callable[[str], Awaitable[SanitizeResult]],
+    ) -> None:
+        """Sanitize ``data[prompt_field]`` in place (``"system"`` or ``"instructions"``).
+
+        Extracted so `pre_call` can drive both fields through the identical
+        fail-closed/audit behavior instead of picking one via a ternary.
+        """
+        system = data.get(prompt_field)
+        if not system:
+            return
+        if isinstance(system, str):
+            system_bytes = len(system.encode("utf-8"))
+        else:
+            system_bytes = len(json.dumps(system).encode("utf-8"))
+        logger.info(
+            "litellm_pre_call_system_sanitize_start request_id=%s field=%s content_bytes=%d",
+            request_id,
+            prompt_field,
+            system_bytes,
+        )
+        try:
+            new_system, results = await sanitize_content(system, sanitize_one)
+        except ContentTooDeepError as exc:
+            self._record_failure(request_id, error_code="E_BAD_REQUEST")
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                400,
+                "E_BAD_REQUEST",
+                "request content nesting too deep",
+            ) from exc
+        except UnsanitizableContentBlockError as exc:
+            # Fail closed: an unrecognized content block type must not egress unscanned.
+            self._record_failure(request_id, error_code="E_BAD_REQUEST")
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                400,
+                "E_BAD_REQUEST",
+                "unsupported content block type",
+            ) from exc
+        except OversizeContentError as exc:
+            # F1: fail-closed on an oversize leaf. Never forward the original.
+            state.block_reason = "oversize:blocked"
+            self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
+            self._metrics.record_block("oversize:blocked")
+            logger.info(
+                "litellm_pre_call_oversize_blocked request_id=%s field=%s "
+                "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
+                request_id,
+                prompt_field,
+                exc.content_bytes,
+                exc.threshold_bytes,
+            )
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                422,
+                "E_OVERSIZE_BLOCKED",
+                "request blocked: oversize content",
+            ) from exc
+        except (CorpLlmHttpError, AllStrategiesFailedError) as exc:
+            logger.warning(
+                "litellm_pre_call_corp_llm_failed request_id=%s "
+                "field=%s error_code=E_CORP_LLM_DOWN exception=%s",
+                request_id,
+                prompt_field,
+                type(exc).__name__,
+            )
+            self._record_failure(request_id, error_code="E_CORP_LLM_DOWN")
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                503,
+                "E_CORP_LLM_DOWN",
+                "corp sanitization LLM unavailable",
+            ) from exc
+        except NerUnavailableError as exc:
+            # F2 fail-closed (M4): required NER unavailable on this field.
+            logger.warning(
+                "litellm_pre_call_ner_unavailable request_id=%s "
+                "field=%s error_code=E_NER_UNAVAILABLE exception=%s",
+                request_id,
+                prompt_field,
+                type(exc).__name__,
+            )
+            self._record_failure(request_id, error_code="E_NER_UNAVAILABLE")
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                503,
+                "E_NER_UNAVAILABLE",
+                "NER detector unavailable",
+            ) from exc
+        data[prompt_field] = new_system
+        for result in results:
+            self._merge_into_state(state, result)
+            if result.skipped:
+                # Reachable only via the opt-in oversize deliver-flag policy
+                # (the old size-skip is gone — oversize now fails closed or
+                # chunks by default). The original was delivered on purpose
+                # after a clean full rescan; flagged for the audit trail.
+                logger.warning(
+                    "litellm_pre_call_system_oversize_delivered request_id=%s "
+                    "field=%s content_bytes=%d block_reason=%s",
+                    request_id,
+                    prompt_field,
+                    system_bytes,
+                    result.block_reason,
+                )
+        logger.info(
+            "litellm_pre_call_system_sanitize_done request_id=%s field=%s total_redaction_count=%d",
+            request_id,
+            prompt_field,
+            state.redaction_count,
+        )
 
     async def post_call_stream(
         self,

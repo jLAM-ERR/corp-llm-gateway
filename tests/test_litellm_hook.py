@@ -1560,6 +1560,49 @@ async def test_pre_call_no_system_no_op() -> None:
     assert out["messages"][0]["content"] == "hello [N1]"
 
 
+# ---- Task 8 / defect #2: both system AND instructions must be sanitized -----
+
+
+async def test_pre_call_sanitizes_both_system_and_instructions_when_both_present() -> None:
+    """A payload carrying BOTH `system` and `instructions` non-empty must not
+    egress either original — the old ternary picked exactly one field, so
+    whichever field lost the ternary egressed raw."""
+    g, _ = _build_guardrail([("SecretEnvA", "[ENV_001]"), ("SecretEnvB", "[ENV_002]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "hello"}],
+        "system": "SecretEnvA=/prod",
+        "instructions": "SecretEnvB=/prod",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(data)
+
+    assert out["system"] == "[ENV_001]=/prod"
+    assert out["instructions"] == "[ENV_002]=/prod"
+    forwarded = json.dumps(out)
+    assert "SecretEnvA" not in forwarded, "system original egressed"
+    assert "SecretEnvB" not in forwarded, "instructions original egressed"
+
+
+async def test_pre_call_oversize_on_instructions_second_field_fails_closed() -> None:
+    """Error branches must fire per field, not just for whichever field the old
+    ternary happened to pick: oversize on `instructions` (the SECOND field in
+    iteration order) while `system` is small and clean."""
+    secret = "sk-" + "a" * 40
+    g, _ = _build_guardrail_oversize(threshold=64)
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "hello"}],
+        "system": "fine",
+        "instructions": f"{secret} " + "x" * 200,
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+
+
 async def test_pre_call_str_message_regression() -> None:
     """Task 2: plain-string message content still works (OpenAI-compatible regression)."""
     g, _ = _build_guardrail([("alice", "[N1]")])
