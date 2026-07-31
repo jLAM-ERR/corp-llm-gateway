@@ -1001,16 +1001,28 @@ def test_collect_text_reasoning_text_and_summary_text_and_refusal_blocks() -> No
     assert collect_text(content) == ["a", "b", "c"]
 
 
-# ---- G: unknown block type fails closed (compounding defect #1) ------------
+# ---- G: unknown block type is scanned fail-safe (MAJOR 4) ------------------
+#
+# Was "fails closed" (raise + 400): Anthropic/OpenAI ship several new block
+# types a year (web_fetch_tool_result, bash_code_execution_tool_result,
+# text_editor_code_execution_tool_result, code_execution_output, a dict block
+# with no "type" key, ...) and multi-turn conversations replay these blocks
+# verbatim in `messages`, so a hard 400 on any one of them poisons the whole
+# conversation. Inverted to fail SAFE: scan the block's value tree the same
+# way an arbitrary JSON blob is scanned.
 
 
-async def test_sanitize_unknown_block_type_fails_closed() -> None:
+async def test_sanitize_unknown_block_type_is_scanned_fail_safe() -> None:
     async def mock_sanitize(text: str) -> MockSanitizeResult:
-        raise AssertionError("should not be called")
+        replaced = text.replace("raw secret", "[REDACTED]")
+        pairs = (("raw secret", "[REDACTED]"),) if "raw secret" in text else ()
+        return MockSanitizeResult(replaced, pairs=pairs)
 
     content = [{"type": "some_future_block", "payload": "raw secret"}]
-    with pytest.raises(UnsanitizableContentBlockError):
-        await sanitize_content(content, mock_sanitize)
+    new_content, results = await sanitize_content(content, mock_sanitize)
+    assert new_content[0]["payload"] == "[REDACTED]"
+    assert new_content[0]["type"] == "some_future_block"  # structural, preserved verbatim
+    assert len(results) == 1
 
 
 async def test_sanitize_known_opaque_block_types_still_pass_through() -> None:
@@ -1338,32 +1350,47 @@ async def test_sanitize_opaque_openai_block_types_pass_through_unchanged(
     assert results == []
 
 
-async def test_sanitize_still_fails_closed_on_genuinely_unknown_type() -> None:
-    """The widened allowlist must not become a blanket pass-through."""
+async def test_sanitize_genuinely_unknown_type_no_longer_fails_closed() -> None:
+    """MAJOR 4: was "the widened allowlist must not become a blanket
+    pass-through, so raise" — inverted, since a blanket 400 is worse (it
+    poisons real production traffic on every new provider block type). A
+    benign unrecognized block with no PII match still passes through
+    unchanged; the scan test above pins that a match DOES get redacted."""
 
-    async def fail(text: str) -> MockSanitizeResult:
-        raise AssertionError("should not be called")
+    async def passthrough(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text, pairs=())
 
-    with pytest.raises(UnsanitizableContentBlockError):
-        await sanitize_content([{"type": "some_future_block", "payload": "raw"}], fail)
+    content = [{"type": "some_future_block", "payload": "raw"}]
+    new_content, results = await sanitize_content(content, passthrough)
+    assert new_content == content
+    assert all(not r.pairs for r in results)
 
 
-def test_unsanitizable_content_block_error_does_not_echo_block_type() -> None:
-    """M1-14 surface (iii): the exception message must not carry client-controlled
-    content (block_type is a client-supplied string, chained via `raise ... from
-    exc` into whatever eventually logs the traceback)."""
+def test_unrecognized_block_type_value_preserved_and_dict_without_type_key_is_scanned() -> None:
+    """Was "the UnsanitizableContentBlockError message must not echo
+    block_type" — moot now: an unrecognized type no longer raises at all, so
+    there is no exception message to leak into. What actually matters (per
+    the review's own repro, a dict block with no "type" key at all) is pinned
+    here instead: the "type" value is preserved verbatim (it is a structural
+    discriminator, not user content, so echoing it back is fine), and a dict
+    block that doesn't even HAVE a "type" key is still scanned, not skipped."""
     secret_type = "SECRET-token-abc123"
-    try:
-        import asyncio
 
-        async def fail(text: str) -> MockSanitizeResult:
-            raise AssertionError("should not be called")
+    async def redact(text: str) -> MockSanitizeResult:
+        replaced = text.replace(secret_type, "[REDACTED]")
+        pairs = ((secret_type, "[REDACTED]"),) if secret_type in text else ()
+        return MockSanitizeResult(replaced, pairs=pairs)
 
-        asyncio.run(sanitize_content([{"type": secret_type}], fail))
-    except UnsanitizableContentBlockError as exc:
-        assert secret_type not in str(exc)
-    else:
-        raise AssertionError("expected UnsanitizableContentBlockError")
+    import asyncio
+
+    new_content, _ = asyncio.run(
+        sanitize_content([{"type": secret_type, "note": secret_type}], redact)
+    )
+    assert new_content[0]["type"] == secret_type
+    assert new_content[0]["note"] == "[REDACTED]"
+
+    new_content2, _ = asyncio.run(sanitize_content([{"foo": secret_type}], redact))
+    assert new_content2[0]["foo"] == "[REDACTED]"
 
 
 # ---- K: Major 3 — tool_calls/function_call on a Responses item -------------
