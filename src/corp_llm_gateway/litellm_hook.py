@@ -422,6 +422,27 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         )
         self._req_state[request_id] = state
 
+        # A client fully controls the request body: {"messages": [], "input": [...]}
+        # made `_request_items` pick the empty `messages` list while `input` egressed
+        # untouched, bypassing sanitize, Stage 0 and Stage 5 entirely. Refuse the
+        # ambiguous shape outright rather than guess which one is real.
+        if "messages" in data and "input" in data:
+            state.block_reason = "request:ambiguous_shape"
+            self._record_failure(request_id, error_code="E_POLICY_BLOCKED")
+            self._metrics.record_block(state.block_reason)
+            logger.info(
+                "litellm_pre_call_blocked request_id=%s block_reason=%s",
+                request_id,
+                state.block_reason,
+            )
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed")
+            raise GuardrailHttpException(
+                422,
+                "E_POLICY_BLOCKED",
+                "request blocked: payload carries both messages and input",
+            )
+
         # D4: resolve the team's merged profile once per request. Empty
         # profile_ids → passthrough (default policy, no fingerprint) == today.
         # A misconfigured profile fails CLOSED — never fall through to

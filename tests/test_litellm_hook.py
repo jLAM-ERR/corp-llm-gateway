@@ -2090,6 +2090,93 @@ async def test_pre_call_bad_request_audits_inline() -> None:
     assert sink.records[0]["error_code"] == "E_BAD_REQUEST"
 
 
+# ---- Hybrid messages+input payload must be refused, not silently mis-routed ---
+
+
+async def test_pre_call_hybrid_messages_empty_and_input_rejected() -> None:
+    """`_request_items` picks `messages` whenever the key is merely present, even
+    `[]` — so `input` passed through untouched, bypassing sanitize/Stage 0/Stage 5
+    entirely. A payload carrying both keys must be refused outright."""
+    original = "sk-corp-secret-hybrid"
+    g, sink = _build_guardrail([(original, "[SECRET_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": [],
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": original}]}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_POLICY_BLOCKED"
+    assert original not in json.dumps(sink.records), "original leaked into the audit record"
+
+
+async def test_pre_call_hybrid_messages_none_and_input_rejected() -> None:
+    """Same hybrid rejection when `messages` is explicitly `None` rather than `[]`."""
+    original = "sk-corp-secret-hybrid-2"
+    g, _ = _build_guardrail([(original, "[SECRET_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": None,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": original}]}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_POLICY_BLOCKED"
+    # pre_call raises before returning — nothing is ever forwarded to the upstream
+    # provider, so there is no outgoing dict for the original to leak into.
+
+
+async def test_pre_call_hybrid_payload_audit_matches_stage0_convention() -> None:
+    """block_reason / audit shape for the hybrid rejection mirrors Stage 0's
+    (see test_stage0_audit_record_emitted_with_block_reason)."""
+    g, sink = _build_guardrail()
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": [],
+        "input": ["anything"],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_POLICY_BLOCKED"
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    assert rec.get("block_reason") == "request:ambiguous_shape"
+    assert rec.get("status") == "failed"
+    assert rec.get("error_code") == "E_POLICY_BLOCKED"
+    assert rec.get("user_id") == "alice"
+    assert rec.get("team_id") == "t1"
+
+
+async def test_pre_call_single_key_shapes_unaffected_by_hybrid_guard() -> None:
+    """messages-only, input-as-string, and input-as-list requests are untouched
+    by the new hybrid guard."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+
+    only_messages = _data_with_token("tok-1", content="hello alice")
+    out = await g.pre_call(only_messages)
+    assert out["messages"][0]["content"] == "hello [NAME_001]"
+
+    input_string_data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello alice",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out2 = await g.pre_call(input_string_data)
+    assert out2["input"] == "hello [NAME_001]"
+
+    input_list_data = {
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello alice"}]}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out3 = await g.pre_call(input_list_data)
+    assert out3["input"][0]["content"][0]["text"] == "hello [NAME_001]"
+
+
 # ---- Document block integration tests (A) -----------------------------------
 
 
