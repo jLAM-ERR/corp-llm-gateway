@@ -1175,6 +1175,30 @@ def test_non_overlapping_spans_overlap_and_add_boundary_conditions() -> None:
     assert spans.overlaps(30, 40) is False  # past every accepted span
 
 
+def test_non_overlapping_spans_zero_length_candidate_diverges_at_left_edge() -> None:
+    """Pin a known, narrow divergence from the old linear scan's semantics
+    (`any(start < used_end and end > used_start for ...)`): a zero-length
+    candidate (start == end) sitting exactly at an accepted span's own start
+    is flagged as overlapping here (bisect finds the accepted span at the
+    insertion point and its end is past the candidate's start), but the old
+    strict `end > used_start` check said False for that same query. Every
+    other zero-length position (right edge, fully inside, before, after)
+    agrees with the old semantics — only the exact left-edge touch differs.
+    Unreachable in practice: `_rule_matches`/`_plan_replacements` only ever
+    add spans from a non-empty regex match, so start < end always holds for
+    every candidate this engine actually produces (0 divergences observed in
+    a 200k-case fuzz against the old linear scan)."""
+    from corp_llm_gateway.sanitizer.orchestrator import _NonOverlappingSpans
+
+    spans = _NonOverlappingSpans()
+    spans.add(10, 20)
+    assert spans.overlaps(10, 10) is True
+    assert spans.overlaps(20, 20) is False
+    assert spans.overlaps(15, 15) is True
+    assert spans.overlaps(5, 5) is False
+    assert spans.overlaps(25, 25) is False
+
+
 def test_rule_matches_stays_within_budget_on_large_duplicate_heavy_text() -> None:
     """CRITICAL 2 regression: a single short rule term repeated ~20k times in a
     100 KiB leaf used to make `_rule_matches`' O(candidates x accepted) overlap

@@ -161,6 +161,14 @@ class _NonOverlappingSpans:
         self._ends: list[int] = []
 
     def overlaps(self, start: int, end: int) -> bool:
+        # A zero-length candidate (start == end) sitting exactly at an
+        # accepted span's own start diverges from the old linear scan's
+        # `start < used_end and end > used_start` semantics (this returns
+        # True there; the old check returned False) — every other position,
+        # including every other zero-length position, agrees. Unreachable in
+        # practice: every candidate this engine produces comes from a
+        # non-empty regex match, so start < end always holds. See
+        # test_non_overlapping_spans_zero_length_candidate_diverges_at_left_edge.
         i = bisect.bisect_right(self._starts, start)
         if i > 0 and self._ends[i - 1] > start:
             return True
@@ -221,9 +229,9 @@ class _ReplacementPlan:
     spans: tuple[AppliedSpan, ...]
     # Originals (of `pairs`) matched by a replace.md rule rather than a
     # detector/oracle finding — threaded to SanitizeResult so the request-level
-    # RequestPlaceholderAllocator can exempt them from the bijection re-mint
-    # (MAJOR 5: case-insensitive rule matches sharing one configured
-    # replacement are a deliberate many-to-one mapping, not a collision).
+    # RequestPlaceholderAllocator can exempt them from the bijection re-mint:
+    # case-insensitive rule matches sharing one configured replacement are a
+    # deliberate many-to-one mapping, not a collision.
     rule_originals: frozenset[str] = frozenset()
 
 
@@ -317,7 +325,7 @@ class SanitizeResult:
     # remapping can reproduce the same overlap decisions without global replace.
     applied_spans: tuple[AppliedSpan, ...] = ()
     # Originals (of `pairs`) matched by a replace.md rule — see
-    # RequestPlaceholderAllocator.remap's `exempt_from_bijection` (MAJOR 5).
+    # RequestPlaceholderAllocator.remap's `exempt_from_bijection`.
     rule_originals: frozenset[str] = frozenset()
 
 
@@ -784,11 +792,11 @@ class SanitizationOrchestrator:
         )
         if self._allowlist is not None:
             global_rule_pairs = self._allowlist.filter_pairs(global_rule_pairs)
-        # MAJOR 5: case-insensitive rule matching can produce several
-        # differently-cased originals sharing one CONFIGURED replacement —
-        # exempt every rule-derived original from this allocator's bijection
-        # re-mint (computed once, before any _absorb call, since it only
-        # depends on the static `rules`, not on absorb order).
+        # Case-insensitive rule matching can produce several differently-cased
+        # originals sharing one CONFIGURED replacement — exempt every
+        # rule-derived original from this allocator's bijection re-mint
+        # (computed once, before any _absorb call, since it only depends on
+        # the static `rules`, not on absorb order).
         rule_exempt_originals = frozenset(original for original, _ in global_rule_pairs)
 
         def _absorb(

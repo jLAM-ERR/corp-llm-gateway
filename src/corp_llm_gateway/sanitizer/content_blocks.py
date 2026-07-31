@@ -24,6 +24,15 @@ _MAX_JSON_DEPTH = 64
 # leaf-by-leaf. Anthropic signs `encrypted_content` (web-search/mcp results,
 # same idea as thinking blocks) and requires it to round-trip byte-identical.
 _JSON_OPAQUE_KEYS = frozenset({"encrypted_content"})
+# The generic fail-safe scan for an unrecognized block type additionally
+# treats "signature" as opaque: Anthropic signs several block types (thinking
+# blocks are already fully passed through above) and a future signed block
+# type not yet named in _OPAQUE_BLOCK_TYPES would otherwise have its
+# signature rewritten by a detector match and rejected on replay. Scoped to
+# this one fallback rather than added to _JSON_OPAQUE_KEYS globally —
+# "signature" is also a plausible ordinary field name inside arbitrary tool
+# JSON, where it should still be scanned like any other string leaf.
+_BLOCK_FALLBACK_OPAQUE_KEYS = _JSON_OPAQUE_KEYS | frozenset({"signature"})
 
 
 class ContentTooDeepError(Exception):
@@ -38,10 +47,13 @@ class UnsanitizableToolArgumentsError(Exception):
 
 
 class UnsanitizableContentBlockError(Exception):
-    """A content block has a ``type`` this walker doesn't recognize.
+    """A Responses item field registered as text-bearing holds a value shape
+    this walker cannot scan (a bare scalar, not str/dict/list/None).
 
-    Raised instead of the old silent pass-through: an unrecognized block type
-    would otherwise egress to the upstream provider unscanned."""
+    An unrecognized block/item TYPE no longer raises this — it fails SAFE
+    through the generic value-tree scan instead (see ``_sanitize_block``'s
+    fallback branch). This is raised only for a genuinely unscannable value
+    under a KNOWN text field name, so it can't silently egress unscanned."""
 
 
 # block type -> field name carrying its scannable text. Covers Anthropic
@@ -463,8 +475,8 @@ async def _sanitize_block(
         # non-streaming). Streaming tool_use desanitization (input_json_delta) is
         # handled in streaming.py via SseStreamDesanitizer with JSON-string-escaping.
         return block, []
-    # MAJOR 4: a genuinely unrecognized block type used to fail CLOSED (raise
-    # here, 400 upstream). Anthropic/OpenAI ship several new block types a
+    # A genuinely unrecognized block type used to fail CLOSED (raise here,
+    # 400 upstream). Anthropic/OpenAI ship several new block types a
     # year (web_fetch_tool_result, bash_code_execution_tool_result,
     # text_editor_code_execution_tool_result, code_execution_output, ...) —
     # a hard 400 on every one of them 400s real production traffic, and
@@ -483,7 +495,7 @@ async def _sanitize_block(
     new_block: dict[str, Any] = {}
     results: list[Any] = []
     for key, value in block.items():
-        if key == "type" or key in _JSON_OPAQUE_KEYS:
+        if key == "type" or key in _BLOCK_FALLBACK_OPAQUE_KEYS:
             new_block[key] = value
             continue
         new_value, sub_results = await _sanitize_json(value, sanitize_one, 1)
@@ -537,7 +549,7 @@ def _desanitize_block(block: dict[str, Any], reverse: ReverseOne) -> dict[str, A
     # Mirror _sanitize_block's fail-safe generic scan for an unrecognized type.
     fallback_block: dict[str, Any] = {}
     for key, value in block.items():
-        if key == "type" or key in _JSON_OPAQUE_KEYS:
+        if key == "type" or key in _BLOCK_FALLBACK_OPAQUE_KEYS:
             fallback_block[key] = value
         else:
             fallback_block[key] = _desanitize_json(value, reverse, 1)
@@ -647,7 +659,7 @@ def _collect_block_text(block: dict[str, Any]) -> list[str]:
     # Mirror _sanitize_block's fail-safe generic scan for an unrecognized type.
     fallback_text: list[str] = []
     for key, value in block.items():
-        if key == "type" or key in _JSON_OPAQUE_KEYS:
+        if key == "type" or key in _BLOCK_FALLBACK_OPAQUE_KEYS:
             continue
         fallback_text.extend(_collect_json_text(value, 1))
     return fallback_text
@@ -710,10 +722,10 @@ _RESPONSES_BLOCK_LIST_FIELDS = frozenset({"content", "summary"})
 # class shows up under different field names on different item types (e.g.
 # computer_call_output.output and image_generation_call.result), so every
 # entry must be named explicitly. Every OTHER item type's "output" (or any
-# other field) is still scanned by the default branch below (CRITICAL: this
-# used to be an ALLOWLIST of exactly two item types, which silently left
-# local_shell_call_output.output/mcp_call.output unscanned and un-DLP'd —
-# the same defect class as the field-registry gap).
+# other field) is still scanned by the default branch below — an allowlist of
+# exactly one or two item types here would silently leave every other item
+# type's binary/text fields un-DLP'd, the same defect class as the
+# field-registry gap this registry itself replaces.
 _RESPONSES_OPAQUE_ITEM_FIELDS: dict[str, frozenset[str]] = {
     "computer_call_output": frozenset({"output"}),
     "image_generation_call": frozenset({"result"}),
@@ -747,10 +759,10 @@ async def sanitize_responses_item(
     """Sanitize one OpenAI Responses API item (an element of ``data["input"]``).
 
     Field-name-keyed like ``desanitize_responses_payload`` for the fields it
-    recognizes, but CRITICAL: a positive allowlist alone silently skips any
-    field name it doesn't happen to name — the exact class of bug defect #1
-    was (custom_tool_call.input/reasoning.summary), reproduced again after
-    that fix on local_shell_call.action.command, local_shell_call_output.output,
+    recognizes, but a positive allowlist alone silently skips any field name
+    it doesn't happen to name — the exact class of bug defect #1 was
+    (custom_tool_call.input/reasoning.summary), reproduced again after that
+    fix on local_shell_call.action.command, local_shell_call_output.output,
     mcp_call.output, code_interpreter_call.code, none of which are enumerated
     field names. So: known fields get their SPECIALIZED handler (JSON-string
     arguments, the block-list walker, the output/screenshot gate); everything

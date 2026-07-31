@@ -1025,6 +1025,26 @@ async def test_sanitize_unknown_block_type_is_scanned_fail_safe() -> None:
     assert len(results) == 1
 
 
+async def test_sanitize_unknown_block_type_preserves_signature_verbatim() -> None:
+    """A future signed block type not yet in _OPAQUE_BLOCK_TYPES must not have
+    its `signature` rewritten by a detector match — Anthropic signs several
+    block types and rejects a modified signature on replay."""
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text.replace("raw secret", "[REDACTED]")
+        pairs = (("raw secret", "[REDACTED]"),) if "raw secret" in text else ()
+        return MockSanitizeResult(replaced, pairs=pairs)
+
+    sig = "raw secret-looking-signature-bytes"
+    block = {"type": "some_future_signed_block", "payload": "raw secret", "signature": sig}
+    new_block, _ = await sanitize_content(block, mock_sanitize)
+    assert new_block["signature"] == sig
+    assert new_block["payload"] == "[REDACTED]"
+
+    assert desanitize_content(new_block, lambda text: text)["signature"] == sig
+    assert collect_text(block) == ["raw secret"]
+
+
 async def test_sanitize_known_opaque_block_types_still_pass_through() -> None:
     async def mock_sanitize(text: str) -> MockSanitizeResult:
         raise AssertionError("should not be called for opaque blocks")
