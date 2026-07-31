@@ -1,9 +1,15 @@
 import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
-from corp_llm_gateway.sanitizer import SseStreamDesanitizer, StrategyResult, StreamingDesanitizer
+from corp_llm_gateway.sanitizer import (
+    ResponsesStreamDesanitizer,
+    SseStreamDesanitizer,
+    StrategyResult,
+    StreamingDesanitizer,
+)
 
 
 def _mapping(*pairs: tuple[str, str]) -> StrategyResult:
@@ -551,3 +557,115 @@ def test_sse_str_input_returns_str_output() -> None:
     out.extend(sse.flush())
     for chunk in out:
         assert isinstance(chunk, str)
+
+
+# --- Minor: ResponsesStreamDesanitizer must not bypass validation on failure -
+
+
+class _FakeResponsesEvent:
+    """Duck-typed stand-in for a litellm-yielded Pydantic Responses event."""
+
+    def __init__(self, type_: str, **fields: Any) -> None:
+        self.type = type_
+        self._fields = fields
+        for k, v in fields.items():
+            setattr(self, k, v)
+
+    def model_dump(self, mode: str = "python", exclude_none: bool = False) -> dict[str, Any]:
+        return {"type": self.type, **self._fields}
+
+    @classmethod
+    def model_validate(cls, payload: dict[str, Any]) -> "_FakeResponsesEvent":
+        fields = {k: v for k, v in payload.items() if k != "type"}
+        return cls(payload["type"], **fields)
+
+    def model_copy(self, *, update: dict[str, Any], deep: bool = True) -> "_FakeResponsesEvent":
+        fields = {**self._fields, **{k: v for k, v in update.items() if k != "type"}}
+        return _FakeResponsesEvent(update.get("type", self.type), **fields)
+
+
+class _FakeResponsesEventValidateFails(_FakeResponsesEvent):
+    @classmethod
+    def model_validate(cls, payload: dict[str, Any]) -> "_FakeResponsesEventValidateFails":
+        raise ValueError("simulated reconstruction failure")
+
+    def model_copy(
+        self, *, update: dict[str, Any], deep: bool = True
+    ) -> "_FakeResponsesEventValidateFails":
+        raise AssertionError(
+            "must not fall through to an unvalidated model_copy after model_validate fails"
+        )
+
+
+def test_responses_stream_event_reconstruct_failure_does_not_bypass_validation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model_validate failure on a typed Responses stream event must not
+    silently degrade to an unvalidated model_copy — the exact class of
+    degradation litellm_hook.py's _apply_reverse_to_response deliberately
+    refuses (log + return the untouched original instead)."""
+    import logging
+
+    d = ResponsesStreamDesanitizer(_mapping(("alice", "[NAME_001]")))
+    event = _FakeResponsesEventValidateFails(
+        "response.completed", output=[{"content": "hi [NAME_001]"}]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        out = d.feed(event)
+
+    assert out == [event]
+    assert "reconstruct_failed" in caplog.text.lower()
+
+
+def test_responses_stream_event_reconstruct_success_still_restores() -> None:
+    """Positive control: when model_validate succeeds, the event is restored
+    and desanitized normally (the failure path must not become the norm)."""
+
+    d = ResponsesStreamDesanitizer(_mapping(("alice", "[NAME_001]")))
+    event = _FakeResponsesEvent("response.completed", output=[{"content": "hi [NAME_001]"}])
+
+    out = d.feed(event)
+
+    assert len(out) == 1
+    assert out[0].output[0]["content"] == "hi alice"
+
+
+# --- Minor: synthetic tail event must not replay a stale sequence_number ----
+
+
+def test_responses_stream_synthetic_tail_event_uses_latest_sequence_number() -> None:
+    """_event_metadata used to snapshot id fields (incl. sequence_number) only
+    from the FIRST delta of a stream key — every later delta for that same
+    key advances sequence_number, so a synthetic tail event built from the
+    stale snapshot replayed an already-sent value instead of the latest one."""
+    d = ResponsesStreamDesanitizer(_mapping(("alice", "[NAME_001]")))
+
+    assert (
+        d.feed(
+            {
+                "type": "response.output_text.delta",
+                "item_id": "item_1",
+                "sequence_number": 100,
+                "delta": "x",
+            }
+        )
+        == []
+    )
+    assert (
+        d.feed(
+            {
+                "type": "response.output_text.delta",
+                "item_id": "item_1",
+                "sequence_number": 101,
+                "delta": "y",
+            }
+        )
+        == []
+    )
+
+    tail_events = d.flush()
+    assert len(tail_events) == 1
+    tail = json.loads(tail_events[0])
+    assert tail["delta"] == "xy"
+    assert tail["sequence_number"] == 101
