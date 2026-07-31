@@ -516,6 +516,33 @@ async def test_rule_wins_over_local_finding_in_gazetteer_nohit() -> None:
     assert not any("PERSON" in p for _, p in result.pairs)
 
 
+# ---------------------------------------------------------------------------
+# Defect #7 — rule matching restored to substring semantics (decision 2)
+# ---------------------------------------------------------------------------
+
+
+def test_rule_matches_as_infix_substring_release_semantics() -> None:
+    """A rule word must redact inside a larger identifier, per release/1.0.x's
+    plain `r.pattern in text` substring test — the PR's identifier-prefix
+    anchor (`(?<![^\\W_])`) blocked this (a rule `Ledger` no longer matched
+    `MyLedger`); decision 2 drops the anchor."""
+    from corp_llm_gateway.sanitizer.orchestrator import _rule_matches
+
+    rules = Rules(rules=(Rule("Ledger", "[PROJECT_LEDGER]"),))
+    matches = _rule_matches(rules, "MyLedger status update")
+    assert [m.original for m in matches] == ["Ledger"]
+
+
+def test_rule_matches_phrase_case_insensitively() -> None:
+    """Retained widening: case-insensitive matching redacts strictly more than
+    release's case-sensitive substring test."""
+    from corp_llm_gateway.sanitizer.orchestrator import _rule_matches
+
+    rules = Rules(rules=(Rule("Project Polaris", "[CONFIDENTIAL]"),))
+    matches = _rule_matches(rules, "the project polaris rollout")
+    assert [m.original for m in matches] == ["project polaris"]
+
+
 async def test_rules_match_case_insensitively_and_apply_replacement_verbatim() -> None:
     rules = Rules(
         rules=(
@@ -541,12 +568,14 @@ async def test_rules_match_case_insensitively_and_apply_replacement_verbatim() -
 
     assert len(captured) == 0
     # No case-preservation (decision 4): the configured replacement is used verbatim.
+    # Decision 2 (defect #7) drops the PR's identifier-prefix anchor, so "kdir"
+    # matches as a plain case-insensitive substring — including inside "mkdir",
+    # same as release/1.0.x's `r.pattern in text` would (the PR's own anchored
+    # regex previously kept "mkdir" intact; that narrowing is no longer applied).
     assert result.sanitized_text == (
-        "mkdir -p companynameabcService1; companynameabdClient; company name abe; "
-        "confidential project acn confidential project acn"
+        "mcompanynameabc -p companynameabcService1; companynameabdClient; "
+        "company name abe; confidential project acn confidential project acn"
     )
-    assert "mkdir" in result.sanitized_text
-    assert "companynameabc" not in result.sanitized_text.split(" ", 1)[0]
 
 
 async def test_rule_spans_win_over_overlapping_local_findings() -> None:

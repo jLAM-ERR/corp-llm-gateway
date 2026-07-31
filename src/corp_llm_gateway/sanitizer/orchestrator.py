@@ -132,16 +132,15 @@ class _MatchedRule:
 
 
 def _rule_pattern(source: str) -> re.Pattern[str]:
-    """Compile the same case-insensitive phrase/identifier semantics as ru-llm-proxy."""
-    escaped = re.escape(source)
-    if re.fullmatch(r"\w+", source, re.UNICODE):
-        # A single word is an identifier prefix: KdirService matches, mkdir does not.
-        expression = rf"(?<![^\W_]){escaped}"
-    else:
-        left = r"(?<!\w)" if source[:1].isalnum() or source.startswith("_") else ""
-        right = r"(?!\w)" if source[-1:].isalnum() or source.endswith("_") else ""
-        expression = f"{left}{escaped}{right}"
-    return re.compile(expression, re.IGNORECASE | re.UNICODE)
+    """Case-insensitive substring match (decision 2, defect #7).
+
+    release/1.0.x used a plain `r.pattern in text` (case-sensitive) substring
+    test; an identifier-prefix anchor was added on top of it, which silently
+    REDUCED redaction (a rule `Ledger` stopped matching `MyLedger`). Keep only
+    the case-insensitivity widening — drop the anchor so a rule matches inside
+    a larger word on either side, same as release, plus the widening.
+    """
+    return re.compile(re.escape(source), re.IGNORECASE | re.UNICODE)
 
 
 def _rule_matches(rules: Rules, text: str) -> tuple[_MatchedRule, ...]:
