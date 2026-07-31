@@ -19,8 +19,19 @@ for two different people.
 request-canonical placeholder, guaranteeing within one request that the same
 original always maps to one placeholder (reused across segments) and that
 different originals never share a placeholder (a fresh label in the same family
-is minted on collision). See project_placeholder_collision_cross_segment in
-session memory.
+is minted on collision) — EXCEPT for one deliberate exemption: an
+operator-configured ``replace.md`` rule replacement matched case-insensitively
+against several differently-cased originals (or two different rules sharing
+the identical configured replacement text) is intentionally many-to-one (see
+``remap``'s ``exempt_from_bijection`` parameter). For that one case, forward
+substitution is correct (every exempt original maps to its configured
+placeholder), but REVERSE restoration is inherently lossy — a static
+placeholder->original reverse map can only ever restore ONE original for a
+placeholder shared by several. ``placeholder.build_reverse_substituter`` keeps
+the FIRST original to claim a placeholder, matching this allocator's own
+``_by_placeholder.setdefault`` first-claim order, so the two maps at least
+agree on which original comes back rather than disagreeing arbitrarily. See
+project_placeholder_collision_cross_segment in session memory.
 """
 
 from __future__ import annotations
@@ -76,7 +87,10 @@ class RequestPlaceholderAllocator:
         deliberate many-to-one mapping, not a collision between two different
         real-world originals, so it must not compete for a freshly minted
         label the way two distinct detector findings sharing a placeholder
-        would (see MAJOR 5).
+        would. Restoring one of these collapsed placeholders on the reverse
+        pass is inherently lossy (see the module docstring); it deterministically
+        resolves to the first original that claimed it, matching
+        ``placeholder.build_reverse_substituter``.
         """
         return tuple(
             (original, self._canonical(original, placeholder, original in exempt_from_bijection))

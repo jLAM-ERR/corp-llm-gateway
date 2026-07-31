@@ -4009,10 +4009,10 @@ async def test_rule_overlap_round_trip_survives_placeholder_canonicalization() -
 
 
 async def test_case_insensitive_rule_matches_collapse_to_one_configured_token() -> None:
-    """MAJOR 5 exact review repro: rule `Acme = PARTNER-A`, matched
-    case-insensitively against `acme`/`ACME`/`Acme`, must ALL become the one
-    configured replacement — not three tokens, two of them minted and never
-    documented anywhere in the operator's dictionary."""
+    """Rule `Acme = PARTNER-A`, matched case-insensitively against
+    `acme`/`ACME`/`Acme`, must ALL become the one configured replacement —
+    not three tokens, two of them minted and never documented anywhere in
+    the operator's dictionary."""
     g, _ = _build_guardrail([], rules=Rules(rules=(Rule("Acme", "PARTNER-A"),)))
     data = _data_with_token("tok-1", content="acme and ACME and Acme")
 
@@ -4022,12 +4022,14 @@ async def test_case_insensitive_rule_matches_collapse_to_one_configured_token() 
 
     # Many-to-one is inherently lossy on reverse: one casing wins for every
     # occurrence of the shared token. Which one wins is deterministic (the
-    # last-registered pair for that placeholder), not a leak either way.
+    # FIRST-registered pair for that placeholder — build_reverse_substituter
+    # agrees with RequestPlaceholderAllocator's own first-claim semantics),
+    # not a leak either way.
     restored = ""
     chunks_in = [{"choices": [{"delta": {"content": sanitized}}]}]
     async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
         restored += chunk["choices"][0]["delta"]["content"]
-    assert restored == "Acme and Acme and Acme"
+    assert restored == "acme and acme and acme"
 
 
 async def test_user_typed_placeholder_literal_preserved_not_collided(

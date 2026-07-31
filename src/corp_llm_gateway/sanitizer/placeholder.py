@@ -117,11 +117,22 @@ def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> Callable[[str
     contain any character, including one a padding-based scheme might
     otherwise have reserved as a marker.
 
+    When two different originals share one placeholder — an operator
+    ``replace.md`` rule replacement configured many-to-one, which
+    ``RequestPlaceholderAllocator`` deliberately exempts from its bijection —
+    the reverse map keeps the FIRST original to claim that placeholder,
+    matching the allocator's own ``_by_placeholder.setdefault`` semantics.
+    Restoring such a collapsed placeholder is inherently lossy (only one of
+    the two originals can ever come back for a GIVEN static reverse map); this
+    at least makes the two maps agree instead of picking different originals.
+
     Every reverse site (unary response, Anthropic/OpenAI SSE streaming,
     Responses SSE streaming) must build its reverse function through this
     helper so the boundary rule is enforced uniformly.
     """
-    by_placeholder = {placeholder: original for original, placeholder in pairs}
+    by_placeholder: dict[str, str] = {}
+    for original, placeholder in pairs:
+        by_placeholder.setdefault(placeholder, original)
     entries: list[tuple[str, str, re.Pattern[str] | None]] = []
     for placeholder in sort_placeholders_by_descending_length(by_placeholder):
         replacement = by_placeholder[placeholder]
