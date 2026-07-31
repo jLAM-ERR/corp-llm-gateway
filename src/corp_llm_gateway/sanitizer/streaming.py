@@ -48,7 +48,12 @@ class StreamingDesanitizer:
         self._buffer += chunk
         self._buffer = self._replace_all(self._buffer, final=False)
 
-        if self._max_len <= 1:
+        if self._max_len == 0:
+            # No pairs at all: the reverse function is the identity, so
+            # nothing can ever match regardless of what follows — safe to
+            # emit immediately. A length-1 bare placeholder can still have a
+            # deferred (not-yet-confirmed) match at the tail, so it must go
+            # through the hold-back path below like any other length.
             safe = self._buffer
             self._buffer = ""
             return safe

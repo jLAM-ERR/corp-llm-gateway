@@ -251,6 +251,18 @@ def test_bare_no_bracket_sibling_placeholder_at_max_len_not_corrupted_in_one_fee
     assert out == "acme and acme and acme"
 
 
+def test_bare_single_char_placeholder_deferred_at_buffer_tail_still_restores() -> None:
+    """A bare placeholder of length <= 1 hit the "nothing to hold back" fast
+    path unconditionally, draining and clearing the buffer even when the
+    trailing occurrence was deferred (not yet confirmed complete) — the
+    deferred, unreplaced placeholder was then emitted as-is and never
+    retried, instead of surviving into flush() where it correctly restores."""
+    d = StreamingDesanitizer(_mapping(("Ivanov", "X")))
+    out = d.feed("hello X")
+    out += d.flush()
+    assert out == "hello Ivanov"
+
+
 def test_bare_alias_boundary_defeated_by_chunk_split_end_of_buffer() -> None:
     """MAJOR 3: the exact review repro. Unary (whole text at once) correctly
     leaves `NAME_001Suffix` untouched (the anchor's trailing lookahead sees
