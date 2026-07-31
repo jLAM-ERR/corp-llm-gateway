@@ -57,25 +57,53 @@ class RequestPlaceholderAllocator:
     def _is_taken(self, label: str) -> bool:
         return label in self._by_placeholder or label in self._forbidden
 
-    def remap(self, pairs: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+    def remap(
+        self,
+        pairs: tuple[tuple[str, str], ...],
+        *,
+        exempt_from_bijection: frozenset[str] = frozenset(),
+    ) -> tuple[tuple[str, str], ...]:
         """Return request-canonical ``(original, placeholder)`` pairs.
 
         Input order is preserved. Each call updates allocator state so later
         segments observe placeholders already claimed by earlier ones.
+
+        *exempt_from_bijection*: originals (matched substrings) that came from
+        an operator-configured ``replace.md`` rule rather than a detector/
+        oracle finding. Case-insensitive rule matching means the SAME rule can
+        match several differently-cased originals (``Acme``/``acme``/``ACME``)
+        that all carry the identical CONFIGURED replacement text — that is a
+        deliberate many-to-one mapping, not a collision between two different
+        real-world originals, so it must not compete for a freshly minted
+        label the way two distinct detector findings sharing a placeholder
+        would (see MAJOR 5).
         """
         return tuple(
-            (original, self._canonical(original, placeholder)) for original, placeholder in pairs
+            (original, self._canonical(original, placeholder, original in exempt_from_bijection))
+            for original, placeholder in pairs
         )
 
-    def _canonical(self, original: str, placeholder: str) -> str:
+    def _canonical(self, original: str, placeholder: str, exempt: bool = False) -> str:
         existing = self._by_original.get(original)
         if existing is not None:
             # Same original seen before (possibly in another segment): reuse its
             # placeholder so the model sees one consistent token for it.
             return existing
-        chosen = placeholder if not self._is_taken(placeholder) else self._mint(placeholder)
+        taken = self._is_taken(placeholder)
+        if taken and exempt and placeholder not in self._forbidden:
+            # Another rule occurrence (same rule, a different case variant, or
+            # a different rule sharing the same configured replacement text)
+            # already claimed this exact token — reuse it verbatim rather than
+            # minting a fresh, operator-unconfigured one. The `_forbidden`
+            # check is NOT skipped: a placeholder the user typed literally
+            # must still never be reused for a real redaction, exempt or not.
+            chosen = placeholder
+        elif taken:
+            chosen = self._mint(placeholder)
+        else:
+            chosen = placeholder
         self._by_original[original] = chosen
-        self._by_placeholder[chosen] = original
+        self._by_placeholder.setdefault(chosen, original)
         return chosen
 
     def _mint(self, placeholder: str) -> str:
