@@ -1279,6 +1279,7 @@ async def test_post_call_stream_openai_dict_gpt4o_contract() -> None:
 
 
 async def test_post_call_stream_responses_events_restore_split_placeholder() -> None:
+    pytest.importorskip("litellm", reason="typed Responses stream events need litellm installed")
     from litellm.types.llms.openai import (
         OutputTextDeltaEvent,
         OutputTextDoneEvent,
@@ -1413,6 +1414,55 @@ async def test_post_call_stream_responses_restores_bracket_stripped_identifier()
         ]
         == f"*** Add File: {original}.cs"
     )
+
+
+async def test_post_call_stream_custom_tool_input_delta_and_done_agree_on_special_chars() -> None:
+    """custom_tool_call.input is freeform text (a diff/shell command), not JSON —
+    escaping the delta half while the `.done` half stays unescaped (Task 15 item 1)
+    made quotes/backslashes/newlines diverge between the two."""
+    original = 'diff --git a/x "b/x"\ncontent with \\ backslash'
+    g, _ = _build_guardrail([(original, "[SECRET_001]")])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": f"apply: {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+    events = [
+        {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "tool_1",
+            "output_index": 0,
+            "delta": "*** patch: [SECR",
+        },
+        {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "tool_1",
+            "output_index": 0,
+            "delta": "ET_001]",
+        },
+        {
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "tool_1",
+            "output_index": 0,
+            "input": "*** patch: [SECRET_001]",
+        },
+    ]
+
+    out: list[Any] = []
+    async for chunk in g.post_call_stream(data, _async_iter(events)):
+        out.append(json.loads(chunk) if isinstance(chunk, str) else chunk)
+
+    tool_deltas = "".join(
+        event["delta"] for event in out if event["type"] == "response.custom_tool_call_input.delta"
+    )
+    done_input = next(
+        event for event in out if event["type"] == "response.custom_tool_call_input.done"
+    )["input"]
+    expected = f"*** patch: {original}"
+    assert tool_deltas == expected
+    assert done_input == expected
+    assert tool_deltas == done_input
 
 
 async def test_post_call_unary_restores_bracket_stripped_identifier() -> None:
@@ -2814,6 +2864,57 @@ async def test_audit_recovers_state_via_litellm_call_id() -> None:
     assert rec["team_id"] == "t1"
     assert rec["model"] == "claude"
     assert rec["redaction_count"] == 1
+    assert rec["status"] == "ok"
+
+
+async def test_codex_path_metadata_pop_does_not_break_audit_attribution() -> None:
+    """Task 15 item 2: the ChatGPT auth bridge's `data.pop("metadata", None)`
+    discards litellm's proxy-internal accounting dict wholesale rather than
+    narrowing to a single offending key — litellm's real
+    `add_litellm_data_to_request()` (proxy/litellm_pre_call_utils.py) populates
+    `data["metadata"]` with dozens of keys (`user_api_key_auth`, `headers`,
+    `requester_metadata`, ...), several holding non-string/non-serializable
+    values, so there is no single key to narrow to; the whole shape is
+    unsuited to the wire field, not one member of it. Audit attribution is
+    unaffected by the pop either way: team_id/user_id come from AuthMiddleware
+    via our own per-request state and request_id is keyed on
+    `litellm_call_id` — neither reads `data["metadata"]`."""
+    g, sink = _build_guardrail(forward_chatgpt_auth=True)
+    call_id = "litellm-call-codex-1"
+    data: dict[str, Any] = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "litellm_call_id": call_id,
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth-value"},
+        # Shape modeled on litellm's real proxy-internal metadata dict for a
+        # Responses-API call: a rich accounting dict, not a flat string map.
+        "metadata": {
+            "user_api_key_team_id": "t1",
+            "user_api_key_user_id": "alice",
+            "headers": {"authorization": "Bearer oauth-value"},
+            "requester_metadata": {"trace": "abc"},
+        },
+    }
+    out = await g.pre_call(data)
+    assert "metadata" not in out, "the bridge must still drop the proxy-internal dict"
+
+    await g.async_log_success_event(
+        kwargs={
+            "litellm_call_id": call_id,
+            "optional_params": {"model": "gpt-5.6-sol"},
+            "litellm_params": {"litellm_call_id": call_id, "metadata": {}},
+        },
+        response_obj={
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}]
+        },
+        start_time=time.time(),
+        end_time=time.time() + 0.05,
+    )
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    assert rec["request_id"] == call_id
+    assert rec["user_id"] == "alice"
+    assert rec["team_id"] == "t1"
     assert rec["status"] == "ok"
 
 
