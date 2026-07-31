@@ -61,6 +61,9 @@
 # CORP_LLM_DLP_GUARD        = "1"      # Stage 5 DLP egress guard (re-scan sanitized request)
 # CORP_LLM_DLP_CANARIES     = "canary-abc,canary-def"   # comma-separated canary regexes
 # CORP_LLM_FORWARD_CHATGPT_AUTH = "0"  # opt-in allowlisted Codex OAuth forwarding
+#   Resolved by bootstrap.build_guardrail() in every deployment (k8s/Helm
+#   included), not just the docker-compose Codex demo overlay. See
+#   docs/chatgpt-codex.md.
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #

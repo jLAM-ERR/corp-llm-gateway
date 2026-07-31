@@ -38,15 +38,25 @@ Notes:
   `<!--` (HTML-style for editors that render markdown).
 - Blank lines are ignored.
 - Whitespace around tokens is stripped.
-- Matching is case-insensitive. Lowercase source/replacement pairs preserve the
-  input's case style, so `kdir = companynameabc` maps `KdirService` to
-  `CompanynameabcService` and can be restored exactly.
-- A source made of one word matches at an identifier boundary and may have an
-  identifier suffix. It matches `KdirService`, but does not replace the `kdir`
-  characters inside `mkdir`.
-- Multi-word and punctuation-bearing sources use whole-phrase boundaries.
-- Longer dictionary rules win on overlap, and dictionary spans override
-  overlapping NER/oracle findings.
+- Matching is a plain case-insensitive substring test — no word-boundary or
+  identifier-anchor requirement, for a single-word source or a multi-word
+  phrase alike. `kdir = [X]` also matches the `kdir` inside `mkdir`, not just
+  a standalone `Kdir` or an identifier like `KdirService`; `project polaris =
+  [X]` also matches inside `reproject polaristation`.
+  **This changes behavior for existing dictionaries**: an earlier release
+  anchored a single-word source to an identifier boundary, so upgrading
+  widens matches — review your rules if a short, common source (e.g.
+  `ledger`) is meant to match only as a standalone word.
+- The REPLACEMENT text is applied verbatim. Matching is case-insensitive,
+  but the output is always exactly the replacement you configured —
+  there is no case-preserving transform of the replacement based on the
+  matched input's case.
+- On overlap, the **longer span wins**, whether it's a dictionary rule or a
+  detector/NER/oracle finding — a rule no longer automatically overrides a
+  longer overlapping finding (e.g. rule `Alice = [EMPLOYEE_001]` loses its
+  span to a longer `Alice Smith` → `[PERSON_001]` finding, so the output is
+  `Contact [PERSON_001] today`, not `Contact [EMPLOYEE_001] Smith today`).
+  A rule still wins when its span is IDENTICAL to a finding's span.
 
 ## Example file
 
@@ -77,8 +87,9 @@ without traffic loss).
 
 ## Authoring tips
 
-- **Be specific**. `- foo = [BAR]` will replace `foo` case-insensitively at
-  identifier boundaries in every request. If `foo` appears legitimately in many contexts, the
+- **Be specific**. `- foo = [BAR]` will replace `foo` case-insensitively as a
+  plain substring — anywhere it appears, including inside a longer word — in
+  every request. If `foo` appears legitimately in many contexts, the
   replacement breaks them.
 - **Order doesn't matter for correctness**, but the engine sorts
   patterns by descending length before replacement (M1-9 invariant)
