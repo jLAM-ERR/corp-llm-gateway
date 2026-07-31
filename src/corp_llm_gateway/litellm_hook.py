@@ -51,7 +51,9 @@ from corp_llm_gateway.sanitizer import (
 )
 from corp_llm_gateway.sanitizer.content_blocks import (
     ContentTooDeepError,
+    UnsanitizableContentBlockError,
     UnsanitizableToolArgumentsError,
+    collect_responses_item_text,
     collect_text,
     collect_tool_call_text,
     desanitize_content,
@@ -60,6 +62,7 @@ from corp_llm_gateway.sanitizer.content_blocks import (
     message_has_tool_calls,
     sanitize_content,
     sanitize_message,
+    sanitize_responses_item,
 )
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
@@ -376,6 +379,17 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 ) from None
 
         messages = raw_messages
+
+        def _item_text(msg: dict[str, Any]) -> list[str]:
+            # Chat Completions/Anthropic messages stay on the item-type-keyed
+            # walkers (unchanged behavior). Responses items (function_call,
+            # custom_tool_call, reasoning, …) route through the field-name-keyed
+            # walker so every text-bearing field is visible here, not just the
+            # enumerated item types (see content_blocks.sanitize_responses_item).
+            if request_shape == "messages":
+                return collect_text(msg.get("content")) + collect_tool_call_text(msg)
+            return collect_responses_item_text(msg)
+
         if not isinstance(messages, list):
             logger.info(
                 "litellm_pre_call_bad_request request_id=%s error_code=E_BAD_REQUEST",
@@ -465,10 +479,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         input_unwrapped_literals: set[str] = set()
         for _m in messages:
             if isinstance(_m, dict):
-                for _seg in collect_text(_m.get("content")):
-                    input_literals.extend(find_placeholder_literals(_seg))
-                    input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
-                for _seg in collect_tool_call_text(_m):
+                for _seg in _item_text(_m):
                     input_literals.extend(find_placeholder_literals(_seg))
                     input_unwrapped_literals.update(find_unwrapped_placeholder_literals(_seg))
         for _prompt_field in ("system", "instructions"):
@@ -491,8 +502,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             _s0_texts: list[str] = []
             for _s0_msg in messages:
                 if isinstance(_s0_msg, dict):
-                    _s0_texts.extend(collect_text(_s0_msg.get("content")))
-                    _s0_texts.extend(collect_tool_call_text(_s0_msg))
+                    _s0_texts.extend(_item_text(_s0_msg))
             for _prompt_field in ("system", "instructions"):
                 _s0_texts.extend(collect_text(data.get(_prompt_field)))
             _s0_reason = classify_block("\n".join(_s0_texts))
@@ -555,7 +565,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             content_empty = content is None or (isinstance(content, str) and not content)
             # A tool-call-only assistant message (content=None) still carries
             # sanitizable data in tool_calls[].function.arguments (F4) — process it.
-            if content_empty and not message_has_tool_calls(msg):
+            # Same for a Responses item with no "content" at all (function_call,
+            # custom_tool_call, reasoning, …) — _item_text sees its other
+            # text-bearing fields (arguments/output/input/summary/refusal).
+            has_sanitizable_data = (
+                message_has_tool_calls(msg)
+                if request_shape == "messages"
+                else bool(_item_text(msg))
+            )
+            if content_empty and not has_sanitizable_data:
                 logger.info(
                     "litellm_pre_call_message_skipped request_id=%s "
                     "message_index=%d reason=empty_or_non_string",
@@ -571,7 +589,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 content_bytes = len(json.dumps(content).encode("utf-8"))
             else:
                 content_bytes = len(
-                    json.dumps(msg.get("tool_calls") or msg.get("function_call")).encode("utf-8")
+                    json.dumps(msg.get("tool_calls") or msg.get("function_call") or msg).encode(
+                        "utf-8"
+                    )
                 )
 
             logger.info(
@@ -583,7 +603,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 content_bytes,
             )
             try:
-                new_msg, results = await sanitize_message(msg, sanitize_one)
+                if request_shape == "messages":
+                    new_msg, results = await sanitize_message(msg, sanitize_one)
+                else:
+                    new_msg, results = await sanitize_responses_item(msg, sanitize_one)
             except ContentTooDeepError as exc:
                 self._record_failure(request_id, error_code="E_BAD_REQUEST")
                 _now = datetime.now(UTC)
@@ -602,6 +625,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     400,
                     "E_BAD_REQUEST",
                     "unsupported tool-call arguments shape",
+                ) from exc
+            except UnsanitizableContentBlockError as exc:
+                # Fail closed: an unrecognized content block type must not egress unscanned.
+                self._record_failure(request_id, error_code="E_BAD_REQUEST")
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    400,
+                    "E_BAD_REQUEST",
+                    "unsupported content block type",
                 ) from exc
             except OversizeContentError as exc:
                 # F1: fail-closed on an oversize leaf. Never forward the original.
@@ -712,6 +745,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "E_BAD_REQUEST",
                     "request content nesting too deep",
                 ) from exc
+            except UnsanitizableContentBlockError as exc:
+                # Fail closed: an unrecognized content block type must not egress unscanned.
+                self._record_failure(request_id, error_code="E_BAD_REQUEST")
+                _now = datetime.now(UTC)
+                await self.audit(data, None, _now, _now, status="failed")
+                raise GuardrailHttpException(
+                    400,
+                    "E_BAD_REQUEST",
+                    "unsupported content block type",
+                ) from exc
             except OversizeContentError as exc:
                 # F1: fail-closed on an oversize system leaf. Never forward the original.
                 state.block_reason = "oversize:blocked"
@@ -799,8 +842,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             _s5_messages, _ = _request_items(data)
             for _s5_msg in _s5_messages or []:
                 if isinstance(_s5_msg, dict):
-                    _s5_texts.extend(collect_text(_s5_msg.get("content")))
-                    _s5_texts.extend(collect_tool_call_text(_s5_msg))
+                    _s5_texts.extend(_item_text(_s5_msg))
             for _prompt_field in ("system", "instructions"):
                 _s5_texts.extend(collect_text(data.get(_prompt_field)))
             _s5_joined = "\n".join(_s5_texts)

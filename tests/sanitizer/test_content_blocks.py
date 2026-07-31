@@ -9,11 +9,15 @@ import pytest
 
 from corp_llm_gateway.sanitizer.content_blocks import (
     ContentTooDeepError,
+    UnsanitizableContentBlockError,
     _collect_json_text,
     _sanitize_json,
+    collect_responses_item_text,
     collect_text,
     desanitize_content,
+    desanitize_responses_payload,
     sanitize_content,
+    sanitize_responses_item,
 )
 
 
@@ -938,3 +942,214 @@ async def test_no_original_in_sanitized_tool_use_and_document() -> None:
     assert email1 not in serialized, f"raw {email1!r} leaked into egress"
     assert email2 not in serialized, f"raw {email2!r} leaked into egress"
     assert "[E1]" in serialized or "[E2]" in serialized
+
+
+# ---- F: reasoning_text/summary_text/refusal block widening (defect #1) ------
+
+
+async def test_sanitize_reasoning_text_block() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text.replace("acme", "[ORG_001]"), pairs=(("acme", "[ORG_001]"),))
+
+    content = [{"type": "reasoning_text", "text": "thinking about acme"}]
+    new_content, results = await sanitize_content(content, mock_sanitize)
+    assert new_content[0]["text"] == "thinking about [ORG_001]"
+    assert len(results) == 1
+
+
+async def test_sanitize_summary_text_block() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text.replace("acme", "[ORG_001]"), pairs=(("acme", "[ORG_001]"),))
+
+    content = [{"type": "summary_text", "text": "plan for acme rollout"}]
+    new_content, results = await sanitize_content(content, mock_sanitize)
+    assert new_content[0]["text"] == "plan for [ORG_001] rollout"
+    assert len(results) == 1
+
+
+async def test_sanitize_refusal_block() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text.replace("acme", "[ORG_001]"), pairs=(("acme", "[ORG_001]"),))
+
+    content = [{"type": "refusal", "refusal": "cannot share acme secrets"}]
+    new_content, results = await sanitize_content(content, mock_sanitize)
+    assert new_content[0]["refusal"] == "cannot share [ORG_001] secrets"
+    assert len(results) == 1
+
+
+def test_desanitize_reasoning_text_and_summary_text_and_refusal_blocks() -> None:
+    def reverse(text: str) -> str:
+        return text.replace("[ORG_001]", "acme")
+
+    content = [
+        {"type": "reasoning_text", "text": "thinking about [ORG_001]"},
+        {"type": "summary_text", "text": "plan for [ORG_001]"},
+        {"type": "refusal", "refusal": "cannot share [ORG_001] secrets"},
+    ]
+    new_content = desanitize_content(content, reverse)
+    assert new_content[0]["text"] == "thinking about acme"
+    assert new_content[1]["text"] == "plan for acme"
+    assert new_content[2]["refusal"] == "cannot share acme secrets"
+
+
+def test_collect_text_reasoning_text_and_summary_text_and_refusal_blocks() -> None:
+    content = [
+        {"type": "reasoning_text", "text": "a"},
+        {"type": "summary_text", "text": "b"},
+        {"type": "refusal", "refusal": "c"},
+    ]
+    assert collect_text(content) == ["a", "b", "c"]
+
+
+# ---- G: unknown block type fails closed (compounding defect #1) ------------
+
+
+async def test_sanitize_unknown_block_type_fails_closed() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        raise AssertionError("should not be called")
+
+    content = [{"type": "some_future_block", "payload": "raw secret"}]
+    with pytest.raises(UnsanitizableContentBlockError):
+        await sanitize_content(content, mock_sanitize)
+
+
+async def test_sanitize_known_opaque_block_types_still_pass_through() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        raise AssertionError("should not be called for opaque blocks")
+
+    content = [
+        {"type": "image", "source": "binary"},
+        {"type": "image_url", "image_url": {"url": "https://..."}},
+        {"type": "thinking", "thinking": "internal reasoning"},
+        {"type": "redacted_thinking", "data": "opaque"},
+    ]
+    new_content, results = await sanitize_content(content, mock_sanitize)
+    assert new_content == content
+    assert results == []
+
+
+# ---- H: sanitize_responses_item / collect_responses_item_text --------------
+
+
+async def test_sanitize_responses_item_custom_tool_call_input() -> None:
+    """defect #1: custom_tool_call.input must be sanitized, not skipped."""
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text.replace("sk-secret", "[SECRET_001]")
+        pairs = (("sk-secret", "[SECRET_001]"),) if "sk-secret" in text else ()
+        return MockSanitizeResult(replaced, pairs=pairs)
+
+    item = {
+        "type": "custom_tool_call",
+        "call_id": "call_1",
+        "name": "apply_patch",
+        "input": "*** Add File: x\n+KEY=sk-secret",
+    }
+    new_item, results = await sanitize_responses_item(item, mock_sanitize)
+    assert new_item["input"] == "*** Add File: x\n+KEY=[SECRET_001]"
+    assert new_item["call_id"] == "call_1"
+    assert len(results) == 1
+
+
+async def test_sanitize_responses_item_reasoning_summary() -> None:
+    """defect #1: reasoning.summary[].text must be sanitized, not skipped."""
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text.replace("acme", "[ORG_001]")
+        pairs = (("acme", "[ORG_001]"),) if "acme" in text else ()
+        return MockSanitizeResult(replaced, pairs=pairs)
+
+    item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "plan for acme"}],
+    }
+    new_item, results = await sanitize_responses_item(item, mock_sanitize)
+    assert new_item["summary"][0]["text"] == "plan for [ORG_001]"
+    assert len(results) == 1
+
+
+async def test_sanitize_responses_item_function_call_arguments_json() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text.replace("a@x.com", "[E1]")
+        pairs = (("a@x.com", "[E1]"),) if "a@x.com" in text else ()
+        return MockSanitizeResult(replaced, pairs=pairs)
+
+    item = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "send",
+        "arguments": json.dumps({"to": "a@x.com"}),
+    }
+    new_item, results = await sanitize_responses_item(item, mock_sanitize)
+    assert json.loads(new_item["arguments"]) == {"to": "[E1]"}
+    assert len(results) == 1
+
+
+async def test_sanitize_responses_item_function_call_output() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        replaced = text.replace("acme", "[ORG_001]")
+        pairs = (("acme", "[ORG_001]"),) if "acme" in text else ()
+        return MockSanitizeResult(replaced, pairs=pairs)
+
+    item = {"type": "function_call_output", "call_id": "call_1", "output": "acme.cs"}
+    new_item, results = await sanitize_responses_item(item, mock_sanitize)
+    assert new_item["output"] == "[ORG_001].cs"
+    assert len(results) == 1
+
+
+async def test_sanitize_responses_item_message_content_unaffected_fields_kept() -> None:
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text, pairs=())
+
+    item = {"role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+    new_item, _ = await sanitize_responses_item(item, mock_sanitize)
+    assert new_item["role"] == "user"
+    assert new_item["content"][0]["text"] == "hi"
+
+
+def test_collect_responses_item_text_custom_tool_call_and_reasoning() -> None:
+    assert collect_responses_item_text({"type": "custom_tool_call", "input": "patch text"}) == [
+        "patch text"
+    ]
+    assert collect_responses_item_text(
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan"}]}
+    ) == ["plan"]
+
+
+def test_collect_responses_item_text_empty_item() -> None:
+    assert collect_responses_item_text({"type": "reasoning", "summary": []}) == []
+
+
+# ---- I: symmetry — sanitize field set == desanitize field set (defect #1) --
+
+
+async def test_responses_registry_symmetry_sanitize_matches_desanitize() -> None:
+    """Every field _RESPONSES_TEXT_FIELDS lists must be covered by BOTH
+    sanitize_responses_item and desanitize_responses_payload — a field added to
+    only one side is exactly the class of bug defect #1 was."""
+    from corp_llm_gateway.sanitizer.content_blocks import (
+        _RESPONSES_OPAQUE_FIELDS,
+        _RESPONSES_TEXT_FIELDS,
+    )
+
+    fields = sorted(_RESPONSES_TEXT_FIELDS - _RESPONSES_OPAQUE_FIELDS)
+    item = {field: f"ORIGINAL_{field}" for field in fields}
+
+    async def mock_sanitize(text: str) -> MockSanitizeResult:
+        return MockSanitizeResult(text.replace("ORIGINAL", "PLACEHOLDER"), pairs=())
+
+    sanitized, _ = await sanitize_responses_item(item, mock_sanitize)
+    sanitized_fields = {f for f in fields if sanitized[f] != item[f]}
+    assert sanitized_fields == set(fields), (
+        f"sanitize_responses_item did not touch: {set(fields) - sanitized_fields}"
+    )
+
+    def reverse(text: str) -> str:
+        return text.replace("PLACEHOLDER", "ORIGINAL")
+
+    restored = desanitize_responses_payload(sanitized, reverse)
+    restored_fields = {f for f in fields if restored[f] == item[f]}
+    assert restored_fields == set(fields), (
+        f"desanitize_responses_payload did not restore: {set(fields) - restored_fields}"
+    )
