@@ -13,6 +13,7 @@ import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 
 from corp_llm_gateway.corp_llm import (
     SANITIZE_TOOL_NAME,
@@ -131,6 +132,13 @@ class _MatchedRule:
     replacement: str
 
 
+# Rule dictionaries are per-team and small (tens of patterns); recompiling one
+# on every _rule_matches call measured ~44 ms/call at 200 rules x 10.8 KB
+# against a ~6 ms p50 CPU budget (no GPU escape hatch — see CLAUDE.md). 4096
+# covers, e.g., ~20 teams at 200 unique patterns each (or far more teams with
+# smaller dictionaries) while staying bounded so the cache can't grow without
+# limit across an unbounded number of teams over the process lifetime.
+@lru_cache(maxsize=4096)
 def _rule_pattern(source: str) -> re.Pattern[str]:
     """Case-insensitive substring match (decision 2, defect #7).
 
@@ -410,7 +418,13 @@ class SanitizationOrchestrator:
             content_hash[:12],
         )
 
-        detected = await self._detect(text, rules, team_id=team_id, conversation_id=conversation_id)
+        detected = await self._detect(
+            text,
+            rules,
+            team_id=team_id,
+            conversation_id=conversation_id,
+            rule_matches=rule_matches,
+        )
         plan = _plan_replacements(text, detected.pairs, rule_matches)
         mapping = PlaceholderMapping(pairs=plan.pairs)
 
@@ -450,6 +464,7 @@ class SanitizationOrchestrator:
         team_id: str,
         conversation_id: str,
         chunked: bool = False,
+        rule_matches: tuple[_MatchedRule, ...] | None = None,
     ) -> StrategyResult:
         """Run the local-first cascade over one text leaf; return merged pairs.
 
@@ -457,9 +472,17 @@ class SanitizationOrchestrator:
         callers (`sanitize` / `_sanitize_chunked`) — this is the detection core.
         When *chunked*, the NER-only local pass is used (regex/checksum runs
         full-text in `_sanitize_chunked`, so it is not repeated per chunk — H1).
+
+        *rule_matches*: `sanitize()` already computes this over the SAME full
+        `text` before calling here, so it is threaded through to avoid a second
+        ~O(rules x len(text)) pass. `_sanitize_chunked` calls this with
+        `chunked=True` on a per-chunk substring (different text than the rule
+        matches it computed for the full document), so that call site must
+        NOT pass its own — leaving the default (None) recomputes for the chunk.
         """
         local_pass = self._chunk_local if chunked else self._local
-        rule_matches = _rule_matches(rules, text)
+        if rule_matches is None:
+            rule_matches = _rule_matches(rules, text)
         rules_pairs = tuple(
             dict.fromkeys((match.original, match.replacement) for match in rule_matches)
         )

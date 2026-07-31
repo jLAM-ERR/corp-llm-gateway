@@ -1082,3 +1082,69 @@ async def test_oracle_mode_change_invalidates_cache_a_entry() -> None:
     assert r_on.cache_a_hit is False, "oracle mode change must miss the oracle-off cache entry"
     assert "Project Nightingale" not in r_on.sanitized_text
     assert len(captured) == 1, "the oracle must actually run once re-enabled"
+
+
+# ---------------------------------------------------------------------------
+# Task 13 — rule-matching performance: _rule_pattern compile caching
+# ---------------------------------------------------------------------------
+
+
+def test_rule_pattern_compile_is_cached() -> None:
+    """`_rule_pattern` must not recompile the same rule source on every call —
+    it was measured recompiling on every call at ~11-22 ms/request for
+    200 rules x 10.8 KB against a ~6 ms p50 CPU budget."""
+    from corp_llm_gateway.sanitizer.orchestrator import _rule_pattern
+
+    _rule_pattern.cache_clear()
+    _rule_pattern("cache-test-unique-source-task13")
+    hits_after_first_call = _rule_pattern.cache_info().hits
+    _rule_pattern("cache-test-unique-source-task13")
+    hits_after_second_call = _rule_pattern.cache_info().hits
+    assert hits_after_second_call > hits_after_first_call
+
+
+async def test_detect_reuses_threaded_rule_matches_instead_of_recomputing() -> None:
+    """`sanitize()` computes `_rule_matches` once and threads it into `_detect()`;
+    a rule match must still be applied (this pins the threading didn't drop it),
+    and the chunked path is untouched by this change (covered separately)."""
+    rules = Rules(rules=(Rule("acme", "[COMPANY_001]"),))
+    orch = SanitizationOrchestrator(
+        None,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        gazetteer=Gazetteer({}),
+        oracle_enabled=False,
+    )
+    result = await orch.sanitize("contact acme today", team_id="t1", conversation_id="c1")
+    assert result.pairs == (("acme", "[COMPANY_001]"),)
+    assert result.sanitized_text == "contact [COMPANY_001] today"
+
+
+async def test_sanitize_computes_rule_matches_only_once_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`sanitize()` and `_detect()` operate on the SAME full text, so
+    `_rule_matches` must be threaded through rather than recomputed."""
+    from corp_llm_gateway.sanitizer import orchestrator as orch_module
+
+    calls: list[str] = []
+    original = orch_module._rule_matches
+
+    def _counting(rules: Rules, text: str) -> tuple:
+        calls.append(text)
+        return original(rules, text)
+
+    monkeypatch.setattr(orch_module, "_rule_matches", _counting)
+
+    rules = Rules(rules=(Rule("acme", "[COMPANY_001]"),))
+    orch = SanitizationOrchestrator(
+        None,
+        InMemoryMappingStore(),
+        _StaticRulesLoader(rules),
+        gazetteer=Gazetteer({}),
+        oracle_enabled=False,
+    )
+    await orch.sanitize("contact acme today", team_id="t1", conversation_id="c1")
+    assert calls == ["contact acme today"], (
+        "rule_matches must be computed exactly once for the shared full text"
+    )
