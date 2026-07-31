@@ -1801,7 +1801,21 @@ def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:
             validator = getattr(type(response), "model_validate", None)
             if callable(validator):
                 try:
-                    return validator(rewritten)
+                    restored = validator(rewritten)
+                    # MAJOR 8: model_validate() builds a BRAND NEW instance from
+                    # the dumped dict, which never carries pydantic private
+                    # attrs like litellm's `_hidden_params` (model_dump omits
+                    # them; confirmed against the real litellm.ModelResponse).
+                    # The proxy reads `_hidden_params` for cost tracking and
+                    # x-litellm-* response headers, so losing it here would
+                    # silently break that on the DEFAULT (flag-off) path.
+                    # model_copy() (the other branch below) doesn't have this
+                    # problem — it copies the existing instance rather than
+                    # reconstructing one, so private attrs survive naturally.
+                    hidden_params = getattr(response, "_hidden_params", None)
+                    if hidden_params is not None and hasattr(restored, "_hidden_params"):
+                        restored._hidden_params = hidden_params
+                    return restored
                 except Exception:
                     # The rewritten payload failed to validate back into its own
                     # type. Falling through to model_copy() would bypass that

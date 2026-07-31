@@ -1976,6 +1976,40 @@ async def test_post_call_unary_reverses_chat_completions_model_response_object()
     assert out.choices[0]["message"]["content"] == "hello alice!"
 
 
+async def test_post_call_unary_real_litellm_model_response_preserves_hidden_params() -> None:
+    """MAJOR 8: the pydantic branch was only ever exercised by the duck-typed
+    fake above (pydantic/litellm are absent from the local .venv) — a REAL
+    litellm.ModelResponse round-tripped through model_dump -> model_validate
+    loses `_hidden_params` (a pydantic PRIVATE attribute, never in the dumped
+    dict), which the proxy reads for cost tracking / x-litellm-* headers.
+    This is on the DEFAULT (flag-off) path, so CI (which has litellm) must
+    exercise the real object, not just the fake."""
+    litellm = pytest.importorskip("litellm")
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    response = litellm.ModelResponse(
+        id="chatcmpl-x",
+        model="gpt-4",
+        choices=[
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello [N1]!"},
+                "finish_reason": "stop",
+            }
+        ],
+    )
+    response._hidden_params = {"x-litellm-key": "team-a-key-hash"}
+
+    out = await g.post_call_unary(data, response)
+
+    assert isinstance(out, litellm.ModelResponse)
+    assert out.choices[0].message.content == "hello alice!"
+    assert out._hidden_params == {"x-litellm-key": "team-a-key-hash"}
+
+
 async def test_post_call_unary_response_reconstruct_failure_does_not_bypass_validation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
