@@ -750,6 +750,52 @@ async def test_pre_call_unrecognized_call_type_still_sanitizes_input() -> None:
     assert out["input"] == "contact [NAME_001]"
 
 
+# ---- Round-4 CRITICAL 2: /v1/audio/speech's `input` is text-to-synthesize ---
+
+
+async def test_pre_call_speech_input_passes_through_untouched() -> None:
+    """Exact review repro: litellm's pinned proxy_server.py passes
+    call_type="aspeech" for POST /v1/audio/speech, whose `input` is the raw
+    text to synthesize — there is no reverse path for audio, so redacting it
+    would make the synthesized speech say the placeholder token aloud."""
+    g, _ = _build_guardrail([("Alice Smith", "[NAME_001]")])
+    data = {
+        "model": "tts-1",
+        "input": "Please welcome Alice Smith to the stage",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data, call_type="aspeech")
+    assert out["input"] == "Please welcome Alice Smith to the stage"
+    assert "messages" not in out
+
+
+async def test_pre_call_speech_call_type_also_passes_through() -> None:
+    g, _ = _build_guardrail([("Alice Smith", "[NAME_001]")])
+    data = {
+        "model": "tts-1",
+        "input": "Alice Smith",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data, call_type="speech")
+    assert out["input"] == "Alice Smith"
+
+
+async def test_pre_call_pass_through_endpoint_input_passes_through_untouched() -> None:
+    """pass_through_endpoint bodies are opaque and admin/backend-defined (e.g.
+    a Voyage-embeddings-shaped `{"input": [...]}`) — same class of risk as
+    /v1/embeddings, so treated the same way: not rewritten as Responses
+    items, only DLP-scanned (Stage 5) via the unmanaged shape."""
+    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+    data = {
+        "model": "voyage-3",
+        "input": ["alice@corp.example"],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    out = await g.pre_call(data, call_type="pass_through_endpoint")
+    assert out["input"] == ["alice@corp.example"]
+    assert "messages" not in out
+
+
 async def test_pre_call_codex_profile_oracle_disabled_applies_rules_directly() -> None:
     """Codex profile (forward_chatgpt_auth=True) + oracle disabled: a replace.md
     rule reaches the Responses `input` field through the local_pass branch's
