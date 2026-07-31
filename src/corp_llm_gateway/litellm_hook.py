@@ -1452,12 +1452,31 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
 # non-conversational data are listed; the cost of over-sanitizing some other
 # unlisted endpoint is a bug report, the cost of under-sanitizing one is a
 # leak.
+#
+# `speech`/`aspeech` (POST /v1/audio/speech): `input` is the plain text to
+# synthesize. There is no reverse path for an audio response — a redacted
+# `input` would make the synthesized speech say the placeholder token aloud,
+# permanently (verified against pinned litellm 1.94.1's
+# proxy_server.py:9440, `call_type="aspeech"`).
+#
+# `pass_through_endpoint` (litellm's admin-configured arbitrary passthrough,
+# e.g. proxying to Voyage AI): the body shape is entirely backend-defined and
+# unvalidated by litellm, so an `input` key there means whatever THAT
+# backend's API says it means — often the same raw-embed-text semantics as
+# `/v1/embeddings` (Voyage's own embeddings endpoint uses `input` this way).
+# Decision: treat it the same as embeddings/moderations rather than guess a
+# per-backend shape we can't see; Stage 5's `collect_raw_text_leaves` still
+# DLP-scans it via the "unmanaged" shape, so this is never a blind spot, only
+# a no-rewrite path (same design as embeddings).
 _NON_CHAT_INPUT_CALL_TYPES = frozenset(
     {
         "embedding",
         "aembedding",
         "moderation",
         "amoderation",
+        "speech",
+        "aspeech",
+        "pass_through_endpoint",
     }
 )
 
