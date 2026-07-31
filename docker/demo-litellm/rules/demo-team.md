@@ -1,9 +1,5 @@
-# Demo team replace.md — reversible deterministic substitutions shared with ru-llm-proxy.
-# Matching is case-insensitive; single-word sources also match identifier prefixes.
-# Separator is '=' (quote any value containing '=').
+# Demo team replace.md — literal overrides. Separator is '=' (quote any value containing '=').
 # '→' is still accepted for legacy files. See docs/replace-md-authoring.md for the full spec.
-- `kdir` = `companynameabc`
-- `betadirect` = `companynameabd`
-- `beta direct` = `company name abe`
-- `zephyr ledger` = `confidential project acn`
-- `db-legacy-7` = `internalhostaco`
+- `Zephyr Ledger` = `[CONFIDENTIAL_PROJECT]`
+- `db-legacy-7` = `[INTERNAL_HOST]`
+- `Betadirect` = `[PARTNER_CODENAME]`
