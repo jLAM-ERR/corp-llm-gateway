@@ -298,6 +298,109 @@ async def test_pre_call_sanitizes_responses_input_instructions_and_tool_output()
     assert "messages" not in out
 
 
+# ---- defect #1: custom_tool_call / reasoning replay must not leak -----------
+
+
+async def test_pre_call_responses_custom_tool_call_input_replay_does_not_leak() -> None:
+    """Turn 1: the model's custom_tool_call.input carries a placeholder, desanitized
+    for the client. Turn 2: the client (Codex-style) replays that exact item in
+    `input` — the original must be re-sanitized, never egress raw."""
+    original = "sk-corp-secret-token-001"
+    g, _ = _build_guardrail([(original, "[SECRET_001]")])
+    turn1_data = {
+        "model": "gpt-5.6-sol",
+        "input": f"Store the token {original} in config.py",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(turn1_data)
+    turn1_response = {
+        "output": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "input": "*** Add File: config.py\n+API_KEY = [SECRET_001]",
+            }
+        ]
+    }
+    restored = await g.post_call_unary(turn1_data, turn1_response)
+    assert restored["output"][0]["input"] == f"*** Add File: config.py\n+API_KEY = {original}"
+
+    turn2_data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "input": restored["output"][0]["input"],
+            },
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(turn2_data)
+
+    assert original not in json.dumps(out), "raw secret leaked on custom_tool_call.input replay"
+
+
+async def test_pre_call_responses_reasoning_summary_replay_does_not_leak() -> None:
+    """Same replay shape as above for reasoning.summary[].text."""
+    original = "internal-codename-zephyr"
+    g, _ = _build_guardrail([(original, "[PROJECT_001]")])
+    turn1_data = {
+        "model": "gpt-5.6-sol",
+        "input": f"Summarize plans for {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(turn1_data)
+    turn1_response = {
+        "output": [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "Working on [PROJECT_001] rollout"}],
+            }
+        ]
+    }
+    restored = await g.post_call_unary(turn1_data, turn1_response)
+    assert restored["output"][0]["summary"][0]["text"] == f"Working on {original} rollout"
+
+    turn2_data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": restored["output"][0]["summary"],
+            },
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    out = await g.pre_call(turn2_data)
+
+    assert original not in json.dumps(out), "raw original leaked on reasoning.summary replay"
+
+
+async def test_stage0_blocks_env_dump_in_responses_custom_tool_call_input() -> None:
+    """Stage 0 must see custom_tool_call.input — previously invisible (defect #1)."""
+    g, _ = _build_guardrail([])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "input": "DB_HOST=prod.internal\nDB_USER=admin\nDB_PASSWORD=hunter2\n",
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.error_code == "E_POLICY_BLOCKED"
+
+
 async def test_pre_call_codex_profile_oracle_disabled_applies_rules_directly() -> None:
     """Codex profile (forward_chatgpt_auth=True) + oracle disabled: a replace.md
     rule reaches the Responses `input` field through the local_pass branch's
@@ -3454,6 +3557,29 @@ async def test_stage5_dlp_raw_secret_blocked_by_default_guard() -> None:
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
     assert ei.value.status_code == 422
+    assert ei.value.error_code == "E_DLP_BLOCKED"
+
+
+async def test_stage5_dlp_blocks_canary_in_responses_custom_tool_call_input() -> None:
+    """Stage 5 must see a canary inside a Responses custom_tool_call.input — it was
+    previously invisible (`collect_tool_call_text` returned [] for this item type,
+    defect #1), so the canary egressed unblocked."""
+    canary = "DLP-CANARY-RAW-99999"
+    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "input": f"*** Add File: x\n+SECRET={canary}",
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
     assert ei.value.error_code == "E_DLP_BLOCKED"
 
 

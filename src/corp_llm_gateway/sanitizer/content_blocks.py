@@ -33,6 +33,32 @@ class UnsanitizableToolArgumentsError(Exception):
     upstream provider, so an unrecognized shape fails closed."""
 
 
+class UnsanitizableContentBlockError(Exception):
+    """A content block has a ``type`` this walker doesn't recognize.
+
+    Raised instead of the old silent pass-through: an unrecognized block type
+    would otherwise egress to the upstream provider unscanned."""
+
+
+# block type -> field name carrying its scannable text. Covers Anthropic
+# ("text") and OpenAI Responses ("input_text"/"output_text"/"reasoning_text"/
+# "summary_text"/"refusal") text-bearing block shapes in one place so
+# sanitize/desanitize/collect can't drift apart on which types are "text".
+_TEXT_BLOCK_FIELD: dict[str, str] = {
+    "text": "text",
+    "input_text": "text",
+    "output_text": "text",
+    "reasoning_text": "text",
+    "summary_text": "text",
+    "refusal": "refusal",
+}
+# Block types with no scannable text — pass through unchanged. Anthropic SIGNS
+# thinking/redacted_thinking blocks (see the SECURITY note below); images are
+# binary. Anything NOT in this set and NOT a recognized shape below is
+# genuinely unknown and fails closed in _sanitize_block.
+_OPAQUE_BLOCK_TYPES = frozenset({"image", "image_url", "thinking", "redacted_thinking"})
+
+
 async def _sanitize_json(
     value: Any, sanitize_one: SanitizeOne, _depth: int = 0
 ) -> tuple[Any, list[Any]]:
@@ -311,9 +337,10 @@ async def _sanitize_block(
     live in exactly one place.
     """
     block_type = block.get("type")
-    if block_type in {"text", "input_text", "output_text"} and isinstance(block.get("text"), str):
-        result = await sanitize_one(block["text"])
-        return {**block, "text": result.sanitized_text}, [result]
+    text_field = _TEXT_BLOCK_FIELD.get(block_type) if isinstance(block_type, str) else None
+    if text_field is not None and isinstance(block.get(text_field), str):
+        result = await sanitize_one(block[text_field])
+        return {**block, text_field: result.sanitized_text}, [result]
     if block_type == "tool_result" and "content" in block:
         new_sub, sub_results = await sanitize_content(block["content"], sanitize_one)
         return {**block, "content": new_sub}, sub_results
@@ -342,15 +369,21 @@ async def _sanitize_block(
                 results.extend(sub)
             # base64 / url sources: binary or out-of-scope → leave untouched
         return new_block, results
-    # SECURITY: thinking/redacted_thinking blocks are intentionally passed through
-    # unchanged. Anthropic SIGNS thinking blocks and rejects modified ones on
-    # multi-turn replay — rewriting them would break conversations. The model only
-    # ever sees placeholders anyway, so no originals are present to leak.
-    # SECURITY: egress sanitization covers tool_use.input (string leaves, non-streaming).
-    # Streaming tool_use desanitization (input_json_delta) is handled in streaming.py
-    # via SseStreamDesanitizer with JSON-string-escaping of originals.
-    # Image, image_url, unknown → pass through unchanged.
-    return block, []
+    if block_type in _OPAQUE_BLOCK_TYPES:
+        # SECURITY: thinking/redacted_thinking blocks are intentionally passed
+        # through unchanged. Anthropic SIGNS thinking blocks and rejects modified
+        # ones on multi-turn replay — rewriting them would break conversations.
+        # The model only ever sees placeholders anyway, so no originals are
+        # present to leak. image/image_url are binary, not scannable.
+        # SECURITY: egress sanitization covers tool_use.input (string leaves,
+        # non-streaming). Streaming tool_use desanitization (input_json_delta) is
+        # handled in streaming.py via SseStreamDesanitizer with JSON-string-escaping.
+        return block, []
+    # Genuinely unrecognized block type: fail closed rather than egress an
+    # unscanned block (this is the fix for the reasoning/custom-tool-call defect
+    # class — a new block shape must be explicitly allowlisted above, not
+    # silently forwarded).
+    raise UnsanitizableContentBlockError(str(block_type))
 
 
 def _desanitize_block(block: dict[str, Any], reverse: ReverseOne) -> dict[str, Any]:
@@ -359,8 +392,9 @@ def _desanitize_block(block: dict[str, Any], reverse: ReverseOne) -> dict[str, A
     Shared by the list-item path and the bare-dict path.
     """
     block_type = block.get("type")
-    if block_type in {"text", "input_text", "output_text"} and isinstance(block.get("text"), str):
-        return {**block, "text": reverse(block["text"])}
+    text_field = _TEXT_BLOCK_FIELD.get(block_type) if isinstance(block_type, str) else None
+    if text_field is not None and isinstance(block.get(text_field), str):
+        return {**block, text_field: reverse(block[text_field])}
     if block_type == "tool_result" and "content" in block:
         return {**block, "content": desanitize_content(block["content"], reverse)}
     if block_type == "tool_use" and "input" in block:
@@ -436,57 +470,43 @@ def collect_text(content: Any) -> list[str]:
     if isinstance(content, list):
         out: list[str] = []
         for item in content:
-            if not isinstance(item, dict):
-                continue
-            block_type = item.get("type")
-            if block_type in {"text", "input_text", "output_text"} and isinstance(
-                item.get("text"), str
-            ):
-                out.append(item["text"])
-            elif block_type == "tool_result" and "content" in item:
-                out.extend(collect_text(item["content"]))
-            elif block_type == "tool_use" and "input" in item:
-                out.extend(_collect_json_text(item["input"]))
-            elif block_type == "document":
-                for fld in ("title", "context"):
-                    v = item.get(fld)
-                    if isinstance(v, str) and v:
-                        out.append(v)
-                src = item.get("source")
-                if isinstance(src, dict):
-                    stype = src.get("type")
-                    if stype == "text" and isinstance(src.get("data"), str):
-                        out.append(src["data"])
-                    elif stype == "content" and "content" in src:
-                        out.extend(collect_text(src["content"]))
+            if isinstance(item, dict):
+                out.extend(_collect_block_text(item))
         return out
     if isinstance(content, dict):
-        block_type = content.get("type")
-        if block_type in {"text", "input_text", "output_text"} and isinstance(
-            content.get("text"), str
-        ):
-            return [content["text"]]
-        if block_type == "tool_result" and "content" in content:
-            return collect_text(content["content"])
-        # SECURITY: egress sanitization covers tool_use.input (string leaves, non-streaming).
-        # Streaming tool_use desanitization (input_json_delta) is handled in streaming.py.
-        if block_type == "tool_use" and "input" in content:
-            return _collect_json_text(content["input"])
-        if block_type == "document":
-            document_text: list[str] = []
-            for fld in ("title", "context"):
-                v = content.get(fld)
-                if isinstance(v, str) and v:
-                    document_text.append(v)
-            src = content.get("source")
-            if isinstance(src, dict):
-                stype = src.get("type")
-                if stype == "text" and isinstance(src.get("data"), str):
-                    document_text.append(src["data"])
-                elif stype == "content" and "content" in src:
-                    document_text.extend(collect_text(src["content"]))
-            return document_text
-        return []
+        return _collect_block_text(content)
+    return []
+
+
+def _collect_block_text(block: dict[str, Any]) -> list[str]:
+    """Read-only mirror of _sanitize_block's traversal (shared by the list-item
+    and bare-dict paths). Unlike _sanitize_block, an unrecognized block type
+    simply collects nothing here rather than raising — the fail-closed behavior
+    lives in the sanitize step; this is only the pre-scan."""
+    block_type = block.get("type")
+    text_field = _TEXT_BLOCK_FIELD.get(block_type) if isinstance(block_type, str) else None
+    if text_field is not None and isinstance(block.get(text_field), str):
+        return [block[text_field]]
+    if block_type == "tool_result" and "content" in block:
+        return collect_text(block["content"])
+    # SECURITY: egress sanitization covers tool_use.input (string leaves, non-streaming).
+    # Streaming tool_use desanitization (input_json_delta) is handled in streaming.py.
+    if block_type == "tool_use" and "input" in block:
+        return _collect_json_text(block["input"])
+    if block_type == "document":
+        document_text: list[str] = []
+        for fld in ("title", "context"):
+            v = block.get(fld)
+            if isinstance(v, str) and v:
+                document_text.append(v)
+        src = block.get("source")
+        if isinstance(src, dict):
+            stype = src.get("type")
+            if stype == "text" and isinstance(src.get("data"), str):
+                document_text.append(src["data"])
+            elif stype == "content" and "content" in src:
+                document_text.extend(collect_text(src["content"]))
+        return document_text
     return []
 
 
@@ -536,6 +556,76 @@ _RESPONSES_TEXT_FIELDS = frozenset(
     }
 )
 _RESPONSES_OPAQUE_FIELDS = frozenset({"encrypted_content"})
+# Fields whose value is a list of content-style blocks (input_text/output_text/
+# reasoning_text/summary_text/refusal) — reuse sanitize_content's block walker
+# instead of treating the field as a single text leaf.
+_RESPONSES_BLOCK_LIST_FIELDS = frozenset({"content", "summary"})
+# Fields whose value is an arbitrary JSON tree (any string leaf regardless of
+# its own key is scannable) rather than a single text leaf.
+_RESPONSES_FULL_SCAN_FIELDS = frozenset({"output"})
+
+
+async def sanitize_responses_item(
+    item: dict[str, Any], sanitize_one: SanitizeOne
+) -> tuple[dict[str, Any], list[Any]]:
+    """Sanitize one OpenAI Responses API item (an element of ``data["input"]``).
+
+    Field-name-keyed like ``desanitize_responses_payload`` — both consume the
+    same ``_RESPONSES_TEXT_FIELDS`` registry, so a field can't be added to one
+    side without covering the other (see the symmetry test). This covers every
+    item type uniformly (``message``, ``function_call``, ``function_call_output``,
+    ``custom_tool_call``, ``custom_tool_call_output``, ``reasoning``, …) instead
+    of enumerating item types one at a time.
+
+    Applied PER ITEM — ``data["input"]`` is already the item list, so this must
+    never be called on the whole payload (that would re-walk "content"/"summary",
+    which sanitize_content already fully recurses).
+
+    ``refusal`` is covered here because assistant ``message`` items carrying a
+    refusal can be replayed verbatim in a later turn's ``input``, same as
+    ``custom_tool_call``/``reasoning``. ``transcript`` (audio item output) is
+    NOT wired into a block-type handler here — no audio shape is otherwise
+    exercised in this codebase; it stays a desanitize(response)-only field until
+    an audio-item test motivates the request-side handling.
+    """
+    new_item = dict(item)
+    results: list[Any] = []
+    for field, value in item.items():
+        if field in _RESPONSES_OPAQUE_FIELDS:
+            continue
+        if field == "arguments":
+            new_value, r = await _sanitize_tool_arguments(value, sanitize_one)
+        elif field in _RESPONSES_BLOCK_LIST_FIELDS:
+            new_value, r = await sanitize_content(value, sanitize_one)
+        elif field in _RESPONSES_FULL_SCAN_FIELDS:
+            new_value, r = await _sanitize_json(value, sanitize_one)
+        elif field in _RESPONSES_TEXT_FIELDS and isinstance(value, str):
+            result = await sanitize_one(value)
+            new_value, r = result.sanitized_text, [result]
+        else:
+            continue
+        new_item[field] = new_value
+        results.extend(r)
+    return new_item, results
+
+
+def collect_responses_item_text(item: dict[str, Any]) -> list[str]:
+    """Read-only mirror of ``sanitize_responses_item`` for the Stage-0/Stage-5
+    pre-scan — same field registry, same per-field routing, so the scan sees
+    exactly what will be sanitized."""
+    out: list[str] = []
+    for field, value in item.items():
+        if field in _RESPONSES_OPAQUE_FIELDS:
+            continue
+        if field == "arguments":
+            out.extend(_collect_tool_arguments_text(value))
+        elif field in _RESPONSES_BLOCK_LIST_FIELDS:
+            out.extend(collect_text(value))
+        elif field in _RESPONSES_FULL_SCAN_FIELDS:
+            out.extend(_collect_json_text(value))
+        elif field in _RESPONSES_TEXT_FIELDS and isinstance(value, str):
+            out.append(value)
+    return out
 
 
 def desanitize_responses_payload(
