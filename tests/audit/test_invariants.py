@@ -44,3 +44,10 @@ def test_top_level_never_key_still_caught() -> None:
 def test_string_value_is_not_walked_as_chars() -> None:
     # A string value that happens to contain a NEVER word is content, not a key.
     assert_no_never_fields({"note": "the mapping was applied"})
+
+
+def test_extra_headers_field_is_never_allowed() -> None:
+    with pytest.raises(NeverFieldPresentError, match="extra_headers"):
+        assert_no_never_fields(
+            {"request_id": "r1", "extra_headers": {"ChatGPT-Account-Id": "acct-1"}}
+        )

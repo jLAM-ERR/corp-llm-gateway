@@ -1203,3 +1203,101 @@ async def test_system_field_oversize_blocks_and_never_leaks_original(
     serialized = json.dumps(sink.records[0])
     assert _haystack_contains_any_original(serialized) is None, "original in audit record"
     assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+
+
+# (xiv) Codex OAuth bridge: data["api_key"] carries the developer's ChatGPT
+# subscription bearer (litellm_hook.py). It is not an AuditEvent attribute, so
+# the audit layer already can't emit it — this pins that the current code path
+# never puts it in an audit record or a log line. `api_key` is NOT added to
+# NEVER_FIELDS (see the Task 7 report: the regex_checksum detector's "API_KEY"
+# finding-label family collides case-insensitively with it inside the
+# legitimate `finding_label_counts` field).
+
+_CHATGPT_OAUTH_TOKEN = "oauth-secret-token-f7"
+
+
+def _chatgpt_oauth_guardrail() -> tuple[object, ListSink]:
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+
+    def _empty_pairs_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": '{"pairs": []}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_empty_pairs_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+        forward_chatgpt_auth=True,
+    )
+    return guardrail, sink
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_oauth_token_never_reaches_audit_record_or_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    guardrail, sink = _chatgpt_oauth_guardrail()
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "headers": {
+            "X-Corp-Auth": "tok-inv",
+            "Authorization": f"Bearer {_CHATGPT_OAUTH_TOKEN}",
+        },
+    }
+    with caplog.at_level(logging.DEBUG):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+        assert out["api_key"] == _CHATGPT_OAUTH_TOKEN
+
+        now = datetime.now(UTC)
+        await guardrail.audit(  # type: ignore[attr-defined]
+            data, None, start_time=now, end_time=now, status="ok"
+        )
+
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert _CHATGPT_OAUTH_TOKEN not in serialized, "OAuth bearer leaked into audit record"
+    assert _CHATGPT_OAUTH_TOKEN not in caplog.text, "OAuth bearer leaked into a log line"

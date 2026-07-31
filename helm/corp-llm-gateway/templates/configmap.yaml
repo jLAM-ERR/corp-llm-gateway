@@ -67,7 +67,8 @@ data:
           !exists(.cookie) &&
           !exists(.Cookie) &&
           !exists(.set_cookie) &&
-          !exists(."Set-Cookie")
+          !exists(."Set-Cookie") &&
+          !exists(.extra_headers)
 
       # Keep ONLY AuditEvent-shaped records: drop parse failures (plain-text
       # uvicorn lines) and litellm's own JSON wrappers, so neither Langfuse nor
