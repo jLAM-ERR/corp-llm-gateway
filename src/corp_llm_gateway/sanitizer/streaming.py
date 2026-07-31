@@ -113,7 +113,11 @@ _RESPONSES_DELTA_EVENTS: dict[str, tuple[str, bool]] = {
     "response.reasoning_text.delta": ("delta", False),
     "response.refusal.delta": ("delta", False),
     "response.function_call_arguments.delta": ("delta", True),
-    "response.custom_tool_call_input.delta": ("delta", True),
+    # Freeform text (a shell command / apply_patch diff), not a JSON-encoded
+    # arguments string — the paired `.done` event goes through the unescaped
+    # `desanitize_responses_payload` walker, so escaping only the delta half
+    # made quotes/backslashes/newlines diverge between delta and done.
+    "response.custom_tool_call_input.delta": ("delta", False),
 }
 _RESPONSES_DONE_EVENTS: dict[str, tuple[str, str]] = {
     "response.output_text.done": ("text", "response.output_text.delta"),
