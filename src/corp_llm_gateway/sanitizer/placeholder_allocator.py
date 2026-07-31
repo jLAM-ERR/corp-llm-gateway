@@ -30,8 +30,18 @@ placeholder->original reverse map can only ever restore ONE original for a
 placeholder shared by several. ``placeholder.build_reverse_substituter`` keeps
 the FIRST original to claim a placeholder, matching this allocator's own
 ``_by_placeholder.setdefault`` first-claim order, so the two maps at least
-agree on which original comes back rather than disagreeing arbitrarily. See
-project_placeholder_collision_cross_segment in session memory.
+agree on which original comes back rather than disagreeing arbitrarily.
+
+The exemption is scoped to rule-derived claims ONLY: it collapses several
+exempt originals sharing one CONFIGURED placeholder text onto each other, and
+is resolved once per configured text (``_exempt_canonical``) so arrival order
+can't split one rule's case-variants across two different minted tokens. A
+detector/oracle pair must never inherit this exemption merely because it
+happens to land on the same placeholder text a rule is configured to use —
+if a non-exempt claim already holds that text when the first exempt claim for
+it arrives, the rule side mints (once) instead of colliding onto the
+non-rule token. See project_placeholder_collision_cross_segment in session
+memory.
 """
 
 from __future__ import annotations
@@ -55,6 +65,13 @@ class RequestPlaceholderAllocator:
         self._by_placeholder: dict[str, str] = {}
         self._forbidden: set[str] = set()
         self._family_next: dict[str, int] = {}
+        # Keyed on the CONFIGURED placeholder text a rule asked for; value is
+        # the canonical token every exempt original sharing that configured
+        # text resolves to (itself, or a mint if something non-exempt already
+        # held it when the first exempt claim arrived). Resolved once per
+        # configured text so order of arrival can't split one rule's
+        # case-variants across two different minted tokens.
+        self._exempt_canonical: dict[str, str] = {}
 
     def forbid(self, labels: Iterable[str]) -> None:
         """Mark labels that must never be assigned (they appear literally in
@@ -103,16 +120,20 @@ class RequestPlaceholderAllocator:
             # Same original seen before (possibly in another segment): reuse its
             # placeholder so the model sees one consistent token for it.
             return existing
-        taken = self._is_taken(placeholder)
-        if taken and exempt and placeholder not in self._forbidden:
-            # Another rule occurrence (same rule, a different case variant, or
-            # a different rule sharing the same configured replacement text)
-            # already claimed this exact token — reuse it verbatim rather than
-            # minting a fresh, operator-unconfigured one. The `_forbidden`
-            # check is NOT skipped: a placeholder the user typed literally
-            # must still never be reused for a real redaction, exempt or not.
-            chosen = placeholder
-        elif taken:
+        if exempt:
+            chosen = self._exempt_canonical.get(placeholder)
+            if chosen is None:
+                # First time this CONFIGURED text is claimed by a rule-derived
+                # original: only reuse it verbatim if nothing else already
+                # holds it (a detector/oracle pair, or the forbidden-literal
+                # guard) — a rule must never collapse onto a non-rule token.
+                # Resolved once and cached: every later exempt original with
+                # this SAME configured text (another case variant of this
+                # rule, or a different rule configured with identical text)
+                # gets the identical answer regardless of arrival order.
+                chosen = self._mint(placeholder) if self._is_taken(placeholder) else placeholder
+                self._exempt_canonical[placeholder] = chosen
+        elif self._is_taken(placeholder):
             chosen = self._mint(placeholder)
         else:
             chosen = placeholder
