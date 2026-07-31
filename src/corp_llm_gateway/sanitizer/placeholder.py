@@ -97,10 +97,25 @@ def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> Callable[[str
     brackets are not identifier characters, so they already delimit a
     boundary. A bracket-less response alias (``FAMILY_001``, added by
     :func:`add_unwrapped_response_aliases` for models that strip brackets
-    when coining identifiers) is replaced only at an identifier boundary
+    when coining identifiers, or an operator ``replace.md`` rule replacement
+    with no bracketed sibling) is replaced only at an identifier boundary
     (``(?<![A-Za-z0-9_])alias(?![A-Za-z0-9_])``), so a model-coined
     identifier that merely CONTAINS the alias (``MY_PROJECT_001``) is left
     untouched instead of corrupted by an unbounded ``str.replace``.
+
+    The returned callable accepts an optional ``final`` keyword (default
+    ``True``) for streaming callers with an in-flight, not-yet-complete
+    buffer: a bare-alias match ending exactly at the buffer's current end is
+    indistinguishable from one a later chunk could still extend past the
+    boundary (the trailing lookahead is zero-width, so "nothing here yet"
+    satisfies it the same as "definitely nothing here") — pass
+    ``final=False`` to leave such a trailing match unreplaced instead of
+    finalizing it early; the caller's hold-back window keeps the unreplaced
+    text buffered until real trailing context (or the final flush) confirms
+    it one way or the other. No synthetic character is ever inserted into
+    the text being matched, so a replacement/placeholder value can safely
+    contain any character, including one a padding-based scheme might
+    otherwise have reserved as a marker.
 
     Every reverse site (unary response, Anthropic/OpenAI SSE streaming,
     Responses SSE streaming) must build its reverse function through this
@@ -116,12 +131,29 @@ def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> Callable[[str
             pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(placeholder)}(?![A-Za-z0-9_])")
             entries.append((placeholder, replacement, pattern))
 
-    def _reverse(text: str) -> str:
+    def _reverse(text: str, *, final: bool = True) -> str:
         for placeholder, replacement, pattern in entries:
             if pattern is None:
                 text = text.replace(placeholder, replacement)
-            else:
+                continue
+            if final:
                 text = pattern.sub(lambda _m, r=replacement: r, text)
+                continue
+            # Not the final flush: a match whose end lands exactly at the
+            # buffer's current end can't yet be told apart from one a later
+            # chunk could still extend past the boundary — defer it (leave
+            # it unmatched here) instead of finalizing.
+            pieces: list[str] = []
+            cursor = 0
+            end = len(text)
+            for m in pattern.finditer(text):
+                if m.end() == end:
+                    break
+                pieces.append(text[cursor : m.start()])
+                pieces.append(replacement)
+                cursor = m.end()
+            pieces.append(text[cursor:])
+            text = "".join(pieces)
         return text
 
     return _reverse

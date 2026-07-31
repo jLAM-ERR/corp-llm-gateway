@@ -276,6 +276,28 @@ def test_bare_alias_boundary_respected_when_split_lands_on_real_word_boundary() 
     assert out == "class Alice Smith: pass"
 
 
+def test_bare_alias_ending_in_hold_back_sentinel_char_not_corrupted_across_chunks() -> None:
+    """A rule replacement (bare, no bracketed sibling) can legitimately end in
+    any character, including one a hold-back scheme might otherwise reserve
+    as a synthetic marker. A partial occurrence split across a chunk boundary
+    must never be treated as complete just because the split itself happens
+    to produce that trailing character."""
+    d = StreamingDesanitizer(_mapping(("ProjectPhoenix", "matrix")))
+    out = d.feed("the matri")
+    out += d.feed("cal build of matrix")
+    out += d.flush()
+    assert out == "the matrical build of ProjectPhoenix"
+
+
+def test_bare_alias_ending_in_hold_back_sentinel_char_restored_in_one_feed() -> None:
+    """Positive control for the same trailing character: a genuine, complete
+    occurrence fed and flushed with nothing else pending must still restore."""
+    d = StreamingDesanitizer(_mapping(("ProjectPhoenix", "matrix")))
+    out = d.feed("see matrix here")
+    out += d.flush()
+    assert out == "see ProjectPhoenix here"
+
+
 # Streaming async iterator interface ----------------------------------------
 
 
