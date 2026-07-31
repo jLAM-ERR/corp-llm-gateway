@@ -1263,9 +1263,13 @@ async def test_post_call_stream_responses_events_restore_split_placeholder() -> 
 
 
 async def test_post_call_stream_responses_restores_bracket_stripped_identifier() -> None:
-    """Models drop placeholder brackets when generating identifiers and paths."""
+    """Models drop placeholder brackets when generating identifiers and paths.
+
+    Bare-alias restoration is a Codex-only behavior (defect #6) — only
+    exercised with ``forward_chatgpt_auth=True``.
+    """
     original = "KdirCorpCalculatorService"
-    g, _ = _build_guardrail([(original, "[LOCATION_007]")])
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")], forward_chatgpt_auth=True)
     data = {
         "model": "gpt-5.6-luna",
         "input": f"Create class {original}",
@@ -1339,8 +1343,9 @@ async def test_post_call_stream_responses_restores_bracket_stripped_identifier()
 
 
 async def test_post_call_unary_restores_bracket_stripped_identifier() -> None:
+    """Bare-alias restoration is a Codex-only behavior (defect #6)."""
     original = "KdirCorpCalculatorService"
-    g, _ = _build_guardrail([(original, "[LOCATION_007]")])
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")], forward_chatgpt_auth=True)
     data = {
         "model": "gpt-5.6-luna",
         "input": f"Create class {original}",
@@ -1368,7 +1373,7 @@ async def test_post_call_unary_restores_bracket_stripped_identifier() -> None:
 
 async def test_post_call_does_not_restore_user_supplied_bare_placeholder() -> None:
     original = "KdirCorpCalculatorService"
-    g, _ = _build_guardrail([(original, "[LOCATION_007]")])
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")], forward_chatgpt_auth=True)
     data = {
         "model": "gpt-5.6-luna",
         "input": f"Keep literal LOCATION_007 and create {original}",
@@ -1382,6 +1387,159 @@ async def test_post_call_does_not_restore_user_supplied_bare_placeholder() -> No
     )
 
     assert out["output"][0]["content"][0]["text"] == "LOCATION_007"
+
+
+# ---- Defect #6: bare-alias reverse must not corrupt model-coined identifiers
+
+
+async def test_post_call_unary_bare_alias_does_not_corrupt_containing_identifier() -> None:
+    """Repro from defect #6(i): MY_PROJECT_001 merely CONTAINS the bare alias
+    PROJECT_001 — an unbounded str.replace mangles it into MY_Zephyr Ledger."""
+    original = "Zephyr Ledger"
+    g, _ = _build_guardrail([(original, "[PROJECT_001]")], forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-luna",
+        "input": f"track {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+    text = "const MY_PROJECT_001 = 1; // see PROJECT_001"
+    response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+    out = await g.post_call_unary(data, response)
+
+    assert (
+        out["output"][0]["content"][0]["text"] == "const MY_PROJECT_001 = 1; // see Zephyr Ledger"
+    )
+
+
+async def test_post_call_unary_bare_alias_relocation_repro() -> None:
+    original = "SecretPlace"
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")], forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-luna",
+        "input": f"see {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+    text = "RELOCATION_0071 and PICKUP_LOCATION_007X"
+    response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+    out = await g.post_call_unary(data, response)
+
+    assert out["output"][0]["content"][0]["text"] == text
+
+
+async def test_post_call_unary_bracket_stripped_identifier_not_restored_when_codex_flag_off() -> (
+    None
+):
+    """Default (non-Codex) path: bare-alias restoration must be OFF, so
+    responses stay byte-identical to release/1.0.x — no `forward_chatgpt_auth`."""
+    original = "KdirCorpCalculatorService"
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")])
+    data = {
+        "model": "gpt-5.6-luna",
+        "input": f"Create class {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+
+    out = await g.post_call_unary(
+        data,
+        {"output": [{"type": "message", "content": [{"text": "LOCATION_007"}]}]},
+    )
+
+    assert out["output"][0]["content"][0]["text"] == "LOCATION_007"
+
+
+async def test_post_call_stream_responses_bare_alias_does_not_corrupt_containing_identifier() -> (
+    None
+):
+    """Same repro as the unary test, over the Responses SSE streaming path,
+    with the alias split across two delta events at the identifier boundary."""
+    original = "SecretPlace"
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")], forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-luna",
+        "input": f"see {original}",
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    await g.pre_call(data)
+    events = [
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "const MY_",
+        },
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "LOCATION_007 = 1;",
+        },
+        {
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "const MY_LOCATION_007 = 1;",
+        },
+    ]
+
+    out: list[Any] = []
+    async for chunk in g.post_call_stream(data, _async_iter(events)):
+        out.append(json.loads(chunk) if isinstance(chunk, str) else chunk)
+
+    text_deltas = "".join(
+        event["delta"] for event in out if event["type"] == "response.output_text.delta"
+    )
+    assert text_deltas == "const MY_LOCATION_007 = 1;"
+    assert (
+        next(event for event in out if event["type"] == "response.output_text.done")["text"]
+        == "const MY_LOCATION_007 = 1;"
+    )
+
+
+async def test_post_call_stream_anthropic_sse_bare_alias_does_not_corrupt_identifier() -> None:
+    """Same repro over the Anthropic/OpenAI SSE `StreamingDesanitizer` path,
+    with the alias split across two text_delta events."""
+    original = "SecretPlace"
+    g, _ = _build_guardrail([(original, "[LOCATION_007]")], forward_chatgpt_auth=True)
+    data = _data_with_token("tok-1", content=f"see {original}")
+    await g.pre_call(data)
+
+    sse_events: list[bytes] = [
+        _MSG_START,
+        _cb_start(0),
+        _delta("const MY_"),
+        _delta("LOCATION_007 = 1;"),
+        _cb_stop(0),
+        _MSG_DELTA,
+        _MSG_STOP,
+    ]
+
+    out_chunks: list[bytes] = []
+    async for chunk in g.post_call_stream(data, _async_iter(sse_events)):
+        out_chunks.append(chunk)
+
+    text_parts: list[str] = []
+    for chunk in out_chunks:
+        for line in chunk.decode().splitlines():
+            if line.startswith("data:"):
+                try:
+                    obj = json.loads(line[5:].lstrip())
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "content_block_delta":
+                    delta = obj.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text_parts.append(delta["text"])
+
+    full_text = "".join(text_parts)
+    assert full_text == "const MY_LOCATION_007 = 1;"
 
 
 async def test_post_call_stream_anthropic_sse_bytes_placeholder_restored() -> None:

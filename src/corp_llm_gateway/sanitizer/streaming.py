@@ -7,7 +7,7 @@ from collections.abc import AsyncIterable, AsyncIterator, Callable
 from typing import Any
 
 from corp_llm_gateway.sanitizer.content_blocks import desanitize_responses_payload
-from corp_llm_gateway.sanitizer.placeholder import sort_placeholders_by_descending_length
+from corp_llm_gateway.sanitizer.placeholder import build_reverse_substituter
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
 
 # Regex that matches a complete SSE event boundary (two consecutive newlines).
@@ -28,14 +28,12 @@ class StreamingDesanitizer:
     """
 
     def __init__(self, mapping: StrategyResult, escape: Callable[[str], str] | None = None) -> None:
-        self._by_placeholder: dict[str, str] = {
-            placeholder: (escape(original) if escape else original)
+        escaped_pairs = (
+            ((escape(original) if escape else original), placeholder)
             for original, placeholder in mapping.pairs
-        }
-        self._sorted_placeholders: tuple[str, ...] = tuple(
-            sort_placeholders_by_descending_length(self._by_placeholder)
         )
-        self._max_len = max((len(p) for p in self._by_placeholder), default=0)
+        self._reverse = build_reverse_substituter(escaped_pairs)
+        self._max_len = max((len(placeholder) for _, placeholder in mapping.pairs), default=0)
         self._buffer = ""
         self._flushed = False
 
@@ -75,9 +73,7 @@ class StreamingDesanitizer:
             yield tail
 
     def _replace_all(self, text: str) -> str:
-        for placeholder in self._sorted_placeholders:
-            text = text.replace(placeholder, self._by_placeholder[placeholder])
-        return text
+        return self._reverse(text)
 
 
 class OpenAiToolCallDesanitizer:
@@ -156,9 +152,7 @@ class ResponsesStreamDesanitizer:
 
     def __init__(self, mapping: StrategyResult) -> None:
         self._mapping = mapping
-        by_placeholder = {placeholder: original for original, placeholder in mapping.pairs}
-        self._placeholders = tuple(sort_placeholders_by_descending_length(by_placeholder))
-        self._by_placeholder = by_placeholder
+        self._reverse_fn = build_reverse_substituter(mapping.pairs)
         self._streams: dict[tuple[Any, ...], StreamingDesanitizer] = {}
         self._metadata: dict[tuple[Any, ...], dict[str, Any]] = {}
 
@@ -246,9 +240,7 @@ class ResponsesStreamDesanitizer:
         return out
 
     def _reverse(self, text: str) -> str:
-        for placeholder in self._placeholders:
-            text = text.replace(placeholder, self._by_placeholder[placeholder])
-        return text
+        return self._reverse_fn(text)
 
     @staticmethod
     def _event_metadata(payload: dict[str, Any]) -> dict[str, Any]:

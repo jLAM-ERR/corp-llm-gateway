@@ -5,6 +5,7 @@ from corp_llm_gateway.sanitizer.placeholder import (
     add_unwrapped_response_aliases,
     apply_pairs,
     apply_spans,
+    build_reverse_substituter,
     find_placeholder_literals,
     find_unwrapped_placeholder_literals,
     sort_placeholders_by_descending_length,
@@ -116,4 +117,64 @@ def test_add_unwrapped_response_aliases_does_not_override_explicit_mapping() -> 
     assert pairs == (
         ("KdirCorpCalculatorService", "[LOCATION_007]"),
         ("literal", "LOCATION_007"),
+    )
+
+
+# --- build_reverse_substituter (defect #6: boundary-anchored bare aliases) --
+
+
+def test_build_reverse_substituter_bracketed_placeholder_is_plain_replace() -> None:
+    reverse = build_reverse_substituter([("alice", "[NAME_001]")])
+    assert reverse("hello [NAME_001]") == "hello alice"
+
+
+def test_build_reverse_substituter_bare_alias_replaces_at_word_boundary() -> None:
+    reverse = build_reverse_substituter(
+        [("SecretPlace", "[LOCATION_007]"), ("SecretPlace", "LOCATION_007")]
+    )
+    assert reverse("see LOCATION_007 here") == "see SecretPlace here"
+
+
+def test_build_reverse_substituter_bare_alias_does_not_corrupt_containing_identifier() -> None:
+    """Defect #6(i): MY_PROJECT_001 merely CONTAINS the alias PROJECT_001 —
+    an unbounded str.replace corrupts it into MY_Zephyr Ledger. The stand-alone
+    occurrence right after it is a legitimate bracket-stripped alias and must
+    still be restored."""
+    reverse = build_reverse_substituter(
+        [("Zephyr Ledger", "[PROJECT_001]"), ("Zephyr Ledger", "PROJECT_001")]
+    )
+    text = "const MY_PROJECT_001 = 1; // see PROJECT_001"
+    assert reverse(text) == "const MY_PROJECT_001 = 1; // see Zephyr Ledger"
+
+
+def test_build_reverse_substituter_bare_alias_relocation_repro() -> None:
+    reverse = build_reverse_substituter(
+        [("SecretPlace", "[LOCATION_007]"), ("SecretPlace", "LOCATION_007")]
+    )
+    assert reverse("RELOCATION_0071") == "RELOCATION_0071"
+    assert reverse("PICKUP_LOCATION_007X") == "PICKUP_LOCATION_007X"
+
+
+def test_sort_placeholders_descending_length_with_aliases_present() -> None:
+    """Invariant 5 (M1-9) still holds once bracketless response aliases are
+    mixed in with their bracketed placeholders."""
+    assert sort_placeholders_by_descending_length(["X_001", "[X_0011]", "[X_001]", "X_0011"]) == [
+        "[X_0011]",
+        "[X_001]",
+        "X_0011",
+        "X_001",
+    ]
+
+
+def test_build_reverse_substituter_length_descending_with_aliases_present() -> None:
+    reverse = build_reverse_substituter(
+        [
+            ("long-original", "[X_0011]"),
+            ("long-original", "X_0011"),
+            ("short-original", "[X_001]"),
+            ("short-original", "X_001"),
+        ]
+    )
+    assert reverse("[X_0011] X_0011 [X_001] X_001") == (
+        "long-original long-original short-original short-original"
     )

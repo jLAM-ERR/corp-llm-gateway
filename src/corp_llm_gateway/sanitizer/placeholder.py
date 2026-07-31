@@ -1,5 +1,5 @@
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 _PLACEHOLDER_FIND_RE = re.compile(r"\[[A-Z][A-Z0-9_]*_\d{3,}\]")
@@ -73,6 +73,44 @@ def sort_placeholders_by_descending_length(placeholders: Iterable[str]) -> list[
     Lift from the data-sanitizer plugin's `desanitize.py:18`.
     """
     return sorted(placeholders, key=lambda s: (-len(s), s))
+
+
+def build_reverse_substituter(pairs: Iterable[tuple[str, str]]) -> Callable[[str], str]:
+    """Build the shared reverse (model-output → original) substitution function.
+
+    Applies longest-placeholder-first (M1-9). A bracketed placeholder
+    (``[FAMILY_001]``) is replaced with a plain substring match — the
+    brackets are not identifier characters, so they already delimit a
+    boundary. A bracket-less response alias (``FAMILY_001``, added by
+    :func:`add_unwrapped_response_aliases` for models that strip brackets
+    when coining identifiers) is replaced only at an identifier boundary
+    (``(?<![A-Za-z0-9_])alias(?![A-Za-z0-9_])``), so a model-coined
+    identifier that merely CONTAINS the alias (``MY_PROJECT_001``) is left
+    untouched instead of corrupted by an unbounded ``str.replace``.
+
+    Every reverse site (unary response, Anthropic/OpenAI SSE streaming,
+    Responses SSE streaming) must build its reverse function through this
+    helper so the boundary rule is enforced uniformly.
+    """
+    by_placeholder = {placeholder: original for original, placeholder in pairs}
+    entries: list[tuple[str, str, re.Pattern[str] | None]] = []
+    for placeholder in sort_placeholders_by_descending_length(by_placeholder):
+        replacement = by_placeholder[placeholder]
+        if placeholder.startswith("["):
+            entries.append((placeholder, replacement, None))
+        else:
+            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(placeholder)}(?![A-Za-z0-9_])")
+            entries.append((placeholder, replacement, pattern))
+
+    def _reverse(text: str) -> str:
+        for placeholder, replacement, pattern in entries:
+            if pattern is None:
+                text = text.replace(placeholder, replacement)
+            else:
+                text = pattern.sub(lambda _m, r=replacement: r, text)
+        return text
+
+    return _reverse
 
 
 def apply_pairs(text: str, pairs: Iterable[tuple[str, str]]) -> str:
