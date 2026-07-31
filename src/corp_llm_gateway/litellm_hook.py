@@ -66,6 +66,7 @@ from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.sanitizer.placeholder import (
     add_unwrapped_response_aliases,
     apply_pairs,
+    apply_spans,
     find_placeholder_literals,
     find_unwrapped_placeholder_literals,
     placeholder_family,
@@ -530,17 +531,21 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             canonical_pairs = allocator.remap(result.pairs)
             if canonical_pairs == result.pairs:
                 return result
-            # Re-derive the sanitized text from the ORIGINAL segment text using
-            # the canonical labels. Re-applying to the original (rather than
-            # renaming labels in the already-substituted text) avoids any
-            # chained-replacement hazard when a minted label coincides with
-            # another segment's token.
+            # Re-derive from the ORIGINAL segment using the exact selected spans.
+            # Legacy/custom orchestrators without span metadata retain the old
+            # longest-original-first fallback.
+            sanitized_text = (
+                apply_spans(text, result.applied_spans, canonical_pairs)
+                if result.applied_spans
+                else apply_pairs(text, canonical_pairs)
+            )
             return SanitizeResult(
-                sanitized_text=apply_pairs(text, canonical_pairs),
+                sanitized_text=sanitized_text,
                 pairs=canonical_pairs,
                 cache_a_hit=result.cache_a_hit,
                 skipped=result.skipped,
                 block_reason=result.block_reason,
+                applied_spans=result.applied_spans,
             )
 
         for i, msg in enumerate(messages):
