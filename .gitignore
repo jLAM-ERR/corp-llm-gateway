@@ -42,3 +42,4 @@ scripts/bench_local_first.py
 # Research / benchmark virtualenvs (NER bench + DeepPavlov comparison)
 .venv-bench/
 .venv-dp/
+.claude/prompts/
