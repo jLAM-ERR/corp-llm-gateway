@@ -110,7 +110,9 @@ docker compose run --rm e2e pytest -q tests/e2e
 
 ## Tooling
 
-- Python 3.12+, mypy strict, ruff for lint+format
+- Python 3.12+, ruff for lint and format (`ruff-pre-commit` v0.15.14 runs
+  `ruff --fix` + `ruff-format` in pre-commit; CI's lint job runs `ruff check`
+  AND `ruff format --check` on every PR). No type checker is configured.
 - Async-first (LiteLLM hooks are async); pytest-asyncio mode = "auto"
 - Default branch: `master` (NOT main)
 - CI: GitHub Actions (`.github/workflows/`)
