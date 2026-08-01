@@ -97,8 +97,9 @@ def _constant_replacer(value: str) -> Callable[[re.Match[str]], str]:
     interprets backslash escapes (`\\1`, `\\g<name>`) in a STRING repl, which
     would corrupt/error on a replacement text that happens to contain a
     literal backslash-digit sequence (e.g. a Windows path). A one-off lambda
-    per call (the previous `lambda _m, r=replacement: r` default-arg trick)
-    defeated mypy's inference; a named factory doesn't.
+    per call (the previous `lambda _m, r=replacement: r` default-arg trick,
+    used to bind `replacement` per loop iteration) worked but obscured intent;
+    a named factory makes the closure-over-loop-variable explicit.
     """
     return lambda _m: value
 

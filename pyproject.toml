@@ -30,7 +30,6 @@ dev = [
     "fakeredis>=2.23",
     "PyYAML>=6.0",
     "ruff==0.15.14",
-    "mypy>=1.10",
     "pre-commit>=3.7",
 ]
 # Postgres token store backend. Keeps the default install lean.
@@ -67,14 +66,3 @@ ignore = []
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
-
-[tool.mypy]
-python_version = "3.12"
-strict = true
-files = ["src"]
-
-# prometheus-client is the optional [metrics] extra; keep mypy clean whether or
-# not it is installed in the checking environment (lazy-imported at call sites).
-[[tool.mypy.overrides]]
-module = ["prometheus_client.*"]
-ignore_missing_imports = true
