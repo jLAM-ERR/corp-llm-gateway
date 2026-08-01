@@ -258,9 +258,9 @@ Ongoing operations after install — incident playbook, fail-policy matrix, scal
 
 ## Team rules (`replace.md`)
 
-Each team maintains a `replace.md` file at `<rules-dir>/<team_id>.md`. These rules run **first** in the local cascade and **override** auto-detection — a term listed here is always replaced, regardless of what the detectors find.
+Each team maintains a `replace.md` file at `<rules-dir>/<team_id>.md`. These rules run **first** in the local cascade; a rule match and a detector/NER/oracle finding compete on the same span — whichever is longer wins, and a rule wins a tie only when its span is identical to a finding's.
 
-Format — one rule per line, separator `=` (the legacy `→` U+2192 is still accepted). Matching is a plain case-insensitive substring test, for a single-word source or a multi-word phrase alike — there is no identifier-boundary requirement, so `kdir = [X]` also matches the `kdir` inside `mkdir`, not just `KdirService`. On overlap, the **longer span wins**, whether it's a rule or a NER/oracle finding — a rule no longer automatically overrides a longer overlapping finding (it still wins on an identical span). Both of these are behavior changes from an earlier release; see [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md) before assuming an existing rule still matches only where it used to. Quote any value containing `=`:
+Format — one rule per line, separator `=` (the legacy `→` U+2192 is still accepted). Matching is a plain case-insensitive substring test (previously case-sensitive), for a single-word source or a multi-word phrase alike — there is no identifier-boundary requirement, so `kdir = [X]` also matches the `kdir` inside `mkdir`, not just `KdirService`. On overlap, the **longer span wins**, whether it's a rule or a NER/oracle finding — a rule no longer automatically overrides a longer overlapping finding (it still wins on an identical span). The case-insensitive matching is a behavior change from an earlier release; see [`docs/replace-md-authoring.md`](docs/replace-md-authoring.md) before assuming an existing rule still matches only where it used to. Quote any value containing `=`:
 
 ```markdown
 - `Project Polaris` = `[CONFIDENTIAL_PROJECT]`

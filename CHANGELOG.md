@@ -53,18 +53,28 @@ security & extensibility** build. Non-negotiable criterion: zero confirmed leak 
 
 ### Changed — `replace.md` rule-matching semantics (behavior change for every existing dictionary)
 
-- **Case-insensitive substring matching, no identifier-boundary anchor.** A `replace.md` rule
-  now matches as a plain case-insensitive substring, for a single-word source or a multi-word
-  phrase alike — `kdir = [X]` also matches the `kdir` inside `mkdir`, not just `KdirService`.
-  An earlier release anchored single-word sources to an identifier boundary; that anchor is
-  dropped, so upgrading widens matches on existing dictionaries. See
-  `docs/replace-md-authoring.md`.
-- **Longest-span-wins across rules and detector/NER/oracle findings.** On overlap, whichever
-  span is longer wins, regardless of whether it came from a `replace.md` rule or a local/oracle
-  finding — a rule no longer automatically overrides a longer overlapping finding (it still
-  wins on an identical span). Closes a redaction-reducing regression where a short rule
-  matching inside a longer finding could drop the finding's pair (and its Cache-B mapping)
-  entirely.
+- **Case-insensitive substring matching (previously case-sensitive).** A `replace.md` rule now
+  matches as a plain case-insensitive substring, for a single-word source or a multi-word
+  phrase alike — a rule `Acme = [X]` now also matches `acme` and `ACME`, not just `Acme`. This
+  is the real widening on upgrade: review existing dictionaries for short or common sources
+  that also occur as ordinary lowercase/uppercase text. See `docs/replace-md-authoring.md`.
+- **Rules and findings now compete in one longest-span-wins pool.** `replace.md` rule matches
+  and detector/NER/oracle findings are selected from a single candidate pool ordered by span
+  length descending — whichever span is longer wins, regardless of source; a rule wins a tie
+  only when its span is identical to a finding's span. This guarantees a shorter rule can never
+  silently discard a longer overlapping finding (and its Cache-B mapping).
+
+### Changed — other flag-off behavior changes
+
+- **Unrecognized Anthropic content-block types are now scanned instead of passed through
+  unchanged.** A block type this gateway doesn't recognize (e.g. a new
+  `web_fetch_tool_result` shape) used to egress as-is; it's now walked as a generic JSON
+  value tree so every string leaf is sanitized — this widens redaction coverage on unmodified
+  Anthropic traffic. See `docs/security.md` ("Not sanitized / deferred").
+- **A request carrying both `messages` and `input` is now rejected (HTTP 422).** Previously
+  the ambiguous shape forwarded whichever field the request-item walker happened to pick,
+  silently bypassing sanitize/Stage 0/Stage 5 for the other field; the gateway now fails
+  closed instead of guessing which one is real.
 
 ### Local-first detection cycle (2026-06-30)
 
