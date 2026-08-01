@@ -43,10 +43,10 @@ Notes:
   phrase alike. `kdir = [X]` also matches the `kdir` inside `mkdir`, not just
   a standalone `Kdir` or an identifier like `KdirService`; `project polaris =
   [X]` also matches inside `reproject polaristation`.
-  **This changes behavior for existing dictionaries**: an earlier release
-  anchored a single-word source to an identifier boundary, so upgrading
-  widens matches — review your rules if a short, common source (e.g.
-  `ledger`) is meant to match only as a standalone word.
+  **This changes behavior for existing dictionaries**: matching used to be
+  case-sensitive; it is now case-insensitive, so upgrading widens matches —
+  review your rules if a short, common source (e.g. `Acme`) should not also
+  match `acme` or `ACME`.
 - The REPLACEMENT text is applied verbatim. Matching is case-insensitive,
   but the output is always exactly the replacement you configured —
   there is no case-preserving transform of the replacement based on the

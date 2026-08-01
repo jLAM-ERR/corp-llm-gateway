@@ -1512,9 +1512,11 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
 # `speech`/`aspeech` (POST /v1/audio/speech): `input` is the plain text to
 # synthesize. There is no reverse path for an audio response — a redacted
 # `input` would make the synthesized speech say the placeholder token aloud,
-# permanently (verified against a real litellm 1.94.1 install in a scratch
-# venv — proxy_server.py:9440, `call_type="aspeech"`; the repo itself pins
-# `litellm>=1.40,<2.0` and ships 1.85.0/1.89.3, not 1.94.1).
+# permanently (the `call_type="aspeech"` / `proxy_server.py:9440` routing was
+# verified in a scratch venv against a litellm 1.94.1 install — a version this
+# repo neither pins nor ships: `pyproject.toml` pins `litellm>=1.40,<2.0`,
+# helm/build-image ship v1.85.0, `docker/chatgpt-codex/Dockerfile` ships
+# v1.89.3).
 #
 # `pass_through_endpoint` (litellm's admin-configured arbitrary passthrough,
 # e.g. proxying to Voyage AI): the body shape is entirely backend-defined and

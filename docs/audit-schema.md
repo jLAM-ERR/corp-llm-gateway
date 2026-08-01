@@ -43,8 +43,10 @@ and the record is dropped.
 | `original_content` / `unredacted_content` / `pre_sanitization` | Pre-sanitization payload |
 | `replace_md` / `rule_values` | Per-team rule values may contain regulated terms |
 | `x_corp_auth` / `corp_token` / any case variation | Gateway auth credential |
+| `api_key` | Provider credential (Anthropic/OpenAI/corp-vLLM key) |
 | `authorization` / any header name `*-bearer-*` | Developer's BYOK key (Anthropic/OpenAI key) |
 | `cookie` / `set_cookie` | Out-of-band auth material |
+| `extra_headers` | Arbitrary caller-supplied headers, which may carry credentials |
 
 The list extends to any key whose name suggests a credential or unredacted
 content. Vector's VRL transform uses an explicit allow-list (the ALWAYS

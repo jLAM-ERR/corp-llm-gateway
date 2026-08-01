@@ -50,7 +50,7 @@ pre-scan sees exactly what will be sanitized.
 | `server_tool_use` / `mcp_tool_use` blocks | Their `input`, recursively (same JSON-tree scan as `tool_use.input`) |
 | `web_search_tool_result` / `code_execution_tool_result` / `mcp_tool_result` blocks | Their `content`, recursively as an arbitrary JSON tree (string leaves regardless of key name) — `encrypted_content` keys are protected (see below) |
 | `search_result` block | `title` and `content` (recursively re-enters `sanitize_content`, like `tool_result`) |
-| A Responses `input` item (`custom_tool_call`, `reasoning`, `function_call_output`, …) | Every field the response-side field registry (`_RESPONSES_TEXT_FIELDS`) also reverses — `input`, `summary`, `refusal`, `arguments` (JSON-parsed), `output` (JSON tree, only for `function_call_output`/`custom_tool_call_output` items) — via `sanitize_responses_item`/`collect_responses_item_text`, applied per item |
+| A Responses `input` item (`custom_tool_call`, `reasoning`, `function_call_output`, …) | Every field EXCEPT the structural identifiers (`_RESPONSES_STRUCTURAL_FIELDS`: `type`/`id`/`call_id`/`status`/`role`/`container_id`/`name`/`server_label`) and the opaque signed fields (`encrypted_content`, `computer_call_output.output`, `image_generation_call.result`) — known fields get specialized handling (`arguments` JSON-parsed, block-list fields recursed via `sanitize_content`, `output` scanned as a JSON tree), everything else — including a field the registry has never named — gets the same generic string-leaf scan `_sanitize_json` applies to an arbitrary JSON blob, via `sanitize_responses_item`/`collect_responses_item_text`, applied per item |
 | Chat-Completions-shaped `tool_calls`/`function_call` on a Responses item | `function.arguments` / `arguments`, same as the `messages` shape |
 | A bare string element of `data["input"]` (not a dict) | The whole string, same as top-level string content |
 
@@ -67,6 +67,7 @@ pre-scan sees exactly what will be sanitized.
 | `encrypted_content` (any key inside a JSON tree we scan, e.g. `web_search_result.encrypted_content`) | Same signed-content reasoning as `thinking`; excluded from `_sanitize_json`/`_desanitize_json`/`_collect_json_text` by key name |
 | `computer_call_output.output` | A base64 screenshot; scanning it would trip the oversize policy on ordinary screenshots, so `output` is only scanned for `function_call_output`/`custom_tool_call_output` items |
 | A genuinely unrecognized block `type` | **Fails safe**: `_sanitize_block` scans it as a generic JSON value tree (the same recursion `_sanitize_json` applies to an arbitrary blob) instead of hard-rejecting the request. `"type"` and the opaque-key set (`_BLOCK_FALLBACK_OPAQUE_KEYS`, e.g. `signature`) are preserved verbatim; every other key's string leaves are sanitized, so nothing egresses unscanned — a new provider block shape (`web_fetch_tool_result`, `bash_code_execution_tool_result`, …) no longer 400s real traffic or poisons a multi-turn conversation that replays it. `UnsanitizableContentBlockError` still exists, but now only for a genuinely unscannable *value* under a *known* text field name (a bare scalar where str/dict/list was expected), not for an unrecognized block type. |
+| Responses `input` item structural fields (`_RESPONSES_STRUCTURAL_FIELDS`: `type`, `id`, `call_id`, `status`, `role`, `container_id`, `name`, `server_label`) and `data["tools"]` | **Deliberately excluded from both rewriting and the Stage-0/Stage-5 scan.** `name`/`server_label` on an `input` item (e.g. `function_call`, `mcp_call`) must correlate by exact value to its own declaration in the untouched `data["tools"]` array; rewriting only the `input`-side occurrence desyncs the two and the provider rejects the request. The remaining fields in the set are routing/status enums, never free text. This is the one real, currently-undocumented-elsewhere blind spot in Responses coverage. |
 
 Response-side de-sanitization (the reverse path) restores originals in streamed
 and unary **text**, **`tool_use` input** (`input_json_delta`, JSON-escaped so the
@@ -292,7 +293,7 @@ case-insensitive and treats `-` as `_`, so `X-Corp-Auth` / `Set-Cookie` match):
 ```
 mapping, mapping_table, pairs, original_content, unredacted_content,
 pre_sanitization, replace_md, rule_values, x_corp_auth, corp_token,
-authorization, cookie, set_cookie
+api_key, authorization, cookie, set_cookie, extra_headers
 ```
 
 **Current status (2026-07-01).** The Vector SIEM sink **and** the
