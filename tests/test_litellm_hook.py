@@ -4951,3 +4951,181 @@ async def test_stage5_dlp_disabled_by_flag_passes_through() -> None:
     finally:
         del os.environ["CORP_LLM_DLP_GUARD"]
         _cfg_module.reset_cache()
+
+
+# ---- max_output_tokens_cap: no coverage anywhere before this (only src +
+# _demo_guardrail.py reference it) --------------------------------------------
+
+
+def _build_guardrail_with_cap(cap: int) -> tuple[CorpLlmGuardrail, ListSink]:
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    sink = ListSink()
+    return (
+        CorpLlmGuardrail(
+            orch,
+            AuthMiddleware(token_store),
+            AuditLogger(sink, gateway_version="0.0.1"),
+            max_output_tokens_cap=cap,
+        ),
+        sink,
+    )
+
+
+async def test_pre_call_max_tokens_clamped_when_over_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A request's `max_tokens` above the configured cap is clamped down before
+    sanitization/upstream, and the clamp is logged with the before/after values."""
+    g, _ = _build_guardrail_with_cap(4096)
+    data = _data_with_token("tok-1", content="hello")
+    data["max_tokens"] = 64000
+
+    with caplog.at_level(logging.INFO):
+        out = await g.pre_call(data)
+
+    assert out["max_tokens"] == 4096
+    assert "litellm_pre_call_max_tokens_clamped" in caplog.text
+    assert "requested=64000" in caplog.text
+    assert "capped=4096" in caplog.text
+
+
+async def test_pre_call_max_tokens_not_clamped_when_at_or_under_cap() -> None:
+    """`max_tokens` at or under the cap is left untouched."""
+    g, _ = _build_guardrail_with_cap(4096)
+    data = _data_with_token("tok-1", content="hello")
+    data["max_tokens"] = 4096
+
+    out = await g.pre_call(data)
+
+    assert out["max_tokens"] == 4096
+
+
+async def test_pre_call_max_tokens_cap_none_by_default() -> None:
+    """No `max_output_tokens_cap` configured (the default) leaves max_tokens alone."""
+    g, _ = _build_guardrail()
+    data = _data_with_token("tok-1", content="hello")
+    data["max_tokens"] = 64000
+
+    out = await g.pre_call(data)
+
+    assert out["max_tokens"] == 64000
+
+
+# ---- system/instructions oversize deliver-flag: `litellm_pre_call_system_oversize_
+# delivered` had no coverage anywhere; the branch moved it into
+# `_sanitize_prompt_field` without a test -------------------------------------
+
+
+async def test_system_oversize_deliver_flag_logs_system_oversize_delivered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The deliver-flag oversize policy on data["system"] takes the
+    `_sanitize_prompt_field` skipped branch and logs
+    litellm_pre_call_system_oversize_delivered."""
+    g, sink = _build_guardrail_oversize(
+        threshold=64, policy="deliver-flag", deliver_teams=frozenset({"t1"})
+    )
+    clean_system = "the quick brown fox jumps over the lazy dog and keeps running along here"
+    assert len(clean_system.encode("utf-8")) > 64
+    data = _data_with_token("tok-1", content="hi", system=clean_system)
+
+    with caplog.at_level(logging.WARNING):
+        out = await g.pre_call(data)
+
+    assert out["system"] == clean_system, "clean oversize system leaf must be delivered"
+    assert "litellm_pre_call_system_oversize_delivered" in caplog.text
+    assert "field=system" in caplog.text
+
+    start = time.time()
+    await g.async_log_success_event(
+        kwargs={"data": data},
+        response_obj={"choices": [{"message": {"content": "ok"}}]},
+        start_time=start,
+        end_time=start + 0.100,
+    )
+    assert len(sink.records) == 1
+    assert sink.records[0]["block_reason"] == "oversize:delivered"
+
+
+# ---- Hardening: `role` and the request id must not be log-injection vectors --
+
+
+async def test_pre_call_unknown_role_logs_invalid_not_verbatim(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unbounded/adversarial `role` value must not reach the log line verbatim
+    (litellm_hook.py:672 hardening) — only the known role set is logged as-is."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    injected = "user\nlitellm_pre_call_forged_line request_id=evil"
+    data = {
+        "model": "claude",
+        "messages": [{"role": injected, "content": "hi alice"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO):
+        await g.pre_call(data)
+    assert injected not in caplog.text
+    assert "role=invalid" in caplog.text
+
+
+async def test_pre_call_known_role_logs_verbatim() -> None:
+    """A well-formed, known role is logged unchanged — no behavior regression."""
+    from corp_llm_gateway.litellm_hook import _safe_role_for_log
+
+    assert _safe_role_for_log({"role": "assistant"}) == "assistant"
+    assert _safe_role_for_log({"role": "user"}) == "user"
+    assert _safe_role_for_log({}) == "unknown"
+    assert _safe_role_for_log({"role": None}) == "unknown"
+    assert _safe_role_for_log({"role": 42}) == "invalid"
+
+
+async def test_pre_call_newline_bearing_litellm_call_id_falls_back_to_uuid() -> None:
+    """A caller-controlled `litellm_call_id` carrying a newline (log-injection
+    attempt) must not be used verbatim as the request id — fall back to a
+    generated UUID instead (litellm_hook.py:_ensure_request_id hardening)."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    forged = "abc\nlitellm_pre_call_forged_line request_id=evil"
+    data = _data_with_token("tok-1", content="hi alice")
+    data["litellm_call_id"] = forged
+
+    out = await g.pre_call(data)
+
+    assert out["_corp_gateway_request_id"] != forged
+    assert "\n" not in out["_corp_gateway_request_id"]
+
+
+async def test_pre_call_oversize_litellm_call_id_falls_back_to_uuid() -> None:
+    """A `litellm_call_id` far beyond any realistic length must not be trusted
+    verbatim — fall back to a generated UUID."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    data["litellm_call_id"] = "x" * 1000
+
+    out = await g.pre_call(data)
+
+    assert out["_corp_gateway_request_id"] != data["litellm_call_id"]
+    assert len(out["_corp_gateway_request_id"]) < 1000
+
+
+async def test_pre_call_wellformed_litellm_call_id_used_verbatim() -> None:
+    """A normal litellm_call_id is unaffected by the new validation."""
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    call_id = "litellm-call-abc123"
+    data = _data_with_token("tok-1", content="hi alice")
+    data["litellm_call_id"] = call_id
+
+    out = await g.pre_call(data)
+
+    assert out["_corp_gateway_request_id"] == call_id

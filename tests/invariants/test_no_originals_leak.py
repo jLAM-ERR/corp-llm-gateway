@@ -1301,3 +1301,526 @@ async def test_chatgpt_oauth_token_never_reaches_audit_record_or_log_line(
     serialized = json.dumps(sink.records[0])
     assert _CHATGPT_OAUTH_TOKEN not in serialized, "OAuth bearer leaked into audit record"
     assert _CHATGPT_OAUTH_TOKEN not in caplog.text, "OAuth bearer leaked into a log line"
+
+
+# (xv) CodeQL-adjudication follow-up: seven pre_call error/blocked log lines were
+# each reached by exactly one existing unit test in tests/test_litellm_hook.py, but
+# none of those tests drove caplog — so nothing pinned them as original-free. Each
+# test below drives the same code path with a distinctive corpus original present
+# in the request and asserts it never reaches caplog.text or the audit record.
+
+
+def _cross_segment_guardrail() -> tuple[object, ListSink]:
+    """An oracle that redacts one email per segment call — modelling the
+    per-call numbering collision that forces the request-level allocator remap
+    (and, once ``apply_spans`` is monkeypatched to fail, a ``StaleSpanError``)."""
+    import re as _re
+
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+
+    email_re = _re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seg_text = body["messages"][-1]["content"]
+        m = email_re.search(seg_text)
+        pairs = [{"original": m.group(0), "replacement": "[EMAIL_001]"}] if m else []
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": json.dumps({"pairs": pairs}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+    )
+    return guardrail, sink
+
+
+def _corp_llm_second_segment_fails_guardrail() -> tuple[object, ListSink]:
+    """Oracle succeeds on the first segment then times out on the second —
+    exercising the fail-closed corp_llm_failed path via `_sanitize_prompt_field`."""
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+
+    call_count = 0
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "c1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": SANITIZE_TOOL_NAME,
+                                            "arguments": json.dumps(
+                                                {
+                                                    "pairs": [
+                                                        {
+                                                            "original": "a@corp.example",
+                                                            "replacement": "[EMAIL_001]",
+                                                        }
+                                                    ]
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        raise httpx.ConnectTimeout("", request=request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+    )
+    return guardrail, sink
+
+
+def _ner_required_guardrail() -> tuple[object, ListSink]:
+    """A guardrail whose only local detector is a required NER engine that
+    always raises (model/deps absent) — the F2 fail-closed path."""
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.detectors import DualNerDetector, PIIDetector
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+
+    class _RaisingNerEngine(PIIDetector):
+        async def detect(self, text: str) -> list[Finding]:
+            raise RuntimeError("ner deps absent")
+
+    def _empty_pairs_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": '{"pairs": []}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_empty_pairs_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    dual = DualNerDetector(require_ner=True, engines=[_RaisingNerEngine(), _RaisingNerEngine()])
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(
+            corp_llm, InMemoryMappingStore(), _NoRules(), local_detectors=[dual]
+        ),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+    )
+    return guardrail, sink
+
+
+@pytest.mark.asyncio
+async def test_provider_auth_failed_log_contains_no_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm_pre_call_provider_auth_failed: the Codex bridge's missing-bearer
+    rejection fires before any content is processed; a distinctive original
+    elsewhere in the request must not reach any log line emitted along the way."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _chatgpt_oauth_guardrail()
+    original = ORIGINAL_CORPUS[3]
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": original,
+        "headers": {"X-Corp-Auth": "tok-inv"},  # no bearer Authorization
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    assert ei.value.error_code == "E_PROVIDER_AUTH"
+    assert "litellm_pre_call_provider_auth_failed" in caplog.text
+    assert _haystack_contains_any_original(caplog.text) is None
+
+    now = datetime.now(UTC)
+    await guardrail.audit(data, None, start_time=now, end_time=now, status="failed")  # type: ignore[attr-defined]
+    assert len(sink.records) == 1
+    assert _haystack_contains_any_original(json.dumps(sink.records[0])) is None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_shape_blocked_log_contains_no_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm_pre_call_blocked (ambiguous shape): a payload carrying both
+    `messages` and `input` is refused before any sanitize call — the mock
+    transport raises if the oracle is ever reached, pinning that ordering."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _oversize_guardrail()
+    original = ORIGINAL_CORPUS[4]
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hi"}],
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": original}]}],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    assert ei.value.error_code == "E_POLICY_BLOCKED"
+    assert "litellm_pre_call_blocked" in caplog.text
+    assert "ambiguous_shape" in caplog.text
+    assert _haystack_contains_any_original(caplog.text) is None
+    assert len(sink.records) == 1
+    assert _haystack_contains_any_original(json.dumps(sink.records[0])) is None
+
+
+@pytest.mark.asyncio
+async def test_stale_span_message_loop_log_contains_no_raw_content(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm_pre_call_stale_span (message loop): a cross-block collision inside
+    ONE message forces the allocator remap; apply_spans raising StaleSpanError
+    must fail closed with no original in any log line or the audit record."""
+    import corp_llm_gateway.litellm_hook as hook_module
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+    from corp_llm_gateway.sanitizer.placeholder import StaleSpanError
+
+    def _raise_stale(*_args: object, **_kwargs: object) -> str:
+        raise StaleSpanError("applied span does not match source text: start=0 end=5")
+
+    monkeypatch.setattr(hook_module, "apply_spans", _raise_stale)
+
+    guardrail, sink = _cross_segment_guardrail()
+    first, second = "first-alpha@corp.example", "second-beta@corp.example"
+    data = {
+        "model": "claude",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"first {first}"},
+                    {"type": "text", "text": f"second {second}"},
+                ],
+            }
+        ],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    assert ei.value.error_code == "E_SPAN_INVALID"
+    assert "litellm_pre_call_stale_span" in caplog.text
+    assert first not in caplog.text
+    assert second not in caplog.text
+    assert len(sink.records) == 1
+    rec_json = json.dumps(sink.records[0])
+    assert first not in rec_json
+    assert second not in rec_json
+
+
+@pytest.mark.asyncio
+async def test_stale_span_prompt_field_log_contains_no_raw_content(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm_pre_call_stale_span (prompt field): same fail-closed mapping via
+    `_sanitize_prompt_field`, triggered by a message/system cross-segment collision."""
+    import corp_llm_gateway.litellm_hook as hook_module
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+    from corp_llm_gateway.sanitizer.placeholder import StaleSpanError
+
+    def _raise_stale(*_args: object, **_kwargs: object) -> str:
+        raise StaleSpanError("applied span does not match source text: start=0 end=5")
+
+    monkeypatch.setattr(hook_module, "apply_spans", _raise_stale)
+
+    guardrail, sink = _cross_segment_guardrail()
+    first, second = "third-gamma@corp.example", "fourth-delta@corp.example"
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": f"contact {second}"}],
+        "system": f"admin is {first}",
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    assert ei.value.error_code == "E_SPAN_INVALID"
+    assert "litellm_pre_call_stale_span" in caplog.text
+    assert "field=system" in caplog.text
+    assert first not in caplog.text
+    assert second not in caplog.text
+    assert len(sink.records) == 1
+    rec_json = json.dumps(sink.records[0])
+    assert first not in rec_json
+    assert second not in rec_json
+
+
+@pytest.mark.asyncio
+async def test_corp_llm_failed_prompt_field_log_contains_no_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm_pre_call_corp_llm_failed (prompt field): the oracle succeeds on
+    the message segment then dies on the system segment; fail-closed 503, no
+    original in any log line or the audit record."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _corp_llm_second_segment_fails_guardrail()
+    message_original = ORIGINAL_CORPUS[1]
+    system_original = ORIGINAL_CORPUS[2]
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": f"message has {message_original}"}],
+        "system": f"system has {system_original}",
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    assert ei.value.error_code == "E_CORP_LLM_DOWN"
+    assert "litellm_pre_call_corp_llm_failed" in caplog.text
+    assert "field=system" in caplog.text
+    assert message_original not in caplog.text
+    assert system_original not in caplog.text
+    assert len(sink.records) == 1
+    rec_json = json.dumps(sink.records[0])
+    assert message_original not in rec_json
+    assert system_original not in rec_json
+
+
+@pytest.mark.asyncio
+async def test_ner_unavailable_prompt_field_log_contains_no_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm_pre_call_ner_unavailable (prompt field): an empty message defers
+    to the system field, where the required NER engine's absence fails closed."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _ner_required_guardrail()
+    original = ORIGINAL_CORPUS[0]
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": ""}],
+        "system": f"owner {original}",
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    assert ei.value.error_code == "E_NER_UNAVAILABLE"
+    assert "litellm_pre_call_ner_unavailable" in caplog.text
+    assert "field=system" in caplog.text
+    assert _haystack_contains_any_original(caplog.text) is None
+    assert len(sink.records) == 1
+    assert _haystack_contains_any_original(json.dumps(sink.records[0])) is None
+
+
+@pytest.mark.asyncio
+async def test_oversize_unmanaged_input_log_contains_no_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """litellm_pre_call_oversize_blocked (unmanaged): an oversize embeddings-style
+    `input` is fail-closed BEFORE the DLP/Stage-0 scan runs, with no original in
+    any log line or the audit record."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+    from corp_llm_gateway.payload import DEFAULT_THRESHOLD_BYTES
+
+    guardrail, sink = _tool_call_guardrail(())
+    original = ORIGINAL_CORPUS[0]
+    padding = "x" * DEFAULT_THRESHOLD_BYTES
+    data = {
+        "model": "text-embedding-3-small",
+        "input": original + padding,
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data, call_type="embedding")  # type: ignore[attr-defined]
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+    assert "field=unmanaged_input" in caplog.text
+    assert _haystack_contains_any_original(caplog.text) is None
+    assert len(sink.records) == 1
+    assert _haystack_contains_any_original(json.dumps(sink.records[0])) is None
+
+
+# (xvi) `instructions` field asymmetry: defect #2 made `instructions` a
+# first-class sanitized field alongside `system`, but this file only ever
+# exercised `system`. Mirror the (xiii) system-field coverage for `instructions`.
+
+
+@pytest.mark.asyncio
+async def test_instructions_field_sanitized_and_never_leaks_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Corpus originals in data["instructions"] (plain-string form) are redacted
+    before egress; the outbound instructions field and every log line are
+    original-free."""
+    guardrail, _ = _tool_call_guardrail(_redacted_pairs())
+    instructions_text = "\n".join(ORIGINAL_CORPUS)
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "hello"}],
+        "instructions": instructions_text,
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    assert _haystack_contains_any_original(out["instructions"]) is None, (
+        "original egressed in instructions"
+    )
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+    assert "tok-inv" not in caplog.text, "corp token leaked into log line"
+
+
+@pytest.mark.asyncio
+async def test_instructions_field_block_list_sanitized_no_leak(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Corpus originals in data["instructions"] as a list of text blocks are
+    redacted by the content walker; outbound instructions and log lines are
+    original-free."""
+    guardrail, _ = _tool_call_guardrail(_redacted_pairs())
+    instructions_blocks = [{"type": "text", "text": orig} for orig in ORIGINAL_CORPUS]
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "hello"}],
+        "instructions": instructions_blocks,
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    forwarded = json.dumps(out["instructions"])
+    assert _haystack_contains_any_original(forwarded) is None, (
+        "original egressed in instructions blocks"
+    )
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+    assert "tok-inv" not in caplog.text, "corp token leaked into log line"
+
+
+@pytest.mark.asyncio
+async def test_instructions_field_oversize_blocks_and_never_leaks_original(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An oversize data["instructions"] carrying every corpus original is
+    fail-closed and never leaks via exception, log, or audit."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _oversize_guardrail()
+    big_instructions = "\n".join(ORIGINAL_CORPUS) + " " + "x" * 64
+    data = {
+        "model": "gpt-5.6-sol",
+        # Empty content is skipped by the message loop before it ever calls
+        # sanitize_one — the mock transport forbids any oracle call.
+        "messages": [{"role": "user", "content": ""}],
+        "instructions": big_instructions,
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)
+    assert ei.value.error_code == "E_OVERSIZE_BLOCKED"
+    assert "field=instructions" in caplog.text
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert _haystack_contains_any_original(serialized) is None, "original in audit record"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"

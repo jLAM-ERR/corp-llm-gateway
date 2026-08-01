@@ -113,6 +113,20 @@ logger = logging.getLogger(__name__)
 # small window suffices; this just prevents unbounded growth over process life.
 _AUDIT_DEDUP_CAP = 4096
 
+# `role` is echoed straight from the request body into a log line. Only these
+# known message roles are logged verbatim; anything else logs as "invalid" so a
+# caller cannot inject arbitrary (or newline-bearing) text into pod stdout.
+_KNOWN_MESSAGE_ROLES = frozenset({"user", "assistant", "system", "tool", "function", "developer"})
+
+
+def _safe_role_for_log(msg: dict[str, Any]) -> str:
+    role = msg.get("role")
+    if role is None:
+        return "unknown"
+    if isinstance(role, str) and role in _KNOWN_MESSAGE_ROLES:
+        return role
+    return "invalid"
+
 
 class GuardrailHttpException(Exception):  # noqa: N818 — intentional name; LiteLLM-facing API
     """Raised to signal LiteLLM that the request must be rejected.
@@ -669,7 +683,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 "message_index=%d role=%s content_bytes=%d",
                 request_id,
                 i,
-                str(msg.get("role") or "unknown") if isinstance(msg, dict) else "unknown",
+                _safe_role_for_log(msg) if isinstance(msg, dict) else "unknown",
                 content_bytes,
             )
             new_msg: str | dict[str, Any]
@@ -1223,14 +1237,22 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         On a total miss, generate a UUID. In all cases scatter the chosen id so
         the fallback lookup paths keep working.
+
+        Every candidate is shape-validated (``_valid_request_id``) before use:
+        this id is interpolated into ~30 log lines and the audit ``request_id``
+        field, and it arrives from caller-controlled input (``litellm_call_id``
+        or nested ``metadata``), so an unvalidated newline-bearing value would
+        let a caller forge log lines. A candidate that fails validation is
+        treated as absent, falling through to the next lookup path or the
+        generated UUID.
         """
         call_id = data.get("litellm_call_id")
-        if isinstance(call_id, str) and call_id:
+        if isinstance(call_id, str) and _valid_request_id(call_id):
             _scatter(data, call_id)
             return call_id
         for path in _REQUEST_ID_LOOKUP_PATHS:
             rid = _dig(data, path)
-            if isinstance(rid, str) and rid:
+            if isinstance(rid, str) and _valid_request_id(rid):
                 _scatter(data, rid)
                 return rid
         rid = str(uuid.uuid4())
@@ -1327,6 +1349,23 @@ _REQUEST_ID_LOOKUP_PATHS: tuple[tuple[str, ...], ...] = (
     ("litellm_metadata", _REQUEST_ID_KEY),
     ("litellm_params", "metadata", _REQUEST_ID_KEY),
 )
+
+# Generous cap — real litellm_call_id / UUID values are well under 100 chars;
+# this only bounds a hostile value, never a legitimate one.
+_REQUEST_ID_MAX_LEN = 256
+
+
+def _valid_request_id(value: str) -> bool:
+    """Reject empty/oversize/control-character request ids.
+
+    This id is interpolated into ~30 log lines and the audit ``request_id``
+    field; a newline or other control character would let a caller forge log
+    lines. Rejected candidates fall back to the next lookup path or a
+    generated UUID — see ``_ensure_request_id``.
+    """
+    if not value or len(value) > _REQUEST_ID_MAX_LEN:
+        return False
+    return all(ord(ch) >= 0x20 and ch != "\x7f" for ch in value)
 
 
 def _dig(d: Any, path: tuple[str, ...]) -> Any:
