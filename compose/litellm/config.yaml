@@ -1,0 +1,30 @@
+# Data-plane litellm config — production, non-k8s hosts. Routes every
+# request to the corp vLLM oracle over litellm's hosted_vllm/ provider, the
+# only route that does a low-level passthrough of the inbound Authorization
+# header (BYOK, invariant #3) — see compose/README.md "Why hosted_vllm/".
+model_list:
+  - model_name: "*"
+    litellm_params:
+      # The corp vLLM exposes a single model; rewrite every inbound model
+      # name to it. Keep this literal in sync with CORP_LLM_MODEL in .env
+      # (used by the gateway's own oracle client) if you change it — see
+      # helm/corp-llm-gateway/values.yaml corpLlm.model for the k8s twin.
+      model: "hosted_vllm/GLM-5.1-AWQ"
+      api_base: "os.environ/CORP_LLM_ENDPOINT"
+      api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
+      # Claude Code sends max_tokens=64000 (Opus default); GLM-5.1-AWQ has a
+      # 65536-token window, so cap here to leave prompt headroom (matches
+      # helm/corp-llm-gateway values.yaml corpLlm.maxTokens).
+      max_tokens: 4096
+litellm_settings:
+  # Reference a module-level INSTANCE (`guardrail`), not the class — litellm's
+  # get_instance_fn calls methods on whatever object lives at the path; a
+  # class fails ("missing self"). See corp_llm_gateway/bootstrap.py below and
+  # helm/corp-llm-gateway/templates/configmap-litellm.yaml.
+  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+  # Claude Code sends modern Anthropic params some upstream models don't
+  # accept yet; drop unsupported params rather than 400-ing the request.
+  drop_params: true
+  # Emit AuditEvent JSON as single-line records (matches the Helm chart; ready
+  # for the Vector sidecar A3 wires in).
+  json_logs: true

@@ -32,6 +32,14 @@ crt/*.pem
 crt/*.crt
 !crt/README.md
 
+# compose/ production stack — operator secrets and staged/site-specific material
+compose/.env
+compose/certs/*.pem
+compose/certs/*.crt
+!compose/certs/README.md
+compose/nginx/certs/*.pem
+compose/postgres/initdb/*.sql
+
 # Internal research, decision records, and benchmarks — maintainer / product-owner only.
 # Kept on disk locally, excluded from the published tree (see README: only public docs are linked).
 docs/adr/

@@ -1,0 +1,96 @@
+# Production compose stack for non-k8s hosts — data plane (this revision).
+# See compose/README.md. The admin-only litellm + self-hosted Langfuse (A2),
+# the production Vector config (A3) and the optional nginx front door
+# (`--profile nginx`, C1) land in later revisions of this file. The offline
+# corp-NER mock (workstream B) will register under `--profile mock`.
+
+services:
+  redis:
+    image: redis:8-alpine
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - gateway-redis-data:/data
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
+    volumes:
+      - gateway-postgres-data:/var/lib/postgresql/data
+      # Staged here at deploy time from src/corp_llm_gateway/tokens/schema.sql
+      # — never committed, so the DB schema cannot drift from source. See
+      # compose/postgres/initdb/README.md.
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway} -d ${POSTGRES_DB:-gateway}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  litellm:
+    # Prebuilt image only — compose never rebuilds it and never `pip install
+    # -e`s at boot (that's a docker-compose.demo.yml affordance). Built from
+    # Dockerfile.gateway, whose ENTRYPOINT is already
+    # `litellm --config /etc/litellm/config.yaml --port 4000`.
+    image: ghcr.io/jlam-err/corp-llm-gateway:${GATEWAY_IMAGE_TAG:?set GATEWAY_IMAGE_TAG in .env}
+    volumes:
+      - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
+      # litellm resolves litellm_settings.callbacks as a FILE PATH relative to
+      # the mounted config dir, never via importlib — this shim must land at
+      # exactly this path. See litellm/corp_llm_gateway/bootstrap.py.
+      - ./litellm/corp_llm_gateway/bootstrap.py:/etc/litellm/corp_llm_gateway/bootstrap.py:ro
+      - ./certs:/etc/corp-llm-gateway/certs:ro
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CORP_LLM_PG_DSN: postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gateway}
+      CORP_LLM_AUTH_PROVIDER: ${CORP_LLM_AUTH_PROVIDER:-noop}
+      CORP_LLM_ENDPOINT: ${CORP_LLM_ENDPOINT:?set CORP_LLM_ENDPOINT in .env}
+      CORP_LLM_AUTH_TOKEN: ${CORP_LLM_AUTH_TOKEN:-}
+      CORP_LLM_MODEL: ${CORP_LLM_MODEL:-GLM-5.1-AWQ}
+      # NOTE: do NOT set LITELLM_MASTER_KEY here. Once it's set, litellm
+      # intercepts the Authorization header on every API endpoint and rejects
+      # anything that isn't one of its own virtual keys — which breaks the
+      # BYOK / Claude Code subscription flow that is the whole point of this
+      # gateway (CLAUDE.md invariant #3). The admin-only instance (A2) gets
+      # the master key; this data-plane instance never does.
+    # CORP_LLM_CA_BUNDLE / SSL_CERT_FILE are deliberately NOT declared above:
+    # picked up from .env via env_file only when the operator uncomments them
+    # (compose/certs/README.md), so an unset CA bundle means the two vars are
+    # absent from the container entirely, not set to an empty string.
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The litellm image has no curl/wget; use Python stdlib. litellm's own
+      # built-in liveliness route — /healthz/* wiring onto litellm's ASGI app
+      # is a separate, not-yet-landed concern (see healthz/server.py).
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness',timeout=2).status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  gateway-redis-data:
+  gateway-postgres-data:
