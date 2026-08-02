@@ -36,9 +36,18 @@ crt/*.crt
 compose/.env
 compose/certs/*.pem
 compose/certs/*.crt
+compose/certs/*.key
+compose/certs/*.p12
+compose/certs/*.pfx
 !compose/certs/README.md
 compose/nginx/certs/*.pem
+compose/nginx/certs/*.crt
+compose/nginx/certs/*.key
+compose/nginx/certs/*.p12
+compose/nginx/certs/*.pfx
+!compose/nginx/certs/README.md
 compose/postgres/initdb/*.sql
+!compose/postgres/initdb/*.sh
 
 # Internal research, decision records, and benchmarks — maintainer / product-owner only.
 # Kept on disk locally, excluded from the published tree (see README: only public docs are linked).

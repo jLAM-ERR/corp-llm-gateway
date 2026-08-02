@@ -225,7 +225,7 @@ def build_guardrail(
     dlp_guard: DlpEgressGuard | None = None,
     sink: Sink | None = None,
     max_output_tokens_cap: int | None = None,
-    strip_inbound_headers_to_upstream: bool = False,
+    strip_inbound_headers_to_upstream: bool | None = None,
     forward_chatgpt_auth: bool | None = None,
 ) -> CorpLlmGuardrail:
     """Assemble a `CorpLlmGuardrail` from config, with optional dep overrides.
@@ -274,22 +274,28 @@ def build_guardrail(
     register_sink(REGISTRY, active_sink, sink_name_for(active_sink))
     REGISTRY.validate_api_version(EXTENSION_API_VERSION)
     audit_logger = AuditLogger(active_sink, gateway_version=gateway_version())
-    # Unlike strip_inbound_headers_to_upstream / max_output_tokens_cap (call-site
-    # policy toggles with no corresponding env var), this one is documented as an
-    # operator-settable cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH) — a plain
-    # `bool = False` default would silently override the env var in every real
-    # deploy, so only resolve from config when the caller left it unset.
+    # Unlike max_output_tokens_cap (a call-site-only policy toggle with no
+    # corresponding env var), forward_chatgpt_auth and
+    # strip_inbound_headers_to_upstream are documented as operator-settable
+    # cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH / CORP_LLM_STRIP_INBOUND_HEADERS)
+    # — a plain bool default would silently override the env var in every real
+    # deploy, so only resolve from config when the caller left the kwarg unset.
     resolved_forward_chatgpt_auth = (
         forward_chatgpt_auth
         if forward_chatgpt_auth is not None
         else _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
+    )
+    resolved_strip_inbound_headers_to_upstream = (
+        strip_inbound_headers_to_upstream
+        if strip_inbound_headers_to_upstream is not None
+        else _flag("CORP_LLM_STRIP_INBOUND_HEADERS", "0")
     )
     return CorpLlmGuardrail(
         orchestrator,
         auth,
         audit_logger,
         max_output_tokens_cap=max_output_tokens_cap,
-        strip_inbound_headers_to_upstream=strip_inbound_headers_to_upstream,
+        strip_inbound_headers_to_upstream=resolved_strip_inbound_headers_to_upstream,
         forward_chatgpt_auth=resolved_forward_chatgpt_auth,
         dlp_guard=dlp_guard if dlp_guard is not None else _build_dlp_guard(),
         metrics=get_exporter(),

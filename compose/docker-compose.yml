@@ -1,8 +1,12 @@
 # Production compose stack for non-k8s hosts — data plane (this revision).
-# See compose/README.md. The admin-only litellm + self-hosted Langfuse (A2),
-# the production Vector config (A3) and the optional nginx front door
-# (`--profile nginx`, C1) land in later revisions of this file. The offline
-# corp-NER mock (workstream B) will register under `--profile mock`.
+# See compose/README.md. Self-hosted Langfuse (A2), the production Vector
+# config (A3) and the optional nginx front door land in later revisions of
+# this file, each gated behind its own `profiles: ["<name>"]` on the service
+# it adds (`nginx/` -> `--profile nginx`, `vector/` wires into the always-on
+# audit path, `langfuse/` -> reachable only via nginx/SSH tunnel — see those
+# directories). The offline corp-NER mock (workstream B) will register a
+# service carrying `profiles: ["mock"]`.
+name: corp-llm-gateway
 
 services:
   redis:
@@ -26,8 +30,9 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-gateway}
     volumes:
       - gateway-postgres-data:/var/lib/postgresql/data
-      # Staged here at deploy time from src/corp_llm_gateway/tokens/schema.sql
-      # — never committed, so the DB schema cannot drift from source. See
+      # 00-create-litellm-db.sh (committed) + 01-schema.sql (staged at deploy
+      # time from src/corp_llm_gateway/tokens/schema.sql, gitignored — never
+      # committed, so the schema cannot drift from source). See
       # compose/postgres/initdb/README.md.
       - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -50,28 +55,57 @@ services:
       # exactly this path. See litellm/corp_llm_gateway/bootstrap.py.
       - ./litellm/corp_llm_gateway/bootstrap.py:/etc/litellm/corp_llm_gateway/bootstrap.py:ro
       - ./certs:/etc/corp-llm-gateway/certs:ro
+    # Explicit per-key list — NOT `env_file: .env`, which would inject the
+    # WHOLE file (POSTGRES_PASSWORD, UI_PASSWORD, ...) into this container.
+    # Every secret this service legitimately needs is named below; nothing
+    # else from .env reaches it. CORP_LLM_CA_BUNDLE / SSL_CERT_FILE use the
+    # bare-name form so an unset value is ABSENT from the container, not set
+    # to an empty string (see compose/certs/README.md).
     environment:
-      REDIS_URL: redis://redis:6379/0
-      CORP_LLM_PG_DSN: postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gateway}
-      CORP_LLM_AUTH_PROVIDER: ${CORP_LLM_AUTH_PROVIDER:-noop}
-      CORP_LLM_ENDPOINT: ${CORP_LLM_ENDPOINT:?set CORP_LLM_ENDPOINT in .env}
-      CORP_LLM_AUTH_TOKEN: ${CORP_LLM_AUTH_TOKEN:-}
-      CORP_LLM_MODEL: ${CORP_LLM_MODEL:-GLM-5.1-AWQ}
-      # NOTE: do NOT set LITELLM_MASTER_KEY here. Once it's set, litellm
-      # intercepts the Authorization header on every API endpoint and rejects
-      # anything that isn't one of its own virtual keys — which breaks the
-      # BYOK / Claude Code subscription flow that is the whole point of this
-      # gateway (CLAUDE.md invariant #3). The admin-only instance (A2) gets
-      # the master key; this data-plane instance never does.
-    # CORP_LLM_CA_BUNDLE / SSL_CERT_FILE are deliberately NOT declared above:
-    # picked up from .env via env_file only when the operator uncomments them
-    # (compose/certs/README.md), so an unset CA bundle means the two vars are
-    # absent from the container entirely, not set to an empty string.
-    env_file:
-      - path: .env
-        required: false
+      - REDIS_URL=redis://redis:6379/0
+      - CORP_LLM_PG_DSN=postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gateway}
+      - CORP_LLM_AUTH_PROVIDER=${CORP_LLM_AUTH_PROVIDER:-noop}
+      # Corp vLLM oracle (local-first cascade's conditional fallback) AND,
+      # when set, the corp-* litellm route's upstream — see litellm/config.yaml.
+      # Optional: unset degrades the oracle to its placeholder-endpoint warning
+      # and the corp-* route to a per-request failure; it does not block boot
+      # or the claude-*/gpt-* routes.
+      - CORP_LLM_ENDPOINT=${CORP_LLM_ENDPOINT:-}
+      - CORP_LLM_AUTH_TOKEN=${CORP_LLM_AUTH_TOKEN:-}
+      - CORP_LLM_MODEL=${CORP_LLM_MODEL:-GLM-5.1-AWQ}
+      # hosted_vllm forwards proxy_server_request headers (incl. Host) to the
+      # corp ingress, which 503s the unknown vhost; harmless on the
+      # claude-*/gpt-* routes, which never read wire headers for auth. See
+      # settings.py CORP_LLM_STRIP_INBOUND_HEADERS / bootstrap.build_guardrail().
+      - CORP_LLM_STRIP_INBOUND_HEADERS=${CORP_LLM_STRIP_INBOUND_HEADERS:-1}
+      # F9 guard (config.py is_prod()): arms the refusal of SSL_VERIFY=false
+      # on the corp-LLM call, which carries raw user content.
+      - CORP_ENV=${CORP_ENV:-production}
+      # F2: a self-disabled NER engine must fail closed, not silently return
+      # no findings and let a PERSON/ORG egress. Load-bearing in production —
+      # see helm/corp-llm-gateway/values-prod.yaml.
+      - CORP_LLM_REQUIRE_NER=${CORP_LLM_REQUIRE_NER:-1}
+      - SSL_VERIFY=${SSL_VERIFY:-true}
+      # Gateway-held provider keys (see compose/README.md "Virtual keys" —
+      # native anthropic/openai routing can't forward a per-developer key).
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Virtual-key auth: the developer credential on this instance. Litellm
+      # intercepts Authorization and validates it against a virtual key
+      # (its own DB, not $POSTGRES_DB) instead of forwarding it — see
+      # compose/README.md "Virtual keys".
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      - STORE_MODEL_IN_DB=True
+      - UI_USERNAME=${UI_USERNAME:?set UI_USERNAME in .env}
+      - UI_PASSWORD=${UI_PASSWORD:?set UI_PASSWORD in .env}
+      - CORP_LLM_CA_BUNDLE
+      - SSL_CERT_FILE
     ports:
-      - "${GATEWAY_PORT:-4000}:4000"
+      # Loopback only — no TLS on this port until the nginx profile (C1)
+      # lands; virtual keys + X-Corp-Auth must not cross a server-class
+      # network in cleartext.
+      - "127.0.0.1:${GATEWAY_PORT:-4000}:4000"
     depends_on:
       redis:
         condition: service_healthy

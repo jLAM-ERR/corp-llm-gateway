@@ -103,6 +103,12 @@ KEYS: tuple[Key, ...] = (
         default="0",
         help="forward allowlisted Codex OAuth headers to ChatGPT backend",
     ),
+    Key(
+        "CORP_LLM_STRIP_INBOUND_HEADERS",
+        flag=True,
+        default="0",
+        help="strip inbound wire headers before forwarding to upstream (hosted_vllm/ Host 503 fix)",
+    ),
     # Choices validated by normalize_oversize_policy (see _check_oversize), not
     # the generic choice check, so the canonical error message is used once.
     Key("CORP_LLM_OVERSIZE_POLICY", default="fail-closed", help="oversize-leaf policy (F1)"),

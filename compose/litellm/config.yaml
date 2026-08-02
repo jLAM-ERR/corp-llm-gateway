@@ -1,14 +1,32 @@
-# Data-plane litellm config — production, non-k8s hosts. Routes every
-# request to the corp vLLM oracle over litellm's hosted_vllm/ provider, the
-# only route that does a low-level passthrough of the inbound Authorization
-# header (BYOK, invariant #3) — see compose/README.md "Why hosted_vllm/".
+# Data-plane litellm config — production, non-k8s hosts. Per-model-prefix
+# routing: `claude-*` -> native anthropic/, `gpt-*` -> native openai/, `corp-*`
+# -> hosted_vllm/ at the corp vLLM. See compose/README.md "Upstream routing".
+#
+# BYOK note (verified twice — examples/compose/README.md "BYOK in local mode
+# (SPIKE finding)"): native anthropic/ and openai/ providers build their OWN
+# upstream credential from the `api_key` below and never read the inbound
+# client Authorization header. That header instead carries a LiteLLM virtual
+# key, consumed by litellm itself before routing — see "Virtual keys" below.
+# BYOK (raw client Authorization forwarded untouched) is retained ONLY on the
+# corp-* / hosted_vllm route.
 model_list:
-  - model_name: "*"
+  - model_name: "claude-*"
     litellm_params:
-      # The corp vLLM exposes a single model; rewrite every inbound model
+      model: "anthropic/claude-*"
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+  - model_name: "gpt-*"
+    litellm_params:
+      model: "openai/gpt-*"
+      api_key: "os.environ/OPENAI_API_KEY"
+  - model_name: "corp-*"
+    litellm_params:
+      # The corp vLLM exposes a single model; rewrite every corp-* inbound
       # name to it. Keep this literal in sync with CORP_LLM_MODEL in .env
-      # (used by the gateway's own oracle client) if you change it — see
+      # (used by the gateway's own oracle client too) if you change it — see
       # helm/corp-llm-gateway/values.yaml corpLlm.model for the k8s twin.
+      # CORP_LLM_ENDPOINT is optional (no corp vLLM in every deployment) —
+      # left unset, this entry alone fails per-request; it does not fail
+      # config load, and the claude-*/gpt-* routes above are unaffected.
       model: "hosted_vllm/GLM-5.1-AWQ"
       api_base: "os.environ/CORP_LLM_ENDPOINT"
       api_key: "os.environ/CORP_LLM_AUTH_TOKEN"

@@ -64,6 +64,11 @@
 #   Resolved by bootstrap.build_guardrail() in every deployment (k8s/Helm
 #   included), not just the docker-compose Codex demo overlay. See
 #   docs/chatgpt-codex.md.
+# CORP_LLM_STRIP_INBOUND_HEADERS = "0"  # strip inbound wire headers before upstream
+#   Set "1" when routing through litellm's hosted_vllm/ provider (corp-*
+#   models): it forwards proxy_server_request headers (incl. Host) upstream,
+#   and an unknown vhost 503s the corp ingress. Off by default to preserve
+#   existing anthropic/openai routing behaviour.
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #

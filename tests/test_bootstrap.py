@@ -298,6 +298,51 @@ def test_forward_chatgpt_auth_explicit_argument_overrides_config(
     assert guardrail._forward_chatgpt_auth is False
 
 
+# ── strip_inbound_headers_to_upstream: build_guardrail must resolve
+# CORP_LLM_STRIP_INBOUND_HEADERS from config (compose's hosted_vllm/ route needs
+# this True or the corp ingress 503s on the forwarded Host header) ─────────────
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
+def test_strip_inbound_headers_truthy_spellings_enable_the_flag(
+    monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_STRIP_INBOUND_HEADERS", truthy)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._strip_inbound_headers_to_upstream is True
+
+
+@pytest.mark.parametrize("falsy", ["0", "off", "no", "false", "OFF"])
+def test_strip_inbound_headers_falsy_spellings_disable_the_flag(
+    monkeypatch: pytest.MonkeyPatch, falsy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_STRIP_INBOUND_HEADERS", falsy)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._strip_inbound_headers_to_upstream is False
+
+
+def test_strip_inbound_headers_unset_defaults_off() -> None:
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._strip_inbound_headers_to_upstream is False
+
+
+def test_strip_inbound_headers_explicit_argument_overrides_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit caller argument (e.g. the demo shim resolving its own copy)
+    # must win over whatever the env var says.
+    monkeypatch.setenv("CORP_LLM_STRIP_INBOUND_HEADERS", "1")
+
+    guardrail = bootstrap.build_guardrail(strip_inbound_headers_to_upstream=False)
+
+    assert guardrail._strip_inbound_headers_to_upstream is False
+
+
 # ── no-op-sanitizer floor: build_guardrail must not skip this even though it
 # never calls settings.validate() (Helm's config-check initContainer does; this
 # covers compose/demo/bare-litellm boots) ────────────────────────────────────
