@@ -29,9 +29,19 @@ a clear "set X in .env" error rather than silently booting half-configured.
 
 `litellm/config.yaml` routes by model-name prefix: `claude-*` → native
 `anthropic/`, `gpt-*` → native `openai/`, `corp-*` → `hosted_vllm/` at
-`CORP_LLM_ENDPOINT` (optional — see below). Provider credentials for the
-first two come from `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in `.env`, held by
-the gateway, not the developer — see "Virtual keys" for why.
+`CORP_LLM_ENDPOINT`. Provider credentials for the first two come from
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in `.env`, held by the gateway, not the
+developer — see "Virtual keys" for why.
+
+`CORP_LLM_ENDPOINT` is optional, but leaving it unset does **not** disable
+anything by itself: `CORP_LLM_ORACLE_ENABLED=0` (the `.env.example` default)
+is what keeps the corp-LLM oracle off. With the oracle enabled and no
+endpoint, a gazetteer hit falls through to `bootstrap.py`'s non-routable
+placeholder host and fails the request closed — on **every** route, not
+just `corp-*`. Set `CORP_LLM_ORACLE_ENABLED=1` only once `CORP_LLM_ENDPOINT`
+points at a reachable corp vLLM. The `corp-*` route itself always needs the
+endpoint regardless of the oracle flag; without it, `corp-*` requests fail
+per-request rather than failing config load.
 
 ## Virtual keys
 
@@ -56,34 +66,48 @@ on every request:
 - `X-Corp-Auth: <corp team token>` — which team's profile/rules/audit
   identity applies inside the guardrail.
 
-## Why not BYOK against Anthropic/OpenAI
+## Why not BYOK
 
-Native `anthropic/` and `openai/` litellm providers build their own upstream
-credential header purely from the `api_key` configured in
-`litellm/config.yaml` and never read the inbound client's `Authorization`
-header — verified twice (litellm source, and a live capture server standing
-in for `api.anthropic.com`; see `examples/compose/README.md` "BYOK in local
-mode (SPIKE finding)" for the full writeup). `forward_client_headers_to_llm_api`
-only forwards `x-*` headers and explicitly excludes `Authorization`. There is
-no config flag that changes this for these two providers.
+litellm forwards an inbound request header to ANY upstream provider only
+through `data["headers"]`, which is populated only when
+`forward_client_headers_to_llm_api` is set — either on `general_settings` or
+per model group (`litellm/proxy/litellm_pre_call_utils.py`
+`add_litellm_data_for_backend_llm_call` / `add_headers_to_llm_call_by_model_group`)
+— and even then it forwards only `x-*` headers plus `anthropic-beta`, never
+`Authorization`. Neither setting appears anywhere in `litellm/config.yaml`.
+Verified twice: against litellm 1.85.0 (the pinned image) and independently
+against 1.90.1; see `examples/compose/README.md` "BYOK in local mode (SPIKE
+finding)" for the native-provider half of the writeup.
+
+**No inbound header — `Authorization` or `Host` — reaches any upstream on
+this stack, on any route, including `corp-*`.** The `corp-*` /
+`hosted_vllm/` route builds its upstream request the same way `anthropic/`
+and `openai/` do: from the configured `api_key` and model params, never from
+wire headers. An earlier revision of this README claimed `hosted_vllm/`
+passed inbound headers through and that `CORP_LLM_STRIP_INBOUND_HEADERS=1`
+was needed to stop a `Host` header 503ing the corp ingress — that was wrong;
+without `forward_client_headers_to_llm_api`, the header the flag strips
+never reaches litellm's provider layer in the first place, so the flag is
+currently inert on this stack. It stays set (see `.env.example`) as a
+reserved seam for a future deployment that does enable header forwarding.
 
 BYOK (the developer's own key forwarded untouched — CLAUDE.md invariant #3)
-is retained only on the `corp-*` (`hosted_vllm/`) route, which does a
-low-level passthrough of inbound request headers. That's also why
-`CORP_LLM_STRIP_INBOUND_HEADERS=1` is the default here: `hosted_vllm/`
-forwards `proxy_server_request.headers` (incl. `Host: 127.0.0.1:4000`)
-upstream, and the corp ingress 503s on the unknown vhost unless those wire
-headers are stripped first (`settings.py` `CORP_LLM_STRIP_INBOUND_HEADERS`,
-plumbed through `bootstrap.build_guardrail()`).
+is **not available on this compose stack at all**, on any route. Developers
+authenticate with the litellm virtual key described above, full stop.
 
 ## TLS to the corp vLLM
 
 See `compose/certs/README.md`. Two different HTTP clients in the `litellm`
-container each read their own trust-store env var: `CORP_LLM_CA_BUNDLE`
-(our `CorpLlmClient`, httpx) and `SSL_CERT_FILE` (litellm's `hosted_vllm/`
-upstream, aiohttp). Both use the compose bare-name environment form, so an
-unset value is absent from the container entirely, not set to an empty
-string.
+container read TLS trust differently: our own `CorpLlmClient` (httpx) reads
+`CORP_LLM_CA_BUNDLE` from `.env` (bare-name form, so an unset value is
+absent from the container entirely, not set to an empty string) — scoped to
+calls to the corp vLLM only. litellm's own clients (native `anthropic/`,
+`openai/` AND `hosted_vllm/`, all aiohttp) read `SSL_CERT_FILE`, which is
+**process-global**: pointing it straight at the corp CA would silently
+replace the trust store for `api.anthropic.com`/`api.openai.com` too. So
+`SSL_CERT_FILE` is not set from `.env` at all — the container's entrypoint
+builds a combined bundle (certifi's public roots, plus `corp-ca-bundle.pem`
+appended if mounted) at boot and `SSL_CERT_FILE` always points at that.
 
 ## Postgres
 
@@ -104,14 +128,24 @@ cleartext.
 
 ## Durability
 
-`redis`, `postgres` and `litellm` all use named volumes, so `docker compose
-down` (without `-v`) keeps mappings, tokens/team-config and virtual keys
-across a restart — unlike `docker-compose.demo.yml`'s laptop-walkthrough
-posture. Redis is configured `noeviction` (`compose/redis/redis.conf`): Cache
-B is CLAUDE.md's *required* per-conversation mapping store for `post_call`
-desanitization, so an under-memory Redis must fail loudly (`OOM` errors)
-rather than silently evict live mappings and return placeholder text to a
-developer.
+`redis` and `postgres` use named volumes, so `docker compose down` (without
+`-v`) keeps mappings, tokens/team-config and virtual keys across a restart —
+unlike `docker-compose.demo.yml`'s laptop-walkthrough posture. `litellm`
+itself has no named volume; it is stateless (config/certs are read-only bind
+mounts) and its state already lives in `redis`/`postgres` above. Redis is
+configured `noeviction` (`compose/redis/redis.conf`): Cache B is CLAUDE.md's
+*required* per-conversation mapping store for `post_call` desanitization, so
+an under-memory Redis must fail loudly (`OOM` errors) rather than silently
+evict live mappings and return placeholder text to a developer.
+
+## Upgrading from an earlier deployment
+
+If you already ran this stack before the litellm virtual-key rework (no
+`compose/postgres/initdb/00-create-litellm-db.sh`), your `postgres` volume
+has no `litellm` database and the `litellm` container fails at boot —
+`docker-entrypoint-initdb.d` scripts only run once, against an empty volume.
+See `compose/postgres/initdb/README.md` "Upgrading a pre-existing
+deployment" for the recreate / manual `CREATE DATABASE` fix.
 
 ## Environment posture
 

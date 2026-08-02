@@ -6,7 +6,13 @@
 # audit path, `langfuse/` -> reachable only via nginx/SSH tunnel — see those
 # directories). The offline corp-NER mock (workstream B) will register a
 # service carrying `profiles: ["mock"]`.
-name: corp-llm-gateway
+#
+# Distinct from docker-compose.demo.yml's default project name
+# (`corp-llm-gateway`, derived from the repo directory basename): reusing it
+# here would make this stack's `gateway-*-data` volumes collide with the
+# demo's, silently attaching its already-initialised Postgres (no `litellm`
+# database, no gateway schema, Cache B pre-seeded with demo data).
+name: corp-llm-gateway-prod
 
 services:
   redis:
@@ -36,7 +42,12 @@ services:
       # compose/postgres/initdb/README.md.
       - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway} -d ${POSTGRES_DB:-gateway}"]
+      # -h 127.0.0.1 forces TCP: bare pg_isready hits the unix socket, which
+      # the entrypoint's temporary init server also listens on, so this would
+      # go healthy mid-initdb — before `litellm` (CREATE DATABASE) runs —
+      # letting the litellm service start under `condition: service_healthy`
+      # against a not-yet-created database.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-gateway} -d ${POSTGRES_DB:-gateway}"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -45,8 +56,10 @@ services:
   litellm:
     # Prebuilt image only — compose never rebuilds it and never `pip install
     # -e`s at boot (that's a docker-compose.demo.yml affordance). Built from
-    # Dockerfile.gateway, whose ENTRYPOINT is already
-    # `litellm --config /etc/litellm/config.yaml --port 4000`.
+    # Dockerfile.gateway, whose ENTRYPOINT is
+    # `litellm --config /etc/litellm/config.yaml --port 4000`; the
+    # entrypoint/command override below runs the same command, prefixed with
+    # the SSL_CERT_FILE bundle build (see the environment block).
     image: ghcr.io/jlam-err/corp-llm-gateway:${GATEWAY_IMAGE_TAG:?set GATEWAY_IMAGE_TAG in .env}
     volumes:
       - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
@@ -58,25 +71,35 @@ services:
     # Explicit per-key list — NOT `env_file: .env`, which would inject the
     # WHOLE file (POSTGRES_PASSWORD, UI_PASSWORD, ...) into this container.
     # Every secret this service legitimately needs is named below; nothing
-    # else from .env reaches it. CORP_LLM_CA_BUNDLE / SSL_CERT_FILE use the
-    # bare-name form so an unset value is ABSENT from the container, not set
-    # to an empty string (see compose/certs/README.md).
+    # else from .env reaches it. CORP_LLM_CA_BUNDLE uses the bare-name form
+    # so an unset value is ABSENT from the container, not set to an empty
+    # string (see compose/certs/README.md). SSL_CERT_FILE is fixed, not
+    # sourced from .env — see the entrypoint below.
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CORP_LLM_PG_DSN=postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gateway}
       - CORP_LLM_AUTH_PROVIDER=${CORP_LLM_AUTH_PROVIDER:-noop}
       # Corp vLLM oracle (local-first cascade's conditional fallback) AND,
       # when set, the corp-* litellm route's upstream — see litellm/config.yaml.
-      # Optional: unset degrades the oracle to its placeholder-endpoint warning
-      # and the corp-* route to a per-request failure; it does not block boot
-      # or the claude-*/gpt-* routes.
+      # Optional: only required when CORP_LLM_ORACLE_ENABLED=1 (default 0
+      # below) or you use the corp-* route; the claude-*/gpt-* routes never
+      # need it.
       - CORP_LLM_ENDPOINT=${CORP_LLM_ENDPOINT:-}
       - CORP_LLM_AUTH_TOKEN=${CORP_LLM_AUTH_TOKEN:-}
       - CORP_LLM_MODEL=${CORP_LLM_MODEL:-GLM-5.1-AWQ}
-      # hosted_vllm forwards proxy_server_request headers (incl. Host) to the
-      # corp ingress, which 503s the unknown vhost; harmless on the
-      # claude-*/gpt-* routes, which never read wire headers for auth. See
-      # settings.py CORP_LLM_STRIP_INBOUND_HEADERS / bootstrap.build_guardrail().
+      # Default OFF: with no endpoint set, an enabled oracle falls back to
+      # bootstrap.py's non-routable placeholder host, and any gazetteer hit
+      # then fails the request closed on every route, not just corp-*
+      # (settings.validate() would refuse to boot on this — build_guardrail()
+      # doesn't call it, so the failure only surfaces on the first hit).
+      # Flip to 1 only once CORP_LLM_ENDPOINT points at a reachable corp vLLM.
+      - CORP_LLM_ORACLE_ENABLED=${CORP_LLM_ORACLE_ENABLED:-0}
+      # Reserved: only takes effect once this stack's litellm config also
+      # sets forward_client_headers_to_llm_api (it doesn't today), the one
+      # gate that puts inbound headers into data["headers"] for ANY route.
+      # Without it, no wire header — including Host — reaches any upstream,
+      # so this flag is currently inert. See settings.py
+      # CORP_LLM_STRIP_INBOUND_HEADERS / bootstrap.build_guardrail().
       - CORP_LLM_STRIP_INBOUND_HEADERS=${CORP_LLM_STRIP_INBOUND_HEADERS:-1}
       # F9 guard (config.py is_prod()): arms the refusal of SSL_VERIFY=false
       # on the corp-LLM call, which carries raw user content.
@@ -100,7 +123,21 @@ services:
       - UI_USERNAME=${UI_USERNAME:?set UI_USERNAME in .env}
       - UI_PASSWORD=${UI_PASSWORD:?set UI_PASSWORD in .env}
       - CORP_LLM_CA_BUNDLE
-      - SSL_CERT_FILE
+      # Always the combined bundle the entrypoint below builds (certifi
+      # public roots + the corp CA, if mounted) — SSL_CERT_FILE is
+      # process-global for litellm's aiohttp clients (native anthropic/,
+      # openai/ AND hosted_vllm/ all read it), so pointing it at the corp CA
+      # alone would replace the trust store for api.anthropic.com/
+      # api.openai.com too. See compose/certs/README.md.
+      - SSL_CERT_FILE=/tmp/corp-ca-bundle.pem
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        { cat "$(python3 -c 'import certifi; print(certifi.where())')";
+        if [ -f /etc/corp-llm-gateway/certs/corp-ca-bundle.pem ]; then
+        cat /etc/corp-llm-gateway/certs/corp-ca-bundle.pem; fi; }
+        > /tmp/corp-ca-bundle.pem &&
+        exec litellm --config /etc/litellm/config.yaml --port 4000
     ports:
       # Loopback only — no TLS on this port until the nginx profile (C1)
       # lands; virtual keys + X-Corp-Auth must not cross a server-class
@@ -123,6 +160,9 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+      # DATABASE_URL makes litellm run prisma setup at boot; 5s x 10 (50s)
+      # is not enough headroom before that finishes.
+      start_period: 60s
     restart: unless-stopped
 
 volumes:

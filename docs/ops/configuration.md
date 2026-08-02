@@ -75,6 +75,7 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 | `CORP_LLM_OVERSIZE_DELIVER_TEAMS` | teams allowed the `deliver-flag` path | `""` | no |
 | `CORP_LLM_REQUIRE_NER` | fail closed when NER absent (F2) | `0` | prod: **yes** |
 | `CORP_LLM_ORACLE_TRIGGER` | `gazetteer_hit` \| `any_local_finding` \| `sampled:<pct>` \| `always` (F3) | `gazetteer_hit` | no |
+| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers before forwarding to upstream; reserved for deployments that enable litellm's `forward_client_headers_to_llm_api` — inert otherwise | `0` | no |
 | `CORP_LLM_LOG_LEVEL` | log level | `INFO` | no |
 
 ### Backends

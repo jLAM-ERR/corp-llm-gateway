@@ -12,13 +12,21 @@ uncomment and set:
 
 ```
 CORP_LLM_CA_BUNDLE=/etc/corp-llm-gateway/certs/corp-ca-bundle.pem
-SSL_CERT_FILE=/etc/corp-llm-gateway/certs/corp-ca-bundle.pem
 ```
 
-Two different HTTP clients read TLS trust from these two variables inside
-the litellm container: our own `CorpLlmClient` (httpx) reads
-`CORP_LLM_CA_BUNDLE`; litellm's `hosted_vllm/` upstream (aiohttp) reads
-`SSL_CERT_FILE`. Leave both commented out (the `.env.example` default) when
-the corp vLLM's certificate already chains to a publicly-trusted root — both
-clients then fall back to their own default trust store, and the two env
-vars are never set on the container (not even to an empty string).
+Two different HTTP clients read TLS trust inside the litellm container: our
+own `CorpLlmClient` (httpx) reads `CORP_LLM_CA_BUNDLE` above, scoped to calls
+to the corp vLLM only. litellm's own clients (native `anthropic/`, `openai/`
+AND `hosted_vllm/`, all aiohttp) read `SSL_CERT_FILE` — a **process-global**
+trust store, not a per-client one. Pointing it straight at the corp CA alone
+(as an earlier revision of this stack did) would silently replace the trust
+store for `api.anthropic.com`/`api.openai.com` too, breaking those routes
+for anyone who set it.
+
+`SSL_CERT_FILE` is therefore **not** set from `.env`. `compose/docker-compose.yml`
+fixes it at a combined-bundle path the container's entrypoint builds at
+boot: certifi's public roots, plus `corp-ca-bundle.pem` appended if this
+directory has one. Leave `CORP_LLM_CA_BUNDLE` commented out (the
+`.env.example` default) when the corp vLLM's certificate already chains to a
+publicly-trusted root — `CorpLlmClient` then falls back to its own default
+trust store, and the combined bundle still has the public roots either way.

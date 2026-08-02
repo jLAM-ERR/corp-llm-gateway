@@ -39,13 +39,11 @@ compose/certs/*.crt
 compose/certs/*.key
 compose/certs/*.p12
 compose/certs/*.pfx
-!compose/certs/README.md
 compose/nginx/certs/*.pem
 compose/nginx/certs/*.crt
 compose/nginx/certs/*.key
 compose/nginx/certs/*.p12
 compose/nginx/certs/*.pfx
-!compose/nginx/certs/README.md
 compose/postgres/initdb/*.sql
 !compose/postgres/initdb/*.sh
 
