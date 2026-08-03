@@ -23,6 +23,7 @@ import contextlib
 import io
 import json
 import logging
+import traceback
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -75,6 +76,14 @@ def _haystack_contains_any_original(haystack: str) -> str | None:
         if original in haystack:
             return original
     return None
+
+
+def _formatted_traceback(exc: BaseException) -> str:
+    """Render the FULL exception chain (`__cause__`/`__context__` included)
+    the way uvicorn's unhandled-ASGI logger / `logger.exception` /
+    litellm's `verbose_proxy_logger.exception` would. `str(exc)` alone does
+    NOT catch a leak riding in a chained exception (M1-14 surface iii/vi)."""
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
 # (i) Audit logger never emits originals -----------------------------------
@@ -1886,6 +1895,12 @@ async def test_unexpected_backend_exception_body_contains_no_backend_detail(
     assert "corp_tokens" not in exc_text, "backend DB detail leaked into exception body"
     assert _haystack_contains_any_original(exc_text) is None, "original leaked into exception body"
 
+    # str() alone doesn't catch a leak riding in `__cause__`/`__context__` —
+    # format the full chain the way an unhandled-exception logger would.
+    tb_text = _formatted_traceback(ei.value)
+    assert "corp_tokens" not in tb_text, "backend DB detail leaked into exception chain"
+    assert _haystack_contains_any_original(tb_text) is None, "original leaked into exception chain"
+
     # INFO (not just ERROR) so the pre-failure INFO trail (e.g.
     # litellm_pre_call_received) is actually checked, not silently excluded.
     assert "corp_tokens" not in caplog.text, "backend DB detail leaked into log line"
@@ -1952,6 +1967,11 @@ async def test_double_failure_backend_and_audit_sink_still_returns_opaque_500(
     assert "ingestion failed" not in exc_text, "sink failure message leaked into exception body"
     assert _haystack_contains_any_original(exc_text) is None, "original leaked into exception body"
 
+    tb_text = _formatted_traceback(ei.value)
+    assert "corp_tokens" not in tb_text, "backend DB detail leaked into exception chain"
+    assert "ingestion failed" not in tb_text, "sink failure message leaked into exception chain"
+    assert _haystack_contains_any_original(tb_text) is None, "original leaked into exception chain"
+
     assert "corp_tokens" not in caplog.text, "backend DB detail leaked into log line"
     assert "ingestion failed" not in caplog.text, "sink failure message leaked into log line"
     assert _haystack_contains_any_original(caplog.text) is None, "original leaked into log line"
@@ -1998,6 +2018,10 @@ async def test_post_call_unary_unexpected_error_log_contains_no_raw_content(
     exc_text = str(ei.value)
     assert "secret-alice" not in exc_text
     assert "secret-alice" not in caplog.text
+    tb_text = _formatted_traceback(ei.value)
+    assert "secret-alice" not in tb_text, (
+        "original leaked via exception chain (__cause__/__context__)"
+    )
 
     assert len(sink.records) == 1
     serialized = json.dumps(sink.records[0])
@@ -2005,11 +2029,15 @@ async def test_post_call_unary_unexpected_error_log_contains_no_raw_content(
 
 
 @pytest.mark.asyncio
-async def test_post_call_stream_mid_iteration_error_log_contains_no_raw_content(
+async def test_post_call_stream_own_bug_mid_stream_log_contains_no_raw_content(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """(xvii) widened: a failure mid-stream — not just on entry — must be
-    caught before any raw content in its message reaches the client/log."""
+    """(xvii) widened: a bug in OUR OWN desanitization work mid-stream — as
+    opposed to an upstream transport failure, which now propagates
+    unconverted (Major: the wrapper must not swallow upstream provider
+    errors) — must still be caught before any raw content in its
+    message/exception chain reaches the client/log/audit record."""
+    import corp_llm_gateway.litellm_hook as hook_mod
     from corp_llm_gateway.litellm_hook import GuardrailHttpException
 
     guardrail, sink = _tool_call_guardrail((("secret-alice", "[N1]"),))
@@ -2020,19 +2048,31 @@ async def test_post_call_stream_mid_iteration_error_log_contains_no_raw_content(
     }
     await guardrail.pre_call(data)  # type: ignore[attr-defined]
 
-    async def _raising_iter():
+    async def _good_iter():
         yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
-        raise RuntimeError("upstream stream broke for secret-alice")
+        yield {"choices": [{"delta": {"content": " again [N1]"}}]}
 
-    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
-        async for _chunk in guardrail.post_call_stream(data, _raising_iter()):  # type: ignore[attr-defined]
-            pass
+    def _boom(chunk: object) -> str | None:
+        raise RuntimeError("desanitize bug for secret-alice")
+
+    original = hook_mod._extract_chunk_text
+    hook_mod._extract_chunk_text = _boom  # type: ignore[assignment]
+    try:
+        with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+            async for _chunk in guardrail.post_call_stream(data, _good_iter()):  # type: ignore[attr-defined]
+                pass
+    finally:
+        hook_mod._extract_chunk_text = original
 
     assert ei.value.status_code == 500
     assert ei.value.error_code == "E_INTERNAL"
     exc_text = str(ei.value)
     assert "secret-alice" not in exc_text
     assert "secret-alice" not in caplog.text
+    tb_text = _formatted_traceback(ei.value)
+    assert "secret-alice" not in tb_text, (
+        "original leaked via exception chain (__cause__/__context__)"
+    )
 
     assert len(sink.records) == 1
     serialized = json.dumps(sink.records[0])

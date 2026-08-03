@@ -27,11 +27,11 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any
 
-from corp_llm_gateway.audit import AuditEvent, AuditLogger
+from corp_llm_gateway.audit import AuditEvent, AuditLogger, AuditWriteAmbiguousError
 from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
@@ -209,6 +209,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # already-blocked/failed request whose own inline audit() call then
         # raises) doesn't get double-counted and mislabeled as internal.
         self._failure_recorded_ids: OrderedDict[str, None] = OrderedDict()
+        # Bounded set of request_ids whose latency has already been observed
+        # via audit() — a failed emit + safety-net retry call audit() twice
+        # for one request; the histogram must only see it once.
+        self._latency_observed_ids: OrderedDict[str, None] = OrderedDict()
 
     # ---- LiteLLM hook entry points ----------------------------------------
 
@@ -287,7 +291,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             await self._report_internal_failure(
                 request_id, data, exc, log_event="litellm_pre_call_unexpected_error"
             )
-            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from exc
+            # `from None`: `exc` must never become `__cause__` (M1-14 surface iii/vi) —
+            # `_report_internal_failure` already logged its TYPE only, above.
+            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
 
     async def _report_internal_failure(
         self,
@@ -1117,23 +1123,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     ) -> AsyncIterator[Any]:
         """Wrap an async iterator of SSE chunks with de-sanitization.
 
-        F8 safety net: the `async for` that drives `_post_call_stream_impl`
-        lives INSIDE the try so a mid-iteration failure (not just a failure
-        on entry) is caught — this runs after placeholders have already been
-        replaced by originals, the one path most likely to carry user
-        content in an exception message.
+        No safety net here on purpose: `_post_call_stream_impl` guards only
+        its OWN desanitization work, not the upstream provider's stream — an
+        `httpx.RemoteProtocolError` mid-stream is not our bug and must reach
+        litellm's own failure handling untouched, not get relabelled
+        `E_INTERNAL`.
         """
         request_id = self._ensure_request_id(request_data)
-        try:
-            async for chunk in self._post_call_stream_impl(request_id, request_data, response):
-                yield chunk
-        except GuardrailHttpException:
-            raise
-        except Exception as exc:
-            await self._report_internal_failure(
-                request_id, request_data, exc, log_event="litellm_post_call_stream_unexpected_error"
-            )
-            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from exc
+        async for chunk in self._post_call_stream_impl(request_id, request_data, response):
+            yield chunk
 
     async def _post_call_stream_impl(
         self,
@@ -1170,44 +1168,93 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Responses API path: typed Pydantic ``response.*`` events.
         responses_desanitizer = ResponsesStreamDesanitizer(response_mapping)
         chunk_count = 0
-        async for chunk in response:
+        # Manual `__anext__` loop (instead of `async for`) so fetching the next
+        # chunk from the UPSTREAM iterator is NOT inside the try/except below —
+        # only our own per-chunk desanitization work is guarded (F8: never wrap
+        # the provider's own transport).
+        stream_iter = response.__aiter__()
+        while True:
+            try:
+                chunk = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception:
+                # Upstream/transport failure (e.g. httpx.RemoteProtocolError)
+                # fetching the next chunk. Flush any already-buffered
+                # desanitized tail (best effort — already-yielded chunks may
+                # have held content back) then let litellm see the ORIGINAL
+                # exception untouched; it is not ours to reclassify.
+                try:
+                    for tail_chunk in _flush_stream_tails(
+                        sse,
+                        dict_desanitizer,
+                        dict_tool_calls,
+                        dict_function_call,
+                        responses_desanitizer,
+                    ):
+                        yield tail_chunk
+                except Exception:
+                    logger.warning(
+                        "litellm_post_call_stream_flush_after_upstream_error_failed request_id=%s",
+                        request_id,
+                    )
+                raise
             chunk_count += 1
-            if isinstance(chunk, (bytes, str)):
-                for out_chunk in sse.feed(chunk):
-                    yield out_chunk
-            elif _is_responses_event(chunk):
-                for out_chunk in responses_desanitizer.feed(chunk):
-                    yield out_chunk
-            elif isinstance(chunk, dict):
-                chunk, had_tc = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
-                chunk, had_fc = _desanitize_chunk_function_call(chunk, dict_function_call)
-                text = _extract_chunk_text(chunk)
-                if text is None:
+            try:
+                if isinstance(chunk, (bytes, str)):
+                    for out_chunk in sse.feed(chunk):
+                        yield out_chunk
+                elif _is_responses_event(chunk):
+                    for out_chunk in responses_desanitizer.feed(chunk):
+                        yield out_chunk
+                elif isinstance(chunk, dict):
+                    chunk, had_tc = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
+                    chunk, had_fc = _desanitize_chunk_function_call(chunk, dict_function_call)
+                    text = _extract_chunk_text(chunk)
+                    if text is None:
+                        yield chunk
+                    else:
+                        out = dict_desanitizer.feed(text)
+                        # Held-back/empty content must not drop a tool_call/function_call
+                        # riding in the same delta (its id/name/args would be lost).
+                        if out or had_tc or had_fc:
+                            yield _replace_chunk_text(chunk, out)
+                else:
                     yield chunk
-                    continue
-                out = dict_desanitizer.feed(text)
-                # Held-back/empty content must not drop a tool_call/function_call
-                # riding in the same delta (its id/name/args would be lost).
-                if out or had_tc or had_fc:
-                    yield _replace_chunk_text(chunk, out)
-            else:
-                yield chunk
-        # Flush SSE desanitizer (handles truncated streams / held-back tail).
-        for out_chunk in sse.flush():
-            yield out_chunk
-        # Flush dict desanitizer tail.
-        tail = dict_desanitizer.flush()
-        if tail:
-            yield _replace_chunk_text(_make_text_chunk(), tail)
-        # Flush any held-back tool_calls arguments tails.
-        for tc_index, tc_tail in dict_tool_calls.flush():
-            yield _make_tool_call_chunk(tc_index, tc_tail)
-        # Flush any held-back legacy function_call arguments tail.
-        fc_tail = dict_function_call.flush()
-        if fc_tail:
-            yield _make_function_call_chunk(fc_tail)
-        for responses_tail in responses_desanitizer.flush():
-            yield responses_tail
+            except GuardrailHttpException:
+                raise
+            except Exception as exc:
+                # Our own desanitization work failed — this runs AFTER
+                # placeholders have been replaced by originals, the one path
+                # most likely to carry real user content in the exception
+                # message (F8).
+                try:
+                    for tail_chunk in _flush_stream_tails(
+                        sse,
+                        dict_desanitizer,
+                        dict_tool_calls,
+                        dict_function_call,
+                        responses_desanitizer,
+                    ):
+                        yield tail_chunk
+                except Exception:
+                    logger.warning(
+                        "litellm_post_call_stream_flush_after_failure_failed request_id=%s",
+                        request_id,
+                    )
+                await self._report_internal_failure(
+                    request_id,
+                    request_data,
+                    exc,
+                    log_event="litellm_post_call_stream_unexpected_error",
+                )
+                # `from None`: `exc` (already-desanitized content) must never
+                # become `__cause__` (M1-14 surface iii/vi).
+                raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
+        for tail_chunk in _flush_stream_tails(
+            sse, dict_desanitizer, dict_tool_calls, dict_function_call, responses_desanitizer
+        ):
+            yield tail_chunk
         logger.info(
             "litellm_post_call_stream_desanitize_done request_id=%s chunk_count=%d",
             request_id,
@@ -1235,7 +1282,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             await self._report_internal_failure(
                 request_id, request_data, exc, log_event="litellm_post_call_unary_unexpected_error"
             )
-            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from exc
+            # `from None`: `exc` (already-desanitized content) must never
+            # become `__cause__` (M1-14 surface iii/vi).
+            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
 
     async def _post_call_unary_impl(
         self,
@@ -1274,9 +1323,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if request_id in self._audited_ids:
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
             return
-        # Pop unconditionally (success or failure below) so _req_state never
-        # grows unbounded on a request that keeps failing to audit.
-        state = self._req_state.pop(request_id, None)
+        # Do NOT pop yet: a failed emit below must leave `state` in place for
+        # a genuine retry (the F8 safety net's own guarded audit() call) to
+        # find the real user_id/redaction_count/block_reason instead of
+        # "unknown"/0/null — popping only happens once emit() has actually
+        # succeeded (or the sink tells us the write is ambiguous, below).
+        state = self._req_state.get(request_id)
         # litellm v1.85 passes datetime objects for start_time / end_time
         # to async_log_*_event; older versions used floats. Handle both.
         delta = end_time - start_time
@@ -1284,7 +1336,14 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             latency_ms = max(0, int(delta.total_seconds() * 1000))
         else:
             latency_ms = max(0, int(delta * 1000))
-        self._metrics.observe_request_latency(latency_ms / 1000.0, status=status)
+        # Once per REQUEST, not once per audit() call: a failed emit + safety-net
+        # retry must not double-observe the same request's latency under two
+        # different status labels.
+        if request_id not in self._latency_observed_ids:
+            self._metrics.observe_request_latency(latency_ms / 1000.0, status=status)
+            self._latency_observed_ids[request_id] = None
+            if len(self._latency_observed_ids) > _AUDIT_DEDUP_CAP:
+                self._latency_observed_ids.popitem(last=False)
         prompt_tokens, completion_tokens = _extract_token_counts(response)
 
         event = AuditEvent(
@@ -1312,14 +1371,28 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         )
         try:
             await self._audit.emit(event)
+        except AuditWriteAmbiguousError:
+            # The sink may have already persisted this record before raising
+            # (e.g. an HTTP response was accepted but reading the ack timed
+            # out) — treat it as delivered so a safety-net retry for the same
+            # request_id doesn't write a second record for one logical write.
+            logger.error("litellm_audit_emit_ambiguous request_id=%s status=%s", request_id, status)
+            self._req_state.pop(request_id, None)
+            self._audited_ids[request_id] = None
+            if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+                self._audited_ids.popitem(last=False)
+            raise
         except Exception:
-            # Do NOT mark dedup on a failed emit: a request whose only audit
-            # attempt raised (e.g. a sink outage) must stay eligible for a
-            # genuine retry — the F8 safety net's own guarded audit() call is
-            # exactly that retry — instead of being silently deduped away
-            # with zero records ever written.
+            # Do NOT mark dedup on a confirmed failed emit: a request whose
+            # only audit attempt raised (e.g. a sink outage) must stay
+            # eligible for a genuine retry — the F8 safety net's own guarded
+            # audit() call is exactly that retry — instead of being silently
+            # deduped away with zero records ever written.
             logger.error("litellm_audit_emit_failed request_id=%s status=%s", request_id, status)
             raise
+        # Pop only after a confirmed-successful emit, so `_req_state` never
+        # grows unbounded past this point either.
+        self._req_state.pop(request_id, None)
         self._audited_ids[request_id] = None
         if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
             self._audited_ids.popitem(last=False)
@@ -1338,7 +1411,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     # ---- internals --------------------------------------------------------
 
     @staticmethod
-    def _ensure_request_id(data: dict[str, Any]) -> str:
+    def _ensure_request_id(data: Any) -> str:
         """Return a stable id that survives the pre_call → log-event handoff.
 
         litellm's own per-call id, ``litellm_call_id``, is the one identifier
@@ -1369,7 +1442,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         let a caller forge log lines. A candidate that fails validation is
         treated as absent, falling through to the next lookup path or the
         generated UUID.
+
+        Called both inside and outside every F8 safety net (including from
+        within an `except` block), so it must never raise itself — a
+        non-dict `data` would otherwise escape as a raw `AttributeError`
+        whose `__context__` carries whatever exception was already being
+        handled (M1-14 surface iii). A non-dict `data` gets a fresh,
+        unscattered UUID instead.
         """
+        if not isinstance(data, dict):
+            return str(uuid.uuid4())
         call_id = data.get("litellm_call_id")
         if isinstance(call_id, str) and _valid_request_id(call_id):
             _scatter(data, call_id)
@@ -1993,6 +2075,29 @@ def _make_tool_call_chunk(index: int, arguments: str) -> dict[str, Any]:
 
 def _make_function_call_chunk(arguments: str) -> dict[str, Any]:
     return {"choices": [{"delta": {"function_call": {"arguments": arguments}}}]}
+
+
+def _flush_stream_tails(
+    sse: SseStreamDesanitizer,
+    dict_desanitizer: StreamingDesanitizer,
+    dict_tool_calls: OpenAiToolCallDesanitizer,
+    dict_function_call: StreamingDesanitizer,
+    responses_desanitizer: ResponsesStreamDesanitizer,
+) -> Iterator[Any]:
+    """Flush every stream desanitizer's held-back tail, in the fixed order
+    the normal end-of-stream path uses. Shared with both stream-failure
+    paths so an aborted stream doesn't silently drop already-buffered
+    (partially desanitized) content."""
+    yield from sse.flush()
+    tail = dict_desanitizer.flush()
+    if tail:
+        yield _replace_chunk_text(_make_text_chunk(), tail)
+    for tc_index, tc_tail in dict_tool_calls.flush():
+        yield _make_tool_call_chunk(tc_index, tc_tail)
+    fc_tail = dict_function_call.flush()
+    if fc_tail:
+        yield _make_function_call_chunk(fc_tail)
+    yield from responses_desanitizer.flush()
 
 
 def _desanitize_chunk_tool_calls(

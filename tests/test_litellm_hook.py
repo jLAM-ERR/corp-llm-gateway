@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-from corp_llm_gateway.audit import AuditLogger, ListSink, Sink
+from corp_llm_gateway.audit import AuditLogger, AuditWriteAmbiguousError, ListSink, Sink
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
@@ -387,6 +387,22 @@ async def test_pre_call_wrapper_does_not_swallow_cancelled_error() -> None:
     assert sink.records == []
 
 
+async def test_pre_call_non_dict_data_returns_opaque_500() -> None:
+    """Minor: `_ensure_request_id` must never raise itself — a non-dict
+    `data` must not escape as a raw `AttributeError`, which (fired from
+    inside the safety net's own `except` block) would carry the ORIGINAL
+    exception via `__context__` (M1-14 surface iii)."""
+    g, _sink = _build_guardrail()
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(["not", "a", "dict"])  # type: ignore[arg-type]
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    assert ei.value.__cause__ is None
+    assert ei.value.__context__ is None or ei.value.__suppress_context__
+
+
 class _RaisingSink(Sink):
     """An audit sink whose transport is down — write() always raises."""
 
@@ -422,22 +438,53 @@ async def test_post_call_unary_unexpected_error_returns_opaque_500() -> None:
     assert sink.records[0]["error_code"] == "E_INTERNAL"
 
 
-async def test_post_call_stream_mid_iteration_error_returns_opaque_500() -> None:
-    """Major: a failure mid-stream (not just on entry) must be caught too —
-    wrapping a generator with try/except only guards the first `__anext__`
-    unless the `async for` itself lives inside the try."""
+async def test_post_call_stream_upstream_error_propagates_unconverted() -> None:
+    """Major: a failure fetching the NEXT chunk from the upstream iterator
+    (e.g. a mid-stream `httpx.RemoteProtocolError`) is not our bug — it must
+    reach litellm untouched, not get relabelled E_INTERNAL and swallowed as
+    an unrecoverable, unclassified gateway failure."""
     g, sink = _build_guardrail([("alice", "[N1]")])
     data = _data_with_token("tok-1", content="hi alice")
     await g.pre_call(data)
 
     async def _raising_iter() -> AsyncIterator[Any]:
         yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
-        raise RuntimeError("upstream stream broke for alice")
+        raise httpx.RemoteProtocolError("peer reset")
 
     chunks = []
-    with pytest.raises(GuardrailHttpException) as ei:
+    with pytest.raises(httpx.RemoteProtocolError):
         async for chunk in g.post_call_stream(data, _raising_iter()):
             chunks.append(chunk)
+
+    # No fabricated E_INTERNAL for a real provider failure — litellm owns it.
+    assert sink.records == []
+
+
+async def test_post_call_stream_own_bug_mid_stream_returns_opaque_500() -> None:
+    """Major: a bug in OUR OWN desanitization work mid-stream (as opposed to
+    an upstream transport failure) must still be caught and mapped to an
+    opaque 500 — this runs after placeholders were replaced by originals."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    async def _good_iter() -> AsyncIterator[Any]:
+        yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
+        yield {"choices": [{"delta": {"content": " again [N1]"}}]}
+
+    import corp_llm_gateway.litellm_hook as hook_mod
+
+    def _boom(chunk: Any) -> str | None:
+        raise RuntimeError("desanitize bug for alice")
+
+    original = hook_mod._extract_chunk_text
+    hook_mod._extract_chunk_text = _boom  # type: ignore[assignment]
+    try:
+        with pytest.raises(GuardrailHttpException) as ei:
+            async for _chunk in g.post_call_stream(data, _good_iter()):
+                pass
+    finally:
+        hook_mod._extract_chunk_text = original
 
     assert ei.value.status_code == 500
     assert ei.value.error_code == "E_INTERNAL"
@@ -483,6 +530,65 @@ async def test_reentrant_audit_failure_does_not_double_count_component_failure()
     # happened (dlp), not doubled with an "internal" for the same request.
     assert ei.value.error_code == "E_INTERNAL"
     assert metrics.failures == ["dlp"]
+    # A confirmed-failed emit + the safety net's own retry both call audit()
+    # for this request — the latency histogram must still see it only once.
+    assert len(metrics.latencies) == 1
+
+
+class _AmbiguousAckSink(Sink):
+    """Simulates a sink whose write() call already persisted the record
+    downstream before raising — e.g. an HTTP response was accepted but
+    reading the acknowledgement timed out."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    async def write(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
+        raise AuditWriteAmbiguousError("ack read timed out")
+
+
+async def test_reentrant_audit_ambiguous_delivery_does_not_duplicate_and_keeps_state() -> None:
+    """Major: a sink that delivers-then-fails-the-ack must not have the
+    safety net retry-emit a second record for the same request. And whatever
+    WAS recorded must carry the real block_reason/user_id, not "unknown"/None
+    from a state destroyed by popping `_req_state` before emit."""
+    metrics = _RecordingMetrics()
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = _AmbiguousAckSink()
+    g = CorpLlmGuardrail(
+        orch,
+        AuthMiddleware(token_store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+        metrics=metrics,
+    )
+    raw_key = "sk-" + "a" * 48
+    data = _data_with_token("tok-1", content=f"my key is {raw_key}")
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+
+    assert ei.value.error_code == "E_INTERNAL"
+    assert metrics.failures == ["dlp"]
+
+    # Exactly one delivered record — the safety net must not retry an
+    # ambiguous (possibly-already-delivered) audit write.
+    assert len(sink.records) == 1
+    record = sink.records[0]
+    assert record["user_id"] == "alice"
+    assert record["block_reason"] == "dlp:secret_leak"
 
 
 def _case_missing_token() -> tuple[CorpLlmGuardrail, dict[str, Any]]:

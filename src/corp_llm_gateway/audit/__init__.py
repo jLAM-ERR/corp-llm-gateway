@@ -16,12 +16,13 @@ from corp_llm_gateway.audit.retention import (
     lifecycle_configuration,
     lifecycle_rule_for,
 )
-from corp_llm_gateway.audit.sinks import ListSink, Sink, StdoutSink
+from corp_llm_gateway.audit.sinks import AuditWriteAmbiguousError, ListSink, Sink, StdoutSink
 
 __all__ = [
     "NEVER_FIELDS",
     "AuditEvent",
     "AuditLogger",
+    "AuditWriteAmbiguousError",
     "LangfuseIngestionError",
     "LangfuseSink",
     "ListSink",

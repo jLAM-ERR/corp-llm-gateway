@@ -7,6 +7,7 @@ import pytest
 
 from corp_llm_gateway.audit import (
     AuditEvent,
+    AuditWriteAmbiguousError,
     LangfuseIngestionError,
     LangfuseSink,
 )
@@ -210,3 +211,43 @@ async def test_transport_error_raises_ingestion_error() -> None:
     sink = LangfuseSink("https://x", public_key="pk", secret_key="sk", http=http)
     with pytest.raises(LangfuseIngestionError, match="transport error"):
         await sink.write_event(_event())
+
+
+async def test_read_timeout_raises_ambiguous_delivery_error() -> None:
+    """The request may have already reached/been processed by Langfuse when
+    only the response read times out — callers must not treat this the same
+    as a confirmed non-delivery (e.g. a caller retry would risk writing a
+    duplicate record for one logical write)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("ack read timed out")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    sink = LangfuseSink("https://x", public_key="pk", secret_key="sk", http=http)
+    with pytest.raises(AuditWriteAmbiguousError):
+        await sink.write_event(_event())
+
+
+async def test_remote_protocol_error_raises_ambiguous_delivery_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("peer reset")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    sink = LangfuseSink("https://x", public_key="pk", secret_key="sk", http=http)
+    with pytest.raises(AuditWriteAmbiguousError):
+        await sink.write_event(_event())
+
+
+async def test_connect_error_is_not_ambiguous_delivery_error() -> None:
+    """A connection that never gets established is confirmed non-delivery,
+    not ambiguous — it must stay a plain (retry-safe) LangfuseIngestionError,
+    not the ambiguous variant."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    sink = LangfuseSink("https://x", public_key="pk", secret_key="sk", http=http)
+    with pytest.raises(LangfuseIngestionError) as ei:
+        await sink.write_event(_event())
+    assert not isinstance(ei.value, AuditWriteAmbiguousError)
