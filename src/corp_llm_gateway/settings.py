@@ -107,8 +107,9 @@ KEYS: tuple[Key, ...] = (
         "CORP_LLM_STRIP_INBOUND_HEADERS",
         flag=True,
         default="0",
-        help="strip inbound wire headers before forwarding to upstream; reserved for "
-        "deployments that enable litellm's forward_client_headers_to_llm_api",
+        help="strip inbound wire headers (Host, User-Agent, ...) before forwarding to "
+        "upstream; the guardrail sets data['headers'] unconditionally, so this matters "
+        "regardless of litellm's forward_client_headers_to_llm_api",
     ),
     # Choices validated by normalize_oversize_policy (see _check_oversize), not
     # the generic choice check, so the canonical error message is used once.

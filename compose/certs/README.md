@@ -26,7 +26,12 @@ for anyone who set it.
 `SSL_CERT_FILE` is therefore **not** set from `.env`. `compose/docker-compose.yml`
 fixes it at a combined-bundle path the container's entrypoint builds at
 boot: certifi's public roots, plus `corp-ca-bundle.pem` appended if this
-directory has one. Leave `CORP_LLM_CA_BUNDLE` commented out (the
+directory has one. This **replaces the base image's OS trust store** for
+every aiohttp client in the container — the entrypoint runs before `exec
+litellm`, so nothing reads the image's own `/etc/ssl/certs` afterward. That
+build now aborts boot on failure (`set -e` in the entrypoint command) rather
+than leaving `SSL_CERT_FILE` pointing at a 0-byte or corp-CA-only file — see
+`compose/docker-compose.yml`. Leave `CORP_LLM_CA_BUNDLE` commented out (the
 `.env.example` default) when the corp vLLM's certificate already chains to a
 publicly-trusted root — `CorpLlmClient` then falls back to its own default
 trust store, and the combined bundle still has the public roots either way.

@@ -75,8 +75,24 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 | `CORP_LLM_OVERSIZE_DELIVER_TEAMS` | teams allowed the `deliver-flag` path | `""` | no |
 | `CORP_LLM_REQUIRE_NER` | fail closed when NER absent (F2) | `0` | prod: **yes** |
 | `CORP_LLM_ORACLE_TRIGGER` | `gazetteer_hit` \| `any_local_finding` \| `sampled:<pct>` \| `always` (F3) | `gazetteer_hit` | no |
-| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers before forwarding to upstream; reserved for deployments that enable litellm's `forward_client_headers_to_llm_api` — inert otherwise | `0` | no |
 | `CORP_LLM_LOG_LEVEL` | log level | `INFO` | no |
+
+### Header forwarding to upstream
+
+Transport knobs, not detection-pipeline ones — they run downstream of the
+cascade above, on the already-sanitized request.
+
+| Key | Purpose | Default | Required |
+|-----|---------|---------|----------|
+| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Type`, ...) before forwarding to upstream | `0` | no |
+
+`CorpLlmGuardrail.async_pre_call_hook` sets `data["headers"]` **unconditionally**
+(`litellm_hook.py:340`), independent of litellm's own
+`forward_client_headers_to_llm_api` gate — litellm forwards whatever ends up
+in `data["headers"]` regardless of how it got there. This flag is
+load-bearing wherever the guardrail runs in front of any litellm provider,
+not a no-op reserved for a future config: see `compose/README.md` "Why not
+BYOK" for a wire-verified writeup. It never touches `Authorization`.
 
 ### Backends
 

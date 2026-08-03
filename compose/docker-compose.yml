@@ -12,6 +12,11 @@
 # here would make this stack's `gateway-*-data` volumes collide with the
 # demo's, silently attaching its already-initialised Postgres (no `litellm`
 # database, no gateway schema, Cache B pre-seeded with demo data).
+#
+# The default GATEWAY_IMAGE_TAG (.env.example) is a published rc that
+# predates this branch — see docker-compose.build.yml to run this branch's
+# code instead, and compose/README.md for why that matters before a real
+# deploy (Workstream B's corp NER work is not in any published tag yet).
 name: corp-llm-gateway-prod
 
 services:
@@ -54,9 +59,13 @@ services:
     restart: unless-stopped
 
   litellm:
-    # Prebuilt image only — compose never rebuilds it and never `pip install
-    # -e`s at boot (that's a docker-compose.demo.yml affordance). Built from
-    # Dockerfile.gateway, whose ENTRYPOINT is
+    # Prebuilt image by default — compose never rebuilds it and never `pip
+    # install -e`s at boot (that's a docker-compose.demo.yml affordance).
+    # `docker compose -f docker-compose.yml -f docker-compose.build.yml`
+    # builds THIS BRANCH's code from Dockerfile.gateway instead — required
+    # to get CORP_LLM_STRIP_INBOUND_HEADERS and Workstream B's corp NER
+    # work, neither of which is in the published GATEWAY_IMAGE_TAG below.
+    # Built from Dockerfile.gateway, whose ENTRYPOINT is
     # `litellm --config /etc/litellm/config.yaml --port 4000`; the
     # entrypoint/command override below runs the same command, prefixed with
     # the SSL_CERT_FILE bundle build (see the environment block).
@@ -93,22 +102,39 @@ services:
       # (settings.validate() would refuse to boot on this — build_guardrail()
       # doesn't call it, so the failure only surfaces on the first hit).
       # Flip to 1 only once CORP_LLM_ENDPOINT points at a reachable corp vLLM.
+      # Coupled to CORP_LLM_LOCAL_FIRST (not set here, so it keeps its
+      # settings.py default "1"): bootstrap.build_guardrail() raises
+      # ConfigError(NO_OP_SANITIZER_MESSAGE) at boot if BOTH the oracle and
+      # local-first are off — don't set CORP_LLM_LOCAL_FIRST=0 in .env
+      # without also flipping this to 1, or the container won't start.
       - CORP_LLM_ORACLE_ENABLED=${CORP_LLM_ORACLE_ENABLED:-0}
-      # Reserved: only takes effect once this stack's litellm config also
-      # sets forward_client_headers_to_llm_api (it doesn't today), the one
-      # gate that puts inbound headers into data["headers"] for ANY route.
-      # Without it, no wire header — including Host — reaches any upstream,
-      # so this flag is currently inert. See settings.py
+      # Load-bearing, not reserved: our own guardrail sets data["headers"]
+      # UNCONDITIONALLY at litellm_hook.py:340, independent of litellm's own
+      # forward_client_headers_to_llm_api gate. Wire-captured against a
+      # stand-in upstream: host/user-agent/accept/connection/content-type/
+      # content-length (plus an arbitrary probe header) all reached the
+      # upstream call on BOTH corp-* and claude-* routes with this off;
+      # none did with it on. Keep "1". See settings.py
       # CORP_LLM_STRIP_INBOUND_HEADERS / bootstrap.build_guardrail().
       - CORP_LLM_STRIP_INBOUND_HEADERS=${CORP_LLM_STRIP_INBOUND_HEADERS:-1}
       # F9 guard (config.py is_prod()): arms the refusal of SSL_VERIFY=false
-      # on the corp-LLM call, which carries raw user content.
+      # on the corp-LLM ORACLE call specifically — reached only through
+      # build_corp_llm_client(), itself called only when
+      # CORP_LLM_ORACLE_ENABLED=1 (default 0 below), so it does not fire on
+      # this stack's default posture. Kept set for when the oracle is enabled.
       - CORP_ENV=${CORP_ENV:-production}
       # F2: a self-disabled NER engine must fail closed, not silently return
       # no findings and let a PERSON/ORG egress. Load-bearing in production —
       # see helm/corp-llm-gateway/values-prod.yaml.
       - CORP_LLM_REQUIRE_NER=${CORP_LLM_REQUIRE_NER:-1}
-      - SSL_VERIFY=${SSL_VERIFY:-true}
+      # Hardcoded, NOT sourced from .env: litellm's own get_ssl_verify()
+      # reads this SAME variable directly, at HIGHER priority than
+      # SSL_CERT_FILE, for every upstream provider (anthropic/, openai/,
+      # hosted_vllm/) — and unlike the F9 guard above, that read has no
+      # CORP_ENV gate. An operator-settable "false" here would silently
+      # disable certificate verification stack-wide. See
+      # docs/security.md "Known gaps" and compose/README.md.
+      - SSL_VERIFY=true
       # Gateway-held provider keys (see compose/README.md "Virtual keys" —
       # native anthropic/openai routing can't forward a per-developer key).
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -131,12 +157,22 @@ services:
       # api.openai.com too. See compose/certs/README.md.
       - SSL_CERT_FILE=/tmp/corp-ca-bundle.pem
     entrypoint: ["sh", "-c"]
+    # `set -e`: a failing certifi lookup or a failing `cat` must abort boot,
+    # not leave SSL_CERT_FILE pointing at a 0-byte (or corp-CA-only) trust
+    # store with `exec litellm` still starting. Also replaces the image's OS
+    # trust store with certifi's roots (+ the corp CA, if mounted) — see
+    # compose/certs/README.md.
+    # $$ (not $) below: docker compose's own ${VAR}/$VAR interpolation runs
+    # BEFORE this reaches the shell, and would otherwise try to substitute
+    # $certifi_bundle as a compose variable (silently blanking it).
     command:
-      - >-
-        { cat "$(python3 -c 'import certifi; print(certifi.where())')";
+      - |-
+        set -e
+        certifi_bundle="$$(python3 -c 'import certifi; print(certifi.where())')"
+        cat "$$certifi_bundle" > /tmp/corp-ca-bundle.pem
         if [ -f /etc/corp-llm-gateway/certs/corp-ca-bundle.pem ]; then
-        cat /etc/corp-llm-gateway/certs/corp-ca-bundle.pem; fi; }
-        > /tmp/corp-ca-bundle.pem &&
+          cat /etc/corp-llm-gateway/certs/corp-ca-bundle.pem >> /tmp/corp-ca-bundle.pem
+        fi
         exec litellm --config /etc/litellm/config.yaml --port 4000
     ports:
       # Loopback only — no TLS on this port until the nginx profile (C1)

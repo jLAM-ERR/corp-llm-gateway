@@ -16,14 +16,39 @@ cp .env.example .env
 chmod 0600 .env
 # edit .env: GATEWAY_IMAGE_TAG, POSTGRES_PASSWORD, LITELLM_MASTER_KEY,
 # UI_USERNAME, UI_PASSWORD, and at least one of ANTHROPIC_API_KEY/OPENAI_API_KEY
+cp ../src/corp_llm_gateway/tokens/schema.sql postgres/initdb/01-schema.sql
 docker compose up -d
-docker compose ps                              # all healthy
+docker compose ps                              # wait ~30-60s (start_period) for "healthy"
 curl http://localhost:4000/health/liveliness
 ```
+
+Skipping the `01-schema.sql` staging step is a silent trap, not an obvious
+failure: `docker compose ps` reports everything healthy and
+`/health/liveliness` answers, but every real request 500s because
+`corp_tokens`/`team_config` don't exist. See
+`compose/postgres/initdb/README.md` for what each init script does and how
+to re-stage after an upgrade.
 
 `GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, `LITELLM_MASTER_KEY`, `UI_USERNAME`
 and `UI_PASSWORD` have no default — `docker compose up` refuses to start with
 a clear "set X in .env" error rather than silently booting half-configured.
+
+## Building from this branch
+
+The `GATEWAY_IMAGE_TAG` default (`.env.example`) is a published rc that
+predates whichever branch you're reading this on — features landing here
+(e.g. `CORP_LLM_STRIP_INBOUND_HEADERS`, Workstream B's corp NER
+integration) are silently absent from that tag until a new rc is cut and
+`GATEWAY_IMAGE_TAG` is bumped to it. To run the current branch's code
+instead of the published tag:
+
+```
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+**This is a dev/staging convenience, not a substitute for a release.**
+`GATEWAY_IMAGE_TAG` must point at an rc containing Workstream B's corp NER
+work before this stack is production-ready — treat that as a release gate.
 
 ## Upstream routing
 
@@ -68,32 +93,41 @@ on every request:
 
 ## Why not BYOK
 
-litellm forwards an inbound request header to ANY upstream provider only
-through `data["headers"]`, which is populated only when
-`forward_client_headers_to_llm_api` is set — either on `general_settings` or
-per model group (`litellm/proxy/litellm_pre_call_utils.py`
-`add_litellm_data_for_backend_llm_call` / `add_headers_to_llm_call_by_model_group`)
-— and even then it forwards only `x-*` headers plus `anthropic-beta`, never
-`Authorization`. Neither setting appears anywhere in `litellm/config.yaml`.
-Verified twice: against litellm 1.85.0 (the pinned image) and independently
-against 1.90.1; see `examples/compose/README.md` "BYOK in local mode (SPIKE
-finding)" for the native-provider half of the writeup.
+Two independent findings, both narrower than an earlier revision of this
+README claimed — read carefully, the mechanisms are different.
 
-**No inbound header — `Authorization` or `Host` — reaches any upstream on
-this stack, on any route, including `corp-*`.** The `corp-*` /
-`hosted_vllm/` route builds its upstream request the same way `anthropic/`
-and `openai/` do: from the configured `api_key` and model params, never from
-wire headers. An earlier revision of this README claimed `hosted_vllm/`
-passed inbound headers through and that `CORP_LLM_STRIP_INBOUND_HEADERS=1`
-was needed to stop a `Host` header 503ing the corp ingress — that was wrong;
-without `forward_client_headers_to_llm_api`, the header the flag strips
-never reaches litellm's provider layer in the first place, so the flag is
-currently inert on this stack. It stays set (see `.env.example`) as a
-reserved seam for a future deployment that does enable header forwarding.
+**(a) Native `anthropic/`/`openai/` credentials never come from the client.**
+Those providers build their upstream credential from the configured
+`api_key` (`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`) and never read the inbound
+`Authorization` header. Verified twice: against litellm 1.85.0 (the pinned
+image) and independently against 1.90.1; see `examples/compose/README.md`
+"BYOK in local mode (SPIKE finding)".
+
+**(b) Our own guardrail forwards inbound wire headers regardless of
+litellm's own gate — that's what `CORP_LLM_STRIP_INBOUND_HEADERS` is for.**
+litellm's `forward_client_headers_to_llm_api` gate (`litellm/proxy/
+litellm_pre_call_utils.py`, `add_litellm_data_for_backend_llm_call` /
+`add_headers_to_llm_call_by_model_group`) is correctly unset in
+`litellm/config.yaml` — litellm itself does not copy client headers into
+`data["headers"]`. But `CorpLlmGuardrail.async_pre_call_hook` sets
+`data["headers"]` **unconditionally** (`litellm_hook.py:340`), independent
+of that gate, and litellm forwards whatever ends up in `data["headers"]` to
+the upstream HTTP call regardless of how it got there. Wire-captured
+against a stand-in upstream: `host`, `user-agent`, `accept`, `connection`,
+`content-type`, `content-length` and an arbitrary probe header all reached
+the upstream call, on **both** `corp-*` and `claude-*` routes, with the
+strip flag off; none did with it on. So `CORP_LLM_STRIP_INBOUND_HEADERS` is
+load-bearing on this stack, not a reserved no-op — it's set `1` in
+`docker-compose.yml`/`.env.example`. It never touches `Authorization` (see
+`litellm_hook.py` `_WIRE_HEADERS_TO_DROP` — BYOK passthrough, invariant #3,
+is preserved for deployments that DO forward it).
 
 BYOK (the developer's own key forwarded untouched — CLAUDE.md invariant #3)
-is **not available on this compose stack at all**, on any route. Developers
-authenticate with the litellm virtual key described above, full stop.
+is nonetheless **not available on this compose stack at all**, on any
+route: developers authenticate with the litellm virtual key described
+above, and the `corp-*`/`hosted_vllm/` route builds its upstream request
+from the configured `api_key`/model params the same way `anthropic/` and
+`openai/` do, not from a forwarded client `Authorization`. Full stop.
 
 ## TLS to the corp vLLM
 
@@ -150,9 +184,39 @@ deployment" for the recreate / manual `CREATE DATABASE` fix.
 ## Environment posture
 
 `CORP_ENV=production` arms the F9 guard (`config.py` `is_prod()`): an
-operator's `SSL_VERIFY=false` on the corp-LLM call is refused rather than
-silently disabling TLS verification on the path carrying raw user content.
-`CORP_LLM_REQUIRE_NER=1` makes a self-disabled NER engine fail closed
-(`NerUnavailableError`) instead of silently returning no findings and
-letting a PERSON/ORG egress (F2). Both are set by default in `.env.example`;
-do not clear them for a real deploy.
+operator's `SSL_VERIFY=false` on the corp-LLM **oracle** call is refused
+rather than silently disabling TLS verification there. F9 only reaches that
+guard through `build_corp_llm_client()`, which runs only when
+`CORP_LLM_ORACLE_ENABLED=1` — off by default on this stack — so treat it as
+a narrow oracle-only protection, not a blanket one (see "TLS verification is
+always on" below). `CORP_LLM_REQUIRE_NER=1` makes a self-disabled NER engine
+fail closed (`NerUnavailableError`) instead of silently returning no
+findings and letting a PERSON/ORG egress (F2). Both are set by default in
+`.env.example`; do not clear them for a real deploy.
+
+**TLS verification is always on.** `SSL_VERIFY` is hardcoded `true` in
+`docker-compose.yml` and is **not** an `.env` key — litellm's own
+`get_ssl_verify()` reads that same variable directly, at *higher* priority
+than `SSL_CERT_FILE`, for every upstream provider (`anthropic/`, `openai/`,
+`hosted_vllm/`), with no `CORP_ENV` guard on that read. An operator-settable
+`SSL_VERIFY=false` here would silently disable certificate verification
+stack-wide, not just for the oracle. See `docs/security.md` "Known
+gaps/follow-ups" — widening F9 to cover litellm's read is a `src` follow-up,
+out of scope for this compose stack.
+
+**`CORP_LLM_ORACLE_ENABLED` and `CORP_LLM_LOCAL_FIRST` are coupled.**
+`bootstrap.build_guardrail()` raises `ConfigError(NO_OP_SANITIZER_MESSAGE)`
+at boot if both are off — the gateway refuses to run as a no-op sanitizer.
+This stack leaves `CORP_LLM_LOCAL_FIRST` unset (its `settings.py` default is
+`"1"`), so the default posture is safe; don't set it to `0` in `.env`
+without also setting `CORP_LLM_ORACLE_ENABLED=1`, or the container fails to
+boot with no other warning.
+
+## Operator CLI (gateway-admin)
+
+`gateway-admin team create` / `token issue` and other RBAC-gated mutations
+need either `CORP_GATEWAY_ADMIN_TOKEN` (an operator JWT) or
+`CORP_GATEWAY_RBAC=0` (dev bypass) — **neither is set in the `litellm`
+service's environment today**. Export one of them on the machine running
+`gateway-admin` before issuing tokens or creating teams against this
+deployment; see `docs/ops/admin-cli.md`.

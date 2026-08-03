@@ -7,8 +7,10 @@
 # upstream credential from the `api_key` below and never read the inbound
 # client Authorization header. That header instead carries a LiteLLM virtual
 # key, consumed by litellm itself before routing — see "Virtual keys" below.
-# BYOK (raw client Authorization forwarded untouched) is retained ONLY on the
-# corp-* / hosted_vllm route.
+# BYOK (the developer's own Authorization forwarded untouched) is **not
+# available on ANY route in this stack, including corp-*/hosted_vllm** — see
+# compose/README.md "Why not BYOK". Developers authenticate with virtual
+# keys, full stop.
 model_list:
   - model_name: "claude-*"
     litellm_params:

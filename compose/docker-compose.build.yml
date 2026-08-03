@@ -1,0 +1,24 @@
+# Build overlay: run THIS BRANCH's code instead of pulling the published
+# GATEWAY_IMAGE_TAG.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# The default GATEWAY_IMAGE_TAG (1.0.0-rc.5, see .env.example) predates this
+# branch: it was built from 30e41da, before CORP_LLM_STRIP_INBOUND_HEADERS
+# existed in settings.KEYS/build_guardrail() — so the header-stripping
+# mitigation documented in compose/README.md "Why not BYOK" is silently
+# absent on that tag. It also predates Workstream B's corp NER integration.
+#
+# This is a dev/staging convenience for running the current branch, NOT a
+# substitute for cutting a release: `GATEWAY_IMAGE_TAG` in `.env` must be
+# bumped to an rc containing Workstream B's corp NER work before this stack
+# is production-ready — that is a release gate, not a detail.
+#
+# context: `..` because this file lives in `compose/`, but `Dockerfile.gateway`
+# expects the repo root as build context (it COPYs `pyproject.toml`,
+# `README.md` and `src/` from there).
+services:
+  litellm:
+    build:
+      context: ..
+      dockerfile: Dockerfile.gateway

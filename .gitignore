@@ -30,7 +30,6 @@ helm/*/Chart.lock
 # operator-provided corp CA bundle — never commit real internal PKI material
 crt/*.pem
 crt/*.crt
-!crt/README.md
 
 # compose/ production stack — operator secrets and staged/site-specific material
 compose/.env
@@ -45,7 +44,6 @@ compose/nginx/certs/*.key
 compose/nginx/certs/*.p12
 compose/nginx/certs/*.pfx
 compose/postgres/initdb/*.sql
-!compose/postgres/initdb/*.sh
 
 # Internal research, decision records, and benchmarks — maintainer / product-owner only.
 # Kept on disk locally, excluded from the published tree (see README: only public docs are linked).
