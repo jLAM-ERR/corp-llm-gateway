@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -14,11 +15,13 @@ from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
+from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.rules import Gazetteer, Rule, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.placeholder import StaleSpanError
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import (
+    AuthError,
     AuthMiddleware,
     InMemoryTokenStore,
     TokenInfo,
@@ -63,6 +66,41 @@ class _RaisingTokenStore(TokenStore):
 
     async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
         raise NotImplementedError
+
+
+class _CancellingTokenStore(TokenStore):
+    """Simulates the auth backend being cancelled mid-lookup (request timeout /
+    server shutdown). ``asyncio.CancelledError`` is a ``BaseException`` in
+    Python 3.8+, NOT an ``Exception`` — the F8 wrapper's ``except Exception``
+    must not catch it."""
+
+    async def lookup(self, corp_token: str) -> TokenInfo | None:
+        raise asyncio.CancelledError
+
+    async def revoke_user(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+        raise NotImplementedError
+
+
+class _RecordingMetrics(MetricsExporter):
+    """Records every call instead of exporting — used to assert the F8 wrapper
+    still fires `gateway_failure{component}` on the unexpected-error path."""
+
+    def __init__(self) -> None:
+        self.blocks: list[str] = []
+        self.failures: list[str] = []
+        self.latencies: list[tuple[float, str]] = []
+
+    def record_block(self, block_reason: str) -> None:
+        self.blocks.append(block_reason)
+
+    def record_failure(self, component: str) -> None:
+        self.failures.append(component)
+
+    def observe_request_latency(self, seconds: float, *, status: str) -> None:
+        self.latencies.append((seconds, status))
 
 
 def _corp_llm_returning(pairs: list[tuple[str, str]]) -> CorpLlmClient:
@@ -311,6 +349,165 @@ async def test_pre_call_backend_db_error_returns_opaque_500(caplog: Any) -> None
     serialized = json.dumps(sink.records[0])
     assert "corp_tokens" not in serialized
     assert sink.records[0]["error_code"] == "E_INTERNAL"
+
+
+async def test_pre_call_unexpected_error_records_metrics_failure() -> None:
+    """F8: an unexpected backend exception must still increment
+    gateway_failure{component="internal"} — otherwise a real outage on this
+    path is invisible to the runbook's alerting query, and an operator has
+    no signal that anything went wrong at all."""
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    metrics = _RecordingMetrics()
+    g = CorpLlmGuardrail(orch, AuthMiddleware(_RaisingTokenStore()), audit_logger, metrics=metrics)
+
+    with pytest.raises(GuardrailHttpException):
+        await g.pre_call(_data_with_token("tok-1"))
+
+    assert metrics.failures == ["internal"]
+
+
+async def test_pre_call_wrapper_does_not_swallow_cancelled_error() -> None:
+    """The F8 safety-net wrapper's `except Exception` must NOT catch
+    `asyncio.CancelledError` — it is a `BaseException`, not an `Exception`, in
+    every Python version this repo supports. Catching it would convert a
+    cancelled/timed-out request into a fabricated 500 E_INTERNAL and defeat
+    task cancellation (a hung request would appear to "complete" instead)."""
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(orch, AuthMiddleware(_CancellingTokenStore()), audit_logger)
+
+    with pytest.raises(asyncio.CancelledError):
+        await g.pre_call(_data_with_token("tok-1"))
+
+    # The wrapper's except block never ran, so no failure was recorded — a
+    # cancellation is not a gateway failure and must not be reported as one.
+    assert sink.records == []
+
+
+def _case_missing_token() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail()
+    return g, {"messages": [], "headers": {}}
+
+
+def _case_bad_request() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail()
+    data = _data_with_token("tok-1", content="hi")
+    data["messages"] = "not-a-list"
+    return g, data
+
+
+def _case_policy_blocked_ambiguous_shape() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail()
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": [],
+        "input": ["anything"],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    return g, data
+
+
+def _case_provider_auth() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail(forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "headers": {"X-Corp-Auth": "tok-1"},
+    }
+    return g, data
+
+
+def _case_corp_llm_down() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
+    data = _data_with_token("tok-1", content="hello")
+    return g, data
+
+
+def _case_dlp_blocked() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail(pairs=[])
+    raw_key = "sk-" + "a" * 48
+    data = _data_with_token("tok-1", content=f"my key is {raw_key}")
+    return g, data
+
+
+@pytest.mark.parametrize(
+    ("case_factory", "expected_status", "expected_error_code"),
+    [
+        (_case_missing_token, 401, "E_MISSING_TOKEN"),
+        (_case_bad_request, 400, "E_BAD_REQUEST"),
+        (_case_policy_blocked_ambiguous_shape, 422, "E_POLICY_BLOCKED"),
+        (_case_provider_auth, 401, "E_PROVIDER_AUTH"),
+        (_case_corp_llm_down, 503, "E_CORP_LLM_DOWN"),
+        (_case_dlp_blocked, 422, "E_DLP_BLOCKED"),
+    ],
+    ids=[
+        "missing_token",
+        "bad_request",
+        "policy_blocked_stage0",
+        "provider_auth",
+        "corp_llm_down",
+        "dlp_blocked_stage5",
+    ],
+)
+async def test_pre_call_wrapper_preserves_named_error_codes(
+    case_factory: Any, expected_status: int, expected_error_code: str
+) -> None:
+    """F8 regression guard: the pre_call safety-net wrapper's
+    `except GuardrailHttpException: raise` must pass every deliberately
+    raised, already-classified error through UNCHANGED — never flatten it to
+    500 E_INTERNAL. NER (both call sites) is pinned separately by
+    test_pre_call_ner_required_but_absent_returns_503_not_500 /
+    test_pre_call_ner_required_but_absent_on_system_returns_503;
+    E_PROVIDER_BLOCKED / E_PROFILE_UNAVAILABLE are pinned in
+    tests/sanitizer/test_profile_orchestrator.py (they need a profile-file
+    fixture) — both already exercise this same `pre_call` wrapper."""
+    g, data = case_factory()
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == expected_status
+    assert ei.value.error_code == expected_error_code
+
+
+async def test_auth_error_message_lookup_falls_back_safely_for_unmapped_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_AUTH_ERROR_MESSAGES.get(error_code, "authentication failed")` must
+    degrade to the static default for any AuthError subclass
+    `_classify_auth_error` hasn't been taught about yet — never a KeyError,
+    never `str(exc)` (which could carry backend-derived detail, the exact
+    defect class this lookup table replaced)."""
+    import corp_llm_gateway.litellm_hook as hook_module
+
+    class _FutureAuthError(AuthError):
+        pass
+
+    class _FutureRaisingTokenStore(TokenStore):
+        async def lookup(self, corp_token: str) -> TokenInfo | None:
+            raise _FutureAuthError("backend-derived detail that must never reach the client")
+
+        async def revoke_user(self, user_id: str) -> int:
+            raise NotImplementedError
+
+        async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+            raise NotImplementedError
+
+    monkeypatch.setattr(hook_module, "_classify_auth_error", lambda exc: "E_FUTURE_AUTH_CODE")
+
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(orch, AuthMiddleware(_FutureRaisingTokenStore()), audit_logger)
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(_data_with_token("tok-1"))
+
+    assert ei.value.status_code == 401
+    assert ei.value.error_code == "E_FUTURE_AUTH_CODE"
+    assert "backend-derived detail" not in str(ei.value)
+    assert str(ei.value) == "401 E_FUTURE_AUTH_CODE: authentication failed"
 
 
 async def test_pre_call_sanitizes_responses_input_instructions_and_tool_output() -> None:
