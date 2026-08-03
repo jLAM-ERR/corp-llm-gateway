@@ -110,7 +110,7 @@ litellm_pre_call_utils.py`, `add_litellm_data_for_backend_llm_call` /
 `add_headers_to_llm_call_by_model_group`) is correctly unset in
 `litellm/config.yaml` — litellm itself does not copy client headers into
 `data["headers"]`. But `CorpLlmGuardrail.async_pre_call_hook` sets
-`data["headers"]` **unconditionally** (`litellm_hook.py:340`), independent
+`data["headers"]` **unconditionally** (`litellm_hook.py:375`), independent
 of that gate, and litellm forwards whatever ends up in `data["headers"]` to
 the upstream HTTP call regardless of how it got there. Wire-captured
 against a stand-in upstream: `host`, `user-agent`, `accept`, `connection`,

@@ -33,6 +33,7 @@ from corp_llm_gateway.audit import (
     AuditLogger,
     ListSink,
     NeverFieldPresentError,
+    Sink,
     StdoutSink,
     assert_no_never_fields,
 )
@@ -1823,6 +1824,7 @@ async def test_instructions_field_oversize_blocks_and_never_leaks_original(
     assert len(sink.records) == 1
     serialized = json.dumps(sink.records[0])
     assert _haystack_contains_any_original(serialized) is None, "original in audit record"
+    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
 
 
 # (xvii) F8: an unexpected backend exception (e.g. a DB error) must never surface
@@ -1875,7 +1877,7 @@ async def test_unexpected_backend_exception_body_contains_no_backend_detail(
         "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
     }
 
-    with caplog.at_level(logging.ERROR), pytest.raises(GuardrailHttpException) as ei:
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
         await guardrail.pre_call(data)  # type: ignore[attr-defined]
 
     assert ei.value.status_code == 500
@@ -1884,6 +1886,8 @@ async def test_unexpected_backend_exception_body_contains_no_backend_detail(
     assert "corp_tokens" not in exc_text, "backend DB detail leaked into exception body"
     assert _haystack_contains_any_original(exc_text) is None, "original leaked into exception body"
 
+    # INFO (not just ERROR) so the pre-failure INFO trail (e.g.
+    # litellm_pre_call_received) is actually checked, not silently excluded.
     assert "corp_tokens" not in caplog.text, "backend DB detail leaked into log line"
     assert _haystack_contains_any_original(caplog.text) is None, "original leaked into log line"
 
@@ -1891,4 +1895,209 @@ async def test_unexpected_backend_exception_body_contains_no_backend_detail(
     serialized = json.dumps(sink.records[0])
     assert "corp_tokens" not in serialized, "backend DB detail leaked into audit record"
     assert _haystack_contains_any_original(serialized) is None, "original leaked into audit record"
-    assert _haystack_contains_any_original(caplog.text) is None, "original in log line"
+
+
+class _RaisingSink(Sink):
+    """An audit sink whose transport is down (Vector/Langfuse outage) —
+    write() always raises, carrying its own backend-shaped detail that must
+    never surface anywhere either, on top of whatever tripped the original
+    failure."""
+
+    async def write(self, record: dict) -> None:
+        raise RuntimeError("langfuse ingestion failed: connection refused")
+
+
+@pytest.mark.asyncio
+async def test_double_failure_backend_and_audit_sink_still_returns_opaque_500(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F8 re-entrancy: a backend exception (token store) AND a failing audit
+    sink at the same time must still resolve to a clean 500 E_INTERNAL — the
+    guarded safety net must not let the SECOND exception (the sink outage)
+    replace the first one's opaque GuardrailHttpException."""
+    from corp_llm_gateway.corp_llm import CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+
+    def _dummy_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("upstream must NOT be called for a rejected request")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_dummy_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(_BackendFailingTokenStore()),
+        AuditLogger(_RaisingSink(), gateway_version="0.0.1"),
+    )
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    exc_text = str(ei.value)
+    assert "corp_tokens" not in exc_text, "backend DB detail leaked into exception body"
+    assert "ingestion failed" not in exc_text, "sink failure message leaked into exception body"
+    assert _haystack_contains_any_original(exc_text) is None, "original leaked into exception body"
+
+    assert "corp_tokens" not in caplog.text, "backend DB detail leaked into log line"
+    assert "ingestion failed" not in caplog.text, "sink failure message leaked into log line"
+    assert _haystack_contains_any_original(caplog.text) is None, "original leaked into log line"
+
+
+# (xvii) widened: pre_call's F8 wrapper is not the only path that can leak an
+# unexpected exception's message — post_call and streaming run AFTER
+# placeholders have been replaced by originals, and an exception can also
+# originate somewhere other than the token store (e.g. a RulesLoader).
+
+
+@pytest.mark.asyncio
+async def test_post_call_unary_unexpected_error_log_contains_no_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(xvii) widened: post_call_unary runs after de-sanitization, so a raw
+    exception there could carry a real original in its message."""
+    import corp_llm_gateway.litellm_hook as hook_mod
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _tool_call_guardrail((("secret-alice", "[N1]"),))
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hi secret-alice"}],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    def _boom(response: object, mapping: object) -> object:
+        raise RuntimeError("reconstruct failed for secret-alice")
+
+    original = hook_mod._apply_reverse_to_response
+    hook_mod._apply_reverse_to_response = _boom  # type: ignore[assignment]
+    try:
+        with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+            await guardrail.post_call_unary(  # type: ignore[attr-defined]
+                data, {"choices": [{"message": {"content": "hello [N1]!"}}]}
+            )
+    finally:
+        hook_mod._apply_reverse_to_response = original
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    exc_text = str(ei.value)
+    assert "secret-alice" not in exc_text
+    assert "secret-alice" not in caplog.text
+
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert "secret-alice" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_post_call_stream_mid_iteration_error_log_contains_no_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(xvii) widened: a failure mid-stream — not just on entry — must be
+    caught before any raw content in its message reaches the client/log."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink = _tool_call_guardrail((("secret-alice", "[N1]"),))
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hi secret-alice"}],
+        "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
+    }
+    await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    async def _raising_iter():
+        yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
+        raise RuntimeError("upstream stream broke for secret-alice")
+
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        async for _chunk in guardrail.post_call_stream(data, _raising_iter()):  # type: ignore[attr-defined]
+            pass
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    exc_text = str(ei.value)
+    assert "secret-alice" not in exc_text
+    assert "secret-alice" not in caplog.text
+
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert "secret-alice" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_non_token_store_exception_origin_returns_opaque_500(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(xvii) widened: the safety net must also cover an unexpected exception
+    that does NOT originate in the token store — e.g. a RulesLoader backed by
+    the same kind of unmigrated-schema failure."""
+    from corp_llm_gateway.corp_llm import CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+
+    def _dummy_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("upstream must NOT be called for a rejected request")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_dummy_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _BackendFailingRulesLoader(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            raise RuntimeError(f'relation "team_rules" does not exist; owner={ORIGINAL_CORPUS[0]}')
+
+    sink = ListSink()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _BackendFailingRulesLoader()),
+        AuthMiddleware(InMemoryTokenStore()),
+        AuditLogger(sink, gateway_version="0.0.1"),
+    )
+    now = datetime.now(UTC)
+    guardrail._auth._store.upsert(  # type: ignore[attr-defined]
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    exc_text = str(ei.value)
+    assert "team_rules" not in exc_text, "backend DB detail leaked into exception body"
+    assert _haystack_contains_any_original(exc_text) is None, "original leaked into exception body"
+
+    assert "team_rules" not in caplog.text, "backend DB detail leaked into log line"
+    assert _haystack_contains_any_original(caplog.text) is None, "original leaked into log line"
+
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert "team_rules" not in serialized, "backend DB detail leaked into audit record"
+    assert _haystack_contains_any_original(serialized) is None, "original leaked into audit record"

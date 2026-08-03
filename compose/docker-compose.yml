@@ -109,7 +109,7 @@ services:
       # without also flipping this to 1, or the container won't start.
       - CORP_LLM_ORACLE_ENABLED=${CORP_LLM_ORACLE_ENABLED:-0}
       # Load-bearing, not reserved: our own guardrail sets data["headers"]
-      # UNCONDITIONALLY at litellm_hook.py:340, independent of litellm's own
+      # UNCONDITIONALLY at litellm_hook.py:375, independent of litellm's own
       # forward_client_headers_to_llm_api gate. Wire-captured against a
       # stand-in upstream: host/user-agent/accept/connection/content-type/
       # content-length (plus an arbitrary probe header) all reached the

@@ -203,6 +203,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # keeps audit() exactly-once even if a future litellm version also fires
         # the failure event for the same request_id.
         self._audited_ids: OrderedDict[str, None] = OrderedDict()
+        # Bounded set of request_ids that already had a component-specific
+        # gateway_failure recorded (auth/dlp/oversize/...). The F8 safety net
+        # checks this before recording "internal" so a re-entrant failure (an
+        # already-blocked/failed request whose own inline audit() call then
+        # raises) doesn't get double-counted and mislabeled as internal.
+        self._failure_recorded_ids: OrderedDict[str, None] = OrderedDict()
 
     # ---- LiteLLM hook entry points ----------------------------------------
 
@@ -278,15 +284,42 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             raise
         except Exception as exc:
             request_id = self._ensure_request_id(data)
-            logger.error(
-                "litellm_pre_call_unexpected_error request_id=%s exc_type=%s",
-                request_id,
-                type(exc).__name__,
+            await self._report_internal_failure(
+                request_id, data, exc, log_event="litellm_pre_call_unexpected_error"
             )
-            self._record_failure(request_id, error_code="E_INTERNAL")
-            _now = datetime.now(UTC)
-            await self.audit(data, None, _now, _now, status="failed", error_code="E_INTERNAL")
             raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from exc
+
+    async def _report_internal_failure(
+        self,
+        request_id: str,
+        request_data: dict[str, Any],
+        exc: Exception,
+        *,
+        log_event: str,
+    ) -> None:
+        """F8 safety net internals: log (type only, never `str(exc)`), then
+        best-effort record-failure + audit, each in its own guard so a SECOND
+        exception (e.g. an audit-sink outage) can never replace the caller's
+        opaque GuardrailHttpException. Never raises.
+
+        Skips the "internal" gateway_failure when a component-specific one
+        was already recorded for this request_id (e.g. a DLP block whose own
+        inline `audit()` call is what raised) — otherwise a prevented leak
+        gets double-counted and mislabeled as an internal error.
+        """
+        logger.error("%s request_id=%s exc_type=%s", log_event, request_id, type(exc).__name__)
+        try:
+            if request_id not in self._failure_recorded_ids:
+                self._record_failure(request_id, error_code="E_INTERNAL")
+        except Exception:
+            logger.error("litellm_safety_net_record_failure_error request_id=%s", request_id)
+        try:
+            _now = datetime.now(UTC)
+            await self.audit(
+                request_data, None, _now, _now, status="failed", error_code="E_INTERNAL"
+            )
+        except Exception:
+            logger.error("litellm_safety_net_audit_error request_id=%s", request_id)
 
     async def _pre_call_impl(
         self, data: dict[str, Any], *, call_type: str | None = None
@@ -1082,8 +1115,32 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         request_data: dict[str, Any],
         response: AsyncIterator[Any],
     ) -> AsyncIterator[Any]:
-        """Wrap an async iterator of SSE chunks with de-sanitization."""
+        """Wrap an async iterator of SSE chunks with de-sanitization.
+
+        F8 safety net: the `async for` that drives `_post_call_stream_impl`
+        lives INSIDE the try so a mid-iteration failure (not just a failure
+        on entry) is caught — this runs after placeholders have already been
+        replaced by originals, the one path most likely to carry user
+        content in an exception message.
+        """
         request_id = self._ensure_request_id(request_data)
+        try:
+            async for chunk in self._post_call_stream_impl(request_id, request_data, response):
+                yield chunk
+        except GuardrailHttpException:
+            raise
+        except Exception as exc:
+            await self._report_internal_failure(
+                request_id, request_data, exc, log_event="litellm_post_call_stream_unexpected_error"
+            )
+            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from exc
+
+    async def _post_call_stream_impl(
+        self,
+        request_id: str,
+        request_data: dict[str, Any],
+        response: AsyncIterator[Any],
+    ) -> AsyncIterator[Any]:
         state = self._req_state.get(request_id)
         if state is None or not state.mapping.pairs:
             logger.info(
@@ -1162,8 +1219,30 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         request_data: dict[str, Any],
         response: Any,
     ) -> Any:
-        """De-sanitize a single (non-streaming) response."""
+        """De-sanitize a single (non-streaming) response.
+
+        Thin F8 safety-net wrapper (same shape as `pre_call`): this runs
+        AFTER placeholders have been replaced by originals, so an unexpected
+        exception here is the one place raw content is most likely to ride
+        in an exception message. Never let that reach the client raw.
+        """
         request_id = self._ensure_request_id(request_data)
+        try:
+            return await self._post_call_unary_impl(request_id, request_data, response)
+        except GuardrailHttpException:
+            raise
+        except Exception as exc:
+            await self._report_internal_failure(
+                request_id, request_data, exc, log_event="litellm_post_call_unary_unexpected_error"
+            )
+            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from exc
+
+    async def _post_call_unary_impl(
+        self,
+        request_id: str,
+        request_data: dict[str, Any],
+        response: Any,
+    ) -> Any:
         state = self._req_state.get(request_id)
         if state is None or not state.mapping.pairs:
             logger.info(
@@ -1195,9 +1274,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if request_id in self._audited_ids:
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
             return
-        self._audited_ids[request_id] = None
-        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
-            self._audited_ids.popitem(last=False)
+        # Pop unconditionally (success or failure below) so _req_state never
+        # grows unbounded on a request that keeps failing to audit.
         state = self._req_state.pop(request_id, None)
         # litellm v1.85 passes datetime objects for start_time / end_time
         # to async_log_*_event; older versions used floats. Handle both.
@@ -1206,7 +1284,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             latency_ms = max(0, int(delta.total_seconds() * 1000))
         else:
             latency_ms = max(0, int(delta * 1000))
-        # Once-per-request (audit() is deduped above) request-latency observation.
         self._metrics.observe_request_latency(latency_ms / 1000.0, status=status)
         prompt_tokens, completion_tokens = _extract_token_counts(response)
 
@@ -1233,7 +1310,19 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             block_reason=(state.block_reason if state else None),
             profile_ids=(state.profile_ids if state else ()),
         )
-        await self._audit.emit(event)
+        try:
+            await self._audit.emit(event)
+        except Exception:
+            # Do NOT mark dedup on a failed emit: a request whose only audit
+            # attempt raised (e.g. a sink outage) must stay eligible for a
+            # genuine retry — the F8 safety net's own guarded audit() call is
+            # exactly that retry — instead of being silently deduped away
+            # with zero records ever written.
+            logger.error("litellm_audit_emit_failed request_id=%s status=%s", request_id, status)
+            raise
+        self._audited_ids[request_id] = None
+        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+            self._audited_ids.popitem(last=False)
         logger.info(
             "litellm_audit_emitted request_id=%s status=%s latency_ms=%d "
             "redaction_count=%d cache_a_hit=%s prompt_tokens=%d completion_tokens=%d",
@@ -1313,6 +1402,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:
             self._req_state[request_id].error_code = error_code
+        self._failure_recorded_ids[request_id] = None
+        if len(self._failure_recorded_ids) > _AUDIT_DEDUP_CAP:
+            self._failure_recorded_ids.popitem(last=False)
         # gateway_failure{component} — the single failure choke point. Fires even
         # when no _RequestState exists yet (e.g. an auth failure before state is built).
         self._metrics.record_failure(_failure_component(error_code))

@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-from corp_llm_gateway.audit import AuditLogger, ListSink
+from corp_llm_gateway.audit import AuditLogger, ListSink, Sink
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
@@ -335,7 +335,7 @@ async def test_pre_call_backend_db_error_returns_opaque_500(caplog: Any) -> None
     orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
     g = CorpLlmGuardrail(orch, AuthMiddleware(_RaisingTokenStore()), audit_logger)
 
-    with caplog.at_level(logging.ERROR), pytest.raises(GuardrailHttpException) as ei:
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(_data_with_token("tok-1"))
 
     assert ei.value.status_code == 500
@@ -385,6 +385,104 @@ async def test_pre_call_wrapper_does_not_swallow_cancelled_error() -> None:
     # The wrapper's except block never ran, so no failure was recorded — a
     # cancellation is not a gateway failure and must not be reported as one.
     assert sink.records == []
+
+
+class _RaisingSink(Sink):
+    """An audit sink whose transport is down — write() always raises."""
+
+    async def write(self, record: dict[str, Any]) -> None:
+        raise RuntimeError("sink transport down")
+
+
+async def test_post_call_unary_unexpected_error_returns_opaque_500() -> None:
+    """Major: post_call_unary runs AFTER placeholders are replaced by
+    originals, so an unexpected exception there is the one place raw content
+    could plausibly leak. It must get the same F8 safety net as pre_call."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    def _boom(response: Any, mapping: Any) -> Any:
+        raise RuntimeError(f"reconstruct failed for alice: {response!r}")
+
+    import corp_llm_gateway.litellm_hook as hook_mod
+
+    original = hook_mod._apply_reverse_to_response
+    hook_mod._apply_reverse_to_response = _boom  # type: ignore[assignment]
+    try:
+        with pytest.raises(GuardrailHttpException) as ei:
+            await g.post_call_unary(data, {"choices": [{"message": {"content": "hello [N1]!"}}]})
+    finally:
+        hook_mod._apply_reverse_to_response = original
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    assert "alice" not in str(ei.value)
+    assert len(sink.records) == 1
+    assert sink.records[0]["error_code"] == "E_INTERNAL"
+
+
+async def test_post_call_stream_mid_iteration_error_returns_opaque_500() -> None:
+    """Major: a failure mid-stream (not just on entry) must be caught too —
+    wrapping a generator with try/except only guards the first `__anext__`
+    unless the `async for` itself lives inside the try."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    async def _raising_iter() -> AsyncIterator[Any]:
+        yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
+        raise RuntimeError("upstream stream broke for alice")
+
+    chunks = []
+    with pytest.raises(GuardrailHttpException) as ei:
+        async for chunk in g.post_call_stream(data, _raising_iter()):
+            chunks.append(chunk)
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    assert "alice" not in str(ei.value)
+    assert len(sink.records) == 1
+    assert sink.records[0]["error_code"] == "E_INTERNAL"
+
+
+async def test_reentrant_audit_failure_does_not_double_count_component_failure() -> None:
+    """Major: a DLP block whose own inline `audit()` call itself raises (sink
+    outage) must not ALSO record `gateway_failure{component="internal"}` on
+    top of the `component="dlp"` failure already recorded for the same
+    request — one real failure, one metric, not two."""
+    metrics = _RecordingMetrics()
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    g = CorpLlmGuardrail(
+        orch,
+        AuthMiddleware(token_store),
+        AuditLogger(_RaisingSink(), gateway_version="0.0.1"),
+        metrics=metrics,
+    )
+    raw_key = "sk-" + "a" * 48
+    data = _data_with_token("tok-1", content=f"my key is {raw_key}")
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+
+    # The sink outage on the DLP branch's own audit() call re-enters the
+    # wrapper, which reclassifies the client-visible error — but the
+    # component metric must stay attributed to the failure that actually
+    # happened (dlp), not doubled with an "internal" for the same request.
+    assert ei.value.error_code == "E_INTERNAL"
+    assert metrics.failures == ["dlp"]
 
 
 def _case_missing_token() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
@@ -508,6 +606,26 @@ async def test_auth_error_message_lookup_falls_back_safely_for_unmapped_code(
     assert ei.value.error_code == "E_FUTURE_AUTH_CODE"
     assert "backend-derived detail" not in str(ei.value)
     assert str(ei.value) == "401 E_FUTURE_AUTH_CODE: authentication failed"
+
+
+def test_auth_error_messages_keys_match_classify_auth_error_return_values() -> None:
+    """Pin `_AUTH_ERROR_MESSAGES`'s keys against every value `_classify_auth_error`
+    can currently return, so a new `AuthError` subclass added there without a
+    matching message here fails this test immediately instead of silently
+    degrading to the generic fallback in production."""
+    from corp_llm_gateway.litellm_hook import _AUTH_ERROR_MESSAGES, _classify_auth_error
+    from corp_llm_gateway.tokens import ExpiredTokenError, InvalidTokenError, RevokedTokenError
+
+    class _UnclassifiedAuthError(AuthError):
+        pass
+
+    observed = {
+        _classify_auth_error(ExpiredTokenError("x")),
+        _classify_auth_error(RevokedTokenError("x")),
+        _classify_auth_error(InvalidTokenError("x")),
+        _classify_auth_error(_UnclassifiedAuthError("x")),
+    }
+    assert observed == set(_AUTH_ERROR_MESSAGES.keys())
 
 
 async def test_pre_call_sanitizes_responses_input_instructions_and_tool_output() -> None:

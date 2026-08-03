@@ -87,7 +87,7 @@ cascade above, on the already-sanitized request.
 | `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Type`, ...) before forwarding to upstream | `0` | no |
 
 `CorpLlmGuardrail.async_pre_call_hook` sets `data["headers"]` **unconditionally**
-(`litellm_hook.py:340`), independent of litellm's own
+(`litellm_hook.py:375`), independent of litellm's own
 `forward_client_headers_to_llm_api` gate — litellm forwards whatever ends up
 in `data["headers"]` regardless of how it got there. This flag is
 load-bearing wherever the guardrail runs in front of any litellm provider,
