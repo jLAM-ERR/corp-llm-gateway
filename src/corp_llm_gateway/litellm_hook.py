@@ -264,6 +264,35 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     ) -> dict[str, Any]:
         """Sanitize a request body in-place; return the mutated dict.
 
+        Thin safety-net wrapper around `_pre_call_impl`: any exception that
+        isn't already a `GuardrailHttpException` (i.e. wasn't deliberately
+        mapped by a known failure branch below) is an unexpected backend
+        failure — a DB error, a transport bug, anything. Those must never
+        reach the client as raw exception text (F8): map to an opaque 500
+        carrying only a stable error_code + request_id; the exception detail
+        goes to the log (type only — its message could carry user content).
+        """
+        try:
+            return await self._pre_call_impl(data, call_type=call_type)
+        except GuardrailHttpException:
+            raise
+        except Exception as exc:
+            request_id = self._ensure_request_id(data)
+            logger.error(
+                "litellm_pre_call_unexpected_error request_id=%s exc_type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            self._record_failure(request_id, error_code="E_INTERNAL")
+            _now = datetime.now(UTC)
+            await self.audit(data, None, _now, _now, status="failed", error_code="E_INTERNAL")
+            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from exc
+
+    async def _pre_call_impl(
+        self, data: dict[str, Any], *, call_type: str | None = None
+    ) -> dict[str, Any]:
+        """Sanitize a request body in-place; return the mutated dict.
+
         If `max_output_tokens_cap` was passed to __init__, clamp the
         request's `max_tokens` before any other step. This stops
         Claude-Code-style requests with a huge default output budget
@@ -328,7 +357,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             self._record_failure(request_id, error_code=error_code)
             _now = datetime.now(UTC)
             await self.audit(data, None, _now, _now, status="failed", error_code=error_code)
-            raise GuardrailHttpException(401, error_code, str(exc)) from exc
+            # A static message per error_code, never str(exc) — AuthError
+            # subclasses are internal-only today, but interpolating the
+            # exception text here would be the same class of defect as F8
+            # the moment a future subclass wraps something backend-derived.
+            raise GuardrailHttpException(
+                401, error_code, _AUTH_ERROR_MESSAGES.get(error_code, "authentication failed")
+            ) from exc
 
         logger.info(
             "litellm_pre_call_auth_ok request_id=%s team_id=%s user_id=%s",
@@ -1769,6 +1804,15 @@ def _classify_auth_error(exc: AuthError) -> str:
     return "E_AUTH"
 
 
+# Static, backend-detail-free messages for each auth error_code — never str(exc).
+_AUTH_ERROR_MESSAGES: dict[str, str] = {
+    "E_TOKEN_EXPIRED": "token expired",
+    "E_TOKEN_REVOKED": "token revoked",
+    "E_TOKEN_INVALID": "invalid token",
+    "E_AUTH": "authentication failed",
+}
+
+
 # error_code → coarse component for the gateway_failure{component} series. The
 # runbook queries component="corp_llm"/"pre_pass"; unmapped codes fall back to "other".
 _FAILURE_COMPONENT: dict[str, str] = {
@@ -1787,6 +1831,7 @@ _FAILURE_COMPONENT: dict[str, str] = {
     "E_DLP_BLOCKED": "dlp",
     "E_BAD_REQUEST": "request",
     "E_SPAN_INVALID": "sanitize",
+    "E_INTERNAL": "internal",
 }
 
 

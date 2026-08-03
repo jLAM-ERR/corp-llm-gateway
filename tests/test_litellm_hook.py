@@ -22,6 +22,7 @@ from corp_llm_gateway.tokens import (
     AuthMiddleware,
     InMemoryTokenStore,
     TokenInfo,
+    TokenStore,
 )
 from tests.sanitizer.test_streaming import (
     _MSG_DELTA,
@@ -47,6 +48,21 @@ class _RaisingNerEngine(PIIDetector):
 
     async def detect(self, text: str) -> list[Finding]:
         raise RuntimeError("ner deps absent")
+
+
+class _RaisingTokenStore(TokenStore):
+    """F8 repro: a token store backed by a DB with no schema staged — the real
+    PostgresTokenStore.lookup() raises asyncpg.UndefinedTableError with this
+    exact message when `corp_tokens` hasn't been migrated."""
+
+    async def lookup(self, corp_token: str) -> TokenInfo | None:
+        raise RuntimeError('relation "corp_tokens" does not exist')
+
+    async def revoke_user(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+        raise NotImplementedError
 
 
 def _corp_llm_returning(pairs: list[tuple[str, str]]) -> CorpLlmClient:
@@ -270,6 +286,31 @@ async def test_pre_call_missing_token_rejected() -> None:
         await g.pre_call({"messages": [], "headers": {}})
     assert ei.value.status_code == 401
     assert ei.value.error_code == "E_MISSING_TOKEN"
+
+
+async def test_pre_call_backend_db_error_returns_opaque_500(caplog: Any) -> None:
+    """F8 repro: with no schema staged, the token store raises a raw DB
+    exception. That must never reach the client as exception text — only
+    an opaque 500 carrying a stable error_code + request_id."""
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(orch, AuthMiddleware(_RaisingTokenStore()), audit_logger)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(_data_with_token("tok-1"))
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    exc_text = str(ei.value)
+    assert "corp_tokens" not in exc_text
+    assert "relation" not in exc_text
+    assert "corp_tokens" not in caplog.text
+
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert "corp_tokens" not in serialized
+    assert sink.records[0]["error_code"] == "E_INTERNAL"
 
 
 async def test_pre_call_sanitizes_responses_input_instructions_and_tool_output() -> None:
