@@ -350,16 +350,66 @@ docker compose up -d --scale vector=0
 docker compose up -d
 ```
 
-Step 4 loses nothing. `vector` has no read checkpoint yet, and its source is
-`read_from: beginning`, so its first run replays the `litellm` container's log
-file from byte 0 — including every audit record written during steps 2 and 3.
-That guarantee lasts exactly as long as those log lines do; see "Audit buffering
-is not fail-closed" for what bounds that.
+**What step 4 does and does not recover.** `vector` has no read checkpoint yet,
+and its source is `read_from: beginning`, so its first run replays every log file
+the glob matches, from byte 0: the `litellm` container's active `-json.log` **and
+its numbered rotations** (`-json.log.1`, `.2`, …, which the glob covers for
+exactly this reason). What it cannot recover is anything docker has already
+discarded — records rotated past `LITELLM_LOG_MAX_FILE` are gone from the host
+and no replay reaches them. In practice steps 2–3 are minutes of low traffic and
+sit far inside one `LITELLM_LOG_MAX_SIZE` file, so nothing is lost; the claim is
+bounded by log retention, not unconditional. See "Audit buffering is not
+fail-closed".
 
 The same hazard applies after first boot: if the project keys are rotated in
 Langfuse and `.env` is not updated, `vector` keeps posting and keeps dropping.
 `docker compose logs vector | grep "Events dropped"` is the check that surfaces
 it.
+
+### Recovering records vector dropped with a wrong key
+
+This is the case the workflow above exists to prevent, and it needs a deliberate
+recovery — restarting `vector` does **not** perform one. The file source
+checkpoints on *read*, not on delivery (end-to-end acknowledgements are off), so
+a record that Langfuse rejected with `401` was already counted as consumed and
+the checkpoint moved past it. On restart Vector resumes after those bytes and
+they are never re-read.
+
+To replay them, delete the file source's checkpoint. It lives in `data_dir`
+(`/var/lib/vector`, on the `vector-data` volume) under the source's component
+name, and holds only a content fingerprint plus a byte offset per file — no log
+content:
+
+```
+# 1. fix CORP_LANGFUSE_PUBLIC_KEY / CORP_LANGFUSE_SECRET_KEY in .env FIRST.
+#    Replaying with the same wrong key just drops everything a second time.
+docker compose stop vector
+
+# 2. drop the read checkpoint (the disk buffer under /var/lib/vector/buffer is
+#    NOT touched — those events are still queued for delivery)
+docker compose run --rm --no-deps --entrypoint sh vector \
+  -c 'rm -f /var/lib/vector/container_logs/checkpoints.json'
+
+# 3. read_from: beginning now applies again
+docker compose up -d vector
+docker compose logs vector | grep "Events dropped"   # expect nothing new
+```
+
+Two things to know before you run it:
+
+- **It replays everything still on disk, not just the dropped window.** Records
+  Langfuse already accepted are posted again. Each carries the same
+  `body.id` (the gateway's `request_id`), and Langfuse's ingestion API is an
+  upsert on that id, so the expected result is an overwrite rather than a
+  duplicate trace — confirm on a small window before running it against a busy
+  instance.
+- **It only reaches bytes docker still has.** Rotated-away records are
+  unrecoverable, full stop: the gateway wrote them to stdout and kept no copy,
+  so once the log file holding them is gone there is nothing left to replay
+  from. That is the real reason the first-boot workflow starts with
+  `--scale vector=0` instead of relying on recovery, and the reason
+  `LITELLM_LOG_MAX_SIZE` × `LITELLM_LOG_MAX_FILE` is a sizing decision rather
+  than a default to leave alone.
 
 ## Audit pipeline
 
@@ -389,11 +439,20 @@ because the socket is the docker daemon's control plane — read access to it is
 host root, since a container holding it can start a privileged sibling with `/`
 bind-mounted. Here Vector reads a **read-only bind of the container log
 directory** (`DOCKER_CONTAINERS_DIR`, default `/var/lib/docker/containers`)
-with a `file` source: data in, no control plane, no write path. Three
+with a `file` source: data in, no control plane, no write path. Four
 consequences worth knowing:
 
-- the glob is `*/*-json.log`, so the sibling `config.v2.json` / `hostconfig.json`
-  files — which hold every container's environment — are never read;
+- the glob is `*/*-json.log` plus `*/*-json.log.[0-9]` and its two-digit form, so
+  the sibling `config.v2.json` / `hostconfig.json` files — which hold every
+  container's environment — are never read. **Rotated logs are read too.** Docker
+  renames `<id>-json.log` to `<id>-json.log.1` on rotation; a glob covering only
+  the active file would lose
+  every record that rotated away while Vector was down or behind. Re-reading is
+  safe because Vector identifies a file by content fingerprint, not path — a
+  renamed file keeps its checkpoint, so already-shipped bytes are not re-sent.
+  The patterns stop at two digits on purpose: `…-json.log.*` would also match
+  `…-json.log.1.gz`, and Vector's file source cannot decompress. Leave docker's
+  `compress` log-opt off (its default) for the same reason;
 - the source sees **every** container's logs, not just `litellm`, because the
   log directory is keyed by container id and the glob cannot be narrowed. The
   scoping is done one transform later — see "Container identity boundary";
@@ -401,8 +460,18 @@ consequences worth knowing:
   service pins `logging.driver: json-file` rather than inheriting the host
   default. Under a daemon-wide `local`, `journald` or remote driver the other
   containers produce no `*-json.log` files, but `litellm` — the only one this
-  pipeline reads — still does. Every option the service does not set (notably
-  `max-size` / `max-file`) is still merged in from the daemon's defaults.
+  pipeline reads — still does;
+- **pinning the driver costs the daemon's rotation policy, so the service sets
+  its own.** Docker merges daemon-level `log-opts` into a container *only when
+  the container's driver equals the daemon's default driver* (moby
+  `daemon/logs.go`, `mergeAndVerifyLogConfig` — the copy loop sits inside
+  `if cfg.Type == daemon.defaultLogConfig.Type`). On a `local`-default host the
+  pinned service would therefore inherit nothing, and `json-file`'s own
+  `max-size` default is `-1`: no rotation at all, an unbounded audit log on the
+  same disk as Cache B and Postgres. `logging.options` sets `max-size` /
+  `max-file` explicitly (`LITELLM_LOG_MAX_SIZE` / `LITELLM_LOG_MAX_FILE`,
+  default `100m` × `10` ≈ the 1 GiB disk buffer). Removing them does **not**
+  hand the job back to the daemon.
 
 **Container identity boundary.** `docker-compose.yml` puts a
 `com.corp-llm-gateway.audit-source: gateway-stdout` label on the `litellm`
@@ -421,6 +490,24 @@ before anything downstream sees it. So feeding the audit pipeline requires
 control over container creation on this host, not merely the ability to print a
 line. All three pieces (label, log option, filter) are one mechanism; remove any
 one and the pipeline either goes silent or loses its boundary.
+
+**It is a misconfiguration guard, not a security boundary — and the difference
+is a production requirement.** The label name and its value are public, printed
+in this file and in the config; nothing about them is secret or verified.
+Anyone who can run `docker run` on this host can start a container with the same
+`--label com.corp-llm-gateway.audit-source=gateway-stdout` and the same
+`--log-opt labels=com.corp-llm-gateway.audit-source`, print `AuditEvent`-shaped
+JSON, and have it pass this filter, the NEVER-fields gate and `audit_only` —
+forging audit records in Langfuse. The filter raises the bar from "can write a
+log line" to "can start a container here", and no further.
+
+So: **no untrusted `docker run` on the host that runs this stack.** Treat
+membership of the `docker` group (and any CI runner, agent or sidecar with
+socket access) as equivalent to write access to the audit trail, and restrict it
+accordingly. This is a limitation of reading every container's logs; closing it
+properly needs a private channel only `litellm` can write — a dedicated
+bind-mounted audit file or unix socket — which is a change to the gateway's
+audit sink in `src/`, not to this stack. Recorded in `docs/security.md` §8.2.
 
 `audit_only` stays what it always was: a **schema** gate that keeps
 non-`AuditEvent` lines (litellm's own JSON wrappers, uvicorn access logs) out.
@@ -469,21 +556,27 @@ request-path fail-closed needs a health/buffer gate inside
 That is a deliberate deviation from the matrix default, not an oversight, and it
 is the price of not making the gateway process depend on the audit forwarder's
 health. The residual risk: while Langfuse is unreachable, accepted audit records
-live **only in the `litellm` container's docker json-file log** (plus whatever
-already made it into Vector's disk buffer). Log rotation — not the disk buffer —
-is therefore what actually bounds durability, because Vector's glob is
-`*/*-json.log` and does **not** follow the rotated `-json.log.1` files. A
-rotation that outruns Vector loses those audit records permanently.
+live **only in the `litellm` container's docker json-file logs** (plus whatever
+already made it into Vector's disk buffer). Log retention — not the disk buffer —
+is therefore what actually bounds durability. Vector's glob does follow the
+numbered rotations (`-json.log.1`, `.2`, …), so a single rotation no longer
+discards anything; but a file rotated past `LITELLM_LOG_MAX_FILE` is deleted by
+docker, and those audit records are gone permanently.
 
 Two things an operator must configure before going live:
 
 1. **Size the docker log retention** for the `litellm` container against the
-   longest Langfuse outage you intend to survive, at your own audit volume. Set
-   `max-size` / `max-file` in the daemon's `log-opts` (they are merged into this
-   service, which sets neither) or add them to the service's `logging.options`.
-   The product `max-size * max-file` must exceed the audit bytes produced during
-   that window; the disk buffer's `CORP_VECTOR_LANGFUSE_BUFFER_BYTES` should be
-   sized for the same window.
+   longest Langfuse outage you intend to survive, at your own audit volume. The
+   knobs are `LITELLM_LOG_MAX_SIZE` / `LITELLM_LOG_MAX_FILE` (default `100m` ×
+   `10`), which the service sets on its own `logging.options`. **Do not set them
+   in the daemon's `log-opts` and expect them to apply** — docker merges
+   daemon-level log-opts into a container only when the container's driver
+   equals the daemon's default, and this service pins `json-file` because the
+   pipeline needs it. On a host defaulting to `local` or `journald` the daemon
+   policy is silently ignored for this container. The product
+   `max-size × max-file` must exceed the audit bytes produced during that
+   window; `CORP_VECTOR_LANGFUSE_BUFFER_BYTES` should be sized for the same
+   window (the defaults match at ~1 GiB).
 2. **Alert on a stalled or lossy audit path.** Nothing does this for you — the
    `vector` healthcheck only proves the process is alive, and `langfuse-redis`
    answers `PING` while full. The three checks that surface it:
@@ -495,9 +588,15 @@ docker compose exec vector du -sh /var/lib/vector/buffer
 # dropped outright — a wrong key, or any other non-retriable response
 docker compose logs vector | grep "Events dropped"
 
-# is the litellm log about to rotate away ahead of vector?
-docker compose exec vector du -sh \
-  "$(docker inspect -f '{{.LogPath}}' "$(docker compose ps -q litellm)")"
+# how much rotation headroom is left? one `-json.log` plus N `-json.log.<n>`
+# files; at LITELLM_LOG_MAX_FILE the next rotation DELETES the oldest, and with
+# it any audit record vector has not read yet
+docker compose exec vector ls -l \
+  "$(dirname "$(docker inspect -f '{{.LogPath}}' "$(docker compose ps -q litellm)")")"
+
+# how far behind is vector? one {fingerprint, position} per file it has read —
+# offsets only, never log content
+docker compose exec vector cat /var/lib/vector/container_logs/checkpoints.json
 ```
 
 **Long records are reassembled.** The `json-file` driver splits any output line

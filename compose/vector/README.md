@@ -23,6 +23,9 @@ container_logs -> gateway_container_only -> unwrap_docker_envelope
   -> audit_only -> <sinks>
 ```
 
+The topology is linear and every sink hangs off `audit_only` or below, so no
+record reaches a sink without passing `never_fields_gate`.
+
 Three things in `vector.yaml` must not be edited casually:
 
 - **`never_fields_gate` and `audit_only`** are copied verbatim from
@@ -37,7 +40,15 @@ Three things in `vector.yaml` must not be edited casually:
   `logging.options.labels`. The label, the log option and this filter are one
   mechanism in three files — change them together. `audit_only` is a schema
   gate and is **not** a substitute: `request_id` and `redaction_count` are two
-  ordinary keys any co-located container can print.
+  ordinary keys any co-located container can print. The filter is a
+  **misconfiguration guard, not a security boundary** — the label is public and
+  reproducible by anyone who can start a container here. See `compose/README.md`
+  "Container identity boundary" and `docs/security.md` §8.2.
+- **the source glob**, which covers the active log *and* its numbered rotations
+  (`…-json.log.[0-9]`, `[0-9][0-9]`). Dropping the rotated patterns silently
+  loses every record that rotated away while Vector was down. Widening them to
+  `…-json.log.*` is worse, not better: it pulls in gzipped rotations Vector
+  cannot decompress.
 - **the Langfuse sink's disk buffer** (`when_full: block`) and its retry
   policy. `compose/README.md` tells operators that a full `langfuse-redis`
   surfaces as an ingestion 5xx "which Vector retries"; that is only true with

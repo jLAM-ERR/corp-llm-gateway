@@ -24,7 +24,8 @@
 #      it names; a file source over the log DIRECTORY is not, so this config
 #      adds the `gateway_container_only` filter as its container identity
 #      boundary. It is a separate transform and leaves never_fields_gate /
-#      audit_only untouched.
+#      audit_only untouched. Read its comment before trusting it: it is a
+#      misconfiguration guard, not a security boundary.
 #
 # CORP_LANGFUSE_PUBLIC_KEY / CORP_LANGFUSE_SECRET_KEY are required by the
 # vector service in compose/docker-compose.yml (`:?` form), so a missing key
@@ -53,6 +54,21 @@ sources:
   # down get delivered rather than skipped — the demo's docker_logs source
   # streams live only.
   #
+  # ROTATED FILES ARE INCLUDED. Docker renames `<id>-json.log` to
+  # `<id>-json.log.1` (then .1 -> .2 ...) when max-size is reached; a glob
+  # covering only the active file loses every record that rotated away while
+  # Vector was down or behind. Re-reading is safe because Vector identifies a
+  # file by CONTENT FINGERPRINT, not by path: a renamed file keeps its
+  # fingerprint, so the checkpoint in data_dir still applies and already-read
+  # bytes are not re-sent. Measured against timberio/vector:0.53.0-alpine —
+  # read the active file, stop, rename it to .1, restart: only the new records
+  # are emitted.
+  #
+  # The numeric classes cover max-file up to 99 and deliberately do NOT match
+  # `<id>-json.log.1.gz`: Vector's file source cannot decompress, so leave
+  # docker's `compress` log-opt off (its default). A `*` suffix here would pull
+  # the gzip bytes in as unparsable garbage instead.
+  #
   # This picks up EVERY container on the host, not just litellm: the log
   # directory is keyed by container id, not name, so the glob cannot be narrowed
   # here. `gateway_container_only` below is the container identity boundary.
@@ -60,6 +76,8 @@ sources:
     type: file
     include:
       - /var/lib/docker/containers/*/*-json.log
+      - /var/lib/docker/containers/*/*-json.log.[0-9]
+      - /var/lib/docker/containers/*/*-json.log.[0-9][0-9]
     read_from: beginning
 
 transforms:
@@ -74,6 +92,14 @@ transforms:
   # not merely the ability to print a line. Both halves are load-bearing:
   # drop either and this filter matches nothing and the audit pipeline goes
   # silent.
+  #
+  # NOT A SECURITY BOUNDARY. The label name and value are public, and any
+  # container started with the same label plus the same --log-opt gets the same
+  # `attrs` stamp — so this raises the bar from "can print a line" to "can run
+  # a container on this host", and no further. It is a MISCONFIGURATION GUARD.
+  # "No untrusted `docker run` on this host" is a hard production requirement of
+  # this deployment model; a real boundary needs a private channel only litellm
+  # can write (a `src/` audit-sink change). See docs/security.md 8.2.
   #
   # `audit_only` further down is a SCHEMA gate (is this an AuditEvent?), not a
   # trust boundary: `request_id` + `redaction_count` are two ordinary keys that
