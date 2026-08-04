@@ -23,6 +23,7 @@ import contextlib
 import io
 import json
 import logging
+import traceback
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -41,6 +42,7 @@ from corp_llm_gateway.detectors import (
     PIIDetector,
     ShadowDetector,
 )
+from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.sanitizer import (
     CorpLlmSanitizer,
     SanitizerStrategy,
@@ -1301,6 +1303,190 @@ async def test_chatgpt_oauth_token_never_reaches_audit_record_or_log_line(
     serialized = json.dumps(sink.records[0])
     assert _CHATGPT_OAUTH_TOKEN not in serialized, "OAuth bearer leaked into audit record"
     assert _CHATGPT_OAUTH_TOKEN not in caplog.text, "OAuth bearer leaked into a log line"
+
+
+# (xiv-bis) Anthropic OAuth bridge: data["api_key"] carries the developer's
+# Anthropic subscription bearer. Its ONE authorized destination is the upstream
+# Authorization header litellm builds out of that api_key; a leak is the token
+# appearing anywhere else. The inbound Authorization header is deliberately
+# preserved in every header bucket (invariant 3, pinned above at
+# test_corp_token_never_egresses_from_any_forwarded_header), so the rule here is
+# "no header OTHER than Authorization carries it" — an assertion demanding the
+# token be absent from every header would contradict that invariant.
+#
+# Surfaces are split by what this harness can observe: logger emissions, error
+# bodies, exception traces, metric labels and audit records are in-process and
+# belong here. The litellm process's own stdout/stderr is NOT observable from
+# here (litellm keeps the raw api_key in model_call_details / error_logs and
+# hands them to its logging callbacks) — that surface belongs to
+# tests/integration/test_anthropic_oauth_outbound.py, which runs the proxy.
+
+_ANTHROPIC_OAUTH_TOKEN = "sk-ant-oat01-subscription-secret-f8"
+_ANTHROPIC_REJECTED_KEY = "sk-ant-api03-plain-api-key-secret-f8"
+
+
+class _RecordingMetrics(MetricsExporter):
+    def __init__(self) -> None:
+        self.blocks: list[str] = []
+        self.failures: list[str] = []
+
+    def record_block(self, block_reason: str) -> None:
+        self.blocks.append(block_reason)
+
+    def record_failure(self, component: str) -> None:
+        self.failures.append(component)
+
+    def observe_request_latency(self, seconds: float, *, status: str) -> None:
+        return None
+
+
+def _anthropic_oauth_guardrail() -> tuple[object, ListSink, _RecordingMetrics]:
+    from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+    from corp_llm_gateway.rules import Rules, RulesLoader
+    from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+    from corp_llm_gateway.storage import InMemoryMappingStore
+
+    def _empty_pairs_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": SANITIZE_TOOL_NAME,
+                                        "arguments": '{"pairs": []}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_empty_pairs_handler))
+    corp_llm = CorpLlmClient("https://corp-llm.example", model="m", http=http)
+
+    class _NoRules(RulesLoader):
+        async def load(self, team_id: str) -> Rules:
+            return Rules(rules=())
+
+    store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    store.upsert(
+        TokenInfo(
+            corp_token="tok-inv",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = ListSink()
+    metrics = _RecordingMetrics()
+    guardrail = CorpLlmGuardrail(
+        SanitizationOrchestrator(corp_llm, InMemoryMappingStore(), _NoRules()),
+        AuthMiddleware(store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+        forward_anthropic_auth=True,
+        metrics=metrics,
+    )
+    return guardrail, sink, metrics
+
+
+def _anthropic_request(authorization: str) -> dict[str, object]:
+    hdrs = {
+        "X-Corp-Auth": "tok-inv",
+        "Authorization": authorization,
+        "anthropic-version": "2023-06-01",
+    }
+    return {
+        "model": "claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": dict(hdrs),
+        "proxy_server_request": {"headers": dict(hdrs)},
+        "litellm_metadata": {"headers": dict(hdrs)},
+        "secret_fields": {"raw_headers": dict(hdrs)},
+    }
+
+
+@pytest.mark.asyncio
+async def test_anthropic_oauth_token_never_leaves_its_authorized_destination(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Success path: the bearer reaches `api_key` (litellm's OAuth branch reads it
+    there) and no other header bucket, no log line and no audit record carries it.
+    The inbound Authorization header itself still survives — invariant 3."""
+    guardrail, sink, _ = _anthropic_oauth_guardrail()
+    data = _anthropic_request(f"Bearer {_ANTHROPIC_OAUTH_TOKEN}")
+
+    with caplog.at_level(logging.DEBUG):
+        out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+        now = datetime.now(UTC)
+        await guardrail.audit(  # type: ignore[attr-defined]
+            data, None, start_time=now, end_time=now, status="ok"
+        )
+
+    assert out["api_key"] == _ANTHROPIC_OAUTH_TOKEN
+    upstream = {name.lower(): value for name, value in out["extra_headers"].items()}
+    assert "authorization" not in upstream
+    assert _ANTHROPIC_OAUTH_TOKEN not in json.dumps(upstream), "bearer copied into extra_headers"
+    assert "x-corp-auth" not in upstream
+
+    for bucket in (
+        out["headers"],
+        out["proxy_server_request"]["headers"],
+        out["litellm_metadata"]["headers"],
+        out["secret_fields"]["raw_headers"],
+    ):
+        carriers = {
+            name.lower() for name, value in bucket.items() if _ANTHROPIC_OAUTH_TOKEN in value
+        }
+        assert carriers <= {"authorization"}, f"bearer egressed in {carriers}"
+        assert carriers == {"authorization"}, "BYOK Authorization dropped (invariant 3 violation)"
+        assert not any(name.lower() == "x-corp-auth" for name in bucket)
+
+    assert len(sink.records) == 1
+    assert _ANTHROPIC_OAUTH_TOKEN not in json.dumps(sink.records[0]), "bearer in audit record"
+    assert _ANTHROPIC_OAUTH_TOKEN not in caplog.text, "bearer leaked into a log line"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_oauth_rejection_never_leaks_the_offered_credential(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rejection path: a plain API key is refused (OAuth-only bridge) and the
+    refused credential reaches none of the error body, the exception trace, the
+    metric labels, the audit record or a log line."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, sink, metrics = _anthropic_oauth_guardrail()
+    data = _anthropic_request(f"Bearer {_ANTHROPIC_REJECTED_KEY}")
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    exc = ei.value
+    assert exc.status_code == 401
+    assert exc.error_code == "E_PROVIDER_AUTH"
+    assert _ANTHROPIC_REJECTED_KEY not in str(exc), "credential in the error body"
+    trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    assert _ANTHROPIC_REJECTED_KEY not in trace, "credential in an exception trace"
+    assert metrics.failures == ["auth"]
+    labels = json.dumps({"failures": metrics.failures, "blocks": metrics.blocks})
+    assert _ANTHROPIC_REJECTED_KEY not in labels, "credential in a metric label"
+    assert len(sink.records) == 1
+    assert _ANTHROPIC_REJECTED_KEY not in json.dumps(sink.records[0]), "credential in audit record"
+    assert _ANTHROPIC_REJECTED_KEY not in caplog.text, "credential leaked into a log line"
+    assert "tok-inv" not in caplog.text, "corp token leaked into a log line (invariant 4)"
+    assert "api_key" not in data, "a refused credential was still staged for egress"
 
 
 # (xv) CodeQL-adjudication follow-up: seven pre_call error/blocked log lines were
