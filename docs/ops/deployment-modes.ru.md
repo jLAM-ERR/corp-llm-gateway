@@ -85,6 +85,20 @@ scripts/deploy/deploy.sh --host user@server --mode oauth up
 `logs`, `status`, `down` и `restart` резолвят стек через этот список файлов, и
 запуск с одним базовым файлом покажет (или пересоздаст) другой стек.
 
+**Для автозапуска при загрузке хоста раскомментируйте `COMPOSE_FILE` в `.env`:**
+
+```
+COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml
+```
+
+`scripts/deploy/corp-llm-gateway.service` выполняет голый `docker compose up -d`,
+который без этой строки резолвит только базовый файл — то есть режим с
+виртуальными ключами. Он падает громко, а не поднимает не тот режим (в `.env`
+режима B нет мастер-ключа, и guard в entrypoint отказывает), но стек так и
+останется лежать, пока его не поднимут руками. Явный `-f` в командной строке
+по-прежнему главнее `COMPOSE_FILE`, поэтому эта строка и `deploy.sh --mode oauth`
+не конфликтуют.
+
 Оверлей меняет ровно две вещи: включает `CORP_LLM_FORWARD_ANTHROPIC_AUTH=1` и
 монтирует `litellm/config.oauth.yaml` поверх `/etc/litellm/config.yaml`. Токены
 команд в Postgres, mapping-store в Redis, Langfuse и пайплайн аудита Vector — всё

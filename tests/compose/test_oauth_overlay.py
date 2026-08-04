@@ -146,12 +146,31 @@ def test_the_overlay_arms_the_anthropic_bridge_and_swaps_the_config_mount() -> N
     assert "LITELLM_MASTER_KEY" not in litellm["environment"]
 
 
-def test_the_env_example_tells_mode_b_to_delete_the_line_rather_than_blank_it() -> None:
+def test_the_env_example_tells_mode_b_to_delete_the_lines_rather_than_blank_them() -> None:
+    # The single most expensive mistake in this mode, because a blank value
+    # looks like "off" and is treated as "on".
     text = ENV_EXAMPLE.read_text()
 
     assert "docker-compose.oauth.yml" in text
-    assert re.search(r"DELETE ALL\s+# THREE LINES ENTIRELY", text) or "DELETE" in text
+    assert "DELETE ALL" in text and "THREE LINES ENTIRELY" in text
     assert "blank" in text.lower()
+
+
+def test_the_env_example_offers_the_compose_file_line_mode_b_autostart_needs() -> None:
+    # Commented by default (Mode A must not pick it up), but present, because
+    # the systemd unit below cannot name the overlay any other way.
+    assert "# COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml" in ENV_EXAMPLE.read_text()
+
+
+def test_the_autostart_unit_runs_a_bare_compose_up_so_mode_b_needs_compose_file() -> None:
+    # The coupling the .env line exists for. If this unit ever grows an explicit
+    # `-f`, revisit that line and the two deployment-modes docs together — an
+    # explicit -f wins over COMPOSE_FILE and would pin the unit to one mode.
+    unit = (ROOT / "scripts" / "deploy" / "corp-llm-gateway.service").read_text()
+    exec_start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+
+    assert exec_start == "ExecStart=/usr/bin/docker compose up -d"
+    assert " -f " not in exec_start
 
 
 # --------------------------------------------------------------------------- #

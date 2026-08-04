@@ -85,6 +85,19 @@ Pass the **same** `--mode oauth` to every later run against that host — `logs`
 `status`, `down` and `restart` all resolve the stack through this file list, and
 a run with the base file alone would report on (or recreate) a different stack.
 
+**For boot-time autostart, uncomment `COMPOSE_FILE` in `.env`:**
+
+```
+COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml
+```
+
+`scripts/deploy/corp-llm-gateway.service` runs a bare `docker compose up -d`,
+which without this line resolves the base file alone — i.e. the virtual-key
+mode. It fails loudly rather than serving the wrong one (Mode B's `.env` has no
+master key, so the entrypoint guard refuses), but the stack stays down until
+someone starts it by hand. An explicit `-f` on the command line still wins over
+`COMPOSE_FILE`, so this and `deploy.sh --mode oauth` agree rather than fight.
+
 The overlay changes exactly two things: it turns on
 `CORP_LLM_FORWARD_ANTHROPIC_AUTH=1`, and it mounts `litellm/config.oauth.yaml`
 over `/etc/litellm/config.yaml`. Postgres-backed team tokens, the Redis mapping
