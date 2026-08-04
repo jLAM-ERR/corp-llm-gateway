@@ -51,11 +51,24 @@ from corp_llm_gateway.sanitizer.strategies import (
 from corp_llm_gateway.storage import MappingStore, PlaceholderMapping
 
 _PLACEHOLDER_LABEL_RE = re.compile(r"^\[([A-Z_]+)_(\d+)\]$")
-# Bump this on ANY change that widens what the request path redacts, not only on a
-# substitution-semantics change. A Cache-A hit applies the stored mapping WITHOUT
-# running detectors, so an entry written by a narrower build replays as unredacted
-# for the whole ~10h TTL. The version is part of the key, so a bump retires those
-# entries at upgrade with no cache flush needed. Log of boundaries:
+# A Cache-A hit applies the stored mapping WITHOUT running detectors, so an entry
+# written under narrower coverage replays as unredacted for the whole ~10h TTL.
+# TWO mechanisms keep the key honest, and neither subsumes the other:
+#
+#   1. this constant — bump on any BUILD-time change to what the request path
+#      redacts or how it substitutes. It is the only thing that can see a change
+#      made INSIDE a component: adding BANK_CARD was a rule-table edit inside
+#      RegexChecksumDetector — same class, same config, same construction args,
+#      so the policy fingerprint below is blind to it.
+#   2. `_policy_fingerprint` (computed per orchestrator in __init__) — hashes the
+#      effective policy: detector classes, the code-safe subset, gazetteer terms,
+#      allowlist entries, oracle trigger. It is the only thing that can see a
+#      RUNTIME/CONFIG-time change: flipping CORP_NER_ENABLED adds a whole
+#      detector on one pod while its neighbours on the same image, same version
+#      and same Redis keep the old set.
+#
+# Bumping the constant retires every prior entry at upgrade with no cache flush.
+# Log of boundaries:
 #   span-aware-v1  substitution moved from pair-global replace to span-aware
 #                  planning; old entries could have dropped a mapping.
 #   coverage-v2    detector coverage widened three ways: the Luhn-validated
@@ -63,6 +76,10 @@ _PLACEHOLDER_LABEL_RE = re.compile(r"^\[([A-Z_]+)_(\d+)\]$")
 #                  local NER's participation in CODE segments changed, and corp
 #                  NER can add a whole detector when enabled.
 _CACHE_A_ALGORITHM_VERSION = b"coverage-v2"
+
+# Bump when the fingerprint's own INPUT SET changes (a newly folded component),
+# so entries keyed by the older, less complete fingerprint are retired too.
+_POLICY_FINGERPRINT_VERSION = b"policy-v1"
 
 # Chunk overlap sizing (F1 chunk policy). Regex/checksum patterns are LINEAR and
 # now run over the FULL text (see `_sanitize_chunked`), so the overlap no longer
@@ -427,6 +444,40 @@ class SanitizationOrchestrator:
         # Deterministic regex+checksum detector used both for the deliver-flag
         # rescan and for the full-text (seam-independent) pass in chunk mode.
         self._regex_checksum = RegexChecksumDetector()
+        # Computed ONCE: it is per-request-invariant, and the local path has a
+        # ~6ms p50 budget. None ⇒ fail closed: Cache A is off for this instance.
+        self._policy_fingerprint = self._compute_policy_fingerprint()
+
+    def _compute_policy_fingerprint(self) -> str | None:
+        """Hash the effective redaction policy; None when it cannot be computed.
+
+        Returning None disables Cache A rather than falling back to a constant —
+        a constant would silently restore cross-policy replay (M4 fail-closed).
+        """
+        try:
+            h = hashlib.sha256()
+            _feed(h, [_POLICY_FINGERPRINT_VERSION])
+            detectors = self._local.detectors if self._local is not None else ()
+            code_detectors = self._local.code_detectors if self._local is not None else ()
+            _feed(h, [b"detectors"])
+            _feed(h, sorted(_detector_identity(d).encode("utf-8") for d in detectors))
+            _feed(h, [b"code_safe"])
+            _feed(h, sorted(_detector_identity(d).encode("utf-8") for d in code_detectors))
+            _feed(h, [b"gazetteer"])
+            if self._gazetteer is not None:
+                _feed(h, [t.encode("utf-8") for t in self._gazetteer.term_signature()])
+            _feed(h, [b"allowlist"])
+            if self._allowlist is not None:
+                _feed(h, sorted(e.encode("utf-8") for e in self._allowlist.entries))
+            _feed(h, [b"oracle_trigger", self._oracle_trigger.encode("utf-8")])
+            return h.hexdigest()
+        except Exception as exc:
+            # Type name only — never the policy contents or any user text (M1-14).
+            logger.warning(
+                "cache_a_disabled reason=policy_fingerprint_failed exc=%s",
+                type(exc).__name__,
+            )
+            return None
 
     async def sanitize(
         self,
@@ -466,11 +517,23 @@ class SanitizationOrchestrator:
         )
         rule_matches = _rule_matches(rules, text)
 
-        content_hash = _content_hash(
-            team_id, rules, text, profile_fingerprint, self._oracle_enabled
+        # No policy fingerprint ⇒ Cache A is off for this orchestrator: both the
+        # read and the write are skipped, so nothing can be served or seeded under
+        # a key that ignores the effective policy.
+        content_hash = (
+            _content_hash(
+                team_id,
+                rules,
+                text,
+                profile_fingerprint,
+                self._oracle_enabled,
+                policy_fingerprint=self._policy_fingerprint,
+            )
+            if self._policy_fingerprint is not None
+            else None
         )
 
-        cached = await self._mapping_store.get_dedup(content_hash)
+        cached = await self._mapping_store.get_dedup(content_hash) if content_hash else None
         if cached is not None:
             plan = _plan_replacements(text, cached.pairs, rule_matches)
             logger.info(
@@ -502,7 +565,7 @@ class SanitizationOrchestrator:
             "sanitize_cache_a_miss team_id=%s conversation_id=%s content_hash=%s",
             team_id,
             conversation_id,
-            content_hash[:12],
+            content_hash[:12] if content_hash else "disabled",
         )
 
         detected = await self._detect(
@@ -515,15 +578,19 @@ class SanitizationOrchestrator:
         plan = _plan_replacements(text, detected.pairs, rule_matches)
         mapping = PlaceholderMapping(pairs=plan.pairs)
 
-        await self._mapping_store.set_dedup(content_hash, mapping, ttl_seconds=self._cache_a_ttl)
-        logger.info(
-            "sanitize_cache_a_stored team_id=%s conversation_id=%s content_hash=%s ttl=%d pairs=%d",
-            team_id,
-            conversation_id,
-            content_hash[:12],
-            self._cache_a_ttl,
-            len(plan.pairs),
-        )
+        if content_hash:
+            await self._mapping_store.set_dedup(
+                content_hash, mapping, ttl_seconds=self._cache_a_ttl
+            )
+            logger.info(
+                "sanitize_cache_a_stored team_id=%s conversation_id=%s "
+                "content_hash=%s ttl=%d pairs=%d",
+                team_id,
+                conversation_id,
+                content_hash[:12],
+                self._cache_a_ttl,
+                len(plan.pairs),
+            )
 
         await self._record_conversation_mappings(conversation_id, plan.pairs)
         logger.info(
@@ -1028,12 +1095,34 @@ def _build_system_prompt(rules: Rules) -> str:
     return "\n".join(lines)
 
 
+def _detector_identity(detector: object) -> str:
+    """Stable cross-process identity for a detector instance.
+
+    Import path + qualname, never ``hash()``/``id()``/default ``repr()``: those
+    are process-local (PYTHONHASHSEED, memory address), so pods sharing one Redis
+    would derive different keys and fragment — or worse, silently agree by
+    accident on one pod pair and not another.
+    """
+    cls = type(detector)
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _feed(h: hashlib._Hash, parts: list[bytes]) -> None:
+    """Absorb length-prefixed parts so no concatenation of items can collide."""
+    for part in parts:
+        h.update(len(part).to_bytes(8, "big"))
+        h.update(part)
+    h.update(b"\x1c")
+
+
 def _content_hash(
     team_id: str,
     rules: Rules,
     text: str,
     profile_fingerprint: str | None = None,
     oracle_enabled: bool | None = None,
+    *,
+    policy_fingerprint: str | None = None,
 ) -> str:
     h = hashlib.sha256()
     # Retires every Cache-A entry written by a build with different substitution
@@ -1061,6 +1150,13 @@ def _content_hash(
     if oracle_enabled is not None:
         h.update(b"\x1b")
         h.update(b"oracle:1" if oracle_enabled else b"oracle:0")
+    # Effective-policy discriminator: covers coverage changes made at RUNTIME
+    # (e.g. CORP_NER_ENABLED adding a detector) that the build-time algorithm
+    # version constant cannot see. None only on direct legacy calls — the request
+    # path never keys without it (it disables Cache A instead).
+    if policy_fingerprint is not None:
+        h.update(b"\x1a")
+        h.update(policy_fingerprint.encode("utf-8"))
     return h.hexdigest()
 
 

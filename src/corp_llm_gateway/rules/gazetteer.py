@@ -143,6 +143,14 @@ class Gazetteer(PIIDetector):
             if len(seq) == 1:
                 self._single_lemmas.setdefault(seq[0], label)
 
+    def term_signature(self) -> tuple[str, ...]:
+        """Sorted "lemma lemma…\\x1flabel" strings — the coverage this instance has.
+
+        Corp vocabulary, never user content. Callers fold it into cache keys so a
+        term-list change cannot be served from an entry built without it.
+        """
+        return tuple(sorted(" ".join(seq) + "\x1f" + label for seq, label in self._index.items()))
+
     async def detect(self, text: str) -> list[Finding]:
         if not text.strip() or not self._index:
             return []

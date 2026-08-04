@@ -31,6 +31,11 @@ class Allowlist:
     def __init__(self, originals: Iterable[str]) -> None:
         self._allowed: frozenset[str] = frozenset(originals)
 
+    @property
+    def entries(self) -> frozenset[str]:
+        """Configured originals. Operator-supplied test data, never user content."""
+        return self._allowed
+
     def filter_pairs(
         self,
         pairs: tuple[tuple[str, str], ...],
