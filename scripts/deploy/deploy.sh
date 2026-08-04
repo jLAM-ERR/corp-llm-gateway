@@ -371,12 +371,21 @@ wait_for_healthcheck() {
             stuck="none reported"
         else
             while IFS=$'\t' read -r service state health; do
-                # OK if the container runs, or its healthcheck says healthy.
-                if [[ "$health" == "unhealthy" || ( "$state" != "running" && "$health" != "healthy" ) ]]; then
-                    all_healthy=false
-                    stuck="${service} (state=${state:-?} health=${health:-none})"
-                    break
+                # A service that DECLARES a healthcheck must actually report
+                # "healthy": "starting" is not healthy yet and can still flip to
+                # "unhealthy", so accepting it ended the wait on the first poll.
+                # Only a service with NO healthcheck (empty Health) falls back to
+                # "is it running".
+                if [[ -n "$health" ]]; then
+                    if [[ "$health" == "healthy" ]]; then
+                        continue
+                    fi
+                elif [[ "$state" == "running" ]]; then
+                    continue
                 fi
+                all_healthy=false
+                stuck="${service} (state=${state:-?} health=${health:-none})"
+                break
             done <<< "$states"
         fi
 

@@ -7,6 +7,10 @@ would serialise against the service timeout.
 Fail-closed everywhere: any failure raises ``CorpNerUnavailableError``, which the
 existing ``except NerUnavailableError`` handlers on the egress path already turn
 into a refusal. Never logs request or response text (M1-14).
+
+Failures are NOT counted here. ``litellm_hook._record_failure`` is the one
+request-level choke point for ``gateway_failure{component}``; counting in both
+places doubled every failed request in that series.
 """
 
 from __future__ import annotations
@@ -21,11 +25,10 @@ import httpx
 from corp_llm_gateway.corp_ner import AnalyzeResult, CorpNerClient, CorpNerUnavailableError
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.detectors.regex_checksum import _deduplicate
-from corp_llm_gateway.metrics.base import MetricsExporter
-from corp_llm_gateway.metrics.noop import NoopExporter
 
 logger = logging.getLogger(__name__)
 
+# The gateway_failure{component} label the hook emits for E_CORP_NER_UNAVAILABLE.
 FAILURE_COMPONENT = "corp_ner"
 
 # The nine contract labels. ORGANIZATION -> ORG matches ner_ru/ner_en; the rest
@@ -151,9 +154,8 @@ def _build_map(text: str, nfc: str) -> _OffsetMap:
 
 
 class CorpNerDetector(PIIDetector):
-    def __init__(self, client: CorpNerClient, *, metrics: MetricsExporter | None = None) -> None:
+    def __init__(self, client: CorpNerClient) -> None:
         self._client = client
-        self._metrics = metrics if metrics is not None else NoopExporter()
 
     async def detect(self, text: str) -> list[Finding]:
         return (await self.detect_batch([text]))[0]
@@ -167,11 +169,7 @@ class CorpNerDetector(PIIDetector):
             results = await self._analyze([texts[i] for i in indices])
             for i, result in zip(indices, results, strict=True):
                 out[i] = _findings(texts[i], result)
-        except CorpNerUnavailableError:
-            self._metrics.record_failure(FAILURE_COMPONENT)
-            raise
         except httpx.HTTPError as exc:
-            self._metrics.record_failure(FAILURE_COMPONENT)
             raise CorpNerUnavailableError(
                 f"corp-ner transport error: {type(exc).__name__}"
             ) from exc

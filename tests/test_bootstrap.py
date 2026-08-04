@@ -5,16 +5,19 @@ import importlib
 import logging
 import sys
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 from corp_llm_gateway import bootstrap, config, settings
 from corp_llm_gateway.audit import StdoutSink
+from corp_llm_gateway.corp_ner import E_CORP_NER_UNAVAILABLE
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.detectors.dual_ner import DualNerDetector
 from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
-from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.profile_orchestrator import ProfileAwareOrchestrator
@@ -26,7 +29,12 @@ from corp_llm_gateway.team_config import (
     PostgresTeamConfigStore,
     TeamConfig,
 )
-from corp_llm_gateway.tokens import InMemoryTokenStore, InvalidTokenError, MissingTokenError
+from corp_llm_gateway.tokens import (
+    InMemoryTokenStore,
+    InvalidTokenError,
+    MissingTokenError,
+    TokenInfo,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -943,18 +951,65 @@ async def test_corp_ner_never_receives_code_segment_text(monkeypatch: pytest.Mon
     assert not any("x = 1" in seen for seen in detector.seen)
 
 
+class _RecordingMetrics(MetricsExporter):
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+
+    def record_block(self, block_reason: str) -> None:
+        pass
+
+    def record_failure(self, component: str) -> None:
+        self.failures.append(component)
+
+    def observe_request_latency(self, seconds: float, *, status: str) -> None:
+        pass
+
+
+def _authorized(guardrail: CorpLlmGuardrail) -> dict[str, object]:
+    now = datetime.now(UTC)
+    guardrail._auth._store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    return {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "ping Мамонтов Пётр Ильич"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+
+
 @pytest.mark.usefixtures("_isolate_registry")
-def test_corp_ner_detector_gets_the_live_metrics_exporter(
+async def test_a_corp_ner_outage_fires_gateway_failure_exactly_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Without this, gateway_failure{component="corp_ner"} never fires in prod:
-    # CorpNerDetector defaults to a Noop exporter of its own.
+    # The detector and the hook share one exporter, so a detector-side counter
+    # doubles every failed request in gateway_failure{component="corp_ner"} and
+    # inflates any alert built on it. The hook is the single request-level choke
+    # point (it also owns the error-code mapping).
     _enable_corp_ner(monkeypatch)
-
+    metrics = _RecordingMetrics()
+    monkeypatch.setattr(bootstrap, "get_exporter", lambda: metrics)
+    # No models on 3.14 and no model load on 3.12: local NER is not under test.
+    monkeypatch.setattr(
+        bootstrap, "DualNerDetector", lambda: DualNerDetector(engines=[], require_ner=False)
+    )
     guardrail = bootstrap.build_guardrail()
+    client = _local_pass(guardrail)._detectors[-1]._client
+    client._http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(503, json={"detail": "loading"}))
+    )
 
-    corp_ner = _local_pass(guardrail)._detectors[-1]
-    assert corp_ner._metrics is guardrail._metrics
+    with pytest.raises(GuardrailHttpException) as excinfo:
+        await guardrail.pre_call(_authorized(guardrail))
+
+    assert excinfo.value.error_code == E_CORP_NER_UNAVAILABLE
+    assert metrics.failures == ["corp_ner"]
 
 
 @pytest.mark.usefixtures("_isolate_registry")

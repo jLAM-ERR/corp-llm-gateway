@@ -18,8 +18,17 @@
 # context: `..` because this file lives in `compose/`, but `Dockerfile.gateway`
 # expects the repo root as build context (it COPYs `pyproject.toml`,
 # `README.md` and `src/` from there).
+#
+# NER_PROFILE is load-bearing, not decoration. `Dockerfile.gateway` defaults to
+# `base`, which installs the NER libraries but NOT the en_core_web_md wheel; this
+# stack ships CORP_LLM_REQUIRE_NER=1 (F2 fail-closed), so a `base` image disables
+# the EN engine on the first request and every request then 503s with
+# E_NER_UNAVAILABLE — a dead gateway. `ru-en` is the profile that matches the
+# compose posture: both engines present, nothing degraded.
 services:
   litellm:
     build:
       context: ..
       dockerfile: Dockerfile.gateway
+      args:
+        NER_PROFILE: ru-en

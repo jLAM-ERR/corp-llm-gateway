@@ -78,6 +78,11 @@ instead of the published tag:
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
+The overlay builds the **`ru-en`** NER profile (`NER_PROFILE` build arg), not
+`Dockerfile.gateway`'s `base` default: `base` ships no `en_core_web_md`, and with
+`CORP_LLM_REQUIRE_NER=1` (the default here) a missing EN engine turns every
+request into a 503 `E_NER_UNAVAILABLE`. Do not drop that arg.
+
 **This is a dev/staging convenience, not a substitute for a release.**
 `GATEWAY_IMAGE_TAG` must point at an rc containing Workstream B's corp NER
 work before this stack is production-ready — treat that as a release gate.

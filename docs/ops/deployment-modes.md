@@ -138,6 +138,9 @@ CORP_NER_ENDPOINT=http://<ner-host>:<port>      # BASE url; the client appends /
   commit `1f170ea`) is an *ancestor* of the branch that added corp NER, so on
   that image these variables do nothing. Use
   `docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`.
+  That overlay builds the `ru-en` NER profile on purpose — the Dockerfile default
+  (`base`) ships no EN model, and with `CORP_LLM_REQUIRE_NER=1` that image 503s
+  on every request.
 - Optional tuning, passed by **bare name** (leave the lines commented rather than
   empty — an empty env var wins over the config file):
   `CORP_NER_TIMEOUT_S` (30), `CORP_NER_MAX_TEXTS` (256),

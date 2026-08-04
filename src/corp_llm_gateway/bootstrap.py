@@ -29,14 +29,18 @@ from corp_llm_gateway import config
 from corp_llm_gateway.audit import AuditLogger, Sink, get_sink, register_sink, sink_name_for
 from corp_llm_gateway.auth import get_auth_provider
 from corp_llm_gateway.corp_llm import CorpLlmClient
-from corp_llm_gateway.corp_ner import CorpNerClient
+from corp_llm_gateway.corp_ner import (
+    CORP_NER_TABLE,
+    corp_ner_setting,
+    resolve_corp_ner_transport,
+)
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import PIIDetector
 from corp_llm_gateway.detectors.corp_ner import CorpNerDetector
 from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
 from corp_llm_gateway.extensions.corp_ner import CorpNerExtension, register_corp_ner
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
-from corp_llm_gateway.metrics import MetricsExporter, get_exporter
+from corp_llm_gateway.metrics import get_exporter
 from corp_llm_gateway.profiles import FileProfileLoader, ProfileBundle, ProfileResolver
 from corp_llm_gateway.rules import (
     CachedRulesLoader,
@@ -151,81 +155,38 @@ def build_corp_llm_client() -> CorpLlmClient:
     )
 
 
-# The one detector table that is actually read; a generic ExtensionRegistry
-# .discover() over every [extensions.<kind>.<name>] stays out of scope (C2/C3).
-_CORP_NER_TABLE = "extensions.detector.corp_ner"
-
-
-def _corp_ner_setting(
-    table: dict[str, object], env_name: str, table_key: str, default: str | None = None
-) -> str | None:
-    """Resolve one corp-NER value: env/scalar chain first, then the table.
-
-    ``config.get`` already covers env → flat config scalar; the nested table is
-    file-only (env carries scalars), so it sits underneath — a container can
-    always override a baked-in config file.
-    """
-    value = config.get(env_name)
-    if value:
-        return value
-    raw = table.get(table_key)
-    if raw is not None:
-        return str(raw)
-    return default
-
-
-def _corp_ner_int(table: dict[str, object], env_name: str, table_key: str, default: str) -> int:
-    raw = _corp_ner_setting(table, env_name, table_key, default) or default
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ConfigError([f"{env_name}={raw!r} is not an integer"]) from exc
-
-
-def build_corp_ner(*, metrics: MetricsExporter) -> tuple[CorpNerDetector, CorpNerExtension] | None:
+def build_corp_ner() -> tuple[CorpNerDetector, CorpNerExtension] | None:
     """Corp NER detector + its registry extension, or None when disabled.
 
     Off by default (``CORP_NER_ENABLED=0``) so existing deploys are untouched.
     When on, a missing endpoint is a boot-time refusal — `settings.validate()`
     covers `config check` only, and the compose/demo boots skip it.
 
-    ``metrics`` is the LIVE exporter (not the detector's Noop default), or
-    ``gateway_failure{component="corp_ner"}`` would never fire in production.
+    No metrics exporter is threaded in: ``gateway_failure{component="corp_ner"}``
+    is emitted once per request by ``litellm_hook._record_failure``.
 
-    TLS verification is never disabled here (unlike ``SSL_VERIFY`` for the
-    oracle): this call carries RAW user content. Point ``CORP_NER_CA_BUNDLE`` at
-    an internal CA instead. Construction performs no I/O.
+    Transport settings (CA bundle, timeout, batch limits) resolve through
+    ``corp_ner.resolve_corp_ner_transport`` — the same reader the profile
+    registry uses, so the two paths cannot drift. Construction performs no I/O.
     """
-    table = config.get_table(_CORP_NER_TABLE)
-    if not parse_flag(_corp_ner_setting(table, "CORP_NER_ENABLED", "enabled", "0")):
+    table = config.get_table(CORP_NER_TABLE)
+    if not parse_flag(corp_ner_setting(table, "CORP_NER_ENABLED", "enabled", "0")):
         return None
-    endpoint = _corp_ner_setting(table, "CORP_NER_ENDPOINT", "endpoint")
+    endpoint = corp_ner_setting(table, "CORP_NER_ENDPOINT", "endpoint")
     if not endpoint:
         raise ConfigError(
             [
                 "CORP_NER_ENDPOINT: required when CORP_NER_ENABLED=1 — set the env var, "
-                f"the config-file scalar, or endpoint under [{_CORP_NER_TABLE}]"
+                f"the config-file scalar, or endpoint under [{CORP_NER_TABLE}]"
             ]
         )
-    timeout = _corp_ner_setting(table, "CORP_NER_TIMEOUT_S", "timeout_s", "30") or "30"
-    try:
-        timeout_s = float(timeout)
-    except ValueError as exc:
-        raise ConfigError([f"CORP_NER_TIMEOUT_S={timeout!r} is not a number"]) from exc
-    ca_bundle = _corp_ner_setting(table, "CORP_NER_CA_BUNDLE", "ca_bundle")
-    http = httpx.AsyncClient(timeout=timeout_s, verify=ca_bundle or True)
-    client = CorpNerClient(
-        endpoint,
-        http=http,
-        timeout=timeout_s,
-        max_texts=_corp_ner_int(table, "CORP_NER_MAX_TEXTS", "max_texts", "256"),
-        max_input_chars=_corp_ner_int(
-            table, "CORP_NER_MAX_INPUT_CHARS", "max_input_chars", "200000"
-        ),
-    )
+    transport = resolve_corp_ner_transport(table)
+    http = transport.http_client()
     # The extension shares the client so readiness and the request path can never
     # disagree about how the service is reached.
-    return CorpNerDetector(client, metrics=metrics), CorpNerExtension(endpoint, http=http)
+    return CorpNerDetector(transport.client(endpoint, http=http)), CorpNerExtension(
+        endpoint, http=http
+    )
 
 
 def _code_safe_detectors(
@@ -453,11 +414,10 @@ def build_guardrail(
         client = None
         _log.info("bootstrap oracle_enabled=false — local-first only")
     team_store = team_config_store if team_config_store is not None else build_team_config_store()
-    # One exporter instance for the hook AND the corp NER detector: get_exporter()
-    # builds a new one per call, and a second instance would emit to a registry
-    # nobody scrapes.
+    # One exporter instance for the hook: get_exporter() builds a new one per
+    # call, and a second instance would emit to a registry nobody scrapes.
     metrics = get_exporter()
-    corp_ner = build_corp_ner(metrics=metrics)
+    corp_ner = build_corp_ner()
     core = _build_orchestrator(
         client,
         store,
