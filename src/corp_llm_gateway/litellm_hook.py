@@ -381,6 +381,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             if isinstance(md, dict):
                 _drop_wire_headers(md.get("headers"))
 
+        # Pure function of data["model"] — hoisted above both auth bridges so the
+        # Anthropic bridge can gate on it and either bridge's rejection can
+        # attribute its audit record; reused for _RequestState below.
+        provider = _detect_provider(data)
+
         if self._forward_chatgpt_auth:
             try:
                 upstream_headers = _chatgpt_upstream_headers(inbound_headers)
@@ -403,7 +408,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 # Responses API parameter. Correlation remains available via
                 # the top-level and litellm_metadata request-id copies.
                 data.pop("metadata", None)
+                _scrub_retained_request_metadata(data)
             except ValueError:
+                self._seed_request_state(
+                    request_id,
+                    user_id=ctx.user_id,
+                    team_id=ctx.team_id,
+                    provider=provider,
+                    model=model,
+                )
                 self._record_failure(request_id, error_code="E_PROVIDER_AUTH")
                 logger.info(
                     "litellm_pre_call_provider_auth_failed request_id=%s "
@@ -424,10 +437,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "E_PROVIDER_AUTH",
                     "missing or invalid OpenAI bearer authentication",
                 ) from None
-
-        # Pure function of data["model"] — hoisted above the Anthropic bridge so
-        # the bridge can gate on it; reused for _RequestState below.
-        provider = _detect_provider(data)
 
         # Anthropic subscription (OAuth) bridge. Publishing the developer's
         # sk-ant-oat token as the per-request api_key is what selects litellm's
@@ -472,7 +481,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 # /v1/chat/completions still reaches the leaking adapter.
                 data.pop("metadata", None)
                 data.pop("user", None)
+                _scrub_retained_request_metadata(data)
             except ValueError:
+                self._seed_request_state(
+                    request_id,
+                    user_id=ctx.user_id,
+                    team_id=ctx.team_id,
+                    provider=provider,
+                    model=model,
+                )
                 self._record_failure(request_id, error_code="E_PROVIDER_AUTH")
                 logger.info(
                     "litellm_pre_call_provider_auth_failed request_id=%s "
@@ -1362,6 +1379,35 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if result.block_reason is not None:
             state.block_reason = result.block_reason
 
+    def _seed_request_state(
+        self,
+        request_id: str,
+        *,
+        user_id: str,
+        team_id: str,
+        provider: Provider,
+        model: str,
+    ) -> _RequestState:
+        """Register the per-request state audit() reads identity from.
+
+        A rejection raised before pre_call builds the main state would otherwise
+        audit as user_id/team_id "unknown" even though corp auth already
+        succeeded — the failure could not be attributed to a developer or team.
+        """
+        state = _RequestState(
+            request_id=request_id,
+            user_id=user_id,
+            team_id=team_id,
+            provider=provider,
+            model=model,
+            redaction_count=0,
+            placeholders=[],
+            cache_a_hit=False,
+            mapping=StrategyResult(pairs=()),
+        )
+        self._req_state[request_id] = state
+        return state
+
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:
             self._req_state[request_id].error_code = error_code
@@ -1587,6 +1633,26 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
     secret_fields = data.get("secret_fields")
     if isinstance(secret_fields, dict):
         _drop_corp_token(secret_fields.get("raw_headers"))
+
+
+def _scrub_retained_request_metadata(data: dict[str, Any]) -> None:
+    """Drop ``metadata``/``user`` from litellm's logging object as well as *data*.
+
+    litellm builds the logging object BEFORE it invokes this hook and keeps its
+    own copy of the request in ``model_call_details`` (``litellm_params`` and the
+    top level). Popping the keys off *data* therefore leaves the unsanitized
+    values reachable by every configured logging callback — the logger surface of
+    invariant 1. Every step is guarded: the key may be absent, the attribute may
+    not exist, and unit tests pass stub objects, so this must never raise out of
+    the hook.
+    """
+    details = getattr(data.get("litellm_logging_obj"), "model_call_details", None)
+    if not isinstance(details, dict):
+        return
+    for bucket in (details, details.get("litellm_params")):
+        if isinstance(bucket, dict):
+            bucket.pop("metadata", None)
+            bucket.pop("user", None)
 
 
 _CHATGPT_HEADER_ALLOWLIST = frozenset(
