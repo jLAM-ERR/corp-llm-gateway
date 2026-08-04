@@ -54,6 +54,7 @@ from corp_llm_gateway.settings import (
     NO_OP_SANITIZER_MESSAGE,
     ConfigError,
     forward_auth_conflict,
+    master_key_conflict,
     parse_flag,
 )
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
@@ -281,6 +282,47 @@ def build_guardrail(
     at import — so a version-incompatible extension is refused before the
     guardrail serves any traffic.
     """
+    # Unlike strip_inbound_headers_to_upstream / max_output_tokens_cap (call-site
+    # policy toggles with no corresponding env var), these two are documented as
+    # operator-settable cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH /
+    # CORP_LLM_FORWARD_ANTHROPIC_AUTH) — a plain `bool = False` default would
+    # silently override the env var in every real deploy, so only resolve from
+    # config when the caller left the kwarg unset.
+    configured_forward_chatgpt_auth = _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
+    configured_forward_anthropic_auth = _flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0")
+    resolved_forward_chatgpt_auth = (
+        forward_chatgpt_auth
+        if forward_chatgpt_auth is not None
+        else configured_forward_chatgpt_auth
+    )
+    resolved_forward_anthropic_auth = (
+        forward_anthropic_auth
+        if forward_anthropic_auth is not None
+        else configured_forward_anthropic_auth
+    )
+    # Same reason as the no-op-sanitizer floor below: settings.validate() covers
+    # `config check` only, and the compose/demo boots these bridges ship on skip it.
+    # Checked before anything is constructed so a config conflict is what the
+    # operator sees, not a downstream failure of a component we should not have
+    # started building.
+    conflict = forward_auth_conflict(
+        chatgpt=resolved_forward_chatgpt_auth, anthropic=resolved_forward_anthropic_auth
+    )
+    if conflict is not None:
+        raise ConfigError([conflict])
+    master_key_problem = master_key_conflict(
+        master_key=config.get("LITELLM_MASTER_KEY"),
+        chatgpt=resolved_forward_chatgpt_auth,
+        anthropic=resolved_forward_anthropic_auth,
+    )
+    if master_key_problem is not None:
+        raise ConfigError([master_key_problem])
+    _warn_on_disarmed_forward_auth_conflict(
+        configured_chatgpt=configured_forward_chatgpt_auth,
+        configured_anthropic=configured_forward_anthropic_auth,
+        resolved_chatgpt=resolved_forward_chatgpt_auth,
+        resolved_anthropic=resolved_forward_anthropic_auth,
+    )
     auth = auth_middleware if auth_middleware is not None else make_auth_middleware()
     store = mapping_store if mapping_store is not None else build_mapping_store()
     oracle_enabled = _flag("CORP_LLM_ORACLE_ENABLED")
@@ -311,37 +353,6 @@ def build_guardrail(
     register_sink(REGISTRY, active_sink, sink_name_for(active_sink))
     REGISTRY.validate_api_version(EXTENSION_API_VERSION)
     audit_logger = AuditLogger(active_sink, gateway_version=gateway_version())
-    # Unlike strip_inbound_headers_to_upstream / max_output_tokens_cap (call-site
-    # policy toggles with no corresponding env var), these two are documented as
-    # operator-settable cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH /
-    # CORP_LLM_FORWARD_ANTHROPIC_AUTH) — a plain `bool = False` default would
-    # silently override the env var in every real deploy, so only resolve from
-    # config when the caller left the kwarg unset.
-    configured_forward_chatgpt_auth = _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
-    configured_forward_anthropic_auth = _flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0")
-    resolved_forward_chatgpt_auth = (
-        forward_chatgpt_auth
-        if forward_chatgpt_auth is not None
-        else configured_forward_chatgpt_auth
-    )
-    resolved_forward_anthropic_auth = (
-        forward_anthropic_auth
-        if forward_anthropic_auth is not None
-        else configured_forward_anthropic_auth
-    )
-    # Same reason as the no-op-sanitizer floor above: settings.validate() covers
-    # `config check` only, and the compose/demo boots this bridge ships on skip it.
-    conflict = forward_auth_conflict(
-        chatgpt=resolved_forward_chatgpt_auth, anthropic=resolved_forward_anthropic_auth
-    )
-    if conflict is not None:
-        raise ConfigError([conflict])
-    _warn_on_disarmed_forward_auth_conflict(
-        configured_chatgpt=configured_forward_chatgpt_auth,
-        configured_anthropic=configured_forward_anthropic_auth,
-        resolved_chatgpt=resolved_forward_chatgpt_auth,
-        resolved_anthropic=resolved_forward_anthropic_auth,
-    )
     return CorpLlmGuardrail(
         orchestrator,
         auth,

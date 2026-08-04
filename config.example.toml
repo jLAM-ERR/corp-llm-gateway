@@ -79,6 +79,12 @@
 #   MUTUALLY EXCLUSIVE with CORP_LLM_FORWARD_CHATGPT_AUTH: both consume the same
 #   inbound Authorization bearer, so setting both refuses to boot (and fails
 #   `gateway-admin config check`). Picking a bridge per provider is a v2 follow-up.
+# LITELLM_MASTER_KEY = ""   # litellm's own virtual-key switch — NOT a gateway knob
+#   Listed here only because it is INCOMPATIBLE with either bridge above: with a
+#   master key set, litellm reads the inbound Authorization header as one of its
+#   own virtual keys and answers 401 before pre_call runs, so the bridge never
+#   sees the developer's OAuth bearer. That pair refuses to boot and fails
+#   `gateway-admin config check`. A master key with both bridges off is fine.
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #

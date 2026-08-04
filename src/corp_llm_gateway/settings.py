@@ -110,6 +110,15 @@ KEYS: tuple[Key, ...] = (
         help="forward an Anthropic subscription (sk-ant-oat) OAuth bearer upstream; "
         "mutually exclusive with CORP_LLM_FORWARD_CHATGPT_AUTH",
     ),
+    # Not a gateway knob — litellm's own virtual-key switch. Registered so it
+    # resolves through the config chain (never a bare os.environ read) and so
+    # `config check` can refuse it alongside a forward-auth bridge.
+    Key(
+        "LITELLM_MASTER_KEY",
+        secret=True,
+        default="",
+        help="litellm virtual-key master key; must be unset while a forward-auth bridge is on",
+    ),
     # Choices validated by normalize_oversize_policy (see _check_oversize), not
     # the generic choice check, so the canonical error message is used once.
     Key("CORP_LLM_OVERSIZE_POLICY", default="fail-closed", help="oversize-leaf policy (F1)"),
@@ -396,6 +405,42 @@ def _check_forward_auth_exclusive(values: Mapping[str, str | None], problems: li
         problems.append(conflict)
 
 
+# Shared with bootstrap.build_guardrail(); the compose stacks the bridges ship on
+# never run `validate()`, and their `env_file:` is a developer-owned file, so this
+# has to be a boot-time refusal rather than a documented convention.
+MASTER_KEY_VS_FORWARD_AUTH_MESSAGE = (
+    "LITELLM_MASTER_KEY is set while a subscription-auth bridge is on "
+    "(CORP_LLM_FORWARD_ANTHROPIC_AUTH / CORP_LLM_FORWARD_CHATGPT_AUTH). A master key makes "
+    "litellm read the inbound Authorization header as one of its own virtual keys and answer "
+    "401 before pre_call ever sees the developer's OAuth bearer, so the bridge can never run. "
+    "Unset it — a leftover LITELLM_MASTER_KEY in the local .env.demo that docker-compose "
+    "passes in via `env_file:` is the usual source — or turn the bridge off"
+)
+
+
+def master_key_conflict(*, master_key: str | None, chatgpt: bool, anthropic: bool) -> str | None:
+    """The one place the master-key-vs-bridge rule is expressed.
+
+    Takes an already-resolved master key and already-parsed bridge flags so
+    `build_guardrail()` can apply it to values that came from explicit kwargs.
+    A master key on its own is legitimate (a plain BYOK-less litellm deploy uses
+    one); only the combination is unserviceable.
+    """
+    if not (chatgpt or anthropic):
+        return None
+    return MASTER_KEY_VS_FORWARD_AUTH_MESSAGE if (master_key or "").strip() else None
+
+
+def _check_master_key_conflict(values: Mapping[str, str | None], problems: list[str]) -> None:
+    conflict = master_key_conflict(
+        master_key=values.get("LITELLM_MASTER_KEY"),
+        chatgpt=_as_flag(values.get("CORP_LLM_FORWARD_CHATGPT_AUTH")),
+        anthropic=_as_flag(values.get("CORP_LLM_FORWARD_ANTHROPIC_AUTH")),
+    )
+    if conflict is not None:
+        problems.append(conflict)
+
+
 def _check_no_op_sanitizer(values: Mapping[str, str | None], problems: list[str]) -> None:
     """Refuse to boot as a no-op sanitizer: oracle off requires the local-first floor.
 
@@ -475,6 +520,7 @@ def validate() -> Settings:
     _check_oracle_endpoint(values, problems)
     _check_no_op_sanitizer(values, problems)
     _check_forward_auth_exclusive(values, problems)
+    _check_master_key_conflict(values, problems)
     if problems:
         raise ConfigError(list(dict.fromkeys(problems)))
     return Settings(values=values)
