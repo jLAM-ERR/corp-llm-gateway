@@ -159,6 +159,46 @@ replace the trust store for `api.anthropic.com`/`api.openai.com` too. So
 builds a combined bundle (certifi's public roots, plus `corp-ca-bundle.pem`
 appended if mounted) at boot and `SSL_CERT_FILE` always points at that.
 
+## Corp NER service (optional, off)
+
+A remote NER detector appended to the local-first cascade
+(`detectors/corp_ner.py`, wired by `bootstrap.build_corp_ner()`). It is **off
+by default** — `CORP_NER_ENABLED=0` — and while it is off the stack behaves
+exactly as it did before the feature existed: no detector, no readiness probe.
+Not to be confused with `CORP_LLM_REQUIRE_NER` ("Environment posture"), which
+governs the **in-process** RU/EN NER engines and stays `1` either way.
+
+Turning it on needs both `CORP_NER_ENABLED=1` and `CORP_NER_ENDPOINT` (the
+service **base** URL; the client appends `/v1/analyze`). Enabled without an
+endpoint is a **boot refusal**, not a silent skip — `build_corp_ner()` raises
+`ConfigError`, and `gateway-admin config check` reports the same problem.
+
+Four tuning keys are passed to the container **by bare name**, which is the
+reason `.env.example` ships them commented rather than empty:
+
+| key | code default | notes |
+|---|---|---|
+| `CORP_NER_TIMEOUT_S` | `30` | under the service's own 60s |
+| `CORP_NER_MAX_TEXTS` | `256` | texts per batch (service limit) |
+| `CORP_NER_MAX_INPUT_CHARS` | `200000` | chars per batch; a longer single text fails **closed** |
+| `CORP_NER_CA_BUNDLE` | unset | PEM chain for an internal-CA NER cert |
+
+`CORP_NER_TIMEOUT_S=` (empty) is **not** the same as leaving the line
+commented. An empty env var wins over the config file in `config.get()`, so it
+shadows any value in a mounted `/etc/corp-llm-gateway/config.toml` and makes
+`gateway-admin config check` print `''` where the effective default is `30`.
+Bare-name passthrough keeps "unset in `.env`" meaning "not configured here",
+which is exactly what the required-when-enabled check on `CORP_NER_ENDPOINT`
+is written to see. Same reasoning as `CORP_LLM_CA_BUNDLE` above.
+
+The NER call carries **raw user content**, so its TLS verification is never
+disabled — there is no `SSL_VERIFY`-style escape hatch for it. Point
+`CORP_NER_CA_BUNDLE` at an internal CA chain instead (the `compose/certs`
+mount already available to the container works).
+
+Note the published `GATEWAY_IMAGE_TAG` predates this work — see "Building from
+this branch".
+
 ## Two UIs — which one answers which question
 
 The stack ships two web UIs. They do not overlap; reaching for the wrong one
@@ -451,8 +491,8 @@ consequences worth knowing:
   safe because Vector identifies a file by content fingerprint, not path — a
   renamed file keeps its checkpoint, so already-shipped bytes are not re-sent.
   The patterns stop at two digits on purpose: `…-json.log.*` would also match
-  `…-json.log.1.gz`, and Vector's file source cannot decompress. Leave docker's
-  `compress` log-opt off (its default) for the same reason;
+  `…-json.log.1.gz`, and Vector's file source cannot decompress. The service
+  therefore pins `compress: "false"` — see the last bullet;
 - the source sees **every** container's logs, not just `litellm`, because the
   log directory is keyed by container id and the glob cannot be narrowed. The
   scoping is done one transform later — see "Container identity boundary";
@@ -471,7 +511,19 @@ consequences worth knowing:
   same disk as Cache B and Postgres. `logging.options` sets `max-size` /
   `max-file` explicitly (`LITELLM_LOG_MAX_SIZE` / `LITELLM_LOG_MAX_FILE`,
   default `100m` × `10` ≈ the 1 GiB disk buffer). Removing them does **not**
-  hand the job back to the daemon.
+  hand the job back to the daemon;
+- **the same merge runs the other way for `compress`, so the service pins it
+  off.** On a host whose daemon default *is* `json-file` and carries
+  `compress=true`, the merge copies that option into any container that has not
+  named it — docker then writes rotations as `…-json.log.1.gz`, which Vector's
+  glob does not match and Vector could not read if it did. Every record that
+  rotated while Vector was down or back-pressured would be lost silently.
+  Measured on a docker 29.7.1 daemon defaulting to json-file +
+  `max-size=1k`/`max-file=4`/`compress=true`: a container pinning only the two
+  size options rotated to `…-json.log.{1,2,3}.gz`; adding `compress: "false"`
+  gave plain `…-json.log.{1,2,3}`. It is not an `.env` key — widening the
+  Vector glob to `…-json.log.*` is not an alternative fix, it just matches
+  files Vector still cannot decompress.
 
 **Container identity boundary.** `docker-compose.yml` puts a
 `com.corp-llm-gateway.audit-source: gateway-stdout` label on the `litellm`
