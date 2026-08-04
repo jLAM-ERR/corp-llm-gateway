@@ -77,6 +77,45 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 | `CORP_LLM_ORACLE_TRIGGER` | `gazetteer_hit` \| `any_local_finding` \| `sampled:<pct>` \| `always` (F3) | `gazetteer_hit` | no |
 | `CORP_LLM_LOG_LEVEL` | log level | `INFO` | no |
 
+### Subscription-auth bridges
+
+| Key | Purpose | Default | Required |
+|-----|---------|---------|----------|
+| `CORP_LLM_FORWARD_CHATGPT_AUTH` | lift the inbound Codex OAuth bearer onto the upstream OpenAI Responses call | `0` | no |
+| `CORP_LLM_FORWARD_ANTHROPIC_AUTH` | lift the inbound `sk-ant-oat…` bearer onto the upstream Anthropic call | `0` | no |
+
+Both bridges consume the **same** inbound `Authorization` bearer, so they are
+**mutually exclusive**: setting both refuses to boot (`build_guardrail()` raises)
+and fails `gateway-admin config check` with one shared message. The runtime check
+matters because compose / demo / bare-litellm boots skip `settings.validate()`
+entirely. Selecting a bridge per provider is a v2 follow-up.
+
+`CORP_LLM_FORWARD_ANTHROPIC_AUTH` accepts only `sk-ant-oat…` OAuth tokens;
+anything else is `401 E_PROVIDER_AUTH`. A plain `sk-ant-api…` key would make
+litellm emit `x-api-key` while the inbound `Authorization` is still merged in —
+two competing auth schemes on one upstream request.
+
+**Supported on the `anthropic-oauth` docker-compose overlay only.** Enabling it
+anywhere else risks handing the developer's subscription token to the wrong
+provider:
+
+| Deployment | Why not |
+|-----|-----|
+| Helm chart | Its litellm ConfigMap routes `"*"` to the corp vLLM and has no `anthropic/` route, so litellm's OAuth branch is unreachable — and a `claude-…` alias on that wildcard would carry the token to the corp vLLM. |
+| Production compose | `Authorization` there is already spoken for by litellm virtual keys, so the OAuth token has no header to travel on. Picking a second header is a governance decision that has not been made. |
+
+The guardrail does check that the request looks Anthropic-routed, but it reads
+only the **client-visible model alias**; litellm resolves the real deployment
+after the hook runs. That check is defence-in-depth, not a routing guarantee. The
+binding control is the deployment shape: a litellm config with no `model_name:
+"*"` catch-all and no non-`anthropic/` route, which is what
+`docker/anthropic-oauth/litellm-config.yaml` ships and
+`tests/test_anthropic_oauth_profile.py` pins.
+
+Consequence to accept knowingly: that overlay has no litellm virtual keys, so
+subscription auth and native budget / rate-limit governance are not available at
+the same time today.
+
 ### Backends
 
 | Key | Purpose | Default | Required |

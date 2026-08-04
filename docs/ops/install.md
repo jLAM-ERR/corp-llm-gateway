@@ -141,3 +141,66 @@ The gateway image mounts these onto LiteLLM's ASGI app (probes target them):
 
 `helm rollback gw <revision>` (`helm history gw`; Helm keeps the last 10). See
 `runbook.md`.
+
+## Developer laptop: Claude Code on an Anthropic subscription
+
+This runs `claude` through the gateway with **no `ANTHROPIC_API_KEY` anywhere** —
+the developer's own Max/Pro OAuth token pays for the upstream call.
+
+It runs on the `anthropic-oauth` docker-compose overlay only. The Helm chart
+above cannot serve it: its litellm ConfigMap routes `"*"` to the corp vLLM and
+has no `anthropic/` route at all, so litellm's Anthropic OAuth branch is never
+reached. See `configuration.md` for the full reason and the production-compose
+case.
+
+1. **Start the overlay** (it sets `CORP_LLM_FORWARD_ANTHROPIC_AUTH=1` and swaps
+   in an Anthropic-only litellm config):
+
+   ```bash
+   cp -n .env.demo.example .env.demo     # CORP_LLM_ENDPOINT = the sanitization helper
+
+   docker compose \
+     -f docker-compose.demo.yml \
+     -f docker-compose.anthropic-oauth.yml \
+     up -d --build redis postgres litellm
+
+   curl -fsS http://127.0.0.1:4000/health/liveliness
+   ```
+
+2. **Point Claude Code at it.** Export your subscription token, then source the
+   profile's env snippet — it is the single place the corp-identity header layout
+   is written, and it unsets `ANTHROPIC_API_KEY` so a leftover key cannot shadow
+   the subscription:
+
+   ```bash
+   export ANTHROPIC_AUTH_TOKEN='sk-ant-oat...'
+   source docker/anthropic-oauth/claude-env.sh
+   claude
+   ```
+
+   `ANTHROPIC_AUTH_TOKEN` makes `claude` send `Authorization: Bearer <token>`;
+   the gateway lifts it onto the upstream Anthropic call. Corp identity travels
+   separately on `X-Corp-Auth` and is stripped before egress, so the two
+   credentials never collide.
+
+3. **Stop just this profile's stack:**
+
+   ```bash
+   docker compose \
+     -f docker-compose.demo.yml \
+     -f docker-compose.anthropic-oauth.yml \
+     stop litellm redis postgres
+   ```
+
+Notes:
+
+- Only `sk-ant-oat…` OAuth tokens are accepted. A plain `sk-ant-api…` key is
+  rejected with `401 E_PROVIDER_AUTH`: litellm would send it as `x-api-key`
+  while the inbound `Authorization` is still merged in, putting two competing
+  auth schemes on one upstream request.
+- `401 E_MISSING_TOKEN` instead means `X-Corp-Auth` never arrived — check
+  `echo "$ANTHROPIC_CUSTOM_HEADERS"` in the shell you launched `claude` from.
+- The overlay deliberately sets no `LITELLM_MASTER_KEY`. With one, litellm
+  consumes the inbound `Authorization` as a virtual key and rejects the request
+  before `pre_call` runs — so there are also no litellm virtual keys, and no
+  native budget or rate-limit enforcement, on this route.
