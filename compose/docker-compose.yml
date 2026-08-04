@@ -1,9 +1,9 @@
 # Production compose stack for non-k8s hosts — data plane + self-hosted
-# Langfuse (this revision). See compose/README.md. The production Vector
-# config (A3) and the optional nginx front door land in later revisions of
-# this file (`nginx/` -> `--profile nginx`, `vector/` wires into the
-# always-on audit path — see those directories). The offline corp-NER mock
-# (workstream B) will register a service carrying `profiles: ["mock"]`.
+# Langfuse + the audit pipeline (this revision). See compose/README.md. The
+# optional nginx front door lands in a later revision of this file (`nginx/`
+# -> `--profile nginx`); `vector` below is always-on, because audit is not
+# optional. The offline corp-NER mock (workstream B) will register a service
+# carrying `profiles: ["mock"]`.
 # Langfuse publishes NO host port: it is reachable only through the nginx
 # profile or an SSH tunnel (compose/README.md "Langfuse").
 #
@@ -494,6 +494,106 @@ services:
       start_period: 120s
     restart: unless-stopped
 
+  # ---- Audit pipeline ------------------------------------------------------
+  # gateway stdout -> vector -> langfuse. CORP_AUDIT_SINK is deliberately unset
+  # on the litellm service, so audit/factory.py's default StdoutSink applies and
+  # this service is on the REAL audit path: a misconfiguration here loses audit
+  # records. Not profile-gated for the same reason.
+  vector:
+    image: timberio/vector:0.53.0-alpine
+    volumes:
+      # Replaces the demo's `/var/run/docker.sock` mount (docker-compose.demo.yml
+      # warns against reusing that): the socket is the docker daemon's control
+      # plane, so read access to it is host root — a container holding it can
+      # start a privileged sibling with / bind-mounted. This is a read-only bind
+      # of the container LOG DIRECTORY instead: data in, no control plane, no
+      # write path. vector.yaml's file source globs only `*/*-json.log`, so the
+      # sibling config.v2.json / hostconfig.json files (which hold every
+      # container's environment) are never read.
+      #
+      # Requires docker's default `json-file` logging driver. Under `local`,
+      # `journald` or a remote driver there are no *-json.log files and this
+      # source reads nothing — the audit pipeline goes quiet. See
+      # compose/README.md "Audit pipeline".
+      #
+      # No `user:` override: the log directory is mode 0710 root:root, so vector
+      # must stay the image's default root to read it. Everything else is locked
+      # down instead (read_only rootfs, all capabilities dropped).
+      - ${DOCKER_CONTAINERS_DIR:-/var/lib/docker/containers}:/var/lib/docker/containers:ro
+      - ./vector:/etc/vector:ro
+      # Read checkpoints (resume where the last run stopped, so a vector restart
+      # neither loses nor duplicates audit records) + the langfuse disk buffer.
+      - vector-data:/var/lib/vector
+    # Scoped per-key, not `env_file: .env` — nothing here needs POSTGRES_PASSWORD,
+    # the provider keys or the Langfuse infrastructure secrets. The two ingestion
+    # keys are the Langfuse PROJECT API keys (public/secret), provisioned by the
+    # LANGFUSE_INIT_* block or in the UI; they are required, so a missing one
+    # fails `docker compose config` instead of leaving audit silently undelivered.
+    environment:
+      # Fixed, NOT sourced from .env: this stack self-hosts Langfuse, and an
+      # operator-settable audit destination is a redirect lever on the audit
+      # trail.
+      - CORP_LANGFUSE_URL=http://langfuse-web:3000
+      - CORP_LANGFUSE_PUBLIC_KEY=${CORP_LANGFUSE_PUBLIC_KEY:?set CORP_LANGFUSE_PUBLIC_KEY in .env}
+      - CORP_LANGFUSE_SECRET_KEY=${CORP_LANGFUSE_SECRET_KEY:?set CORP_LANGFUSE_SECRET_KEY in .env}
+      - CORP_VECTOR_LANGFUSE_BUFFER_BYTES=${CORP_VECTOR_LANGFUSE_BUFFER_BYTES:-1073741824}
+      # Optional archive/forwarder sinks, OFF by default (see the command
+      # below). Bare names so an unset value is ABSENT from the container rather
+      # than an empty string — vector fails config load on a referenced variable
+      # that is missing, which is what makes "enabled but unconfigured" a boot
+      # failure instead of a silent no-op.
+      - CORP_AUDIT_S3_ENABLED=${CORP_AUDIT_S3_ENABLED:-0}
+      - CORP_AUDIT_SIEM_ENABLED=${CORP_AUDIT_SIEM_ENABLED:-0}
+      - CORP_AUDIT_S3_BUCKET
+      - CORP_AUDIT_S3_REGION
+      - CORP_VECTOR_S3_BUFFER_BYTES
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - CORP_AUDIT_SIEM_URL
+      - CORP_VECTOR_SIEM_BUFFER_BYTES
+    entrypoint: ["sh", "-c"]
+    # Config-gating: vector merges every --config file into one topology, so the
+    # optional sinks attach to vector.yaml's `audit_only` transform (and thus
+    # inherit the NEVER-fields gate) without vector.yaml knowing about them.
+    # Compose cannot conditionally add an argument — an unset variable in a
+    # command list expands to an empty argv entry, which vector rejects — hence
+    # the shell. $$ keeps these variables away from compose's own interpolation.
+    command:
+      - |-
+        set -e
+        set -- --config /etc/vector/vector.yaml
+        if [ "$$CORP_AUDIT_S3_ENABLED" = "1" ]; then
+          set -- "$$@" --config /etc/vector/sinks-s3.yaml
+        fi
+        if [ "$$CORP_AUDIT_SIEM_ENABLED" = "1" ]; then
+          set -- "$$@" --config /etc/vector/sinks-siem.yaml
+        fi
+        exec vector "$$@"
+    # No published port. The vector API is bound to 127.0.0.1 inside the
+    # container (vector.yaml) purely so this healthcheck can reach it.
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      # service_started, NOT service_healthy: the audit forwarder must not be
+      # gated on the health of the thing it audits. Vector reads a log FILE, so
+      # an unhealthy-but-running litellm still gets its audit records shipped.
+      litellm:
+        condition: service_started
+      # This one is service_healthy — it is the sink's target.
+      langfuse-web:
+        condition: service_healthy
+    healthcheck:
+      # The vector image has no curl. 127.0.0.1, NOT localhost: busybox wget
+      # tries ::1 first and the vector API listens on IPv4 only, so `localhost`
+      # here reports the container permanently unhealthy.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8686/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
 volumes:
   gateway-redis-data:
   gateway-postgres-data:
@@ -502,3 +602,4 @@ volumes:
   langfuse-clickhouse-data:
   langfuse-clickhouse-logs:
   langfuse-minio-data:
+  vector-data:

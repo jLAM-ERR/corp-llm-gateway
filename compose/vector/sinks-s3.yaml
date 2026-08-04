@@ -1,0 +1,36 @@
+# OPTIONAL durable audit archive. NOT loaded by default — the vector service in
+# compose/docker-compose.yml passes this file to `vector --config` only when
+# CORP_AUDIT_S3_ENABLED=1. Vector merges every --config file into one topology,
+# so `audit_only` below is the transform defined in vector.yaml.
+#
+# `audit_only` is downstream of `never_fields_gate`, so this sink inherits the
+# NEVER-fields gate (invariant #2) — it gets the flat, gated audit record, not
+# the Langfuse envelope. Do not point it at an upstream transform.
+#
+# Retention is the object store's job (docs/ops/ has the 90-day policy); Vector
+# only writes.
+
+sinks:
+  s3:
+    type: aws_s3
+    inputs: ["audit_only"]
+    bucket: "${CORP_AUDIT_S3_BUCKET}"
+    region: "${CORP_AUDIT_S3_REGION}"
+    # team_id is an ALWAYS field of AuditEvent, so this key always resolves.
+    key_prefix: "{{ team_id }}/dt=%Y-%m-%d/"
+    compression: gzip
+    encoding:
+      codec: json
+    # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (passed
+    # through by the vector service) or the instance role — no explicit auth
+    # block, so nothing credential-shaped lives in this file.
+    #
+    # For an S3-compatible store (MinIO, Ceph) add an `endpoint:` key here,
+    # reading a CORP_AUDIT_S3_ENDPOINT env var, and pass that var through in
+    # the vector service's environment block. (Not written out literally:
+    # Vector interpolates env-var references inside comments too, so an unset
+    # variable named in a comment fails config load.)
+    buffer:
+      type: disk
+      max_size: ${CORP_VECTOR_S3_BUFFER_BYTES:-5368709120}
+      when_full: block
