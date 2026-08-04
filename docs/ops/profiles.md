@@ -56,6 +56,15 @@ pre_pass_down = "fail-closed"
 - **`[policy]`** knobs — `size_threshold_bytes`, `block_payloads`, `dlp_guard`,
   `oracle_mode`, `allowed_providers`, `canary_patterns`, `retention_*`, and
   `[policy.fail_policy]`.
+- **`oracle_mode`** — validated at parse time (same canonical forms as
+  `CORP_LLM_ORACLE_TRIGGER`: `gazetteer_hit` | `any_local_finding` | `always` |
+  `sampled:<pct>`); an unknown value is a `ProfileParseError`. The profiled
+  request runs on the **broader** of this and the global
+  `CORP_LLM_ORACLE_TRIGGER` — neither knob can narrow the other.
+- **`[policy.fail_policy]`** and **`retention_*`** are parsed, merged and folded
+  into the bundle fingerprint, but no runtime path reads them yet: the egress
+  path is unconditionally fail-closed and retention comes from `team_config`.
+  Setting them changes nothing today except the cache key.
 - **`content_hash`** — optional; see integrity below.
 - Any other key (e.g. `data_residency`) is advisory — `parse_manifest` ignores
   it and no code path reads it yet.

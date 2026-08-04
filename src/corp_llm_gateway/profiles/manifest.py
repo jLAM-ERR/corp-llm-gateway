@@ -178,6 +178,23 @@ def verify_integrity(manifest: ProfileManifest, computed_hash: str) -> None:
     verify_signature(manifest)
 
 
+def _parse_oracle_mode(raw: Any) -> str:
+    """Validate `oracle_mode` here, where the profile is read, not at request time.
+
+    The value drives the inner orchestrator's oracle trigger, so an unrecognized
+    one would otherwise rank as the narrowest mode and silently skip the oracle.
+    Local import: the canonical form lives with the orchestrator that consumes it
+    and importing it at module scope would tie `profiles` to `sanitizer`.
+    """
+    from corp_llm_gateway.sanitizer.orchestrator import normalize_oracle_trigger
+
+    value = _as_str(raw, "oracle_mode")
+    try:
+        return normalize_oracle_trigger(value)
+    except ValueError as exc:
+        raise ProfileParseError(f"profile.toml: oracle_mode: {exc}") from exc
+
+
 def _parse_policy(raw: Any) -> PolicyKnobs:
     if not isinstance(raw, dict):
         raise ProfileParseError("profile.toml: [policy] must be a table")
@@ -191,7 +208,7 @@ def _parse_policy(raw: Any) -> PolicyKnobs:
     if "dlp_guard" in raw:
         kwargs["dlp_guard"] = _as_bool(raw["dlp_guard"], "dlp_guard")
     if "oracle_mode" in raw:
-        kwargs["oracle_mode"] = _as_str(raw["oracle_mode"], "oracle_mode")
+        kwargs["oracle_mode"] = _parse_oracle_mode(raw["oracle_mode"])
     if "allowed_providers" in raw:
         kwargs["allowed_providers"] = frozenset(
             _as_str_tuple(raw["allowed_providers"], "allowed_providers")

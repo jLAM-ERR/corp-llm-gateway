@@ -79,7 +79,10 @@ _CACHE_A_ALGORITHM_VERSION = b"coverage-v2"
 
 # Bump when the fingerprint's own INPUT SET changes (a newly folded component),
 # so entries keyed by the older, less complete fingerprint are retired too.
-_POLICY_FINGERPRINT_VERSION = b"policy-v1"
+#   policy-v2  the gazetteer's LEMMATIZER identity joined the input set: equal
+#              term signatures still match different text when one process has
+#              the `ner` extra and another does not.
+_POLICY_FINGERPRINT_VERSION = b"policy-v2"
 
 # Chunk overlap sizing (F1 chunk policy). Regex/checksum patterns are LINEAR and
 # now run over the FULL text (see `_sanitize_chunked`), so the overlap no longer
@@ -466,6 +469,11 @@ class SanitizationOrchestrator:
             _feed(h, [b"gazetteer"])
             if self._gazetteer is not None:
                 _feed(h, [t.encode("utf-8") for t in self._gazetteer.term_signature()])
+                # Matching lemmatizes; the CONFIGURED terms alone do not say what
+                # this process can match. Taken here, at construction, because
+                # the probe latches the lazy backends: the value cannot change
+                # once the fingerprint has been written.
+                _feed(h, [t.encode("utf-8") for t in self._gazetteer.lemmatizer_signature()])
             _feed(h, [b"allowlist"])
             if self._allowlist is not None:
                 _feed(h, sorted(e.encode("utf-8") for e in self._allowlist.entries))
