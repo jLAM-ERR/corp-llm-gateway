@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from corp_llm_gateway import bootstrap, config
+from corp_llm_gateway import bootstrap, config, settings
 from corp_llm_gateway.audit import StdoutSink
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
@@ -298,6 +298,119 @@ def test_forward_chatgpt_auth_explicit_argument_overrides_config(
     assert guardrail._forward_chatgpt_auth is False
 
 
+# ── forward_anthropic_auth: same config-resolution contract as the Codex flag ─
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
+def test_forward_anthropic_auth_truthy_spellings_enable_the_flag(
+    monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", truthy)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._forward_anthropic_auth is True
+
+
+@pytest.mark.parametrize("falsy", ["0", "off", "no", "false", "OFF"])
+def test_forward_anthropic_auth_falsy_spellings_disable_the_flag(
+    monkeypatch: pytest.MonkeyPatch, falsy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", falsy)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._forward_anthropic_auth is False
+
+
+def test_forward_anthropic_auth_unset_defaults_off() -> None:
+    # Backward compatibility: an existing deploy that sets neither key keeps
+    # today's behavior exactly.
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._forward_anthropic_auth is False
+    assert guardrail._forward_chatgpt_auth is False
+
+
+def test_forward_anthropic_auth_explicit_argument_overrides_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+
+    assert bootstrap.build_guardrail(forward_anthropic_auth=False)._forward_anthropic_auth is False
+
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0")
+
+    assert bootstrap.build_guardrail(forward_anthropic_auth=True)._forward_anthropic_auth is True
+
+
+# ── flag exclusivity: enforced at RUNTIME, not only in `config check` (the
+# compose/demo/bare-litellm boots this bridge ships on never call
+# settings.validate()) ───────────────────────────────────────────────────────
+
+
+def test_both_forward_auth_flags_raise_from_build_guardrail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+
+    with pytest.raises(ConfigError) as exc_info:
+        bootstrap.build_guardrail()
+
+    assert settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE in exc_info.value.problems
+
+
+@pytest.mark.parametrize("truthy", ["true", "yes", "on"])
+def test_both_forward_auth_flags_lenient_spellings_raise_from_build_guardrail(
+    monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", truthy)
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", truthy)
+
+    with pytest.raises(ConfigError, match="mutually"):
+        bootstrap.build_guardrail()
+
+
+def test_both_forward_auth_flags_raise_when_one_comes_from_a_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The conflict is checked on the RESOLVED pair, so a caller-supplied kwarg
+    # cannot smuggle the second bridge past the rule.
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
+
+    with pytest.raises(ConfigError, match="mutually"):
+        bootstrap.build_guardrail(forward_anthropic_auth=True)
+
+
+def test_kwarg_off_disarms_the_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both env vars on, but the caller explicitly turns one off — the resolved
+    # pair is legal, so the build succeeds with only the Anthropic bridge live.
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+
+    guardrail = bootstrap.build_guardrail(forward_chatgpt_auth=False)
+
+    assert guardrail._forward_chatgpt_auth is False
+    assert guardrail._forward_anthropic_auth is True
+
+
+@pytest.mark.parametrize(
+    "chatgpt,anthropic",
+    [("1", "0"), ("0", "1"), ("0", "0")],
+)
+def test_one_forward_auth_flag_at_a_time_builds_fine(
+    monkeypatch: pytest.MonkeyPatch, chatgpt: str, anthropic: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", chatgpt)
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", anthropic)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._forward_chatgpt_auth is (chatgpt == "1")
+    assert guardrail._forward_anthropic_auth is (anthropic == "1")
+
+
 # ── no-op-sanitizer floor: build_guardrail must not skip this even though it
 # never calls settings.validate() (Helm's config-check initContainer does; this
 # covers compose/demo/bare-litellm boots) ────────────────────────────────────
@@ -521,6 +634,39 @@ async def test_demo_shim_yields_in_memory_deps_and_working_guardrail() -> None:
     ctx = await guardrail._auth.authenticate("demo-team-token")
     assert ctx.team_id == "demo-team"
     assert ctx.user_id == "demo-user"
+
+
+@pytest.mark.usefixtures("_restore_pkg_logger")
+def test_demo_shim_resolves_forward_anthropic_auth_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Lenient spelling on purpose: the demo shim must use settings.parse_flag,
+    # not a raw `== "1"`.
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "yes")
+    config.reset_cache()
+    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
+
+    module = importlib.import_module("corp_llm_gateway._demo_guardrail")
+
+    assert module.guardrail._forward_anthropic_auth is True
+    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
+
+
+@pytest.mark.usefixtures("_restore_pkg_logger")
+def test_demo_boot_path_raises_when_both_forward_auth_flags_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The demo/compose boot never calls settings.validate(), so the exclusivity
+    # rule has to fire from build_guardrail() for this path to be covered.
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    config.reset_cache()
+    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
+
+    with pytest.raises(ConfigError, match="mutually"):
+        importlib.import_module("corp_llm_gateway._demo_guardrail")
+
+    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
 
 
 @pytest.mark.usefixtures("_restore_pkg_logger")

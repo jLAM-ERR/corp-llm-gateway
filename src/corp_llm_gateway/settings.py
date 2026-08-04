@@ -103,6 +103,13 @@ KEYS: tuple[Key, ...] = (
         default="0",
         help="forward allowlisted Codex OAuth headers to ChatGPT backend",
     ),
+    Key(
+        "CORP_LLM_FORWARD_ANTHROPIC_AUTH",
+        flag=True,
+        default="0",
+        help="forward an Anthropic subscription (sk-ant-oat) OAuth bearer upstream; "
+        "mutually exclusive with CORP_LLM_FORWARD_CHATGPT_AUTH",
+    ),
     # Choices validated by normalize_oversize_policy (see _check_oversize), not
     # the generic choice check, so the canonical error message is used once.
     Key("CORP_LLM_OVERSIZE_POLICY", default="fail-closed", help="oversize-leaf policy (F1)"),
@@ -354,6 +361,35 @@ NO_OP_SANITIZER_MESSAGE = (
 )
 
 
+# Shared with bootstrap.build_guardrail(), which enforces the same invariant at
+# runtime (compose/demo/bare-litellm boots never run `validate()`).
+FORWARD_AUTH_EXCLUSIVE_MESSAGE = (
+    "CORP_LLM_FORWARD_CHATGPT_AUTH and CORP_LLM_FORWARD_ANTHROPIC_AUTH are mutually "
+    "exclusive — both consume the same inbound Authorization bearer, so with both on "
+    "the developer's credential would be lifted onto whichever upstream the request "
+    "happens to reach. Provider-keyed selection of the two bridges is a v2 follow-up; "
+    "enable exactly one in v1"
+)
+
+
+def forward_auth_conflict(*, chatgpt: bool, anthropic: bool) -> str | None:
+    """The one place the exclusivity rule is expressed.
+
+    Takes already-parsed flags so `build_guardrail()` can apply it to values that
+    came from explicit kwargs rather than config.
+    """
+    return FORWARD_AUTH_EXCLUSIVE_MESSAGE if chatgpt and anthropic else None
+
+
+def _check_forward_auth_exclusive(values: Mapping[str, str | None], problems: list[str]) -> None:
+    conflict = forward_auth_conflict(
+        chatgpt=_as_flag(values.get("CORP_LLM_FORWARD_CHATGPT_AUTH")),
+        anthropic=_as_flag(values.get("CORP_LLM_FORWARD_ANTHROPIC_AUTH")),
+    )
+    if conflict is not None:
+        problems.append(conflict)
+
+
 def _check_no_op_sanitizer(values: Mapping[str, str | None], problems: list[str]) -> None:
     """Refuse to boot as a no-op sanitizer: oracle off requires the local-first floor.
 
@@ -432,6 +468,7 @@ def validate() -> Settings:
     _check_oracle_trigger(values, problems)
     _check_oracle_endpoint(values, problems)
     _check_no_op_sanitizer(values, problems)
+    _check_forward_auth_exclusive(values, problems)
     if problems:
         raise ConfigError(list(dict.fromkeys(problems)))
     return Settings(values=values)

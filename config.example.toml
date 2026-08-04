@@ -64,6 +64,13 @@
 #   Resolved by bootstrap.build_guardrail() in every deployment (k8s/Helm
 #   included), not just the docker-compose Codex demo overlay. See
 #   docs/chatgpt-codex.md.
+# CORP_LLM_FORWARD_ANTHROPIC_AUTH = "0"  # opt-in Anthropic subscription (OAuth) forwarding
+#   Lifts the developer's `sk-ant-oat…` bearer into the upstream Anthropic call,
+#   so no ANTHROPIC_API_KEY is needed on the laptop. Only applied to requests
+#   routed to an Anthropic model.
+#   MUTUALLY EXCLUSIVE with CORP_LLM_FORWARD_CHATGPT_AUTH: both consume the same
+#   inbound Authorization bearer, so setting both refuses to boot (and fails
+#   `gateway-admin config check`). Picking a bridge per provider is a v2 follow-up.
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #
