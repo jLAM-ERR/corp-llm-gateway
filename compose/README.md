@@ -1,11 +1,17 @@
 # Production compose stack
 
 A production deploy target for non-k8s hosts, alongside `helm/corp-llm-gateway/`
-(the k8s target). This directory currently ships the **data plane** only:
-`litellm` (the guardrail-fronted proxy) + `redis` (Cache B, the per-conversation
-mapping store) + `postgres` (the token/team-config store, plus litellm's own
-virtual-key/UI database). Self-hosted Langfuse, production Vector config and
-the optional nginx front door land in later revisions of this stack — see
+(the k8s target). This directory ships:
+
+- the **data plane** — `litellm` (the guardrail-fronted proxy) + `redis`
+  (Cache B, the per-conversation mapping store) + `postgres` (the
+  token/team-config store, plus litellm's own virtual-key/UI database);
+- **self-hosted Langfuse v3** — `langfuse-web`, `langfuse-worker`,
+  `langfuse-postgres`, `clickhouse`, `minio`, `minio-init` and
+  `langfuse-redis`, publishing no host port (see "Langfuse" below).
+
+The production Vector config and the optional nginx front door land in later
+revisions of this stack — see
 `docs/plans/20260802-production-compose-corp-ner.md` for the full build order.
 
 ## Quickstart
@@ -15,10 +21,15 @@ cd compose
 cp .env.example .env
 chmod 0600 .env
 # edit .env: GATEWAY_IMAGE_TAG, POSTGRES_PASSWORD, LITELLM_MASTER_KEY,
-# UI_USERNAME, UI_PASSWORD, and at least one of ANTHROPIC_API_KEY/OPENAI_API_KEY
+# UI_USERNAME, UI_PASSWORD, at least one of ANTHROPIC_API_KEY/OPENAI_API_KEY,
+# and the Langfuse secrets (LANGFUSE_POSTGRES_PASSWORD,
+# LANGFUSE_CLICKHOUSE_PASSWORD, MINIO_ROOT_PASSWORD, LANGFUSE_NEXTAUTH_SECRET,
+# LANGFUSE_SALT, LANGFUSE_ENCRYPTION_KEY)
 cp ../src/corp_llm_gateway/tokens/schema.sql postgres/initdb/01-schema.sql
 docker compose up -d
-docker compose ps                              # wait ~30-60s (start_period) for "healthy"
+docker compose ps                              # wait ~30-60s (start_period) for "healthy";
+                                               # langfuse-web/worker take ~2 min on a fresh
+                                               # volume while migrations run
 curl http://localhost:4000/health/liveliness
 ```
 
@@ -144,6 +155,95 @@ replace the trust store for `api.anthropic.com`/`api.openai.com` too. So
 builds a combined bundle (certifi's public roots, plus `corp-ca-bundle.pem`
 appended if mounted) at boot and `SSL_CERT_FILE` always points at that.
 
+## Two UIs — which one answers which question
+
+The stack ships two web UIs. They do not overlap; reaching for the wrong one
+is the usual reason an operator concludes "the gateway has no data".
+
+| Question | Where |
+|---|---|
+| Who has a virtual key, and is it still valid? | LiteLLM UI |
+| How much has a developer/team spent, and what are their rate limits? | LiteLLM UI |
+| Which models does this proxy expose, and is a route healthy? | LiteLLM UI |
+| What did request `<id>` look like end to end — latency, token counts, upstream error? | Langfuse |
+| Was that request sanitized, and how many redactions did it carry (`redaction_count`, `finding_label_counts`)? | Langfuse |
+| Why was a request blocked (`block_reason`), and which team was it? | Langfuse |
+| What is the audit trail for the last 90 days? | Langfuse |
+
+Short version: **LiteLLM = keys, models, spend. Langfuse = request-level
+traces and the audit trail.** Neither ever holds original user content —
+audit records pass the NEVER-fields gate (`audit/invariants.py`) plus
+Vector's VRL gate before they reach Langfuse (invariant #2).
+
+## Langfuse
+
+Self-hosted Langfuse v3, ported from `docker-compose.demo.yml` and hardened:
+
+- **every secret comes from `.env`** — the demo ships literal
+  `demo-secret-key-change-in-production` / `demo-salt-change-in-production` /
+  an all-zero `ENCRYPTION_KEY` / `minioadmin`. Here `docker compose up`
+  refuses to start until each is set;
+- **no host port is published by any Langfuse service** (the demo publishes
+  `3000` for the UI and `9001` for the MinIO console). Langfuse holds
+  request-level traces and the audit trail, so it is reachable only through
+  the nginx profile (C1) or an SSH tunnel;
+- **named volumes** for all four stateful services (`langfuse-postgres-data`,
+  `langfuse-clickhouse-data`, `langfuse-clickhouse-logs`,
+  `langfuse-minio-data`, `langfuse-redis-data`);
+- **scoped `environment:`** per service, as everywhere else in this file — no
+  `env_file:`, which would broadcast `POSTGRES_PASSWORD`/`UI_PASSWORD`/
+  provider keys into ClickHouse, MinIO and Langfuse alike.
+
+`langfuse-redis` is a **separate** Redis instance, not the gateway's. The
+gateway's `redis` is Cache B — CLAUDE.md calls it *required* for `post_call`
+desanitization — and `redis/redis.conf` caps it at `maxmemory 512mb` with
+`noeviction`. Sharing it (as the demo does) means a Langfuse ingestion
+backlog can exhaust that budget and make Cache B writes fail with `OOM`: an
+observability backlog would break live desanitization. Both instances run
+`noeviction`; Langfuse's queue holds not-yet-persisted events that nothing
+can reconstruct.
+
+`minio-init` is a one-shot job that creates the event-upload bucket, because
+**Langfuse v3 does not create it itself**. Without it, `langfuse-web` and
+`langfuse-worker` come up healthy and then fail every ingestion write.
+
+ClickHouse gets `langfuse/clickhouse-config.xml`, which deletes `query_log`,
+`query_thread_log`, `query_views_log` and `text_log`. Those system tables
+keep raw INSERT text — i.e. a second copy of trace content, on ClickHouse's
+own 30-day retention, in a store no NEVER-fields gate watches (invariant #1).
+
+### Reaching the UI
+
+Once `--profile nginx` (C1) lands: `langfuse.<domain>` → `langfuse-web:3000`,
+and `LANGFUSE_PUBLIC_URL` must be that public origin.
+
+Until then, an SSH tunnel. Nothing is published on the host, so tunnel to the
+container address (the docker bridge is routable from the host on Linux):
+
+```
+# on the server
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+  "$(docker compose ps -q langfuse-web)"
+
+# from your laptop, with that address
+ssh -N -L 3000:<container-ip>:3000 <user>@<server>
+# then open http://localhost:3000
+```
+
+`LANGFUSE_PUBLIC_URL` (→ `NEXTAUTH_URL`) must match the origin the **browser**
+uses. Its default `http://localhost:3000` is right for the tunnel and wrong
+behind nginx; the two cannot be correct at the same time, so change it when
+nginx lands.
+
+### First login
+
+`LANGFUSE_DISABLE_SIGNUP=true` by default: on a fresh instance whoever
+reaches the UI first would otherwise claim the admin account. Provision the
+first user (and the org, project and ingestion API keys) with the
+`LANGFUSE_INIT_*` block in `.env.example` — those keys are what the Vector
+audit sink authenticates with. With signup disabled **and** no init user
+there is no way to log in; that combination is the one mistake to avoid.
+
 ## Postgres
 
 Two databases on the one `postgres` service: `$POSTGRES_DB` (default
@@ -159,13 +259,15 @@ staged (git-ignored — never committed, so it cannot drift from
 The `litellm` port publishes on `127.0.0.1`, not `0.0.0.0`. Until the nginx
 profile (`--profile nginx`) lands there is no TLS in front of this stack, and
 virtual keys + `X-Corp-Auth` would otherwise cross a server-class network in
-cleartext.
+cleartext. It is the only published port in the stack: no Langfuse service
+publishes one at all (see "Langfuse").
 
 ## Durability
 
-`redis` and `postgres` use named volumes, so `docker compose down` (without
-`-v`) keeps mappings, tokens/team-config and virtual keys across a restart —
-unlike `docker-compose.demo.yml`'s laptop-walkthrough posture. `litellm`
+Every stateful service uses a named volume, so `docker compose down` (without
+`-v`) keeps mappings, tokens/team-config, virtual keys and the whole Langfuse
+trace/audit history across a restart — unlike `docker-compose.demo.yml`'s
+laptop-walkthrough posture. `litellm`
 itself has no named volume; it is stateless (config/certs are read-only bind
 mounts) and its state already lives in `redis`/`postgres` above. Redis is
 configured `noeviction` (`compose/redis/redis.conf`): Cache B is CLAUDE.md's
