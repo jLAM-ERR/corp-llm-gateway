@@ -11,11 +11,14 @@ import pytest
 
 from corp_llm_gateway import bootstrap, config, settings
 from corp_llm_gateway.audit import StdoutSink
+from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.detectors.dual_ner import DualNerDetector
 from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.profile_orchestrator import ProfileAwareOrchestrator
+from corp_llm_gateway.sanitizer.segmenter import SegmentKind, split_segments
 from corp_llm_gateway.settings import ConfigError
 from corp_llm_gateway.storage import InMemoryMappingStore, RedisMappingStore
 from corp_llm_gateway.team_config import (
@@ -860,16 +863,22 @@ def test_corp_ner_disabled_by_default_changes_nothing() -> None:
     assert ("detector", "corp_ner") not in REGISTRY._factories
 
 
-def test_ner_detectors_never_run_on_code_segments() -> None:
-    # code_safe_detectors was a dead parameter: every detector ran on CODE
-    # segments. Only the deterministic regex/checksum pass belongs there.
+def test_only_network_backed_detectors_are_kept_off_code_segments() -> None:
+    # Every LOCAL detector scans CODE, local dual-NER included — that is what
+    # ran before code_safe_detectors was ever passed. Narrowing this list to
+    # regex-only let PERSON/ORG/LOCATION inside fenced JSON, SQL values and
+    # config examples egress unredacted (tests/sanitizer/test_code_segment_ner.py).
     guardrail = bootstrap.build_guardrail()
 
     code_detectors = _local_pass(guardrail)._code_detectors
-    assert [type(d).__name__ for d in code_detectors] == ["RegexChecksumDetector"]
+    assert [type(d).__name__ for d in code_detectors] == [
+        "RegexChecksumDetector",
+        "DualNerDetector",
+    ]
     # Chunk mode pulls regex out and runs it over the full text, so its CODE list
-    # is empty — NOT the default-to-everything fallback.
-    assert guardrail._orch._core._chunk_local._code_detectors == []
+    # carries local NER only — NOT the default-to-everything fallback.
+    chunk_code = guardrail._orch._core._chunk_local._code_detectors
+    assert [type(d).__name__ for d in chunk_code] == ["DualNerDetector"]
 
 
 @pytest.mark.usefixtures("_isolate_registry")
@@ -882,11 +891,56 @@ def test_corp_ner_enabled_appends_detector_off_the_code_path(
 
     names = [type(d).__name__ for d in _local_pass(guardrail)._detectors]
     assert names == ["RegexChecksumDetector", "DualNerDetector", "CorpNerDetector"]
-    # Corp NER must never see CODE segments: its regex half fires on code tokens
-    # and it would ship source code to an external service.
+    # Corp NER is the ONLY detector kept off CODE: its regex half fires on code
+    # tokens and it would ship source code to an external service. The local
+    # detectors beside it stay code-safe.
     assert [type(d).__name__ for d in _local_pass(guardrail)._code_detectors] == [
-        "RegexChecksumDetector"
+        "RegexChecksumDetector",
+        "DualNerDetector",
     ]
+
+
+class _RecordingCorpNerDetector(PIIDetector):
+    """Stand-in for CorpNerDetector that records every text handed to it."""
+
+    def __init__(self, client: object, *, metrics: object = None) -> None:
+        self._client = client
+        self._metrics = metrics
+        self.seen: list[str] = []
+
+    async def detect(self, text: str) -> list[Finding]:
+        self.seen.append(text)
+        return []
+
+    async def detect_batch(self, texts: list[str]) -> list[list[Finding]]:
+        self.seen.extend(texts)
+        return [[] for _ in texts]
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+async def test_corp_ner_never_receives_code_segment_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_corp_ner(monkeypatch)
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    recorded: list[_RecordingCorpNerDetector] = []
+
+    def _make(client: object, *, metrics: object = None) -> _RecordingCorpNerDetector:
+        recorded.append(_RecordingCorpNerDetector(client, metrics=metrics))
+        return recorded[-1]
+
+    monkeypatch.setattr(bootstrap, "CorpNerDetector", _make)
+    # No models on 3.14 and no model load on 3.12: local NER is not under test here.
+    monkeypatch.setattr(
+        bootstrap, "DualNerDetector", lambda: DualNerDetector(engines=[], require_ner=False)
+    )
+    text = "contact John Smith\n```py\nx = 1  # note alice\n```\n"
+
+    guardrail = bootstrap.build_guardrail()
+    await guardrail._orch._core.sanitize(text, team_id="t1", conversation_id="c1")
+
+    (detector,) = recorded
+    segments = split_segments(text)
+    assert detector.seen == [s.text for s in segments if s.kind is not SegmentKind.CODE]
+    assert not any("x = 1" in seen for seen in detector.seen)
 
 
 @pytest.mark.usefixtures("_isolate_registry")

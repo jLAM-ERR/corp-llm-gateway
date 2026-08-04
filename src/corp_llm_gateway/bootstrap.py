@@ -228,6 +228,23 @@ def build_corp_ner(*, metrics: MetricsExporter) -> tuple[CorpNerDetector, CorpNe
     return CorpNerDetector(client, metrics=metrics), CorpNerExtension(endpoint, http=http)
 
 
+def _code_safe_detectors(
+    local_detectors: list[PIIDetector], network_backed: PIIDetector | None
+) -> list[PIIDetector]:
+    """Detectors allowed on raw CODE segments — every LOCAL detector.
+
+    The rule is network-backed vs local, NOT "NER vs regex". Local dual-NER
+    stays in: PERSON / ORG / LOCATION inside fenced JSON, SQL values, config
+    examples and test fixtures is caught there and nowhere else, so narrowing
+    this list to regex/checksum only was a leak. ``network_backed`` (corp NER
+    today) is the one exclusion, for two reasons specific to it: its regex half
+    fires on code tokens, and calling it would ship the developer's source code
+    to an external service. Derived by exclusion so a new LOCAL detector is
+    code-safe by default; a new network-backed one has to be named here.
+    """
+    return [d for d in local_detectors if d is not network_backed]
+
+
 def _deliver_teams() -> frozenset[str]:
     """Teams allowed the oversize deliver-flag (shared by core + profile inners)."""
     raw_teams = config.get("CORP_LLM_OVERSIZE_DELIVER_TEAMS", "") or ""
@@ -242,14 +259,8 @@ def _build_orchestrator(
     corp_ner: PIIDetector | None = None,
 ) -> SanitizationOrchestrator:
     local_detectors: list[PIIDetector] = []
-    # Only the deterministic regex/checksum pass runs on raw CODE segments. NER
-    # is prose-shaped and corp NER is a network call, so shipping a code block to
-    # it would both misfire and send source code out of the process.
-    code_safe_detectors: list[PIIDetector] = []
     if _flag("CORP_LLM_LOCAL_FIRST"):
-        regex = RegexChecksumDetector()
-        local_detectors += [regex, DualNerDetector()]
-        code_safe_detectors.append(regex)
+        local_detectors += [RegexChecksumDetector(), DualNerDetector()]
     if corp_ner is not None:
         local_detectors.append(corp_ner)
     gazetteer = Gazetteer.from_defaults() if _flag("CORP_LLM_GAZETTEER") else None
@@ -261,7 +272,7 @@ def _build_orchestrator(
         oversize_policy=config.oversize_policy(),
         oversize_deliver_teams=_deliver_teams(),
         local_detectors=local_detectors or None,
-        code_safe_detectors=code_safe_detectors,
+        code_safe_detectors=_code_safe_detectors(local_detectors, corp_ner),
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),
         oracle_trigger=config.oracle_trigger(),
