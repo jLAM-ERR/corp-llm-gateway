@@ -18,16 +18,22 @@ The optional nginx front door lands in a later revision of this stack — see
 ## Which mode am I deploying?
 
 Read `docs/ops/deployment-modes.md` (RU: `deployment-modes.ru.md`) first. It
-covers the two **mutually exclusive** auth modes — API keys (this stack) vs the
-subscription/OAuth overlay — and exactly how to turn the corp-LLM oracle and the
-corp NER service on and off. Short version for this stack:
+covers the two **mutually exclusive** auth modes — API keys vs subscription/OAuth
+— and exactly how to turn the corp-LLM oracle and the corp NER service on and
+off. Both are production modes and both run **this** stack. Short version:
 
-- **API-key mode.** `LITELLM_MASTER_KEY` is required; developers use LiteLLM
-  virtual keys. `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are **optional** — set
-  only the routes you use, or neither if you only call `corp-*`.
-- **Subscription mode is NOT this stack.** It overlays the demo stack
-  (`docker-compose.demo.yml` + `docker-compose.anthropic-oauth.yml`) and requires
-  that no `LITELLM_MASTER_KEY` exist at all.
+- **API-key mode (default).** `docker compose up -d`. `LITELLM_MASTER_KEY` is
+  required; developers use LiteLLM virtual keys. `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` are **optional** — set only the routes you use, or neither if
+  you only call `corp-*`.
+- **Subscription mode.** `docker compose -f docker-compose.yml -f
+  docker-compose.oauth.yml up -d`. Requires that no `LITELLM_MASTER_KEY` exist at
+  all, serves `claude-*` only, and forwards the developer's own Anthropic
+  subscription token upstream. Everything below about virtual keys applies to
+  the API-key mode only; the rest of this file (audit, NER, oracle, Vector,
+  volumes, TLS) is identical in both.
+  The root-level `docker-compose.anthropic-oauth.yml` is a **demo-only** variant
+  of the same idea over `docker-compose.demo.yml` — not a deployment target.
 - **Oracle:** `CORP_LLM_ORACLE_ENABLED` (default `0`), needs `CORP_LLM_ENDPOINT`
   when `1`. **Corp NER:** `CORP_NER_ENABLED` (default `0`), needs
   `CORP_NER_ENDPOINT` when `1`.
@@ -39,7 +45,8 @@ cd compose
 cp .env.example .env
 chmod 0600 .env
 # edit .env: GATEWAY_IMAGE_TAG, POSTGRES_PASSWORD, LITELLM_MASTER_KEY,
-# UI_USERNAME, UI_PASSWORD, at least one of ANTHROPIC_API_KEY/OPENAI_API_KEY,
+# UI_USERNAME, UI_PASSWORD, whichever of ANTHROPIC_API_KEY/OPENAI_API_KEY
+# match the routes you actually use (neither, if only corp-*),
 # the Langfuse secrets (LANGFUSE_POSTGRES_PASSWORD,
 # LANGFUSE_CLICKHOUSE_PASSWORD, MINIO_ROOT_PASSWORD, LANGFUSE_NEXTAUTH_SECRET,
 # LANGFUSE_SALT, LANGFUSE_ENCRYPTION_KEY) and the Langfuse PROJECT API keys the
@@ -60,10 +67,16 @@ failure: `docker compose ps` reports everything healthy and
 `compose/postgres/initdb/README.md` for what each init script does and how
 to re-stage after an upgrade.
 
-`GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, `LITELLM_MASTER_KEY`, `UI_USERNAME`,
-`UI_PASSWORD`, `CORP_LANGFUSE_PUBLIC_KEY` and `CORP_LANGFUSE_SECRET_KEY` have
-no default — `docker compose up` refuses to start with a clear "set X in .env"
-error rather than silently booting half-configured.
+`GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, `CORP_LANGFUSE_PUBLIC_KEY` and
+`CORP_LANGFUSE_SECRET_KEY` have no default — `docker compose up` refuses to
+start with a clear "set X in .env" error rather than silently booting
+half-configured.
+
+`LITELLM_MASTER_KEY`, `UI_USERNAME` and `UI_PASSWORD` are required too, but the
+check lives in the litellm entrypoint rather than in compose interpolation,
+because it has to be **mode-aware**: subscription mode needs all three absent.
+Missing them in API-key mode is still a boot refusal naming the variable — it
+just happens a second later, when the container starts.
 
 ## Building from this branch
 
@@ -106,6 +119,10 @@ endpoint regardless of the oracle flag; without it, `corp-*` requests fail
 per-request rather than failing config load.
 
 ## Virtual keys
+
+**API-key mode only.** In subscription mode there is no master key, so there are
+no virtual keys and no Admin UI; the developer's OAuth bearer is the credential
+and `X-Corp-Auth` remains the team identity. See `docs/ops/deployment-modes.md`.
 
 Developers authenticate with a **LiteLLM virtual key**
 (`Authorization: Bearer sk-...`), issued from the litellm Admin UI or API and

@@ -7,17 +7,29 @@ off. Russian mirror: `deployment-modes.ru.md`.
 There are two authentication modes and they are **mutually exclusive**. Pick one
 before you write `.env`.
 
+Both are production modes. They run the same stack, the same sanitization
+cascade and the same audit chain; what differs is the upstream credential.
+
 | | Mode A — API keys | Mode B — subscription (OAuth) |
 |---|---|---|
-| Stack | `compose/` (production) | `docker-compose.demo.yml` + `docker-compose.anthropic-oauth.yml` |
+| Stack | `compose/` | `compose/` + `docker-compose.oauth.yml` |
 | Upstream credential | the gateway's own `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | the developer's own OAuth bearer, forwarded |
 | Developer sends | `Authorization: Bearer <litellm virtual key>` | `Authorization: Bearer <OAuth token>` |
+| Team identity | `X-Corp-Auth: <team token>` | `X-Corp-Auth: <team token>` |
 | `LITELLM_MASTER_KEY` | **required** | **must be absent** |
+| Routes served | `claude-*`, `gpt-*`, `corp-*` | `claude-*` only |
 | Per-developer revocation / spend | yes, via the LiteLLM Admin UI | no |
+| Audit trail | Vector → Langfuse / S3 / SIEM | same |
+
+There is also a **demo-only** OAuth stack — `docker-compose.demo.yml` +
+`docker-compose.anthropic-oauth.yml` at the repo root. It exists to try the
+subscription bridge on a laptop and is **not** a deployment target: it runs
+`_demo_guardrail`, whose token store is in memory with a hardcoded
+`demo-team-token`, and it has no audit pipeline. Do not point it at a server.
 
 ---
 
-## Mode A — API keys (production compose stack)
+## Mode A — API keys
 
 The stack in `compose/`. Developers authenticate with a **LiteLLM virtual key**;
 the gateway holds the provider credentials.
@@ -55,27 +67,76 @@ The developer's Anthropic subscription token is forwarded to `api.anthropic.com`
 untouched. **No `ANTHROPIC_API_KEY` exists anywhere in this mode.**
 
 ```
-docker compose -f docker-compose.demo.yml -f docker-compose.anthropic-oauth.yml up -d --build
+cd compose
+cp .env.example .env
+chmod 0600 .env
+# fill in the required secrets, then DELETE the LITELLM_MASTER_KEY,
+# UI_USERNAME and UI_PASSWORD lines entirely (see the trap below), then:
+docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d
 ```
 
-It overlays the **demo** stack on purpose, because that stack sets no
-`LITELLM_MASTER_KEY`. The bridge is enabled by
-`CORP_LLM_FORWARD_ANTHROPIC_AUTH=1` (the overlay sets it).
+From a laptop, against a server prepared by `scripts/deploy/bootstrap-server.sh`:
+
+```
+scripts/deploy/deploy.sh --host user@server --mode oauth up
+```
+
+Pass the **same** `--mode oauth` to every later run against that host — `logs`,
+`status`, `down` and `restart` all resolve the stack through this file list, and
+a run with the base file alone would report on (or recreate) a different stack.
+
+The overlay changes exactly two things: it turns on
+`CORP_LLM_FORWARD_ANTHROPIC_AUTH=1`, and it mounts `litellm/config.oauth.yaml`
+over `/etc/litellm/config.yaml`. Postgres-backed team tokens, the Redis mapping
+store, Langfuse and the Vector audit pipeline are all untouched — the callback is
+the production `corp_llm_gateway.bootstrap.guardrail`, exactly as in Mode A.
+
+**Only `claude-*` is served.** `litellm/config.oauth.yaml` has one route, native
+`anthropic/`, with no `gpt-*`, no `corp-*` and no `"*"` catch-all — and that is
+the binding control, not a simplification. The guardrail gates the OAuth lift on
+the client-visible model alias, but litellm resolves the actual deployment
+*after* the hook runs, so the alias gate alone cannot prove where a request
+lands. An Anthropic-only routing table can. Do not add a second route.
+
+The corp vLLM oracle still works: it is reached through the gateway's own HTTP
+client (`CORP_LLM_ENDPOINT`), not through a litellm route. Dropping `corp-*` only
+means clients cannot address corp models directly.
 
 **The master key and the bridge cannot coexist.** With a master key set, litellm
 treats the inbound `Authorization` header as one of its own virtual keys and
 answers 401 *before* `pre_call` ever runs, so the OAuth bearer would never reach
 the bridge. `build_guardrail()` therefore refuses to boot and names the cause
-(`settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE`) rather than serving 401s.
+(`settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE`) rather than serving 401s. The
+overlay deliberately does not neutralise a leftover key — an override would
+silence the mistake instead of reporting it.
 
 > **Trap:** a blank `LITELLM_MASTER_KEY=` line **counts as set** — litellm keeps
 > the empty value and enables proxy auth for anything that is not `None`. Delete
-> the line entirely. A leftover key in a git-ignored `.env.demo` picked up via
-> `env_file:` is the usual source.
+> the line entirely. On the demo stack the usual source is a leftover key in a
+> git-ignored `.env.demo` picked up via `env_file:`; on the production stack it
+> is `compose/.env` copied from `.env.example` without removing the line.
 
-Consequence to plan for: Mode B has **no per-developer virtual keys**, so no
-per-developer revocation or spend accounting through the LiteLLM UI. Sanitization,
-audit and the `X-Corp-Auth` team identity work exactly the same in both modes.
+`UI_USERNAME` / `UI_PASSWORD` can go with it: without a master key the LiteLLM
+admin UI cannot authenticate anyone, so they have nothing to guard.
+
+### What you give up, and what to close
+
+Mode B has **no per-developer virtual keys**, so no per-developer revocation or
+spend accounting through the LiteLLM UI. Team identity, sanitization and audit
+are unchanged: developers still send `X-Corp-Auth: <team token>`, which the
+gateway validates in `pre_call` against the Postgres token store, and a request
+without a valid one is refused (`MissingTokenError` / `InvalidTokenError`).
+
+**Litellm's own management endpoints are unauthenticated in this mode.** Its
+proxy auth is skipped entirely when the master key is `None`, which is precisely
+the posture this mode requires. That covers `/key/*`, `/model/*`, `/user/*` and
+the UI — *not* the LLM routes, which the gateway's `X-Corp-Auth` check in
+`pre_call` still gates. Today the port is published as
+`127.0.0.1:${GATEWAY_PORT:-4000}` (loopback only), so the surface is reachable
+only from the host itself; anyone with a shell on that host can reach it. When
+the nginx front door lands, that management surface must be blocked there before
+the port is exposed beyond loopback. Mode A does not have this gap — the master
+key authenticates those endpoints.
 
 ---
 

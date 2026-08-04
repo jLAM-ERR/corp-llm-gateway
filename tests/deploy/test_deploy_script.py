@@ -161,6 +161,7 @@ def _fake_repo(tmp_path: Path) -> Path:
     (compose / ".env.example").write_text("POSTGRES_PASSWORD=\n")
     (compose / "docker-compose.yml").write_text("services: {}\n")
     (compose / "docker-compose.build.yml").write_text("services: {}\n")
+    (compose / "docker-compose.oauth.yml").write_text("services: {}\n")
     (compose / "certs" / "server.key").write_text("-----BEGIN PRIVATE KEY-----\n")
     (compose / "postgres" / "initdb" / "README.md").write_text("staged at deploy time\n")
 
@@ -249,8 +250,10 @@ def test_only_the_production_compose_entrypoint_is_used(script_text: str) -> Non
     ]
     for line in build_overlay:
         assert "exclude" in line, f"the dev-only build overlay must never be deployed: {line!r}"
-    # The compose v1 binary, not the plugin package or a .yml filename.
-    v1 = re.search(r"\bdocker-compose\b(?!-plugin)(?!\.(?:build\.)?ya?ml)", script_text)
+    # The compose v1 binary, not the plugin package or a .yml filename. The
+    # filename arm is generic (`docker-compose.<anything>.yml`) so adding an
+    # overlay does not read as a v1 invocation.
+    v1 = re.search(r"\bdocker-compose\b(?!-plugin)(?!(?:\.[A-Za-z0-9-]+)*\.ya?ml)", script_text)
     assert v1 is None, f"compose v1 (`docker-compose`) is not supported: {v1}"
 
 
@@ -684,3 +687,78 @@ def test_dry_run_touches_nothing_on_the_remote(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
     assert not (remote / "docker-compose.yml").exists(), "dry-run must not transfer files"
     assert "up -d" not in _log(tmp_path, "docker.log")
+
+
+# --------------------------------------------------------------------------- #
+# --mode: which compose file list every remote call carries
+# --------------------------------------------------------------------------- #
+
+BOTH_FILES = "-f docker-compose.yml -f docker-compose.oauth.yml"
+
+
+def test_oauth_mode_layers_the_overlay_on_every_remote_compose_call(tmp_path: Path) -> None:
+    # A logs/status/down run that resolved a different file list than the `up`
+    # would report on a stack that is not the running one — and an `up` with the
+    # base file alone would recreate the containers in the virtual-key mode.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "--mode", "oauth", "up"],
+        ps=HEALTHY_PS,
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    docker_log = _log(tmp_path, "docker.log")
+    assert f"compose {BOTH_FILES} pull" in docker_log
+    assert f"compose {BOTH_FILES} up -d" in docker_log
+    assert f"compose {BOTH_FILES} ps --all" in docker_log
+    # No call may fall back to the base file alone.
+    for line in docker_log.splitlines():
+        if line.startswith("compose "):
+            assert line.startswith(f"compose {BOTH_FILES}"), line
+
+
+def test_the_default_mode_keeps_the_base_file_alone(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "status"], ps=HEALTHY_PS)
+
+    assert "docker-compose.oauth.yml" not in _log(tmp_path, "docker.log")
+
+
+def test_the_oauth_overlay_is_synced_unlike_the_dev_only_build_overlay(tmp_path: Path) -> None:
+    # Mode B is a deployable mode, so its overlay has to reach the server;
+    # docker-compose.build.yml is a laptop convenience and must not.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "--mode", "oauth", "up"],
+        ps=HEALTHY_PS,
+    )
+
+    assert (remote / "docker-compose.oauth.yml").exists()
+    assert not (remote / "docker-compose.build.yml").exists()
+
+
+@pytest.mark.parametrize("mode", ["", "prod", "oauth2", "VIRTUAL-KEYS"])
+def test_an_unknown_mode_is_refused_before_anything_remote_happens(
+    mode: str, tmp_path: Path
+) -> None:
+    # Falling back to the default would deploy the virtual-key mode onto a host
+    # whose .env has no master key, and the stack would then refuse to boot
+    # citing a variable the operator never meant to use.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "--mode", mode, "status"])
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    assert "--mode must be virtual-keys or oauth" in result.stderr  # type: ignore[attr-defined]
+    assert _log(tmp_path, "ssh.log") == ""

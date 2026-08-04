@@ -24,6 +24,14 @@ set -euo pipefail
 
 REMOTE_DIR="${CORP_GATEWAY_DEPLOY_DIR:-/opt/corp-llm-gateway}"
 COMPOSE_FILE="docker-compose.yml"
+# Mode B (--mode oauth) layers docker-compose.oauth.yml on top. Every remote
+# `docker compose` call has to carry the SAME file list: a `logs` or `status`
+# run with only the base file resolves a different config than the running
+# stack, and `up -d` with the wrong list would silently recreate the containers
+# in the other mode. Hence one variable, used everywhere.
+DEPLOY_MODE="virtual-keys"
+OAUTH_OVERLAY_FILE="docker-compose.oauth.yml"
+COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/compose"
@@ -73,6 +81,13 @@ Subcommands:
 Options:
   --host USER@SERVER  SSH destination (required)
   --dir PATH          Remote deploy directory (default /opt/corp-llm-gateway)
+  --mode MODE         virtual-keys (default) or oauth. `oauth` adds
+                      docker-compose.oauth.yml: developers authenticate with
+                      their own Anthropic subscription token instead of a
+                      litellm virtual key. The server's .env must then contain
+                      NO LITELLM_MASTER_KEY line at all. Pass the SAME --mode
+                      to every later run against that host — logs/status/down
+                      resolve the stack through this file list.
   --tail N            Lines of history for `logs` (default 200)
   --dry-run           Print what would change; transfers and starts nothing
   --yes               Skip the confirmation prompt (needed for `down`)
@@ -111,6 +126,15 @@ parse_args() {
                 ;;
             --dir=*)
                 REMOTE_DIR="${1#*=}"
+                shift
+                ;;
+            --mode)
+                (( $# >= 2 )) || fatal "--mode needs virtual-keys or oauth"
+                DEPLOY_MODE="$2"
+                shift 2
+                ;;
+            --mode=*)
+                DEPLOY_MODE="${1#*=}"
                 shift
                 ;;
             --tail)
@@ -168,6 +192,23 @@ parse_args() {
     [[ -n "$REMOTE_DIR" ]] || fatal "--dir must not be the filesystem root"
     [[ "$TAIL_LINES" =~ ^[0-9]+$ ]] || fatal "--tail needs a number (got: ${TAIL_LINES})"
 
+    # Resolved here, not at parse time, so `--mode` is order-independent. A
+    # typo must be a refusal: falling back to the default would silently deploy
+    # the virtual-key mode onto a host whose .env has no master key, and the
+    # stack would then refuse to boot with a message about a variable the
+    # operator never meant to use.
+    case "$DEPLOY_MODE" in
+        virtual-keys)
+            COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE}"
+            ;;
+        oauth)
+            COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE} -f ${OAUTH_OVERLAY_FILE}"
+            ;;
+        *)
+            fatal "--mode must be virtual-keys or oauth (got: ${DEPLOY_MODE})"
+            ;;
+    esac
+
     local arg
     for arg in ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"}; do
         [[ "$arg" =~ ^[A-Za-z0-9._-]+$ ]] \
@@ -208,7 +249,7 @@ ssh_capture() {
 }
 
 compose_remote() {
-    ssh_run "cd ${REMOTE_DIR} && docker compose -f ${COMPOSE_FILE} $*"
+    ssh_run "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} $*"
 }
 
 ensure_remote_ready() {
@@ -345,7 +386,7 @@ sync_compose() {
 # One TSV line per service: name, state, health. Compose v2 prints either a
 # JSON array or one object per line depending on the version; both are handled.
 service_states() {
-    ssh_capture "cd ${REMOTE_DIR} && docker compose -f ${COMPOSE_FILE} ps --all --format json" \
+    ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} ps --all --format json" \
         | jq -s -r '[.[] | if type == "array" then .[] else . end]
                     | .[]
                     | [(.Service // .Name // "?"), (.State // ""), (.Health // "")]
@@ -441,6 +482,12 @@ confirm() {
 # subcommands
 # --------------------------------------------------------------------------- #
 
+# --mode oauth against a server whose .env still has a LITELLM_MASTER_KEY line
+# is deliberately NOT pre-checked here: this script never reads the server's
+# .env, not even to test whether a key is present. The stack already refuses
+# that combination at boot with a named cause
+# (settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE), and wait_for_healthcheck below
+# surfaces it as a failed deploy. See docs/ops/deployment-modes.md.
 cmd_up() {
     stage_schema
     ensure_remote_ready
@@ -450,8 +497,8 @@ cmd_up() {
         info "[dry-run] would pull images and start the stack in ${REMOTE_DIR}"
         return 0
     fi
-    ssh_run "cd ${REMOTE_DIR} && docker compose -f ${COMPOSE_FILE} pull \
-&& docker compose -f ${COMPOSE_FILE} up -d"
+    ssh_run "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} pull \
+&& docker compose ${COMPOSE_FILE_ARGS} up -d"
     wait_for_healthcheck
     print_status
     info "deployed to ${HOST}:${REMOTE_DIR}"
@@ -481,7 +528,7 @@ cmd_restart() {
 cmd_logs() {
     ensure_remote_ready
     warn "remote logs stream straight to this terminal — treat them as sensitive"
-    ssh_capture "cd ${REMOTE_DIR} && docker compose -f ${COMPOSE_FILE} logs \
+    ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} logs \
 --follow --tail ${TAIL_LINES} ${EXTRA_ARGS+${EXTRA_ARGS[*]}}"
 }
 

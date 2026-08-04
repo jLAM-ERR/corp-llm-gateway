@@ -1,0 +1,46 @@
+# Mode B overlay: run the PRODUCTION stack with Anthropic subscription (OAuth)
+# passthrough instead of litellm virtual keys.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d
+#
+# Combined with the branch-build overlay (order matters — later files win):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml \
+#                  -f docker-compose.oauth.yml up -d --build
+#
+# Everything else in the stack is unchanged and still production-grade:
+# Postgres-backed team tokens, Redis mapping store, Langfuse, and the Vector
+# audit pipeline. This differs from the root `docker-compose.anthropic-oauth.yml`,
+# which overlays the DEMO stack (`_demo_guardrail`, in-memory token store, no
+# audit chain) and is for local demos only.
+#
+# `.env` MUST NOT CONTAIN A `LITELLM_MASTER_KEY` LINE AT ALL.
+# Not blank, not commented-back-in later: settings.master_key_conflict() treats
+# a blank value as set, because litellm keeps the empty string and enables proxy
+# auth for anything that is not None. With a master key present litellm consumes
+# the inbound Authorization header as one of its own virtual keys and answers
+# 401 before pre_call ever runs, so the OAuth bearer would never reach the
+# bridge. build_guardrail() therefore refuses to boot and names the cause
+# (settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE) rather than serving 401s.
+# UI_USERNAME / UI_PASSWORD are equally unnecessary here: without a master key
+# the litellm admin UI cannot authenticate anyone.
+#
+# ANTHROPIC_API_KEY and OPENAI_API_KEY are unused in this mode — no route in
+# litellm/config.oauth.yaml reads them. The developer's own token is the only
+# upstream credential.
+#
+# Developers still authenticate to the gateway with `X-Corp-Auth: <team token>`
+# exactly as in Mode A; what changes is the upstream credential, not the team
+# identity that the audit trail records.
+services:
+  litellm:
+    volumes:
+      # Same container path as the base file's `./litellm/config.yaml` mount,
+      # which is what makes compose replace it rather than mount both: short
+      # syntax entries are keyed by target path when files are merged.
+      - ./litellm/config.oauth.yaml:/etc/litellm/config.yaml:ro
+    environment:
+      # The bridge itself. bootstrap.build_guardrail() reads this; the base
+      # file's entrypoint guard also reads it, to tell "master key deliberately
+      # absent" from "operator forgot the master key".
+      CORP_LLM_FORWARD_ANTHROPIC_AUTH: "1"

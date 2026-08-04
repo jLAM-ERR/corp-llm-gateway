@@ -170,15 +170,38 @@ services:
       # native anthropic/openai routing can't forward a per-developer key).
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Subscription-auth bridge (Mode B, docker-compose.oauth.yml). Named here
+      # so the entrypoint guard below can tell the two modes apart — without
+      # these the container could not distinguish "operator forgot the master
+      # key" from "master key deliberately absent because the bridge is on".
+      # bootstrap.build_guardrail() reads the same two keys.
+      - CORP_LLM_FORWARD_ANTHROPIC_AUTH=${CORP_LLM_FORWARD_ANTHROPIC_AUTH:-0}
+      - CORP_LLM_FORWARD_CHATGPT_AUTH=${CORP_LLM_FORWARD_CHATGPT_AUTH:-0}
       # Virtual-key auth: the developer credential on this instance. Litellm
       # intercepts Authorization and validates it against a virtual key
       # (its own DB, not $POSTGRES_DB) instead of forwarding it — see
       # compose/README.md "Virtual keys".
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+      #
+      # BARE NAMES, not `${X:?...}`, and that is load-bearing for Mode B.
+      # Compose interpolates every `-f` file BEFORE merging them, so a `:?`
+      # here aborts `docker compose -f docker-compose.yml -f
+      # docker-compose.oauth.yml` no matter what the overlay says — the
+      # subscription mode could never be deployed on this stack. It also has
+      # to be ABSENT rather than empty: settings.master_key_conflict() treats
+      # a blank LITELLM_MASTER_KEY as set (litellm enables proxy auth for
+      # anything that is not None) and build_guardrail() then refuses to boot
+      # while a bridge is on. The bare form gives exactly that — unset in
+      # .env means the variable never reaches the container.
+      #
+      # The requirement the `:?` used to enforce did not go away; it moved
+      # into the entrypoint below, where it can be mode-aware.
+      - LITELLM_MASTER_KEY
       - DATABASE_URL=postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/litellm
       - STORE_MODEL_IN_DB=True
-      - UI_USERNAME=${UI_USERNAME:?set UI_USERNAME in .env}
-      - UI_PASSWORD=${UI_PASSWORD:?set UI_PASSWORD in .env}
+      # Same reasoning: the admin UI cannot work without a master key, so
+      # Mode B must not be forced to invent credentials for it.
+      - UI_USERNAME
+      - UI_PASSWORD
       - CORP_LLM_CA_BUNDLE
       # Always the combined bundle the entrypoint below builds (certifi
       # public roots + the corp CA, if mounted) — SSL_CERT_FILE is
@@ -196,9 +219,34 @@ services:
     # $$ (not $) below: docker compose's own ${VAR}/$VAR interpolation runs
     # BEFORE this reaches the shell, and would otherwise try to substitute
     # $certifi_bundle as a compose variable (silently blanking it).
+    #
+    # The first block is the mode-aware replacement for the `${LITELLM_MASTER_KEY:?}`
+    # that used to sit in the environment list (see the note there). Mode A
+    # (no bridge) authenticates developers with litellm virtual keys and is
+    # unserviceable without a master key — and worse, litellm skips proxy auth
+    # entirely when the key is None, so a missing key silently downgrades the
+    # only per-developer credential this mode has. Mode B (a bridge on) is
+    # legitimately master-key-less: the developer's own OAuth bearer is the
+    # credential, and build_guardrail() refuses to boot if a master key is
+    # present anyway. It runs before the certifi work so a misconfigured stack
+    # dies on the first line with a named cause.
     command:
       - |-
         set -e
+        if [ "$${CORP_LLM_FORWARD_ANTHROPIC_AUTH:-0}" != "1" ] \
+           && [ "$${CORP_LLM_FORWARD_CHATGPT_AUTH:-0}" != "1" ] \
+           && { [ -z "$${LITELLM_MASTER_KEY:-}" ] \
+                || [ -z "$${UI_USERNAME:-}" ] \
+                || [ -z "$${UI_PASSWORD:-}" ]; }; then
+          echo "LITELLM_MASTER_KEY / UI_USERNAME / UI_PASSWORD must all be set in .env" >&2
+          echo "when no subscription-auth bridge is on. This stack authenticates" >&2
+          echo "developers with litellm virtual keys, which need a master key -- and" >&2
+          echo "litellm skips proxy auth entirely when the key is absent, so a missing" >&2
+          echo "one silently removes the only per-developer credential this mode has." >&2
+          echo "Set them in .env, or deploy the subscription mode instead:" >&2
+          echo "  docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d" >&2
+          exit 1
+        fi
         certifi_bundle="$$(python3 -c 'import certifi; print(certifi.where())')"
         cat "$$certifi_bundle" > /tmp/corp-ca-bundle.pem
         if [ -f /etc/corp-llm-gateway/certs/corp-ca-bundle.pem ]; then
