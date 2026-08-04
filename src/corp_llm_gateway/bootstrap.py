@@ -303,6 +303,7 @@ def _build_profile_wrapper(
     base_rules_loader = _RulesLoader(rules_dir)
     oversize_policy = config.oversize_policy()
     deliver_teams = _deliver_teams()
+    oracle_trigger = config.oracle_trigger()
 
     def build_inner(bundle: ProfileBundle) -> SanitizationOrchestrator:
         return build_inner_orchestrator(
@@ -313,6 +314,7 @@ def _build_profile_wrapper(
             oversize_policy=oversize_policy,
             oversize_deliver_teams=deliver_teams,
             oracle_enabled=oracle_enabled,
+            oracle_trigger=oracle_trigger,
         )
 
     return ProfileAwareOrchestrator(

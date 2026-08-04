@@ -1351,6 +1351,90 @@ def test_policy_fingerprint_is_stable_across_python_hash_seeds() -> None:
     assert first == run("12345"), "fingerprint must be identical across processes"
 
 
+# Cache A — the gazetteer's LEMMATIZER capability is part of the policy --------
+
+# `term_signature()` covers the CONFIGURED terms, but matching runs through
+# `_lemmatize_word`, which depends on the lazily-loaded pymorphy3 / spaCy
+# handles. Those are absent without the `ner` extra (documented: NER needs
+# Python 3.12, 3.14 degrades gracefully), so two pods can hold IDENTICAL term
+# signatures and still match different text. If the model-less pod seeds Cache A
+# first, the model-backed pod replays its empty mapping for the ~10h TTL.
+
+_R11_TERM = "договор"
+_R11_TEXT = "подписан договоры сегодня"
+# Inflected form: matched only when a lemmatizer is available.
+_R11_SURFACE = "договоры"
+
+
+class _FakeParse:
+    def __init__(self, normal_form: str) -> None:
+        self.normal_form = normal_form
+
+
+class _FakeMorph:
+    """Stands in for pymorphy3 on a pod that HAS the `ner` extra installed."""
+
+    def parse(self, word: str) -> list[_FakeParse]:
+        return [_FakeParse(word.lower().removesuffix("ы"))]
+
+
+def _gaz_orch(store: InMemoryMappingStore, gazetteer: Gazetteer) -> SanitizationOrchestrator:
+    return SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        gazetteer=gazetteer,
+        oracle_enabled=False,
+    )
+
+
+async def test_cache_a_not_shared_across_gazetteer_lemmatizer_capability() -> None:
+    from corp_llm_gateway.rules import gazetteer as gaz_module
+
+    store = InMemoryMappingStore()  # ONE shared Cache A, as two pods share Redis
+
+    # Both capabilities are simulated, never taken from the ambient interpreter,
+    # so the test means the same thing with and without the `ner` extra.
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(gaz_module, "_try_load_ru_morph", lambda: None)
+        blind_gaz = Gazetteer({_R11_TERM: "REGULATED"})
+        blind = _gaz_orch(store, blind_gaz)
+        r_blind = await blind.sanitize(_R11_TEXT, team_id="t1", conversation_id="c-blind")
+        assert r_blind.pairs == (), "without a lemmatizer the inflected form is not matched"
+
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(gaz_module, "_try_load_ru_morph", _FakeMorph)
+        lemma_gaz = Gazetteer({_R11_TERM: "REGULATED"})
+        assert blind_gaz.term_signature() == lemma_gaz.term_signature(), (
+            "the terms are identical — only the lemmatizer differs"
+        )
+        lemma = _gaz_orch(store, lemma_gaz)
+        r_lemma = await lemma.sanitize(_R11_TEXT, team_id="t1", conversation_id="c-lemma")
+
+        assert r_lemma.cache_a_hit is False, "a model-less pod's entry must not be served"
+        assert _R11_SURFACE not in r_lemma.sanitized_text, (
+            "LEAK: the model-less entry replayed the gazetteer term unredacted"
+        )
+
+        # Control: against a COLD store the lemmatizing config really does redact,
+        # so the assertion above cannot pass by detection silently failing.
+        cold = _gaz_orch(InMemoryMappingStore(), Gazetteer({_R11_TERM: "REGULATED"}))
+        r_cold = await cold.sanitize(_R11_TEXT, team_id="t1", conversation_id="c-cold")
+        assert _R11_SURFACE not in r_cold.sanitized_text
+
+
+async def test_cache_a_still_shared_across_equal_lemmatizer_capability() -> None:
+    """The capability probe must not fragment the cache between equal pods."""
+    store = InMemoryMappingStore()
+    first = _gaz_orch(store, Gazetteer({_R11_TERM: "REGULATED"}))
+    second = _gaz_orch(store, Gazetteer({_R11_TERM: "REGULATED"}))
+
+    r1 = await first.sanitize(_R11_TEXT, team_id="t1", conversation_id="c1")
+    r2 = await second.sanitize(_R11_TEXT, team_id="t1", conversation_id="c2")
+    assert r1.cache_a_hit is False
+    assert r2.cache_a_hit is True
+
+
 # ---------------------------------------------------------------------------
 # Task 13 — rule-matching performance: _rule_pattern compile caching
 # ---------------------------------------------------------------------------

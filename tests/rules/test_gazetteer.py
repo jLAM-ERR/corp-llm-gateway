@@ -257,3 +257,41 @@ async def test_identifier_snake_case_sub_token() -> None:
     findings = await gaz.detect(text)
     # "betadirect" is its own \w+ token in snake_case, so whole-token match
     assert any(f.label == "PRODUCT" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Lemmatizer capability signature (Cache-A key input)
+# ---------------------------------------------------------------------------
+
+
+def test_lemmatizer_signature_distinguishes_backend_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same terms + different lemmatizer capability must be distinguishable —
+    that difference changes which text the SAME terms match."""
+    from corp_llm_gateway.rules import gazetteer as gaz_module
+
+    gaz = Gazetteer({"AML": "REGULATED"})
+
+    monkeypatch.setattr(gaz_module, "_try_load_ru_morph", lambda: None)
+    monkeypatch.setattr(gaz_module, "_try_load_en_nlp", lambda: None)
+    absent = gaz.lemmatizer_signature()
+
+    monkeypatch.setattr(gaz_module, "_try_load_ru_morph", object)
+    present = gaz.lemmatizer_signature()
+
+    assert absent == ("ru:none", "en:none")
+    assert present != absent
+    assert all(isinstance(part, str) for part in present)
+
+
+def test_lemmatizer_signature_forces_lazy_backends_to_settle() -> None:
+    """The signature is folded into a cache key computed ONCE, so the capability
+    it reports must not be able to change afterwards: probing resolves the lazy
+    handles, and their `_tried` flags latch for the process lifetime."""
+    from corp_llm_gateway.rules import gazetteer as gaz_module
+
+    Gazetteer({}).lemmatizer_signature()
+
+    assert gaz_module._morph_tried is True
+    assert gaz_module._spacy_tried is True

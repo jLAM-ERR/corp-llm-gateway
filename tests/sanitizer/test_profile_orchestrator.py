@@ -24,12 +24,17 @@ from corp_llm_gateway.profiles import (
     DETECTOR_REGISTRY,
     NETWORK_DETECTORS,
     FileProfileLoader,
+    PolicyKnobs,
+    ProfileBundle,
     ProfileNotFoundError,
+    ProfileParseError,
     ProfileResolver,
     bundle_fingerprint,
+    parse_manifest,
 )
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.allowlist import Allowlist
 from corp_llm_gateway.sanitizer.profile_orchestrator import (
     ProfileAwareOrchestrator,
     build_inner_orchestrator,
@@ -38,6 +43,7 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
+from tests.sanitizer.test_orchestrator import _client_returning_pairs
 from tests.test_litellm_hook import _corp_llm_returning
 
 _CONFIG_PAYLOAD = (
@@ -415,6 +421,126 @@ async def test_empty_profile_bundle_keeps_the_no_local_pass_path(tmp_path: Path)
 
     inner = (await wrapper.resolve("t1")).orchestrator
     assert inner._local is None
+
+
+# --- the profile's oracle_mode must reach the inner orchestrator -----------
+
+# `PolicyKnobs.oracle_mode` is parsed, merged and fingerprinted, so a profile can
+# ask for a WIDER oracle trigger than the global CORP_LLM_ORACLE_TRIGGER. The
+# shipped ru-152fz profile does exactly that. If the inner orchestrator keeps the
+# constructor default, an oracle-only finding on a no-gazetteer-hit leaf egresses
+# raw AND seeds Cache A with the under-redacted result.
+
+_ORACLE_ONLY_NAME = "Ivan Petrov"
+
+
+async def test_profile_oracle_mode_always_runs_the_oracle_on_a_no_hit_leaf(
+    tmp_path: Path,
+) -> None:
+    _write_profile(
+        tmp_path,
+        "wide",
+        'name = "wide"\ndetectors = ["regex_checksum"]\n[policy]\noracle_mode = "always"\n',
+        products="nightingale\n",  # a gazetteer that does NOT hit the leaf below
+    )
+    team_store = await _team_store(t1=("wide",))
+    store = InMemoryMappingStore()
+    corp, captured = _client_returning_pairs([(_ORACLE_ONLY_NAME, "[PERSON_001]")])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    result = await wrapper.sanitize(
+        f"ship it with {_ORACLE_ONLY_NAME}", team_id="t1", conversation_id="c1"
+    )
+
+    assert captured, "oracle_mode=always must run the oracle on a no-gazetteer-hit leaf"
+    assert _ORACLE_ONLY_NAME not in result.sanitized_text, (
+        "LEAK: the profile's oracle_mode was ignored and the oracle-only value egressed"
+    )
+
+
+async def test_profile_oracle_mode_any_local_finding_runs_the_oracle(tmp_path: Path) -> None:
+    """The shipped ru-152fz shape: oracle_mode="any_local_finding" + a local
+    regex finding on a leaf the gazetteer does not hit."""
+    _write_profile(
+        tmp_path,
+        "ru-like",
+        'name = "ru-like"\ndetectors = ["regex_checksum"]\n'
+        '[policy]\noracle_mode = "any_local_finding"\n',
+        products="nightingale\n",
+    )
+    team_store = await _team_store(t1=("ru-like",))
+    store = InMemoryMappingStore()
+    corp, captured = _client_returning_pairs([(_ORACLE_ONLY_NAME, "[PERSON_001]")])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    result = await wrapper.sanitize(
+        f"ping ivan@example.com about {_ORACLE_ONLY_NAME}",
+        team_id="t1",
+        conversation_id="c1",
+    )
+
+    assert captured, "a local finding must trigger the oracle under any_local_finding"
+    assert _ORACLE_ONLY_NAME not in result.sanitized_text, (
+        "LEAK: the profile's oracle_mode was ignored and the oracle-only value egressed"
+    )
+
+
+def _bundle_with(oracle_mode: str) -> ProfileBundle:
+    return ProfileBundle(
+        detectors=(),
+        gazetteer=None,
+        rules=Rules(rules=()),
+        allowlist=Allowlist([]),
+        policy=PolicyKnobs(oracle_mode=oracle_mode),
+        profile_ids=("p",),
+    )
+
+
+def _inner_trigger(*, global_trigger: str, oracle_mode: str) -> str:
+    inner = build_inner_orchestrator(
+        _bundle_with(oracle_mode),
+        corp_llm=_corp_llm_returning([]),
+        mapping_store=InMemoryMappingStore(),
+        base_rules_loader=_StaticRules(),
+        oracle_trigger=global_trigger,
+    )
+    return inner._oracle_trigger
+
+
+@pytest.mark.parametrize(
+    ("global_trigger", "oracle_mode", "expected"),
+    [
+        ("gazetteer_hit", "gazetteer_hit", "gazetteer_hit"),
+        ("gazetteer_hit", "always", "always"),
+        ("always", "gazetteer_hit", "always"),
+        ("any_local_finding", "gazetteer_hit", "any_local_finding"),
+        ("sampled:50", "any_local_finding", "any_local_finding"),
+        ("any_local_finding", "sampled:50", "any_local_finding"),
+        ("sampled:10", "sampled:90", "sampled:90"),
+        ("sampled:100", "any_local_finding", "always"),
+    ],
+)
+def test_inner_trigger_is_the_broader_of_global_and_policy(
+    global_trigger: str, oracle_mode: str, expected: str
+) -> None:
+    """Both knobs only WIDEN coverage, so the inner orchestrator must take the
+    broader one — picking either alone silently narrows the other."""
+    assert _inner_trigger(global_trigger=global_trigger, oracle_mode=oracle_mode) == expected
+
+
+def test_invalid_profile_oracle_mode_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="invalid oracle trigger"):
+        _inner_trigger(global_trigger="gazetteer_hit", oracle_mode="bogus")
+
+
+def test_invalid_profile_oracle_mode_is_a_parse_error(tmp_path: Path) -> None:
+    _write_profile(tmp_path, "bad", 'name = "bad"\n[policy]\noracle_mode = "bogus"\n')
+    with pytest.raises(ProfileParseError, match="oracle_mode"):
+        parse_manifest((tmp_path / "bad" / "profile.toml").read_text(encoding="utf-8"))
 
 
 def test_passthrough_resolved_shape() -> None:
