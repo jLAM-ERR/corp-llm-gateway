@@ -31,7 +31,7 @@ on:
       litellm_version:
         description: "litellm base image tag (pin; 'main-stable' floats)"
         required: false
-        default: "v1.85.0"
+        default: "v1.95.0"
 
 permissions:
   contents: read
@@ -88,12 +88,13 @@ jobs:
           context: .
           file: Dockerfile.gateway
           platforms: linux/amd64,linux/arm64
-          # LITELLM_VERSION pins the base for reproducible release images
-          # (Dockerfile default 'main-stable' floats); demo-stack-validated.
+          # LITELLM_VERSION pins the base for reproducible release images. This
+          # workflow is the source of truth for the pin — scripts/release/gates.sh
+          # and Dockerfile.gateway's ARG default must carry the same tag.
           build-args: |
             NER_PROFILE=${{ matrix.profile }}
             EN_MODEL_VERSION=${{ inputs.en_model_version || '3.8.0' }}
-            LITELLM_VERSION=${{ inputs.litellm_version || 'v1.85.0' }}
+            LITELLM_VERSION=${{ inputs.litellm_version || 'v1.95.0' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

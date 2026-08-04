@@ -1,6 +1,7 @@
 # ChatGPT subscription passthrough requires LiteLLM's current Responses API
-# implementation. Keep this profile separate from the pinned GLM demo image.
-FROM ghcr.io/berriai/litellm:v1.89.3
+# implementation. Kept as its own profile so this route's pin can move
+# independently of the GLM demo image's.
+FROM ghcr.io/berriai/litellm:v1.95.0
 
 # Match the demo's bilingual local NER coverage so changing the upstream model
 # does not silently weaken PERSON/ORGANIZATION detection.

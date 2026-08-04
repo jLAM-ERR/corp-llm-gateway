@@ -33,4 +33,8 @@ data:
     # corp_llm_gateway.bootstrap installed in the image's site-packages, so the
     # chart never drifts from the wheel. Verified against litellm 1.85.0, the
     # version shipped in ghcr.io/jlam-err/corp-llm-gateway:1.0.0-rc.5-en (`pip show litellm`).
+    # litellm 1.95.0 (the current image pin) DOES fall back to importlib when the
+    # file is missing, so the shim is belt-and-braces there. Keep it anyway: the
+    # 1.85.0 check recorded above found no such fallback, and the chart can run
+    # on an older base.
     from corp_llm_gateway.bootstrap import guardrail  # noqa: F401

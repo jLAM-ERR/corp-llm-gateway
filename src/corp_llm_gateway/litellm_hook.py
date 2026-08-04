@@ -1806,10 +1806,10 @@ def _anthropic_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
 # synthesize. There is no reverse path for an audio response — a redacted
 # `input` would make the synthesized speech say the placeholder token aloud,
 # permanently (the `call_type="aspeech"` / `proxy_server.py:9440` routing was
-# verified in a scratch venv against a litellm 1.94.1 install — a version this
-# repo neither pins nor ships: `pyproject.toml` pins `litellm>=1.40,<2.0`,
-# helm/build-image ship v1.85.0, `docker/chatgpt-codex/Dockerfile` ships
-# v1.89.3).
+# verified in a scratch venv against a litellm 1.94.1 install; `pyproject.toml`
+# declares the floor `litellm>=1.40,<2.0` and every image now pins v1.95.0 —
+# `tests/litellm_hook/test_litellm_route_assumptions.py` re-checks these
+# call_type names against whichever litellm is installed).
 #
 # `pass_through_endpoint` (litellm's admin-configured arbitrary passthrough,
 # e.g. proxying to Voyage AI): the body shape is entirely backend-defined and
