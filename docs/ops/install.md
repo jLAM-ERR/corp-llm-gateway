@@ -159,6 +159,8 @@ case.
    ```bash
    cp -n .env.demo.example .env.demo     # CORP_LLM_ENDPOINT = the sanitization helper
 
+   grep LITELLM_MASTER_KEY .env.demo     # must print nothing — see the note below
+
    docker compose \
      -f docker-compose.demo.yml \
      -f docker-compose.anthropic-oauth.yml \
@@ -204,3 +206,14 @@ Notes:
   consumes the inbound `Authorization` as a virtual key and rejects the request
   before `pre_call` runs — so there are also no litellm virtual keys, and no
   native budget or rate-limit enforcement, on this route.
+- **`cp -n` keeps an existing `.env.demo`.** If you already have one from an
+  older stack and it carries `LITELLM_MASTER_KEY`, the copy step above is a
+  no-op and the demo stack passes that key straight into the litellm container
+  via `env_file:`. The container then **refuses to start** and logs
+  `invalid gateway configuration: - LITELLM_MASTER_KEY is set while a
+  subscription-auth bridge is on …`. Symptom: `docker compose up` never becomes
+  healthy and `curl http://127.0.0.1:4000/health/liveliness` gets a connection
+  refused. Fix: delete the line from `.env.demo` (or re-copy from
+  `.env.demo.example`) and bring the stack up again. The boot-time refusal is
+  deliberate — without it you would instead get an unexplained `401` on every
+  `claude` request.

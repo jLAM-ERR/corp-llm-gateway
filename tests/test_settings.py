@@ -202,6 +202,73 @@ def test_forward_auth_conflict_is_the_single_shared_rule() -> None:
     assert settings.forward_auth_conflict(chatgpt=False, anthropic=False) is None
 
 
+# ── validate(): a litellm master key cancels either bridge ───────────────────
+
+
+def test_validate_rejects_a_master_key_next_to_the_anthropic_bridge(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+
+    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc.value.problems
+    # the message must name the symptom (a 401 before pre_call), not just the rule.
+    assert "401" in settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE
+    # and must never echo the key it rejects.
+    assert "master-key-fixture" not in str(exc.value)
+
+
+def test_validate_rejects_a_master_key_next_to_the_chatgpt_bridge(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "on")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY"):
+        config.validate()
+
+
+@pytest.mark.parametrize("master_key", ["", "   "])
+def test_validate_treats_an_empty_master_key_as_unset(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, master_key: str
+) -> None:
+    # litellm itself ignores a blank master key, so a blank one must not block a bridge.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", master_key)
+
+    assert isinstance(config.validate(), Settings)
+
+
+def test_validate_allows_a_master_key_when_no_bridge_is_on(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A plain litellm deploy with virtual keys and no subscription bridge is fine.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    assert isinstance(config.validate(), Settings)
+
+
+def test_master_key_is_registered_as_a_secret_so_config_check_redacts_it() -> None:
+    assert "LITELLM_MASTER_KEY" in settings.all_keys()
+    assert settings.is_secret("LITELLM_MASTER_KEY")
+
+
+def test_master_key_conflict_is_the_single_shared_rule() -> None:
+    message = settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE
+    assert settings.master_key_conflict(master_key="k", chatgpt=True, anthropic=False) == message
+    assert settings.master_key_conflict(master_key="k", chatgpt=False, anthropic=True) == message
+    assert settings.master_key_conflict(master_key="k", chatgpt=False, anthropic=False) is None
+    assert settings.master_key_conflict(master_key=None, chatgpt=False, anthropic=True) is None
+    assert settings.master_key_conflict(master_key="", chatgpt=False, anthropic=True) is None
+
+
 # ── validate(): malformed choices ────────────────────────────────────────────
 
 

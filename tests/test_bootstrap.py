@@ -420,6 +420,69 @@ def test_no_disarm_warning_when_the_env_pair_is_already_legal(
     assert not [r for r in caplog.records if "mutually exclusive" in r.getMessage()]
 
 
+# ── a litellm master key cancels either bridge: same runtime enforcement, because
+# docker-compose's `env_file:` is a developer-owned file no `config check` sees ──
+
+
+def test_master_key_next_to_a_bridge_raises_from_build_guardrail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    with pytest.raises(ConfigError) as exc_info:
+        bootstrap.build_guardrail()
+
+    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc_info.value.problems
+    assert "master-key-fixture" not in str(exc_info.value)
+
+
+def test_master_key_is_checked_against_the_resolved_flag_not_the_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The demo shim passes its own resolved flags, so the rule must see those —
+    # a kwarg that turns the bridge on must not slip past an env-only check.
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY"):
+        bootstrap.build_guardrail(forward_anthropic_auth=True)
+
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+
+    assert bootstrap.build_guardrail(forward_anthropic_auth=False) is not None
+
+
+def test_master_key_alone_still_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._forward_anthropic_auth is False
+    assert guardrail._forward_chatgpt_auth is False
+
+
+def test_master_key_refusal_precedes_any_component_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A misconfigured stack must name the master key, not die first on some
+    # unrelated backend the build should never have started.
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+    monkeypatch.setattr(
+        bootstrap,
+        "build_corp_llm_client",
+        lambda: pytest.fail("built the corp-LLM client despite an invalid config"),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "build_mapping_store",
+        lambda: pytest.fail("built the mapping store despite an invalid config"),
+    )
+
+    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY"):
+        bootstrap.build_guardrail()
+
+
 @pytest.mark.parametrize(
     "chatgpt,anthropic",
     [("1", "0"), ("0", "1"), ("0", "0")],
