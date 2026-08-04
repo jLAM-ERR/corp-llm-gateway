@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from corp_llm_gateway.corp_ner import (
+    KNOWN_LABELS,
     MAX_BODY_BYTES,
     MAX_INPUT_CHARS,
     MAX_TEXTS,
@@ -134,14 +135,188 @@ async def test_parses_truncated_flag() -> None:
     assert results[0].truncated is True
 
 
-async def test_accepts_bare_list_response() -> None:
+def _static_handler(payload: object) -> object:  # type: ignore[type-arg]
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=[{"spans": [], "truncated": False}])
+        return httpx.Response(200, json=payload)
 
-    client = CorpNerClient(BASE_URL, http=_mock_transport(handler))
+    return handler
+
+
+async def test_bare_list_response_fails_closed() -> None:
+    """The contract is an object with `results`. A bare list is a different
+    service (or a hostile one) — it must never read as a clean scan."""
+    client = CorpNerClient(
+        BASE_URL, http=_mock_transport(_static_handler([{"spans": [], "truncated": False}]))
+    )
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_missing_results_key_fails_closed() -> None:
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler({"spans": []})))
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_results_not_a_list_fails_closed() -> None:
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler({"results": {}})))
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_empty_result_object_fails_closed() -> None:
+    """`{"results":[{}]}` is the hostile shape: nothing was scanned, yet the
+    old parser reported zero findings."""
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler({"results": [{}]})))
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_missing_spans_key_fails_closed() -> None:
+    client = CorpNerClient(
+        BASE_URL, http=_mock_transport(_static_handler({"results": [{"truncated": False}]}))
+    )
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_null_spans_fails_closed() -> None:
+    client = CorpNerClient(
+        BASE_URL,
+        http=_mock_transport(_static_handler({"results": [{"spans": None, "truncated": False}]})),
+    )
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_missing_truncated_key_fails_closed() -> None:
+    """A missing flag must not default to "the whole text was scanned"."""
+    client = CorpNerClient(
+        BASE_URL, http=_mock_transport(_static_handler({"results": [{"spans": []}]}))
+    )
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_non_bool_truncated_fails_closed() -> None:
+    client = CorpNerClient(
+        BASE_URL,
+        http=_mock_transport(_static_handler({"results": [{"spans": [], "truncated": 0}]})),
+    )
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+def _one_span(**overrides: object) -> dict:  # type: ignore[type-arg]
+    span = {"start": 0, "end": 1, "label": "PERSON", "score": 0.9, "source": "ner"}
+    span.update(overrides)
+    return {"results": [{"spans": [span], "truncated": False}]}
+
+
+async def test_unknown_label_fails_closed() -> None:
+    client = CorpNerClient(
+        BASE_URL, http=_mock_transport(_static_handler(_one_span(label="MYSTERY")))
+    )
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_unknown_source_fails_closed() -> None:
+    client = CorpNerClient(
+        BASE_URL, http=_mock_transport(_static_handler(_one_span(source="oracle")))
+    )
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_missing_source_fails_closed() -> None:
+    """Defaulting to "ner" would fabricate the provenance B2 derives scores from."""
+    payload = _one_span()
+    del payload["results"][0]["spans"][0]["source"]  # type: ignore[index]
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler(payload)))
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_unknown_label_value_never_reaches_the_error_message() -> None:
+    """M1-14: an unknown label is attacker-controlled text, not a constant."""
+    canary = "RAW-SECRET-as-a-label-7b1e"
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler(_one_span(label=canary))))
+
+    with pytest.raises(CorpNerUnavailableError) as exc_info:
+        await client.analyze(["x"])
+
+    assert canary not in str(exc_info.value)
+
+
+async def test_bool_score_fails_closed() -> None:
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler(_one_span(score=True))))
+
+    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+        await client.analyze(["x"])
+
+
+async def test_all_nine_contract_labels_are_accepted() -> None:
+    labels = sorted(KNOWN_LABELS)
+    assert len(labels) == 9
+    payload = {
+        "results": [
+            {
+                "spans": [
+                    {"start": i, "end": i + 1, "label": label, "score": None, "source": "regex"}
+                    for i, label in enumerate(labels)
+                ],
+                "truncated": False,
+            }
+        ]
+    }
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler(payload)))
+
     results = await client.analyze(["x"])
 
-    assert results == [AnalyzeResult(spans=(), truncated=False)]
+    assert [s.label for s in results[0].spans] == labels
+
+
+async def test_all_three_sources_are_accepted() -> None:
+    payload = {
+        "results": [
+            {
+                "spans": [
+                    {"start": i, "end": i + 1, "label": "PERSON", "score": None, "source": source}
+                    for i, source in enumerate(("ner", "regex", "both"))
+                ],
+                "truncated": False,
+            }
+        ]
+    }
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler(payload)))
+
+    results = await client.analyze(["x"])
+
+    assert [s.source for s in results[0].spans] == ["ner", "regex", "both"]
+
+
+async def test_absent_score_is_none() -> None:
+    """The one deliberate laxity: a missing score cannot hide a finding, so it
+    reads as None (same as the contract's null) instead of failing the batch."""
+    payload = _one_span()
+    del payload["results"][0]["spans"][0]["score"]  # type: ignore[index]
+    client = CorpNerClient(BASE_URL, http=_mock_transport(_static_handler(payload)))
+
+    results = await client.analyze(["x"])
+
+    assert results[0].spans[0].score is None
 
 
 async def test_empty_texts_makes_no_request() -> None:
@@ -165,8 +340,15 @@ async def test_chunks_at_max_texts_and_preserves_order() -> None:
                 "results": [
                     {
                         "spans": [
-                            {"start": 0, "end": 1, "label": t, "score": None, "source": "regex"}
-                        ]
+                            {
+                                "start": ord(t) - ord("a"),
+                                "end": ord(t) - ord("a") + 1,
+                                "label": "PERSON",
+                                "score": None,
+                                "source": "regex",
+                            }
+                        ],
+                        "truncated": False,
                     }
                     for t in body["texts"]
                 ]
@@ -177,7 +359,7 @@ async def test_chunks_at_max_texts_and_preserves_order() -> None:
     results = await client.analyze(["a", "b", "c", "d", "e"])
 
     assert [c["texts"] for c in captured] == [["a", "b"], ["c", "d"], ["e"]]
-    assert [r.spans[0].label for r in results] == ["a", "b", "c", "d", "e"]
+    assert [r.spans[0].start for r in results] == [0, 1, 2, 3, 4]
 
 
 async def test_exactly_max_texts_is_one_request() -> None:
@@ -305,12 +487,19 @@ async def test_malformed_span_fails_closed() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"results": [{"spans": [{"start": "nope", "end": 3, "label": "PERSON"}]}]},
+            json={
+                "results": [
+                    {
+                        "spans": [{"start": "nope", "end": 3, "label": "PERSON"}],
+                        "truncated": False,
+                    }
+                ]
+            },
         )
 
     client = CorpNerClient(BASE_URL, http=_mock_transport(handler))
 
-    with pytest.raises(CorpNerUnavailableError, match="malformed"):
+    with pytest.raises(CorpNerUnavailableError, match="malformed span"):
         await client.analyze(["x"])
 
 
