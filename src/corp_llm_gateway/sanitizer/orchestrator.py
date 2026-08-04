@@ -39,6 +39,7 @@ from corp_llm_gateway.sanitizer.engine import (
     AllStrategiesFailedError,
     CorpLlmSanitizer,
 )
+from corp_llm_gateway.sanitizer.identity_preamble import is_identity_preamble
 from corp_llm_gateway.sanitizer.local_pass import LocalDetectionPass
 from corp_llm_gateway.sanitizer.placeholder import AppliedSpan, apply_spans
 from corp_llm_gateway.sanitizer.placeholder_allocator import RequestPlaceholderAllocator
@@ -418,6 +419,16 @@ class SanitizationOrchestrator:
             conversation_id,
             content_bytes,
         )
+
+        if is_identity_preamble(text):
+            # The client's identity preamble is a fixed constant matched upstream
+            # by exact equality; a redaction inside it invalidates the request.
+            logger.info(
+                "sanitize_identity_preamble_passthrough team_id=%s conversation_id=%s",
+                team_id,
+                conversation_id,
+            )
+            return SanitizeResult(text, (), cache_a_hit=False, skipped=False)
 
         if should_skip_sanitization(content_bytes, threshold_bytes=self._size_threshold):
             return await self._handle_oversize(
