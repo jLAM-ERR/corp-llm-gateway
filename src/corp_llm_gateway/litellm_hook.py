@@ -161,6 +161,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         max_output_tokens_cap: int | None = None,
         strip_inbound_headers_to_upstream: bool = False,
         forward_chatgpt_auth: bool = False,
+        forward_anthropic_auth: bool = False,
         dlp_guard: DlpEgressGuard | None = None,
         metrics: MetricsExporter | None = None,
     ) -> None:
@@ -190,6 +191,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Authorization header at its proxy boundary, so copy only the headers
         # required by the ChatGPT Codex backend into per-request extra_headers.
         self._forward_chatgpt_auth = forward_chatgpt_auth
+        # Opt-in bridge for an Anthropic subscription (OAuth) token. Same
+        # mechanism as the Codex one — litellm consumes the client
+        # Authorization header at its proxy boundary — but gated on the request
+        # looking Anthropic-routed so the token cannot be copied onto another
+        # provider's upstream call.
+        self._forward_anthropic_auth = forward_anthropic_auth
         self._dlp_guard = dlp_guard if dlp_guard is not None else DlpEgressGuard()
         # Pluggable metrics exporter (B4). Default Noop = nothing emitted; a
         # PrometheusExporter (config-selected in the composition root) exposes the
@@ -406,6 +413,75 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "missing or invalid OpenAI bearer authentication",
                 ) from None
 
+        # Pure function of data["model"] — hoisted above the Anthropic bridge so
+        # the bridge can gate on it; reused for _RequestState below.
+        provider = _detect_provider(data)
+
+        # Anthropic subscription (OAuth) bridge. Publishing the developer's
+        # sk-ant-oat token as the per-request api_key is what selects litellm's
+        # own OAuth branch (llms/anthropic/common_utils.py), which then emits
+        # `Authorization: Bearer` plus the oauth beta header upstream and
+        # suppresses x-api-key.
+        #
+        # LIMITATION: this gate reads the client-visible model alias, NOT the
+        # resolved deployment — litellm picks that after the hook runs, so on a
+        # wildcard route a `claude-…` alias can still reach a non-Anthropic
+        # upstream. It is defence-in-depth against copying the token onto an
+        # OpenAI/vLLM call, not a guarantee; the binding control is deploying
+        # this flag only against a config whose every route is `anthropic/`.
+        if self._forward_anthropic_auth and provider == "anthropic":
+            try:
+                upstream_headers = _anthropic_upstream_headers(inbound_headers)
+                authorization = next(
+                    value
+                    for name, value in upstream_headers.items()
+                    if name.lower() == "authorization"
+                )
+                data["api_key"] = authorization[7:].strip()
+                data["extra_headers"] = {
+                    name: value
+                    for name, value in upstream_headers.items()
+                    if name.lower() != "authorization"
+                }
+                # `metadata` and a top-level `user` are the two request fields
+                # that egress to Anthropic without ever passing through
+                # sanitization: on the chat-completions adapter litellm maps
+                # `user` to metadata.user_id and copies metadata.user_id into
+                # the outbound body, rejecting only complete email/phone shapes.
+                # Dropped rather than sanitized — litellm's proxy fills
+                # `metadata` with dozens of internal, non-wire keys, so there is
+                # nothing to narrow to, and neither field is desanitized on the
+                # response path. Request correlation survives via the top-level
+                # and litellm_metadata request-id copies.
+                # The primary /v1/messages route uses the pass-through
+                # transformer, which does not support `metadata` at all; this
+                # scrub matters because the bridge is gated by provider, not by
+                # call_type, so a claude-* request arriving on
+                # /v1/chat/completions still reaches the leaking adapter.
+                data.pop("metadata", None)
+                data.pop("user", None)
+            except ValueError:
+                self._record_failure(request_id, error_code="E_PROVIDER_AUTH")
+                logger.info(
+                    "litellm_pre_call_provider_auth_failed request_id=%s "
+                    "error_code=E_PROVIDER_AUTH",
+                    request_id,
+                )
+                _now = datetime.now(UTC)
+                await self.audit(
+                    data,
+                    None,
+                    _now,
+                    _now,
+                    status="failed",
+                    error_code="E_PROVIDER_AUTH",
+                )
+                raise GuardrailHttpException(
+                    401,
+                    "E_PROVIDER_AUTH",
+                    "missing or invalid Anthropic OAuth bearer authentication",
+                ) from None
+
         messages = raw_messages
 
         def _item_text(msg: dict[str, Any] | str) -> list[str]:
@@ -436,7 +512,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 "messages/input must be a list or input must be a string",
             )
 
-        provider = _detect_provider(data)
         state = _RequestState(
             request_id=request_id,
             user_id=ctx.user_id,
