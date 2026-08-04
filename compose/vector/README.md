@@ -48,7 +48,12 @@ Three things in `vector.yaml` must not be edited casually:
   (`…-json.log.[0-9]`, `[0-9][0-9]`). Dropping the rotated patterns silently
   loses every record that rotated away while Vector was down. Widening them to
   `…-json.log.*` is worse, not better: it pulls in gzipped rotations Vector
-  cannot decompress.
+  cannot decompress. The other half of that pair lives in
+  `compose/docker-compose.yml`: the `litellm` service pins `compress: "false"`
+  in its `logging.options`, because a daemon whose own default is json-file
+  *with* `compress=true` would otherwise have that option merged in and every
+  rotation would arrive as `.gz` — unreadable here, and silent audit loss. Glob
+  and log-opt are one mechanism; do not relax either.
 - **the Langfuse sink's disk buffer** (`when_full: block`) and its retry
   policy. `compose/README.md` tells operators that a full `langfuse-redis`
   surfaces as an ingestion 5xx "which Vector retries"; that is only true with

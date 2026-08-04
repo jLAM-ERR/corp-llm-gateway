@@ -80,10 +80,15 @@ services:
     # Explicit per-key list — NOT `env_file: .env`, which would inject the
     # WHOLE file (POSTGRES_PASSWORD, UI_PASSWORD, ...) into this container.
     # Every secret this service legitimately needs is named below; nothing
-    # else from .env reaches it. CORP_LLM_CA_BUNDLE uses the bare-name form
-    # so an unset value is ABSENT from the container, not set to an empty
-    # string (see compose/certs/README.md). SSL_CERT_FILE is fixed, not
-    # sourced from .env — see the entrypoint below.
+    # else from .env reaches it. A key an operator may leave unconfigured is
+    # listed by BARE NAME (CORP_LLM_CA_BUNDLE, the CORP_NER_* block), so an
+    # unset value is ABSENT from the container rather than an empty string:
+    # config.get() lets an empty env var win over the config file, so the
+    # `${X:-}` form would silently shadow a mounted
+    # /etc/corp-llm-gateway/config.toml scalar AND make `gateway-admin config
+    # check` report '' instead of the effective default. See
+    # compose/certs/README.md. SSL_CERT_FILE is fixed, not sourced from
+    # .env — see the entrypoint below.
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CORP_LLM_PG_DSN=postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gateway}
@@ -127,6 +132,32 @@ services:
       # no findings and let a PERSON/ORG egress. Load-bearing in production —
       # see helm/corp-llm-gateway/values-prod.yaml.
       - CORP_LLM_REQUIRE_NER=${CORP_LLM_REQUIRE_NER:-1}
+      # Corp NER service (detectors/corp_ner.py, wired by
+      # bootstrap.build_corp_ner()). Without these six keys the feature is
+      # unreachable from this stack: build_corp_ner() reads the container
+      # environment, so an operator setting CORP_NER_ENABLED=1 in .env would
+      # get the code default (off), no detector, no readiness probe and no
+      # error.
+      #
+      # OFF by default and the only key with an explicit default: `:-0` never
+      # renders empty, so an operator who does nothing gets exactly one new
+      # variable whose value states the posture, and build_corp_ner() returns
+      # None (no behaviour change).
+      - CORP_NER_ENABLED=${CORP_NER_ENABLED:-0}
+      # Bare names, deliberately. CORP_NER_ENDPOINT is required-when-enabled
+      # (settings.py `_check_corp_ner_endpoint`, re-enforced as a boot refusal
+      # in build_corp_ner()); the other four have code defaults (30s / 256
+      # texts / 200000 chars / no CA bundle) that must not be duplicated here
+      # where they can drift. Absent means "not configured on this stack" and
+      # keeps the config-file fallback live; an empty string does not — see
+      # the note above the environment block.
+      - CORP_NER_ENDPOINT
+      - CORP_NER_TIMEOUT_S
+      - CORP_NER_MAX_TEXTS
+      - CORP_NER_MAX_INPUT_CHARS
+      # Same job as CORP_LLM_CA_BUNDLE below, for the NER call — which carries
+      # RAW user content, so there is no SSL_VERIFY-style escape hatch for it.
+      - CORP_NER_CA_BUNDLE
       # Hardcoded, NOT sourced from .env: litellm's own get_ssl_verify()
       # reads this SAME variable directly, at HIGHER priority than
       # SSL_CERT_FILE, for every upstream provider (anthropic/, openai/,
@@ -225,6 +256,23 @@ services:
         max-size: ${LITELLM_LOG_MAX_SIZE:-100m}
         # Quoted: docker requires log-opt values to be strings.
         max-file: "${LITELLM_LOG_MAX_FILE:-10}"
+        # Pinned off, not left at json-file's own default, for the same merge
+        # reason as the two options above — with the OPPOSITE trigger. Here the
+        # risk is a host whose daemon default IS json-file and carries
+        # `compress=true` in its log-opts: `mergeAndVerifyLogConfig` then copies
+        # that option in (it only skips keys the container already sets), docker
+        # writes rotations as `<id>-json.log.1.gz`, and vector.yaml's file source
+        # cannot decompress — so it reads nothing from them. That is silent audit
+        # loss for every record that rotated while vector was down or
+        # back-pressured. Widening the vector glob to `-json.log.*` is NOT the
+        # fix: it would match the .gz files vector still cannot read. Naming the
+        # option is what blocks the merge. Measured on a docker 29.7.1 daemon
+        # whose default was json-file + max-size=1k/max-file=4/compress=true: a
+        # container pinning json-file with only the two size options rotated to
+        # `…-json.log.{1,2,3}.gz`; the same container with this option rotated
+        # to `…-json.log.{1,2,3}`. `compress` is a json-file option (not `local`
+        # / `journald`), so it is valid exactly where this driver is pinned.
+        compress: "false"
     ports:
       # Loopback only — no TLS on this port until the nginx profile (C1)
       # lands; virtual keys + X-Corp-Auth must not cross a server-class
