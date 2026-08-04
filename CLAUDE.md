@@ -43,7 +43,7 @@ helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto (~1392 passed / 91 skipped on 3.14; full NER + RS256 crypto run on 3.12/CI)
+tests/                   pytest, pytest-asyncio mode=auto (~2274 passed / 107 skipped on 3.14; full NER + RS256 crypto run on 3.12/CI)
 ```
 
 The GA-readiness / security / extensibility build is `docs/plans/20260708-ga-readiness-security-extensibility.md`

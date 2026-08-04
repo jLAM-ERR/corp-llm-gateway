@@ -1,7 +1,7 @@
 # Production compose stack
 
 A production deploy target for non-k8s hosts, alongside `helm/corp-llm-gateway/`
-(the k8s target). This directory ships:
+(the k8s target). Russian mirror: `README.ru.md`. This directory ships:
 
 - the **data plane** — `litellm` (the guardrail-fronted proxy) + `redis`
   (Cache B, the per-conversation mapping store) + `postgres` (the

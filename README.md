@@ -8,6 +8,8 @@ Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances
 
 **GA-ready.** Landed: the local-first detection cascade, a full security-hardening pass (11 repro-first leak-surface fixes — oversize, NER fail-open, OpenAI `tool_calls`, segmenter coverage, header stripping, dev-proxy, TLS/RBAC), the country / division / regulatory-regime **profile-plugin** layer (declarative bundles + in-tree detector registry + cross-jurisdiction cache isolation), and the operational surfaces (composition root, real `gateway-admin`, production Helm chart, pluggable metrics, served healthz, ops docs). Non-negotiable success criterion: **zero confirmed leak incidents** in the 90 days post-GA.
 
+**Newest:** a **production docker-compose deploy target** for non-k8s hosts ([`compose/`](compose/)) — the full data plane plus self-hosted Langfuse v3 and the Vector audit pipeline, with two mutually exclusive auth modes (corp API keys, or a developer's own Anthropic **subscription** forwarded via OAuth), one-command server bootstrap and deploy scripts, and an optional **corp NER service** detector. Start at [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md).
+
 ## Table of contents
 
 - [Overview](#overview)
@@ -15,6 +17,8 @@ Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances
 - [Architecture](#architecture)
 - [Repo layout](#repo-layout)
 - [Developer quickstart (laptop)](#developer-quickstart-laptop)
+- [Deployment targets](#deployment-targets)
+- [Run on a server (docker compose)](#run-on-a-server-docker-compose)
 - [Run locally (docker compose)](#run-locally-docker-compose)
 - [Operator quickstart (k8s)](#operator-quickstart-k8s)
 - [Team rules (`replace.md`)](#team-rules-replacemd)
@@ -42,6 +46,7 @@ A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. 
 - **Code-identifier splitter** — splits camel/snake identifiers (`CompanynameabcService`) and scans segments against the gazetteer
 - **Test-data allowlist** — deterministic exemption for test fixtures; cannot suppress actual secrets
 - **Secret patterns** — JWT, PEM private key, `sk-` / `AKIA` / `ghp_` / generic `password=` / `Bearer` values
+- **Corp NER service** (optional, off) — a remote NER detector appended to the local cascade (`CORP_NER_ENABLED` + `CORP_NER_ENDPOINT`). Network-backed, so it is the one detector excluded from `CODE` segments — it would ship source code to an external service; all local detectors keep scanning code. Enabled without an endpoint is a boot refusal, never a silent skip
 
 ### Blocking
 
@@ -51,6 +56,7 @@ A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. 
 ### Auth & compliance
 
 - **X-Corp-Auth + Postgres token store** — `AuthMiddleware` validates tokens against `PostgresTokenStore` (asyncpg); 60 s revocation-propagation upper bound
+- **Two upstream credential modes** — corp API keys (developers hold a per-person LiteLLM virtual key: revocation + spend accounting) or **subscription passthrough**, where the developer's own Anthropic OAuth bearer is forwarded untouched and no corp `ANTHROPIC_API_KEY` exists at all. Mutually exclusive, chosen at deploy time; sanitization, team identity and audit are identical in both — [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md)
 - **`gateway:operator` RBAC** — admin CLI commands gated on JWT claim `gateway:operator`; verified via PyJWT against Keycloak realm roles
 - **Audit pipeline** — rich `AuditEvent` schema (ALWAYS / CONDITIONAL field tiers) + NEVER-fields gate: the logger refuses records containing `mapping`, `original`, or `credentials`
 - **SIEM sink** — Vector HTTP sink with inherited NEVER-gate + Helm alerts (`AuditVectorDropHigh`, `LeakAttemptDetected`)
@@ -74,7 +80,8 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
   cli/                  gateway-admin (team/token/extensions/config check), corp-llm-gateway status, proxy
   config.py/settings.py config loader (env→file→default) + typed single-source-of-truth registry + validate()
   corp_llm/             httpx client speaking vLLM /v1/chat/completions
-  detectors/            PIIDetector + RegexChecksumDetector + DualNerDetector (RU+EN); fail-closed on missing NER
+  corp_ner/             httpx client + factory for the optional remote corp NER service (/v1/analyze)
+  detectors/            PIIDetector + RegexChecksumDetector + DualNerDetector (RU+EN) + CorpNerDetector; fail-closed on missing NER
   extensions/           ExtensionRegistry (audit-sink / provider / detector / … kinds); fail-closed register + api-version gate
   healthz/              live / ready / sanitization / extensions checks + ASGI server (build_health_router)
   metrics/              pluggable exporter (noop / prometheus) — blocked_requests_total + gateway_failure
@@ -88,9 +95,14 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
   tokens/               schema.sql + AuthMiddleware + TokenIssuer + stores
   litellm_hook.py       CorpLlmGuardrail — LiteLLM callback adapter (incl. OpenAI tool_calls + streaming)
 helm/corp-llm-gateway/  Helm chart (gateway image + guardrail callback, Secret, HPA/PDB/SA, ServiceMonitor, config-check initContainer, NetworkPolicy, CoreDNS sinkhole)
-docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
+compose/                production single-host deploy target — data plane (litellm + redis + postgres) + self-hosted
+                        Langfuse v3 + Vector audit pipeline; docker-compose.oauth.yml (subscription mode) and
+                        docker-compose.build.yml (build from source) overlays
+examples/compose/       lightweight local sanitizing proxy (one container, oracle off) — not a deploy target
+docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                  pytest, pytest-asyncio mode=auto (~1392 passed / 91 skipped; 3.14 graceful NER, full on 3.12/CI)
+scripts/deploy/         server bootstrap (bootstrap-server.sh + systemd unit) + deploy.sh (push/upgrade a host)
+tests/                  pytest, pytest-asyncio mode=auto (~2274 passed / 107 skipped; 3.14 graceful NER, full on 3.12/CI)
 ```
 
 ## Developer quickstart (laptop)
@@ -156,6 +168,93 @@ To rotate manually before expiry, re-run `install.sh`.
 
 A parallel demo stack shows the full round-trip — redaction, audit pipeline lit up in Langfuse, fail-closed posture — on your laptop: `scripts/demo.sh up` (watch the flow with `scripts/demo.sh logs`). Setup, prompt set, and troubleshooting: [`docs/demo.md`](docs/demo.md).
 
+## Deployment targets
+
+Four things in this repo run the gateway. Only the first two are deploy targets.
+
+| Target | Where | Use when |
+|---|---|---|
+| **Single host, docker compose** | [`compose/`](compose/) | production on a non-k8s host — full data plane + self-hosted Langfuse + audit pipeline |
+| **Kubernetes** | [`helm/corp-llm-gateway/`](helm/corp-llm-gateway/) | production on a cluster — see [Operator quickstart](#operator-quickstart-k8s) |
+| Local sanitizing proxy | [`examples/compose/`](examples/compose/) | one container in front of Anthropic/OpenAI on a laptop, oracle off — **not** a deploy target |
+| Laptop demo | `docker-compose.demo.yml` (`scripts/demo.sh`) | show the round-trip and the audit trail — in-memory tokens, hardcoded team token, no audit pipeline |
+
+## Run on a server (docker compose)
+
+[`compose/`](compose/) is the production target for hosts without Kubernetes. It ships the **data plane** (`litellm` — the guardrail-fronted proxy — plus `redis` for Cache B and `postgres` for tokens/team config), **self-hosted Langfuse v3** (`langfuse-web`/`-worker`, ClickHouse, MinIO, its own Redis) and the **audit pipeline** (`vector`, tailing the gateway's stdout into Langfuse, with the NEVER-fields VRL gate byte-identical to the Helm chart's).
+
+### Pick an auth mode first
+
+Two modes, both production, **mutually exclusive** — decide before you write `.env`. They run the same stack, the same cascade and the same audit chain; only the upstream credential differs.
+
+| | **Mode A** — corp API keys | **Mode B** — subscription (OAuth) |
+|---|---|---|
+| Stack | `docker compose up -d` | `-f docker-compose.yml -f docker-compose.oauth.yml` |
+| Upstream credential | the gateway's `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | the developer's own Anthropic OAuth bearer, forwarded untouched |
+| Developer sends | `Authorization: Bearer <litellm virtual key>` | `Authorization: Bearer <sk-ant-oat…>` |
+| Team identity | `X-Corp-Auth: <team token>` | same |
+| `LITELLM_MASTER_KEY` | **required** | **must be absent** (a blank line counts as set — delete it) |
+| Routes served | `claude-*`, `gpt-*`, `corp-*` | `claude-*` only, and that is a load-bearing control, not a simplification |
+| Per-developer revocation / spend | yes, via the LiteLLM Admin UI | no |
+
+Full matrix, every failure mode, and why the two cannot coexist: [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md) · RU: [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md).
+
+### Quickstart
+
+```bash
+# day 0, on the server (installs docker if missing, creates /opt/corp-llm-gateway
+# and a 0600 .env, then exits 1 so you fill the .env in — that exit is expected)
+sudo scripts/deploy/bootstrap-server.sh
+
+# stage the token-store schema — postgres init scripts only run on an empty volume
+cp src/corp_llm_gateway/tokens/schema.sql compose/postgres/initdb/01-schema.sql
+
+cd compose && docker compose up -d          # Mode A
+docker compose ps                           # healthy in ~30-60s; langfuse ~2 min on a fresh volume
+curl -fsS http://127.0.0.1:4000/health/liveliness
+```
+
+Skipping the schema step is a silent trap, not a visible failure: every service reports healthy and `/health/liveliness` answers, but every real request 500s because `corp_tokens` / `team_config` don't exist.
+
+Secrets with no default (`GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, the `LANGFUSE_*` infrastructure secrets, `CORP_LANGFUSE_PUBLIC_KEY` / `CORP_LANGFUSE_SECRET_KEY`) make `docker compose up` refuse to start naming the variable, rather than booting half-configured. Full annotated template: [`compose/.env.example`](compose/.env.example).
+
+### Deploy from an operator laptop
+
+```bash
+scripts/deploy/deploy.sh --host user@server up               # Mode A
+scripts/deploy/deploy.sh --host user@server --mode oauth up  # Mode B
+```
+
+It stages the SQL schema, syncs `compose/`, pulls, brings the stack up and waits for healthchecks. The local `.env` is never uploaded and the server's `.env` is never read, printed or overwritten; keys and certificates are excluded from the sync. Other subcommands: `down` (volumes survive, asks first), `restart`, `logs`, `status`; useful flags `--dry-run`, `--yes`, `--dir`, `--force-unlock`. **Pass the same `--mode` on every later run against that host** — `logs`/`status`/`down` resolve the stack through the same file list, and a run without it reports on (or recreates) a different stack.
+
+For boot-time autostart in Mode B, also uncomment `COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml` in `.env`: the systemd unit runs a bare `docker compose up -d`, which would otherwise resolve the base file alone.
+
+### The two optional network dependencies
+
+Both are **off by default**, and turning either on is safe for Cache A — the cache key folds a fingerprint of the effective detector policy, so pods with different settings derive disjoint keys. No flush needed.
+
+| Toggle | Off (default) | On |
+|---|---|---|
+| `CORP_LLM_ORACLE_ENABLED` | no oracle call is ever attempted; `CORP_LLM_ENDPOINT` unneeded for detection | requires a reachable `CORP_LLM_ENDPOINT` — enabling it without one fails requests closed on **every** route, not just `corp-*` |
+| `CORP_NER_ENABLED` | no detector, no readiness probe — as if the feature did not exist | requires `CORP_NER_ENDPOINT` (base URL; the client appends `/v1/analyze`), and a **source build** — the published image tag predates this work |
+
+```bash
+# run this branch's code instead of the published tag (builds the ru-en NER profile
+# on purpose: the Dockerfile default ships no EN model and would 503 every request)
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+Don't confuse `CORP_NER_ENABLED` (the remote service) with `CORP_LLM_REQUIRE_NER` (the in-process RU/EN engines), which stays `1` in production either way.
+
+### Know before going live
+
+- **No TLS in front of the stack yet.** The only published port is `127.0.0.1:4000`; the nginx front door is a later revision. Until then developers reach it through an SSH tunnel, not across the network.
+- **In Mode B, litellm's management endpoints are unauthenticated** (`/key/*`, `/model/*`, `/user/*`, the UI) — its proxy auth is skipped entirely without a master key, which is exactly what the mode requires. The LLM routes are still gated by the guardrail's `X-Corp-Auth` check. Loopback-only today; this must be closed at nginx before the port is exposed. Mode A doesn't have this gap.
+- **No untrusted `docker run` on that host.** Vector selects audit records by a public container label, so anyone who can start a container there can forge audit records. That is a deployment-model requirement, not advice.
+- **Audit is buffered but not fail-closed** — a documented deviation from the `vectorBufferFull` default in [`docs/security.md`](docs/security.md) §8. A stalled audit path does not stop egress; durability is bounded by docker log rotation, not by Vector's disk buffer.
+
+**Full stack reference** (routing, virtual keys, why BYOK isn't available here, Langfuse, the audit pipeline, TLS to the corp vLLM, recovery procedures): [`compose/README.md`](compose/README.md) · RU: [`compose/README.ru.md`](compose/README.ru.md). **Step-by-step handoff** for whoever does the deploy: [`docs/ops/deploy-handoff.md`](docs/ops/deploy-handoff.md) · RU: [`docs/ops/deploy-handoff.ru.md`](docs/ops/deploy-handoff.ru.md).
+
 ## Run locally (docker compose)
 
 No corp vLLM, no Kubernetes: `CORP_LLM_ORACLE_ENABLED=0` runs the gateway as
@@ -175,10 +274,14 @@ cd examples/compose && cp .env.example .env   # fill in a dev token + provider k
 docker compose up -d
 ```
 
+This is a laptop convenience, not a deployment target — it has no audit pipeline and no Langfuse. For a server, use [`compose/`](#run-on-a-server-docker-compose).
+
 Full walkthrough, the BYOK finding, and the oracle re-enable path:
 [`examples/compose/README.md`](examples/compose/README.md).
 
 ## Operator quickstart (k8s)
+
+The cluster target. For a single non-k8s host, see [Run on a server](#run-on-a-server-docker-compose) — same guardrail, same audit chain, different packaging.
 
 ### What gets deployed
 
@@ -301,7 +404,7 @@ Requires Python 3.12+.
 ```bash
 pip install -e ".[dev]"
 pre-commit install
-PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~1392 passed / 91 skipped, ~23s (3.14 graceful NER; full NER + RS256 crypto on 3.12/CI)
+PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~2274 passed / 107 skipped, ~76s (3.14 graceful NER; full NER + RS256 crypto on 3.12/CI)
 PYTHONPATH=src .venv/bin/ruff check src tests
 ```
 
@@ -315,7 +418,7 @@ Open-source components this gateway assembles (Architecture B — best-of-breed)
 - **Bilingual NER & morphology** — RU: [Natasha](https://github.com/natasha/natasha) · [Slovnet](https://github.com/natasha/slovnet) · [Navec](https://github.com/natasha/navec) · [Razdel](https://github.com/natasha/razdel) · [pymorphy3](https://pypi.org/project/pymorphy3/); EN: [spaCy](https://spacy.io) + [`en_core_web_md`](https://spacy.io/models/en). Alternatives ([Presidio](https://github.com/microsoft/presidio), [DeepPavlov](https://github.com/deeppavlov/DeepPavlov)) were evaluated and rejected for CPU latency
 - **State & storage** — [Redis](https://redis.io) (mapping / dedup caches) · [PostgreSQL](https://www.postgresql.org) via [asyncpg](https://github.com/MagicStack/asyncpg) (token store)
 - **Audit & observability** — [Vector](https://vector.dev) → [Langfuse](https://langfuse.com) + S3 + SIEM
-- **Delivery & clients** — [Helm](https://helm.sh) (chart) · [CoreDNS](https://coredns.io) (egress sinkhole) · [httpx](https://www.python-httpx.org) (corp-LLM client)
+- **Delivery & clients** — [Helm](https://helm.sh) (chart) · [Docker Compose](https://docs.docker.com/compose/) (single-host deploy target) · [CoreDNS](https://coredns.io) (egress sinkhole) · [httpx](https://www.python-httpx.org) (corp-LLM client)
 
 ## License
 

@@ -5,6 +5,84 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added — production compose deploy target (`compose/`)
+
+- **A second production deploy target**, for hosts without Kubernetes, alongside the Helm chart:
+  the data plane (`litellm` + `redis` + `postgres`), **self-hosted Langfuse v3** (web/worker,
+  ClickHouse, MinIO, its own capped Redis — no host port published by any of them) and the
+  **audit pipeline** (`vector`, reading a read-only bind of the container log directory rather
+  than the docker socket, with the `never_fields_gate` / `audit_only` transforms byte-identical
+  to the Helm chart's configmap). Every secret comes from `.env`; the four keys with no default make
+  `docker compose up` refuse to start rather than boot half-configured.
+- **Two mutually exclusive auth modes.** Mode A — corp API keys, developers hold a LiteLLM
+  virtual key (per-person revocation + spend). Mode B (`docker-compose.oauth.yml`) — the
+  developer's own Anthropic subscription OAuth bearer is forwarded upstream and **no corp
+  `ANTHROPIC_API_KEY` exists at all**; it serves `claude-*` only, which is a binding control
+  rather than a simplification (litellm resolves the deployment after the hook runs, so an
+  Anthropic-only routing table is the only proof of where a request lands). A master key and the
+  bridge cannot coexist — `build_guardrail()` refuses to boot and names the cause.
+- **Server bootstrap + deploy scripts** — `scripts/deploy/bootstrap-server.sh` (idempotent day-0
+  host prep + optional systemd unit) and `scripts/deploy/deploy.sh` (`up`/`down`/`restart`/
+  `logs`/`status`, `--mode oauth`, `--dry-run`, `--yes`). The local `.env` is never uploaded and
+  the server's is never read or overwritten.
+- **`docker-compose.build.yml`** — build the current branch instead of the published tag, pinned
+  to the `ru-en` NER profile (the `base` default ships no EN model and would 503 every request
+  under `CORP_LLM_REQUIRE_NER=1`).
+
+### Added — corp NER service (optional, off by default)
+
+- **`CorpNerDetector` + `corp_ner/` client** — a remote NER detector appended to the local-first
+  cascade, off unless `CORP_NER_ENABLED=1`, and requiring `CORP_NER_ENDPOINT` when on (enabled
+  without an endpoint is a boot refusal, not a silent skip). Tuning:
+  `CORP_NER_TIMEOUT_S` / `CORP_NER_MAX_TEXTS` / `CORP_NER_MAX_INPUT_CHARS` / `CORP_NER_CA_BUNDLE`.
+- **Network-backed detectors are excluded from `CODE` segments** — shipping source to an external
+  service is the leak this prevents. All *local* detectors keep scanning code; the exclusion is
+  local-vs-network, not code-safe-vs-not.
+- **The NER call carries raw user content**, so its TLS verification can never be disabled; an
+  internal CA goes through `CORP_NER_CA_BUNDLE`.
+- A readiness check for the service, and `gateway-admin config check` coverage of the new keys.
+
+### Added — detection
+
+- **`BANK_CARD` Luhn rule** — IIN-plausible, Luhn-valid PANs (13–19 digits, tolerating space and
+  hyphen grouping), with length and offset enforced before Luhn is spent so that a longer
+  incidental Luhn hit cannot evict a real PAN.
+
+### Changed — Cache A key boundary
+
+- The Cache A key now folds a **detector-policy fingerprint** as well as a coverage-version
+  constant, so entries produced under different detector coverage (corp NER on/off, a widened
+  profile, a different NER engine capability, a different gazetteer lemmatizer) can never be
+  served to each other. Flipping either network toggle needs **no cache flush**.
+
+### Docs
+
+- `docs/ops/deployment-modes.md` + `.ru.md` — the mode matrix, both network toggles, every
+  failure mode.
+- `docs/ops/deploy-handoff.md` + `.ru.md` — the condensed step-by-step for whoever runs the
+  deploy.
+- `compose/README.md` + `.ru.md` — the full stack reference (routing, virtual keys, why BYOK is
+  not available here, Langfuse, the audit pipeline and its recovery procedures, TLS to the corp
+  vLLM, environment posture).
+- README (EN/RU) now documents the deployment targets, the compose stack and the corp NER
+  toggle; the RU README caught up on the local-compose section, the `replace.md` matching
+  semantics and the licence section.
+
+### Known limitations of the compose target
+
+- **No TLS in front of the stack yet** — the only published port is `127.0.0.1:4000`; the nginx
+  front door is a later revision.
+- **In Mode B litellm's management endpoints are unauthenticated** (`/key/*`, `/model/*`,
+  `/user/*`, the UI) — its proxy auth is skipped without a master key, which is what the mode
+  requires. The LLM routes stay gated by `X-Corp-Auth`. Must be closed at nginx before the port
+  leaves loopback.
+- **Audit is buffered but not fail-closed** — a documented deviation from the `vectorBufferFull`
+  default in `docs/security.md` §8. Durability is bounded by docker log rotation.
+- **No untrusted `docker run` on the host** — Vector's container-label filter is a
+  misconfiguration guard, not a security boundary (`docs/security.md` §8.2).
+
 ## [1.0.0] — GA (2026-07-09)
 
 The first GA release — the **local-first detection cycle** (below) plus the **GA-readiness /

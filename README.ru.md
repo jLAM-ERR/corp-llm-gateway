@@ -8,6 +8,8 @@
 
 **Готов к GA.** Реализованы: local-first каскад детекции, полный проход по укреплению безопасности (11 исправлений поверхностей утечки, каждое repro-first — oversize, fail-open NER, `tool_calls` OpenAI, покрытие сегментатора, срезание заголовков, dev-прокси, TLS/RBAC), слой **profile-плагинов** по стране / подразделению / регуляторному режиму (декларативные бандлы + in-tree реестр детекторов + изоляция кэша между юрисдикциями) и эксплуатационные поверхности (composition root, реальный `gateway-admin`, production Helm-чарт, подключаемые метрики, обслуживаемый healthz, ops-документация). Некомпромиссный критерий успеха: **ноль подтверждённых инцидентов утечки** за 90 дней после GA.
 
+**Новое:** **production-развёртывание на docker compose** для хостов без Kubernetes ([`compose/`](compose/)) — полный data plane плюс self-hosted Langfuse v3 и конвейер аудита на Vector, два взаимоисключающих режима аутентификации (корпоративные API-ключи или проброс **подписки** самого разработчика через OAuth), скрипты подготовки сервера и развёртывания в одну команду, а также опциональный детектор на **сервисе корп-NER**. Начинать здесь: [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md).
+
 ## Оглавление
 
 - [Обзор](#обзор)
@@ -15,6 +17,9 @@
 - [Архитектура](#архитектура)
 - [Структура репозитория](#структура-репозитория)
 - [Быстрый старт для разработчика (ноутбук)](#быстрый-старт-для-разработчика-ноутбук)
+- [Куда можно развернуть](#куда-можно-развернуть)
+- [Запуск на сервере (docker compose)](#запуск-на-сервере-docker-compose)
+- [Запуск локально (docker compose)](#запуск-локально-docker-compose)
 - [Быстрый старт для оператора (k8s)](#быстрый-старт-для-оператора-k8s)
 - [Правила команды (`replace.md`)](#правила-команды-replacemd)
 - [Идентификация и поток токена](#идентификация-и-поток-токена)
@@ -41,6 +46,7 @@
 - **Сплиттер идентификаторов кода** — разбивает camel/snake-идентификаторы (`CompanynameabcService`) и сканирует сегменты по газеттиру
 - **Allowlist тестовых данных** — детерминированное исключение для тестовых фикстур; не может подавить настоящие секреты
 - **Паттерны секретов** — JWT, приватный ключ PEM, значения `sk-` / `AKIA` / `ghp_` / обобщённый `password=` / `Bearer`
+- **Сервис корп-NER** (опционально, выключен) — удалённый NER-детектор, добавляемый в локальный каскад (`CORP_NER_ENABLED` + `CORP_NER_ENDPOINT`). Ходит по сети, поэтому это единственный детектор, исключённый из сегментов `CODE` — иначе исходники ушли бы во внешний сервис; локальные детекторы код сканировать продолжают. Включён без endpoint'а — отказ на старте, а не тихий пропуск
 
 ### Блокировка
 
@@ -50,6 +56,7 @@
 ### Аутентификация и соответствие требованиям
 
 - **X-Corp-Auth + хранилище токенов на Postgres** — `AuthMiddleware` валидирует токены против `PostgresTokenStore` (asyncpg); верхняя граница распространения отзыва — 60 s
+- **Два режима upstream-креденшела** — корпоративные API-ключи (у разработчика персональный виртуальный ключ LiteLLM: есть отзыв и учёт расходов) либо **проброс подписки**, когда OAuth-токен подписки самого разработчика уходит наверх без изменений, а корпоративного `ANTHROPIC_API_KEY` не существует вовсе. Режимы взаимоисключающие, выбираются при развёртывании; санитизация, идентичность команды и аудит в обоих одинаковы — [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md)
 - **RBAC `gateway:operator`** — команды admin CLI закрыты гейтом по JWT-claim `gateway:operator`; проверяется через PyJWT против ролей realm в Keycloak
 - **Конвейер аудита** — богатая схема `AuditEvent` (уровни полей ALWAYS / CONDITIONAL) + гейт NEVER-полей: логгер отклоняет записи, содержащие `mapping`, `original` или `credentials`
 - **SIEM-sink** — HTTP-sink Vector с унаследованным NEVER-гейтом + Helm-алерты (`AuditVectorDropHigh`, `LeakAttemptDetected`)
@@ -73,7 +80,8 @@ src/corp_llm_gateway/   Python-guardrail (кастомные хуки LiteLLM + 
   cli/                  gateway-admin (team/token/extensions/config check), corp-llm-gateway status, proxy
   config.py/settings.py загрузчик конфига (env→файл→default) + типизированный реестр single-source-of-truth + validate()
   corp_llm/             httpx-клиент, говорящий с vLLM /v1/chat/completions
-  detectors/            PIIDetector + RegexChecksumDetector + DualNerDetector (RU+EN); fail-closed при отсутствии NER
+  corp_ner/             httpx-клиент + фабрика для опционального удалённого сервиса корп-NER (/v1/analyze)
+  detectors/            PIIDetector + RegexChecksumDetector + DualNerDetector (RU+EN) + CorpNerDetector; fail-closed при отсутствии NER
   extensions/           ExtensionRegistry (виды audit-sink / provider / detector / …); fail-closed register + гейт api-version
   healthz/              проверки live / ready / sanitization / extensions + ASGI-сервер (build_health_router)
   metrics/              подключаемый экспортер (noop / prometheus) — blocked_requests_total + gateway_failure
@@ -87,9 +95,14 @@ src/corp_llm_gateway/   Python-guardrail (кастомные хуки LiteLLM + 
   tokens/               schema.sql + AuthMiddleware + TokenIssuer + хранилища
   litellm_hook.py       CorpLlmGuardrail — адаптер callback-ов LiteLLM (вкл. OpenAI tool_calls + streaming)
 helm/corp-llm-gateway/  Helm-чарт (образ шлюза + callback guardrail, Secret, HPA/PDB/SA, ServiceMonitor, config-check initContainer, NetworkPolicy, CoreDNS sinkhole)
-docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
+compose/                production-развёртывание на одном хосте — data plane (litellm + redis + postgres) +
+                        self-hosted Langfuse v3 + конвейер аудита на Vector; оверлеи docker-compose.oauth.yml
+                        (режим подписки) и docker-compose.build.yml (сборка из исходников)
+examples/compose/       лёгкий локальный санитизирующий прокси (один контейнер, оракул выключен) — не боевой вариант
+docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      установщик для ноутбука (bash/zsh/fish, macOS/Linux)
-tests/                  pytest, pytest-asyncio mode=auto (~1392 passed / 91 skipped; 3.14 грациозный NER, полный на 3.12/CI)
+scripts/deploy/         подготовка сервера (bootstrap-server.sh + systemd-юнит) + deploy.sh (развёртывание/обновление хоста)
+tests/                  pytest, pytest-asyncio mode=auto (~2274 passed / 107 skipped; 3.14 грациозный NER, полный на 3.12/CI)
 ```
 
 ## Быстрый старт для разработчика (ноутбук)
@@ -156,7 +169,120 @@ export OPENAI_BASE_URL='http://127.0.0.1:9999/v1'
 
 Параллельный демо-стек показывает полный round-trip — маскирование, конвейер аудита, подсвеченный в Langfuse, fail-closed-поведение — на вашем ноутбуке: `scripts/demo.sh up` (наблюдать поток можно через `scripts/demo.sh logs`). Настройка, набор промптов и разбор проблем: [`docs/demo.md`](docs/demo.ru.md).
 
+## Куда можно развернуть
+
+Шлюз в этом репозитории запускается четырьмя способами. Боевых из них — два первых.
+
+| Вариант | Где | Когда |
+|---|---|---|
+| **Один хост, docker compose** | [`compose/`](compose/) | production на хосте без Kubernetes — полный data plane + self-hosted Langfuse + конвейер аудита |
+| **Kubernetes** | [`helm/corp-llm-gateway/`](helm/corp-llm-gateway/) | production в кластере — см. [Быстрый старт для оператора](#быстрый-старт-для-оператора-k8s) |
+| Локальный санитизирующий прокси | [`examples/compose/`](examples/compose/) | один контейнер перед Anthropic/OpenAI на ноутбуке, оракул выключен — **не** боевой вариант |
+| Демо на ноутбуке | `docker-compose.demo.yml` (`scripts/demo.sh`) | показать round-trip и аудит — токены в памяти, захардкоженный командный токен, без конвейера аудита |
+
+## Запуск на сервере (docker compose)
+
+[`compose/`](compose/) — боевой вариант для хостов без Kubernetes. В него входят **data plane** (`litellm` — прокси со встроенным guardrail — плюс `redis` под Cache B и `postgres` под токены/конфиг команд), **self-hosted Langfuse v3** (`langfuse-web`/`-worker`, ClickHouse, MinIO, отдельный Redis) и **конвейер аудита** (`vector`, читает stdout шлюза и доставляет в Langfuse; VRL-гейт NEVER-полей побайтово совпадает с тем, что в Helm-чарте).
+
+### Сначала — выбрать режим аутентификации
+
+Режима два, оба production, **взаимоисключающие** — решение принимается до заполнения `.env`. Стек, каскад детекции и цепочка аудита у них одинаковые; отличается только креденшел, с которым идёт запрос наверх.
+
+| | **Режим A** — корп-API-ключи | **Режим B** — подписка (OAuth) |
+|---|---|---|
+| Запуск | `docker compose up -d` | `-f docker-compose.yml -f docker-compose.oauth.yml` |
+| Креденшел наверх | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` шлюза | OAuth-токен подписки разработчика, пробрасывается без изменений |
+| Разработчик шлёт | `Authorization: Bearer <виртуальный ключ litellm>` | `Authorization: Bearer <sk-ant-oat…>` |
+| Идентичность команды | `X-Corp-Auth: <токен команды>` | так же |
+| `LITELLM_MASTER_KEY` | **обязателен** | **должен отсутствовать** (пустая строка считается заданной — удалять строку целиком) |
+| Обслуживаемые маршруты | `claude-*`, `gpt-*`, `corp-*` | только `claude-*`, и это несущий контроль безопасности, а не упрощение |
+| Отзыв / учёт расходов на человека | да, через админ-UI LiteLLM | нет |
+
+Полная матрица, все режимы отказа и почему режимы не сосуществуют: [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md) · EN: [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md).
+
+### Быстрый старт
+
+```bash
+# день 0, на сервере (поставит docker, если его нет, создаст /opt/corp-llm-gateway
+# и .env с правами 0600, затем выйдет с кодом 1, чтобы вы заполнили .env — так и задумано)
+sudo scripts/deploy/bootstrap-server.sh
+
+# положить схему хранилища токенов — init-скрипты postgres отрабатывают только на пустом томе
+cp src/corp_llm_gateway/tokens/schema.sql compose/postgres/initdb/01-schema.sql
+
+cd compose && docker compose up -d          # режим A
+docker compose ps                           # healthy через ~30-60 с; langfuse на чистом томе ~2 мин
+curl -fsS http://127.0.0.1:4000/health/liveliness
+```
+
+Пропустить шаг со схемой — тихая ловушка, а не заметный сбой: все сервисы отчитываются healthy, `/health/liveliness` отвечает, но каждый реальный запрос падает с 500, потому что `corp_tokens` / `team_config` не существуют.
+
+Секреты без значения по умолчанию (`GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, инфраструктурные `LANGFUSE_*`, `CORP_LANGFUSE_PUBLIC_KEY` / `CORP_LANGFUSE_SECRET_KEY`) заставляют `docker compose up` отказаться стартовать с указанием переменной, а не подняться наполовину настроенным. Полный прокомментированный шаблон: [`compose/.env.example`](compose/.env.example).
+
+### Развёртывание с ноутбука оператора
+
+```bash
+scripts/deploy/deploy.sh --host user@server up               # режим A
+scripts/deploy/deploy.sh --host user@server --mode oauth up  # режим B
+```
+
+Скрипт подкладывает SQL-схему, синхронизирует `compose/`, делает `pull`, поднимает стек и ждёт healthcheck'ов. Локальный `.env` наверх не уезжает никогда, серверный `.env` не читается, не печатается и не перезаписывается; ключи и сертификаты из синхронизации исключены. Остальные подкоманды: `down` (тома сохраняются, спрашивает подтверждение), `restart`, `logs`, `status`; полезные флаги `--dry-run`, `--yes`, `--dir`, `--force-unlock`. **Тот же `--mode` нужно передавать во все последующие запуски по этому хосту** — `logs`/`status`/`down` резолвят стек через тот же список файлов, и запуск без него покажет (или пересоздаст) другой стек.
+
+Для автозапуска после перезагрузки в режиме B дополнительно раскомментируйте `COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml` в `.env`: systemd-юнит выполняет голый `docker compose up -d`, который иначе резолвит только базовый файл.
+
+### Две опциональные сетевые зависимости
+
+Обе **выключены по умолчанию**, и включение любой из них **безопасно для Cache A** — в ключ кэша входит отпечаток эффективной политики детекторов, поэтому записи с разными настройками не пересекаются. Чистить кэш не нужно.
+
+| Переключатель | Выключено (по умолчанию) | Включено |
+|---|---|---|
+| `CORP_LLM_ORACLE_ENABLED` | вызов оракула не делается никогда; `CORP_LLM_ENDPOINT` для детекции не нужен | требует доступного `CORP_LLM_ENDPOINT` — включение без него роняет запросы fail-closed на **всех** маршрутах, а не только на `corp-*` |
+| `CORP_NER_ENABLED` | ни детектора, ни пробы готовности — так, будто фичи не существует | требует `CORP_NER_ENDPOINT` (базовый URL, клиент сам добавит `/v1/analyze`) и **сборки из исходников** — опубликованный тег образа старше этой работы |
+
+```bash
+# запустить код текущей ветки вместо опубликованного тега (оверлей намеренно собирает
+# NER-профиль ru-en: в профиле по умолчанию нет английской модели, и такой образ отвечал бы 503)
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+Не путайте `CORP_NER_ENABLED` (удалённый сервис) с `CORP_LLM_REQUIRE_NER` (внутрипроцессные RU/EN-движки) — второй в production остаётся `1` в любом случае.
+
+### Что знать до ввода в эксплуатацию
+
+- **TLS перед стеком ещё нет.** Единственный опубликованный порт — `127.0.0.1:4000`; фронт на nginx появится в следующей ревизии. До этого разработчики ходят через SSH-туннель, а не по сети.
+- **В режиме B management-эндпоинты litellm без аутентификации** (`/key/*`, `/model/*`, `/user/*`, UI) — без мастер-ключа его proxy-auth пропускается целиком, а это ровно то, чего режим требует. LLM-маршруты по-прежнему закрывает проверка `X-Corp-Auth` в guardrail. Сегодня доступно только с loopback; закрыть на nginx **до** вывода порта наружу. В режиме A такого разрыва нет.
+- **Никакого недоверенного `docker run` на этом хосте.** Vector отбирает записи аудита по публичной метке контейнера, поэтому любой, кто может запускать там контейнеры, может подделать записи аудита. Это требование модели развёртывания, а не рекомендация.
+- **Аудит буферизуется, но не fail-closed** — осознанное отступление от значения `vectorBufferFull` по умолчанию из [`docs/security.ru.md`](docs/security.ru.md) §8. Остановка доставки аудита не останавливает egress; реальная граница долговечности — ротация логов docker'а, а не дисковый буфер Vector.
+
+**Полный справочник по стеку** (маршрутизация, виртуальные ключи, почему здесь нет BYOK, Langfuse, конвейер аудита, TLS до корп-vLLM, процедуры восстановления): [`compose/README.ru.md`](compose/README.ru.md) · EN: [`compose/README.md`](compose/README.md). **Пошаговая инструкция** для того, кто разворачивает: [`docs/ops/deploy-handoff.ru.md`](docs/ops/deploy-handoff.ru.md) · EN: [`docs/ops/deploy-handoff.md`](docs/ops/deploy-handoff.md).
+
+## Запуск локально (docker compose)
+
+Без корп-vLLM и без Kubernetes: `CORP_LLM_ORACLE_ENABLED=0` запускает шлюз как
+локальный санитизирующий прокси прямо перед Anthropic/OpenAI, на опубликованном
+образе из GHCR. Локальный каскад (regex+checksum, двуязычный NER, газеттир,
+сплиттер) по-прежнему отрабатывает на каждом запросе — пропускается только
+уточняющий проход LLM-оракула. BYOK в этом режиме — общий ключ на стороне
+шлюза, а не ключ каждого разработчика (нативная маршрутизация anthropic/openai
+не умеет пробрасывать клиентский ключ — полный разбор в README примера).
+
+Требуется опубликованный образ `≥ v1.0.0-rc.5` (первый тег с переключателем
+оракула) — либо соберите локально: `docker build -f Dockerfile.gateway
+--build-arg NER_PROFILE=en -t corp-llm-gateway:local .`
+
+```bash
+cd examples/compose && cp .env.example .env   # вписать dev-токен + ключ(и) провайдера
+docker compose up -d
+```
+
+Это удобство для ноутбука, а не боевой вариант — здесь нет ни конвейера аудита, ни Langfuse. Для сервера используйте [`compose/`](#запуск-на-сервере-docker-compose).
+
+Полный разбор, находка про BYOK и путь обратного включения оракула:
+[`examples/compose/README.md`](examples/compose/README.md).
+
 ## Быстрый старт для оператора (k8s)
+
+Вариант для кластера. Для одного хоста без k8s см. [Запуск на сервере](#запуск-на-сервере-docker-compose) — тот же guardrail, та же цепочка аудита, другая упаковка.
 
 ### Что разворачивается
 
@@ -238,7 +364,7 @@ CLI оператора, обычно запускается через `kubectl 
 
 Каждая команда ведёт файл `replace.md` по пути `<rules-dir>/<team_id>.md`. Эти правила выполняются **первыми** в локальном каскаде; совпадение правила и находка детектора/NER/корп-LLM состязаются за один и тот же span — побеждает более длинный, а правило побеждает при равенстве только если его span совпадает со span находки ТОЧНО.
 
-Формат — одно правило на строку, разделитель `=` (легаси `→` U+2192 по-прежнему принимается); правила применяются длиннейшими вперёд (инвариант #5). Оборачивайте в кавычки любое значение, содержащее `=`:
+Формат — одно правило на строку, разделитель `=` (легаси `→` U+2192 по-прежнему принимается). Сопоставление — обычная подстрока **без учёта регистра** (раньше регистр учитывался), одинаково для одного слова и для фразы; требования к границам идентификатора нет, поэтому `kdir = [X]` совпадёт и с `kdir` внутри `mkdir`, а не только с `KdirService`. При пересечении побеждает **более длинный span** — правило или находка NER/оракула, безразлично; правило больше не перебивает автоматически более длинную пересекающуюся находку (при точном совпадении span оно по-прежнему выигрывает). Регистронезависимое сопоставление — это изменение поведения относительно прошлого релиза; прочитайте [`docs/replace-md-authoring.ru.md`](docs/replace-md-authoring.ru.md), прежде чем считать, что существующее правило срабатывает там же, где раньше. Оборачивайте в кавычки любое значение, содержащее `=`:
 
 ```markdown
 - `Project Polaris` = `[CONFIDENTIAL_PROJECT]`
@@ -279,7 +405,7 @@ CLI оператора, обычно запускается через `kubectl 
 ```bash
 pip install -e ".[dev]"
 pre-commit install
-PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~1392 passed / 91 skipped, ~23с (3.14 грациозный NER; полный NER + RS256 crypto на 3.12/CI)
+PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~2274 passed / 107 skipped, ~76с (3.14 грациозный NER; полный NER + RS256 crypto на 3.12/CI)
 PYTHONPATH=src .venv/bin/ruff check src tests
 ```
 
@@ -293,4 +419,15 @@ Open-source-компоненты, из которых собран шлюз (А�
 - **Двуязычный NER и морфология** — RU: [Natasha](https://github.com/natasha/natasha) · [Slovnet](https://github.com/natasha/slovnet) · [Navec](https://github.com/natasha/navec) · [Razdel](https://github.com/natasha/razdel) · [pymorphy3](https://pypi.org/project/pymorphy3/); EN: [spaCy](https://spacy.io) + [`en_core_web_md`](https://spacy.io/models/en). Альтернативы ([Presidio](https://github.com/microsoft/presidio), [DeepPavlov](https://github.com/deeppavlov/DeepPavlov)) рассмотрены и отклонены из-за латентности на CPU
 - **Состояние и хранилища** — [Redis](https://redis.io) (кэши маппинга / дедупа) · [PostgreSQL](https://www.postgresql.org) через [asyncpg](https://github.com/MagicStack/asyncpg) (хранилище токенов)
 - **Аудит и наблюдаемость** — [Vector](https://vector.dev) → [Langfuse](https://langfuse.com) + S3 + SIEM
-- **Доставка и клиенты** — [Helm](https://helm.sh) (чарт) · [CoreDNS](https://coredns.io) (egress-sinkhole) · [httpx](https://www.python-httpx.org) (клиент корп-LLM)
+- **Доставка и клиенты** — [Helm](https://helm.sh) (чарт) · [Docker Compose](https://docs.docker.com/compose/) (развёртывание на одном хосте) · [CoreDNS](https://coredns.io) (egress-sinkhole) · [httpx](https://www.python-httpx.org) (клиент корп-LLM)
+
+## Лицензия
+
+Copyright (c) 2026 Artem Likhomanenko.
+
+**Ядро** шлюза (этот репозиторий) распространяется под
+[Apache License 2.0](LICENSE) — свободно для любого использования, включая
+коммерческое. **Enterprise-плагины, готовые enterprise-сборки и коммерческая
+поддержка** — отдельные проприетарные предложения, см.
+[`LEGAL/COMMERCIAL-LICENSING.md`](LEGAL/COMMERCIAL-LICENSING.md).
+Вклады принимаются на условиях [`LEGAL/CLA.md`](LEGAL/CLA.md).
