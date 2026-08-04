@@ -113,10 +113,11 @@ KEYS: tuple[Key, ...] = (
     # Not a gateway knob — litellm's own virtual-key switch. Registered so it
     # resolves through the config chain (never a bare os.environ read) and so
     # `config check` can refuse it alongside a forward-auth bridge.
+    # No default: `None` has to mean "absent", because litellm reads a blank
+    # assignment as a set-and-empty master key, not as an unset one.
     Key(
         "LITELLM_MASTER_KEY",
         secret=True,
-        default="",
         help="litellm virtual-key master key; must be unset while a forward-auth bridge is on",
     ),
     # Choices validated by normalize_oversize_policy (see _check_oversize), not
@@ -413,8 +414,10 @@ MASTER_KEY_VS_FORWARD_AUTH_MESSAGE = (
     "(CORP_LLM_FORWARD_ANTHROPIC_AUTH / CORP_LLM_FORWARD_CHATGPT_AUTH). A master key makes "
     "litellm read the inbound Authorization header as one of its own virtual keys and answer "
     "401 before pre_call ever sees the developer's OAuth bearer, so the bridge can never run. "
-    "Unset it — a leftover LITELLM_MASTER_KEY in the local .env.demo that docker-compose "
-    "passes in via `env_file:` is the usual source — or turn the bridge off"
+    "A blank `LITELLM_MASTER_KEY=` counts as set: litellm keeps the empty value and enables "
+    "proxy auth for anything that is not None. Remove the line entirely — a leftover "
+    "LITELLM_MASTER_KEY in the local .env.demo that docker-compose passes in via `env_file:` "
+    "is the usual source — or turn the bridge off"
 )
 
 
@@ -425,10 +428,15 @@ def master_key_conflict(*, master_key: str | None, chatgpt: bool, anthropic: boo
     `build_guardrail()` can apply it to values that came from explicit kwargs.
     A master key on its own is legitimate (a plain BYOK-less litellm deploy uses
     one); only the combination is unserviceable.
+
+    PRESENT, not truthy: litellm's `get_secret_str` hands `''` and `'   '` back
+    unchanged and its proxy auth is skipped only for `master_key is None`, so a
+    bare `LITELLM_MASTER_KEY=` still consumes the developer's bearer and 401s
+    before pre_call. Anything other than absent is a conflict.
     """
     if not (chatgpt or anthropic):
         return None
-    return MASTER_KEY_VS_FORWARD_AUTH_MESSAGE if (master_key or "").strip() else None
+    return MASTER_KEY_VS_FORWARD_AUTH_MESSAGE if master_key is not None else None
 
 
 def _check_master_key_conflict(values: Mapping[str, str | None], problems: list[str]) -> None:

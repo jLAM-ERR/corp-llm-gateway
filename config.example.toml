@@ -85,6 +85,9 @@
 #   own virtual keys and answers 401 before pre_call runs, so the bridge never
 #   sees the developer's OAuth bearer. That pair refuses to boot and fails
 #   `gateway-admin config check`. A master key with both bridges off is fine.
+#   PRESENCE is what counts: litellm keeps a blank value and enables proxy auth
+#   for anything that is not unset, so `LITELLM_MASTER_KEY = ""` next to a bridge
+#   is refused too. Remove the line rather than blanking it.
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #

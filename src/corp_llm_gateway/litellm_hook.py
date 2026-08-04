@@ -70,6 +70,7 @@ from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.sanitizer.identity_preamble import (
     is_identity_preamble,
     leading_identity_block_index,
+    split_billing_marker,
 )
 from corp_llm_gateway.sanitizer.placeholder import (
     StaleSpanError,
@@ -942,8 +943,20 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # A well-formed request carries at most one, but nothing rejects a
         # payload carrying both — sanitize whichever are present rather than
         # picking one via a ternary (defect #2: the other egressed raw).
+        # The identity carve-out only pays for itself on the route it protects:
+        # Anthropic's OAuth /v1/messages. Off the bridge, or on a request bound
+        # for any other provider, an identity literal in `system` is ordinary
+        # content and takes the ordinary sanitization path.
+        identity_exempt = self._forward_anthropic_auth and provider == "anthropic"
         for prompt_field in ("system", "instructions"):
-            await self._sanitize_prompt_field(data, prompt_field, request_id, state, sanitize_one)
+            await self._sanitize_prompt_field(
+                data,
+                prompt_field,
+                request_id,
+                state,
+                sanitize_one,
+                identity_exempt=identity_exempt,
+            )
 
         # Stage 5: DLP egress guard — re-scan the SANITIZED outbound request.
         # Defence-in-depth: catches canaries / raw secrets that survived the
@@ -1017,6 +1030,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         request_id: str,
         state: _RequestState,
         sanitize_one: Callable[[str], Awaitable[SanitizeResult]],
+        *,
+        identity_exempt: bool = False,
     ) -> None:
         """Sanitize ``data[prompt_field]`` in place (``"system"`` or ``"instructions"``).
 
@@ -1026,10 +1041,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         Anthropic's OAuth ``/v1/messages`` route accepts a request as a Claude
         Code request on the strength of the LEADING ``system`` block, matched by
         exact equality, so that one block is exempt from rewriting (see
-        ``sanitizer/identity_preamble``). The exemption is claimed here, not in
-        the per-leaf orchestrator: the orchestrator has no field or position
-        context, so claiming it there also exempted an identity literal pasted
-        into ``instructions``, a user message, a ``tool_result`` or a
+        ``sanitizer/identity_preamble``) when ``identity_exempt`` says the
+        request can actually reach that route. The exemption is claimed here,
+        not in the per-leaf orchestrator: the orchestrator has no field or
+        position context, so claiming it there also exempted an identity literal
+        pasted into ``instructions``, a user message, a ``tool_result`` or a
         ``document`` — leaves an operator rule or gazetteer entry must still be
         able to redact.
         """
@@ -1047,7 +1063,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             system_bytes,
         )
         exempt_index: int | None = None
-        if prompt_field == "system":
+        if identity_exempt and prompt_field == "system":
             if isinstance(system, str) and is_identity_preamble(system):
                 logger.info(
                     "litellm_pre_call_identity_preamble_passthrough request_id=%s field=%s",
@@ -1067,13 +1083,29 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     prompt_field,
                     exempt_index,
                 )
-                exempt_block = system[exempt_index]
-                rest = list(system)
-                del rest[exempt_index]
+                # What makes the identity block the LEADING one is that every
+                # block before it is a billing marker. Sanitizing those markers
+                # away would break that arrangement on the way out, so each
+                # marker prefix is held back — a fixed protocol string, not user
+                # content — and only the caller-controlled remainder goes
+                # through the walker, exactly like any other leaf.
+                split = [
+                    split_billing_marker(block["text"]) or ("", block["text"])
+                    for block in system[:exempt_index]
+                ]
+                rest: list[Any] = [
+                    {**block, "text": remainder}
+                    for block, (_, remainder) in zip(system[:exempt_index], split, strict=True)
+                ]
+                rest.extend(system[exempt_index + 1 :])
                 new_rest, results = await sanitize_content(rest, sanitize_one)
+                new_head = [
+                    {**block, "text": prefix + block["text"]}
+                    for block, (prefix, _) in zip(new_rest[:exempt_index], split, strict=True)
+                ]
                 new_system = [
-                    *new_rest[:exempt_index],
-                    exempt_block,
+                    *new_head,
+                    system[exempt_index],
                     *new_rest[exempt_index:],
                 ]
         except ContentTooDeepError as exc:

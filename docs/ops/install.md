@@ -216,4 +216,7 @@ Notes:
   refused. Fix: delete the line from `.env.demo` (or re-copy from
   `.env.demo.example`) and bring the stack up again. The boot-time refusal is
   deliberate — without it you would instead get an unexplained `401` on every
-  `claude` request.
+  `claude` request. **Blanking the line is not enough**: `LITELLM_MASTER_KEY=`
+  with no value is still a set master key to litellm (it keeps the empty string
+  and enables proxy auth for any non-`None` value), so the gateway refuses that
+  too. Delete the line.

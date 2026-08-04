@@ -133,6 +133,23 @@ def test_router_treats_api_key_as_a_clientside_credential() -> None:
     assert handler.is_clientside_credential({"api_key": _OAUTH_TOKEN})
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_master_key_env_var_stays_a_set_master_key(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    # Why `settings.master_key_conflict` refuses a PRESENT master key rather than
+    # a truthy one: litellm reads the variable through `get_secret_str`, which
+    # preserves a blank value, and skips proxy auth only for `master_key is
+    # None`. A blank one therefore still consumes the developer's bearer.
+    secret_managers = pytest.importorskip("litellm.secret_managers.main", reason=_SKIP_REASON)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", blank)
+
+    resolved = secret_managers.get_secret_str("LITELLM_MASTER_KEY")
+
+    assert resolved == blank
+    assert resolved is not None
+
+
 def test_non_chat_input_call_types_all_exist_in_litellm() -> None:
     # The hook's denylist is written as literal call_type strings; a renamed
     # CallType would silently turn one back into a sanitized-as-chat path.
