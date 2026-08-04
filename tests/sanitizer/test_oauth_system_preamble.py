@@ -12,10 +12,12 @@ Code request.
 
 The gateway sanitizes ``data["system"]``, so it can mutate that block. These
 tests drive the real ``pre_call`` — with the production detector set — over
-realistic ``system`` shapes and pin three things: the leading identity block is
+realistic ``system`` shapes and pin four things: the leading identity block is
 not rewritten; NOTHING ELSE is exempt (a padded copy, a later block,
-``instructions``, a user message, a ``tool_result``); and the exempt block is
-still scanned by Stage 0 and Stage 5.
+``instructions``, a user message, a ``tool_result``, any request that cannot
+reach the OAuth route at all); the arrangement that makes the block *leading*
+survives sanitization; and the exempt block is still scanned by Stage 0 and
+Stage 5.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ from corp_llm_gateway.sanitizer.identity_preamble import (
     CLAUDE_CODE_IDENTITY_PREAMBLES,
     is_identity_preamble,
     leading_identity_block_index,
+    split_billing_marker,
 )
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
@@ -52,7 +55,17 @@ SECRET = "AKIAIOSFODNN7EXAMPLE"
 # carve-out must not be able to disable outside the leading system block.
 RULE_TERM = "Claude Code"
 RULE_REPLACEMENT = "[PRODUCT_001]"
-BILLING_BLOCK = {"type": "text", "text": "x-anthropic-billing-header: claude-code"}
+BILLING_MARKER = "x-anthropic-billing-header:"
+BILLING_BLOCK = {"type": "text", "text": f"{BILLING_MARKER} claude-code"}
+# An operator rule matching inside the billing MARKER itself. Rule matching is a
+# case-insensitive substring test, so this rewrites `x-anthropic-billing-header:`
+# — the arrangement that makes the identity block the leading one.
+MARKER_RULE_TERM = "anthropic"
+MARKER_RULE_REPLACEMENT = "[ORG_999]"
+# The bridge the carve-out exists for: it applies only while this is armed AND
+# the model resolves to the Anthropic provider.
+OAUTH_TOKEN = "sk-ant-oat01-fake-preamble"
+ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
 
 class _StaticRulesLoader(RulesLoader):
@@ -104,6 +117,7 @@ def _guardrail(
     rules: Rules | None = None,
     dlp_guard: DlpEgressGuard | None = None,
     size_threshold_bytes: int = DEFAULT_THRESHOLD_BYTES,
+    forward_anthropic_auth: bool = True,
 ) -> tuple[CorpLlmGuardrail, ListSink, list[int]]:
     """The production wiring: `bootstrap._build_orchestrator`'s detector set."""
     client, call_count = _oracle_client()
@@ -133,6 +147,7 @@ def _guardrail(
         AuthMiddleware(token_store),
         AuditLogger(sink, gateway_version="0.0.1"),
         dlp_guard=dlp_guard,
+        forward_anthropic_auth=forward_anthropic_auth,
     )
     return guardrail, sink, call_count
 
@@ -142,11 +157,12 @@ def _data(
     system: Any = None,
     content: Any = "hello",
     instructions: str | None = None,
+    model: str = ANTHROPIC_MODEL,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "model": "claude",
+        "model": model,
         "messages": [{"role": "user", "content": content}],
-        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": f"Bearer {OAUTH_TOKEN}"},
     }
     if system is not None:
         data["system"] = system
@@ -290,6 +306,151 @@ async def test_identity_literal_in_a_non_leading_system_block_is_still_sanitized
     assert RULE_TERM not in out["system"][1]["text"]
 
 
+# ---- the carve-out reaches ONLY the route that needs it ---------------------
+
+
+async def test_identity_block_is_sanitized_when_the_bridge_is_off() -> None:
+    """The exemption exists to keep Anthropic's OAuth preamble byte-exact. With
+    the bridge off there is no OAuth request to protect, so the block is ordinary
+    content."""
+    g, _, _ = _guardrail(rules=_rules(), forward_anthropic_auth=False)
+    out = await g.pre_call(_data(system=[{"type": "text", "text": PREAMBLE}]))
+
+    assert RULE_TERM not in out["system"][0]["text"]
+    assert RULE_REPLACEMENT in out["system"][0]["text"]
+
+
+async def test_string_identity_system_is_sanitized_when_the_bridge_is_off() -> None:
+    g, _, _ = _guardrail(rules=_rules(), forward_anthropic_auth=False)
+    out = await g.pre_call(_data(system=PREAMBLE))
+
+    assert RULE_TERM not in out["system"]
+    assert RULE_REPLACEMENT in out["system"]
+
+
+@pytest.mark.parametrize("model", ["gpt-4o", "corp-glm-5"])
+async def test_identity_block_is_sanitized_for_a_non_anthropic_model(model: str) -> None:
+    """Bridge armed, but the request resolves to another provider: pasting one of
+    the three literals into `system` must not buy a bypass of replace.md /
+    gazetteer / NER on an OpenAI or corp-vLLM call."""
+    g, _, _ = _guardrail(rules=_rules())
+    out = await g.pre_call(_data(system=[{"type": "text", "text": PREAMBLE}], model=model))
+
+    assert RULE_TERM not in out["system"][0]["text"]
+    assert RULE_REPLACEMENT in out["system"][0]["text"]
+
+
+@pytest.mark.parametrize("model", ["gpt-4o", "corp-glm-5"])
+async def test_string_identity_system_is_sanitized_for_a_non_anthropic_model(model: str) -> None:
+    g, _, _ = _guardrail(rules=_rules())
+    out = await g.pre_call(_data(system=PREAMBLE, model=model))
+
+    assert RULE_TERM not in out["system"]
+
+
+async def test_secret_behind_an_identity_block_is_redacted_off_the_bridge() -> None:
+    g, _, _ = _guardrail(forward_anthropic_auth=False)
+    system = [
+        {"type": "text", "text": PREAMBLE},
+        {"type": "text", "text": f"Deploy with access key {SECRET} against prod."},
+    ]
+    out = await g.pre_call(_data(system=system))
+
+    assert SECRET not in json.dumps(out["system"])
+
+
+# ---- what made the block "leading" must still hold on the way out ----------
+
+
+async def test_billing_marker_prefix_survives_a_rule_that_matches_it() -> None:
+    """A rule matching `anthropic` rewrote the marker to
+    `x-[ORG_999]-billing-header:`, so by the module's own rule the outbound
+    payload no longer had a leading identity block — and Anthropic's OAuth route
+    keys on exactly that arrangement."""
+    rules = Rules(rules=(Rule(pattern=MARKER_RULE_TERM, replacement=MARKER_RULE_REPLACEMENT),))
+    g, _, _ = _guardrail(rules=rules)
+    system = [
+        {"type": "text", "text": f"{BILLING_MARKER} cost-center=demo"},
+        {"type": "text", "text": PREAMBLE},
+    ]
+    out = await g.pre_call(_data(system=system))
+
+    assert out["system"][0]["text"].startswith(BILLING_MARKER), out["system"][0]["text"]
+    assert MARKER_RULE_REPLACEMENT not in out["system"][0]["text"]
+    assert leading_identity_block_index(out["system"]) == 1
+    assert out["system"][1]["text"] == PREAMBLE
+
+
+async def test_two_billing_markers_ahead_of_the_identity_block_all_survive() -> None:
+    rules = Rules(rules=(Rule(pattern=MARKER_RULE_TERM, replacement=MARKER_RULE_REPLACEMENT),))
+    g, _, _ = _guardrail(rules=rules)
+    system = [
+        {"type": "text", "text": f"{BILLING_MARKER} a=1"},
+        {"type": "text", "text": f"{BILLING_MARKER} b=2"},
+        {"type": "text", "text": PREAMBLE},
+    ]
+    out = await g.pre_call(_data(system=system))
+
+    assert [block["text"] for block in out["system"][:2]] == [
+        f"{BILLING_MARKER} a=1",
+        f"{BILLING_MARKER} b=2",
+    ]
+    assert leading_identity_block_index(out["system"]) == 2
+
+
+async def test_a_billing_block_with_no_remainder_is_unchanged() -> None:
+    rules = Rules(rules=(Rule(pattern=MARKER_RULE_TERM, replacement=MARKER_RULE_REPLACEMENT),))
+    g, _, _ = _guardrail(rules=rules)
+    system = [{"type": "text", "text": BILLING_MARKER}, {"type": "text", "text": PREAMBLE}]
+    out = await g.pre_call(_data(system=system))
+
+    assert out["system"][0]["text"] == BILLING_MARKER
+    assert leading_identity_block_index(out["system"]) == 1
+
+
+async def test_other_keys_on_a_billing_block_survive_the_split() -> None:
+    """Claude Code hangs `cache_control` off these blocks; rebuilding the text
+    must not drop the rest of the block."""
+    g, _, _ = _guardrail()
+    system = [
+        {
+            "type": "text",
+            "text": f"{BILLING_MARKER} cost-center=demo",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": PREAMBLE},
+    ]
+    out = await g.pre_call(_data(system=system))
+
+    assert out["system"][0] == system[0]
+
+
+async def test_the_billing_block_remainder_is_still_sanitized() -> None:
+    """Only the fixed marker is held back. Everything the caller wrote after it
+    goes through the detectors — the prefix must not become a smuggling lane."""
+    g, _, _ = _guardrail()
+    system = [
+        {"type": "text", "text": f"{BILLING_MARKER} cost-center={SECRET}"},
+        {"type": "text", "text": PREAMBLE},
+    ]
+    out = await g.pre_call(_data(system=system))
+
+    assert SECRET not in json.dumps(out["system"])
+    assert out["system"][0]["text"].startswith(BILLING_MARKER)
+    assert out["system"][1]["text"] == PREAMBLE
+
+
+async def test_a_rule_matching_the_billing_remainder_still_applies() -> None:
+    g, _, _ = _guardrail(rules=_rules())
+    system = [
+        {"type": "text", "text": f"{BILLING_MARKER} tool={RULE_TERM}"},
+        {"type": "text", "text": PREAMBLE},
+    ]
+    out = await g.pre_call(_data(system=system))
+
+    assert out["system"][0]["text"] == f"{BILLING_MARKER} tool={RULE_REPLACEMENT}"
+
+
 async def test_orchestrator_does_not_exempt_the_literal_on_its_own() -> None:
     """The per-leaf chokepoint has no field/position context, so it must not hold
     the carve-out — otherwise every walker path inherits it."""
@@ -423,6 +584,28 @@ def test_leading_identity_block_index_returns_none(system: Any) -> None:
 )
 def test_leading_identity_block_index_finds_the_head_block(system: Any, expected: int) -> None:
     assert leading_identity_block_index(system) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f"{BILLING_MARKER} cost-center=demo", (BILLING_MARKER, " cost-center=demo")),
+        (BILLING_MARKER, (BILLING_MARKER, "")),
+        ("x-anthropic-billing-header", None),  # prefix incomplete: no colon
+        (f"prefix {BILLING_MARKER} v", None),  # not at the head
+        ("X-Anthropic-Billing-Header: v", None),  # case differs
+        ("", None),
+    ],
+)
+def test_split_billing_marker(text: str, expected: tuple[str, str] | None) -> None:
+    assert split_billing_marker(text) == expected
+
+
+def test_split_billing_marker_is_lossless() -> None:
+    text = f"{BILLING_MARKER} cost-center=demo"
+    prefix, remainder = split_billing_marker(text)  # type: ignore[misc]
+
+    assert prefix + remainder == text
 
 
 # ---- why the carve-out is needed at all -----------------------------------

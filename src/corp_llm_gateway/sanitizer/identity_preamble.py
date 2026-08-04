@@ -11,11 +11,13 @@ request being a Claude Code request.
 
 The strings are fixed client constants, never user content, so exempting them
 from rewriting cannot leak an original (M1-14). The exemption is claimed by
-``litellm_hook._sanitize_prompt_field`` for the leading ``system`` block ONLY —
-never for ``instructions``, user messages, ``tool_result`` or ``document``
-leaves, which are sanitized normally even when they hold an identity literal.
-The exempt block stays fully visible to the Stage-0 / Stage-5 scans, which read
-content through ``collect_text`` rather than through the sanitize path.
+``litellm_hook._sanitize_prompt_field`` for the leading ``system`` block ONLY,
+and only while the Anthropic OAuth bridge is on AND the request resolves to the
+Anthropic provider — never for ``instructions``, user messages, ``tool_result``
+or ``document`` leaves, and never on a request that cannot reach the route the
+exemption exists for. The exempt block stays fully visible to the Stage-0 /
+Stage-5 scans, which read content through ``collect_text`` rather than through
+the sanitize path.
 """
 
 from __future__ import annotations
@@ -46,6 +48,19 @@ def is_identity_preamble(text: str) -> bool:
     let unbounded whitespace ride into an unsanitized, size-unchecked leaf.
     """
     return text in CLAUDE_CODE_IDENTITY_PREAMBLES
+
+
+def split_billing_marker(text: str) -> tuple[str, str] | None:
+    """Split a billing-header block into (fixed marker prefix, caller remainder).
+
+    ``None`` when ``text`` is not a billing-header block. The prefix is a fixed
+    protocol marker: rewriting it would strip the arrangement that makes the
+    identity block a LEADING one, so it is held back while the remainder — which
+    the caller controls — is sanitized like any other leaf.
+    """
+    if not text.startswith(_BILLING_HEADER_PREFIX):
+        return None
+    return _BILLING_HEADER_PREFIX, text[len(_BILLING_HEADER_PREFIX) :]
 
 
 def leading_identity_block_index(system: Any) -> int | None:

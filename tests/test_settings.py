@@ -234,12 +234,37 @@ def test_validate_rejects_a_master_key_next_to_the_chatgpt_bridge(
 
 
 @pytest.mark.parametrize("master_key", ["", "   "])
-def test_validate_treats_an_empty_master_key_as_unset(
+def test_validate_rejects_a_blank_master_key_next_to_a_bridge(
     hermetic: Path, monkeypatch: pytest.MonkeyPatch, master_key: str
 ) -> None:
-    # litellm itself ignores a blank master key, so a blank one must not block a bridge.
+    # litellm does NOT ignore a blank master key: `get_secret_str` returns '' /
+    # '   ' verbatim and proxy auth is skipped only for `master_key is None`, so
+    # `LITELLM_MASTER_KEY=` in a .env still 401s the developer's bearer before
+    # pre_call. Presence is the rule, emptiness buys nothing.
     monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
     monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", master_key)
+
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+
+    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc.value.problems
+
+
+def test_validate_accepts_an_absent_master_key_next_to_a_bridge(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+
+    assert isinstance(config.validate(), Settings)
+
+
+@pytest.mark.parametrize("master_key", ["", "   "])
+def test_validate_allows_a_blank_master_key_when_no_bridge_is_on(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, master_key: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
     monkeypatch.setenv("LITELLM_MASTER_KEY", master_key)
 
     assert isinstance(config.validate(), Settings)
@@ -266,7 +291,9 @@ def test_master_key_conflict_is_the_single_shared_rule() -> None:
     assert settings.master_key_conflict(master_key="k", chatgpt=False, anthropic=True) == message
     assert settings.master_key_conflict(master_key="k", chatgpt=False, anthropic=False) is None
     assert settings.master_key_conflict(master_key=None, chatgpt=False, anthropic=True) is None
-    assert settings.master_key_conflict(master_key="", chatgpt=False, anthropic=True) is None
+    # Set-but-blank is set: litellm enables proxy auth for any non-None value.
+    assert settings.master_key_conflict(master_key="", chatgpt=False, anthropic=True) == message
+    assert settings.master_key_conflict(master_key="   ", chatgpt=False, anthropic=True) == message
 
 
 # ── validate(): malformed choices ────────────────────────────────────────────
