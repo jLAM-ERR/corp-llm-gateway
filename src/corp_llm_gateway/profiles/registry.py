@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from corp_llm_gateway import config
+from corp_llm_gateway.corp_ner import CorpNerClient
+from corp_llm_gateway.detectors.corp_ner import CorpNerDetector
 from corp_llm_gateway.detectors.dual_ner import DualNerDetector
 from corp_llm_gateway.detectors.ner_en import EnNerDetector
 from corp_llm_gateway.detectors.ner_ru import RuNerDetector
@@ -24,6 +27,26 @@ if TYPE_CHECKING:
     DetectorFactory = Callable[[Mapping[str, Any]], PIIDetector]
 
 
+def _make_corp_ner(cfg: Mapping[str, Any]) -> PIIDetector:
+    """Corp NER for a profile bundle that names it.
+
+    Endpoint from the bundle cfg, else the config chain. A missing endpoint is a
+    refusal, not a detector pointed nowhere: that would fail every request as an
+    outage instead of naming the misconfiguration.
+
+    The composition root (``bootstrap.build_corp_ner``) is the path that also
+    wires the live metrics exporter; a profile-declared instance keeps the
+    detector's own Noop default.
+    """
+    endpoint = str(cfg.get("corp_ner_endpoint") or config.get("CORP_NER_ENDPOINT") or "")
+    if not endpoint:
+        raise ValueError(
+            "detector 'corp_ner' needs an endpoint: set CORP_NER_ENDPOINT or "
+            "corp_ner_endpoint in the profile bundle config"
+        )
+    return CorpNerDetector(CorpNerClient(endpoint))
+
+
 # Eager dict literal is safe: values are factory callables, not detectors —
 # nothing is instantiated and no config is read at import.
 DETECTOR_REGISTRY: dict[str, DetectorFactory] = {
@@ -31,6 +54,7 @@ DETECTOR_REGISTRY: dict[str, DetectorFactory] = {
     "dual_ner": lambda cfg: DualNerDetector(),
     "ner_ru": lambda cfg: RuNerDetector(),
     "ner_en": lambda cfg: EnNerDetector(),
+    "corp_ner": _make_corp_ner,
 }
 
 

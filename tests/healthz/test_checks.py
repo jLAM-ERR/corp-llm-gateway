@@ -8,6 +8,7 @@ from corp_llm_gateway.healthz import (
     LiveCheck,
     ReadyCheck,
     SanitizationCheck,
+    make_corp_ner_ready_probe,
     make_ner_ready_probe,
 )
 
@@ -171,6 +172,70 @@ async def test_make_ner_ready_probe_propagates_detector_error() -> None:
     probe = make_ner_ready_probe(_detect)
     with pytest.raises(NerUnavailableError):
         await probe()
+
+
+# Ready — corp NER probe (B4, wired only when CORP_NER_ENABLED is set) --------
+
+
+@pytest.mark.asyncio
+async def test_ready_healthy_when_corp_ner_probe_ok() -> None:
+    rc = ReadyCheck(check_redis=_ok, check_postgres=_ok, check_corp_ner=_ok)
+    status = await rc.check()
+    assert status.healthy is True
+    assert status.detail == "ready"
+
+
+@pytest.mark.asyncio
+async def test_ready_unhealthy_when_corp_ner_unreachable() -> None:
+    """Corp NER is fail-closed on the request path, so an unreachable service
+    must drop the container out of rotation — unlike the deep-check-only
+    ExtensionsCheck."""
+    rc = ReadyCheck(check_redis=_ok, check_postgres=_ok, check_corp_ner=_fail)
+    status = await rc.check()
+    assert status.healthy is False
+    assert status.detail == "corp_ner_unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_ready_corp_ner_exception_caught() -> None:
+    rc = ReadyCheck(check_redis=_ok, check_postgres=_ok, check_corp_ner=_raise)
+    status = await rc.check()
+    assert status.healthy is False
+    assert "corp_ner_error:RuntimeError" in status.detail
+
+
+@pytest.mark.asyncio
+async def test_ready_corp_ner_probe_not_run_until_deps_pass() -> None:
+    called = False
+
+    async def _corp_ner() -> bool:
+        nonlocal called
+        called = True
+        return True
+
+    await ReadyCheck(check_redis=_fail, check_postgres=_ok, check_corp_ner=_corp_ner).check()
+    assert called is False, "corp NER probe should not run once Redis fails"
+
+
+@pytest.mark.asyncio
+async def test_ready_without_corp_ner_probe_is_unchanged() -> None:
+    """CORP_NER_ENABLED=0 ⇒ no probe wired ⇒ readiness exactly as before."""
+    rc = ReadyCheck(check_redis=_ok, check_postgres=_ok)
+    status = await rc.check()
+    assert status.healthy is True
+    assert status.detail == "ready"
+
+
+@pytest.mark.asyncio
+async def test_make_corp_ner_ready_probe_maps_extension_health() -> None:
+    async def _healthy() -> HealthStatus:
+        return HealthStatus(True, "corp_ner_ok")
+
+    async def _down() -> HealthStatus:
+        return HealthStatus(False, "corp_ner_unhealthy:503")
+
+    assert await make_corp_ner_ready_probe(_healthy)() is True
+    assert await make_corp_ner_ready_probe(_down)() is False
 
 
 # Sanitization deep-check ---------------------------------------------------

@@ -35,6 +35,11 @@ from corp_llm_gateway.audit import AuditEvent, AuditLogger, AuditWriteAmbiguousE
 from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
+from corp_llm_gateway.corp_ner.errors import (
+    E_CORP_NER_UNAVAILABLE,
+    E_NER_UNAVAILABLE,
+    ner_error_code,
+)
 from corp_llm_gateway.detectors import NerUnavailableError
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.payload.classifier import classify_block
@@ -71,6 +76,7 @@ from corp_llm_gateway.sanitizer.identity_preamble import (
     is_identity_preamble,
     leading_identity_block_index,
 )
+from corp_llm_gateway.sanitizer.local_pass import DetectorContractError
 from corp_llm_gateway.sanitizer.placeholder import (
     StaleSpanError,
     add_unwrapped_response_aliases,
@@ -156,6 +162,32 @@ class GuardrailHttpException(Exception):  # noqa: N818 — intentional name; Lit
         super().__init__(f"{status_code} {error_code}: {message}")
         self.status_code = status_code
         self.error_code = error_code
+
+
+# A batch detector breaking the BatchPIIDetector contract is a code bug, not a
+# missing NER model — reporting it as E_NER_UNAVAILABLE would send an operator to
+# check models during what is really an integration failure. Status stays 503:
+# the request still failed closed.
+E_DETECTOR_CONTRACT = "E_DETECTOR_CONTRACT"
+
+# Static, content-free client messages per detection-failure code (never str(exc)).
+_DETECTION_FAILURE_MESSAGES: dict[str, str] = {
+    E_NER_UNAVAILABLE: "NER detector unavailable",
+    E_CORP_NER_UNAVAILABLE: "corp NER service unavailable",
+    E_DETECTOR_CONTRACT: "detector contract violation",
+}
+
+
+def _detection_failure_code(exc: BaseException) -> str:
+    """Classify a fail-closed detection failure (F2/M4) into its error code.
+
+    ``NerUnavailableError`` is the shared base of all three, so one handler covers
+    every detector; only the code tells them apart downstream (client, audit,
+    gateway_failure{component}).
+    """
+    if isinstance(exc, DetectorContractError):
+        return E_DETECTOR_CONTRACT
+    return ner_error_code(exc)
 
 
 class CorpLlmGuardrail(_LitellmCustomLogger):
@@ -954,24 +986,27 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "corp sanitization LLM unavailable",
                 ) from exc
             except NerUnavailableError as exc:
-                # F2 fail-closed (M4): a REQUIRED NER engine's model is absent in
-                # this build. Refuse egress — never forward content a PERSON/ORG
-                # detector would have redacted. 503, distinct from E_CORP_LLM_DOWN
-                # so a missing NER model is not confused with an oracle outage.
+                # F2 fail-closed (M4): a detector that must run could not. Refuse
+                # egress — never forward content a PERSON/ORG detector would have
+                # redacted. 503, distinct from E_CORP_LLM_DOWN so a detector
+                # failure is not confused with an oracle outage; the code tells a
+                # missing local model, a corp-NER outage and a contract bug apart.
+                error_code = _detection_failure_code(exc)
                 logger.warning(
                     "litellm_pre_call_ner_unavailable request_id=%s "
-                    "message_index=%d error_code=E_NER_UNAVAILABLE exception=%s",
+                    "message_index=%d error_code=%s exception=%s",
                     request_id,
                     i,
+                    error_code,
                     type(exc).__name__,
                 )
-                self._record_failure(request_id, error_code="E_NER_UNAVAILABLE")
+                self._record_failure(request_id, error_code=error_code)
                 _now = datetime.now(UTC)
                 await self.audit(data, None, _now, _now, status="failed")
                 raise GuardrailHttpException(
                     503,
-                    "E_NER_UNAVAILABLE",
-                    "NER detector unavailable",
+                    error_code,
+                    _DETECTION_FAILURE_MESSAGES[error_code],
                 ) from exc
             except StaleSpanError as exc:
                 # M4 fail-policy matrix: the pre-selected replacement span pool no
@@ -1226,21 +1261,23 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 "corp sanitization LLM unavailable",
             ) from exc
         except NerUnavailableError as exc:
-            # F2 fail-closed (M4): required NER unavailable on this field.
+            # F2 fail-closed (M4): a required detector could not run on this field.
+            error_code = _detection_failure_code(exc)
             logger.warning(
                 "litellm_pre_call_ner_unavailable request_id=%s "
-                "field=%s error_code=E_NER_UNAVAILABLE exception=%s",
+                "field=%s error_code=%s exception=%s",
                 request_id,
                 prompt_field,
+                error_code,
                 type(exc).__name__,
             )
-            self._record_failure(request_id, error_code="E_NER_UNAVAILABLE")
+            self._record_failure(request_id, error_code=error_code)
             _now = datetime.now(UTC)
             await self.audit(data, None, _now, _now, status="failed")
             raise GuardrailHttpException(
                 503,
-                "E_NER_UNAVAILABLE",
-                "NER detector unavailable",
+                error_code,
+                _DETECTION_FAILURE_MESSAGES[error_code],
             ) from exc
         except StaleSpanError as exc:
             # M4 fail-policy matrix: same fail-closed mapping as the messages loop.
@@ -2265,7 +2302,12 @@ _AUTH_ERROR_MESSAGES: dict[str, str] = {
 # runbook queries component="corp_llm"/"pre_pass"; unmapped codes fall back to "other".
 _FAILURE_COMPONENT: dict[str, str] = {
     "E_CORP_LLM_DOWN": "corp_llm",
-    "E_NER_UNAVAILABLE": "ner",
+    E_NER_UNAVAILABLE: "ner",
+    # Must match detectors.corp_ner.FAILURE_COMPONENT: the detector emits
+    # gateway_failure{component="corp_ner"} itself, and one outage must not
+    # split across two series. Pinned by tests/extensions/test_corp_ner_hook_codes.
+    E_CORP_NER_UNAVAILABLE: "corp_ner",
+    E_DETECTOR_CONTRACT: "sanitize",
     "E_PROFILE_UNAVAILABLE": "profile",
     "E_MISSING_TOKEN": "auth",
     "E_TOKEN_EXPIRED": "auth",

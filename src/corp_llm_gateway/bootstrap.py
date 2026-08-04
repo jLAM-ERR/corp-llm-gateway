@@ -29,11 +29,14 @@ from corp_llm_gateway import config
 from corp_llm_gateway.audit import AuditLogger, Sink, get_sink, register_sink, sink_name_for
 from corp_llm_gateway.auth import get_auth_provider
 from corp_llm_gateway.corp_llm import CorpLlmClient
+from corp_llm_gateway.corp_ner import CorpNerClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import PIIDetector
+from corp_llm_gateway.detectors.corp_ner import CorpNerDetector
 from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
+from corp_llm_gateway.extensions.corp_ner import CorpNerExtension, register_corp_ner
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
-from corp_llm_gateway.metrics import get_exporter
+from corp_llm_gateway.metrics import MetricsExporter, get_exporter
 from corp_llm_gateway.profiles import FileProfileLoader, ProfileBundle, ProfileResolver
 from corp_llm_gateway.rules import (
     CachedRulesLoader,
@@ -148,6 +151,83 @@ def build_corp_llm_client() -> CorpLlmClient:
     )
 
 
+# The one detector table that is actually read; a generic ExtensionRegistry
+# .discover() over every [extensions.<kind>.<name>] stays out of scope (C2/C3).
+_CORP_NER_TABLE = "extensions.detector.corp_ner"
+
+
+def _corp_ner_setting(
+    table: dict[str, object], env_name: str, table_key: str, default: str | None = None
+) -> str | None:
+    """Resolve one corp-NER value: env/scalar chain first, then the table.
+
+    ``config.get`` already covers env → flat config scalar; the nested table is
+    file-only (env carries scalars), so it sits underneath — a container can
+    always override a baked-in config file.
+    """
+    value = config.get(env_name)
+    if value:
+        return value
+    raw = table.get(table_key)
+    if raw is not None:
+        return str(raw)
+    return default
+
+
+def _corp_ner_int(table: dict[str, object], env_name: str, table_key: str, default: str) -> int:
+    raw = _corp_ner_setting(table, env_name, table_key, default) or default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError([f"{env_name}={raw!r} is not an integer"]) from exc
+
+
+def build_corp_ner(*, metrics: MetricsExporter) -> tuple[CorpNerDetector, CorpNerExtension] | None:
+    """Corp NER detector + its registry extension, or None when disabled.
+
+    Off by default (``CORP_NER_ENABLED=0``) so existing deploys are untouched.
+    When on, a missing endpoint is a boot-time refusal — `settings.validate()`
+    covers `config check` only, and the compose/demo boots skip it.
+
+    ``metrics`` is the LIVE exporter (not the detector's Noop default), or
+    ``gateway_failure{component="corp_ner"}`` would never fire in production.
+
+    TLS verification is never disabled here (unlike ``SSL_VERIFY`` for the
+    oracle): this call carries RAW user content. Point ``CORP_NER_CA_BUNDLE`` at
+    an internal CA instead. Construction performs no I/O.
+    """
+    table = config.get_table(_CORP_NER_TABLE)
+    if not parse_flag(_corp_ner_setting(table, "CORP_NER_ENABLED", "enabled", "0")):
+        return None
+    endpoint = _corp_ner_setting(table, "CORP_NER_ENDPOINT", "endpoint")
+    if not endpoint:
+        raise ConfigError(
+            [
+                "CORP_NER_ENDPOINT: required when CORP_NER_ENABLED=1 — set the env var, "
+                f"the config-file scalar, or endpoint under [{_CORP_NER_TABLE}]"
+            ]
+        )
+    timeout = _corp_ner_setting(table, "CORP_NER_TIMEOUT_S", "timeout_s", "30") or "30"
+    try:
+        timeout_s = float(timeout)
+    except ValueError as exc:
+        raise ConfigError([f"CORP_NER_TIMEOUT_S={timeout!r} is not a number"]) from exc
+    ca_bundle = _corp_ner_setting(table, "CORP_NER_CA_BUNDLE", "ca_bundle")
+    http = httpx.AsyncClient(timeout=timeout_s, verify=ca_bundle or True)
+    client = CorpNerClient(
+        endpoint,
+        http=http,
+        timeout=timeout_s,
+        max_texts=_corp_ner_int(table, "CORP_NER_MAX_TEXTS", "max_texts", "256"),
+        max_input_chars=_corp_ner_int(
+            table, "CORP_NER_MAX_INPUT_CHARS", "max_input_chars", "200000"
+        ),
+    )
+    # The extension shares the client so readiness and the request path can never
+    # disagree about how the service is reached.
+    return CorpNerDetector(client, metrics=metrics), CorpNerExtension(endpoint, http=http)
+
+
 def _deliver_teams() -> frozenset[str]:
     """Teams allowed the oversize deliver-flag (shared by core + profile inners)."""
     raw_teams = config.get("CORP_LLM_OVERSIZE_DELIVER_TEAMS", "") or ""
@@ -155,11 +235,23 @@ def _deliver_teams() -> frozenset[str]:
 
 
 def _build_orchestrator(
-    corp_llm: CorpLlmClient | None, mapping_store: MappingStore, *, oracle_enabled: bool
+    corp_llm: CorpLlmClient | None,
+    mapping_store: MappingStore,
+    *,
+    oracle_enabled: bool,
+    corp_ner: PIIDetector | None = None,
 ) -> SanitizationOrchestrator:
-    local_detectors: list[PIIDetector] | None = (
-        [RegexChecksumDetector(), DualNerDetector()] if _flag("CORP_LLM_LOCAL_FIRST") else None
-    )
+    local_detectors: list[PIIDetector] = []
+    # Only the deterministic regex/checksum pass runs on raw CODE segments. NER
+    # is prose-shaped and corp NER is a network call, so shipping a code block to
+    # it would both misfire and send source code out of the process.
+    code_safe_detectors: list[PIIDetector] = []
+    if _flag("CORP_LLM_LOCAL_FIRST"):
+        regex = RegexChecksumDetector()
+        local_detectors += [regex, DualNerDetector()]
+        code_safe_detectors.append(regex)
+    if corp_ner is not None:
+        local_detectors.append(corp_ner)
     gazetteer = Gazetteer.from_defaults() if _flag("CORP_LLM_GAZETTEER") else None
     rules_dir = config.get("CORP_LLM_RULES_DIR", _DEFAULT_RULES_DIR) or _DEFAULT_RULES_DIR
     return SanitizationOrchestrator(
@@ -168,7 +260,8 @@ def _build_orchestrator(
         _RulesLoader(rules_dir),
         oversize_policy=config.oversize_policy(),
         oversize_deliver_teams=_deliver_teams(),
-        local_detectors=local_detectors,
+        local_detectors=local_detectors or None,
+        code_safe_detectors=code_safe_detectors,
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),
         oracle_trigger=config.oracle_trigger(),
@@ -347,7 +440,17 @@ def build_guardrail(
         client = None
         _log.info("bootstrap oracle_enabled=false — local-first only")
     team_store = team_config_store if team_config_store is not None else build_team_config_store()
-    core = _build_orchestrator(client, store, oracle_enabled=oracle_enabled)
+    # One exporter instance for the hook AND the corp NER detector: get_exporter()
+    # builds a new one per call, and a second instance would emit to a registry
+    # nobody scrapes.
+    metrics = get_exporter()
+    corp_ner = build_corp_ner(metrics=metrics)
+    core = _build_orchestrator(
+        client,
+        store,
+        oracle_enabled=oracle_enabled,
+        corp_ner=corp_ner[0] if corp_ner is not None else None,
+    )
     orchestrator = _build_profile_wrapper(
         core,
         corp_llm=client,
@@ -357,6 +460,8 @@ def build_guardrail(
     )
     active_sink = sink if sink is not None else get_sink()
     register_sink(REGISTRY, active_sink, sink_name_for(active_sink))
+    if corp_ner is not None:
+        register_corp_ner(REGISTRY, corp_ner[1])
     REGISTRY.validate_api_version(EXTENSION_API_VERSION)
     audit_logger = AuditLogger(active_sink, gateway_version=gateway_version())
     return CorpLlmGuardrail(
@@ -368,7 +473,7 @@ def build_guardrail(
         forward_chatgpt_auth=resolved_forward_chatgpt_auth,
         forward_anthropic_auth=resolved_forward_anthropic_auth,
         dlp_guard=dlp_guard if dlp_guard is not None else _build_dlp_guard(),
-        metrics=get_exporter(),
+        metrics=metrics,
     )
 
 

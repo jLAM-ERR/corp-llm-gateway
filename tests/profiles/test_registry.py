@@ -32,10 +32,30 @@ def test_unknown_detector_raises_listing_known_set() -> None:
         assert known in message
 
 
-def test_registry_maps_every_known_name_to_a_detector() -> None:
+def test_registry_maps_every_known_name_to_a_detector(monkeypatch: pytest.MonkeyPatch) -> None:
+    # corp_ner is the one network-backed detector; it needs an endpoint to build.
+    monkeypatch.setenv("CORP_NER_ENDPOINT", "https://corp-ner.test")
     for name in DETECTOR_REGISTRY:
         (detector,) = build_detectors([name])
         assert isinstance(detector, PIIDetector)
+
+
+def test_corp_ner_is_registered_for_profile_bundles() -> None:
+    assert "corp_ner" in DETECTOR_REGISTRY
+
+
+def test_corp_ner_endpoint_comes_from_the_bundle_cfg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CORP_NER_ENDPOINT", raising=False)
+    (detector,) = build_detectors(["corp_ner"], {"corp_ner_endpoint": "https://from-cfg.test"})
+    assert detector._client._base_url == "https://from-cfg.test"
+
+
+def test_corp_ner_without_an_endpoint_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Never build a detector pointed nowhere: a connect error per request would
+    # read as an outage instead of the misconfiguration it is.
+    monkeypatch.delenv("CORP_NER_ENDPOINT", raising=False)
+    with pytest.raises(ValueError, match="CORP_NER_ENDPOINT"):
+        build_detectors(["corp_ner"])
 
 
 def test_registry_values_are_lazy_factories_not_instances() -> None:

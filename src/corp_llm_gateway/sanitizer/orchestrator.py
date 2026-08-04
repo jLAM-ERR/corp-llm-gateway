@@ -352,6 +352,7 @@ class SanitizationOrchestrator:
         chunk_window_chars: int = _DEFAULT_CHUNK_WINDOW_CHARS,
         chunk_overlap_chars: int = _DEFAULT_CHUNK_OVERLAP_CHARS,
         local_detectors: list[PIIDetector] | None = None,
+        code_safe_detectors: list[PIIDetector] | None = None,
         gazetteer: Gazetteer | None = None,
         allowlist: Allowlist | None = None,
         oracle_trigger: str = ORACLE_TRIGGER_GAZETTEER_HIT,
@@ -374,7 +375,16 @@ class SanitizationOrchestrator:
         self._oversize_deliver_teams = oversize_deliver_teams
         self._chunk_window = chunk_window_chars
         self._chunk_overlap = chunk_overlap_chars
-        self._local = LocalDetectionPass(local_detectors) if local_detectors else None
+        # code_safe_detectors is the subset allowed on raw CODE segments (regex /
+        # checksum). Left None it defaults to every detector, which is what every
+        # pre-B4 caller got; the composition root now passes the restricted list so
+        # NER-class detectors — corp NER above all, which would ship source code to
+        # an external service — never see a CODE segment.
+        self._local = (
+            LocalDetectionPass(local_detectors, code_safe_detectors=code_safe_detectors)
+            if local_detectors
+            else None
+        )
         # NER-only pass for chunk mode: regex/checksum is pulled out and run over
         # the FULL text (H1), so the chunked pass carries only the size-bounded
         # detectors. None when no non-regex detector is configured.
@@ -383,7 +393,16 @@ class SanitizationOrchestrator:
             if local_detectors
             else []
         )
-        self._chunk_local = LocalDetectionPass(chunk_detectors) if chunk_detectors else None
+        chunk_code_safe = (
+            [d for d in code_safe_detectors if not isinstance(d, RegexChecksumDetector)]
+            if code_safe_detectors is not None
+            else None
+        )
+        self._chunk_local = (
+            LocalDetectionPass(chunk_detectors, code_safe_detectors=chunk_code_safe)
+            if chunk_detectors
+            else None
+        )
         self._gazetteer = gazetteer
         self._allowlist = allowlist
         # F3: how widely the conditional oracle fires on a no-gazetteer-hit leaf.

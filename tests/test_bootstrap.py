@@ -4,12 +4,14 @@ import ast
 import importlib
 import logging
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from corp_llm_gateway import bootstrap, config, settings
 from corp_llm_gateway.audit import StdoutSink
+from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
@@ -816,3 +818,175 @@ def test_importing_demo_guardrail_with_pg_dsn_and_no_asyncpg_does_not_raise(
     module = importlib.import_module("corp_llm_gateway._demo_guardrail")
 
     assert isinstance(module.guardrail, CorpLlmGuardrail)
+
+
+# ── B4: corp NER wiring (default off) ────────────────────────────────────────
+
+
+@pytest.fixture
+def _isolate_registry() -> Iterator[None]:
+    """Snapshot/restore the module-level REGISTRY so a corp-NER registration
+    from build_guardrail never leaks into another test's health_all()."""
+    specs = dict(REGISTRY._specs)
+    factories = dict(REGISTRY._factories)
+    try:
+        yield
+    finally:
+        REGISTRY._specs.clear()
+        REGISTRY._specs.update(specs)
+        REGISTRY._factories.clear()
+        REGISTRY._factories.update(factories)
+
+
+def _enable_corp_ner(monkeypatch: pytest.MonkeyPatch, **extra: str) -> None:
+    monkeypatch.setenv("CORP_NER_ENABLED", "1")
+    monkeypatch.setenv("CORP_NER_ENDPOINT", "https://corp-ner.test")
+    for name, value in extra.items():
+        monkeypatch.setenv(name, value)
+
+
+def _local_pass(guardrail: CorpLlmGuardrail) -> object:
+    return guardrail._orch._core._local
+
+
+def test_corp_ner_disabled_by_default_changes_nothing() -> None:
+    guardrail = bootstrap.build_guardrail()
+
+    detectors = _local_pass(guardrail)._detectors
+    assert [type(d).__name__ for d in detectors] == [
+        "RegexChecksumDetector",
+        "DualNerDetector",
+    ]
+    assert ("detector", "corp_ner") not in REGISTRY._factories
+
+
+def test_ner_detectors_never_run_on_code_segments() -> None:
+    # code_safe_detectors was a dead parameter: every detector ran on CODE
+    # segments. Only the deterministic regex/checksum pass belongs there.
+    guardrail = bootstrap.build_guardrail()
+
+    code_detectors = _local_pass(guardrail)._code_detectors
+    assert [type(d).__name__ for d in code_detectors] == ["RegexChecksumDetector"]
+    # Chunk mode pulls regex out and runs it over the full text, so its CODE list
+    # is empty — NOT the default-to-everything fallback.
+    assert guardrail._orch._core._chunk_local._code_detectors == []
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_enabled_appends_detector_off_the_code_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_corp_ner(monkeypatch)
+
+    guardrail = bootstrap.build_guardrail()
+
+    names = [type(d).__name__ for d in _local_pass(guardrail)._detectors]
+    assert names == ["RegexChecksumDetector", "DualNerDetector", "CorpNerDetector"]
+    # Corp NER must never see CODE segments: its regex half fires on code tokens
+    # and it would ship source code to an external service.
+    assert [type(d).__name__ for d in _local_pass(guardrail)._code_detectors] == [
+        "RegexChecksumDetector"
+    ]
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_detector_gets_the_live_metrics_exporter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without this, gateway_failure{component="corp_ner"} never fires in prod:
+    # CorpNerDetector defaults to a Noop exporter of its own.
+    _enable_corp_ner(monkeypatch)
+
+    guardrail = bootstrap.build_guardrail()
+
+    corp_ner = _local_pass(guardrail)._detectors[-1]
+    assert corp_ner._metrics is guardrail._metrics
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_registers_a_detector_extension(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_corp_ner(monkeypatch)
+
+    guardrail = bootstrap.build_guardrail()
+
+    ext = REGISTRY.get("detector", "corp_ner")
+    assert ext.spec.kind == "detector"
+    assert ext.spec.fail_policy == "fail-closed"
+    REGISTRY.validate_api_version(EXTENSION_API_VERSION)
+    # One HTTP client for the request path and the readiness poll.
+    assert ext._http is _local_pass(guardrail)._detectors[-1]._client._http
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_client_reads_its_limits_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_corp_ner(
+        monkeypatch,
+        CORP_NER_TIMEOUT_S="7",
+        CORP_NER_MAX_TEXTS="11",
+        CORP_NER_MAX_INPUT_CHARS="1234",
+    )
+
+    guardrail = bootstrap.build_guardrail()
+
+    client = _local_pass(guardrail)._detectors[-1]._client
+    assert client._base_url == "https://corp-ner.test"
+    assert client._timeout == 7.0
+    assert client._max_texts == 11
+    assert client._max_input_chars == 1234
+
+
+def test_corp_ner_enabled_without_endpoint_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_NER_ENABLED", "1")
+
+    with pytest.raises(ConfigError, match="CORP_NER_ENDPOINT"):
+        bootstrap.build_guardrail()
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_reads_the_extensions_detector_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "with-corp-ner.toml"
+    cfg.write_text(
+        "[extensions.detector.corp_ner]\n"
+        "enabled = true\n"
+        'endpoint = "https://from-table.test"\n'
+        "max_texts = 9\n"
+    )
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    config.reset_cache()
+
+    guardrail = bootstrap.build_guardrail()
+
+    client = _local_pass(guardrail)._detectors[-1]._client
+    assert client._base_url == "https://from-table.test"
+    assert client._max_texts == 9
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_env_wins_over_the_extensions_detector_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "with-corp-ner.toml"
+    cfg.write_text(
+        '[extensions.detector.corp_ner]\nenabled = true\nendpoint = "https://from-table.test"\n'
+    )
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    monkeypatch.setenv("CORP_NER_ENDPOINT", "https://from-env.test")
+    config.reset_cache()
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert _local_pass(guardrail)._detectors[-1]._client._base_url == "https://from-env.test"
+
+
+def test_table_disabled_corp_ner_stays_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "corp-ner-off.toml"
+    cfg.write_text('[extensions.detector.corp_ner]\nenabled = false\nendpoint = "https://x.test"\n')
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    config.reset_cache()
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert len(_local_pass(guardrail)._detectors) == 2
+    assert ("detector", "corp_ner") not in REGISTRY._factories
