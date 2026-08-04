@@ -3,11 +3,12 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 #
-# The default GATEWAY_IMAGE_TAG (1.0.0-rc.5, see .env.example) predates this
-# branch: it was built from 30e41da, before CORP_LLM_STRIP_INBOUND_HEADERS
-# existed in settings.KEYS/build_guardrail() — so the header-stripping
-# mitigation documented in compose/README.md "Why not BYOK" is silently
-# absent on that tag. It also predates Workstream B's corp NER integration.
+# The default GATEWAY_IMAGE_TAG (1.0.0-rc.6, see .env.example) predates this
+# branch: rc.6 is 1f170ea, an ancestor of it. So Workstream B's corp NER
+# integration, the BANK_CARD Luhn rule and the Cache-A coverage-boundary
+# fixes are all absent from that tag, and rc.5 additionally predated
+# CORP_LLM_STRIP_INBOUND_HEADERS (the header-stripping mitigation documented
+# in compose/README.md "Why not BYOK").
 #
 # This is a dev/staging convenience for running the current branch, NOT a
 # substitute for cutting a release: `GATEWAY_IMAGE_TAG` in `.env` must be

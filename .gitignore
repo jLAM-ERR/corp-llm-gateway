@@ -56,3 +56,7 @@ scripts/bench_local_first.py
 .venv-bench/
 .venv-dp/
 .claude/prompts/
+
+# Corp NER connection doc — holds the internal endpoint/credentials. Never commit.
+connect-corp-ner.pdf
+*-corp-ner.pdf
