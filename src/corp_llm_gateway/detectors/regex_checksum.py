@@ -239,11 +239,19 @@ _CARD_GROUP16_PAT = re.compile(r"\b(\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4})\b")
 # \b blocks every shorter span. _card_candidates below scans inside such runs.
 _DIGIT_RUN_PAT = re.compile(r"\d(?:[ -]?\d)*")
 
-# Stray digits allowed between a candidate PAN and the middle of its run. A side
-# that reaches the run boundary is unbounded; this only caps how deep a PAN may
-# be buried with junk on BOTH sides, which keeps the candidate count (and the
-# false-positive rate) flat instead of growing with run length.
-_CARD_STRAY_MARGIN = 6
+# Stray digits allowed between a candidate PAN and the middle of its run, when the
+# PAN touches neither end of the run. At 0 a candidate must reach at least one run
+# boundary, so every accidental-paste shape still matches: a bare PAN, a PAN with a
+# CVV/amount glued to either end, a grouped PAN with a glued tail, and a PAN glued
+# to letters. What it gives up is a PAN buried between stray digits on BOTH sides.
+#
+# Raising the margin does NOT close the padded-PAN bypass — a PAN with 7 junk digits
+# in front escapes at 6 and at 0 alike — it only multiplies the candidate count, and
+# with it the false-positive rate on ordinary long digit runs (a 19-digit nanosecond
+# timestamp goes from 18.5% to 28.9%). Depth is bought with false positives and buys
+# no coverage against a deliberate padder, so the depth is not bought. Details and
+# threat model: docs/security.md, gap (g).
+_CARD_STRAY_MARGIN = 0
 
 # IPv4 — strict-octet validated below
 _IPV4_PAT = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
