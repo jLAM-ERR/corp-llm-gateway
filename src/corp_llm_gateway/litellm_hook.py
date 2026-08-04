@@ -1534,6 +1534,49 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
     return selected
 
 
+# Mirrors litellm's ANTHROPIC_OAUTH_TOKEN_PREFIX (litellm/types/llms/anthropic.py).
+# Copied rather than imported so this module stays importable without litellm;
+# tests/litellm_hook/test_anthropic_upstream_headers.py pins the two values together.
+_ANTHROPIC_OAUTH_TOKEN_PREFIX = "sk-ant-oat"
+
+_ANTHROPIC_HEADER_ALLOWLIST = frozenset(
+    {
+        "authorization",
+        "anthropic-beta",
+        "anthropic-version",
+        "user-agent",
+    }
+)
+
+
+def _anthropic_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
+    """Select Anthropic subscription headers without forwarding corp credentials.
+
+    OAuth tokens only. litellm picks its OAuth branch by prefix
+    (llms/anthropic/common_utils.py); any other value falls through to the
+    ``x-api-key`` branch while the inbound Authorization is still merged in,
+    which would put two competing auth schemes on one upstream request.
+    """
+    selected: dict[str, str] = {}
+    authorization: str | None = None
+    for name, value in inbound.items():
+        lower = name.lower()
+        if lower == _CORP_AUTH_HEADER_LOWER:
+            continue
+        if lower in _ANTHROPIC_HEADER_ALLOWLIST:
+            selected[name] = value
+        if lower == "authorization":
+            authorization = value
+    if authorization is None or not authorization.lower().startswith("bearer "):
+        raise ValueError("missing bearer authorization")
+    bearer = authorization[7:].strip()
+    if not bearer or "\n" in authorization or "\r" in authorization:
+        raise ValueError("invalid bearer authorization")
+    if not bearer.startswith(_ANTHROPIC_OAUTH_TOKEN_PREFIX):
+        raise ValueError("authorization is not an anthropic oauth token")
+    return selected
+
+
 # litellm.types.utils.CallTypes values whose `input` field means raw
 # text/tokens to embed or score, NOT a Responses items list. This is a
 # DENYLIST, not an allowlist: `data["input"]` is treated as Responses-shaped
