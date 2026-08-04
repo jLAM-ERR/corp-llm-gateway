@@ -138,6 +138,60 @@ async def test_bridge_scrubs_metadata_and_top_level_user() -> None:
     assert out["litellm_metadata"]["_corp_gateway_request_id"]
 
 
+class _FakeLoggingObj:
+    """Stand-in for litellm's logging object, which is built before this hook
+    runs and keeps its own copy of the request in ``model_call_details``."""
+
+    def __init__(self) -> None:
+        self.model_call_details: dict[str, Any] = {
+            "user": "alice@corp.example",
+            "litellm_params": {
+                "metadata": {"user_id": "alice@corp.example"},
+                "user": "alice@corp.example",
+                "api_base": "https://api.anthropic.com",
+            },
+        }
+
+
+async def test_bridge_scrubs_metadata_retained_by_the_litellm_logging_object() -> None:
+    g, _, _ = _guardrail()
+    data = _request()
+    data["metadata"] = {"user_id": "alice@corp.example"}
+    data["user"] = "alice@corp.example"
+    logging_obj = _FakeLoggingObj()
+    data["litellm_logging_obj"] = logging_obj
+
+    await g.pre_call(data)
+
+    details = logging_obj.model_call_details
+    assert "metadata" not in details["litellm_params"]
+    assert "user" not in details["litellm_params"]
+    assert "user" not in details
+    # Unrelated litellm params survive the scrub.
+    assert details["litellm_params"]["api_base"] == "https://api.anthropic.com"
+
+
+@pytest.mark.parametrize(
+    "logging_obj",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(object(), id="no_model_call_details"),
+        pytest.param(
+            type("_Stub", (), {"model_call_details": "not-a-dict"})(), id="details_not_a_dict"
+        ),
+    ],
+)
+async def test_logging_object_scrub_never_raises_out_of_the_hook(logging_obj: Any) -> None:
+    g, _, _ = _guardrail()
+    data = _request()
+    if logging_obj is not None:
+        data["litellm_logging_obj"] = logging_obj
+
+    out = await g.pre_call(data)
+
+    assert out["api_key"] == _OAUTH_TOKEN
+
+
 @pytest.mark.parametrize(
     "authorization",
     [
@@ -163,6 +217,12 @@ async def test_malformed_bearer_is_rejected_with_audit_and_metric(authorization:
     rec = sink.records[0]
     assert rec["status"] == "failed"
     assert rec["error_code"] == "E_PROVIDER_AUTH"
+    # Corp auth already succeeded, so the rejection is attributable to the
+    # developer and the team — not audited as "unknown".
+    assert rec["user_id"] == "alice"
+    assert rec["team_id"] == "t1"
+    assert rec["provider"] == "anthropic"
+    assert rec["model"] == _ANTHROPIC_MODEL
     assert "api_key" not in data
 
 
