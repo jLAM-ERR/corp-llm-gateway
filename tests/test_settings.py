@@ -53,6 +53,7 @@ def test_all_keys_contains_core_and_new_knobs() -> None:
         "CORP_LLM_TESTDATA_ALLOWLIST",
         "CORP_LLM_TESTDATA_ALLOWLIST_FILE",
         "CORP_LLM_ORACLE_ENABLED",
+        "CORP_LLM_FORWARD_ANTHROPIC_AUTH",
     } <= keys
 
 
@@ -140,6 +141,65 @@ def test_validate_lenient_falsy_forms_disable_oracle(
     monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", falsy)
     result = config.validate()
     assert result.flag("CORP_LLM_ORACLE_ENABLED") is False
+
+
+# ── validate(): forward-auth bridges are mutually exclusive ──────────────────
+
+
+def test_forward_anthropic_auth_defaults_off(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    result = config.validate()
+    assert result.flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH") is False
+    assert result.flag("CORP_LLM_FORWARD_CHATGPT_AUTH") is False
+
+
+@pytest.mark.parametrize(
+    "chatgpt,anthropic",
+    [("1", "0"), ("0", "1"), ("0", "0"), ("1", ""), ("", "on")],
+)
+def test_validate_ok_unless_both_forward_auth_flags_are_on(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, chatgpt: str, anthropic: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", chatgpt)
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", anthropic)
+    assert isinstance(config.validate(), Settings)
+
+
+def test_validate_rejects_both_forward_auth_flags_with_the_shared_message(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+    assert settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE in exc.value.problems
+    # the message must say WHY it is a v1 limitation, not just that it is one.
+    assert "v2" in settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE
+
+
+@pytest.mark.parametrize("truthy", ["true", "yes", "on", "ON"])
+def test_validate_rejects_lenient_truthy_spellings_of_both_flags(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    # regression: a raw `== "1"` comparison would let these two bridges both boot.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", truthy)
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", truthy)
+    with pytest.raises(ConfigError, match="mutually"):
+        config.validate()
+
+
+def test_forward_auth_conflict_is_the_single_shared_rule() -> None:
+    assert settings.forward_auth_conflict(chatgpt=True, anthropic=True) == (
+        settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE
+    )
+    assert settings.forward_auth_conflict(chatgpt=True, anthropic=False) is None
+    assert settings.forward_auth_conflict(chatgpt=False, anthropic=True) is None
+    assert settings.forward_auth_conflict(chatgpt=False, anthropic=False) is None
 
 
 # ── validate(): malformed choices ────────────────────────────────────────────

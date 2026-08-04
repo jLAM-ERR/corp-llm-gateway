@@ -50,7 +50,12 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     ProfileAwareOrchestrator,
     build_inner_orchestrator,
 )
-from corp_llm_gateway.settings import NO_OP_SANITIZER_MESSAGE, ConfigError, parse_flag
+from corp_llm_gateway.settings import (
+    NO_OP_SANITIZER_MESSAGE,
+    ConfigError,
+    forward_auth_conflict,
+    parse_flag,
+)
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import (
     InMemoryTeamConfigStore,
@@ -227,6 +232,7 @@ def build_guardrail(
     max_output_tokens_cap: int | None = None,
     strip_inbound_headers_to_upstream: bool = False,
     forward_chatgpt_auth: bool | None = None,
+    forward_anthropic_auth: bool | None = None,
 ) -> CorpLlmGuardrail:
     """Assemble a `CorpLlmGuardrail` from config, with optional dep overrides.
 
@@ -275,15 +281,28 @@ def build_guardrail(
     REGISTRY.validate_api_version(EXTENSION_API_VERSION)
     audit_logger = AuditLogger(active_sink, gateway_version=gateway_version())
     # Unlike strip_inbound_headers_to_upstream / max_output_tokens_cap (call-site
-    # policy toggles with no corresponding env var), this one is documented as an
-    # operator-settable cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH) — a plain
-    # `bool = False` default would silently override the env var in every real
-    # deploy, so only resolve from config when the caller left it unset.
+    # policy toggles with no corresponding env var), these two are documented as
+    # operator-settable cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH /
+    # CORP_LLM_FORWARD_ANTHROPIC_AUTH) — a plain `bool = False` default would
+    # silently override the env var in every real deploy, so only resolve from
+    # config when the caller left the kwarg unset.
     resolved_forward_chatgpt_auth = (
         forward_chatgpt_auth
         if forward_chatgpt_auth is not None
         else _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
     )
+    resolved_forward_anthropic_auth = (
+        forward_anthropic_auth
+        if forward_anthropic_auth is not None
+        else _flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0")
+    )
+    # Same reason as the no-op-sanitizer floor above: settings.validate() covers
+    # `config check` only, and the compose/demo boots this bridge ships on skip it.
+    conflict = forward_auth_conflict(
+        chatgpt=resolved_forward_chatgpt_auth, anthropic=resolved_forward_anthropic_auth
+    )
+    if conflict is not None:
+        raise ConfigError([conflict])
     return CorpLlmGuardrail(
         orchestrator,
         auth,
@@ -291,6 +310,7 @@ def build_guardrail(
         max_output_tokens_cap=max_output_tokens_cap,
         strip_inbound_headers_to_upstream=strip_inbound_headers_to_upstream,
         forward_chatgpt_auth=resolved_forward_chatgpt_auth,
+        forward_anthropic_auth=resolved_forward_anthropic_auth,
         dlp_guard=dlp_guard if dlp_guard is not None else _build_dlp_guard(),
         metrics=get_exporter(),
     )

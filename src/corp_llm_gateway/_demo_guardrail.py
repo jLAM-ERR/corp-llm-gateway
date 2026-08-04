@@ -92,6 +92,7 @@ def _build_demo_guardrail() -> CorpLlmGuardrail:
         # settings.parse_flag is the single flag parser (true/yes/on/1, case-insensitive);
         # a raw `== "1"` here would silently reject those spellings.
         forward_chatgpt_auth=_flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0"),
+        forward_anthropic_auth=_flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0"),
     )
 
 

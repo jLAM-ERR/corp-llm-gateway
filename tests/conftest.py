@@ -32,6 +32,7 @@ MANAGED_ENV: tuple[str, ...] = (
     "CORP_LANGFUSE_SECRET_KEY",
     "DEMO_TEAM_TOKEN",
     "CORP_LLM_DEV_TEAM_TOKEN",
+    "CORP_LLM_FORWARD_ANTHROPIC_AUTH",
     "CORP_ENV",
     "CORP_LLM_GATEWAY_CONFIG_FILE",
     # decoy aliases (must be ignored):
