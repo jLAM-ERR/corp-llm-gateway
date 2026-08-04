@@ -1,11 +1,11 @@
-# Production compose stack for non-k8s hosts — data plane (this revision).
-# See compose/README.md. Self-hosted Langfuse (A2), the production Vector
+# Production compose stack for non-k8s hosts — data plane + self-hosted
+# Langfuse (this revision). See compose/README.md. The production Vector
 # config (A3) and the optional nginx front door land in later revisions of
-# this file, each gated behind its own `profiles: ["<name>"]` on the service
-# it adds (`nginx/` -> `--profile nginx`, `vector/` wires into the always-on
-# audit path, `langfuse/` -> reachable only via nginx/SSH tunnel — see those
-# directories). The offline corp-NER mock (workstream B) will register a
-# service carrying `profiles: ["mock"]`.
+# this file (`nginx/` -> `--profile nginx`, `vector/` wires into the
+# always-on audit path — see those directories). The offline corp-NER mock
+# (workstream B) will register a service carrying `profiles: ["mock"]`.
+# Langfuse publishes NO host port: it is reachable only through the nginx
+# profile or an SSH tunnel (compose/README.md "Langfuse").
 #
 # Distinct from docker-compose.demo.yml's default project name
 # (`corp-llm-gateway`, derived from the repo directory basename): reusing it
@@ -201,6 +201,257 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # ---- Self-hosted Langfuse v3 ---------------------------------------------
+  # Ported from docker-compose.demo.yml:124-271 and hardened three ways:
+  # every secret comes from .env (the demo's NEXTAUTH_SECRET / SALT /
+  # ENCRYPTION_KEY / minioadmin are literal "change-in-production"
+  # placeholders), named volumes for all four stateful services, and NO
+  # published ports anywhere — Langfuse holds request-level traces and the
+  # audit trail, so it is reachable only through the nginx profile (C1) or an
+  # SSH tunnel. Each service lists only the keys it needs; there is no
+  # `env_file:` here for the same reason as on the litellm service above.
+
+  langfuse-redis:
+    image: redis:8-alpine
+    # Deliberately NOT the `redis` service above (which the demo shares for
+    # both jobs). That instance is Cache B — CLAUDE.md calls it *required*
+    # for post_call desanitization — and redis/redis.conf caps it at
+    # maxmemory 512mb with noeviction. A Langfuse ingestion backlog on the
+    # same instance would eat that budget and make Cache B writes fail with
+    # OOM, i.e. an observability backlog would break live desanitization.
+    # Langfuse needs noeviction too: its queue holds not-yet-persisted
+    # events, which nothing can reconstruct.
+    command:
+      - redis-server
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    volumes:
+      - langfuse-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  langfuse-postgres:
+    image: postgres:17-alpine
+    # Separate from the gateway `postgres`: Langfuse owns its schema and runs
+    # its own migrations at every upgrade, and it must not share a failure
+    # domain with the token/team-config store the request path reads.
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_POSTGRES_PASSWORD:?set LANGFUSE_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 for the same reason as the gateway postgres above: bare
+      # pg_isready hits the unix socket that the entrypoint's temporary init
+      # server also listens on, so it goes green mid-initdb and langfuse-web
+      # starts its migrations against a database that is about to be
+      # restarted under it.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse:26.3-jammy
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:?set LANGFUSE_CLICKHOUSE_PASSWORD in .env}
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+      - langfuse-clickhouse-logs:/var/log/clickhouse-server
+      # query_log/text_log would keep raw INSERT text — a second, unwatched
+      # copy of trace content. See langfuse/clickhouse-config.xml.
+      - ./langfuse/clickhouse-config.xml:/etc/clickhouse-server/config.d/corp-hardening.xml:ro
+    ulimits:
+      # ClickHouse refuses to start well under the docker default (1024).
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      # Reads the password from the container's own environment ($$ escapes
+      # compose interpolation) instead of repeating it here — a literal would
+      # put the secret in `docker compose config` output and `docker inspect`
+      # a second time. Credentialed on purpose: /ping answers before the
+      # langfuse user is usable.
+      test: ["CMD-SHELL", "clickhouse-client --user=$$CLICKHOUSE_USER --password=$$CLICKHOUSE_PASSWORD --query='SELECT 1'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-langfuse}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      # The demo publishes the console on 9001. Nothing in this stack uses
+      # it (minio-init creates the only bucket), and it is one more
+      # credentialed surface in front of raw event payloads.
+      MINIO_BROWSER: "off"
+    command: ["server", "/data"]
+    volumes:
+      - langfuse-minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot: create the event-upload bucket. Langfuse v3 does NOT create it
+  # itself — without this job both langfuse-web and langfuse-worker come up
+  # and then fail every ingestion write.
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-langfuse}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_BUCKET=${LANGFUSE_S3_BUCKET:-langfuse}
+    entrypoint: ["sh", "-c"]
+    # set -e: a failed `mc mb` must fail the job, otherwise
+    # `condition: service_completed_successfully` lets Langfuse start against
+    # a missing bucket. $$ keeps the shell's variables away from compose's
+    # own interpolation.
+    command:
+      - |-
+        set -e
+        mc alias set langfuse http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing "langfuse/$$LANGFUSE_S3_BUCKET"
+    restart: "no"
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    # List form (not a mapping) so the LANGFUSE_INIT_* bare names below are
+    # PASSED THROUGH: unset in .env means absent from the container, not set
+    # to an empty string — an empty LANGFUSE_INIT_ORG_ID would make headless
+    # init run with a blank id.
+    environment:
+      - DATABASE_URL=postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/langfuse
+      # Must match the origin the browser actually uses, or NextAuth's
+      # sign-in redirect loops: the nginx host (C1) or the local end of your
+      # SSH tunnel. See compose/README.md "Langfuse".
+      - NEXTAUTH_URL=${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
+      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET:?set LANGFUSE_NEXTAUTH_SECRET in .env}
+      - SALT=${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY:?set LANGFUSE_ENCRYPTION_KEY in .env}
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+      - CLICKHOUSE_USER=langfuse
+      - CLICKHOUSE_PASSWORD=${LANGFUSE_CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_HOST=langfuse-redis
+      - REDIS_PORT=6379
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=${LANGFUSE_S3_BUCKET:-langfuse}
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=us-east-1
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=${MINIO_ROOT_USER:-langfuse}
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      # No phone-home from a stack whose traces are corp request metadata.
+      - TELEMETRY_ENABLED=false
+      # Anyone who can reach the UI could otherwise self-register an account
+      # on a fresh instance. Provision the first user with the
+      # LANGFUSE_INIT_* keys below instead of relaxing this.
+      - AUTH_DISABLE_SIGNUP=${LANGFUSE_DISABLE_SIGNUP:-true}
+      # Headless init (optional, applied only when a matching org/project
+      # does not exist). Set these in .env to provision the org, project,
+      # first user and the ingestion API keys the Vector sink (A3) will use.
+      # Per the langfuse docs: do NOT quote LANGFUSE_INIT_* values.
+      - LANGFUSE_INIT_ORG_ID
+      - LANGFUSE_INIT_ORG_NAME
+      - LANGFUSE_INIT_PROJECT_ID
+      - LANGFUSE_INIT_PROJECT_NAME
+      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY
+      - LANGFUSE_INIT_PROJECT_SECRET_KEY
+      - LANGFUSE_INIT_USER_EMAIL
+      - LANGFUSE_INIT_USER_NAME
+      - LANGFUSE_INIT_USER_PASSWORD
+    healthcheck:
+      # langfuse-web binds to eth0, not 127.0.0.1, and the image has no curl.
+      # $$(hostname) — $$ so compose passes the command substitution through
+      # to the shell instead of trying to interpolate it.
+      test: ["CMD-SHELL", "wget -q --spider http://$$(hostname):3000/api/public/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      # Postgres + ClickHouse migrations run at boot on a fresh volume and on
+      # every version bump.
+      start_period: 120s
+    restart: unless-stopped
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    # No NEXTAUTH_* here — the worker serves no UI. SALT/ENCRYPTION_KEY are
+    # needed because it reads the same encrypted rows langfuse-web writes.
+    environment:
+      - DATABASE_URL=postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/langfuse
+      - SALT=${LANGFUSE_SALT}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY}
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+      - CLICKHOUSE_USER=langfuse
+      - CLICKHOUSE_PASSWORD=${LANGFUSE_CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_HOST=langfuse-redis
+      - REDIS_PORT=6379
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=${LANGFUSE_S3_BUCKET:-langfuse}
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=us-east-1
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=${MINIO_ROOT_USER:-langfuse}
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      - TELEMETRY_ENABLED=false
+    healthcheck:
+      # Worker binds eth0:3030 and serves /api/health; no curl in the image.
+      test: ["CMD-SHELL", "wget -q --spider http://$$(hostname):3030/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
 volumes:
   gateway-redis-data:
   gateway-postgres-data:
+  langfuse-redis-data:
+  langfuse-postgres-data:
+  langfuse-clickhouse-data:
+  langfuse-clickhouse-logs:
+  langfuse-minio-data:

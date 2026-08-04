@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!--
+  Mounted at /etc/clickhouse-server/config.d/corp-hardening.xml (see
+  compose/docker-compose.yml). config.d overlays the image's shipped
+  config.xml; remove="1" deletes the inherited section rather than merging
+  into it.
+
+  Langfuse writes trace bodies to ClickHouse as INSERT statements. Every
+  system table below stores raw query text or log messages containing it, on
+  its OWN retention (default 30 days, unrelated to the audit retention
+  generator), in a store the NEVER-fields gate never sees. That is a second
+  copy of request content nobody is watching — CLAUDE.md invariant #1
+  (no originals leak). Drop the tables instead of shortening their TTL.
+
+  Kept on purpose: metric_log / asynchronous_metric_log / part_log carry
+  no query text and are what an operator needs to size the deployment.
+-->
+<clickhouse>
+    <query_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <text_log remove="1"/>
+
+    <!-- 'information' is the image default and does not print statements;
+         'debug'/'trace' do. Pin it so a future image default cannot start
+         echoing INSERT bodies into the container log, which Vector reads. -->
+    <logger>
+        <level>warning</level>
+    </logger>
+</clickhouse>
