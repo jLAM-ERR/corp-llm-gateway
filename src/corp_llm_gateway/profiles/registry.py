@@ -57,6 +57,16 @@ DETECTOR_REGISTRY: dict[str, DetectorFactory] = {
     "corp_ner": _make_corp_ner,
 }
 
+# Which declared detectors may run on raw CODE segments. The line is
+# NETWORK-backed vs LOCAL, not NER vs regex: local NER is the only thing catching
+# PERSON / ORG / LOCATION inside fenced JSON, SQL values and config examples —
+# regex_checksum and the Stage-5 DLP guard do not cover those entity classes, so
+# dropping it off CODE would be a detection regression. corp_ner is excluded on
+# two counts: its regex half fires on code tokens, and it would ship the
+# developer's source code to an external service.
+CODE_SAFE_DETECTORS: frozenset[str] = frozenset({"regex_checksum", "dual_ner", "ner_ru", "ner_en"})
+NETWORK_DETECTORS: frozenset[str] = frozenset({"corp_ner"})
+
 
 def build_detectors(
     names: Sequence[str], cfg: Mapping[str, Any] | None = None
