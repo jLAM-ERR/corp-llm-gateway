@@ -13,6 +13,11 @@ permissions:
 jobs:
   dco:
     runs-on: ubuntu-latest
+    # Job-level scope as well as the workflow-level one above: CodeQL's
+    # actions/missing-workflow-permissions wants the least-privilege grant
+    # declared on the job that actually runs, not only inherited.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
