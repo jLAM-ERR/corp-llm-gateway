@@ -59,6 +59,35 @@ class DualNerDetector(PIIDetector):
         self._disabled: set[int] = set()
         self._require_ner = config.require_ner() if require_ner is None else require_ner
 
+    def policy_signature(self) -> tuple[str, ...]:
+        """Effective engine capability, for the Cache-A policy fingerprint.
+
+        The class name says nothing about coverage: with ``require_ner`` off (the
+        default) an engine whose models are absent is disabled and detect()
+        returns whatever is left, so a model-less pod finds nothing and seeds an
+        EMPTY Cache-A mapping. A model-backed pod on the same Redis would replay
+        it and a PERSON/ORG only NER catches would egress unredacted.
+
+        Derived from each engine's own signature, NEVER from ``self._disabled``:
+        that set is mutated at REQUEST time, so a signature reading it would
+        change meaning after the key was written. Each engine's hook forces its
+        lazy model to resolve, which latches the answer for the process lifetime.
+
+        ``require_ner`` is deliberately NOT folded in: it changes what happens
+        when an engine is missing (raise instead of return), not what an intact
+        pod redacts, and two intact pods must still share the cache.
+        """
+        parts: list[str] = []
+        for engine in self._engines:
+            cls = type(engine)
+            ident = f"{cls.__module__}.{cls.__qualname__}"
+            probe = getattr(engine, "policy_signature", None)
+            if probe is None:
+                parts.append(ident)
+                continue
+            parts.extend(f"{ident}\x1f{sig}" for sig in probe())
+        return tuple(sorted(parts))
+
     async def detect(self, text: str) -> list[Finding]:
         raw: list[Finding] = []
         for idx, engine in enumerate(self._engines):

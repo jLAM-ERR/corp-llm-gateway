@@ -82,7 +82,11 @@ _CACHE_A_ALGORITHM_VERSION = b"coverage-v2"
 #   policy-v2  the gazetteer's LEMMATIZER identity joined the input set: equal
 #              term signatures still match different text when one process has
 #              the `ner` extra and another does not.
-_POLICY_FINGERPRINT_VERSION = b"policy-v2"
+#   policy-v3  detectors may now report a `policy_signature()` beyond their class
+#              (see PolicySignatureDetector); dual_ner reports its effective ENGINE
+#              capability, so a model-less pod and a model-backed one stop sharing
+#              a key. Same hole as policy-v2, on the primary NER path.
+_POLICY_FINGERPRINT_VERSION = b"policy-v3"
 
 # Chunk overlap sizing (F1 chunk policy). Regex/checksum patterns are LINEAR and
 # now run over the FULL text (see `_sanitize_chunked`), so the overlap no longer
@@ -1110,9 +1114,25 @@ def _detector_identity(detector: object) -> str:
     are process-local (PYTHONHASHSEED, memory address), so pods sharing one Redis
     would derive different keys and fragment — or worse, silently agree by
     accident on one pod pair and not another.
+
+    The class alone can be a lie about coverage: two DualNerDetector instances
+    hash identically whether or not their NER models loaded. A detector that
+    implements ``PolicySignatureDetector`` therefore contributes its own strings
+    on top of the class name; the probe lives on the detector, so the policy that
+    only it knows never has to be reconstructed from another module's globals.
+    Sorted here, so construction order inside a detector cannot fork the key.
     """
     cls = type(detector)
-    return f"{cls.__module__}.{cls.__qualname__}"
+    base = f"{cls.__module__}.{cls.__qualname__}"
+    probe = getattr(detector, "policy_signature", None)
+    if probe is None:
+        return base
+    # A raising or non-string signature propagates: the caller turns that into
+    # "no fingerprint" ⇒ Cache A off, never a key that ignores the capability.
+    parts = probe()
+    if not all(isinstance(p, str) for p in parts):
+        raise TypeError(f"policy_signature of {base} must return strings")
+    return "\x1e".join((base, *sorted(parts)))
 
 
 def _feed(h: hashlib._Hash, parts: list[bytes]) -> None:

@@ -1435,6 +1435,149 @@ async def test_cache_a_still_shared_across_equal_lemmatizer_capability() -> None
     assert r2.cache_a_hit is True
 
 
+# Cache A — dual_ner's ENGINE CAPABILITY is part of the policy ---------------
+
+# Same hole as the gazetteer's lemmatizer, on the PRIMARY NER path. With
+# `CORP_LLM_REQUIRE_NER` off (the default) a DualNerDetector whose engines
+# cannot load their models disables them, logs, and returns `[]` — so a
+# model-less pod seeds Cache A with an EMPTY mapping under a key that folds
+# only the class name. A model-backed pod on the same Redis replays it and a
+# PERSON only NER catches egresses in the clear for the ~10h TTL.
+
+_R12_TERM = "Иванов"
+_R12_TEXT = "договор подписал Иванов вчера"
+
+_FAKE_RU_MODELS = ("segmenter", "tagger")
+_FAKE_EN_NLP = "nlp"
+
+
+def _fake_infer_ru(_models: object, text: str) -> list[Finding]:
+    """Stands in for Natasha on a pod that HAS the `ner` extra installed."""
+    start = text.find(_R12_TERM)
+    if start < 0:
+        return []
+    return [
+        Finding(
+            text=_R12_TERM,
+            label="PERSON",
+            start=start,
+            end=start + len(_R12_TERM),
+            score=0.8,
+        )
+    ]
+
+
+def _no_ner_models(*_args: object, **_kwargs: object) -> object:
+    raise RuntimeError("ner_ru requires the 'ner' extra: pip install -e '.[ner]'")
+
+
+def _patch_ner_models_present(m: pytest.MonkeyPatch) -> None:
+    """Simulate a pod WITH both NER engines, never the ambient interpreter, so
+    the test means the same thing on 3.14 (no models) and on 3.12/CI."""
+    from corp_llm_gateway.detectors import ner_en, ner_ru
+
+    m.setattr(ner_ru, "_load_natasha", lambda: _FAKE_RU_MODELS)
+    m.setattr(ner_ru, "_infer_ru", _fake_infer_ru)
+    m.setattr(ner_en, "_load_spacy", lambda: _FAKE_EN_NLP)
+    m.setattr(ner_en, "_infer_en", lambda _nlp, _text: [])
+
+
+def _patch_ner_models_absent(m: pytest.MonkeyPatch) -> None:
+    from corp_llm_gateway.detectors import ner_en, ner_ru
+
+    m.setattr(ner_ru, "_load_natasha", _no_ner_models)
+    m.setattr(ner_en, "_load_spacy", _no_ner_models)
+
+
+def _dual_ner_orch(store: InMemoryMappingStore) -> SanitizationOrchestrator:
+    from corp_llm_gateway.detectors import DualNerDetector
+
+    return SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        # require_ner=False pins the DOCUMENTED default (fail open): a disabled
+        # engine returns [] instead of raising, which is what seeds the bad entry.
+        local_detectors=[DualNerDetector(require_ner=False)],
+        oracle_enabled=False,
+    )
+
+
+async def test_cache_a_not_shared_across_dual_ner_engine_capability() -> None:
+    store = InMemoryMappingStore()  # ONE shared Cache A, as two pods share Redis
+
+    with pytest.MonkeyPatch.context() as m:
+        _patch_ner_models_absent(m)
+        blind = _dual_ner_orch(store)
+        r_blind = await blind.sanitize(_R12_TEXT, team_id="t1", conversation_id="c-blind")
+        assert r_blind.pairs == (), "a model-less pod finds nothing and caches that"
+
+    with pytest.MonkeyPatch.context() as m:
+        _patch_ner_models_present(m)
+        full = _dual_ner_orch(store)
+        r_full = await full.sanitize(_R12_TEXT, team_id="t1", conversation_id="c-full")
+
+        assert r_full.cache_a_hit is False, "a model-less pod's entry must not be served"
+        assert _R12_TERM not in r_full.sanitized_text, (
+            "LEAK: the model-less entry replayed the PERSON unredacted"
+        )
+        assert any(o == _R12_TERM for o, _ in r_full.pairs)
+
+        # Control: against a COLD store the model-backed config really does
+        # redact, so the assertions above cannot pass by detection silently
+        # stopping.
+        cold = _dual_ner_orch(InMemoryMappingStore())
+        r_cold = await cold.sanitize(_R12_TEXT, team_id="t1", conversation_id="c-cold")
+        assert r_cold.cache_a_hit is False
+        assert _R12_TERM not in r_cold.sanitized_text
+        assert any(o == _R12_TERM for o, _ in r_cold.pairs)
+
+
+async def test_cache_a_still_shared_across_equal_dual_ner_capability() -> None:
+    """The capability probe must not fragment the cache between equal pods."""
+    with pytest.MonkeyPatch.context() as m:
+        _patch_ner_models_present(m)
+        store = InMemoryMappingStore()
+        first = _dual_ner_orch(store)
+        second = _dual_ner_orch(store)
+
+        r1 = await first.sanitize(_R12_TEXT, team_id="t1", conversation_id="c1")
+        r2 = await second.sanitize(_R12_TEXT, team_id="t1", conversation_id="c2")
+        assert r1.cache_a_hit is False
+        assert r2.cache_a_hit is True, "equal capability must derive the same Cache-A key"
+        assert r2.sanitized_text == r1.sanitized_text
+
+
+class _BadSignatureDetector(_ProjectTermDetector):
+    """A detector whose capability probe is broken."""
+
+    def policy_signature(self) -> tuple[str, ...]:
+        raise RuntimeError("capability probe unavailable")
+
+
+class _NonStringSignatureDetector(_ProjectTermDetector):
+    def policy_signature(self) -> tuple[str, ...]:
+        return (object(),)  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize(
+    "detector", [_BadSignatureDetector(), _NonStringSignatureDetector()], ids=["raises", "non-str"]
+)
+async def test_unusable_policy_signature_disables_cache_a(detector: PIIDetector) -> None:
+    """A detector that cannot state its capability must take Cache A OFF, never
+    fall back to class identity — that fallback is exactly the replay hole."""
+    store = InMemoryMappingStore()
+    orch = _r9_orch(store, [detector])
+    assert orch._policy_fingerprint is None
+
+    r1 = await orch.sanitize(_R9_TEXT, team_id="t1", conversation_id="c1")
+    r2 = await orch.sanitize(_R9_TEXT, team_id="t1", conversation_id="c2")
+    assert r1.cache_a_hit is False
+    assert r2.cache_a_hit is False
+    assert store._dedup == {}
+    assert _R9_TERM not in r2.sanitized_text
+
+
 # ---------------------------------------------------------------------------
 # Task 13 — rule-matching performance: _rule_pattern compile caching
 # ---------------------------------------------------------------------------
