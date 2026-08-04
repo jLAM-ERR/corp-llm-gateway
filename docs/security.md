@@ -22,7 +22,7 @@ a per-conversation mapping that never leaves the gateway.
 |---|---|
 | Success criterion | **Zero confirmed leak incidents** in the 90 days post-GA (non-negotiable) |
 | Failure posture | **Fail-closed** for the sanitization path: if the corp-LLM can't run, the request is rejected (503 `E_CORP_LLM_DOWN`) rather than forwarded unsanitized (`litellm_hook.py` `pre_call`) |
-| BYOK `Authorization` | The developer's `Authorization: Bearer …` (Anthropic/OpenAI key) is forwarded **untouched** to upstream and is **never logged** — it is a NEVER field in the audit gate |
+| BYOK `Authorization` | The developer's `Authorization: Bearer …` (Anthropic/OpenAI key) is forwarded **untouched** to upstream and is **never logged** — it is a NEVER field in the audit gate. The opt-in subscription-auth bridges also read that bearer without rewriting it; see §13 |
 | `X-Corp-Auth` | The corp token is consumed in `pre_call` (`AuthMiddleware.strip_corp_token`), stripped from forwarded headers, and **never enters the audit pipeline** — NEVER field |
 
 Defense in depth: the no-leak guarantee is enforced at multiple independent
@@ -398,12 +398,13 @@ by construction; if one appears to, that is an M1-14 regression.
 | (b) | **SIEM sink enabled in values but not defined in the configmap.** `audit.sinks.siem.enabled: true` has no corresponding `sinks.siem` in the Vector configmap; `audit_drop` alerting (M3-9) also pending. | **Medium** — SIEM monitoring (incl. leak-attempt alerts) not yet active |
 | (c) | ✅ **FIXED** — streamed `tool_use` `input_json_delta` is now desanitized (JSON-escaped) in `sanitizer/streaming.py`, so the developer's tool receives real values, not `[LABEL_NNN]` tokens. | **Resolved** |
 | (d) | ✅ **By design (not a gap)** — `thinking` / `redacted_thinking` are passed through UNMODIFIED: Anthropic signs thinking blocks and rejects modified ones on multi-turn replay, and the model only ever sees placeholders (no original reaches them). | **Resolved (by design)** |
-| (e) | **F9 only guards the corp-LLM oracle client, not litellm's own global TLS switch.** `corp_llm_verify()` (`config.py`) is reached only through `bootstrap.build_corp_llm_client()`, itself called only when `CORP_LLM_ORACLE_ENABLED=1`. But litellm reads the SAME `SSL_VERIFY` env var directly, via `get_ssl_verify()` — at higher priority than `SSL_CERT_FILE` — for every upstream provider (`anthropic/`, `openai/`, `hosted_vllm/`), with no `CORP_ENV=prod` guard on that read. `SSL_VERIFY=false` therefore disables certificate verification stack-wide on any deployment fronted by litellm with the oracle off (the default posture — see `compose/docker-compose.yml`). Widening F9 to cover litellm's read is a `src` follow-up; `compose/` mitigates today by not exposing `SSL_VERIFY` as an operator-set `.env` key and hardcoding it `true`. | **Medium** — silent TLS-verification bypass for any deployment that sets `SSL_VERIFY=false` outside the documented `.env` surface |
+| (e) | **`_corp_gateway_request_id` reaches the outbound Anthropic body on `/v1/chat/completions`.** `pre_call` writes this correlation key to four places in `data`, one of them the top level, and litellm's chat-completions adapter carries unknown top-level keys into the request it sends. Observed with the subscription bridge **off** as well as on, so it is independent of that bridge. The value is a request id (litellm's call id or a generated UUID), never user content, so it is not an M1-14 leak. The primary `/v1/messages` route — the one Claude Code uses — is unaffected. Not fixed opportunistically because the key is the audit-attribution fallback chain (`_REQUEST_ID_LOOKUP_PATHS`), which has its own regression history. | **Low** — correlation id only; affects the chat-completions route's acceptance upstream, not confidentiality |
+| (f) | **F9 only guards the corp-LLM oracle client, not litellm's own global TLS switch.** `corp_llm_verify()` (`config.py`) is reached only through `bootstrap.build_corp_llm_client()`, itself called only when `CORP_LLM_ORACLE_ENABLED=1`. But litellm reads the SAME `SSL_VERIFY` env var directly, via `get_ssl_verify()` — at higher priority than `SSL_CERT_FILE` — for every upstream provider (`anthropic/`, `openai/`, `hosted_vllm/`), with no `CORP_ENV=prod` guard on that read. `SSL_VERIFY=false` therefore disables certificate verification stack-wide on any deployment fronted by litellm with the oracle off (the default posture — see `compose/docker-compose.yml`). Widening F9 to cover litellm's read is a `src` follow-up; `compose/` mitigates today by not exposing `SSL_VERIFY` as an operator-set `.env` key and hardcoding it `true`. | **Medium** — silent TLS-verification bypass for any deployment that sets `SSL_VERIFY=false` outside the documented `.env` surface |
 
-**(a) and (c) are fixed; (d) is correct by design.** The remaining open items
-are **(b)** — wiring the SIEM sink (gated on the SIEM target, see
-[`remaining-steps.md`](remaining-steps.md)) — and **(e)** — widening F9 to
-guard litellm's global `SSL_VERIFY` read, not just the oracle client's.
+**(a) and (c) are fixed; (d) is correct by design.** The remaining open items are
+**(b)** — wiring the SIEM sink (gated on the SIEM target), see
+[`remaining-steps.md`](remaining-steps.md) — **(e)**, and **(f)** — widening F9
+to guard litellm's global `SSL_VERIFY` read, not just the oracle client's.
 
 ## 12. GA security hardening (F8–F11)
 
@@ -438,3 +439,223 @@ bypasses RBAC for local dev. RS256 verification needs the `cryptography` package
 (the `oidc` extra); without it `verify_operator` raises a clear `RuntimeError`
 rather than falling back to a weaker algorithm. The dev-facing upgrade note
 belongs in `docs/ops/upgrade.md` (plan Task B8).
+
+## 13. Subscription-auth bridges
+
+Two opt-in flags let the developer pay for the upstream call with their own
+subscription OAuth token instead of a shared API key, so no provider API key
+sits on the laptop or in the cluster:
+
+| Flag | Upstream | Accepted token |
+|---|---|---|
+| `CORP_LLM_FORWARD_CHATGPT_AUTH` | ChatGPT Codex (OpenAI Responses) | Codex OAuth bearer |
+| `CORP_LLM_FORWARD_ANTHROPIC_AUTH` | Anthropic | `sk-ant-oat…` OAuth tokens **only** |
+
+Both read the same inbound `Authorization` bearer, so **exactly one may be on**.
+Both flags set is refused at boot by `build_guardrail()` and by
+`gateway-admin config check` (`settings.forward_auth_conflict`). The runtime
+refusal is the load-bearing one: the compose and demo boots these bridges ship
+on never call `settings.validate()`. A set `LITELLM_MASTER_KEY` is refused the
+same way while either bridge is on — with a master key, litellm reads the
+inbound `Authorization` as one of its own virtual keys and answers 401 before
+`pre_call` runs, so the bridge could never see the token. Presence counts, not
+truthiness: litellm treats a blank `LITELLM_MASTER_KEY=` as set.
+
+The rest of this section is the Anthropic bridge (`litellm_hook.py`,
+`_anthropic_upstream_headers` + the `forward_anthropic_auth` branch in
+`pre_call`). Operator setup is in
+[`ops/configuration.md`](ops/configuration.md) and
+[`ops/install.md`](ops/install.md).
+
+### What it forwards, and what it does not
+
+On a request whose model alias resolves to the `anthropic` provider, and only
+when the flag is on, `pre_call`:
+
+- copies the bearer value into `data["api_key"]`. That is what selects litellm's
+  own Anthropic OAuth branch, which emits `Authorization: Bearer <token>`
+  upstream, adds `oauth-2025-04-20` to `anthropic-beta` and
+  `anthropic-dangerous-direct-browser-access: true`, and suppresses `x-api-key`;
+- copies the allowlisted **non-auth** inbound headers into
+  `data["extra_headers"]`. The allowlist is exactly `anthropic-beta`,
+  `anthropic-version`, `user-agent` (plus `authorization`, which is selected for
+  validation and then excluded from `extra_headers`). Every other inbound header
+  is dropped;
+- **never** selects `X-Corp-Auth` — the corp token is skipped before the
+  allowlist is consulted, on top of the normal `strip_corp_token` path
+  (invariant 4);
+- drops `data["metadata"]` and a top-level `data["user"]`, and drops the same
+  two keys from litellm's own `model_call_details` copy of the request (see
+  below).
+
+Rejected: a missing `Authorization`, a non-`Bearer` scheme, an empty bearer, a
+bearer carrying CR or LF, and any token that does not start with litellm's
+`ANTHROPIC_OAUTH_TOKEN_PREFIX` (`sk-ant-oat`) — including a plain
+`sk-ant-api…` API key. Each is `401 E_PROVIDER_AUTH` with an audit record
+(`status="failed"`) and `gateway_failure{component="auth"}`, and the refused
+credential reaches no error body, exception trace, metric label, audit record or
+log line (`tests/invariants/test_no_originals_leak.py`).
+
+API keys are refused deliberately, not as a shortcut. On the non-OAuth branch
+litellm adds `x-api-key` while the inbound `Authorization` is still merged in,
+so the outbound request would carry two competing auth schemes. Plain-API-key
+BYOK on this bridge is a separate decision that has not been made.
+
+### Invariant 3 on this route
+
+Invariant 3 (BYOK `Authorization` passthrough) holds unchanged: the inbound
+`Authorization` header is left in every header bucket exactly as it arrived, and
+the bridge only *reads* it. The upstream `Authorization` header litellm builds
+from `api_key` is the token's **one authorized destination**; the token
+appearing anywhere else — another header, the request body, the router's model
+list, the proxy's log stream — is a leak.
+
+That rule is pinned on both sides of the process boundary, because no single
+harness sees both:
+
+| Surface | Pinned by |
+|---|---|
+| Logger emissions, error bodies, exception traces, metric labels, audit records, forwarded header buckets | `tests/invariants/test_no_originals_leak.py` (in-process) |
+| Upstream request headers and body, retained router deployments, the litellm process's own stdout/stderr | `tests/integration/test_anthropic_oauth_outbound.py` (runs the pinned litellm image against a capturing upstream) |
+
+Every assertion in the capture suite depends on docker, the pinned image and
+container → host reachability, so on a machine without them it skips. CI sets
+`CORP_REQUIRE_PROXY_CAPTURE=1`, which turns each of those skips into a failure —
+otherwise a daemon, registry or network fault produces a green job that verified
+none of it. The suite asserts that wiring against `.github/workflows/ci.yml`
+itself, so dropping the variable fails the run rather than silencing it.
+
+### Provider gating is defence in depth, not a routing guarantee
+
+The bridge runs only when `_detect_provider(data) == "anthropic"`. That check
+reads the **client-visible model alias** (`data["model"]`) and nothing else.
+litellm resolves the actual deployment *after* the pre-call hook runs, and a
+litellm `model_name` may map to any `litellm_params.model` — so on a config with
+a `model_name: "*"` catch-all, a `claude-…` alias passes the gate and can still
+land on a non-Anthropic upstream, taking the subscription token with it.
+
+The gate is therefore a cheap second line of defence against copying the token
+onto an OpenAI or corp-vLLM call. **The binding control is the deployment
+shape**: a litellm config in which every route is `anthropic/` and there is no
+wildcard. `docker/anthropic-oauth/litellm-config.yaml` is such a config, and
+`tests/test_anthropic_oauth_profile.py` pins both properties. Do not read the
+gate as a guarantee it cannot make.
+
+### The `metadata` / `user` scrub
+
+The gateway sanitizes `messages`, `system` and `instructions`. It never
+sanitizes `metadata` or a top-level `user`, and both egress to Anthropic:
+
+- on the **chat-completions adapter**, litellm maps a top-level `user` string to
+  `metadata.user_id` and copies `metadata.user_id` into the outbound body. Its
+  only filter rejects nothing but complete email and phone shapes;
+- on the **`/v1/messages` pass-through route** — the one Claude Code actually
+  uses — `metadata` is absent from the declaratively "supported" params list,
+  but *nothing filters the request against that list*, so a caller-supplied
+  `metadata` is forwarded intact.
+
+So the scrub is load-bearing on **both** routes. The bridge is gated by provider
+rather than by call type, so both are reachable with the flag on.
+`tests/litellm_hook/test_litellm_route_assumptions.py` pins both litellm
+behaviors, and deleting the scrub turns the capture tests red with the canary
+visible in the upstream body.
+
+**Drop, not sanitize.** litellm's proxy fills `data["metadata"]` with dozens of
+internal accounting keys of mixed types, so there is no single field to narrow
+to; sanitizing would mint placeholders in fields the response path never
+reverses, leaving pairs no reverse pass consumes; and a key-specific scrub would
+silently reopen the hole the day litellm copies one more metadata key into the
+body. The cost is litellm's own accounting metadata on this route, which is
+acceptable because the route ships without virtual keys and therefore without
+spend tracking anyway. Audit attribution is unaffected — `user_id` / `team_id`
+come from `AuthMiddleware`, and `request_id` keys on `litellm_call_id`.
+
+### The identity-preamble carve-out
+
+Anthropic's OAuth-authenticated route accepts a request as a Claude Code request
+on the strength of the leading `system` block, matched by **exact string
+equality** against three fixed client literals (`sanitizer/identity_preamble.py`).
+One redacted character stops it being that block — and with the production
+detector set, spaCy tags `Claude` as PERSON and `CLI` as ORG, so the sanitizer
+really did rewrite it before this carve-out existed.
+
+The exemption is deliberately narrow. It applies **only** when:
+
+- `CORP_LLM_FORWARD_ANTHROPIC_AUTH` is on **and** the request resolves to the
+  Anthropic provider — off the bridge, an identity literal is ordinary content;
+- the field is `system`. Never `instructions`, a user message, a `tool_result`
+  or a `document` — an operator `replace.md` rule or gazetteer entry must still
+  be able to redact the same string pasted into those;
+- the block is the **leading** one. Only `x-anthropic-billing-header:` blocks may
+  precede it (litellm keeps those on the first-party Anthropic route, so the real
+  payload can arrive with the identity block at index 1). A later occurrence,
+  after any ordinary prompt block, is sanitized like any other leaf;
+- the match is **byte-exact**. No `strip()`, no whitespace tolerance: padding
+  would both fail upstream anyway and let a caller ride unbounded text into an
+  unchecked leaf.
+
+Two properties keep this from being a hole. The exempt strings are fixed client
+constants, never user content, so exempting them cannot leak an original
+(M1-14). And the exemption is **rewrite-only**: the block is still collected by
+`collect_text`, so the Stage-0 payload classifier and the Stage-5 DLP egress
+guard read it exactly as before, and the fail-closed size check runs before the
+carve-out can apply. This is the same rewrite-vs-scan split already used for
+block `signature` fields.
+
+Neighbouring `system` blocks are unaffected, the billing-marker blocks ahead of
+the identity one included: those go through the walker **whole**, marker text and
+all. An earlier revision held the fixed `x-anthropic-billing-header:` prefix back
+and reattached it after sanitizing the remainder; because `replace.md` rules are
+literal substring matches over the text handed to the orchestrator, that hid every
+rule whose pattern reached across the prefix/remainder boundary and then rebuilt
+the full original on the way to Anthropic — an M1-14 violation Stage 5 cannot
+catch, since it does not replay `replace.md`. Nothing is reattached now. If a rule
+rewrites the marker the identity block stops being a *leading* one and Anthropic
+may refuse the request; a refused request is a UX cost, a reconstructed original
+is a leak. `tests/sanitizer/test_oauth_system_preamble.py` drives real `pre_call`
+with the production detectors — including a rule spanning that boundary — and the
+capture test asserts a redactable email in a neighbouring block still comes back
+as `[EMAIL_nnn]`, so the byte-identical assertions cannot go quietly vacuous.
+
+### Credential retention in the litellm process
+
+litellm treats any request carrying `api_key` as a clientside credential:
+`_handle_clientside_credential` builds a `Deployment` whose id hashes the
+dynamic params and upserts it into `Router.model_list`, **including the raw
+key**. Nothing evicts it. Each distinct `sk-ant-oat…` value therefore leaves one
+credential-bearing deployment resident for the lifetime of the proxy process;
+re-using a token adds none. Measured, not assumed —
+`test_each_distinct_token_retains_exactly_one_router_deployment`.
+
+This is **not introduced by the Anthropic bridge** — the ChatGPT Codex bridge
+has had the identical shape since it shipped — but this route adds a second
+place it happens, so more distinct developer credentials accumulate in memory.
+Bounds and mitigation:
+
+- the admin surface does not hand them back: `/model/info` returns none of the
+  tokens;
+- the tokens do not reach the process's stdout/stderr (pinned by the capture
+  test) or any audit surface;
+- **restarting the litellm process is the mitigation.** There is no eviction
+  knob. Treat process lifetime as the retention window when sizing how long a
+  compromised subscription token stays resident.
+
+### Topology: demo overlay only
+
+Subscription auth runs on the `anthropic-oauth` docker-compose overlay
+(`docker-compose.demo.yml` + `docker-compose.anthropic-oauth.yml`) and nowhere
+else.
+
+| Deployment | Status | Why |
+|---|---|---|
+| `anthropic-oauth` compose overlay | **Supported** | Anthropic-only routes, no wildcard, no `LITELLM_MASTER_KEY`, so the inbound bearer reaches `pre_call` |
+| Production compose | **Unsupported** | `Authorization` there already carries the litellm virtual key. Putting the OAuth token on the wire needs a second header, and which header carries which credential is an open governance decision |
+| Helm chart | **Unsupported** | Its litellm ConfigMap routes `"*"` to the corp vLLM and has no `anthropic/` route, so litellm's OAuth branch is unreachable — and that wildcard is exactly the shape the alias gate cannot protect |
+
+Both unsupported cases are blocked on the same header-layout decision (the
+deferred litellm-governance plan's first gate), not on missing code.
+
+**Consequence to accept knowingly:** the supported overlay has no litellm
+virtual keys, and therefore no native budget, rate-limit or quota enforcement.
+**Subscription auth and virtual-key governance are mutually exclusive today.**
+A rollout that needs both has to wait for the header-layout decision.

@@ -67,6 +67,10 @@ from corp_llm_gateway.sanitizer.content_blocks import (
 )
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
+from corp_llm_gateway.sanitizer.identity_preamble import (
+    is_identity_preamble,
+    leading_identity_block_index,
+)
 from corp_llm_gateway.sanitizer.placeholder import (
     StaleSpanError,
     add_unwrapped_response_aliases,
@@ -105,6 +109,18 @@ try:
     )
 except ImportError:  # pragma: no cover
     _LitellmCustomLogger = object  # type: ignore[assignment,misc]
+
+# litellm selects its Anthropic OAuth branch by testing the api_key against
+# ANTHROPIC_OAUTH_TOKEN_PREFIX (litellm/types/llms/anthropic.py, consumed by
+# llms/anthropic/common_utils.py). `_anthropic_upstream_headers` must gate on the
+# SAME value, so read it from the installed litellm rather than keep a copy.
+# Optional for the same reason as the import above.
+try:
+    from litellm.types.llms.anthropic import (
+        ANTHROPIC_OAUTH_TOKEN_PREFIX as _LITELLM_ANTHROPIC_OAUTH_TOKEN_PREFIX,
+    )
+except ImportError:  # pragma: no cover
+    _LITELLM_ANTHROPIC_OAUTH_TOKEN_PREFIX = None
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +177,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         max_output_tokens_cap: int | None = None,
         strip_inbound_headers_to_upstream: bool = False,
         forward_chatgpt_auth: bool = False,
+        forward_anthropic_auth: bool = False,
         dlp_guard: DlpEgressGuard | None = None,
         metrics: MetricsExporter | None = None,
     ) -> None:
@@ -190,6 +207,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Authorization header at its proxy boundary, so copy only the headers
         # required by the ChatGPT Codex backend into per-request extra_headers.
         self._forward_chatgpt_auth = forward_chatgpt_auth
+        # Opt-in bridge for an Anthropic subscription (OAuth) token. Same
+        # mechanism as the Codex one — litellm consumes the client
+        # Authorization header at its proxy boundary — but gated on the request
+        # looking Anthropic-routed so the token cannot be copied onto another
+        # provider's upstream call.
+        self._forward_anthropic_auth = forward_anthropic_auth
         self._dlp_guard = dlp_guard if dlp_guard is not None else DlpEgressGuard()
         # Pluggable metrics exporter (B4). Default Noop = nothing emitted; a
         # PrometheusExporter (config-selected in the composition root) exposes the
@@ -436,6 +459,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             if isinstance(md, dict):
                 _drop_wire_headers(md.get("headers"))
 
+        # Pure function of data["model"] — hoisted above both auth bridges so the
+        # Anthropic bridge can gate on it and either bridge's rejection can
+        # attribute its audit record; reused for _RequestState below.
+        provider = _detect_provider(data)
+
         if self._forward_chatgpt_auth:
             try:
                 upstream_headers = _chatgpt_upstream_headers(inbound_headers)
@@ -458,7 +486,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 # Responses API parameter. Correlation remains available via
                 # the top-level and litellm_metadata request-id copies.
                 data.pop("metadata", None)
+                _scrub_retained_request_metadata(data)
             except ValueError:
+                self._seed_request_state(
+                    request_id,
+                    user_id=ctx.user_id,
+                    team_id=ctx.team_id,
+                    provider=provider,
+                    model=model,
+                )
                 self._record_failure(request_id, error_code="E_PROVIDER_AUTH")
                 logger.info(
                     "litellm_pre_call_provider_auth_failed request_id=%s "
@@ -478,6 +514,79 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     401,
                     "E_PROVIDER_AUTH",
                     "missing or invalid OpenAI bearer authentication",
+                ) from None
+
+        # Anthropic subscription (OAuth) bridge. Publishing the developer's
+        # sk-ant-oat token as the per-request api_key is what selects litellm's
+        # own OAuth branch (llms/anthropic/common_utils.py), which then emits
+        # `Authorization: Bearer` plus the oauth beta header upstream and
+        # suppresses x-api-key.
+        #
+        # LIMITATION: this gate reads the client-visible model alias, NOT the
+        # resolved deployment — litellm picks that after the hook runs, so on a
+        # wildcard route a `claude-…` alias can still reach a non-Anthropic
+        # upstream. It is defence-in-depth against copying the token onto an
+        # OpenAI/vLLM call, not a guarantee; the binding control is deploying
+        # this flag only against a config whose every route is `anthropic/`.
+        if self._forward_anthropic_auth and provider == "anthropic":
+            try:
+                upstream_headers = _anthropic_upstream_headers(inbound_headers)
+                authorization = next(
+                    value
+                    for name, value in upstream_headers.items()
+                    if name.lower() == "authorization"
+                )
+                data["api_key"] = authorization[7:].strip()
+                data["extra_headers"] = {
+                    name: value
+                    for name, value in upstream_headers.items()
+                    if name.lower() != "authorization"
+                }
+                # `metadata` and a top-level `user` are the two request fields
+                # that egress to Anthropic without ever passing through
+                # sanitization: on the chat-completions adapter litellm maps
+                # `user` to metadata.user_id and copies metadata.user_id into
+                # the outbound body, rejecting only complete email/phone shapes.
+                # Dropped rather than sanitized — litellm's proxy fills
+                # `metadata` with dozens of internal, non-wire keys, so there is
+                # nothing to narrow to, and neither field is desanitized on the
+                # response path. Request correlation survives via the top-level
+                # and litellm_metadata request-id copies.
+                # The primary /v1/messages route uses the pass-through
+                # transformer, which does not support `metadata` at all; this
+                # scrub matters because the bridge is gated by provider, not by
+                # call_type, so a claude-* request arriving on
+                # /v1/chat/completions still reaches the leaking adapter.
+                data.pop("metadata", None)
+                data.pop("user", None)
+                _scrub_retained_request_metadata(data)
+            except ValueError:
+                self._seed_request_state(
+                    request_id,
+                    user_id=ctx.user_id,
+                    team_id=ctx.team_id,
+                    provider=provider,
+                    model=model,
+                )
+                self._record_failure(request_id, error_code="E_PROVIDER_AUTH")
+                logger.info(
+                    "litellm_pre_call_provider_auth_failed request_id=%s "
+                    "error_code=E_PROVIDER_AUTH",
+                    request_id,
+                )
+                _now = datetime.now(UTC)
+                await self.audit(
+                    data,
+                    None,
+                    _now,
+                    _now,
+                    status="failed",
+                    error_code="E_PROVIDER_AUTH",
+                )
+                raise GuardrailHttpException(
+                    401,
+                    "E_PROVIDER_AUTH",
+                    "missing or invalid Anthropic OAuth bearer authentication",
                 ) from None
 
         messages = raw_messages
@@ -510,7 +619,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 "messages/input must be a list or input must be a string",
             )
 
-        provider = _detect_provider(data)
         state = _RequestState(
             request_id=request_id,
             user_id=ctx.user_id,
@@ -908,8 +1016,20 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # A well-formed request carries at most one, but nothing rejects a
         # payload carrying both — sanitize whichever are present rather than
         # picking one via a ternary (defect #2: the other egressed raw).
+        # The identity carve-out only pays for itself on the route it protects:
+        # Anthropic's OAuth /v1/messages. Off the bridge, or on a request bound
+        # for any other provider, an identity literal in `system` is ordinary
+        # content and takes the ordinary sanitization path.
+        identity_exempt = self._forward_anthropic_auth and provider == "anthropic"
         for prompt_field in ("system", "instructions"):
-            await self._sanitize_prompt_field(data, prompt_field, request_id, state, sanitize_one)
+            await self._sanitize_prompt_field(
+                data,
+                prompt_field,
+                request_id,
+                state,
+                sanitize_one,
+                identity_exempt=identity_exempt,
+            )
 
         # Stage 5: DLP egress guard — re-scan the SANITIZED outbound request.
         # Defence-in-depth: catches canaries / raw secrets that survived the
@@ -983,11 +1103,24 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         request_id: str,
         state: _RequestState,
         sanitize_one: Callable[[str], Awaitable[SanitizeResult]],
+        *,
+        identity_exempt: bool = False,
     ) -> None:
         """Sanitize ``data[prompt_field]`` in place (``"system"`` or ``"instructions"``).
 
         Extracted so `pre_call` can drive both fields through the identical
         fail-closed/audit behavior instead of picking one via a ternary.
+
+        Anthropic's OAuth ``/v1/messages`` route accepts a request as a Claude
+        Code request on the strength of the LEADING ``system`` block, matched by
+        exact equality, so that one block is exempt from rewriting (see
+        ``sanitizer/identity_preamble``) when ``identity_exempt`` says the
+        request can actually reach that route. The exemption is claimed here,
+        not in the per-leaf orchestrator: the orchestrator has no field or
+        position context, so claiming it there also exempted an identity literal
+        pasted into ``instructions``, a user message, a ``tool_result`` or a
+        ``document`` — leaves an operator rule or gazetteer entry must still be
+        able to redact.
         """
         system = data.get(prompt_field)
         if not system:
@@ -1002,8 +1135,41 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             prompt_field,
             system_bytes,
         )
+        exempt_index: int | None = None
+        if identity_exempt and prompt_field == "system":
+            if isinstance(system, str) and is_identity_preamble(system):
+                logger.info(
+                    "litellm_pre_call_identity_preamble_passthrough request_id=%s field=%s",
+                    request_id,
+                    prompt_field,
+                )
+                return
+            exempt_index = leading_identity_block_index(system)
         try:
-            new_system, results = await sanitize_content(system, sanitize_one)
+            if exempt_index is None:
+                new_system, results = await sanitize_content(system, sanitize_one)
+            else:
+                logger.info(
+                    "litellm_pre_call_identity_preamble_passthrough request_id=%s "
+                    "field=%s block_index=%d",
+                    request_id,
+                    prompt_field,
+                    exempt_index,
+                )
+                # Only the identity block is held out. The billing markers ahead
+                # of it go through the walker whole, marker text included: rules
+                # match by substring, so holding the fixed prefix back and
+                # reattaching it afterwards rebuilt the original over any rule
+                # that matched across the prefix/remainder boundary. A marker a
+                # rule rewrote stays rewritten — upstream may then refuse the
+                # request, which is the cheaper failure of the two.
+                rest: list[Any] = [*system[:exempt_index], *system[exempt_index + 1 :]]
+                new_rest, results = await sanitize_content(rest, sanitize_one)
+                new_system = [
+                    *new_rest[:exempt_index],
+                    system[exempt_index],
+                    *new_rest[exempt_index:],
+                ]
         except ContentTooDeepError as exc:
             self._record_failure(request_id, error_code="E_BAD_REQUEST")
             _now = datetime.now(UTC)
@@ -1481,6 +1647,35 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if result.block_reason is not None:
             state.block_reason = result.block_reason
 
+    def _seed_request_state(
+        self,
+        request_id: str,
+        *,
+        user_id: str,
+        team_id: str,
+        provider: Provider,
+        model: str,
+    ) -> _RequestState:
+        """Register the per-request state audit() reads identity from.
+
+        A rejection raised before pre_call builds the main state would otherwise
+        audit as user_id/team_id "unknown" even though corp auth already
+        succeeded — the failure could not be attributed to a developer or team.
+        """
+        state = _RequestState(
+            request_id=request_id,
+            user_id=user_id,
+            team_id=team_id,
+            provider=provider,
+            model=model,
+            redaction_count=0,
+            placeholders=[],
+            cache_a_hit=False,
+            mapping=StrategyResult(pairs=()),
+        )
+        self._req_state[request_id] = state
+        return state
+
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:
             self._req_state[request_id].error_code = error_code
@@ -1711,6 +1906,26 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
         _drop_corp_token(secret_fields.get("raw_headers"))
 
 
+def _scrub_retained_request_metadata(data: dict[str, Any]) -> None:
+    """Drop ``metadata``/``user`` from litellm's logging object as well as *data*.
+
+    litellm builds the logging object BEFORE it invokes this hook and keeps its
+    own copy of the request in ``model_call_details`` (``litellm_params`` and the
+    top level). Popping the keys off *data* therefore leaves the unsanitized
+    values reachable by every configured logging callback — the logger surface of
+    invariant 1. Every step is guarded: the key may be absent, the attribute may
+    not exist, and unit tests pass stub objects, so this must never raise out of
+    the hook.
+    """
+    details = getattr(data.get("litellm_logging_obj"), "model_call_details", None)
+    if not isinstance(details, dict):
+        return
+    for bucket in (details, details.get("litellm_params")):
+        if isinstance(bucket, dict):
+            bucket.pop("metadata", None)
+            bucket.pop("user", None)
+
+
 _CHATGPT_HEADER_ALLOWLIST = frozenset(
     {
         "authorization",
@@ -1743,6 +1958,65 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
     return selected
 
 
+# Last-resort value for installs without litellm (e.g. the local 3.14 venv). A
+# stale copy is a credential-path hazard: a token that clears this prefix but not
+# litellm's own would reach upstream through litellm's `x-api-key` branch, i.e.
+# two competing auth schemes on one request — the exact failure the selector
+# exists to prevent. Source of truth stays litellm/types/llms/anthropic.py, which
+# the resolver below prefers whenever it is importable, and which the drift test
+# pins this literal to.
+_ANTHROPIC_OAUTH_TOKEN_PREFIX_FALLBACK = "sk-ant-oat"
+
+
+def _resolve_anthropic_oauth_prefix() -> str:
+    resolved = _LITELLM_ANTHROPIC_OAUTH_TOKEN_PREFIX
+    # An empty or non-str prefix makes `startswith` always true, which would turn
+    # the OAuth-only gate into a pass-through.
+    if isinstance(resolved, str) and resolved:
+        return resolved
+    return _ANTHROPIC_OAUTH_TOKEN_PREFIX_FALLBACK
+
+
+_ANTHROPIC_OAUTH_TOKEN_PREFIX = _resolve_anthropic_oauth_prefix()
+
+_ANTHROPIC_HEADER_ALLOWLIST = frozenset(
+    {
+        "authorization",
+        "anthropic-beta",
+        "anthropic-version",
+        "user-agent",
+    }
+)
+
+
+def _anthropic_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
+    """Select Anthropic subscription headers without forwarding corp credentials.
+
+    OAuth tokens only. litellm picks its OAuth branch by prefix
+    (llms/anthropic/common_utils.py); any other value falls through to the
+    ``x-api-key`` branch while the inbound Authorization is still merged in,
+    which would put two competing auth schemes on one upstream request.
+    """
+    selected: dict[str, str] = {}
+    authorization: str | None = None
+    for name, value in inbound.items():
+        lower = name.lower()
+        if lower == _CORP_AUTH_HEADER_LOWER:
+            continue
+        if lower in _ANTHROPIC_HEADER_ALLOWLIST:
+            selected[name] = value
+        if lower == "authorization":
+            authorization = value
+    if authorization is None or not authorization.lower().startswith("bearer "):
+        raise ValueError("missing bearer authorization")
+    bearer = authorization[7:].strip()
+    if not bearer or "\n" in authorization or "\r" in authorization:
+        raise ValueError("invalid bearer authorization")
+    if not bearer.startswith(_ANTHROPIC_OAUTH_TOKEN_PREFIX):
+        raise ValueError("authorization is not an anthropic oauth token")
+    return selected
+
+
 # litellm.types.utils.CallTypes values whose `input` field means raw
 # text/tokens to embed or score, NOT a Responses items list. This is a
 # DENYLIST, not an allowlist: `data["input"]` is treated as Responses-shaped
@@ -1761,10 +2035,10 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
 # synthesize. There is no reverse path for an audio response — a redacted
 # `input` would make the synthesized speech say the placeholder token aloud,
 # permanently (the `call_type="aspeech"` / `proxy_server.py:9440` routing was
-# verified in a scratch venv against a litellm 1.94.1 install — a version this
-# repo neither pins nor ships: `pyproject.toml` pins `litellm>=1.40,<2.0`,
-# helm/build-image ship v1.85.0, `docker/chatgpt-codex/Dockerfile` ships
-# v1.89.3).
+# verified in a scratch venv against a litellm 1.94.1 install; `pyproject.toml`
+# declares the floor `litellm>=1.40,<2.0` and every image now pins v1.95.0 —
+# `tests/litellm_hook/test_litellm_route_assumptions.py` re-checks these
+# call_type names against whichever litellm is installed).
 #
 # `pass_through_endpoint` (litellm's admin-configured arbitrary passthrough,
 # e.g. proxying to Voyage AI): the body shape is entirely backend-defined and

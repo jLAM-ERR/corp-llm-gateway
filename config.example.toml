@@ -69,6 +69,30 @@
 #   models): it forwards proxy_server_request headers (incl. Host) upstream,
 #   and an unknown vhost 503s the corp ingress. Off by default to preserve
 #   existing anthropic/openai routing behaviour.
+# CORP_LLM_FORWARD_ANTHROPIC_AUTH = "0"  # opt-in Anthropic subscription (OAuth) forwarding
+#   Lifts the developer's `sk-ant-oat…` bearer into the upstream Anthropic call,
+#   so no ANTHROPIC_API_KEY is needed on the laptop.
+#   SUPPORTED ONLY ON AN ANTHROPIC-ONLY DEPLOYMENT: a litellm config with no
+#   wildcard route (`model_name: "*"`) and no non-`anthropic/` route. That
+#   deployment shape is the binding control, NOT the code. The bridge does check
+#   that the request's model looks Anthropic, but it sees only the
+#   client-visible alias — litellm resolves the actual deployment after the
+#   hook runs — so the check is defence-in-depth, not a routing guarantee.
+#   On a multi-provider or wildcard stack a `claude-*` alias can still land on a
+#   non-Anthropic upstream and take the subscription token with it: enabling
+#   this flag there risks handing the credential to the wrong provider.
+#   MUTUALLY EXCLUSIVE with CORP_LLM_FORWARD_CHATGPT_AUTH: both consume the same
+#   inbound Authorization bearer, so setting both refuses to boot (and fails
+#   `gateway-admin config check`). Picking a bridge per provider is a v2 follow-up.
+# LITELLM_MASTER_KEY = ""   # litellm's own virtual-key switch — NOT a gateway knob
+#   Listed here only because it is INCOMPATIBLE with either bridge above: with a
+#   master key set, litellm reads the inbound Authorization header as one of its
+#   own virtual keys and answers 401 before pre_call runs, so the bridge never
+#   sees the developer's OAuth bearer. That pair refuses to boot and fails
+#   `gateway-admin config check`. A master key with both bridges off is fine.
+#   PRESENCE is what counts: litellm keeps a blank value and enables proxy auth
+#   for anything that is not unset, so `LITELLM_MASTER_KEY = ""` next to a bridge
+#   is refused too. Remove the line rather than blanking it.
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #

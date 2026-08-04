@@ -141,3 +141,107 @@ The gateway image mounts these onto LiteLLM's ASGI app (probes target them):
 
 `helm rollback gw <revision>` (`helm history gw`; Helm keeps the last 10). See
 `runbook.md`.
+
+## Developer laptop: Claude Code on an Anthropic subscription
+
+This runs `claude` through the gateway with **no `ANTHROPIC_API_KEY` anywhere** —
+the developer's own Max/Pro OAuth token pays for the upstream call.
+
+It runs on the `anthropic-oauth` docker-compose overlay only. Neither the Helm
+chart above nor production compose supports this route:
+
+- **Helm** routes `"*"` to the corp vLLM and has no `anthropic/` route at all,
+  so litellm's Anthropic OAuth branch is never reached — and that wildcard is
+  the one shape where a `claude-…` alias could carry the subscription token to
+  the wrong upstream.
+- **Production compose** already uses `Authorization` for litellm virtual keys.
+  Moving one of the two credentials to another header is an open decision, not a
+  missing feature.
+
+Both are blocked on the same header-layout decision. Until it is made,
+subscription auth and litellm virtual-key governance (budgets, rate limits,
+quotas) **cannot be used at the same time** — this overlay has no virtual keys.
+See `configuration.md` for the operator view and
+[`../security.md`](../security.md) §13 for what the bridge does and does not
+forward.
+
+1. **Start the overlay** (it sets `CORP_LLM_FORWARD_ANTHROPIC_AUTH=1` and swaps
+   in an Anthropic-only litellm config):
+
+   ```bash
+   cp -n .env.demo.example .env.demo     # CORP_LLM_ENDPOINT = the sanitization helper
+
+   grep LITELLM_MASTER_KEY .env.demo     # must print nothing — see the note below
+
+   docker compose \
+     -f docker-compose.demo.yml \
+     -f docker-compose.anthropic-oauth.yml \
+     up -d --build redis postgres litellm
+
+   curl -fsS http://127.0.0.1:4000/health/liveliness
+   ```
+
+2. **Point Claude Code at it.** Export your subscription token, then source the
+   profile's env snippet — it is the single place the corp-identity header layout
+   is written, and it unsets `ANTHROPIC_API_KEY` so a leftover key cannot shadow
+   the subscription:
+
+   ```bash
+   export ANTHROPIC_AUTH_TOKEN='sk-ant-oat...'
+   source docker/anthropic-oauth/claude-env.sh
+   claude
+   ```
+
+   `ANTHROPIC_AUTH_TOKEN` makes `claude` send `Authorization: Bearer <token>`;
+   the gateway lifts it onto the upstream Anthropic call. Corp identity travels
+   separately on `X-Corp-Auth` and is stripped before egress, so the two
+   credentials never collide.
+
+3. **Stop just this profile's stack:**
+
+   ```bash
+   docker compose \
+     -f docker-compose.demo.yml \
+     -f docker-compose.anthropic-oauth.yml \
+     stop litellm redis postgres
+   ```
+
+Notes:
+
+- Only `sk-ant-oat…` OAuth tokens are accepted. A plain `sk-ant-api…` key is
+  rejected with `401 E_PROVIDER_AUTH`: litellm would send it as `x-api-key`
+  while the inbound `Authorization` is still merged in, putting two competing
+  auth schemes on one upstream request.
+- `401 E_MISSING_TOKEN` instead means `X-Corp-Auth` never arrived — check
+  `echo "$ANTHROPIC_CUSTOM_HEADERS"` in the shell you launched `claude` from.
+- **`CORP_LLM_FORWARD_CHATGPT_AUTH` must be off.** Both bridges read the same
+  inbound `Authorization` bearer, so they are mutually exclusive: with both set
+  the gateway refuses to boot and `gateway-admin config check` fails. If you have
+  the Codex flag in `~/.corp-llm-gateway/config.toml` or in your environment,
+  turn it off before starting this overlay — the overlay itself only sets the
+  Anthropic one.
+- The overlay deliberately sets no `LITELLM_MASTER_KEY`. With one, litellm
+  consumes the inbound `Authorization` as a virtual key and rejects the request
+  before `pre_call` runs — so there are also no litellm virtual keys, and no
+  native budget or rate-limit enforcement, on this route.
+- **Restart the proxy to clear retained tokens.** litellm treats a per-request
+  `api_key` as a clientside credential and keeps one deployment per distinct
+  token — raw value included — in `Router.model_list` for the lifetime of the
+  process. Nothing evicts it. If a subscription token is rotated or believed
+  compromised, restart the `litellm` container; that is the only mitigation. The
+  same is true of the ChatGPT Codex overlay — this is not new behavior, just a
+  second place it applies. Details in [`../security.md`](../security.md) §13.
+- **`cp -n` keeps an existing `.env.demo`.** If you already have one from an
+  older stack and it carries `LITELLM_MASTER_KEY`, the copy step above is a
+  no-op and the demo stack passes that key straight into the litellm container
+  via `env_file:`. The container then **refuses to start** and logs
+  `invalid gateway configuration: - LITELLM_MASTER_KEY is set while a
+  subscription-auth bridge is on …`. Symptom: `docker compose up` never becomes
+  healthy and `curl http://127.0.0.1:4000/health/liveliness` gets a connection
+  refused. Fix: delete the line from `.env.demo` (or re-copy from
+  `.env.demo.example`) and bring the stack up again. The boot-time refusal is
+  deliberate — without it you would instead get an unexplained `401` on every
+  `claude` request. **Blanking the line is not enough**: `LITELLM_MASTER_KEY=`
+  with no value is still a set master key to litellm (it keeps the empty string
+  and enables proxy auth for any non-`None` value), so the gateway refuses that
+  too. Delete the line.

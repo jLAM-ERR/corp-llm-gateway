@@ -53,6 +53,7 @@ def test_all_keys_contains_core_and_new_knobs() -> None:
         "CORP_LLM_TESTDATA_ALLOWLIST",
         "CORP_LLM_TESTDATA_ALLOWLIST_FILE",
         "CORP_LLM_ORACLE_ENABLED",
+        "CORP_LLM_FORWARD_ANTHROPIC_AUTH",
     } <= keys
 
 
@@ -140,6 +141,159 @@ def test_validate_lenient_falsy_forms_disable_oracle(
     monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", falsy)
     result = config.validate()
     assert result.flag("CORP_LLM_ORACLE_ENABLED") is False
+
+
+# ── validate(): forward-auth bridges are mutually exclusive ──────────────────
+
+
+def test_forward_anthropic_auth_defaults_off(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    result = config.validate()
+    assert result.flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH") is False
+    assert result.flag("CORP_LLM_FORWARD_CHATGPT_AUTH") is False
+
+
+@pytest.mark.parametrize(
+    "chatgpt,anthropic",
+    [("1", "0"), ("0", "1"), ("0", "0"), ("1", ""), ("", "on")],
+)
+def test_validate_ok_unless_both_forward_auth_flags_are_on(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, chatgpt: str, anthropic: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", chatgpt)
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", anthropic)
+    assert isinstance(config.validate(), Settings)
+
+
+def test_validate_rejects_both_forward_auth_flags_with_the_shared_message(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+    assert settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE in exc.value.problems
+    # the message must say WHY it is a v1 limitation, not just that it is one.
+    assert "v2" in settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE
+
+
+@pytest.mark.parametrize("truthy", ["true", "yes", "on", "ON"])
+def test_validate_rejects_lenient_truthy_spellings_of_both_flags(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    # regression: a raw `== "1"` comparison would let these two bridges both boot.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", truthy)
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", truthy)
+    with pytest.raises(ConfigError, match="mutually"):
+        config.validate()
+
+
+def test_forward_auth_conflict_is_the_single_shared_rule() -> None:
+    assert settings.forward_auth_conflict(chatgpt=True, anthropic=True) == (
+        settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE
+    )
+    assert settings.forward_auth_conflict(chatgpt=True, anthropic=False) is None
+    assert settings.forward_auth_conflict(chatgpt=False, anthropic=True) is None
+    assert settings.forward_auth_conflict(chatgpt=False, anthropic=False) is None
+
+
+# ── validate(): a litellm master key cancels either bridge ───────────────────
+
+
+def test_validate_rejects_a_master_key_next_to_the_anthropic_bridge(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+
+    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc.value.problems
+    # the message must name the symptom (a 401 before pre_call), not just the rule.
+    assert "401" in settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE
+    # and must never echo the key it rejects.
+    assert "master-key-fixture" not in str(exc.value)
+
+
+def test_validate_rejects_a_master_key_next_to_the_chatgpt_bridge(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "on")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY"):
+        config.validate()
+
+
+@pytest.mark.parametrize("master_key", ["", "   "])
+def test_validate_rejects_a_blank_master_key_next_to_a_bridge(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, master_key: str
+) -> None:
+    # litellm does NOT ignore a blank master key: `get_secret_str` returns '' /
+    # '   ' verbatim and proxy auth is skipped only for `master_key is None`, so
+    # `LITELLM_MASTER_KEY=` in a .env still 401s the developer's bearer before
+    # pre_call. Presence is the rule, emptiness buys nothing.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", master_key)
+
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+
+    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc.value.problems
+
+
+def test_validate_accepts_an_absent_master_key_next_to_a_bridge(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+
+    assert isinstance(config.validate(), Settings)
+
+
+@pytest.mark.parametrize("master_key", ["", "   "])
+def test_validate_allows_a_blank_master_key_when_no_bridge_is_on(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, master_key: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", master_key)
+
+    assert isinstance(config.validate(), Settings)
+
+
+def test_validate_allows_a_master_key_when_no_bridge_is_on(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A plain litellm deploy with virtual keys and no subscription bridge is fine.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+
+    assert isinstance(config.validate(), Settings)
+
+
+def test_master_key_is_registered_as_a_secret_so_config_check_redacts_it() -> None:
+    assert "LITELLM_MASTER_KEY" in settings.all_keys()
+    assert settings.is_secret("LITELLM_MASTER_KEY")
+
+
+def test_master_key_conflict_is_the_single_shared_rule() -> None:
+    message = settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE
+    assert settings.master_key_conflict(master_key="k", chatgpt=True, anthropic=False) == message
+    assert settings.master_key_conflict(master_key="k", chatgpt=False, anthropic=True) == message
+    assert settings.master_key_conflict(master_key="k", chatgpt=False, anthropic=False) is None
+    assert settings.master_key_conflict(master_key=None, chatgpt=False, anthropic=True) is None
+    # Set-but-blank is set: litellm enables proxy auth for any non-None value.
+    assert settings.master_key_conflict(master_key="", chatgpt=False, anthropic=True) == message
+    assert settings.master_key_conflict(master_key="   ", chatgpt=False, anthropic=True) == message
 
 
 # ── validate(): malformed choices ────────────────────────────────────────────

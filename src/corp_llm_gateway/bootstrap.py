@@ -50,7 +50,13 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     ProfileAwareOrchestrator,
     build_inner_orchestrator,
 )
-from corp_llm_gateway.settings import NO_OP_SANITIZER_MESSAGE, ConfigError, parse_flag
+from corp_llm_gateway.settings import (
+    NO_OP_SANITIZER_MESSAGE,
+    ConfigError,
+    forward_auth_conflict,
+    master_key_conflict,
+    parse_flag,
+)
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import (
     InMemoryTeamConfigStore,
@@ -216,6 +222,37 @@ def _build_dlp_guard() -> DlpEgressGuard:
     return DlpEgressGuard(canary_patterns=canaries or None, secret_rescan=True)
 
 
+def _warn_on_disarmed_forward_auth_conflict(
+    *,
+    configured_chatgpt: bool,
+    configured_anthropic: bool,
+    resolved_chatgpt: bool,
+    resolved_anthropic: bool,
+) -> None:
+    # An explicit kwarg legally resolves a both-flags-on config down to one live
+    # bridge, but the deployment config stays broken and `config check` still
+    # refuses it — say so instead of diverging silently.
+    if forward_auth_conflict(chatgpt=configured_chatgpt, anthropic=configured_anthropic) is None:
+        return
+    disarmed = " and ".join(
+        name
+        for name, live in (
+            ("CORP_LLM_FORWARD_CHATGPT_AUTH", resolved_chatgpt),
+            ("CORP_LLM_FORWARD_ANTHROPIC_AUTH", resolved_anthropic),
+        )
+        if not live
+    )
+    _log.warning(
+        "CORP_LLM_FORWARD_CHATGPT_AUTH and CORP_LLM_FORWARD_ANTHROPIC_AUTH are both enabled in "
+        "config, which is mutually exclusive; an explicit build_guardrail() kwarg disarmed %s for "
+        "this process, so the running gateway disagrees with its own config. "
+        "`gateway-admin config check` still rejects this config — turn %s off in the deployment "
+        "config.",
+        disarmed,
+        disarmed,
+    )
+
+
 def build_guardrail(
     *,
     auth_middleware: AuthMiddleware | None = None,
@@ -227,6 +264,7 @@ def build_guardrail(
     max_output_tokens_cap: int | None = None,
     strip_inbound_headers_to_upstream: bool | None = None,
     forward_chatgpt_auth: bool | None = None,
+    forward_anthropic_auth: bool | None = None,
 ) -> CorpLlmGuardrail:
     """Assemble a `CorpLlmGuardrail` from config, with optional dep overrides.
 
@@ -244,6 +282,53 @@ def build_guardrail(
     at import — so a version-incompatible extension is refused before the
     guardrail serves any traffic.
     """
+    # Unlike max_output_tokens_cap (a call-site-only policy toggle with no
+    # corresponding env var), these three are documented as operator-settable
+    # cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH / CORP_LLM_FORWARD_ANTHROPIC_AUTH
+    # / CORP_LLM_STRIP_INBOUND_HEADERS) — a plain `bool = False` default would
+    # silently override the env var in every real deploy, so only resolve from
+    # config when the caller left the kwarg unset.
+    configured_forward_chatgpt_auth = _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
+    configured_forward_anthropic_auth = _flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0")
+    resolved_forward_chatgpt_auth = (
+        forward_chatgpt_auth
+        if forward_chatgpt_auth is not None
+        else configured_forward_chatgpt_auth
+    )
+    resolved_forward_anthropic_auth = (
+        forward_anthropic_auth
+        if forward_anthropic_auth is not None
+        else configured_forward_anthropic_auth
+    )
+    # Independent of the chatgpt/anthropic pair: not part of their mutual exclusivity.
+    resolved_strip_inbound_headers_to_upstream = (
+        strip_inbound_headers_to_upstream
+        if strip_inbound_headers_to_upstream is not None
+        else _flag("CORP_LLM_STRIP_INBOUND_HEADERS", "0")
+    )
+    # Same reason as the no-op-sanitizer floor below: settings.validate() covers
+    # `config check` only, and the compose/demo boots these bridges ship on skip it.
+    # Checked before anything is constructed so a config conflict is what the
+    # operator sees, not a downstream failure of a component we should not have
+    # started building.
+    conflict = forward_auth_conflict(
+        chatgpt=resolved_forward_chatgpt_auth, anthropic=resolved_forward_anthropic_auth
+    )
+    if conflict is not None:
+        raise ConfigError([conflict])
+    master_key_problem = master_key_conflict(
+        master_key=config.get("LITELLM_MASTER_KEY"),
+        chatgpt=resolved_forward_chatgpt_auth,
+        anthropic=resolved_forward_anthropic_auth,
+    )
+    if master_key_problem is not None:
+        raise ConfigError([master_key_problem])
+    _warn_on_disarmed_forward_auth_conflict(
+        configured_chatgpt=configured_forward_chatgpt_auth,
+        configured_anthropic=configured_forward_anthropic_auth,
+        resolved_chatgpt=resolved_forward_chatgpt_auth,
+        resolved_anthropic=resolved_forward_anthropic_auth,
+    )
     auth = auth_middleware if auth_middleware is not None else make_auth_middleware()
     store = mapping_store if mapping_store is not None else build_mapping_store()
     oracle_enabled = _flag("CORP_LLM_ORACLE_ENABLED")
@@ -274,22 +359,6 @@ def build_guardrail(
     register_sink(REGISTRY, active_sink, sink_name_for(active_sink))
     REGISTRY.validate_api_version(EXTENSION_API_VERSION)
     audit_logger = AuditLogger(active_sink, gateway_version=gateway_version())
-    # Unlike max_output_tokens_cap (a call-site-only policy toggle with no
-    # corresponding env var), forward_chatgpt_auth and
-    # strip_inbound_headers_to_upstream are documented as operator-settable
-    # cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH / CORP_LLM_STRIP_INBOUND_HEADERS)
-    # — a plain bool default would silently override the env var in every real
-    # deploy, so only resolve from config when the caller left the kwarg unset.
-    resolved_forward_chatgpt_auth = (
-        forward_chatgpt_auth
-        if forward_chatgpt_auth is not None
-        else _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
-    )
-    resolved_strip_inbound_headers_to_upstream = (
-        strip_inbound_headers_to_upstream
-        if strip_inbound_headers_to_upstream is not None
-        else _flag("CORP_LLM_STRIP_INBOUND_HEADERS", "0")
-    )
     return CorpLlmGuardrail(
         orchestrator,
         auth,
@@ -297,6 +366,7 @@ def build_guardrail(
         max_output_tokens_cap=max_output_tokens_cap,
         strip_inbound_headers_to_upstream=resolved_strip_inbound_headers_to_upstream,
         forward_chatgpt_auth=resolved_forward_chatgpt_auth,
+        forward_anthropic_auth=resolved_forward_anthropic_auth,
         dlp_guard=dlp_guard if dlp_guard is not None else _build_dlp_guard(),
         metrics=get_exporter(),
     )

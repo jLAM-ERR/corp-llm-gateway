@@ -95,6 +95,23 @@ config file like every other gateway setting (see
 compose overlay above. Setting it via a Helm value / k8s env var enables the
 same header bridge on a real cluster deployment — no code change needed.
 
+Two constraints apply wherever you set it:
+
+- **`LITELLM_MASTER_KEY` must be unset.** With a master key, litellm reads the
+  inbound `Authorization` as one of its own virtual keys and answers `401`
+  before `pre_call` runs, so the bridge could never see the Codex token. The
+  gateway now **refuses to boot** on that combination rather than serving
+  unexplained 401s. Presence counts, not truthiness — remove the line, do not
+  blank it.
+- **Mutually exclusive with `CORP_LLM_FORWARD_ANTHROPIC_AUTH`.** Both bridges
+  read the same inbound bearer; setting both refuses to boot and fails
+  `gateway-admin config check`.
+
+Note also that litellm retains one deployment per distinct per-request
+`api_key` — raw value included — for the lifetime of the proxy process, with no
+eviction. Restarting the process is the only way to clear them. See
+[`security.md`](security.md) §13.
+
 ## Troubleshooting
 
 ```bash

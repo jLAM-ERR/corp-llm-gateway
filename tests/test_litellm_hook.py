@@ -1393,8 +1393,44 @@ async def test_pre_call_chatgpt_auth_bridge_reads_litellm_secret_headers() -> No
     assert "X-Corp-Auth" not in out["secret_fields"]["raw_headers"]
 
 
-async def test_pre_call_chatgpt_auth_bridge_requires_bearer() -> None:
+async def test_pre_call_chatgpt_auth_bridge_scrubs_litellm_logging_object_metadata() -> None:
+    """The bridge's `data.pop("metadata")` is not enough: litellm builds its
+    logging object before invoking this hook and keeps the request metadata in
+    `model_call_details["litellm_params"]`, from where every configured logging
+    callback still reads it (invariant 1, logger surface)."""
+
+    class _LoggingObj:
+        def __init__(self) -> None:
+            self.model_call_details: dict[str, Any] = {
+                "user": "alice@corp.example",
+                "litellm_params": {
+                    "metadata": {"user_id": "alice@corp.example"},
+                    "user": "alice@corp.example",
+                    "api_base": "https://chatgpt.example",
+                },
+            }
+
     g, _ = _build_guardrail(forward_chatgpt_auth=True)
+    logging_obj = _LoggingObj()
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "metadata": {"user_id": "alice@corp.example"},
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth-value"},
+        "litellm_logging_obj": logging_obj,
+    }
+
+    await g.pre_call(data)
+
+    details = logging_obj.model_call_details
+    assert "metadata" not in details["litellm_params"]
+    assert "user" not in details["litellm_params"]
+    assert "user" not in details
+    assert details["litellm_params"]["api_base"] == "https://chatgpt.example"
+
+
+async def test_pre_call_chatgpt_auth_bridge_requires_bearer() -> None:
+    g, sink = _build_guardrail(forward_chatgpt_auth=True)
     data = {
         "model": "gpt-5.6-sol",
         "input": "hello",
@@ -1406,6 +1442,16 @@ async def test_pre_call_chatgpt_auth_bridge_requires_bearer() -> None:
 
     assert ei.value.status_code == 401
     assert ei.value.error_code == "E_PROVIDER_AUTH"
+    # Corp auth succeeded before the bridge ran, so the rejection is
+    # attributable to the developer and team rather than audited as "unknown".
+    assert len(sink.records) == 1
+    rec = sink.records[0]
+    assert rec["status"] == "failed"
+    assert rec["error_code"] == "E_PROVIDER_AUTH"
+    assert rec["user_id"] == "alice"
+    assert rec["team_id"] == "t1"
+    assert rec["provider"] == "openai"
+    assert rec["model"] == "gpt-5.6-sol"
 
 
 async def test_pre_call_invalid_token_rejected() -> None:

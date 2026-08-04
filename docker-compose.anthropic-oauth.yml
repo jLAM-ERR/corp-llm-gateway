@@ -1,0 +1,26 @@
+# Overlay for docker-compose.demo.yml. It keeps the existing sanitization helper
+# (CORP_LLM_ENDPOINT) but sends the sanitized request to api.anthropic.com using
+# the developer's own subscription OAuth token — no ANTHROPIC_API_KEY anywhere.
+#
+# It overlays the demo stack specifically because that stack sets no
+# LITELLM_MASTER_KEY (see docker-compose.demo.yml, the NOTE above `env_file`).
+# With a master key litellm consumes the inbound Authorization header as one of
+# its own virtual keys and rejects the request before pre_call ever runs, so the
+# OAuth bearer would never reach the bridge. Do not add one here.
+#
+# The demo stack's `env_file: .env.demo` is developer-owned and git-ignored, so a
+# master key can still arrive from there. It is NOT neutralised here on purpose:
+# an override would silence the mistake. build_guardrail() refuses to boot with a
+# master key while a bridge is on (settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE),
+# so the container dies with a named cause instead of serving 401s.
+
+services:
+  litellm:
+    build:
+      context: .
+      dockerfile: docker/anthropic-oauth/Dockerfile
+    image: corp-llm-gateway-anthropic-oauth:local
+    volumes:
+      - ./docker/anthropic-oauth/litellm-config.yaml:/etc/litellm/config.yaml:ro
+    environment:
+      CORP_LLM_FORWARD_ANTHROPIC_AUTH: "1"

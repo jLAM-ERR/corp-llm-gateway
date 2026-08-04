@@ -32,7 +32,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 1.2 GB litellm image pull for tests/integration/test_anthropic_oauth_outbound.py
+    # on top of the unit suite.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,4 +49,11 @@ jobs:
       # Model wheel version mirrors Dockerfile.gateway's EN_MODEL_VERSION default
       # and build-image.yml's default (3.8.0) — keep all three in sync.
       - run: pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl
+      # CORP_REQUIRE_PROXY_CAPTURE turns the docker/image/reachability skips in
+      # tests/integration/test_anthropic_oauth_outbound.py into failures. Without
+      # it a daemon, registry or network fault produces a green job that verified
+      # none of the outbound headers, body, streaming, retention or proxy stdout.
+      # Asserted from the suite itself, so a dropped var fails the run.
       - run: PYTHONPATH=src pytest tests/ -q
+        env:
+          CORP_REQUIRE_PROXY_CAPTURE: "1"

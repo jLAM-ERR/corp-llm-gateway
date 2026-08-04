@@ -1,0 +1,35 @@
+model_list:
+  # ANTHROPIC-ONLY BY DESIGN — do not add a second route here.
+  #
+  # CORP_LLM_FORWARD_ANTHROPIC_AUTH lifts the developer's `sk-ant-oat…` bearer
+  # into the per-request api_key. The guardrail gates that on the client-visible
+  # model alias, but litellm resolves the actual deployment AFTER the hook runs,
+  # so the alias gate cannot prove where the request lands. The binding control
+  # is this file: every route is `anthropic/`, and there is no `model_name: "*"`
+  # catch-all, so no alias can carry the subscription token to another provider.
+  # tests/test_anthropic_oauth_profile.py pins both properties.
+  - model_name: "claude-*"
+    litellm_params:
+      model: "anthropic/claude-*"
+      # AnthropicConfig refuses to boot a deployment with neither api_key nor
+      # auth_token. The guardrail replaces this with the developer's OAuth token
+      # per request, before litellm builds the upstream Authorization header.
+      # Deliberately NOT `sk-ant-oat…`-shaped: if the bridge is off or rejects
+      # the request, this must fail upstream rather than look like a real token.
+      api_key: "oauth-passthrough-placeholder"
+
+litellm_settings:
+  # _demo_guardrail, NOT bootstrap: it seeds `demo-team-token` into an in-memory
+  # token store, whereas bootstrap's make_auth_middleware() reads CORP_LLM_PG_DSN
+  # — which the demo compose does not set (it sets POSTGRES_DSN). With bootstrap
+  # the store is empty and every `X-Corp-Auth: demo-team-token` request 401s
+  # before it reaches the OAuth bridge. It also carries the demo's
+  # strip_inbound_headers_to_upstream=True.
+  callbacks: ["corp_llm_gateway._demo_guardrail.guardrail"]
+  # Claude Code sends modern Anthropic params some upstream models don't accept
+  # yet; drop unsupported params rather than 400-ing the request.
+  drop_params: true
+  json_logs: true
+
+router_settings:
+  set_verbose: false
