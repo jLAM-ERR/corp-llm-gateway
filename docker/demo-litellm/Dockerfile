@@ -1,4 +1,4 @@
-# Demo-only image: litellm v1.85 + the corp-llm-gateway `ner` extra baked in
+# Demo-only image: litellm v1.95 + the corp-llm-gateway `ner` extra baked in
 # (Natasha RU + spaCy EN + en_core_web_md), so the demo runs FULL bilingual NER
 # (ФИО / organisations) instead of lazily degrading to the regex floor.
 #
@@ -6,7 +6,7 @@
 # resolves and coexists with litellm's numpy/pydantic without downgrading them.
 # The spaCy EN model is a py3-none-any wheel fetched by URL (it is not on PyPI by
 # name, and `python -m spacy download` needs a pip the uv image may lack).
-FROM ghcr.io/berriai/litellm:v1.85.0
+FROM ghcr.io/berriai/litellm:v1.95.0
 
 # litellm's /app/.venv is a uv venv with NO pip — bootstrap it first (the demo's
 # runtime `command` does the same via ensurepip before installing the project).

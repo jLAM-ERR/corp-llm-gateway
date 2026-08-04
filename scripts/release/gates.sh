@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # .github/workflows/build-image.yml is the source of truth for this pin — keep in sync.
-LITELLM_VERSION="v1.85.0"
+LITELLM_VERSION="v1.95.0"
 
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; exit 1; }

@@ -4,7 +4,14 @@
 #
 # Base must ship Python >=3.12 (the wheel is `requires-python >=3.12`). Override
 # the pin at build time: --build-arg LITELLM_VERSION=v1.40.x
-ARG LITELLM_VERSION=main-stable
+#
+# Pinned, not floating: `main-stable` moves under released tags, so two builds of
+# the same commit could ship different proxies. v1.95.0 is the latest stable —
+# `v1.95.0`, `main-stable` and `latest` resolve to byte-identical manifests
+# (verified 2026-08-04). Keep in sync with .github/workflows/build-image.yml,
+# scripts/release/gates.sh and the docker/*/Dockerfile demo profiles; the
+# previous pins and the rollback recipe are in docs/ops/upgrade.md.
+ARG LITELLM_VERSION=v1.95.0
 
 FROM python:3.12-slim AS build
 WORKDIR /build

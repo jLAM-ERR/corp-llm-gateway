@@ -34,7 +34,7 @@ services:
       retries: 5
 
   litellm:
-    # Demo image = litellm v1.85 + the `ner` extra baked in (see
+    # Demo image = litellm v1.95 + the `ner` extra baked in (see
     # docker/demo-litellm/Dockerfile) so bilingual NER runs instead of degrading.
     build:
       context: .
