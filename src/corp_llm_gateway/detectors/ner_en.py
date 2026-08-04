@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.detectors.base import Finding, PIIDetector, package_version
+
+_EN_MODEL = "en_core_web_md"
 
 _EN_LABEL_MAP: dict[str, str] = {
     "PERSON": "PERSON",
@@ -43,10 +45,10 @@ def _load_spacy() -> object:
     except ImportError as exc:
         raise RuntimeError("ner_en requires the 'ner' extra: pip install -e '.[ner]'") from exc
     try:
-        _spacy_nlp = spacy.load("en_core_web_md")
+        _spacy_nlp = spacy.load(_EN_MODEL)
     except OSError as exc:
         raise RuntimeError(
-            "spaCy model 'en_core_web_md' not installed; "
+            f"spaCy model {_EN_MODEL!r} not installed; "
             "install via its wheel URL (see pyproject.toml ner extra)"
         ) from exc
     return _spacy_nlp
@@ -81,6 +83,21 @@ class EnNerDetector(PIIDetector):
     text[start_char:end_char] == ent.text.
     Score is fixed at 0.8 (probabilistic model — not a hard rule).
     """
+
+    def policy_signature(self) -> tuple[str, ...]:
+        """Whether this process can actually run EN NER, plus spaCy + model versions.
+
+        Loading is FORCED here for the same reason as ner_ru: ``_load_spacy``
+        latches ``_spacy_tried``, so the answer cannot change after the Cache-A
+        key has been written.
+        """
+        try:
+            nlp = _load_spacy()
+        except RuntimeError:
+            return ("en_ner:none",)
+        meta = getattr(nlp, "meta", None)
+        model_version = meta.get("version", "unknown") if isinstance(meta, dict) else "unknown"
+        return (f"en_ner:spacy:{package_version('spacy')}:{_EN_MODEL}:{model_version}",)
 
     async def detect(self, text: str) -> list[Finding]:
         if not text.strip():
