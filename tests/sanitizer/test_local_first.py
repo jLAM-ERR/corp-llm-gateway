@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
@@ -13,6 +14,7 @@ from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.local_pass import LocalDetectionPass
 from corp_llm_gateway.sanitizer.orchestrator import _merge_local
+from corp_llm_gateway.sanitizer.segmenter import SegmentKind, split_segments
 from corp_llm_gateway.storage import InMemoryMappingStore
 
 
@@ -96,6 +98,140 @@ async def test_local_pass_deduplicates_overlapping() -> None:
     findings = await lp.findings("alice")
     assert len(findings) == 1
     assert findings[0].text == "alice"
+
+
+# ---- batch seam (B3) -------------------------------------------------------
+
+_BATCH_TEXT = "alpha beta\n```py\nx = 1  # note alice\n```\ncontact bob here"
+
+
+class _BatchDetector(PIIDetector):
+    """Batch-capable fake: findings keyed by the exact text handed to it."""
+
+    def __init__(self, per_text: dict[str, list[Finding]] | None = None) -> None:
+        self._per_text = per_text or {}
+        self.batch_calls: list[list[str]] = []
+        self.detect_calls: list[str] = []
+
+    async def detect(self, text: str) -> list[Finding]:
+        self.detect_calls.append(text)
+        return list(self._per_text.get(text, []))
+
+    async def detect_batch(self, texts: list[str]) -> list[list[Finding]]:
+        self.batch_calls.append(list(texts))
+        return [list(self._per_text.get(t, [])) for t in texts]
+
+
+def _segment_of(text: str, needle: str) -> tuple[int, int]:
+    """Return (segment start, offset of *needle* inside that segment)."""
+    idx = text.index(needle)
+    seg = next(s for s in split_segments(text) if s.start <= idx < s.end)
+    return seg.start, idx - seg.start
+
+
+async def test_local_pass_batch_offsets_corrected_to_absolute() -> None:
+    """Batch findings carry segment-relative offsets and must be re-based."""
+    seg_start, rel = _segment_of(_BATCH_TEXT, "bob")
+    assert seg_start > 0, "fixture must use a segment that does not start at 0"
+    seg_text = _BATCH_TEXT[seg_start : seg_start + len("\ncontact bob here")]
+    det = _BatchDetector({seg_text: [Finding("bob", "PERSON", rel, rel + 3, 0.9)]})
+
+    findings = await LocalDetectionPass([det]).findings(_BATCH_TEXT)
+
+    assert len(det.batch_calls) == 1, "one batched call for all eligible segments"
+    assert det.detect_calls == [], "batch-capable detector must not be called per segment"
+    f = next(f for f in findings if f.label == "PERSON")
+    assert f.start == _BATCH_TEXT.index("bob")
+    assert _BATCH_TEXT[f.start : f.end] == f.text
+
+
+async def test_local_pass_batch_sends_every_segment_by_default() -> None:
+    det = _BatchDetector()
+    await LocalDetectionPass([det]).findings(_BATCH_TEXT)
+    assert det.batch_calls == [[s.text for s in split_segments(_BATCH_TEXT)]]
+
+
+async def test_local_pass_batch_skips_code_when_not_code_safe() -> None:
+    """PROSE + COMMENT only, expressed through code_safe_detectors (corp NER)."""
+    det = _BatchDetector()
+    regex = RegexChecksumDetector()
+    lp = LocalDetectionPass([det, regex], code_safe_detectors=[regex])
+
+    await lp.findings(_BATCH_TEXT)
+
+    assert len(det.batch_calls) == 1
+    sent = det.batch_calls[0]
+    segments = split_segments(_BATCH_TEXT)
+    assert sent == [s.text for s in segments if s.kind is not SegmentKind.CODE]
+    assert "# note alice" in sent, "COMMENT segments stay in scope"
+    assert "x = 1  " not in sent, "CODE segments must not reach the batch detector"
+
+
+async def test_local_pass_batch_and_sequential_detectors_merge() -> None:
+    inn = "7707083893"
+    text = f"{_BATCH_TEXT} ИНН {inn}"
+    seg = next(s for s in split_segments(text) if s.start <= text.index("bob") < s.end)
+    rel = text.index("bob") - seg.start
+    batch = _BatchDetector({seg.text: [Finding("bob", "PERSON", rel, rel + 3, 0.9)]})
+    lp = LocalDetectionPass([batch, RegexChecksumDetector()])
+
+    findings = await lp.findings(text)
+
+    texts = {f.text for f in findings}
+    assert len(batch.batch_calls) == 1 and batch.detect_calls == []
+    assert "bob" in texts, "batched detector contributes"
+    assert inn in texts, "per-segment detector still runs"
+    for f in findings:
+        assert text[f.start : f.end] == f.text
+
+
+async def test_local_pass_batch_result_dedupes_against_sequential() -> None:
+    """Overlapping batch + per-segment findings collapse in the same pass."""
+    text = "alice"
+    batch = _BatchDetector({text: [Finding("alic", "PERSON", 0, 4, 0.5)]})
+    sequential = _StaticFindingDetector([Finding("alice", "PERSON", 0, 5, 0.9)])
+    lp = LocalDetectionPass([batch, sequential])
+
+    findings = await lp.findings(text)
+
+    assert len(findings) == 1
+    assert findings[0].text == "alice"
+
+
+async def test_local_pass_batch_not_called_for_empty_text() -> None:
+    det = _BatchDetector()
+    assert await LocalDetectionPass([det]).findings("") == []
+    assert det.batch_calls == []
+
+
+class _MiscountingBatchDetector(_BatchDetector):
+    async def detect_batch(self, texts: list[str]) -> list[list[Finding]]:
+        self.batch_calls.append(list(texts))
+        return [[] for _ in texts][:-1]
+
+
+class _OutOfRangeBatchDetector(_BatchDetector):
+    async def detect_batch(self, texts: list[str]) -> list[list[Finding]]:
+        self.batch_calls.append(list(texts))
+        return [[Finding("x", "PERSON", 0, len(t) + 1, 1.0)] for t in texts]
+
+
+async def test_local_pass_batch_length_mismatch_fails_closed() -> None:
+    with pytest.raises(ValueError, match="detect_batch"):
+        await LocalDetectionPass([_MiscountingBatchDetector()]).findings(_BATCH_TEXT)
+
+
+async def test_local_pass_batch_out_of_range_offset_fails_closed() -> None:
+    with pytest.raises(ValueError, match="offset"):
+        await LocalDetectionPass([_OutOfRangeBatchDetector()]).findings("alice bob")
+
+
+async def test_local_pass_batch_error_message_has_no_user_text() -> None:
+    """M1-14: a protocol violation must not put user content in the exception."""
+    secret = "s3cret-passphrase"
+    with pytest.raises(ValueError) as exc:
+        await LocalDetectionPass([_OutOfRangeBatchDetector()]).findings(secret)
+    assert secret not in str(exc.value)
 
 
 # ---- _merge_local unit tests -----------------------------------------------
