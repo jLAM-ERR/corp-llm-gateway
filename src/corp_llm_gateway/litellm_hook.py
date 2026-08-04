@@ -106,6 +106,18 @@ try:
 except ImportError:  # pragma: no cover
     _LitellmCustomLogger = object  # type: ignore[assignment,misc]
 
+# litellm selects its Anthropic OAuth branch by testing the api_key against
+# ANTHROPIC_OAUTH_TOKEN_PREFIX (litellm/types/llms/anthropic.py, consumed by
+# llms/anthropic/common_utils.py). `_anthropic_upstream_headers` must gate on the
+# SAME value, so read it from the installed litellm rather than keep a copy.
+# Optional for the same reason as the import above.
+try:
+    from litellm.types.llms.anthropic import (
+        ANTHROPIC_OAUTH_TOKEN_PREFIX as _LITELLM_ANTHROPIC_OAUTH_TOKEN_PREFIX,
+    )
+except ImportError:  # pragma: no cover
+    _LITELLM_ANTHROPIC_OAUTH_TOKEN_PREFIX = None
+
 logger = logging.getLogger(__name__)
 
 # Cap on the audit-idempotency set (bounded FIFO). The two possible audit() calls
@@ -1609,10 +1621,26 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
     return selected
 
 
-# Mirrors litellm's ANTHROPIC_OAUTH_TOKEN_PREFIX (litellm/types/llms/anthropic.py).
-# Copied rather than imported so this module stays importable without litellm;
-# tests/litellm_hook/test_anthropic_upstream_headers.py pins the two values together.
-_ANTHROPIC_OAUTH_TOKEN_PREFIX = "sk-ant-oat"
+# Last-resort value for installs without litellm (e.g. the local 3.14 venv). A
+# stale copy is a credential-path hazard: a token that clears this prefix but not
+# litellm's own would reach upstream through litellm's `x-api-key` branch, i.e.
+# two competing auth schemes on one request — the exact failure the selector
+# exists to prevent. Source of truth stays litellm/types/llms/anthropic.py, which
+# the resolver below prefers whenever it is importable, and which the drift test
+# pins this literal to.
+_ANTHROPIC_OAUTH_TOKEN_PREFIX_FALLBACK = "sk-ant-oat"
+
+
+def _resolve_anthropic_oauth_prefix() -> str:
+    resolved = _LITELLM_ANTHROPIC_OAUTH_TOKEN_PREFIX
+    # An empty or non-str prefix makes `startswith` always true, which would turn
+    # the OAuth-only gate into a pass-through.
+    if isinstance(resolved, str) and resolved:
+        return resolved
+    return _ANTHROPIC_OAUTH_TOKEN_PREFIX_FALLBACK
+
+
+_ANTHROPIC_OAUTH_TOKEN_PREFIX = _resolve_anthropic_oauth_prefix()
 
 _ANTHROPIC_HEADER_ALLOWLIST = frozenset(
     {
