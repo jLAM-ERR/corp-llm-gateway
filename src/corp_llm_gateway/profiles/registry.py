@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from corp_llm_gateway import config
-from corp_llm_gateway.corp_ner import CorpNerClient
+from corp_llm_gateway.corp_ner import resolve_corp_ner_transport
 from corp_llm_gateway.detectors.corp_ner import CorpNerDetector
 from corp_llm_gateway.detectors.dual_ner import DualNerDetector
 from corp_llm_gateway.detectors.ner_en import EnNerDetector
@@ -40,7 +40,10 @@ def _make_corp_ner(cfg: Mapping[str, Any]) -> PIIDetector:
             "detector 'corp_ner' needs an endpoint: set CORP_NER_ENDPOINT or "
             "corp_ner_endpoint in the profile bundle config"
         )
-    return CorpNerDetector(CorpNerClient(endpoint))
+    # Same transport reader as bootstrap.build_corp_ner: reading the CA bundle,
+    # timeout and batch limits here too is what kept CORP_NER_CA_BUNDLE from
+    # being silently dropped on this path.
+    return CorpNerDetector(resolve_corp_ner_transport().client(endpoint))
 
 
 # Eager dict literal is safe: values are factory callables, not detectors —
