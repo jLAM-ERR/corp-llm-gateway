@@ -1,0 +1,32 @@
+# OPTIONAL SIEM forwarder. NOT loaded by default — the vector service in
+# compose/docker-compose.yml passes this file to `vector --config` only when
+# CORP_AUDIT_SIEM_ENABLED=1. The corp SIEM endpoint and its auth scheme are
+# still an open item, so this ships OFF and unconfigured: CORP_AUDIT_SIEM_URL
+# has no default, and enabling the sink without it fails Vector at boot rather
+# than posting audit records somewhere unintended.
+#
+# `audit_only` is downstream of `never_fields_gate`, so this sink inherits the
+# NEVER-fields gate (invariant #2). Do not point it at an upstream transform.
+#
+# When the endpoint is confirmed: add the auth block the SIEM requires (an
+# `auth:` block with strategy bearer, or a `request.headers` entry) — always
+# reading an env var, never a literal in this file. Do not name that env var in
+# a comment either: Vector interpolates env-var references inside comments too,
+# so an unset variable mentioned here fails config load.
+
+sinks:
+  siem:
+    type: http
+    inputs: ["audit_only"]
+    uri: "${CORP_AUDIT_SIEM_URL}"
+    method: post
+    encoding:
+      codec: json
+    request:
+      retry_attempts: 4294967295
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 60
+    buffer:
+      type: disk
+      max_size: ${CORP_VECTOR_SIEM_BUFFER_BYTES:-1073741824}
+      when_full: block

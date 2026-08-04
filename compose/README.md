@@ -8,10 +8,11 @@ A production deploy target for non-k8s hosts, alongside `helm/corp-llm-gateway/`
   token/team-config store, plus litellm's own virtual-key/UI database);
 - **self-hosted Langfuse v3** — `langfuse-web`, `langfuse-worker`,
   `langfuse-postgres`, `clickhouse`, `minio`, `minio-init` and
-  `langfuse-redis`, publishing no host port (see "Langfuse" below).
+  `langfuse-redis`, publishing no host port (see "Langfuse" below);
+- the **audit pipeline** — `vector`, which tails the gateway's stdout and
+  forwards audit records to Langfuse (see "Audit pipeline" below).
 
-The production Vector config and the optional nginx front door land in later
-revisions of this stack — see
+The optional nginx front door lands in a later revision of this stack — see
 `docs/plans/20260802-production-compose-corp-ner.md` for the full build order.
 
 ## Quickstart
@@ -22,9 +23,11 @@ cp .env.example .env
 chmod 0600 .env
 # edit .env: GATEWAY_IMAGE_TAG, POSTGRES_PASSWORD, LITELLM_MASTER_KEY,
 # UI_USERNAME, UI_PASSWORD, at least one of ANTHROPIC_API_KEY/OPENAI_API_KEY,
-# and the Langfuse secrets (LANGFUSE_POSTGRES_PASSWORD,
+# the Langfuse secrets (LANGFUSE_POSTGRES_PASSWORD,
 # LANGFUSE_CLICKHOUSE_PASSWORD, MINIO_ROOT_PASSWORD, LANGFUSE_NEXTAUTH_SECRET,
-# LANGFUSE_SALT, LANGFUSE_ENCRYPTION_KEY)
+# LANGFUSE_SALT, LANGFUSE_ENCRYPTION_KEY) and the Langfuse PROJECT API keys the
+# audit pipeline posts with (CORP_LANGFUSE_PUBLIC_KEY, CORP_LANGFUSE_SECRET_KEY
+# — see "Audit pipeline")
 cp ../src/corp_llm_gateway/tokens/schema.sql postgres/initdb/01-schema.sql
 docker compose up -d
 docker compose ps                              # wait ~30-60s (start_period) for "healthy";
@@ -40,9 +43,10 @@ failure: `docker compose ps` reports everything healthy and
 `compose/postgres/initdb/README.md` for what each init script does and how
 to re-stage after an upgrade.
 
-`GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, `LITELLM_MASTER_KEY`, `UI_USERNAME`
-and `UI_PASSWORD` have no default — `docker compose up` refuses to start with
-a clear "set X in .env" error rather than silently booting half-configured.
+`GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, `LITELLM_MASTER_KEY`, `UI_USERNAME`,
+`UI_PASSWORD`, `CORP_LANGFUSE_PUBLIC_KEY` and `CORP_LANGFUSE_SECRET_KEY` have
+no default — `docker compose up` refuses to start with a clear "set X in .env"
+error rather than silently booting half-configured.
 
 ## Building from this branch
 
@@ -243,7 +247,14 @@ retry beats a silent gap in the audit trail.
 **The request path is not affected.** Nothing in `pre_call`/`post_call` talks
 to this Redis: the gateway's audit sink defaults to `stdout`
 (`CORP_AUDIT_SINK` is unset on this stack — see `audit/factory.py`), and
-Vector forwards from there and retries. Even on a direct-to-Langfuse sink the
+Vector forwards from there and retries. Those retries are not free by default:
+they work because the Langfuse sink in `vector/vector.yaml` is configured with
+a **disk buffer** (`when_full: block`, 1 GiB, on the `vector-data` volume) and
+unlimited retries with backoff. With the stock in-memory buffer, or with
+`when_full: drop_newest`, the 5xx below would silently discard audit records at
+the Vector layer instead — the same gap in the audit trail `noeviction` exists
+to prevent, moved one hop upstream. See "Audit pipeline" for the full path.
+Even on a direct-to-Langfuse sink the
 `audit_sink` fail policy is `continue` (the M4 fail-policy matrix) and a
 failed emit is contained by the safety net in `litellm_hook.audit()` — it
 never reaches the client body and never blocks desanitization. So a full
@@ -306,9 +317,108 @@ nginx lands.
 `LANGFUSE_DISABLE_SIGNUP=true` by default: on a fresh instance whoever
 reaches the UI first would otherwise claim the admin account. Provision the
 first user (and the org, project and ingestion API keys) with the
-`LANGFUSE_INIT_*` block in `.env.example` — those keys are what the Vector
-audit sink authenticates with. With signup disabled **and** no init user
+`LANGFUSE_INIT_*` block in `.env.example` — that key pair is what the Vector
+audit sink authenticates with, copied into `CORP_LANGFUSE_PUBLIC_KEY` /
+`CORP_LANGFUSE_SECRET_KEY`. With signup disabled **and** no init user
 there is no way to log in; that combination is the one mistake to avoid.
+
+Chicken-and-egg on a first boot: `vector` needs the project keys, and the
+project does not exist yet. The clean way out is headless init — set
+`LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `_SECRET_KEY` to values you generate and
+copy the same two values into `CORP_LANGFUSE_PUBLIC_KEY` /
+`CORP_LANGFUSE_SECRET_KEY`. If you provision through the UI instead, put a
+placeholder in the two `CORP_LANGFUSE_*` keys first (they have no default —
+`docker compose config` fails while they are empty, whatever `--scale` you
+pass), create the real keys, then update `.env` and
+`docker compose up -d vector`. Audit records emitted with the wrong key are not
+lost: Langfuse answers 401, Vector retries into its disk buffer, and the log
+files it reads from are still on disk.
+
+## Audit pipeline
+
+```
+gateway stdout (StdoutSink)  ->  docker json-file log  ->  vector  ->  langfuse
+```
+
+`CORP_AUDIT_SINK` is unset on this stack, so `audit/factory.py`'s default
+`stdout` sink applies: every `AuditEvent` is one JSON line on the `litellm`
+container's stdout. `vector` tails that and posts to Langfuse's
+`/api/public/ingestion`, authenticating with the Langfuse **project** API keys
+`CORP_LANGFUSE_PUBLIC_KEY` / `CORP_LANGFUSE_SECRET_KEY` (not the
+`LANGFUSE_*` infrastructure secrets — see "First login" for where they come
+from). The service is always on and not profile-gated: audit is not optional,
+and a mistake here loses audit records.
+
+**Config:** `vector/vector.yaml`, ported from `docker/demo-vector/vector.yaml`.
+The `never_fields_gate` and `audit_only` transforms are copied **verbatim** from
+it (and match `helm/corp-llm-gateway/templates/configmap.yaml`) — they are
+defence-in-depth for CLAUDE.md invariant #2, dropping any record that carries a
+mapping/original/credential key before it can reach a sink, and any record that
+is not AuditEvent-shaped. Do not paraphrase or restructure them.
+
+**No docker socket.** The demo mounts `/var/run/docker.sock` and uses Vector's
+`docker_logs` source; `docker-compose.demo.yml` warns against reusing that,
+because the socket is the docker daemon's control plane — read access to it is
+host root, since a container holding it can start a privileged sibling with `/`
+bind-mounted. Here Vector reads a **read-only bind of the container log
+directory** (`DOCKER_CONTAINERS_DIR`, default `/var/lib/docker/containers`)
+with a `file` source: data in, no control plane, no write path. Three
+consequences worth knowing:
+
+- the glob is `*/*-json.log`, so the sibling `config.v2.json` / `hostconfig.json`
+  files — which hold every container's environment — are never read;
+- the source sees **every** container's logs, not just `litellm`: the log
+  directory carries container ids, not names, so there is nothing to filter on
+  at that layer. `audit_only` is the scoping mechanism — a record reaches a sink
+  only if it parses as JSON and has both `request_id` and `redaction_count`,
+  which nothing but our own `StdoutSink` emits;
+- it requires docker's default **`json-file` logging driver**. Under `local`,
+  `journald` or a remote driver there are no `*-json.log` files and the audit
+  pipeline goes quiet. Check with
+  `docker info --format '{{.LoggingDriver}}'` before a real deploy.
+
+Vector runs with a read-only root filesystem and all capabilities dropped. It
+stays root (the image default) because the log directory is mode `0710
+root:root`; there is no `user:` override to add.
+
+**Delivery is durable.** Read checkpoints and the sink's disk buffer live on the
+`vector-data` named volume, so a Vector restart resumes at the exact byte it
+stopped at — records written while it was down are delivered, not skipped, and
+none are re-sent. The Langfuse sink buffers to disk with `when_full: block` and
+retries indefinitely with backoff; see "When the Langfuse queue fills" for why
+that combination is load-bearing rather than a default. If the disk buffer does
+fill, Vector back-pressures the file source and stops reading — the records stay
+in the docker log files and are picked up from the checkpoint once Langfuse
+recovers.
+
+**Long records are reassembled.** The `json-file` driver splits any output line
+longer than 16 KiB across several records, and only the last one ends in a
+newline. Unmerged, both halves would fail to parse and `audit_only` would drop
+them — a silent hole for exactly the largest audit records (a request with a
+long `placeholder_list`). The `merge_partial_lines` reduce rejoins them, which
+is what Vector's `docker_logs` source does for itself via `auto_partial_merge`.
+
+**S3 and SIEM sinks ship OFF.** `vector/sinks-s3.yaml` (durable archive) and
+`vector/sinks-siem.yaml` (forwarder) are separate config files, loaded only when
+`CORP_AUDIT_S3_ENABLED=1` / `CORP_AUDIT_SIEM_ENABLED=1`. Vector merges every
+`--config` file into one topology, so both attach to the same `audit_only`
+transform and inherit the NEVER-fields gate. The corp SIEM endpoint and its auth
+scheme are still an open item, so that file has no endpoint default: enabling it
+without `CORP_AUDIT_SIEM_URL` makes Vector refuse to start rather than post audit
+records somewhere unintended. The same is true of `CORP_AUDIT_S3_BUCKET` /
+`CORP_AUDIT_S3_REGION`.
+
+One Vector quirk when editing those files: **Vector interpolates `${VAR}`
+references inside YAML comments too**, so a commented-out example naming an
+unset variable fails config load. Describe such options in prose instead.
+
+Validate a change before deploying it:
+
+```
+docker run --rm -v "$PWD/vector:/etc/vector:ro" \
+  -e CORP_LANGFUSE_PUBLIC_KEY=x -e CORP_LANGFUSE_SECRET_KEY=x \
+  timberio/vector:0.53.0-alpine validate --no-environment /etc/vector/vector.yaml
+```
 
 ## Postgres
 
@@ -326,7 +436,8 @@ The `litellm` port publishes on `127.0.0.1`, not `0.0.0.0`. Until the nginx
 profile (`--profile nginx`) lands there is no TLS in front of this stack, and
 virtual keys + `X-Corp-Auth` would otherwise cross a server-class network in
 cleartext. It is the only published port in the stack: no Langfuse service
-publishes one at all (see "Langfuse").
+publishes one at all (see "Langfuse"), and `vector`'s API is bound to
+`127.0.0.1` *inside* its own container, purely so its healthcheck can reach it.
 
 ## Durability
 
