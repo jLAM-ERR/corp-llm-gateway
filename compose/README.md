@@ -15,6 +15,23 @@ A production deploy target for non-k8s hosts, alongside `helm/corp-llm-gateway/`
 The optional nginx front door lands in a later revision of this stack — see
 `docs/plans/20260802-production-compose-corp-ner.md` for the full build order.
 
+## Which mode am I deploying?
+
+Read `docs/ops/deployment-modes.md` (RU: `deployment-modes.ru.md`) first. It
+covers the two **mutually exclusive** auth modes — API keys (this stack) vs the
+subscription/OAuth overlay — and exactly how to turn the corp-LLM oracle and the
+corp NER service on and off. Short version for this stack:
+
+- **API-key mode.** `LITELLM_MASTER_KEY` is required; developers use LiteLLM
+  virtual keys. `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are **optional** — set
+  only the routes you use, or neither if you only call `corp-*`.
+- **Subscription mode is NOT this stack.** It overlays the demo stack
+  (`docker-compose.demo.yml` + `docker-compose.anthropic-oauth.yml`) and requires
+  that no `LITELLM_MASTER_KEY` exist at all.
+- **Oracle:** `CORP_LLM_ORACLE_ENABLED` (default `0`), needs `CORP_LLM_ENDPOINT`
+  when `1`. **Corp NER:** `CORP_NER_ENABLED` (default `0`), needs
+  `CORP_NER_ENDPOINT` when `1`.
+
 ## Quickstart
 
 ```

@@ -6,6 +6,12 @@ The chart is `helm/corp-llm-gateway`. It runs the gateway image (LiteLLM proxy +
 the `corp_llm_gateway.bootstrap.guardrail` callback) plus a Vector log-shipper
 sidecar, and mounts detection in-process — there is no separate pre-pass pod.
 
+For **non-k8s hosts** use the compose stack in `compose/` instead. Either way,
+read `deployment-modes.md` (RU: `deployment-modes.ru.md`) first: it covers the
+two mutually exclusive auth modes (API keys vs subscription/OAuth) and how to
+toggle the corp-LLM oracle (`CORP_LLM_ORACLE_ENABLED`) and the corp NER service
+(`CORP_NER_ENABLED`).
+
 ## Prerequisites
 
 - **Kubernetes**, CPU-only. Corp k8s has no GPU pods; the detection cascade
