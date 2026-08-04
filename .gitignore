@@ -30,7 +30,20 @@ helm/*/Chart.lock
 # operator-provided corp CA bundle — never commit real internal PKI material
 crt/*.pem
 crt/*.crt
-!crt/README.md
+
+# compose/ production stack — operator secrets and staged/site-specific material
+compose/.env
+compose/certs/*.pem
+compose/certs/*.crt
+compose/certs/*.key
+compose/certs/*.p12
+compose/certs/*.pfx
+compose/nginx/certs/*.pem
+compose/nginx/certs/*.crt
+compose/nginx/certs/*.key
+compose/nginx/certs/*.p12
+compose/nginx/certs/*.pfx
+compose/postgres/initdb/*.sql
 
 # Internal research, decision records, and benchmarks — maintainer / product-owner only.
 # Kept on disk locally, excluded from the published tree (see README: only public docs are linked).
@@ -43,3 +56,7 @@ scripts/bench_local_first.py
 .venv-bench/
 .venv-dp/
 .claude/prompts/
+
+# Corp NER connection doc — holds the internal endpoint/credentials. Never commit.
+connect-corp-ner.pdf
+*-corp-ner.pdf

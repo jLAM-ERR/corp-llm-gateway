@@ -75,7 +75,45 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 | `CORP_LLM_OVERSIZE_DELIVER_TEAMS` | teams allowed the `deliver-flag` path | `""` | no |
 | `CORP_LLM_REQUIRE_NER` | fail closed when NER absent (F2) | `0` | prod: **yes** |
 | `CORP_LLM_ORACLE_TRIGGER` | `gazetteer_hit` \| `any_local_finding` \| `sampled:<pct>` \| `always` (F3) | `gazetteer_hit` | no |
+| `CORP_LLM_ORACLE_ENABLED` | call the corp-LLM oracle at all. `1` **requires** `CORP_LLM_ENDPOINT`; `0` **and** `CORP_LLM_LOCAL_FIRST=0` is a boot refusal (`NO_OP_SANITIZER_MESSAGE`) | `0` on the compose stack | no |
 | `CORP_LLM_LOG_LEVEL` | log level | `INFO` | no |
+
+### Corp NER service (remote detector)
+
+Off by default. Not to be confused with `CORP_LLM_REQUIRE_NER`, which governs the
+**in-process** RU/EN engines. Full walkthrough: `deployment-modes.md`.
+
+| Key | Purpose | Default | Required |
+|-----|---------|---------|----------|
+| `CORP_NER_ENABLED` | append the remote corp NER detector to the cascade | `0` | no |
+| `CORP_NER_ENDPOINT` | corp NER **base** URL (client appends `/v1/analyze`) | — | **when `CORP_NER_ENABLED=1`** |
+| `CORP_NER_TIMEOUT_S` | per-call timeout, under the service's own 60 s | `30` | no |
+| `CORP_NER_MAX_TEXTS` | texts per batch | `256` | no |
+| `CORP_NER_MAX_INPUT_CHARS` | chars per batch; a longer single text fails **closed** | `200000` | no |
+| `CORP_NER_CA_BUNDLE` | PEM chain for an internal-CA NER cert | unset | no |
+
+`CORP_NER_ENABLED=1` without `CORP_NER_ENDPOINT` is a **boot refusal**
+(`build_corp_ner()` raises `ConfigError`), not a silent skip. The detector is
+network-backed, so it is excluded from `CODE` segments; local detectors are not.
+On the compose stack the four tuning keys are passed **by bare name** — leave
+them commented rather than empty, since an empty env var beats the config file.
+
+### Header forwarding to upstream
+
+Transport knobs, not detection-pipeline ones — they run downstream of the
+cascade above, on the already-sanitized request.
+
+| Key | Purpose | Default | Required |
+|-----|---------|---------|----------|
+| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Type`, ...) before forwarding to upstream | `0` | no |
+
+`CorpLlmGuardrail._pre_call_impl` (reached via `async_pre_call_hook`) sets
+`data["headers"]` **unconditionally**, independent of litellm's own
+`forward_client_headers_to_llm_api` gate — litellm forwards whatever ends up
+in `data["headers"]` regardless of how it got there. This flag is
+load-bearing wherever the guardrail runs in front of any litellm provider,
+not a no-op reserved for a future config: see `compose/README.md` "Why not
+BYOK" for a wire-verified writeup. It never touches `Authorization`.
 
 ### Subscription-auth bridges
 

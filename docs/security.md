@@ -341,6 +341,7 @@ of truth** — do not add ad-hoc fail-open paths):
 | `profileUnavailable` (D4, when `profile_ids` set) | **fail-closed** (503 `E_PROFILE_UNAVAILABLE`) — a team's resolved profile bundle is missing or malformed; never fall through to un-profiled egress (invariant 6). Empty `profile_ids` → passthrough (no profile resolution, no 503) |
 | `providerBlocked` (D4) | **block** (403 `E_PROVIDER_BLOCKED`) — the merged `allowed_providers` policy rejects the upstream target; a clean policy denial before any content processing, no raw body |
 | `spanApplyFailed` | **fail-closed** (500 `E_SPAN_INVALID`) — `apply_spans` rejects a pre-selected replacement span that no longer matches the segment text (e.g. a stale Cache-A/allocator remap); `StaleSpanError` (`sanitizer/placeholder.py`) is mapped to an audit record + `gateway_failure{component="sanitize"}` rather than escaping as a generic, undocumented 500 |
+| `internalError` (F8) | **fail-closed** (500 `E_INTERNAL`) — an unexpected exception in `pre_call`/`post_call_unary`/`post_call_stream` (a DB error, a bug, an audit-sink outage) is never echoed to the client, the log, or the audit record: only the opaque error_code + `gateway_failure{component="internal"}`. The safety net that maps this is guarded against re-entrancy — a failure while recording the failure itself (e.g. the audit sink is also down) is caught and logged rather than replacing the client-visible 500. A request that already recorded a component-specific failure (e.g. `dlp`) is not double-counted as `internal` too |
 
 See plan §M4 for the full matrix (Redis transient retry, Cache A/C miss
 fall-through, single-audit-sink-down) and per-team override columns.
@@ -352,6 +353,89 @@ gazetteer, splitter) is the whole detection story and Stage 0/Stage 5 are
 unaffected. `CORP_LLM_ORACLE_ENABLED=0` with `CORP_LLM_LOCAL_FIRST=0` refuses
 to boot rather than run with no deterministic floor at all — see
 `docs/plans/20260713-oracle-toggle-compose-quickstart.md`.
+
+### 8.1 `vectorBufferFull` on the compose stack — `continue`, not the default
+
+The matrix row above is unchanged and remains the source of truth. This note
+records where one shipped deployment sits on it, because the deviation was
+previously silent.
+
+**`compose/` takes the `audit_buffer_full=continue` opt and cannot do
+otherwise. That stack does NOT provide the matrix's default fail-closed (503)
+behaviour: requests keep egressing while audit delivery is stalled.**
+
+Why it cannot: `compose/docker-compose.yml` leaves `CORP_AUDIT_SINK` unset, so
+`audit/factory.py`'s default `StdoutSink` applies and the gateway's whole audit
+action is one line on its own stdout, which always succeeds. Vector then tails
+that log file **out of process**, from another container. No signal path exists
+from Vector's buffer state back into `pre_call` / `post_call`, so nothing in the
+request path can observe saturation and return 503; `when_full: block` only
+stops Vector reading. Closing the gap needs a health/buffer gate in `src/`
+feeding the hook — not built.
+
+Residual risk, and what bounds it: while the sink is stalled, accepted audit
+records live only in the `litellm` container's docker json-file logs plus
+whatever already reached Vector's disk buffer. Vector's file glob covers the
+active `-json.log` **and** its numbered rotations (`-json.log.[0-9]`, two-digit
+form too), so a rotation no longer discards records on its own — but a file
+rotated past `max-file` is deleted by docker, so **docker log retention, not the
+disk buffer, is still what bounds audit durability here**. Separately, Vector's
+HTTP sink retries only 408/429/5xx, so a wrong or rotated Langfuse project key
+(401) is dropped rather than buffered — and the file source checkpoints on read,
+not on delivery, so those bytes are not re-read on a restart. Recovery means
+deleting the source's checkpoint under `data_dir`; records already rotated away
+are unrecoverable.
+
+Operators of that stack must therefore size docker log retention
+(`LITELLM_LOG_MAX_SIZE` × `LITELLM_LOG_MAX_FILE`, set on the `litellm` service's
+own `logging.options`) against the longest tolerated Langfuse outage, and alert
+on buffer growth and on Vector's `Events dropped` errors. Note that setting these
+in the **daemon's** `log-opts` does not work: docker merges daemon-level log-opts
+into a container only when the container's log driver equals the daemon's default
+driver, and that service pins `json-file` because the audit pipeline requires it.
+Concrete commands: `compose/README.md` "Audit buffering is not fail-closed".
+
+The Helm deployment is not covered by this note; it is a separate composition.
+
+### 8.2 Audit-source trust on the compose stack — a host precondition
+
+Additive note, same scope as §8.1: it records a precondition of one shipped
+deployment, and changes nothing in the matrix above.
+
+`compose/vector/vector.yaml` reads **every** container's log on the host (a
+read-only bind of `/var/lib/docker/containers`, chosen over mounting the docker
+socket, which is host root). Its `gateway_container_only` filter scopes the
+pipeline to the gateway by requiring the docker json-file `attrs` stamp that the
+`litellm` service's `com.corp-llm-gateway.audit-source` label plus its
+`logging.options.labels` produce.
+
+**That filter is a misconfiguration guard, not a security boundary.** The label
+name and value are public and unverified. Any container started on the same host
+with the same label and the same `--log-opt labels=…` receives the same `attrs`
+stamp; if it then prints `AuditEvent`-shaped JSON (`request_id` +
+`redaction_count`, no NEVER field), the line passes `gateway_container_only`, the
+NEVER-fields gate and `audit_only`, and lands in Langfuse as a genuine-looking
+audit record. The filter raises the attacker requirement from "can write a log
+line" to "can start a container on this host" — a real improvement, and the
+whole of it.
+
+Consequences to accept before deploying that stack:
+
+- **No untrusted `docker run` on the host.** Membership of the `docker` group,
+  and any CI runner, agent or sidecar with daemon access, is equivalent to write
+  access to the audit trail. Restrict it the way you would restrict the audit
+  store itself.
+- The exposure is **forgery (insertion), not disclosure**. Nothing here lets a
+  co-located container read gateway audit records, and invariant #1 / the
+  NEVER-fields gate are unaffected: a forged record still cannot carry a NEVER
+  field through, and originals still never reach any of these surfaces.
+- Closing it properly needs a **private channel** only the gateway can write — a
+  dedicated bind-mounted audit file, or a unix socket, in place of container
+  stdout. That is a change to the audit sink in `src/corp_llm_gateway/audit/`
+  plus the Vector source, not to the compose stack, and is not built.
+
+The Helm deployment is not covered: there the audit path is the pod's own log,
+scoped by the k8s log collector, and a different trust model applies.
 
 ## 9. Invariants — never weaken these
 
@@ -398,10 +482,15 @@ by construction; if one appears to, that is an M1-14 regression.
 | (c) | ✅ **FIXED** — streamed `tool_use` `input_json_delta` is now desanitized (JSON-escaped) in `sanitizer/streaming.py`, so the developer's tool receives real values, not `[LABEL_NNN]` tokens. | **Resolved** |
 | (d) | ✅ **By design (not a gap)** — `thinking` / `redacted_thinking` are passed through UNMODIFIED: Anthropic signs thinking blocks and rejects modified ones on multi-turn replay, and the model only ever sees placeholders (no original reaches them). | **Resolved (by design)** |
 | (e) | **`_corp_gateway_request_id` reaches the outbound Anthropic body on `/v1/chat/completions`.** `pre_call` writes this correlation key to four places in `data`, one of them the top level, and litellm's chat-completions adapter carries unknown top-level keys into the request it sends. Observed with the subscription bridge **off** as well as on, so it is independent of that bridge. The value is a request id (litellm's call id or a generated UUID), never user content, so it is not an M1-14 leak. The primary `/v1/messages` route — the one Claude Code uses — is unaffected. Not fixed opportunistically because the key is the audit-attribution fallback chain (`_REQUEST_ID_LOOKUP_PATHS`), which has its own regression history. | **Low** — correlation id only; affects the chat-completions route's acceptance upstream, not confidentiality |
+| (f) | **F9 only guards the corp-LLM oracle client, not litellm's own global TLS switch.** `corp_llm_verify()` (`config.py`) is reached only through `bootstrap.build_corp_llm_client()`, itself called only when `CORP_LLM_ORACLE_ENABLED=1`. But litellm reads the SAME `SSL_VERIFY` env var directly, via `get_ssl_verify()` — at higher priority than `SSL_CERT_FILE` — for every upstream provider (`anthropic/`, `openai/`, `hosted_vllm/`), with no `CORP_ENV=prod` guard on that read. `SSL_VERIFY=false` therefore disables certificate verification stack-wide on any deployment fronted by litellm with the oracle off (the default posture — see `compose/docker-compose.yml`). Widening F9 to cover litellm's read is a `src` follow-up; `compose/` mitigates today by not exposing `SSL_VERIFY` as an operator-set `.env` key and hardcoding it `true`. | **Medium** — silent TLS-verification bypass for any deployment that sets `SSL_VERIFY=false` outside the documented `.env` surface |
 
-**(a) and (c) are fixed; (d) is correct by design.** The remaining open items are
-**(b)** — wiring the SIEM sink (gated on the SIEM target), see
-[`remaining-steps.md`](remaining-steps.md) — and **(e)**.
+| (g) | **A payment card buried between stray digits on both sides is not detected.** `BANK_CARD` scans inside a glued digit run, but only for a PAN that reaches at least one end of the run (`_CARD_STRAY_MARGIN = 0`, `detectors/regex_checksum.py`). A PAN with junk digits on BOTH sides — `123` + PAN + `123` — is missed, and so is any deliberately padded one. The threat model for this detector is **accidental paste** (a developer drops a card into a prompt), not a determined insider: every realistic paste shape is still caught — a bare PAN, a PAN with a CVV or amount glued to either end, a grouped PAN with a glued tail, and a PAN glued to letters. Closing the gap needs unbounded-depth scanning, measured at **65.8% false positives on random 32-digit runs** (79.3% at 40) and climbing with run length, while a finite margin closes nothing — 7 junk digits in front escape at margin 6 exactly as at 0. Margin 6 cost 2-3x the false positives of 0 on ordinary long digit runs (19-digit nanosecond timestamps 27.9% → 18.4%; 20-digit 24.1% → 10.4%; 23-digit 34.1% → 11.9%) and bought no coverage against a padder, so it was dropped. Anyone deliberately obfuscating a card would equally defeat a regex with base64 or unusual spacing, so chasing depth in `regex_checksum` is unbounded work for no real adversary gain. The layers that can catch a card in prose context are **corp NER** (Workstream B, in progress) and the **Stage 5 DLP egress guard**. Pinned by `test_card_buried_between_stray_digits_is_a_known_limitation`. | **Low** — accepted; accidental paste is covered, deliberate obfuscation is out of this detector's scope |
+
+**(a) and (c) are fixed; (d) is correct by design; (g) is accepted with no fix
+planned.** The remaining open items are **(b)** — wiring the SIEM sink (gated on
+the SIEM target), see [`remaining-steps.md`](remaining-steps.md) — **(e)**, and
+**(f)** — widening F9 to guard litellm's global `SSL_VERIFY` read, not just the
+oracle client's.
 
 ## 12. GA security hardening (F8–F11)
 

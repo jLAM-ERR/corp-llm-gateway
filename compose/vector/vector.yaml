@@ -1,0 +1,297 @@
+# Production audit pipeline: gateway stdout -> Vector -> Langfuse.
+# Ported from docker/demo-vector/vector.yaml. The `never_fields_gate` and
+# `audit_only` transforms below are copied VERBATIM from that file (and match
+# helm/corp-llm-gateway/templates/configmap.yaml) — they are defence-in-depth
+# for CLAUDE.md invariant #2. Do not paraphrase or restructure them.
+#
+# Two things differ from the demo, both deliberate:
+#
+#   1. SOURCE. The demo mounts /var/run/docker.sock and uses `docker_logs`.
+#      docker-compose.demo.yml warns against reusing that: the socket is the
+#      docker daemon API, i.e. host root (any container can be started
+#      privileged with / bind-mounted). Here the source is a read-only bind of
+#      the container log directory instead — data in, no control plane. See
+#      "docker json-file envelope" below and compose/README.md.
+#   2. DELIVERY. The langfuse sink gets a DISK buffer with `when_full: block`
+#      and unlimited retries. compose/README.md states that a full
+#      langfuse-redis surfaces as ingestion 5xx "which Vector retries"; that is
+#      only true with these two settings. An in-memory buffer, or
+#      when_full: drop_newest, would turn the loud rejection that `noeviction`
+#      exists to produce back into silent audit loss one layer up. That covers
+#      TRANSIENT failures; an auth failure is not one of them — see the sink's
+#      retry_attempts comment.
+#   3. SCOPE. The demo's docker_logs source is already limited to the container
+#      it names; a file source over the log DIRECTORY is not, so this config
+#      adds the `gateway_container_only` filter as its container identity
+#      boundary. It is a separate transform and leaves never_fields_gate /
+#      audit_only untouched. Read its comment before trusting it: it is a
+#      misconfiguration guard, not a security boundary.
+#
+# CORP_LANGFUSE_PUBLIC_KEY / CORP_LANGFUSE_SECRET_KEY are required by the
+# vector service in compose/docker-compose.yml (`:?` form), so a missing key
+# fails the compose render, not the ingestion at runtime.
+
+# Checkpoints (which byte of which log file was read) and the langfuse disk
+# buffer. Backed by the `vector-data` named volume, so a container restart
+# resumes where it stopped instead of re-sending or skipping audit records.
+data_dir: /var/lib/vector
+
+api:
+  enabled: true
+  # Bound to loopback, unlike the demo's 0.0.0.0: only the container's own
+  # healthcheck uses it, and it need not be reachable from the compose network.
+  address: 127.0.0.1:8686
+
+sources:
+  # Read-only replacement for the demo's docker.sock + `docker_logs` source.
+  # The docker json-file driver writes one JSON object per line to
+  # /var/lib/docker/containers/<id>/<id>-json.log; the glob deliberately does
+  # NOT match the sibling config.v2.json / hostconfig.json files, which hold
+  # every container's environment.
+  #
+  # `read_from: beginning` (the default, stated for the record) plus the
+  # checkpoint in data_dir is what makes audit records written while Vector was
+  # down get delivered rather than skipped — the demo's docker_logs source
+  # streams live only.
+  #
+  # ROTATED FILES ARE INCLUDED. Docker renames `<id>-json.log` to
+  # `<id>-json.log.1` (then .1 -> .2 ...) when max-size is reached; a glob
+  # covering only the active file loses every record that rotated away while
+  # Vector was down or behind. Re-reading is safe because Vector identifies a
+  # file by CONTENT FINGERPRINT, not by path: a renamed file keeps its
+  # fingerprint, so the checkpoint in data_dir still applies and already-read
+  # bytes are not re-sent. Measured against timberio/vector:0.53.0-alpine —
+  # read the active file, stop, rename it to .1, restart: only the new records
+  # are emitted.
+  #
+  # The numeric classes cover max-file up to 99 and deliberately do NOT match
+  # `<id>-json.log.1.gz`: Vector's file source cannot decompress, so leave
+  # docker's `compress` log-opt off (its default). A `*` suffix here would pull
+  # the gzip bytes in as unparsable garbage instead.
+  #
+  # This picks up EVERY container on the host, not just litellm: the log
+  # directory is keyed by container id, not name, so the glob cannot be narrowed
+  # here. `gateway_container_only` below is the container identity boundary.
+  container_logs:
+    type: file
+    include:
+      - /var/lib/docker/containers/*/*-json.log
+      - /var/lib/docker/containers/*/*-json.log.[0-9]
+      - /var/lib/docker/containers/*/*-json.log.[0-9][0-9]
+    read_from: beginning
+
+transforms:
+  # CONTAINER IDENTITY BOUNDARY. Runs on the raw docker envelope, before any
+  # application log content is unwrapped, and is the only thing that decides
+  # WHICH container may feed the audit pipeline.
+  #
+  # `attrs` is written by the json-file driver only for labels named in that
+  # container's `--log-opt labels=...`. The litellm service in
+  # compose/docker-compose.yml sets both halves — the label and the log option —
+  # so passing this filter requires control over container creation on the host,
+  # not merely the ability to print a line. Both halves are load-bearing:
+  # drop either and this filter matches nothing and the audit pipeline goes
+  # silent.
+  #
+  # NOT A SECURITY BOUNDARY. The label name and value are public, and any
+  # container started with the same label plus the same --log-opt gets the same
+  # `attrs` stamp — so this raises the bar from "can print a line" to "can run
+  # a container on this host", and no further. It is a MISCONFIGURATION GUARD.
+  # "No untrusted `docker run` on this host" is a hard production requirement of
+  # this deployment model; a real boundary needs a private channel only litellm
+  # can write (a `src/` audit-sink change). See docs/security.md 8.2.
+  #
+  # `audit_only` further down is a SCHEMA gate (is this an AuditEvent?), not a
+  # trust boundary: `request_id` + `redaction_count` are two ordinary keys that
+  # any co-located container could print. Keep the two jobs separate.
+  #
+  # Every chunk of a >16 KiB line carries `attrs`, so this runs safely ahead of
+  # merge_partial_lines: a split record is never half-admitted.
+  #
+  # Nothing here logs or re-emits the line (invariant #1) — a non-matching line
+  # is dropped silently, and the `??` guards mean a non-JSON or non-object line
+  # is a plain false rather than a VRL error carrying the text.
+  gateway_container_only:
+    type: filter
+    inputs: ["container_logs"]
+    condition: |
+      envelope = object(parse_json(.message) ?? {}) ?? {}
+      attrs = object(envelope.attrs) ?? {}
+      attrs."com.corp-llm-gateway.audit-source" == "gateway-stdout"
+
+  # docker json-file envelope: {"log":"<one line of app output>\n",
+  # "stream":"stdout","time":"..."}. Unwrap it so the demo's `parse` transform
+  # below sees exactly what its `docker_logs` source used to hand it.
+  #
+  # Nothing here logs, keys on, or re-emits the line content (invariant #1): a
+  # line that is not a docker envelope becomes an empty chunk and is dropped by
+  # `audit_only`, silently and without an error message carrying the text.
+  unwrap_docker_envelope:
+    type: remap
+    inputs: ["gateway_container_only"]
+    source: |
+      envelope, err = parse_json(.message)
+      if err == null {
+        chunk = string(envelope.log) ?? ""
+        . = { "file": .file, "chunk": chunk, "complete": ends_with(chunk, "\n") }
+      } else {
+        . = { "file": .file, "chunk": "", "complete": true }
+      }
+
+  # The json-file driver splits any output line longer than 16 KiB into
+  # several records, and only the LAST one ends with "\n". Left unmerged, both
+  # halves fail `parse_json` and `audit_only` drops them — a silent hole in the
+  # audit trail for exactly the biggest records (a request with a long
+  # `placeholder_list`). Vector's docker_logs source does this merge itself
+  # (auto_partial_merge); the file source does not, so do it here.
+  # expire_after_ms is Vector's default 30s: a chunk whose continuation never
+  # arrives is flushed rather than held forever.
+  merge_partial_lines:
+    type: reduce
+    inputs: ["unwrap_docker_envelope"]
+    group_by: ["file"]
+    ends_when: ".complete == true"
+    merge_strategies:
+      chunk: concat_raw
+      complete: retain
+
+  to_message:
+    type: remap
+    inputs: ["merge_partial_lines"]
+    source: |
+      . = { "message": .chunk }
+
+  # Try to parse each docker log line as JSON. LiteLLM emits both
+  # structured JSON (its own wrappers + our AuditEvent records) and
+  # plain-text uvicorn access logs. Use the non-strict form (no `!`)
+  # so plain text doesn't blow up the event — we filter to audit
+  # shape next.
+  parse:
+    type: remap
+    inputs: ["to_message"]
+    source: |
+      parsed, err = parse_json(.message)
+      if err == null {
+        . = parsed
+      } else {
+        # Mark as unparsable so the filter below drops it.
+        ._unparsable = true
+      }
+
+  # NEVER-fields gate (mirrors src/corp_llm_gateway/audit/invariants.py).
+  # Defence-in-depth: even if a future regression smuggles original/
+  # mapping data into a forwarded event, drop it here before it hits
+  # Langfuse.
+  never_fields_gate:
+    type: filter
+    inputs: ["parse"]
+    condition: |
+      !exists(.mapping) &&
+      !exists(.mapping_table) &&
+      !exists(.pairs) &&
+      !exists(.original_content) &&
+      !exists(.unredacted_content) &&
+      !exists(.pre_sanitization) &&
+      !exists(.replace_md) &&
+      !exists(.rule_values) &&
+      !exists(.x_corp_auth) &&
+      !exists(."X-Corp-Auth") &&
+      !exists(.corp_token) &&
+      !exists(.api_key) &&
+      !exists(.authorization) &&
+      !exists(.Authorization) &&
+      !exists(.cookie) &&
+      !exists(.Cookie) &&
+      !exists(.set_cookie) &&
+      !exists(."Set-Cookie") &&
+      !exists(.extra_headers)
+
+  # Keep ONLY events shaped like AuditEvent (StdoutSink output). Drop
+  # litellm's own JSON wrappers, parse failures, and anything else.
+  # AuditEvent is uniquely identified by having both `request_id` and
+  # `redaction_count`.
+  audit_only:
+    type: filter
+    inputs: ["never_fields_gate"]
+    condition: |
+      !exists(._unparsable) &&
+      exists(.request_id) &&
+      exists(.redaction_count)
+
+  # Build the full Langfuse envelope `{"batch":[<one trace>]}` and
+  # encode it as a single JSON STRING on `.message`. The HTTP sink
+  # below uses codec=text so the body is exactly that string — no
+  # wrapper array, no double-encoding.
+  to_langfuse_schema:
+    type: remap
+    inputs: ["audit_only"]
+    source: |
+      audit = .
+      envelope = {
+        "batch": [{
+          "id": audit.request_id,
+          "type": "trace-create",
+          "timestamp": audit.timestamp,
+          "body": {
+            "id": audit.request_id,
+            "name": "gateway-request",
+            "timestamp": audit.timestamp,
+            "userId": audit.user_id,
+            "metadata": audit,
+          }
+        }]
+      }
+      . = { "message": encode_json(envelope) }
+
+sinks:
+  langfuse:
+    type: http
+    inputs: ["to_langfuse_schema"]
+    uri: "${CORP_LANGFUSE_URL:-http://langfuse-web:3000}/api/public/ingestion"
+    method: "post"
+    encoding:
+      codec: "text"
+      only_fields: ["message"]
+    # One event per HTTP POST. Each .message is already a complete
+    # `{"batch":[...]}` JSON string envelope.
+    batch:
+      max_events: 1
+    request:
+      headers:
+        Content-Type: "application/json"
+      # Unlimited retries with backoff. Langfuse answers 5xx while its
+      # ingestion queue is at the langfuse-redis maxmemory cap; that is a
+      # transient, operator-fixable state (compose/README.md "When the Langfuse
+      # queue fills"), so give up on it and the audit record is gone.
+      #
+      # This covers TRANSIENT failures only. retry_attempts governs how many
+      # times a retriable response is retried, not which responses are
+      # retriable: Vector's HTTP sink retries 408/429/5xx and treats every other
+      # 4xx as final ("Not retriable; dropping the request"). A 401 from a wrong
+      # CORP_LANGFUSE_* key therefore DISCARDS the audit record, and 0.53 has no
+      # knob to change that — the `request` block silently ignores keys it does
+      # not know, so a made-up retry-policy option would look configured and do
+      # nothing. compose/README.md "First login" documents the first-boot order
+      # that keeps this sink from ever running with a placeholder key.
+      retry_attempts: 4294967295
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 60
+    buffer:
+      # Disk, not the default in-memory 500 events: a Langfuse outage longer
+      # than a few seconds must not cost audit records, and the buffer has to
+      # survive a Vector restart. 268435488 is Vector's minimum disk buffer
+      # size; the default below is 1 GiB, matching the helm chart's langfuse
+      # sink.
+      type: disk
+      max_size: ${CORP_VECTOR_LANGFUSE_BUFFER_BYTES:-1073741824}
+      # NOT drop_newest. When the disk buffer fills, Vector applies
+      # back-pressure to the file source and simply stops reading; the records
+      # stay in the docker json-file logs on disk and are picked up from the
+      # checkpoint once Langfuse recovers. drop_newest would discard accepted
+      # audit records silently, which is the failure mode langfuse-redis's
+      # `noeviction` was chosen to prevent.
+      when_full: block
+    auth:
+      strategy: "basic"
+      user: "${CORP_LANGFUSE_PUBLIC_KEY}"
+      password: "${CORP_LANGFUSE_SECRET_KEY}"

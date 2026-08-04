@@ -1,0 +1,34 @@
+# Build overlay: run THIS BRANCH's code instead of pulling the published
+# GATEWAY_IMAGE_TAG.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# The default GATEWAY_IMAGE_TAG (1.0.0-rc.6, see .env.example) predates this
+# branch: rc.6 is 1f170ea, an ancestor of it. So Workstream B's corp NER
+# integration, the BANK_CARD Luhn rule and the Cache-A coverage-boundary
+# fixes are all absent from that tag, and rc.5 additionally predated
+# CORP_LLM_STRIP_INBOUND_HEADERS (the header-stripping mitigation documented
+# in compose/README.md "Why not BYOK").
+#
+# This is a dev/staging convenience for running the current branch, NOT a
+# substitute for cutting a release: `GATEWAY_IMAGE_TAG` in `.env` must be
+# bumped to an rc containing Workstream B's corp NER work before this stack
+# is production-ready — that is a release gate, not a detail.
+#
+# context: `..` because this file lives in `compose/`, but `Dockerfile.gateway`
+# expects the repo root as build context (it COPYs `pyproject.toml`,
+# `README.md` and `src/` from there).
+#
+# NER_PROFILE is load-bearing, not decoration. `Dockerfile.gateway` defaults to
+# `base`, which installs the NER libraries but NOT the en_core_web_md wheel; this
+# stack ships CORP_LLM_REQUIRE_NER=1 (F2 fail-closed), so a `base` image disables
+# the EN engine on the first request and every request then 503s with
+# E_NER_UNAVAILABLE — a dead gateway. `ru-en` is the profile that matches the
+# compose posture: both engines present, nothing degraded.
+services:
+  litellm:
+    build:
+      context: ..
+      dockerfile: Dockerfile.gateway
+      args:
+        NER_PROFILE: ru-en

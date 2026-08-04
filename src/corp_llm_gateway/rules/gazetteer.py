@@ -63,6 +63,35 @@ def _try_load_en_nlp() -> object | None:
     return _spacy_nlp
 
 
+_EN_MODEL = "en_core_web_md"
+
+
+def _package_version(name: str) -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(name)
+    except (PackageNotFoundError, ValueError):
+        return "unknown"
+
+
+def _ru_lemmatizer_identity() -> str:
+    """Deterministic identity of the RU morphology backend, loading it if needed."""
+    if _try_load_ru_morph() is None:
+        return "none"
+    return f"pymorphy3:{_package_version('pymorphy3')}"
+
+
+def _en_lemmatizer_identity() -> str:
+    """Deterministic identity of the EN model, loading it if needed."""
+    nlp = _try_load_en_nlp()
+    if nlp is None:
+        return "none"
+    meta = getattr(nlp, "meta", None)
+    model_version = meta.get("version", "unknown") if isinstance(meta, dict) else "unknown"
+    return f"spacy:{_package_version('spacy')}:{_EN_MODEL}:{model_version}"
+
+
 def _lemmatize_word(word: str) -> str:
     """Return the lowercase lemma for a single word token; falls back to lower()."""
     if _is_cyrillic(word):
@@ -142,6 +171,33 @@ class Gazetteer(PIIDetector):
                 self._index[seq] = label
             if len(seq) == 1:
                 self._single_lemmas.setdefault(seq[0], label)
+
+    def term_signature(self) -> tuple[str, ...]:
+        """Sorted "lemma lemma…\\x1flabel" strings — the coverage this instance has.
+
+        Corp vocabulary, never user content. Callers fold it into cache keys so a
+        term-list change cannot be served from an entry built without it.
+        """
+        return tuple(sorted(" ".join(seq) + "\x1f" + label for seq, label in self._index.items()))
+
+    def lemmatizer_signature(self) -> tuple[str, ...]:
+        """Identity of the lemmatizers request-time matching will actually use.
+
+        ``term_signature`` describes the CONFIGURED terms; matching runs every
+        token through ``_lemmatize_word``, so two processes with equal term
+        signatures still match different text when one has the ``ner`` extra and
+        the other does not (a documented state: NER needs Python 3.12). Callers
+        fold this into cache keys next to ``term_signature``, or a model-less pod
+        can seed an entry that a model-backed pod replays unredacted.
+
+        Resolution is FORCED here rather than probed: both loaders latch a
+        ``_tried`` flag, so after this call the capability can no longer change
+        for the process lifetime and a signature taken once stays true. Probing
+        the not-yet-loaded globals instead would read "absent" at construction
+        and "present" on the first request — a key that changes meaning after
+        it has been written.
+        """
+        return (f"ru:{_ru_lemmatizer_identity()}", f"en:{_en_lemmatizer_identity()}")
 
     async def detect(self, text: str) -> list[Finding]:
         if not text.strip() or not self._index:

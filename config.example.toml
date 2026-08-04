@@ -64,6 +64,11 @@
 #   Resolved by bootstrap.build_guardrail() in every deployment (k8s/Helm
 #   included), not just the docker-compose Codex demo overlay. See
 #   docs/chatgpt-codex.md.
+# CORP_LLM_STRIP_INBOUND_HEADERS = "0"  # strip inbound wire headers before upstream
+#   Set "1" when routing through litellm's hosted_vllm/ provider (corp-*
+#   models): it forwards proxy_server_request headers (incl. Host) upstream,
+#   and an unknown vhost 503s the corp ingress. Off by default to preserve
+#   existing anthropic/openai routing behaviour.
 # CORP_LLM_FORWARD_ANTHROPIC_AUTH = "0"  # opt-in Anthropic subscription (OAuth) forwarding
 #   Lifts the developer's `sk-ant-oat…` bearer into the upstream Anthropic call,
 #   so no ANTHROPIC_API_KEY is needed on the laptop.
@@ -107,6 +112,30 @@
 #           CLOSED (503 E_NER_UNAVAILABLE) and /healthz/ready probes NER-loaded.
 #   false — dev / 3.14 graceful degradation (no NER, no 503). Code default.
 # CORP_LLM_REQUIRE_NER = "1"
+
+# ── Corp NER service (detectors/corp_ner.py) ─────────────────────────────────
+#
+# An ADDITIONAL detector in the local-first cascade, not a replacement: it runs
+# alongside regex+checksum and dual-NER on PROSE/COMMENT segments only — never on
+# CODE segments, so source code is never shipped to the service.
+#
+# Default OFF, so an existing deploy is unaffected until it opts in. When on,
+# CORP_NER_ENDPOINT is required and every failure is FAIL-CLOSED (503
+# E_CORP_NER_UNAVAILABLE, gateway_failure{component="corp_ner"}) — there is no
+# REQUIRE flag to relax, because an unscanned text must never read as clean.
+# Registering it also puts it on /healthz/extensions as detector:corp_ner.
+#
+# CORP_NER_TIMEOUT_S sits deliberately under the service's own 60s client
+# timeout; MAX_TEXTS / MAX_INPUT_CHARS mirror the service's batch limits (a
+# single text above the char limit fails closed rather than being truncated).
+# CORP_NER_CA_BUNDLE verifies corp-NER TLS against an internal CA; verification
+# is never disabled for this call (it carries RAW user content).
+# CORP_NER_ENABLED          = "0"
+# CORP_NER_ENDPOINT         = "https://corp-ner.corp.lan"
+# CORP_NER_TIMEOUT_S        = "30"
+# CORP_NER_MAX_TEXTS        = "256"
+# CORP_NER_MAX_INPUT_CHARS  = "200000"
+# CORP_NER_CA_BUNDLE        = "/etc/corp-llm-gateway/corp-root-ca.pem"
 
 # ── Oracle trigger — when the conditional LLM oracle runs (orchestrator.py, F3) ─
 #
@@ -247,6 +276,18 @@
 # [extensions.detector.presidio]
 # enabled     = false
 # api_version = "1"
+#
+# corp_ner is the one detector table that is actually read (bootstrap.py). Its
+# keys mirror the CORP_NER_* scalars above and the env var WINS when both are
+# set, so a container can override a baked-in config file.
+#
+# [extensions.detector.corp_ner]
+# enabled          = true
+# endpoint         = "https://corp-ner.corp.lan"
+# timeout_s        = 30
+# max_texts        = 256
+# max_input_chars  = 200000
+# ca_bundle        = "/etc/corp-llm-gateway/corp-root-ca.pem"
 #
 # Providers — [providers.<name>]. v1 allows anthropic | openai (upstream) and
 # corp-vllm (oracle); any other name is refused unless CORP_ALLOW_V2_PROVIDERS=1.

@@ -39,6 +39,12 @@ class ReadyCheck(HealthCheck):
     deploy property, not a flapping dependency: a pod started without the
     required NER model would 503 every request (F2 fail-closed), so it must fall
     out of the load balancer rather than serve.
+
+    When ``CORP_NER_ENABLED`` is set, a ``check_corp_ner`` probe is wired the same
+    way (see ``make_corp_ner_ready_probe``). This is in ADDITION to the extension's
+    own health, not a duplicate of it: ``ExtensionsCheck`` is deliberately kept out
+    of readiness, but corp NER is fail-closed on the request path, so a pod that
+    cannot reach the service would 503 every request and must leave rotation.
     """
 
     def __init__(
@@ -47,10 +53,12 @@ class ReadyCheck(HealthCheck):
         check_postgres: Callable[[], Awaitable[bool]],
         *,
         check_ner: Callable[[], Awaitable[bool]] | None = None,
+        check_corp_ner: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self._check_redis = check_redis
         self._check_postgres = check_postgres
         self._check_ner = check_ner
+        self._check_corp_ner = check_corp_ner
 
     async def check(self) -> HealthStatus:
         try:
@@ -73,6 +81,13 @@ class ReadyCheck(HealthCheck):
                 return HealthStatus(False, f"ner_error:{type(exc).__name__}")
             if not ner_ok:
                 return HealthStatus(False, "ner_unhealthy")
+        if self._check_corp_ner is not None:
+            try:
+                corp_ner_ok = await self._check_corp_ner()
+            except Exception as exc:
+                return HealthStatus(False, f"corp_ner_error:{type(exc).__name__}")
+            if not corp_ner_ok:
+                return HealthStatus(False, "corp_ner_unhealthy")
         return HealthStatus(True, "ready")
 
 
@@ -93,6 +108,23 @@ def make_ner_ready_probe(
     async def _probe() -> bool:
         findings = await detect(probe_text)
         return len(findings) > 0
+
+    return _probe
+
+
+def make_corp_ner_ready_probe(
+    health: Callable[[], Awaitable[HealthStatus]],
+) -> Callable[[], Awaitable[bool]]:
+    """Build a readiness probe from the corp NER extension's ``health()`` (B4).
+
+    Takes the extension's health callable rather than an endpoint so readiness and
+    ``/healthz/extensions`` can never disagree about how the service is reached
+    (same client, same TLS config). Wire it into ``ReadyCheck`` only when
+    ``CORP_NER_ENABLED`` is set; otherwise readiness is byte-identical to today.
+    """
+
+    async def _probe() -> bool:
+        return (await health()).healthy
 
     return _probe
 

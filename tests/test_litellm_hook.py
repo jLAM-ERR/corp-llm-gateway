@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -9,19 +10,22 @@ from typing import Any
 import httpx
 import pytest
 
-from corp_llm_gateway.audit import AuditLogger, ListSink
+from corp_llm_gateway.audit import AuditLogger, AuditWriteAmbiguousError, ListSink, Sink
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
+from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.rules import Gazetteer, Rule, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.placeholder import StaleSpanError
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import (
+    AuthError,
     AuthMiddleware,
     InMemoryTokenStore,
     TokenInfo,
+    TokenStore,
 )
 from tests.sanitizer.test_streaming import (
     _MSG_DELTA,
@@ -47,6 +51,56 @@ class _RaisingNerEngine(PIIDetector):
 
     async def detect(self, text: str) -> list[Finding]:
         raise RuntimeError("ner deps absent")
+
+
+class _RaisingTokenStore(TokenStore):
+    """F8 repro: a token store backed by a DB with no schema staged — the real
+    PostgresTokenStore.lookup() raises asyncpg.UndefinedTableError with this
+    exact message when `corp_tokens` hasn't been migrated."""
+
+    async def lookup(self, corp_token: str) -> TokenInfo | None:
+        raise RuntimeError('relation "corp_tokens" does not exist')
+
+    async def revoke_user(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+        raise NotImplementedError
+
+
+class _CancellingTokenStore(TokenStore):
+    """Simulates the auth backend being cancelled mid-lookup (request timeout /
+    server shutdown). ``asyncio.CancelledError`` is a ``BaseException`` in
+    Python 3.8+, NOT an ``Exception`` — the F8 wrapper's ``except Exception``
+    must not catch it."""
+
+    async def lookup(self, corp_token: str) -> TokenInfo | None:
+        raise asyncio.CancelledError
+
+    async def revoke_user(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+        raise NotImplementedError
+
+
+class _RecordingMetrics(MetricsExporter):
+    """Records every call instead of exporting — used to assert the F8 wrapper
+    still fires `gateway_failure{component}` on the unexpected-error path."""
+
+    def __init__(self) -> None:
+        self.blocks: list[str] = []
+        self.failures: list[str] = []
+        self.latencies: list[tuple[float, str]] = []
+
+    def record_block(self, block_reason: str) -> None:
+        self.blocks.append(block_reason)
+
+    def record_failure(self, component: str) -> None:
+        self.failures.append(component)
+
+    def observe_request_latency(self, seconds: float, *, status: str) -> None:
+        self.latencies.append((seconds, status))
 
 
 def _corp_llm_returning(pairs: list[tuple[str, str]]) -> CorpLlmClient:
@@ -270,6 +324,414 @@ async def test_pre_call_missing_token_rejected() -> None:
         await g.pre_call({"messages": [], "headers": {}})
     assert ei.value.status_code == 401
     assert ei.value.error_code == "E_MISSING_TOKEN"
+
+
+async def test_pre_call_backend_db_error_returns_opaque_500(caplog: Any) -> None:
+    """F8 repro: with no schema staged, the token store raises a raw DB
+    exception. That must never reach the client as exception text — only
+    an opaque 500 carrying a stable error_code + request_id."""
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(orch, AuthMiddleware(_RaisingTokenStore()), audit_logger)
+
+    with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(_data_with_token("tok-1"))
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    exc_text = str(ei.value)
+    assert "corp_tokens" not in exc_text
+    assert "relation" not in exc_text
+    assert "corp_tokens" not in caplog.text
+
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert "corp_tokens" not in serialized
+    assert sink.records[0]["error_code"] == "E_INTERNAL"
+
+
+async def test_pre_call_unexpected_error_records_metrics_failure() -> None:
+    """F8: an unexpected backend exception must still increment
+    gateway_failure{component="internal"} — otherwise a real outage on this
+    path is invisible to the runbook's alerting query, and an operator has
+    no signal that anything went wrong at all."""
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    metrics = _RecordingMetrics()
+    g = CorpLlmGuardrail(orch, AuthMiddleware(_RaisingTokenStore()), audit_logger, metrics=metrics)
+
+    with pytest.raises(GuardrailHttpException):
+        await g.pre_call(_data_with_token("tok-1"))
+
+    assert metrics.failures == ["internal"]
+
+
+async def test_pre_call_wrapper_does_not_swallow_cancelled_error() -> None:
+    """The F8 safety-net wrapper's `except Exception` must NOT catch
+    `asyncio.CancelledError` — it is a `BaseException`, not an `Exception`, in
+    every Python version this repo supports. Catching it would convert a
+    cancelled/timed-out request into a fabricated 500 E_INTERNAL and defeat
+    task cancellation (a hung request would appear to "complete" instead)."""
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(orch, AuthMiddleware(_CancellingTokenStore()), audit_logger)
+
+    with pytest.raises(asyncio.CancelledError):
+        await g.pre_call(_data_with_token("tok-1"))
+
+    # The wrapper's except block never ran, so no failure was recorded — a
+    # cancellation is not a gateway failure and must not be reported as one.
+    assert sink.records == []
+
+
+async def test_pre_call_non_dict_data_returns_opaque_500() -> None:
+    """Minor: `_ensure_request_id` must never raise itself — a non-dict
+    `data` must not escape as a raw `AttributeError`, which (fired from
+    inside the safety net's own `except` block) would carry the ORIGINAL
+    exception via `__context__` (M1-14 surface iii)."""
+    g, _sink = _build_guardrail()
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(["not", "a", "dict"])  # type: ignore[arg-type]
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    assert ei.value.__cause__ is None
+    assert ei.value.__context__ is None or ei.value.__suppress_context__
+
+
+class _RaisingSink(Sink):
+    """An audit sink whose transport is down — write() always raises."""
+
+    async def write(self, record: dict[str, Any]) -> None:
+        raise RuntimeError("sink transport down")
+
+
+async def test_post_call_unary_unexpected_error_returns_opaque_500() -> None:
+    """Major: post_call_unary runs AFTER placeholders are replaced by
+    originals, so an unexpected exception there is the one place raw content
+    could plausibly leak. It must get the same F8 safety net as pre_call."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    def _boom(response: Any, mapping: Any) -> Any:
+        raise RuntimeError(f"reconstruct failed for alice: {response!r}")
+
+    import corp_llm_gateway.litellm_hook as hook_mod
+
+    original = hook_mod._apply_reverse_to_response
+    hook_mod._apply_reverse_to_response = _boom  # type: ignore[assignment]
+    try:
+        with pytest.raises(GuardrailHttpException) as ei:
+            await g.post_call_unary(data, {"choices": [{"message": {"content": "hello [N1]!"}}]})
+    finally:
+        hook_mod._apply_reverse_to_response = original
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    assert "alice" not in str(ei.value)
+    assert len(sink.records) == 1
+    assert sink.records[0]["error_code"] == "E_INTERNAL"
+
+
+async def test_post_call_stream_upstream_error_propagates_unconverted() -> None:
+    """Major: a failure fetching the NEXT chunk from the upstream iterator
+    (e.g. a mid-stream `httpx.RemoteProtocolError`) is not our bug — it must
+    reach litellm untouched, not get relabelled E_INTERNAL and swallowed as
+    an unrecoverable, unclassified gateway failure."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    async def _raising_iter() -> AsyncIterator[Any]:
+        yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
+        raise httpx.RemoteProtocolError("peer reset")
+
+    chunks = []
+    with pytest.raises(httpx.RemoteProtocolError):
+        async for chunk in g.post_call_stream(data, _raising_iter()):
+            chunks.append(chunk)
+
+    # No fabricated E_INTERNAL for a real provider failure — litellm owns it.
+    assert sink.records == []
+
+
+async def test_post_call_stream_own_bug_mid_stream_returns_opaque_500() -> None:
+    """Major: a bug in OUR OWN desanitization work mid-stream (as opposed to
+    an upstream transport failure) must still be caught and mapped to an
+    opaque 500 — this runs after placeholders were replaced by originals."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    await g.pre_call(data)
+
+    async def _good_iter() -> AsyncIterator[Any]:
+        yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
+        yield {"choices": [{"delta": {"content": " again [N1]"}}]}
+
+    import corp_llm_gateway.litellm_hook as hook_mod
+
+    def _boom(chunk: Any) -> str | None:
+        raise RuntimeError("desanitize bug for alice")
+
+    original = hook_mod._extract_chunk_text
+    hook_mod._extract_chunk_text = _boom  # type: ignore[assignment]
+    try:
+        with pytest.raises(GuardrailHttpException) as ei:
+            async for _chunk in g.post_call_stream(data, _good_iter()):
+                pass
+    finally:
+        hook_mod._extract_chunk_text = original
+
+    assert ei.value.status_code == 500
+    assert ei.value.error_code == "E_INTERNAL"
+    assert "alice" not in str(ei.value)
+    assert len(sink.records) == 1
+    assert sink.records[0]["error_code"] == "E_INTERNAL"
+
+
+async def test_reentrant_audit_failure_does_not_double_count_component_failure() -> None:
+    """Major: a DLP block whose own inline `audit()` call itself raises (sink
+    outage) must not ALSO record `gateway_failure{component="internal"}` on
+    top of the `component="dlp"` failure already recorded for the same
+    request — one real failure, one metric, not two."""
+    metrics = _RecordingMetrics()
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    g = CorpLlmGuardrail(
+        orch,
+        AuthMiddleware(token_store),
+        AuditLogger(_RaisingSink(), gateway_version="0.0.1"),
+        metrics=metrics,
+    )
+    raw_key = "sk-" + "a" * 48
+    data = _data_with_token("tok-1", content=f"my key is {raw_key}")
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+
+    # The sink outage on the DLP branch's own audit() call re-enters the
+    # wrapper, which reclassifies the client-visible error — but the
+    # component metric must stay attributed to the failure that actually
+    # happened (dlp), not doubled with an "internal" for the same request.
+    assert ei.value.error_code == "E_INTERNAL"
+    assert metrics.failures == ["dlp"]
+    # A confirmed-failed emit + the safety net's own retry both call audit()
+    # for this request — the latency histogram must still see it only once.
+    assert len(metrics.latencies) == 1
+
+
+class _AmbiguousAckSink(Sink):
+    """Simulates a sink whose write() call already persisted the record
+    downstream before raising — e.g. an HTTP response was accepted but
+    reading the acknowledgement timed out."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    async def write(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
+        raise AuditWriteAmbiguousError("ack read timed out")
+
+
+async def test_reentrant_audit_ambiguous_delivery_does_not_duplicate_and_keeps_state() -> None:
+    """Major: a sink that delivers-then-fails-the-ack must not have the
+    safety net retry-emit a second record for the same request. And whatever
+    WAS recorded must carry the real block_reason/user_id, not "unknown"/None
+    from a state destroyed by popping `_req_state` before emit."""
+    metrics = _RecordingMetrics()
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    token_store = InMemoryTokenStore()
+    now = datetime.now(UTC)
+    token_store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    sink = _AmbiguousAckSink()
+    g = CorpLlmGuardrail(
+        orch,
+        AuthMiddleware(token_store),
+        AuditLogger(sink, gateway_version="0.0.1"),
+        metrics=metrics,
+    )
+    raw_key = "sk-" + "a" * 48
+    data = _data_with_token("tok-1", content=f"my key is {raw_key}")
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+
+    assert ei.value.error_code == "E_INTERNAL"
+    assert metrics.failures == ["dlp"]
+
+    # Exactly one delivered record — the safety net must not retry an
+    # ambiguous (possibly-already-delivered) audit write.
+    assert len(sink.records) == 1
+    record = sink.records[0]
+    assert record["user_id"] == "alice"
+    assert record["block_reason"] == "dlp:secret_leak"
+
+
+def _case_missing_token() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail()
+    return g, {"messages": [], "headers": {}}
+
+
+def _case_bad_request() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail()
+    data = _data_with_token("tok-1", content="hi")
+    data["messages"] = "not-a-list"
+    return g, data
+
+
+def _case_policy_blocked_ambiguous_shape() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail()
+    data = {
+        "model": "gpt-5.6-sol",
+        "messages": [],
+        "input": ["anything"],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer oauth"},
+    }
+    return g, data
+
+
+def _case_provider_auth() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail(forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hello",
+        "headers": {"X-Corp-Auth": "tok-1"},
+    }
+    return g, data
+
+
+def _case_corp_llm_down() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
+    data = _data_with_token("tok-1", content="hello")
+    return g, data
+
+
+def _case_dlp_blocked() -> tuple[CorpLlmGuardrail, dict[str, Any]]:
+    g, _ = _build_guardrail(pairs=[])
+    raw_key = "sk-" + "a" * 48
+    data = _data_with_token("tok-1", content=f"my key is {raw_key}")
+    return g, data
+
+
+@pytest.mark.parametrize(
+    ("case_factory", "expected_status", "expected_error_code"),
+    [
+        (_case_missing_token, 401, "E_MISSING_TOKEN"),
+        (_case_bad_request, 400, "E_BAD_REQUEST"),
+        (_case_policy_blocked_ambiguous_shape, 422, "E_POLICY_BLOCKED"),
+        (_case_provider_auth, 401, "E_PROVIDER_AUTH"),
+        (_case_corp_llm_down, 503, "E_CORP_LLM_DOWN"),
+        (_case_dlp_blocked, 422, "E_DLP_BLOCKED"),
+    ],
+    ids=[
+        "missing_token",
+        "bad_request",
+        "policy_blocked_stage0",
+        "provider_auth",
+        "corp_llm_down",
+        "dlp_blocked_stage5",
+    ],
+)
+async def test_pre_call_wrapper_preserves_named_error_codes(
+    case_factory: Any, expected_status: int, expected_error_code: str
+) -> None:
+    """F8 regression guard: the pre_call safety-net wrapper's
+    `except GuardrailHttpException: raise` must pass every deliberately
+    raised, already-classified error through UNCHANGED — never flatten it to
+    500 E_INTERNAL. NER (both call sites) is pinned separately by
+    test_pre_call_ner_required_but_absent_returns_503_not_500 /
+    test_pre_call_ner_required_but_absent_on_system_returns_503;
+    E_PROVIDER_BLOCKED / E_PROFILE_UNAVAILABLE are pinned in
+    tests/sanitizer/test_profile_orchestrator.py (they need a profile-file
+    fixture) — both already exercise this same `pre_call` wrapper."""
+    g, data = case_factory()
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(data)
+    assert ei.value.status_code == expected_status
+    assert ei.value.error_code == expected_error_code
+
+
+async def test_auth_error_message_lookup_falls_back_safely_for_unmapped_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_AUTH_ERROR_MESSAGES.get(error_code, "authentication failed")` must
+    degrade to the static default for any AuthError subclass
+    `_classify_auth_error` hasn't been taught about yet — never a KeyError,
+    never `str(exc)` (which could carry backend-derived detail, the exact
+    defect class this lookup table replaced)."""
+    import corp_llm_gateway.litellm_hook as hook_module
+
+    class _FutureAuthError(AuthError):
+        pass
+
+    class _FutureRaisingTokenStore(TokenStore):
+        async def lookup(self, corp_token: str) -> TokenInfo | None:
+            raise _FutureAuthError("backend-derived detail that must never reach the client")
+
+        async def revoke_user(self, user_id: str) -> int:
+            raise NotImplementedError
+
+        async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+            raise NotImplementedError
+
+    monkeypatch.setattr(hook_module, "_classify_auth_error", lambda exc: "E_FUTURE_AUTH_CODE")
+
+    sink = ListSink()
+    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(orch, AuthMiddleware(_FutureRaisingTokenStore()), audit_logger)
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(_data_with_token("tok-1"))
+
+    assert ei.value.status_code == 401
+    assert ei.value.error_code == "E_FUTURE_AUTH_CODE"
+    assert "backend-derived detail" not in str(ei.value)
+    assert str(ei.value) == "401 E_FUTURE_AUTH_CODE: authentication failed"
+
+
+def test_auth_error_messages_keys_match_classify_auth_error_return_values() -> None:
+    """Pin `_AUTH_ERROR_MESSAGES`'s keys against every value `_classify_auth_error`
+    can currently return, so a new `AuthError` subclass added there without a
+    matching message here fails this test immediately instead of silently
+    degrading to the generic fallback in production."""
+    from corp_llm_gateway.litellm_hook import _AUTH_ERROR_MESSAGES, _classify_auth_error
+    from corp_llm_gateway.tokens import ExpiredTokenError, InvalidTokenError, RevokedTokenError
+
+    class _UnclassifiedAuthError(AuthError):
+        pass
+
+    observed = {
+        _classify_auth_error(ExpiredTokenError("x")),
+        _classify_auth_error(RevokedTokenError("x")),
+        _classify_auth_error(InvalidTokenError("x")),
+        _classify_auth_error(_UnclassifiedAuthError("x")),
+    }
+    assert observed == set(_AUTH_ERROR_MESSAGES.keys())
 
 
 async def test_pre_call_sanitizes_responses_input_instructions_and_tool_output() -> None:

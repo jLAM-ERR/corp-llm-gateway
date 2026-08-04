@@ -27,14 +27,19 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any
 
-from corp_llm_gateway.audit import AuditEvent, AuditLogger
+from corp_llm_gateway.audit import AuditEvent, AuditLogger, AuditWriteAmbiguousError
 from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
+from corp_llm_gateway.corp_ner.errors import (
+    E_CORP_NER_UNAVAILABLE,
+    E_NER_UNAVAILABLE,
+    ner_error_code,
+)
 from corp_llm_gateway.detectors import NerUnavailableError
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.payload.classifier import classify_block
@@ -71,6 +76,7 @@ from corp_llm_gateway.sanitizer.identity_preamble import (
     is_identity_preamble,
     leading_identity_block_index,
 )
+from corp_llm_gateway.sanitizer.local_pass import DetectorContractError
 from corp_llm_gateway.sanitizer.placeholder import (
     StaleSpanError,
     add_unwrapped_response_aliases,
@@ -158,6 +164,32 @@ class GuardrailHttpException(Exception):  # noqa: N818 — intentional name; Lit
         self.error_code = error_code
 
 
+# A batch detector breaking the BatchPIIDetector contract is a code bug, not a
+# missing NER model — reporting it as E_NER_UNAVAILABLE would send an operator to
+# check models during what is really an integration failure. Status stays 503:
+# the request still failed closed.
+E_DETECTOR_CONTRACT = "E_DETECTOR_CONTRACT"
+
+# Static, content-free client messages per detection-failure code (never str(exc)).
+_DETECTION_FAILURE_MESSAGES: dict[str, str] = {
+    E_NER_UNAVAILABLE: "NER detector unavailable",
+    E_CORP_NER_UNAVAILABLE: "corp NER service unavailable",
+    E_DETECTOR_CONTRACT: "detector contract violation",
+}
+
+
+def _detection_failure_code(exc: BaseException) -> str:
+    """Classify a fail-closed detection failure (F2/M4) into its error code.
+
+    ``NerUnavailableError`` is the shared base of all three, so one handler covers
+    every detector; only the code tells them apart downstream (client, audit,
+    gateway_failure{component}).
+    """
+    if isinstance(exc, DetectorContractError):
+        return E_DETECTOR_CONTRACT
+    return ner_error_code(exc)
+
+
 class CorpLlmGuardrail(_LitellmCustomLogger):
     """LiteLLM custom-callback adapter wiring the sanitization pipeline.
 
@@ -226,6 +258,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # keeps audit() exactly-once even if a future litellm version also fires
         # the failure event for the same request_id.
         self._audited_ids: OrderedDict[str, None] = OrderedDict()
+        # Bounded set of request_ids that already had a component-specific
+        # gateway_failure recorded (auth/dlp/oversize/...). The F8 safety net
+        # checks this before recording "internal" so a re-entrant failure (an
+        # already-blocked/failed request whose own inline audit() call then
+        # raises) doesn't get double-counted and mislabeled as internal.
+        self._failure_recorded_ids: OrderedDict[str, None] = OrderedDict()
+        # Bounded set of request_ids whose latency has already been observed
+        # via audit() — a failed emit + safety-net retry call audit() twice
+        # for one request; the histogram must only see it once.
+        self._latency_observed_ids: OrderedDict[str, None] = OrderedDict()
 
     # ---- LiteLLM hook entry points ----------------------------------------
 
@@ -283,6 +325,64 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     # ---- Pure logic (unit-testable without LiteLLM) -----------------------
 
     async def pre_call(
+        self, data: dict[str, Any], *, call_type: str | None = None
+    ) -> dict[str, Any]:
+        """Sanitize a request body in-place; return the mutated dict.
+
+        Thin safety-net wrapper around `_pre_call_impl`: any exception that
+        isn't already a `GuardrailHttpException` (i.e. wasn't deliberately
+        mapped by a known failure branch below) is an unexpected backend
+        failure — a DB error, a transport bug, anything. Those must never
+        reach the client as raw exception text (F8): map to an opaque 500
+        carrying only a stable error_code + request_id; the exception detail
+        goes to the log (type only — its message could carry user content).
+        """
+        try:
+            return await self._pre_call_impl(data, call_type=call_type)
+        except GuardrailHttpException:
+            raise
+        except Exception as exc:
+            request_id = self._ensure_request_id(data)
+            await self._report_internal_failure(
+                request_id, data, exc, log_event="litellm_pre_call_unexpected_error"
+            )
+            # `from None`: `exc` must never become `__cause__` (M1-14 surface iii/vi) —
+            # `_report_internal_failure` already logged its TYPE only, above.
+            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
+
+    async def _report_internal_failure(
+        self,
+        request_id: str,
+        request_data: dict[str, Any],
+        exc: Exception,
+        *,
+        log_event: str,
+    ) -> None:
+        """F8 safety net internals: log (type only, never `str(exc)`), then
+        best-effort record-failure + audit, each in its own guard so a SECOND
+        exception (e.g. an audit-sink outage) can never replace the caller's
+        opaque GuardrailHttpException. Never raises.
+
+        Skips the "internal" gateway_failure when a component-specific one
+        was already recorded for this request_id (e.g. a DLP block whose own
+        inline `audit()` call is what raised) — otherwise a prevented leak
+        gets double-counted and mislabeled as an internal error.
+        """
+        logger.error("%s request_id=%s exc_type=%s", log_event, request_id, type(exc).__name__)
+        try:
+            if request_id not in self._failure_recorded_ids:
+                self._record_failure(request_id, error_code="E_INTERNAL")
+        except Exception:
+            logger.error("litellm_safety_net_record_failure_error request_id=%s", request_id)
+        try:
+            _now = datetime.now(UTC)
+            await self.audit(
+                request_data, None, _now, _now, status="failed", error_code="E_INTERNAL"
+            )
+        except Exception:
+            logger.error("litellm_safety_net_audit_error request_id=%s", request_id)
+
+    async def _pre_call_impl(
         self, data: dict[str, Any], *, call_type: str | None = None
     ) -> dict[str, Any]:
         """Sanitize a request body in-place; return the mutated dict.
@@ -351,7 +451,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             self._record_failure(request_id, error_code=error_code)
             _now = datetime.now(UTC)
             await self.audit(data, None, _now, _now, status="failed", error_code=error_code)
-            raise GuardrailHttpException(401, error_code, str(exc)) from exc
+            # A static message per error_code, never str(exc) — AuthError
+            # subclasses are internal-only today, but interpolating the
+            # exception text here would be the same class of defect as F8
+            # the moment a future subclass wraps something backend-derived.
+            raise GuardrailHttpException(
+                401, error_code, _AUTH_ERROR_MESSAGES.get(error_code, "authentication failed")
+            ) from exc
 
         logger.info(
             "litellm_pre_call_auth_ok request_id=%s team_id=%s user_id=%s",
@@ -880,24 +986,27 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "corp sanitization LLM unavailable",
                 ) from exc
             except NerUnavailableError as exc:
-                # F2 fail-closed (M4): a REQUIRED NER engine's model is absent in
-                # this build. Refuse egress — never forward content a PERSON/ORG
-                # detector would have redacted. 503, distinct from E_CORP_LLM_DOWN
-                # so a missing NER model is not confused with an oracle outage.
+                # F2 fail-closed (M4): a detector that must run could not. Refuse
+                # egress — never forward content a PERSON/ORG detector would have
+                # redacted. 503, distinct from E_CORP_LLM_DOWN so a detector
+                # failure is not confused with an oracle outage; the code tells a
+                # missing local model, a corp-NER outage and a contract bug apart.
+                error_code = _detection_failure_code(exc)
                 logger.warning(
                     "litellm_pre_call_ner_unavailable request_id=%s "
-                    "message_index=%d error_code=E_NER_UNAVAILABLE exception=%s",
+                    "message_index=%d error_code=%s exception=%s",
                     request_id,
                     i,
+                    error_code,
                     type(exc).__name__,
                 )
-                self._record_failure(request_id, error_code="E_NER_UNAVAILABLE")
+                self._record_failure(request_id, error_code=error_code)
                 _now = datetime.now(UTC)
                 await self.audit(data, None, _now, _now, status="failed")
                 raise GuardrailHttpException(
                     503,
-                    "E_NER_UNAVAILABLE",
-                    "NER detector unavailable",
+                    error_code,
+                    _DETECTION_FAILURE_MESSAGES[error_code],
                 ) from exc
             except StaleSpanError as exc:
                 # M4 fail-policy matrix: the pre-selected replacement span pool no
@@ -1152,21 +1261,23 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 "corp sanitization LLM unavailable",
             ) from exc
         except NerUnavailableError as exc:
-            # F2 fail-closed (M4): required NER unavailable on this field.
+            # F2 fail-closed (M4): a required detector could not run on this field.
+            error_code = _detection_failure_code(exc)
             logger.warning(
                 "litellm_pre_call_ner_unavailable request_id=%s "
-                "field=%s error_code=E_NER_UNAVAILABLE exception=%s",
+                "field=%s error_code=%s exception=%s",
                 request_id,
                 prompt_field,
+                error_code,
                 type(exc).__name__,
             )
-            self._record_failure(request_id, error_code="E_NER_UNAVAILABLE")
+            self._record_failure(request_id, error_code=error_code)
             _now = datetime.now(UTC)
             await self.audit(data, None, _now, _now, status="failed")
             raise GuardrailHttpException(
                 503,
-                "E_NER_UNAVAILABLE",
-                "NER detector unavailable",
+                error_code,
+                _DETECTION_FAILURE_MESSAGES[error_code],
             ) from exc
         except StaleSpanError as exc:
             # M4 fail-policy matrix: same fail-closed mapping as the messages loop.
@@ -1213,8 +1324,24 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         request_data: dict[str, Any],
         response: AsyncIterator[Any],
     ) -> AsyncIterator[Any]:
-        """Wrap an async iterator of SSE chunks with de-sanitization."""
+        """Wrap an async iterator of SSE chunks with de-sanitization.
+
+        No safety net here on purpose: `_post_call_stream_impl` guards only
+        its OWN desanitization work, not the upstream provider's stream — an
+        `httpx.RemoteProtocolError` mid-stream is not our bug and must reach
+        litellm's own failure handling untouched, not get relabelled
+        `E_INTERNAL`.
+        """
         request_id = self._ensure_request_id(request_data)
+        async for chunk in self._post_call_stream_impl(request_id, request_data, response):
+            yield chunk
+
+    async def _post_call_stream_impl(
+        self,
+        request_id: str,
+        request_data: dict[str, Any],
+        response: AsyncIterator[Any],
+    ) -> AsyncIterator[Any]:
         state = self._req_state.get(request_id)
         if state is None or not state.mapping.pairs:
             logger.info(
@@ -1244,44 +1371,93 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Responses API path: typed Pydantic ``response.*`` events.
         responses_desanitizer = ResponsesStreamDesanitizer(response_mapping)
         chunk_count = 0
-        async for chunk in response:
+        # Manual `__anext__` loop (instead of `async for`) so fetching the next
+        # chunk from the UPSTREAM iterator is NOT inside the try/except below —
+        # only our own per-chunk desanitization work is guarded (F8: never wrap
+        # the provider's own transport).
+        stream_iter = response.__aiter__()
+        while True:
+            try:
+                chunk = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception:
+                # Upstream/transport failure (e.g. httpx.RemoteProtocolError)
+                # fetching the next chunk. Flush any already-buffered
+                # desanitized tail (best effort — already-yielded chunks may
+                # have held content back) then let litellm see the ORIGINAL
+                # exception untouched; it is not ours to reclassify.
+                try:
+                    for tail_chunk in _flush_stream_tails(
+                        sse,
+                        dict_desanitizer,
+                        dict_tool_calls,
+                        dict_function_call,
+                        responses_desanitizer,
+                    ):
+                        yield tail_chunk
+                except Exception:
+                    logger.warning(
+                        "litellm_post_call_stream_flush_after_upstream_error_failed request_id=%s",
+                        request_id,
+                    )
+                raise
             chunk_count += 1
-            if isinstance(chunk, (bytes, str)):
-                for out_chunk in sse.feed(chunk):
-                    yield out_chunk
-            elif _is_responses_event(chunk):
-                for out_chunk in responses_desanitizer.feed(chunk):
-                    yield out_chunk
-            elif isinstance(chunk, dict):
-                chunk, had_tc = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
-                chunk, had_fc = _desanitize_chunk_function_call(chunk, dict_function_call)
-                text = _extract_chunk_text(chunk)
-                if text is None:
+            try:
+                if isinstance(chunk, (bytes, str)):
+                    for out_chunk in sse.feed(chunk):
+                        yield out_chunk
+                elif _is_responses_event(chunk):
+                    for out_chunk in responses_desanitizer.feed(chunk):
+                        yield out_chunk
+                elif isinstance(chunk, dict):
+                    chunk, had_tc = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
+                    chunk, had_fc = _desanitize_chunk_function_call(chunk, dict_function_call)
+                    text = _extract_chunk_text(chunk)
+                    if text is None:
+                        yield chunk
+                    else:
+                        out = dict_desanitizer.feed(text)
+                        # Held-back/empty content must not drop a tool_call/function_call
+                        # riding in the same delta (its id/name/args would be lost).
+                        if out or had_tc or had_fc:
+                            yield _replace_chunk_text(chunk, out)
+                else:
                     yield chunk
-                    continue
-                out = dict_desanitizer.feed(text)
-                # Held-back/empty content must not drop a tool_call/function_call
-                # riding in the same delta (its id/name/args would be lost).
-                if out or had_tc or had_fc:
-                    yield _replace_chunk_text(chunk, out)
-            else:
-                yield chunk
-        # Flush SSE desanitizer (handles truncated streams / held-back tail).
-        for out_chunk in sse.flush():
-            yield out_chunk
-        # Flush dict desanitizer tail.
-        tail = dict_desanitizer.flush()
-        if tail:
-            yield _replace_chunk_text(_make_text_chunk(), tail)
-        # Flush any held-back tool_calls arguments tails.
-        for tc_index, tc_tail in dict_tool_calls.flush():
-            yield _make_tool_call_chunk(tc_index, tc_tail)
-        # Flush any held-back legacy function_call arguments tail.
-        fc_tail = dict_function_call.flush()
-        if fc_tail:
-            yield _make_function_call_chunk(fc_tail)
-        for responses_tail in responses_desanitizer.flush():
-            yield responses_tail
+            except GuardrailHttpException:
+                raise
+            except Exception as exc:
+                # Our own desanitization work failed — this runs AFTER
+                # placeholders have been replaced by originals, the one path
+                # most likely to carry real user content in the exception
+                # message (F8).
+                try:
+                    for tail_chunk in _flush_stream_tails(
+                        sse,
+                        dict_desanitizer,
+                        dict_tool_calls,
+                        dict_function_call,
+                        responses_desanitizer,
+                    ):
+                        yield tail_chunk
+                except Exception:
+                    logger.warning(
+                        "litellm_post_call_stream_flush_after_failure_failed request_id=%s",
+                        request_id,
+                    )
+                await self._report_internal_failure(
+                    request_id,
+                    request_data,
+                    exc,
+                    log_event="litellm_post_call_stream_unexpected_error",
+                )
+                # `from None`: `exc` (already-desanitized content) must never
+                # become `__cause__` (M1-14 surface iii/vi).
+                raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
+        for tail_chunk in _flush_stream_tails(
+            sse, dict_desanitizer, dict_tool_calls, dict_function_call, responses_desanitizer
+        ):
+            yield tail_chunk
         logger.info(
             "litellm_post_call_stream_desanitize_done request_id=%s chunk_count=%d",
             request_id,
@@ -1293,8 +1469,32 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         request_data: dict[str, Any],
         response: Any,
     ) -> Any:
-        """De-sanitize a single (non-streaming) response."""
+        """De-sanitize a single (non-streaming) response.
+
+        Thin F8 safety-net wrapper (same shape as `pre_call`): this runs
+        AFTER placeholders have been replaced by originals, so an unexpected
+        exception here is the one place raw content is most likely to ride
+        in an exception message. Never let that reach the client raw.
+        """
         request_id = self._ensure_request_id(request_data)
+        try:
+            return await self._post_call_unary_impl(request_id, request_data, response)
+        except GuardrailHttpException:
+            raise
+        except Exception as exc:
+            await self._report_internal_failure(
+                request_id, request_data, exc, log_event="litellm_post_call_unary_unexpected_error"
+            )
+            # `from None`: `exc` (already-desanitized content) must never
+            # become `__cause__` (M1-14 surface iii/vi).
+            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
+
+    async def _post_call_unary_impl(
+        self,
+        request_id: str,
+        request_data: dict[str, Any],
+        response: Any,
+    ) -> Any:
         state = self._req_state.get(request_id)
         if state is None or not state.mapping.pairs:
             logger.info(
@@ -1326,10 +1526,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if request_id in self._audited_ids:
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
             return
-        self._audited_ids[request_id] = None
-        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
-            self._audited_ids.popitem(last=False)
-        state = self._req_state.pop(request_id, None)
+        # Do NOT pop yet: a failed emit below must leave `state` in place for
+        # a genuine retry (the F8 safety net's own guarded audit() call) to
+        # find the real user_id/redaction_count/block_reason instead of
+        # "unknown"/0/null — popping only happens once emit() has actually
+        # succeeded (or the sink tells us the write is ambiguous, below).
+        state = self._req_state.get(request_id)
         # litellm v1.85 passes datetime objects for start_time / end_time
         # to async_log_*_event; older versions used floats. Handle both.
         delta = end_time - start_time
@@ -1337,8 +1539,14 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             latency_ms = max(0, int(delta.total_seconds() * 1000))
         else:
             latency_ms = max(0, int(delta * 1000))
-        # Once-per-request (audit() is deduped above) request-latency observation.
-        self._metrics.observe_request_latency(latency_ms / 1000.0, status=status)
+        # Once per REQUEST, not once per audit() call: a failed emit + safety-net
+        # retry must not double-observe the same request's latency under two
+        # different status labels.
+        if request_id not in self._latency_observed_ids:
+            self._metrics.observe_request_latency(latency_ms / 1000.0, status=status)
+            self._latency_observed_ids[request_id] = None
+            if len(self._latency_observed_ids) > _AUDIT_DEDUP_CAP:
+                self._latency_observed_ids.popitem(last=False)
         prompt_tokens, completion_tokens = _extract_token_counts(response)
 
         event = AuditEvent(
@@ -1364,7 +1572,33 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             block_reason=(state.block_reason if state else None),
             profile_ids=(state.profile_ids if state else ()),
         )
-        await self._audit.emit(event)
+        try:
+            await self._audit.emit(event)
+        except AuditWriteAmbiguousError:
+            # The sink may have already persisted this record before raising
+            # (e.g. an HTTP response was accepted but reading the ack timed
+            # out) — treat it as delivered so a safety-net retry for the same
+            # request_id doesn't write a second record for one logical write.
+            logger.error("litellm_audit_emit_ambiguous request_id=%s status=%s", request_id, status)
+            self._req_state.pop(request_id, None)
+            self._audited_ids[request_id] = None
+            if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+                self._audited_ids.popitem(last=False)
+            raise
+        except Exception:
+            # Do NOT mark dedup on a confirmed failed emit: a request whose
+            # only audit attempt raised (e.g. a sink outage) must stay
+            # eligible for a genuine retry — the F8 safety net's own guarded
+            # audit() call is exactly that retry — instead of being silently
+            # deduped away with zero records ever written.
+            logger.error("litellm_audit_emit_failed request_id=%s status=%s", request_id, status)
+            raise
+        # Pop only after a confirmed-successful emit, so `_req_state` never
+        # grows unbounded past this point either.
+        self._req_state.pop(request_id, None)
+        self._audited_ids[request_id] = None
+        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+            self._audited_ids.popitem(last=False)
         logger.info(
             "litellm_audit_emitted request_id=%s status=%s latency_ms=%d "
             "redaction_count=%d cache_a_hit=%s prompt_tokens=%d completion_tokens=%d",
@@ -1380,7 +1614,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     # ---- internals --------------------------------------------------------
 
     @staticmethod
-    def _ensure_request_id(data: dict[str, Any]) -> str:
+    def _ensure_request_id(data: Any) -> str:
         """Return a stable id that survives the pre_call → log-event handoff.
 
         litellm's own per-call id, ``litellm_call_id``, is the one identifier
@@ -1411,7 +1645,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         let a caller forge log lines. A candidate that fails validation is
         treated as absent, falling through to the next lookup path or the
         generated UUID.
+
+        Called both inside and outside every F8 safety net (including from
+        within an `except` block), so it must never raise itself — a
+        non-dict `data` would otherwise escape as a raw `AttributeError`
+        whose `__context__` carries whatever exception was already being
+        handled (M1-14 surface iii). A non-dict `data` gets a fresh,
+        unscattered UUID instead.
         """
+        if not isinstance(data, dict):
+            return str(uuid.uuid4())
         call_id = data.get("litellm_call_id")
         if isinstance(call_id, str) and _valid_request_id(call_id):
             _scatter(data, call_id)
@@ -1473,6 +1716,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     def _record_failure(self, request_id: str, *, error_code: str) -> None:
         if request_id in self._req_state:
             self._req_state[request_id].error_code = error_code
+        self._failure_recorded_ids[request_id] = None
+        if len(self._failure_recorded_ids) > _AUDIT_DEDUP_CAP:
+            self._failure_recorded_ids.popitem(last=False)
         # gateway_failure{component} — the single failure choke point. Fires even
         # when no _RequestState exists yet (e.g. an auth failure before state is built).
         self._metrics.record_failure(_failure_component(error_code))
@@ -2043,11 +2289,25 @@ def _classify_auth_error(exc: AuthError) -> str:
     return "E_AUTH"
 
 
+# Static, backend-detail-free messages for each auth error_code — never str(exc).
+_AUTH_ERROR_MESSAGES: dict[str, str] = {
+    "E_TOKEN_EXPIRED": "token expired",
+    "E_TOKEN_REVOKED": "token revoked",
+    "E_TOKEN_INVALID": "invalid token",
+    "E_AUTH": "authentication failed",
+}
+
+
 # error_code → coarse component for the gateway_failure{component} series. The
 # runbook queries component="corp_llm"/"pre_pass"; unmapped codes fall back to "other".
 _FAILURE_COMPONENT: dict[str, str] = {
     "E_CORP_LLM_DOWN": "corp_llm",
-    "E_NER_UNAVAILABLE": "ner",
+    E_NER_UNAVAILABLE: "ner",
+    # Must match detectors.corp_ner.FAILURE_COMPONENT, which names the series an
+    # operator alerts on. The detector does NOT count its own failures — this is
+    # the only counter for them. Pinned by tests/extensions/test_corp_ner_hook_codes.
+    E_CORP_NER_UNAVAILABLE: "corp_ner",
+    E_DETECTOR_CONTRACT: "sanitize",
     "E_PROFILE_UNAVAILABLE": "profile",
     "E_MISSING_TOKEN": "auth",
     "E_TOKEN_EXPIRED": "auth",
@@ -2061,6 +2321,7 @@ _FAILURE_COMPONENT: dict[str, str] = {
     "E_DLP_BLOCKED": "dlp",
     "E_BAD_REQUEST": "request",
     "E_SPAN_INVALID": "sanitize",
+    "E_INTERNAL": "internal",
 }
 
 
@@ -2130,6 +2391,29 @@ def _make_tool_call_chunk(index: int, arguments: str) -> dict[str, Any]:
 
 def _make_function_call_chunk(arguments: str) -> dict[str, Any]:
     return {"choices": [{"delta": {"function_call": {"arguments": arguments}}}]}
+
+
+def _flush_stream_tails(
+    sse: SseStreamDesanitizer,
+    dict_desanitizer: StreamingDesanitizer,
+    dict_tool_calls: OpenAiToolCallDesanitizer,
+    dict_function_call: StreamingDesanitizer,
+    responses_desanitizer: ResponsesStreamDesanitizer,
+) -> Iterator[Any]:
+    """Flush every stream desanitizer's held-back tail, in the fixed order
+    the normal end-of-stream path uses. Shared with both stream-failure
+    paths so an aborted stream doesn't silently drop already-buffered
+    (partially desanitized) content."""
+    yield from sse.flush()
+    tail = dict_desanitizer.flush()
+    if tail:
+        yield _replace_chunk_text(_make_text_chunk(), tail)
+    for tc_index, tc_tail in dict_tool_calls.flush():
+        yield _make_tool_call_chunk(tc_index, tc_tail)
+    fc_tail = dict_function_call.flush()
+    if fc_tail:
+        yield _make_function_call_chunk(fc_tail)
+    yield from responses_desanitizer.flush()
 
 
 def _desanitize_chunk_tool_calls(

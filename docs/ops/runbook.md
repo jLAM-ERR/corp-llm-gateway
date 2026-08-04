@@ -29,7 +29,7 @@ Revisions list: `helm history gw`. Default Helm keeps the last 10.
 
 The fail-policy matrix in the plan (M4) is the source of truth for what "should" happen on each component failure. When reality disagrees, that's the bug.
 
-Metrics note: the alert series `gateway_failure{component}` and `corp_llm_gateway_blocked_requests_total{block_reason}` are emitted by the metrics module (plan task B4) and scraped via the ServiceMonitor. Until B4 lands, the same conditions surface in the gateway's structured logs — grep `error_code=` (e.g. `E_CORP_LLM_DOWN`, `E_NER_UNAVAILABLE`, `E_OVERSIZE_BLOCKED`, `E_DLP_BLOCKED`) and `block_reason=` (`litellm_pre_call_blocked` / `litellm_egress_blocked`).
+Metrics note: the alert series `gateway_failure{component}` and `corp_llm_gateway_blocked_requests_total{block_reason}` are emitted by the metrics module (plan task B4) and scraped via the ServiceMonitor. Until B4 lands, the same conditions surface in the gateway's structured logs — grep `error_code=` (e.g. `E_CORP_LLM_DOWN`, `E_NER_UNAVAILABLE`, `E_OVERSIZE_BLOCKED`, `E_DLP_BLOCKED`, `E_INTERNAL`) and `block_reason=` (`litellm_pre_call_blocked` / `litellm_egress_blocked`).
 
 ### Corp-LLM unreachable
 
@@ -67,7 +67,7 @@ ADR-003); the corp-LLM oracle is only a conditional fallback. Two failure modes:
 
 Action:
 1. Add detection capacity by scaling the **gateway** Deployment (it runs
-   detection in-process), not a pre-pass pod: `kubectl scale -n corp-llm-gateway deploy/gw --replicas=N`, or enable/raise the HPA (`autoscaling` in values.yaml).
+   detection in-process), not a pre-pass pod: `kubectl scale -n corp-llm-gateway deploy/gw-corp-llm-gateway --replicas=N`, or enable/raise the HPA (`autoscaling` in values.yaml).
 2. Investigate the pod (OOM? NER model load failure? unusually large payload —
    the M1-11 size threshold / `CORP_LLM_OVERSIZE_POLICY` governs those).
 
@@ -85,12 +85,39 @@ Action:
 
 Symptom: SIEM alert "vector_buffer_50pct".
 
-Behavior (default): fail-closed at 100% (per matrix).
+Behavior: **audit loss risk, NOT request blocking.** The M4 matrix lists
+`vectorBufferFull` as fail-closed, but no deployed topology can enforce that
+today: `CORP_AUDIT_SINK` is unset, so the gateway's only audit action is writing
+a line to its own stdout (`audit/factory.py` default → `StdoutSink`), which
+always succeeds. Vector reads that log file afterwards, from a different
+container. There is no signal path from Vector's buffer state back into
+`pre_call`/`post_call`, so a stalled audit path **cannot** return 503 — requests
+keep egressing. See `compose/README.md` "Audit buffering is not fail-closed".
 
 Action:
 1. Check downstream sinks. Likely Langfuse or SIEM is down/slow.
 2. If a single sink is down: the others continue. Pin which one via Vector metrics.
-3. If buffer fills: requests start returning 503. Revisit fail-policy override at team level if business-critical.
+3. If the buffer fills, Vector back-pressures and stops reading; records stay in
+   the container's log files. What actually bounds durability is **log
+   retention**, not the buffer — once docker rotates a file past
+   `LITELLM_LOG_MAX_FILE`, those audit records are gone permanently. Size
+   `LITELLM_LOG_MAX_SIZE` × `LITELLM_LOG_MAX_FILE` for the longest outage you
+   intend to survive.
+4. `docker compose logs vector | grep "Events dropped"` — a wrong or rotated
+   `CORP_LANGFUSE_*` key gives 401, which Vector does **not** retry. That is
+   silent audit loss and needs the key fixed, not more buffer.
+
+### Unexpected internal error (F8 safety net)
+
+Symptom: `gateway_failure{component="internal"}` rises; requests return 500 with `error_code="E_INTERNAL"` and no other detail.
+
+Behavior: fail-closed (per matrix). This is the catch-all for an exception the gateway didn't anticipate (a DB error, a bug, an audit-sink outage) — `pre_call`, `post_call_unary`, and `post_call_stream` all map it to this opaque response rather than ever echoing the exception text to the client, the log, or the audit record. `litellm_pre_call_unexpected_error` / `litellm_post_call_unary_unexpected_error` / `litellm_post_call_stream_unexpected_error` log the exception TYPE only, never its message.
+
+Action:
+1. Check the gateway pod logs for the matching `*_unexpected_error` line and its `exc_type=` — that names the exception class without leaking its message.
+2. If `exc_type` points at a known dependency (Postgres, Redis, the audit sink), treat it as that component's own incident instead — this path is the safety net, not the root cause.
+3. A request already blocked/failed by a specific component (e.g. `E_DLP_BLOCKED`) does NOT also count as `internal` — the wrapper skips the internal counter when a component-specific failure was already recorded for that request.
+4. An upstream provider/transport failure mid-stream (e.g. `httpx.RemoteProtocolError`) also does NOT count as `internal` — `post_call_stream` only wraps its own desanitization work; fetching the next chunk from the upstream iterator is deliberately outside that guard, so a provider failure propagates to litellm's own failure handling untouched. `internal` rising means a bug in the gateway's own pre/post-call code, not a downstream provider outage and not a duplicate of a component-specific block.
 
 ### Token revocation didn't take effect immediately
 
@@ -146,9 +173,17 @@ The path is in `team_config.replace_md_path`. Read directly from the file or que
 
 ## Useful kubectl
 
+> **Deployment name.** The chart renders `<release>-corp-llm-gateway`
+> (`_helpers.tpl` `fullname`), so for `helm install gw ...` the object is
+> `deploy/gw-corp-llm-gateway` — not `deploy/gw` or `deploy/gateway`. The
+> release-independent form is a label selector:
+> `kubectl -n corp-llm-gateway -l app.kubernetes.io/name=corp-llm-gateway ...`.
+> Set `fullnameOverride` if you want a fixed name.
+
+
 ```
 kubectl -n corp-llm-gateway get pods
-kubectl -n corp-llm-gateway logs deploy/gateway -c litellm
-kubectl -n corp-llm-gateway logs deploy/gateway -c vector
-kubectl -n corp-llm-gateway exec -it deploy/gateway -c litellm -- python -m corp_llm_gateway.cli.admin team --help
+kubectl -n corp-llm-gateway logs deploy/gw-corp-llm-gateway -c litellm
+kubectl -n corp-llm-gateway logs deploy/gw-corp-llm-gateway -c vector
+kubectl -n corp-llm-gateway exec -it deploy/gw-corp-llm-gateway -c litellm -- python -m corp_llm_gateway.cli.admin team --help
 ```

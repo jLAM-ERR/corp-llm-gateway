@@ -29,9 +29,16 @@ from corp_llm_gateway import config
 from corp_llm_gateway.audit import AuditLogger, Sink, get_sink, register_sink, sink_name_for
 from corp_llm_gateway.auth import get_auth_provider
 from corp_llm_gateway.corp_llm import CorpLlmClient
+from corp_llm_gateway.corp_ner import (
+    CORP_NER_TABLE,
+    corp_ner_setting,
+    resolve_corp_ner_transport,
+)
 from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import PIIDetector
+from corp_llm_gateway.detectors.corp_ner import CorpNerDetector
 from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
+from corp_llm_gateway.extensions.corp_ner import CorpNerExtension, register_corp_ner
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 from corp_llm_gateway.metrics import get_exporter
 from corp_llm_gateway.profiles import FileProfileLoader, ProfileBundle, ProfileResolver
@@ -148,6 +155,57 @@ def build_corp_llm_client() -> CorpLlmClient:
     )
 
 
+def build_corp_ner() -> tuple[CorpNerDetector, CorpNerExtension] | None:
+    """Corp NER detector + its registry extension, or None when disabled.
+
+    Off by default (``CORP_NER_ENABLED=0``) so existing deploys are untouched.
+    When on, a missing endpoint is a boot-time refusal — `settings.validate()`
+    covers `config check` only, and the compose/demo boots skip it.
+
+    No metrics exporter is threaded in: ``gateway_failure{component="corp_ner"}``
+    is emitted once per request by ``litellm_hook._record_failure``.
+
+    Transport settings (CA bundle, timeout, batch limits) resolve through
+    ``corp_ner.resolve_corp_ner_transport`` — the same reader the profile
+    registry uses, so the two paths cannot drift. Construction performs no I/O.
+    """
+    table = config.get_table(CORP_NER_TABLE)
+    if not parse_flag(corp_ner_setting(table, "CORP_NER_ENABLED", "enabled", "0")):
+        return None
+    endpoint = corp_ner_setting(table, "CORP_NER_ENDPOINT", "endpoint")
+    if not endpoint:
+        raise ConfigError(
+            [
+                "CORP_NER_ENDPOINT: required when CORP_NER_ENABLED=1 — set the env var, "
+                f"the config-file scalar, or endpoint under [{CORP_NER_TABLE}]"
+            ]
+        )
+    transport = resolve_corp_ner_transport(table)
+    http = transport.http_client()
+    # The extension shares the client so readiness and the request path can never
+    # disagree about how the service is reached.
+    return CorpNerDetector(transport.client(endpoint, http=http)), CorpNerExtension(
+        endpoint, http=http
+    )
+
+
+def _code_safe_detectors(
+    local_detectors: list[PIIDetector], network_backed: PIIDetector | None
+) -> list[PIIDetector]:
+    """Detectors allowed on raw CODE segments — every LOCAL detector.
+
+    The rule is network-backed vs local, NOT "NER vs regex". Local dual-NER
+    stays in: PERSON / ORG / LOCATION inside fenced JSON, SQL values, config
+    examples and test fixtures is caught there and nowhere else, so narrowing
+    this list to regex/checksum only was a leak. ``network_backed`` (corp NER
+    today) is the one exclusion, for two reasons specific to it: its regex half
+    fires on code tokens, and calling it would ship the developer's source code
+    to an external service. Derived by exclusion so a new LOCAL detector is
+    code-safe by default; a new network-backed one has to be named here.
+    """
+    return [d for d in local_detectors if d is not network_backed]
+
+
 def _deliver_teams() -> frozenset[str]:
     """Teams allowed the oversize deliver-flag (shared by core + profile inners)."""
     raw_teams = config.get("CORP_LLM_OVERSIZE_DELIVER_TEAMS", "") or ""
@@ -155,11 +213,17 @@ def _deliver_teams() -> frozenset[str]:
 
 
 def _build_orchestrator(
-    corp_llm: CorpLlmClient | None, mapping_store: MappingStore, *, oracle_enabled: bool
+    corp_llm: CorpLlmClient | None,
+    mapping_store: MappingStore,
+    *,
+    oracle_enabled: bool,
+    corp_ner: PIIDetector | None = None,
 ) -> SanitizationOrchestrator:
-    local_detectors: list[PIIDetector] | None = (
-        [RegexChecksumDetector(), DualNerDetector()] if _flag("CORP_LLM_LOCAL_FIRST") else None
-    )
+    local_detectors: list[PIIDetector] = []
+    if _flag("CORP_LLM_LOCAL_FIRST"):
+        local_detectors += [RegexChecksumDetector(), DualNerDetector()]
+    if corp_ner is not None:
+        local_detectors.append(corp_ner)
     gazetteer = Gazetteer.from_defaults() if _flag("CORP_LLM_GAZETTEER") else None
     rules_dir = config.get("CORP_LLM_RULES_DIR", _DEFAULT_RULES_DIR) or _DEFAULT_RULES_DIR
     return SanitizationOrchestrator(
@@ -168,7 +232,8 @@ def _build_orchestrator(
         _RulesLoader(rules_dir),
         oversize_policy=config.oversize_policy(),
         oversize_deliver_teams=_deliver_teams(),
-        local_detectors=local_detectors,
+        local_detectors=local_detectors or None,
+        code_safe_detectors=_code_safe_detectors(local_detectors, corp_ner),
         gazetteer=gazetteer,
         allowlist=Allowlist.from_config(),
         oracle_trigger=config.oracle_trigger(),
@@ -199,6 +264,7 @@ def _build_profile_wrapper(
     base_rules_loader = _RulesLoader(rules_dir)
     oversize_policy = config.oversize_policy()
     deliver_teams = _deliver_teams()
+    oracle_trigger = config.oracle_trigger()
 
     def build_inner(bundle: ProfileBundle) -> SanitizationOrchestrator:
         return build_inner_orchestrator(
@@ -209,6 +275,7 @@ def _build_profile_wrapper(
             oversize_policy=oversize_policy,
             oversize_deliver_teams=deliver_teams,
             oracle_enabled=oracle_enabled,
+            oracle_trigger=oracle_trigger,
         )
 
     return ProfileAwareOrchestrator(
@@ -262,7 +329,7 @@ def build_guardrail(
     dlp_guard: DlpEgressGuard | None = None,
     sink: Sink | None = None,
     max_output_tokens_cap: int | None = None,
-    strip_inbound_headers_to_upstream: bool = False,
+    strip_inbound_headers_to_upstream: bool | None = None,
     forward_chatgpt_auth: bool | None = None,
     forward_anthropic_auth: bool | None = None,
 ) -> CorpLlmGuardrail:
@@ -282,10 +349,10 @@ def build_guardrail(
     at import — so a version-incompatible extension is refused before the
     guardrail serves any traffic.
     """
-    # Unlike strip_inbound_headers_to_upstream / max_output_tokens_cap (call-site
-    # policy toggles with no corresponding env var), these two are documented as
-    # operator-settable cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH /
-    # CORP_LLM_FORWARD_ANTHROPIC_AUTH) — a plain `bool = False` default would
+    # Unlike max_output_tokens_cap (a call-site-only policy toggle with no
+    # corresponding env var), these three are documented as operator-settable
+    # cluster config (CORP_LLM_FORWARD_CHATGPT_AUTH / CORP_LLM_FORWARD_ANTHROPIC_AUTH
+    # / CORP_LLM_STRIP_INBOUND_HEADERS) — a plain `bool = False` default would
     # silently override the env var in every real deploy, so only resolve from
     # config when the caller left the kwarg unset.
     configured_forward_chatgpt_auth = _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
@@ -299,6 +366,12 @@ def build_guardrail(
         forward_anthropic_auth
         if forward_anthropic_auth is not None
         else configured_forward_anthropic_auth
+    )
+    # Independent of the chatgpt/anthropic pair: not part of their mutual exclusivity.
+    resolved_strip_inbound_headers_to_upstream = (
+        strip_inbound_headers_to_upstream
+        if strip_inbound_headers_to_upstream is not None
+        else _flag("CORP_LLM_STRIP_INBOUND_HEADERS", "0")
     )
     # Same reason as the no-op-sanitizer floor below: settings.validate() covers
     # `config check` only, and the compose/demo boots these bridges ship on skip it.
@@ -341,7 +414,16 @@ def build_guardrail(
         client = None
         _log.info("bootstrap oracle_enabled=false — local-first only")
     team_store = team_config_store if team_config_store is not None else build_team_config_store()
-    core = _build_orchestrator(client, store, oracle_enabled=oracle_enabled)
+    # One exporter instance for the hook: get_exporter() builds a new one per
+    # call, and a second instance would emit to a registry nobody scrapes.
+    metrics = get_exporter()
+    corp_ner = build_corp_ner()
+    core = _build_orchestrator(
+        client,
+        store,
+        oracle_enabled=oracle_enabled,
+        corp_ner=corp_ner[0] if corp_ner is not None else None,
+    )
     orchestrator = _build_profile_wrapper(
         core,
         corp_llm=client,
@@ -351,6 +433,8 @@ def build_guardrail(
     )
     active_sink = sink if sink is not None else get_sink()
     register_sink(REGISTRY, active_sink, sink_name_for(active_sink))
+    if corp_ner is not None:
+        register_corp_ner(REGISTRY, corp_ner[1])
     REGISTRY.validate_api_version(EXTENSION_API_VERSION)
     audit_logger = AuditLogger(active_sink, gateway_version=gateway_version())
     return CorpLlmGuardrail(
@@ -358,11 +442,11 @@ def build_guardrail(
         auth,
         audit_logger,
         max_output_tokens_cap=max_output_tokens_cap,
-        strip_inbound_headers_to_upstream=strip_inbound_headers_to_upstream,
+        strip_inbound_headers_to_upstream=resolved_strip_inbound_headers_to_upstream,
         forward_chatgpt_auth=resolved_forward_chatgpt_auth,
         forward_anthropic_auth=resolved_forward_anthropic_auth,
         dlp_guard=dlp_guard if dlp_guard is not None else _build_dlp_guard(),
-        metrics=get_exporter(),
+        metrics=metrics,
     )
 
 

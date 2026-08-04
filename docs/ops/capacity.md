@@ -49,7 +49,21 @@ by the `autoscaling` HPA in `values.yaml`:
 | Phase 2 | ≤ 25 | 2 pods × (4 vCPU, 16 GB), autoscale to 4 if p95 > 500 ms |
 | Phase 3 | ≤ 200 | 4 pods × (4 vCPU, 16 GB), autoscale to 12 |
 
-Benchmark output (when M0-10 runs against real content) gates these numbers; this table is a placeholder for first-day deploy. If CPU latency makes the 4 s p99 budget infeasible, mitigate first by lowering the M1-11 content-size threshold from 100 KB to 25 KB so the largest payloads bypass sanitization rather than spending the budget.
+Benchmark output (when M0-10 runs against real content) gates these numbers; this
+table is a placeholder for first-day deploy.
+
+If CPU latency makes the 4 s p99 budget infeasible, note that lowering the M1-11
+content-size threshold no longer "bypasses sanitization" — that was the old
+deliver-unsanitized behaviour, a confirmed leak. Oversize handling is now
+governed by `CORP_LLM_OVERSIZE_POLICY`, which defaults to **`fail-closed`**, so
+lowering the threshold simply **rejects more requests** (422 `E_OVERSIZE_BLOCKED`).
+Choose deliberately:
+
+- stay `fail-closed` and scale out instead (more gateway replicas / HPA);
+- set `chunk` to sanitize large payloads in overlapping windows — costs latency
+  rather than shedding it;
+- set `deliver-flag` only for teams in `CORP_LLM_OVERSIZE_DELIVER_TEAMS`, and
+  only knowing a clean full rescan is required before anything is forwarded.
 
 ## Corp-LLM throughput floor
 

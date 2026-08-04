@@ -1,0 +1,58 @@
+# Data-plane litellm config for Mode B (Anthropic subscription / OAuth
+# passthrough) on the PRODUCTION stack. Mounted over /etc/litellm/config.yaml by
+# `docker-compose.oauth.yml`; `config.yaml` next to it is the Mode A (virtual
+# keys) file. Only one of the two is ever mounted.
+#
+# Differences from config.yaml, all of them load-bearing:
+#
+#   1. One route, native `anthropic/`, and no `gpt-*` / `corp-*` / `"*"`.
+#      CORP_LLM_FORWARD_ANTHROPIC_AUTH lifts the developer's `sk-ant-oat...`
+#      bearer into the per-request api_key. The guardrail gates that on the
+#      client-visible model alias, but litellm resolves the actual deployment
+#      AFTER the hook runs, so the alias gate cannot prove where the request
+#      lands. This file is the binding control: with no catch-all and no
+#      foreign-provider route, no alias can carry the subscription token
+#      anywhere but api.anthropic.com. Same property as
+#      docker/anthropic-oauth/litellm-config.yaml, pinned by
+#      tests/compose/test_oauth_overlay.py.
+#
+#   2. No `api_key: os.environ/ANTHROPIC_API_KEY`. There is no gateway-held
+#      Anthropic key in this mode at all; the developer's own token is the
+#      upstream credential.
+#
+# The corp vLLM oracle is unaffected by dropping the `corp-*` route: it is
+# reached through the gateway's own httpx client (CORP_LLM_ENDPOINT), not
+# through a litellm deployment. Dropping the route only means clients cannot
+# address corp models directly on this stack.
+model_list:
+  # ANTHROPIC-ONLY BY DESIGN — do not add a second route here. See (1) above.
+  - model_name: "claude-*"
+    litellm_params:
+      model: "anthropic/claude-*"
+      # AnthropicConfig refuses to boot a deployment with neither api_key nor
+      # auth_token. The guardrail replaces this with the developer's OAuth
+      # token per request, before litellm builds the upstream Authorization
+      # header. Deliberately NOT `sk-ant-oat...`-shaped: if the bridge is off
+      # or rejects the request, this must fail upstream rather than look like a
+      # real token to litellm's OAuth branch.
+      api_key: "oauth-passthrough-placeholder"
+
+litellm_settings:
+  # bootstrap.guardrail, NOT _demo_guardrail — that is the whole point of this
+  # file existing separately from docker/anthropic-oauth/litellm-config.yaml.
+  # bootstrap is the production composition root: Postgres-backed token store
+  # (CORP_LLM_PG_DSN, set by docker-compose.yml), Redis mapping store, the real
+  # audit sink feeding Vector -> Langfuse/S3/SIEM. _demo_guardrail seeds an
+  # in-memory store with `demo-team-token` and has no audit chain; it must
+  # never run on a production host.
+  #
+  # Resolved as a FILE PATH relative to the mounted config dir, never via
+  # importlib — the shim at litellm/corp_llm_gateway/bootstrap.py is what makes
+  # this path exist inside the container. Reference the module-level INSTANCE
+  # (`guardrail`), not the class.
+  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+  # Claude Code sends modern Anthropic params some upstream models don't
+  # accept yet; drop unsupported params rather than 400-ing the request.
+  drop_params: true
+  # Emit AuditEvent JSON as single-line records for the Vector sidecar.
+  json_logs: true

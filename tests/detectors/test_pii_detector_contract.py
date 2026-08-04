@@ -10,9 +10,14 @@ DualNerDetector param is skipped when natasha/spacy are not installed (Python 3.
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
+from corp_llm_gateway.corp_ner import CorpNerClient
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.detectors.corp_ner import CorpNerDetector
 from corp_llm_gateway.detectors.dual_ner import DualNerDetector
 from corp_llm_gateway.detectors.regex_checksum import RegexChecksumDetector
 
@@ -33,15 +38,52 @@ except ImportError:
 # Fixture parametrized over all detectors
 # ---------------------------------------------------------------------------
 
+_CORP_NER_URL = "http://corp-ner.corp.lan:8004"
+
+# What the fake service "detects" — offsets are computed against each submitted
+# text, so the spans it returns are real, not canned.
+_CORP_NER_NEEDLES = (
+    ("John Smith", "PERSON"),
+    ("Анна Кузнецова", "PERSON"),
+    ("john.smith@corp.internal", "SECRET"),
+    ("192.168.1.42", "SECRET"),
+)
+
+
+def _corp_ner_handler(request: httpx.Request) -> httpx.Response:
+    results = []
+    for text in json.loads(request.content)["texts"]:
+        spans = [
+            {
+                "start": text.index(needle),
+                "end": text.index(needle) + len(needle),
+                "label": label,
+                "score": None if label == "SECRET" else 0.9,
+                "source": "regex" if label == "SECRET" else "ner",
+            }
+            for needle, label in _CORP_NER_NEEDLES
+            if needle in text
+        ]
+        results.append({"spans": spans, "truncated": False})
+    return httpx.Response(200, json={"results": results})
+
+
+def _make_corp_ner() -> PIIDetector:
+    transport = httpx.MockTransport(_corp_ner_handler)
+    client = CorpNerClient(_CORP_NER_URL, http=httpx.AsyncClient(transport=transport))
+    return CorpNerDetector(client)
+
+
 _REGEX_PARAM = pytest.param(RegexChecksumDetector, id="regex")
 _DUAL_NER_PARAM = pytest.param(
     DualNerDetector,
     id="dual_ner",
     marks=pytest.mark.skipif(not _ner_available, reason="natasha/spacy not available"),
 )
+_CORP_NER_PARAM = pytest.param(_make_corp_ner, id="corp_ner")
 
 
-@pytest.fixture(params=[_REGEX_PARAM, _DUAL_NER_PARAM])
+@pytest.fixture(params=[_REGEX_PARAM, _DUAL_NER_PARAM, _CORP_NER_PARAM])
 def detector(request: pytest.FixtureRequest) -> PIIDetector:
     cls = request.param
     return cls()

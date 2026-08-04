@@ -6,6 +6,12 @@ The chart is `helm/corp-llm-gateway`. It runs the gateway image (LiteLLM proxy +
 the `corp_llm_gateway.bootstrap.guardrail` callback) plus a Vector log-shipper
 sidecar, and mounts detection in-process — there is no separate pre-pass pod.
 
+For **non-k8s hosts** use the compose stack in `compose/` instead. Either way,
+read `deployment-modes.md` (RU: `deployment-modes.ru.md`) first: it covers the
+two mutually exclusive auth modes (API keys vs subscription/OAuth) and how to
+toggle the corp-LLM oracle (`CORP_LLM_ORACLE_ENABLED`) and the corp NER service
+(`CORP_NER_ENABLED`).
+
 ## Prerequisites
 
 - **Kubernetes**, CPU-only. Corp k8s has no GPU pods; the detection cascade
@@ -117,7 +123,7 @@ from before this fix.
 5. **Wait for readiness** on all pods:
 
    ```
-   kubectl -n corp-llm-gateway rollout status deploy/gw
+   kubectl -n corp-llm-gateway rollout status deploy/gw-corp-llm-gateway
    curl https://gateway-staging.corp.lan/healthz/ready
    curl https://gateway-staging.corp.lan/healthz/sanitization   # deep-check
    ```
@@ -147,21 +153,23 @@ The gateway image mounts these onto LiteLLM's ASGI app (probes target them):
 This runs `claude` through the gateway with **no `ANTHROPIC_API_KEY` anywhere** —
 the developer's own Max/Pro OAuth token pays for the upstream call.
 
-It runs on the `anthropic-oauth` docker-compose overlay only. Neither the Helm
-chart above nor production compose supports this route:
+The steps below use the **demo** overlay, which is the quickest way to try it on
+a laptop. For a server, use the production stack in subscription mode instead —
+`compose/` + `docker-compose.oauth.yml`, which keeps the Postgres token store and
+the audit pipeline the demo stack does not have. See
+[`deployment-modes.md`](deployment-modes.md) "Mode B"; everything about the
+client side below applies unchanged to it.
 
-- **Helm** routes `"*"` to the corp vLLM and has no `anthropic/` route at all,
-  so litellm's Anthropic OAuth branch is never reached — and that wildcard is
-  the one shape where a `claude-…` alias could carry the subscription token to
-  the wrong upstream.
-- **Production compose** already uses `Authorization` for litellm virtual keys.
-  Moving one of the two credentials to another header is an open decision, not a
-  missing feature.
+**Helm does not support this route.** It routes `"*"` to the corp vLLM and has no
+`anthropic/` route at all, so litellm's Anthropic OAuth branch is never reached —
+and that wildcard is the one shape where a `claude-…` alias could carry the
+subscription token to the wrong upstream.
 
-Both are blocked on the same header-layout decision. Until it is made,
-subscription auth and litellm virtual-key governance (budgets, rate limits,
-quotas) **cannot be used at the same time** — this overlay has no virtual keys.
-See `configuration.md` for the operator view and
+Subscription auth and litellm virtual-key governance (budgets, rate limits,
+quotas) **cannot be used at the same time**, in any stack: both would need the
+`Authorization` header, and the subscription mode is the one that gets it. Moving
+one of the two credentials to another header is an open decision, not a missing
+feature. See `configuration.md` for the operator view and
 [`../security.md`](../security.md) §13 for what the bridge does and does not
 forward.
 

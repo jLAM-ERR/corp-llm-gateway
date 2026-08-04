@@ -17,15 +17,24 @@ import pytest
 from corp_llm_gateway import config as _cfg_module
 from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.corp_llm import CorpLlmClient
+from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.profiles import (
+    CODE_SAFE_DETECTORS,
+    DETECTOR_REGISTRY,
+    NETWORK_DETECTORS,
     FileProfileLoader,
+    PolicyKnobs,
+    ProfileBundle,
     ProfileNotFoundError,
+    ProfileParseError,
     ProfileResolver,
     bundle_fingerprint,
+    parse_manifest,
 )
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.allowlist import Allowlist
 from corp_llm_gateway.sanitizer.profile_orchestrator import (
     ProfileAwareOrchestrator,
     build_inner_orchestrator,
@@ -34,6 +43,7 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
+from tests.sanitizer.test_orchestrator import _client_returning_pairs
 from tests.test_litellm_hook import _corp_llm_returning
 
 _CONFIG_PAYLOAD = (
@@ -257,6 +267,280 @@ async def test_unknown_profile_resolve_fails_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(ProfileNotFoundError, match="ghost"):
         await wrapper.resolve("t1")
+
+
+class _SpyLocalDetector(PIIDetector):
+    """Stand-in for a local in-process detector (dual_ner's shape)."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    async def detect(self, text: str) -> list[Finding]:
+        self.seen.append(text)
+        return []
+
+
+class _SpyNetworkDetector(PIIDetector):
+    """Stand-in for a network-backed batch detector (corp NER's shape)."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    async def detect(self, text: str) -> list[Finding]:
+        return (await self.detect_batch([text]))[0]
+
+    async def detect_batch(self, texts: list[str]) -> list[list[Finding]]:
+        self.seen.extend(texts)
+        return [[] for _ in texts]
+
+
+# PROSE, then a fenced block whose body is a CODE segment.
+_CODE_LEAF = "Hi Ivan\n```python\napi_key = load_key()\n```\n"
+
+
+def test_every_registered_detector_is_classified() -> None:
+    # A detector added to the registry without a code-safety decision would
+    # otherwise default one way silently — locally into CODE, or out of it.
+    assert set(DETECTOR_REGISTRY) == CODE_SAFE_DETECTORS | NETWORK_DETECTORS
+    assert not CODE_SAFE_DETECTORS & NETWORK_DETECTORS
+
+
+async def test_profile_network_detector_never_sees_code_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle naming corp_ner must not run it on CODE: it is a network call, so
+    a CODE segment would ship the developer's source out of the process."""
+    spy = _SpyNetworkDetector()
+    monkeypatch.setitem(DETECTOR_REGISTRY, "corp_ner", lambda cfg: spy)
+    _write_profile(tmp_path, "ner", 'name = "ner"\ndetectors = ["regex_checksum", "corp_ner"]\n')
+    team_store = await _team_store(t1=("ner",))
+    store = InMemoryMappingStore()
+    corp = _corp_llm_returning([])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    await wrapper.sanitize(_CODE_LEAF, team_id="t1", conversation_id="c1")
+
+    assert any("Ivan" in text for text in spy.seen), "prose must still reach the detector"
+    assert not any("api_key" in text for text in spy.seen), (
+        "LEAK: a CODE segment reached a network-backed detector"
+    )
+
+
+async def test_profile_local_ner_still_scans_code_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local NER stays code-safe: it is the only thing catching PERSON / ORG /
+    LOCATION inside fenced JSON, SQL values and config examples — regex_checksum
+    and the Stage-5 DLP guard do not cover those entity classes."""
+    spy = _SpyLocalDetector()
+    monkeypatch.setitem(DETECTOR_REGISTRY, "dual_ner", lambda cfg: spy)
+    _write_profile(tmp_path, "ner", 'name = "ner"\ndetectors = ["regex_checksum", "dual_ner"]\n')
+    team_store = await _team_store(t1=("ner",))
+    store = InMemoryMappingStore()
+    corp = _corp_llm_returning([])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    await wrapper.sanitize(_CODE_LEAF, team_id="t1", conversation_id="c1")
+
+    assert any("api_key" in text for text in spy.seen), (
+        "REGRESSION: a local detector stopped scanning CODE segments"
+    )
+
+
+async def test_profile_inner_code_list_excludes_only_network_detectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_spy = _SpyLocalDetector()
+    net_spy = _SpyNetworkDetector()
+    monkeypatch.setitem(DETECTOR_REGISTRY, "dual_ner", lambda cfg: local_spy)
+    monkeypatch.setitem(DETECTOR_REGISTRY, "corp_ner", lambda cfg: net_spy)
+    _write_profile(
+        tmp_path,
+        "ner",
+        'name = "ner"\ndetectors = ["regex_checksum", "dual_ner", "corp_ner"]\n',
+    )
+    team_store = await _team_store(t1=("ner",))
+    store = InMemoryMappingStore()
+    corp = _corp_llm_returning([])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    inner = (await wrapper.resolve("t1")).orchestrator
+
+    assert [type(d).__name__ for d in inner._local._detectors] == [
+        "RegexChecksumDetector",
+        "_SpyLocalDetector",
+        "_SpyNetworkDetector",
+    ]
+    assert [type(d).__name__ for d in inner._local._code_detectors] == [
+        "RegexChecksumDetector",
+        "_SpyLocalDetector",
+    ]
+    # Chunk mode pulls regex out and runs it full-text; the rest of the CODE list
+    # survives — NOT the default-to-everything fallback, which would re-admit the
+    # network detector.
+    assert [type(d).__name__ for d in inner._chunk_local._code_detectors] == ["_SpyLocalDetector"]
+
+
+async def test_profile_with_only_a_network_detector_runs_nothing_on_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle declaring only a network detector leaves the CODE list EMPTY —
+    the None default would have meant "every detector is code-safe"."""
+    spy = _SpyNetworkDetector()
+    monkeypatch.setitem(DETECTOR_REGISTRY, "corp_ner", lambda cfg: spy)
+    _write_profile(tmp_path, "ner-only", 'name = "ner-only"\ndetectors = ["corp_ner"]\n')
+    team_store = await _team_store(t1=("ner-only",))
+    store = InMemoryMappingStore()
+    corp = _corp_llm_returning([])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    inner = (await wrapper.resolve("t1")).orchestrator
+    assert inner._local._code_detectors == []
+
+    await wrapper.sanitize(_CODE_LEAF, team_id="t1", conversation_id="c1")
+    assert not any("api_key" in text for text in spy.seen)
+
+
+async def test_empty_profile_bundle_keeps_the_no_local_pass_path(tmp_path: Path) -> None:
+    """No detectors declared → no local pass at all (unchanged by the CODE gate)."""
+    _write_profile(tmp_path, "bare", 'name = "bare"\n')
+    team_store = await _team_store(t1=("bare",))
+    store = InMemoryMappingStore()
+    corp = _corp_llm_returning([])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    inner = (await wrapper.resolve("t1")).orchestrator
+    assert inner._local is None
+
+
+# --- the profile's oracle_mode must reach the inner orchestrator -----------
+
+# `PolicyKnobs.oracle_mode` is parsed, merged and fingerprinted, so a profile can
+# ask for a WIDER oracle trigger than the global CORP_LLM_ORACLE_TRIGGER. The
+# shipped ru-152fz profile does exactly that. If the inner orchestrator keeps the
+# constructor default, an oracle-only finding on a no-gazetteer-hit leaf egresses
+# raw AND seeds Cache A with the under-redacted result.
+
+_ORACLE_ONLY_NAME = "Ivan Petrov"
+
+
+async def test_profile_oracle_mode_always_runs_the_oracle_on_a_no_hit_leaf(
+    tmp_path: Path,
+) -> None:
+    _write_profile(
+        tmp_path,
+        "wide",
+        'name = "wide"\ndetectors = ["regex_checksum"]\n[policy]\noracle_mode = "always"\n',
+        products="nightingale\n",  # a gazetteer that does NOT hit the leaf below
+    )
+    team_store = await _team_store(t1=("wide",))
+    store = InMemoryMappingStore()
+    corp, captured = _client_returning_pairs([(_ORACLE_ONLY_NAME, "[PERSON_001]")])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    result = await wrapper.sanitize(
+        f"ship it with {_ORACLE_ONLY_NAME}", team_id="t1", conversation_id="c1"
+    )
+
+    assert captured, "oracle_mode=always must run the oracle on a no-gazetteer-hit leaf"
+    assert _ORACLE_ONLY_NAME not in result.sanitized_text, (
+        "LEAK: the profile's oracle_mode was ignored and the oracle-only value egressed"
+    )
+
+
+async def test_profile_oracle_mode_any_local_finding_runs_the_oracle(tmp_path: Path) -> None:
+    """The shipped ru-152fz shape: oracle_mode="any_local_finding" + a local
+    regex finding on a leaf the gazetteer does not hit."""
+    _write_profile(
+        tmp_path,
+        "ru-like",
+        'name = "ru-like"\ndetectors = ["regex_checksum"]\n'
+        '[policy]\noracle_mode = "any_local_finding"\n',
+        products="nightingale\n",
+    )
+    team_store = await _team_store(t1=("ru-like",))
+    store = InMemoryMappingStore()
+    corp, captured = _client_returning_pairs([(_ORACLE_ONLY_NAME, "[PERSON_001]")])
+    wrapper = _wrapper(
+        tmp_path, team_store=team_store, store=store, corp_llm=corp, core=_core_orch(store, corp)
+    )
+
+    result = await wrapper.sanitize(
+        f"ping ivan@example.com about {_ORACLE_ONLY_NAME}",
+        team_id="t1",
+        conversation_id="c1",
+    )
+
+    assert captured, "a local finding must trigger the oracle under any_local_finding"
+    assert _ORACLE_ONLY_NAME not in result.sanitized_text, (
+        "LEAK: the profile's oracle_mode was ignored and the oracle-only value egressed"
+    )
+
+
+def _bundle_with(oracle_mode: str) -> ProfileBundle:
+    return ProfileBundle(
+        detectors=(),
+        gazetteer=None,
+        rules=Rules(rules=()),
+        allowlist=Allowlist([]),
+        policy=PolicyKnobs(oracle_mode=oracle_mode),
+        profile_ids=("p",),
+    )
+
+
+def _inner_trigger(*, global_trigger: str, oracle_mode: str) -> str:
+    inner = build_inner_orchestrator(
+        _bundle_with(oracle_mode),
+        corp_llm=_corp_llm_returning([]),
+        mapping_store=InMemoryMappingStore(),
+        base_rules_loader=_StaticRules(),
+        oracle_trigger=global_trigger,
+    )
+    return inner._oracle_trigger
+
+
+@pytest.mark.parametrize(
+    ("global_trigger", "oracle_mode", "expected"),
+    [
+        ("gazetteer_hit", "gazetteer_hit", "gazetteer_hit"),
+        ("gazetteer_hit", "always", "always"),
+        ("always", "gazetteer_hit", "always"),
+        ("any_local_finding", "gazetteer_hit", "any_local_finding"),
+        ("sampled:50", "any_local_finding", "any_local_finding"),
+        ("any_local_finding", "sampled:50", "any_local_finding"),
+        ("sampled:10", "sampled:90", "sampled:90"),
+        ("sampled:100", "any_local_finding", "always"),
+    ],
+)
+def test_inner_trigger_is_the_broader_of_global_and_policy(
+    global_trigger: str, oracle_mode: str, expected: str
+) -> None:
+    """Both knobs only WIDEN coverage, so the inner orchestrator must take the
+    broader one — picking either alone silently narrows the other."""
+    assert _inner_trigger(global_trigger=global_trigger, oracle_mode=oracle_mode) == expected
+
+
+def test_invalid_profile_oracle_mode_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="invalid oracle trigger"):
+        _inner_trigger(global_trigger="gazetteer_hit", oracle_mode="bogus")
+
+
+def test_invalid_profile_oracle_mode_is_a_parse_error(tmp_path: Path) -> None:
+    _write_profile(tmp_path, "bad", 'name = "bad"\n[policy]\noracle_mode = "bogus"\n')
+    with pytest.raises(ProfileParseError, match="oracle_mode"):
+        parse_manifest((tmp_path / "bad" / "profile.toml").read_text(encoding="utf-8"))
 
 
 def test_passthrough_resolved_shape() -> None:

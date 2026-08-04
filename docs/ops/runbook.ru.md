@@ -47,17 +47,31 @@ staging-гейта апгрейда (согласно задаче M0-7 в пл�
 3. Если нет: разбирайтесь со связностью на стороне шлюза (NetworkPolicy,
    DNS).
 
-### Упал движок пред-пасса
+### Деградация каскада детекции
 
-Симптом: растёт `gateway_failure{component="pre_pass"}`; запросы проходят,
-но медленнее (путь только через корп-LLM).
+Отдельного Deployment'а пред-пасса **не существует**. Детекция работает
+**внутри процесса** шлюза (локальный каскад: regex+checksum, dual-NER,
+газеттир — см. ADR-003); корп-LLM-оракул — только условный fallback. Два
+режима отказа:
 
-Поведение: continue (по матрице).
+- **Модель NER отсутствует или сама себя отключила.** При
+  `CORP_LLM_REQUIRE_NER=1` (prod) это fail-**closed**: запросы возвращают
+  503 `E_NER_UNAVAILABLE` — это не «тихий медленный путь».
+  `/healthz/ready` при этом краснеет на NER-пробе. Почините NER-стек
+  (extra `ner` + wheel'ы моделей), и pod восстановится. С выключенным
+  флагом (dev) NER деградирует молча, не находя ничего, — в prod так
+  работать нельзя.
+- **Оракул (корп-LLM) недоступен.** Проявляется как `E_CORP_LLM_DOWN` —
+  см. раздел выше.
 
 Действия:
-1. Масштабируйте реплики пред-пасса: `kubectl scale -n corp-llm-gateway deploy/pre-pass --replicas=2`.
-2. Разберитесь с нижележащим CPU-pod'ом (OOM? падение воркера? необычно
-   большой payload, превышающий порог M1-11?).
+1. Добавляйте мощность детекции масштабированием Deployment'а **шлюза**
+   (детекция идёт в его процессе), а не pod'а пред-пасса:
+   `kubectl scale -n corp-llm-gateway deploy/gw-corp-llm-gateway --replicas=N`, либо
+   включите/поднимите HPA (`autoscaling` в values.yaml).
+2. Разберитесь с pod'ом (OOM? ошибка загрузки модели NER? необычно
+   большой payload — им управляют порог размера M1-11 /
+   `CORP_LLM_OVERSIZE_POLICY`).
 
 ### Кластер Redis недоступен
 
@@ -75,16 +89,59 @@ staging-гейта апгрейда (согласно задаче M0-7 в пл�
 
 Симптом: алерт SIEM «vector_buffer_50pct».
 
-Поведение (по умолчанию): fail-closed на 100% (по матрице).
+Поведение: **риск потери аудита, а НЕ блокировка запросов.** В матрице M4
+`vectorBufferFull` значится как fail-closed, но ни одна развёрнутая топология
+сегодня этого обеспечить не может: `CORP_AUDIT_SINK` не задан, поэтому
+единственное аудит-действие шлюза — запись строки в собственный stdout
+(`audit/factory.py`, по умолчанию `StdoutSink`), а она всегда успешна. Vector
+читает этот лог-файл уже потом, из другого контейнера. Обратного сигнального
+пути от состояния буфера Vector в `pre_call`/`post_call` нет, поэтому вставший
+аудит **не может** вернуть 503 — запросы продолжают уходить наружу. См.
+`compose/README.md` «Audit buffering is not fail-closed».
 
 Действия:
-1. Проверьте нижележащие sink'и. Вероятно, Langfuse или SIEM
-   лежит/тормозит.
+1. Проверьте нижележащие sink'и. Вероятно, Langfuse или SIEM лежит/тормозит.
 2. Если лежит один sink: остальные продолжают работать. Определите, какой
    именно, по метрикам Vector.
-3. Если буфер заполняется: запросы начинают возвращать 503. Пересмотрите
-   переопределение fail-policy на уровне команды, если это критично для
-   бизнеса.
+3. Если буфер заполнится, Vector включает back-pressure и перестаёт читать;
+   записи остаются в лог-файлах контейнера. Реальную границу сохранности
+   задаёт **ротация логов**, а не буфер: как только docker удалит файл за
+   пределами `LITELLM_LOG_MAX_FILE`, эти аудит-записи пропадут навсегда.
+   Подберите `LITELLM_LOG_MAX_SIZE` × `LITELLM_LOG_MAX_FILE` под самый долгий
+   простой, который вы намерены пережить.
+4. `docker compose logs vector | grep "Events dropped"` — неверный или
+   провёрнутый ключ `CORP_LANGFUSE_*` даёт 401, а его Vector **не**
+   повторяет. Это тихая потеря аудита: чинить надо ключ, а не размер буфера.
+
+### Непредвиденная внутренняя ошибка (страховка F8)
+
+Симптом: растёт `gateway_failure{component="internal"}`; запросы возвращают
+500 с `error_code="E_INTERNAL"` и без каких-либо подробностей.
+
+Поведение: fail-closed (по матрице). Это перехватчик для исключения, которого
+шлюз не ожидал (ошибка БД, баг, отказ audit-sink'а): `pre_call`,
+`post_call_unary` и `post_call_stream` сводят его к этому непрозрачному ответу
+и никогда не отдают текст исключения ни клиенту, ни в лог, ни в аудит-запись.
+`litellm_pre_call_unexpected_error` / `litellm_post_call_unary_unexpected_error`
+/ `litellm_post_call_stream_unexpected_error` логируют только ТИП исключения,
+никогда его сообщение.
+
+Действия:
+1. Найдите в логах pod'а шлюза соответствующую строку `*_unexpected_error` и её
+   `exc_type=` — она называет класс исключения, не раскрывая сообщение.
+2. Если `exc_type` указывает на известную зависимость (Postgres, Redis,
+   audit-sink), разбирайте это как инцидент того компонента — этот путь
+   страховка, а не первопричина.
+3. Запрос, уже заблокированный конкретным компонентом (например,
+   `E_DLP_BLOCKED`), в `internal` **не** попадает: обёртка не увеличивает
+   счётчик, если по этому запросу уже зафиксирован отказ конкретного
+   компонента.
+4. Отказ провайдера/транспорта посреди стрима (например,
+   `httpx.RemoteProtocolError`) тоже **не** считается `internal` —
+   `post_call_stream` оборачивает только свою десанитизацию, а получение
+   следующего чанка из upstream-итератора намеренно вынесено за эту защиту.
+   Рост `internal` означает баг в собственном pre/post-call коде шлюза, а не
+   отказ провайдера и не дубль блокировки конкретного компонента.
 
 ### Отзыв токена не подействовал сразу
 
@@ -150,9 +207,17 @@ gateway-admin token revoke --user alice
 
 ## Полезные команды kubectl
 
+> **Имя Deployment'а.** Чарт рендерит `<release>-corp-llm-gateway`
+> (`fullname` в `_helpers.tpl`), поэтому для `helm install gw ...` объект
+> называется `deploy/gw-corp-llm-gateway`, а не `deploy/gw` или
+> `deploy/gateway`. Не зависящая от имени релиза форма — селектор по метке:
+> `kubectl -n corp-llm-gateway -l app.kubernetes.io/name=corp-llm-gateway ...`.
+> Задайте `fullnameOverride`, если нужно фиксированное имя.
+
+
 ```
 kubectl -n corp-llm-gateway get pods
-kubectl -n corp-llm-gateway logs deploy/gateway -c litellm
-kubectl -n corp-llm-gateway logs deploy/gateway -c vector
-kubectl -n corp-llm-gateway exec -it deploy/gateway -c litellm -- python -m corp_llm_gateway.cli.admin team --help
+kubectl -n corp-llm-gateway logs deploy/gw-corp-llm-gateway -c litellm
+kubectl -n corp-llm-gateway logs deploy/gw-corp-llm-gateway -c vector
+kubectl -n corp-llm-gateway exec -it deploy/gw-corp-llm-gateway -c litellm -- python -m corp_llm_gateway.cli.admin team --help
 ```

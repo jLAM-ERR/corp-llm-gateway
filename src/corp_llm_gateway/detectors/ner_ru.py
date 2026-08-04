@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.detectors.base import Finding, PIIDetector, package_version
 
 _RU_LABEL_MAP: dict[str, str] = {
     "PER": "PERSON",
@@ -69,6 +69,23 @@ class RuNerDetector(PIIDetector):
     Span offsets (.start, .stop) are character positions; text[start:stop] == span.text.
     Score is fixed at 0.8 (probabilistic model — not a hard rule).
     """
+
+    def policy_signature(self) -> tuple[str, ...]:
+        """Whether this process can actually run RU NER, plus the backend versions.
+
+        Loading is FORCED here, not probed: ``_load_natasha`` latches
+        ``_natasha_tried``, so after this call detect() is guaranteed the same
+        outcome and a Cache-A key taken from it stays true for the process
+        lifetime. Reading the not-yet-loaded globals instead would answer
+        "absent" at construction and "present" on the first request.
+        """
+        try:
+            _load_natasha()
+        except RuntimeError:
+            return ("ru_ner:none",)
+        return (
+            f"ru_ner:natasha:{package_version('natasha')}:slovnet:{package_version('slovnet')}",
+        )
 
     async def detect(self, text: str) -> list[Finding]:
         if not text.strip():

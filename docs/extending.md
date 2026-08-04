@@ -43,7 +43,12 @@ Two special cases sit outside the table: **profiles** (pure declarative data —
 
 A detector finds spans to redact. The registry is `DETECTOR_REGISTRY` in
 `src/corp_llm_gateway/profiles/registry.py`; the built-ins are `regex_checksum`, `dual_ner`,
-`ner_ru`, `ner_en`.
+`ner_ru`, `ner_en`, `corp_ner`.
+
+`corp_ner` is the one **network-backed** built-in: selecting it requires
+`CORP_NER_ENDPOINT` (it is a boot refusal without one), and it is excluded from
+`CODE` segments — the local detectors are not, since local NER is what catches
+PERSON/ORG inside fenced JSON, SQL values and config examples.
 
 1. **Implement `PIIDetector`** (`detectors/base.py`) in `src/corp_llm_gateway/detectors/my_rule.py`:
 
@@ -73,6 +78,24 @@ A detector finds spans to redact. The registry is `DETECTOR_REGISTRY` in
    `python -m corp_llm_gateway.profiles.seal src/corp_llm_gateway/profiles/defaults`.
 
 `build_detectors(names, cfg)` builds the selected set; an unknown name is a hard error.
+
+6. **Implement `policy_signature()` if your class does not imply your coverage.** The Cache-A key
+   folds a fingerprint of the effective policy, and a detector is identified there by import path +
+   qualname alone. If two instances of your class can redact differently — optional models that may
+   be absent, coverage-narrowing construction args, a remote endpoint — add the optional
+   `PolicySignatureDetector` hook (`detectors/base.py`) and return that difference:
+
+   ```python
+   def policy_signature(self) -> tuple[str, ...]:
+       return (f"my_rule:{self._mode}:{package_version('my-lib')}",)
+   ```
+
+   Rules: plain sorted strings, no builtin `hash()` / `id()` / object `repr()` / set iteration order
+   (they differ per process, and pods share one Redis); no user content (M1-14); and the value must
+   not change after construction — resolve anything lazy inside the hook so it latches, as
+   `ner_ru` / `ner_en` do. Raising, or returning a non-string, disables Cache A for the whole
+   orchestrator (fail closed). Skip the hook and you inherit class identity, which is correct only
+   when every instance of the class redacts the same way.
 
 ## Add an audit sink (style 1)
 

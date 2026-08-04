@@ -20,12 +20,21 @@ import httpx
 
 from corp_llm_gateway.audit.event import AuditEvent
 from corp_llm_gateway.audit.invariants import assert_no_never_fields
-from corp_llm_gateway.audit.sinks import Sink
+from corp_llm_gateway.audit.sinks import AuditWriteAmbiguousError, Sink
 from corp_llm_gateway.healthz import HealthStatus
 
 
 class LangfuseIngestionError(Exception):
     pass
+
+
+# Raised while reading/parsing the response, i.e. AFTER the request was sent
+# and the server may already have started (or finished) processing it — a
+# duplicate-record risk if the caller blindly retries. `ConnectError` /
+# `ConnectTimeout` / `WriteTimeout` / `PoolTimeout` (never reached the server,
+# or never finished sending) are NOT in this set — those are confirmed
+# non-delivery and remain a plain `LangfuseIngestionError`, safe to retry.
+_AMBIGUOUS_DELIVERY_ERRORS = (httpx.ReadTimeout, httpx.RemoteProtocolError)
 
 
 class LangfuseSink(Sink):
@@ -66,8 +75,14 @@ class LangfuseSink(Sink):
                     "Content-Type": "application/json",
                 },
             )
+        except _AMBIGUOUS_DELIVERY_ERRORS as exc:
+            raise AuditWriteAmbiguousError(
+                f"ambiguous transport error (write may have delivered): {exc}"
+            ) from exc
         except httpx.HTTPError as exc:
             raise LangfuseIngestionError(f"transport error: {exc}") from exc
+        # A 4xx/5xx is an explicit rejection, not delivery — Langfuse never
+        # accepted the batch, so this is confirmed non-delivery, safe to retry.
         if resp.status_code >= 400:
             raise LangfuseIngestionError(
                 f"langfuse ingestion {resp.status_code}: {resp.text[:300]}"

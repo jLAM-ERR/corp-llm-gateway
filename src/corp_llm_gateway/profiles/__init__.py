@@ -5,6 +5,8 @@ from corp_llm_gateway.profiles.base import (
     ProfileNotFoundError,
     ProfileParseError,
     StubProfileLoader,
+    broadest_oracle_mode,
+    oracle_rank,
 )
 from corp_llm_gateway.profiles.cached import CachedProfileLoader
 from corp_llm_gateway.profiles.file_loader import (
@@ -33,12 +35,19 @@ from corp_llm_gateway.profiles.manifest import (
     verify_integrity,
     verify_signature,
 )
-from corp_llm_gateway.profiles.registry import DETECTOR_REGISTRY, build_detectors
+from corp_llm_gateway.profiles.registry import (
+    CODE_SAFE_DETECTORS,
+    DETECTOR_REGISTRY,
+    NETWORK_DETECTORS,
+    build_detectors,
+)
 from corp_llm_gateway.profiles.resolver import ProfileResolver, bundle_fingerprint
 
 __all__ = [
+    "CODE_SAFE_DETECTORS",
     "DETECTOR_REGISTRY",
     "MAX_EXTENDS_DEPTH",
+    "NETWORK_DETECTORS",
     "BundleLintError",
     "CachedProfileLoader",
     "FileProfileLoader",
@@ -55,6 +64,7 @@ __all__ = [
     "ProfileResolver",
     "ProfileSignatureError",
     "StubProfileLoader",
+    "broadest_oracle_mode",
     "build_bundle",
     "build_detectors",
     "bundle_fingerprint",
@@ -63,6 +73,7 @@ __all__ = [
     "discover_profiles",
     "lint_bundle",
     "lint_root",
+    "oracle_rank",
     "parse_manifest",
     "read_layer_source",
     "resolve_extends",

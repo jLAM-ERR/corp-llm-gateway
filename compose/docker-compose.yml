@@ -1,0 +1,759 @@
+# Production compose stack for non-k8s hosts — data plane + self-hosted
+# Langfuse + the audit pipeline (this revision). See compose/README.md. The
+# optional nginx front door lands in a later revision of this file (`nginx/`
+# -> `--profile nginx`); `vector` below is always-on, because audit is not
+# optional. The offline corp-NER mock (workstream B) will register a service
+# carrying `profiles: ["mock"]`.
+# Langfuse publishes NO host port: it is reachable only through the nginx
+# profile or an SSH tunnel (compose/README.md "Langfuse").
+#
+# Distinct from docker-compose.demo.yml's default project name
+# (`corp-llm-gateway`, derived from the repo directory basename): reusing it
+# here would make this stack's `gateway-*-data` volumes collide with the
+# demo's, silently attaching its already-initialised Postgres (no `litellm`
+# database, no gateway schema, Cache B pre-seeded with demo data).
+#
+# The default GATEWAY_IMAGE_TAG (.env.example) is a published rc that
+# predates this branch — see docker-compose.build.yml to run this branch's
+# code instead, and compose/README.md for why that matters before a real
+# deploy (Workstream B's corp NER work is not in any published tag yet).
+name: corp-llm-gateway-prod
+
+services:
+  redis:
+    image: redis:8-alpine
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - gateway-redis-data:/data
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
+    volumes:
+      - gateway-postgres-data:/var/lib/postgresql/data
+      # 00-create-litellm-db.sh (committed) + 01-schema.sql (staged at deploy
+      # time from src/corp_llm_gateway/tokens/schema.sql, gitignored — never
+      # committed, so the schema cannot drift from source). See
+      # compose/postgres/initdb/README.md.
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # -h 127.0.0.1 forces TCP: bare pg_isready hits the unix socket, which
+      # the entrypoint's temporary init server also listens on, so this would
+      # go healthy mid-initdb — before `litellm` (CREATE DATABASE) runs —
+      # letting the litellm service start under `condition: service_healthy`
+      # against a not-yet-created database.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-gateway} -d ${POSTGRES_DB:-gateway}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  litellm:
+    # Prebuilt image by default — compose never rebuilds it and never `pip
+    # install -e`s at boot (that's a docker-compose.demo.yml affordance).
+    # `docker compose -f docker-compose.yml -f docker-compose.build.yml`
+    # builds THIS BRANCH's code from Dockerfile.gateway instead — required
+    # to get CORP_LLM_STRIP_INBOUND_HEADERS and Workstream B's corp NER
+    # work, neither of which is in the published GATEWAY_IMAGE_TAG below.
+    # Built from Dockerfile.gateway, whose ENTRYPOINT is
+    # `litellm --config /etc/litellm/config.yaml --port 4000`; the
+    # entrypoint/command override below runs the same command, prefixed with
+    # the SSL_CERT_FILE bundle build (see the environment block).
+    image: ghcr.io/jlam-err/corp-llm-gateway:${GATEWAY_IMAGE_TAG:?set GATEWAY_IMAGE_TAG in .env}
+    volumes:
+      - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
+      # litellm resolves litellm_settings.callbacks as a FILE PATH relative to
+      # the mounted config dir, never via importlib — this shim must land at
+      # exactly this path. See litellm/corp_llm_gateway/bootstrap.py.
+      - ./litellm/corp_llm_gateway/bootstrap.py:/etc/litellm/corp_llm_gateway/bootstrap.py:ro
+      - ./certs:/etc/corp-llm-gateway/certs:ro
+    # Explicit per-key list — NOT `env_file: .env`, which would inject the
+    # WHOLE file (POSTGRES_PASSWORD, UI_PASSWORD, ...) into this container.
+    # Every secret this service legitimately needs is named below; nothing
+    # else from .env reaches it. A key an operator may leave unconfigured is
+    # listed by BARE NAME (CORP_LLM_CA_BUNDLE, the CORP_NER_* block), so an
+    # unset value is ABSENT from the container rather than an empty string:
+    # config.get() lets an empty env var win over the config file, so the
+    # `${X:-}` form would silently shadow a mounted
+    # /etc/corp-llm-gateway/config.toml scalar AND make `gateway-admin config
+    # check` report '' instead of the effective default. See
+    # compose/certs/README.md. SSL_CERT_FILE is fixed, not sourced from
+    # .env — see the entrypoint below.
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CORP_LLM_PG_DSN=postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gateway}
+      - CORP_LLM_AUTH_PROVIDER=${CORP_LLM_AUTH_PROVIDER:-noop}
+      # Corp vLLM oracle (local-first cascade's conditional fallback) AND,
+      # when set, the corp-* litellm route's upstream — see litellm/config.yaml.
+      # Optional: only required when CORP_LLM_ORACLE_ENABLED=1 (default 0
+      # below) or you use the corp-* route; the claude-*/gpt-* routes never
+      # need it.
+      - CORP_LLM_ENDPOINT=${CORP_LLM_ENDPOINT:-}
+      - CORP_LLM_AUTH_TOKEN=${CORP_LLM_AUTH_TOKEN:-}
+      - CORP_LLM_MODEL=${CORP_LLM_MODEL:-GLM-5.1-AWQ}
+      # Default OFF: with no endpoint set, an enabled oracle falls back to
+      # bootstrap.py's non-routable placeholder host, and any gazetteer hit
+      # then fails the request closed on every route, not just corp-*
+      # (settings.validate() would refuse to boot on this — build_guardrail()
+      # doesn't call it, so the failure only surfaces on the first hit).
+      # Flip to 1 only once CORP_LLM_ENDPOINT points at a reachable corp vLLM.
+      # Coupled to CORP_LLM_LOCAL_FIRST (not set here, so it keeps its
+      # settings.py default "1"): bootstrap.build_guardrail() raises
+      # ConfigError(NO_OP_SANITIZER_MESSAGE) at boot if BOTH the oracle and
+      # local-first are off — don't set CORP_LLM_LOCAL_FIRST=0 in .env
+      # without also flipping this to 1, or the container won't start.
+      - CORP_LLM_ORACLE_ENABLED=${CORP_LLM_ORACLE_ENABLED:-0}
+      # Load-bearing, not reserved: our own guardrail sets data["headers"]
+      # UNCONDITIONALLY in CorpLlmGuardrail._pre_call_impl, independent of
+      # litellm's own forward_client_headers_to_llm_api gate. Wire-captured against a
+      # stand-in upstream: host/user-agent/accept/connection/content-type/
+      # content-length (plus an arbitrary probe header) all reached the
+      # upstream call on BOTH corp-* and claude-* routes with this off;
+      # none did with it on. Keep "1". See settings.py
+      # CORP_LLM_STRIP_INBOUND_HEADERS / bootstrap.build_guardrail().
+      - CORP_LLM_STRIP_INBOUND_HEADERS=${CORP_LLM_STRIP_INBOUND_HEADERS:-1}
+      # F9 guard (config.py is_prod()): arms the refusal of SSL_VERIFY=false
+      # on the corp-LLM ORACLE call specifically — reached only through
+      # build_corp_llm_client(), itself called only when
+      # CORP_LLM_ORACLE_ENABLED=1 (default 0 below), so it does not fire on
+      # this stack's default posture. Kept set for when the oracle is enabled.
+      - CORP_ENV=${CORP_ENV:-production}
+      # F2: a self-disabled NER engine must fail closed, not silently return
+      # no findings and let a PERSON/ORG egress. Load-bearing in production —
+      # see helm/corp-llm-gateway/values-prod.yaml.
+      - CORP_LLM_REQUIRE_NER=${CORP_LLM_REQUIRE_NER:-1}
+      # Corp NER service (detectors/corp_ner.py, wired by
+      # bootstrap.build_corp_ner()). Without these six keys the feature is
+      # unreachable from this stack: build_corp_ner() reads the container
+      # environment, so an operator setting CORP_NER_ENABLED=1 in .env would
+      # get the code default (off), no detector, no readiness probe and no
+      # error.
+      #
+      # OFF by default and the only key with an explicit default: `:-0` never
+      # renders empty, so an operator who does nothing gets exactly one new
+      # variable whose value states the posture, and build_corp_ner() returns
+      # None (no behaviour change).
+      - CORP_NER_ENABLED=${CORP_NER_ENABLED:-0}
+      # Bare names, deliberately. CORP_NER_ENDPOINT is required-when-enabled
+      # (settings.py `_check_corp_ner_endpoint`, re-enforced as a boot refusal
+      # in build_corp_ner()); the other four have code defaults (30s / 256
+      # texts / 200000 chars / no CA bundle) that must not be duplicated here
+      # where they can drift. Absent means "not configured on this stack" and
+      # keeps the config-file fallback live; an empty string does not — see
+      # the note above the environment block.
+      - CORP_NER_ENDPOINT
+      - CORP_NER_TIMEOUT_S
+      - CORP_NER_MAX_TEXTS
+      - CORP_NER_MAX_INPUT_CHARS
+      # Same job as CORP_LLM_CA_BUNDLE below, for the NER call — which carries
+      # RAW user content, so there is no SSL_VERIFY-style escape hatch for it.
+      - CORP_NER_CA_BUNDLE
+      # Hardcoded, NOT sourced from .env: litellm's own get_ssl_verify()
+      # reads this SAME variable directly, at HIGHER priority than
+      # SSL_CERT_FILE, for every upstream provider (anthropic/, openai/,
+      # hosted_vllm/) — and unlike the F9 guard above, that read has no
+      # CORP_ENV gate. An operator-settable "false" here would silently
+      # disable certificate verification stack-wide. See
+      # docs/security.md "Known gaps" and compose/README.md.
+      - SSL_VERIFY=true
+      # Gateway-held provider keys (see compose/README.md "Virtual keys" —
+      # native anthropic/openai routing can't forward a per-developer key).
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Subscription-auth bridge (Mode B, docker-compose.oauth.yml). Named here
+      # so the entrypoint guard below can tell the two modes apart — without
+      # these the container could not distinguish "operator forgot the master
+      # key" from "master key deliberately absent because the bridge is on".
+      # bootstrap.build_guardrail() reads the same two keys.
+      - CORP_LLM_FORWARD_ANTHROPIC_AUTH=${CORP_LLM_FORWARD_ANTHROPIC_AUTH:-0}
+      - CORP_LLM_FORWARD_CHATGPT_AUTH=${CORP_LLM_FORWARD_CHATGPT_AUTH:-0}
+      # Virtual-key auth: the developer credential on this instance. Litellm
+      # intercepts Authorization and validates it against a virtual key
+      # (its own DB, not $POSTGRES_DB) instead of forwarding it — see
+      # compose/README.md "Virtual keys".
+      #
+      # BARE NAMES, not `${X:?...}`, and that is load-bearing for Mode B.
+      # Compose interpolates every `-f` file BEFORE merging them, so a `:?`
+      # here aborts `docker compose -f docker-compose.yml -f
+      # docker-compose.oauth.yml` no matter what the overlay says — the
+      # subscription mode could never be deployed on this stack. It also has
+      # to be ABSENT rather than empty: settings.master_key_conflict() treats
+      # a blank LITELLM_MASTER_KEY as set (litellm enables proxy auth for
+      # anything that is not None) and build_guardrail() then refuses to boot
+      # while a bridge is on. The bare form gives exactly that — unset in
+      # .env means the variable never reaches the container.
+      #
+      # The requirement the `:?` used to enforce did not go away; it moved
+      # into the entrypoint below, where it can be mode-aware.
+      - LITELLM_MASTER_KEY
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      - STORE_MODEL_IN_DB=True
+      # Same reasoning: the admin UI cannot work without a master key, so
+      # Mode B must not be forced to invent credentials for it.
+      - UI_USERNAME
+      - UI_PASSWORD
+      - CORP_LLM_CA_BUNDLE
+      # Always the combined bundle the entrypoint below builds (certifi
+      # public roots + the corp CA, if mounted) — SSL_CERT_FILE is
+      # process-global for litellm's aiohttp clients (native anthropic/,
+      # openai/ AND hosted_vllm/ all read it), so pointing it at the corp CA
+      # alone would replace the trust store for api.anthropic.com/
+      # api.openai.com too. See compose/certs/README.md.
+      - SSL_CERT_FILE=/tmp/corp-ca-bundle.pem
+    entrypoint: ["sh", "-c"]
+    # `set -e`: a failing certifi lookup or a failing `cat` must abort boot,
+    # not leave SSL_CERT_FILE pointing at a 0-byte (or corp-CA-only) trust
+    # store with `exec litellm` still starting. Also replaces the image's OS
+    # trust store with certifi's roots (+ the corp CA, if mounted) — see
+    # compose/certs/README.md.
+    # $$ (not $) below: docker compose's own ${VAR}/$VAR interpolation runs
+    # BEFORE this reaches the shell, and would otherwise try to substitute
+    # $certifi_bundle as a compose variable (silently blanking it).
+    #
+    # The first block is the mode-aware replacement for the `${LITELLM_MASTER_KEY:?}`
+    # that used to sit in the environment list (see the note there). Mode A
+    # (no bridge) authenticates developers with litellm virtual keys and is
+    # unserviceable without a master key — and worse, litellm skips proxy auth
+    # entirely when the key is None, so a missing key silently downgrades the
+    # only per-developer credential this mode has. Mode B (a bridge on) is
+    # legitimately master-key-less: the developer's own OAuth bearer is the
+    # credential, and build_guardrail() refuses to boot if a master key is
+    # present anyway. It runs before the certifi work so a misconfigured stack
+    # dies on the first line with a named cause.
+    command:
+      - |-
+        set -e
+        if [ "$${CORP_LLM_FORWARD_ANTHROPIC_AUTH:-0}" != "1" ] \
+           && [ "$${CORP_LLM_FORWARD_CHATGPT_AUTH:-0}" != "1" ] \
+           && { [ -z "$${LITELLM_MASTER_KEY:-}" ] \
+                || [ -z "$${UI_USERNAME:-}" ] \
+                || [ -z "$${UI_PASSWORD:-}" ]; }; then
+          echo "LITELLM_MASTER_KEY / UI_USERNAME / UI_PASSWORD must all be set in .env" >&2
+          echo "when no subscription-auth bridge is on. This stack authenticates" >&2
+          echo "developers with litellm virtual keys, which need a master key -- and" >&2
+          echo "litellm skips proxy auth entirely when the key is absent, so a missing" >&2
+          echo "one silently removes the only per-developer credential this mode has." >&2
+          echo "Set them in .env, or deploy the subscription mode instead:" >&2
+          echo "  docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d" >&2
+          exit 1
+        fi
+        certifi_bundle="$$(python3 -c 'import certifi; print(certifi.where())')"
+        cat "$$certifi_bundle" > /tmp/corp-ca-bundle.pem
+        if [ -f /etc/corp-llm-gateway/certs/corp-ca-bundle.pem ]; then
+          cat /etc/corp-llm-gateway/certs/corp-ca-bundle.pem >> /tmp/corp-ca-bundle.pem
+        fi
+        exec litellm --config /etc/litellm/config.yaml --port 4000
+    # Container identity for the audit pipeline. This label plus the
+    # `logging.options.labels` block below are what make docker's json-file
+    # driver stamp `"attrs":{"com.corp-llm-gateway.audit-source":
+    # "gateway-stdout"}` onto every log record of THIS container — the only
+    # thing vector.yaml's `gateway_container_only` filter admits. Both halves
+    # are load-bearing and neither does anything alone: drop the label and the
+    # driver has nothing to copy, drop the log option and the label stays in the
+    # container metadata and never reaches the log file. Either way the audit
+    # pipeline silently ships nothing, so change these two together or not at
+    # all.
+    labels:
+      com.corp-llm-gateway.audit-source: "gateway-stdout"
+    logging:
+      # Pinned, not inherited. vector.yaml's source is a `file` source over
+      # /var/lib/docker/containers/*/*-json.log and its numbered rotations,
+      # which only exist under this
+      # driver; on a host whose daemon defaults to `local`/`journald` the audit
+      # pipeline would otherwise read nothing at all. Audit is not optional, so
+      # this service names the driver it needs instead of trusting the host.
+      #
+      # max-size/max-file are set HERE and not left to the daemon, because
+      # pinning the driver above is exactly what stops the daemon's defaults
+      # from applying: moby merges daemon-level log-opts into a container ONLY
+      # when the container's driver equals the daemon's default driver
+      # (daemon/logs.go `mergeAndVerifyLogConfig`; the copy loop is inside
+      # `if cfg.Type == daemon.defaultLogConfig.Type`). On a `local`-default
+      # host this service would therefore get json-file with `labels` and
+      # NOTHING else, and json-file's own max-size default is -1, i.e. no
+      # rotation at all — an unbounded audit log on the same disk as Cache B
+      # and Postgres. Measured on a docker 29.7.1 daemon whose default was
+      # `local` + max-size=1m/max-file=3: a container pinning json-file got
+      # `{"labels":"..."}` and grew one 8 MB file; the same container with
+      # these two options got three ~1 MB files.
+      #
+      # The trade-off, stated: rotation is what BOUNDS durability of the
+      # out-of-process audit path, so a rotation that outruns vector can still
+      # lose records (vector.yaml's glob follows `-json.log.[0-9]`, which
+      # narrows but does not close that window). Unbounded growth is the worse
+      # of the two failure modes — it ends in a full disk, which takes Postgres,
+      # Cache B and the request path down and loses the log anyway — and a
+      # host-wide daemon default is typically 10m x 3, far tighter than the
+      # ~1 GiB below. Size these against the longest Langfuse outage you intend
+      # to survive; the default product (100m x 10) matches
+      # CORP_VECTOR_LANGFUSE_BUFFER_BYTES. See compose/README.md
+      # "Audit buffering is not fail-closed".
+      driver: json-file
+      options:
+        labels: com.corp-llm-gateway.audit-source
+        max-size: ${LITELLM_LOG_MAX_SIZE:-100m}
+        # Quoted: docker requires log-opt values to be strings.
+        max-file: "${LITELLM_LOG_MAX_FILE:-10}"
+        # Pinned off, not left at json-file's own default, for the same merge
+        # reason as the two options above — with the OPPOSITE trigger. Here the
+        # risk is a host whose daemon default IS json-file and carries
+        # `compress=true` in its log-opts: `mergeAndVerifyLogConfig` then copies
+        # that option in (it only skips keys the container already sets), docker
+        # writes rotations as `<id>-json.log.1.gz`, and vector.yaml's file source
+        # cannot decompress — so it reads nothing from them. That is silent audit
+        # loss for every record that rotated while vector was down or
+        # back-pressured. Widening the vector glob to `-json.log.*` is NOT the
+        # fix: it would match the .gz files vector still cannot read. Naming the
+        # option is what blocks the merge. Measured on a docker 29.7.1 daemon
+        # whose default was json-file + max-size=1k/max-file=4/compress=true: a
+        # container pinning json-file with only the two size options rotated to
+        # `…-json.log.{1,2,3}.gz`; the same container with this option rotated
+        # to `…-json.log.{1,2,3}`. `compress` is a json-file option (not `local`
+        # / `journald`), so it is valid exactly where this driver is pinned.
+        compress: "false"
+    ports:
+      # Loopback only — no TLS on this port until the nginx profile (C1)
+      # lands; virtual keys + X-Corp-Auth must not cross a server-class
+      # network in cleartext.
+      - "127.0.0.1:${GATEWAY_PORT:-4000}:4000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The litellm image has no curl/wget; use Python stdlib. litellm's own
+      # built-in liveliness route — /healthz/* wiring onto litellm's ASGI app
+      # is a separate, not-yet-landed concern (see healthz/server.py).
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness',timeout=2).status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      # DATABASE_URL makes litellm run prisma setup at boot; 5s x 10 (50s)
+      # is not enough headroom before that finishes.
+      start_period: 60s
+    restart: unless-stopped
+
+  # ---- Self-hosted Langfuse v3 ---------------------------------------------
+  # Ported from docker-compose.demo.yml:124-271 and hardened three ways:
+  # every secret comes from .env (the demo's NEXTAUTH_SECRET / SALT /
+  # ENCRYPTION_KEY / minioadmin are literal "change-in-production"
+  # placeholders), named volumes for all four stateful services, and NO
+  # published ports anywhere — Langfuse holds request-level traces and the
+  # audit trail, so it is reachable only through the nginx profile (C1) or an
+  # SSH tunnel. Each service lists only the keys it needs; there is no
+  # `env_file:` here for the same reason as on the litellm service above.
+
+  langfuse-redis:
+    image: redis:8-alpine
+    # Deliberately NOT the `redis` service above (which the demo shares for
+    # both jobs). That instance is Cache B — CLAUDE.md calls it *required*
+    # for post_call desanitization — and redis/redis.conf caps it at
+    # maxmemory 512mb with noeviction. A Langfuse ingestion backlog on the
+    # same instance would eat that budget and make Cache B writes fail with
+    # OOM, i.e. an observability backlog would break live desanitization.
+    #
+    # Splitting the instance removes that SHARED-QUOTA coupling but not the
+    # HOST one: an uncapped Redis grows until the kernel OOM killer picks a
+    # victim, and the victim can just as easily be litellm, postgres or
+    # Cache B itself. Both caps below are load-bearing; neither replaces the
+    # other.
+    #   --maxmemory                  Redis's own data accounting. At the cap
+    #                                Redis refuses writes — bounded and loud.
+    #   deploy.resources.limits      RSS backstop, honoured by `docker compose
+    #                                up`. Redis RSS runs ABOVE maxmemory
+    #                                (allocator fragmentation, client output
+    #                                buffers, and the fork copy-on-write of an
+    #                                AOF rewrite), so keep this ~2x the data
+    #                                cap. Setting them equal just moves the
+    #                                kill from the host to this container
+    #                                during an AOF rewrite.
+    # Defaults (.env.example: LANGFUSE_REDIS_MAXMEMORY / _MEM_LIMIT) hold a
+    # six-figure job backlog — hours of a fully stalled langfuse-worker.
+    #
+    # Policy stays noeviction and is hardcoded, NOT an .env key: it decides
+    # which data is lost, not how much memory is used. The trade-off, made
+    # explicit — at the cap Langfuse REJECTS new ingestion writes (loud,
+    # recoverable, visible as 5xx on its ingestion API) instead of silently
+    # deleting queue entries for events it already accepted, which would be
+    # silent audit loss plus a half-deleted BullMQ job. Each queue entry is a
+    # pointer to an event blob already uploaded to MinIO (`events/`), so the
+    # payload survives an eviction — but nothing re-enqueues it, so the trace
+    # never reaches ClickHouse and never appears in the audit view.
+    #
+    # A full queue does NOT reach the gateway REQUEST path. This stack leaves
+    # CORP_AUDIT_SINK unset (audit/factory.py default "stdout"), so gateway
+    # audit records go to stdout -> Vector, which retries against Langfuse;
+    # nothing in pre_call/post_call talks to this Redis. Even on a
+    # direct-to-Langfuse sink the audit_sink fail policy is "continue" (M4
+    # matrix, audit/factory.py) and a failed emit is contained by the F8
+    # safety net in litellm_hook.audit() — it never reaches the client body
+    # and never blocks desanitization. See compose/README.md "When the
+    # Langfuse queue fills".
+    command:
+      - redis-server
+      - --maxmemory
+      - ${LANGFUSE_REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    deploy:
+      resources:
+        limits:
+          memory: ${LANGFUSE_REDIS_MEM_LIMIT:-512mb}
+    volumes:
+      - langfuse-redis-data:/data
+    healthcheck:
+      # PING is a read: a Redis at its maxmemory cap still answers PONG and
+      # this service stays "healthy". A full queue therefore shows up as
+      # Langfuse ingestion 5xx, not as an unhealthy container — see
+      # compose/README.md "When the Langfuse queue fills" for the
+      # `redis-cli info memory` check that does surface it.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  langfuse-postgres:
+    image: postgres:17-alpine
+    # Separate from the gateway `postgres`: Langfuse owns its schema and runs
+    # its own migrations at every upgrade, and it must not share a failure
+    # domain with the token/team-config store the request path reads.
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_POSTGRES_PASSWORD:?set LANGFUSE_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 for the same reason as the gateway postgres above: bare
+      # pg_isready hits the unix socket that the entrypoint's temporary init
+      # server also listens on, so it goes green mid-initdb and langfuse-web
+      # starts its migrations against a database that is about to be
+      # restarted under it.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse:26.3-jammy
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:?set LANGFUSE_CLICKHOUSE_PASSWORD in .env}
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+      - langfuse-clickhouse-logs:/var/log/clickhouse-server
+      # query_log/text_log would keep raw INSERT text — a second, unwatched
+      # copy of trace content. See langfuse/clickhouse-config.xml.
+      - ./langfuse/clickhouse-config.xml:/etc/clickhouse-server/config.d/corp-hardening.xml:ro
+    ulimits:
+      # ClickHouse refuses to start well under the docker default (1024).
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      # Reads the password from the container's own environment ($$ escapes
+      # compose interpolation) instead of repeating it here — a literal would
+      # put the secret in `docker compose config` output and `docker inspect`
+      # a second time. Credentialed on purpose: /ping answers before the
+      # langfuse user is usable.
+      test: ["CMD-SHELL", "clickhouse-client --user=$$CLICKHOUSE_USER --password=$$CLICKHOUSE_PASSWORD --query='SELECT 1'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-langfuse}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      # The demo publishes the console on 9001. Nothing in this stack uses
+      # it (minio-init creates the only bucket), and it is one more
+      # credentialed surface in front of raw event payloads.
+      MINIO_BROWSER: "off"
+    command: ["server", "/data"]
+    volumes:
+      - langfuse-minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot: create the event-upload bucket. Langfuse v3 does NOT create it
+  # itself — without this job both langfuse-web and langfuse-worker come up
+  # and then fail every ingestion write.
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-langfuse}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_BUCKET=${LANGFUSE_S3_BUCKET:-langfuse}
+    entrypoint: ["sh", "-c"]
+    # set -e: a failed `mc mb` must fail the job, otherwise
+    # `condition: service_completed_successfully` lets Langfuse start against
+    # a missing bucket. $$ keeps the shell's variables away from compose's
+    # own interpolation.
+    command:
+      - |-
+        set -e
+        mc alias set langfuse http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing "langfuse/$$LANGFUSE_S3_BUCKET"
+    restart: "no"
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    # List form (not a mapping) so the LANGFUSE_INIT_* bare names below are
+    # PASSED THROUGH: unset in .env means absent from the container, not set
+    # to an empty string — an empty LANGFUSE_INIT_ORG_ID would make headless
+    # init run with a blank id.
+    environment:
+      - DATABASE_URL=postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/langfuse
+      # Must match the origin the browser actually uses, or NextAuth's
+      # sign-in redirect loops: the nginx host (C1) or the local end of your
+      # SSH tunnel. See compose/README.md "Langfuse".
+      - NEXTAUTH_URL=${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
+      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET:?set LANGFUSE_NEXTAUTH_SECRET in .env}
+      - SALT=${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY:?set LANGFUSE_ENCRYPTION_KEY in .env}
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+      - CLICKHOUSE_USER=langfuse
+      - CLICKHOUSE_PASSWORD=${LANGFUSE_CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_HOST=langfuse-redis
+      - REDIS_PORT=6379
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=${LANGFUSE_S3_BUCKET:-langfuse}
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=us-east-1
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=${MINIO_ROOT_USER:-langfuse}
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      # No phone-home from a stack whose traces are corp request metadata.
+      - TELEMETRY_ENABLED=false
+      # Anyone who can reach the UI could otherwise self-register an account
+      # on a fresh instance. Provision the first user with the
+      # LANGFUSE_INIT_* keys below instead of relaxing this.
+      - AUTH_DISABLE_SIGNUP=${LANGFUSE_DISABLE_SIGNUP:-true}
+      # Headless init (optional, applied only when a matching org/project
+      # does not exist). Set these in .env to provision the org, project,
+      # first user and the ingestion API keys the Vector sink (A3) will use.
+      # Per the langfuse docs: do NOT quote LANGFUSE_INIT_* values.
+      - LANGFUSE_INIT_ORG_ID
+      - LANGFUSE_INIT_ORG_NAME
+      - LANGFUSE_INIT_PROJECT_ID
+      - LANGFUSE_INIT_PROJECT_NAME
+      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY
+      - LANGFUSE_INIT_PROJECT_SECRET_KEY
+      - LANGFUSE_INIT_USER_EMAIL
+      - LANGFUSE_INIT_USER_NAME
+      - LANGFUSE_INIT_USER_PASSWORD
+    healthcheck:
+      # langfuse-web binds to eth0, not 127.0.0.1, and the image has no curl.
+      # $$(hostname) — $$ so compose passes the command substitution through
+      # to the shell instead of trying to interpolate it.
+      test: ["CMD-SHELL", "wget -q --spider http://$$(hostname):3000/api/public/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      # Postgres + ClickHouse migrations run at boot on a fresh volume and on
+      # every version bump.
+      start_period: 120s
+    restart: unless-stopped
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    # No NEXTAUTH_* here — the worker serves no UI. SALT/ENCRYPTION_KEY are
+    # needed because it reads the same encrypted rows langfuse-web writes.
+    environment:
+      - DATABASE_URL=postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/langfuse
+      - SALT=${LANGFUSE_SALT}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY}
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+      - CLICKHOUSE_USER=langfuse
+      - CLICKHOUSE_PASSWORD=${LANGFUSE_CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_HOST=langfuse-redis
+      - REDIS_PORT=6379
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=${LANGFUSE_S3_BUCKET:-langfuse}
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=us-east-1
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=${MINIO_ROOT_USER:-langfuse}
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      - TELEMETRY_ENABLED=false
+    healthcheck:
+      # Worker binds eth0:3030 and serves /api/health; no curl in the image.
+      test: ["CMD-SHELL", "wget -q --spider http://$$(hostname):3030/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  # ---- Audit pipeline ------------------------------------------------------
+  # gateway stdout -> vector -> langfuse. CORP_AUDIT_SINK is deliberately unset
+  # on the litellm service, so audit/factory.py's default StdoutSink applies and
+  # this service is on the REAL audit path: a misconfiguration here loses audit
+  # records. Not profile-gated for the same reason.
+  vector:
+    image: timberio/vector:0.53.0-alpine
+    volumes:
+      # Replaces the demo's `/var/run/docker.sock` mount (docker-compose.demo.yml
+      # warns against reusing that): the socket is the docker daemon's control
+      # plane, so read access to it is host root — a container holding it can
+      # start a privileged sibling with / bind-mounted. This is a read-only bind
+      # of the container LOG DIRECTORY instead: data in, no control plane, no
+      # write path. vector.yaml's file source globs only the active log
+      # (`*/*-json.log`) and its numbered rotations (`…-json.log.[0-9]`), so the
+      # sibling config.v2.json / hostconfig.json files (which hold every
+      # container's environment) are never read.
+      #
+      # The glob covers EVERY container on this host — the directory is keyed by
+      # container id, so it cannot be narrowed here. vector.yaml's first
+      # transform, `gateway_container_only`, is the boundary: it admits only
+      # lines carrying the json-file `attrs` stamp that the litellm service's
+      # label + logging.options.labels produce. Adding a service to this stack
+      # does NOT put its logs in the audit trail.
+      #
+      # Needs the `json-file` logging driver, which is why the litellm service
+      # pins it rather than inheriting the host default. See compose/README.md
+      # "Audit pipeline".
+      #
+      # No `user:` override: the log directory is mode 0710 root:root, so vector
+      # must stay the image's default root to read it. Everything else is locked
+      # down instead (read_only rootfs, all capabilities dropped).
+      - ${DOCKER_CONTAINERS_DIR:-/var/lib/docker/containers}:/var/lib/docker/containers:ro
+      - ./vector:/etc/vector:ro
+      # Read checkpoints (resume where the last run stopped, so a vector restart
+      # neither loses nor duplicates audit records) + the langfuse disk buffer.
+      - vector-data:/var/lib/vector
+    # Scoped per-key, not `env_file: .env` — nothing here needs POSTGRES_PASSWORD,
+    # the provider keys or the Langfuse infrastructure secrets. The two ingestion
+    # keys are the Langfuse PROJECT API keys (public/secret), provisioned by the
+    # LANGFUSE_INIT_* block or in the UI; they are required, so a missing one
+    # fails `docker compose config` instead of leaving audit silently undelivered.
+    environment:
+      # Fixed, NOT sourced from .env: this stack self-hosts Langfuse, and an
+      # operator-settable audit destination is a redirect lever on the audit
+      # trail.
+      - CORP_LANGFUSE_URL=http://langfuse-web:3000
+      - CORP_LANGFUSE_PUBLIC_KEY=${CORP_LANGFUSE_PUBLIC_KEY:?set CORP_LANGFUSE_PUBLIC_KEY in .env}
+      - CORP_LANGFUSE_SECRET_KEY=${CORP_LANGFUSE_SECRET_KEY:?set CORP_LANGFUSE_SECRET_KEY in .env}
+      - CORP_VECTOR_LANGFUSE_BUFFER_BYTES=${CORP_VECTOR_LANGFUSE_BUFFER_BYTES:-1073741824}
+      # Optional archive/forwarder sinks, OFF by default (see the command
+      # below). Bare names so an unset value is ABSENT from the container rather
+      # than an empty string — vector fails config load on a referenced variable
+      # that is missing, which is what makes "enabled but unconfigured" a boot
+      # failure instead of a silent no-op.
+      - CORP_AUDIT_S3_ENABLED=${CORP_AUDIT_S3_ENABLED:-0}
+      - CORP_AUDIT_SIEM_ENABLED=${CORP_AUDIT_SIEM_ENABLED:-0}
+      - CORP_AUDIT_S3_BUCKET
+      - CORP_AUDIT_S3_REGION
+      - CORP_VECTOR_S3_BUFFER_BYTES
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - CORP_AUDIT_SIEM_URL
+      - CORP_VECTOR_SIEM_BUFFER_BYTES
+    entrypoint: ["sh", "-c"]
+    # Config-gating: vector merges every --config file into one topology, so the
+    # optional sinks attach to vector.yaml's `audit_only` transform (and thus
+    # inherit the NEVER-fields gate) without vector.yaml knowing about them.
+    # Compose cannot conditionally add an argument — an unset variable in a
+    # command list expands to an empty argv entry, which vector rejects — hence
+    # the shell. $$ keeps these variables away from compose's own interpolation.
+    command:
+      - |-
+        set -e
+        set -- --config /etc/vector/vector.yaml
+        if [ "$$CORP_AUDIT_S3_ENABLED" = "1" ]; then
+          set -- "$$@" --config /etc/vector/sinks-s3.yaml
+        fi
+        if [ "$$CORP_AUDIT_SIEM_ENABLED" = "1" ]; then
+          set -- "$$@" --config /etc/vector/sinks-siem.yaml
+        fi
+        exec vector "$$@"
+    # No published port. The vector API is bound to 127.0.0.1 inside the
+    # container (vector.yaml) purely so this healthcheck can reach it.
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      # service_started, NOT service_healthy: the audit forwarder must not be
+      # gated on the health of the thing it audits. Vector reads a log FILE, so
+      # an unhealthy-but-running litellm still gets its audit records shipped.
+      litellm:
+        condition: service_started
+      # This one is service_healthy — it is the sink's target.
+      langfuse-web:
+        condition: service_healthy
+    healthcheck:
+      # The vector image has no curl. 127.0.0.1, NOT localhost: busybox wget
+      # tries ::1 first and the vector API listens on IPv4 only, so `localhost`
+      # here reports the container permanently unhealthy.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8686/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  gateway-redis-data:
+  gateway-postgres-data:
+  langfuse-redis-data:
+  langfuse-postgres-data:
+  langfuse-clickhouse-data:
+  langfuse-clickhouse-logs:
+  langfuse-minio-data:
+  vector-data:

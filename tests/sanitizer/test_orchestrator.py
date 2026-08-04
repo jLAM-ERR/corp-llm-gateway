@@ -19,7 +19,7 @@ from corp_llm_gateway.rules import (
     RulesLoader,
 )
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
-from corp_llm_gateway.storage import InMemoryMappingStore
+from corp_llm_gateway.storage import InMemoryMappingStore, PlaceholderMapping
 
 
 class _StaticRulesLoader(RulesLoader):
@@ -870,9 +870,20 @@ _D3_SECRET = "Sistema"
 
 
 def _permissive_orch(store: InMemoryMappingStore) -> SanitizationOrchestrator:
-    """Orchestrator whose profile redacts NOTHING (oracle returns no pairs)."""
+    """Orchestrator whose profile redacts NOTHING (oracle returns no pairs).
+
+    Carries the SAME detector class as `_strict_orch`, configured to find
+    nothing. The Cache-A policy fingerprint keys detector identity by class, so
+    these two orchestrators are policy-identical to it — which is exactly the
+    residue the D3 profile fingerprint has to cover.
+    """
     client, _ = _client_returning_pairs([])
-    return SanitizationOrchestrator(client, store, _StaticRulesLoader(Rules(rules=())))
+    return SanitizationOrchestrator(
+        client,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        local_detectors=[_StaticFindingDetector([])],
+    )
 
 
 def _strict_orch(store: InMemoryMappingStore) -> tuple[SanitizationOrchestrator, list[dict]]:
@@ -1049,6 +1060,51 @@ async def test_none_fingerprint_preserves_dedup_behavior() -> None:
     assert len(captured) == 1
 
 
+# Cache A — a superseded algorithm version must not be replayed -------------
+
+# The value shipped before the detector-coverage boundary (BANK_CARD, CODE-segment
+# NER, corp NER). Pinned as a literal on purpose: it is the key an OLDER build
+# wrote under, so it must not track the current constant.
+_SUPERSEDED_CACHE_A_VERSION = b"span-aware-v1"
+
+# Synthetic Visa: 4276 1234 5678 901 + Luhn check digit 4. Not an issued card.
+_STALE_ENTRY_CARD = "4276123456789014"
+
+
+async def test_cache_a_entry_from_superseded_algorithm_version_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An entry written by a build with narrower detector coverage must miss.
+
+    Seeds the store exactly as the previous build would have: an empty mapping
+    (that build had no BANK_CARD rule) under that build's Cache-A key. Serving it
+    would egress the card unredacted until the ~10h TTL expired.
+    """
+    from corp_llm_gateway.sanitizer import orchestrator
+
+    store = InMemoryMappingStore()
+    rules = Rules(rules=())
+    text = f"Charge the pilot budget to {_STALE_ENTRY_CARD} tomorrow."
+
+    with monkeypatch.context() as m:
+        m.setattr(orchestrator, "_CACHE_A_ALGORITHM_VERSION", _SUPERSEDED_CACHE_A_VERSION)
+        stale_key = orchestrator._content_hash("t1", rules, text, None, False)
+    await store.set_dedup(stale_key, PlaceholderMapping(pairs=()), ttl_seconds=36000)
+
+    orch = SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(rules),
+        local_detectors=[RegexChecksumDetector()],
+        oracle_enabled=False,
+    )
+    result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+
+    assert result.cache_a_hit is False, "a superseded-version entry must not be served"
+    assert _STALE_ENTRY_CARD not in result.sanitized_text, "LEAK: stale entry replayed the card"
+    assert any(o == _STALE_ENTRY_CARD for o, _ in result.pairs)
+
+
 # Cache A — oracle mode must not be replayed across a toggle (P1 fix) -------
 
 
@@ -1082,6 +1138,444 @@ async def test_oracle_mode_change_invalidates_cache_a_entry() -> None:
     assert r_on.cache_a_hit is False, "oracle mode change must miss the oracle-off cache entry"
     assert "Project Nightingale" not in r_on.sanitized_text
     assert len(captured) == 1, "the oracle must actually run once re-enabled"
+
+
+# Cache A — a RUNTIME detector-set change must not be replayed ---------------
+
+# The algorithm-version constant only retires entries across a BUILD boundary.
+# `CORP_NER_ENABLED` adds a whole detector at RUNTIME, so two pods on the same
+# image and the same Redis can hold different coverage under one version.
+
+_R9_TERM = "Project Secret"
+_R9_TEXT = "Deploy Project Secret today"
+
+
+class _BlindDetector(PIIDetector):
+    """Stands in for the narrow config: finds nothing."""
+
+    async def detect(self, text: str) -> list[Finding]:
+        return []
+
+
+class _ProjectTermDetector(PIIDetector):
+    """Stands in for the added detector: finds one fixed corp term."""
+
+    async def detect(self, text: str) -> list[Finding]:
+        start = text.find(_R9_TERM)
+        if start < 0:
+            return []
+        return [
+            Finding(
+                text=_R9_TERM,
+                label="PROJECT",
+                start=start,
+                end=start + len(_R9_TERM),
+                score=1.0,
+            )
+        ]
+
+
+def _r9_orch(store: InMemoryMappingStore, detectors: list[PIIDetector]) -> SanitizationOrchestrator:
+    return SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        local_detectors=detectors,
+        oracle_enabled=False,
+    )
+
+
+async def test_cache_a_not_shared_between_narrow_and_wide_detector_sets() -> None:
+    """Same algorithm version, one shared store, detector set widened at runtime.
+
+    The narrow orchestrator stores an empty mapping for the text; the wide one
+    must NOT serve that entry, or the term egresses unredacted for the ~10h TTL.
+    """
+    store = InMemoryMappingStore()
+    narrow = _r9_orch(store, [_BlindDetector()])
+    wide = _r9_orch(store, [_BlindDetector(), _ProjectTermDetector()])
+
+    r_narrow = await narrow.sanitize(_R9_TEXT, team_id="t1", conversation_id="c-narrow")
+    assert r_narrow.cache_a_hit is False
+    assert r_narrow.pairs == (), "narrow config finds nothing and caches that"
+
+    r_wide = await wide.sanitize(_R9_TEXT, team_id="t1", conversation_id="c-wide")
+    assert r_wide.cache_a_hit is False, "a narrower config's entry must not be served"
+    assert _R9_TERM not in r_wide.sanitized_text, "LEAK: narrow entry replayed the term"
+    assert any(o == _R9_TERM for o, _ in r_wide.pairs)
+
+    # Control: the wide detector really does redact against a COLD store, so the
+    # assertions above cannot pass just because detection silently stopped.
+    cold = _r9_orch(InMemoryMappingStore(), [_BlindDetector(), _ProjectTermDetector()])
+    r_cold = await cold.sanitize(_R9_TEXT, team_id="t1", conversation_id="c-cold")
+    assert r_cold.cache_a_hit is False
+    assert _R9_TERM not in r_cold.sanitized_text
+    assert any(o == _R9_TERM for o, _ in r_cold.pairs)
+
+
+async def test_cache_a_still_shared_between_identically_configured_orchestrators() -> None:
+    """The fingerprint must not fragment the cache across equal configs."""
+    store = InMemoryMappingStore()
+    first = _r9_orch(store, [_BlindDetector(), _ProjectTermDetector()])
+    second = _r9_orch(store, [_BlindDetector(), _ProjectTermDetector()])
+
+    r1 = await first.sanitize(_R9_TEXT, team_id="t1", conversation_id="c1")
+    r2 = await second.sanitize(_R9_TEXT, team_id="t1", conversation_id="c2")
+    assert r1.cache_a_hit is False
+    assert r2.cache_a_hit is True, "equal policy must derive the same Cache-A key"
+    assert r2.sanitized_text == r1.sanitized_text
+
+
+async def test_cache_a_keyed_by_code_safe_detector_subset() -> None:
+    """Narrowing the CODE-segment subset is a coverage change the key must see."""
+    store = InMemoryMappingStore()
+    detectors: list[PIIDetector] = [_BlindDetector(), _ProjectTermDetector()]
+    wide = SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        local_detectors=detectors,
+        code_safe_detectors=detectors,
+        oracle_enabled=False,
+    )
+    narrow_code = SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        local_detectors=detectors,
+        code_safe_detectors=[detectors[0]],
+        oracle_enabled=False,
+    )
+    await wide.sanitize(_R9_TEXT, team_id="t1", conversation_id="c1")
+    r2 = await narrow_code.sanitize(_R9_TEXT, team_id="t1", conversation_id="c2")
+    assert r2.cache_a_hit is False, "a different code-safe subset must not share the key"
+
+
+async def test_cache_a_keyed_by_gazetteer_and_allowlist_and_oracle_trigger() -> None:
+    """Gazetteer terms, allowlist entries and the oracle trigger all change what
+    the request path redacts, so each must change the Cache-A key."""
+    from corp_llm_gateway.sanitizer.allowlist import Allowlist
+
+    def fp(**kwargs: object) -> str:
+        orch = SanitizationOrchestrator(
+            None,
+            InMemoryMappingStore(),
+            _StaticRulesLoader(Rules(rules=())),
+            local_detectors=[_BlindDetector()],
+            oracle_enabled=False,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        assert orch._policy_fingerprint is not None
+        return orch._policy_fingerprint
+
+    base = fp()
+    assert fp(gazetteer=Gazetteer({"nightingale": "PRODUCT"})) != base
+    assert fp(gazetteer=Gazetteer({"nightingale": "PRODUCT"})) != fp(
+        gazetteer=Gazetteer({"nightingale": "REGULATED"})
+    )
+    assert fp(allowlist=Allowlist(["ivan@example.com"])) != base
+    assert fp(oracle_trigger="always") != base
+    assert fp() == base, "equal configs must be stable"
+
+
+async def test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fail closed: an uncomputable fingerprint disables Cache A entirely —
+    never falls back to a key that ignores the policy."""
+    import logging
+
+    from corp_llm_gateway.sanitizer import orchestrator
+
+    def _boom(_detector: object) -> str:
+        raise RuntimeError("fingerprint source unavailable")
+
+    store = InMemoryMappingStore()
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(orchestrator, "_detector_identity", _boom)
+        with caplog.at_level(logging.WARNING):
+            orch = _r9_orch(store, [_BlindDetector(), _ProjectTermDetector()])
+
+    assert orch._policy_fingerprint is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("cache_a_disabled" in m for m in warnings)
+    assert not any(_R9_TERM in m for m in warnings), "M1-14: no user content in logs"
+
+    r1 = await orch.sanitize(_R9_TEXT, team_id="t1", conversation_id="c1")
+    r2 = await orch.sanitize(_R9_TEXT, team_id="t1", conversation_id="c2")
+    assert r1.cache_a_hit is False
+    assert r2.cache_a_hit is False, "cache A must be off, not keyed on a constant"
+    assert store._dedup == {}, "a disabled cache must not write entries either"
+    assert _R9_TERM not in r2.sanitized_text
+
+
+def test_policy_fingerprint_is_stable_across_python_hash_seeds() -> None:
+    """Pods share one Redis: the fingerprint must not depend on PYTHONHASHSEED
+    (i.e. must never use the salted builtin hash())."""
+    import os
+    import subprocess
+    import sys
+
+    script = (
+        "from corp_llm_gateway.rules import Rules\n"
+        "from corp_llm_gateway.rules.gazetteer import Gazetteer\n"
+        "from corp_llm_gateway.sanitizer.allowlist import Allowlist\n"
+        "from corp_llm_gateway.detectors import RegexChecksumDetector\n"
+        "from corp_llm_gateway.sanitizer import SanitizationOrchestrator\n"
+        "from corp_llm_gateway.storage import InMemoryMappingStore\n"
+        "class L:\n"
+        "    async def load(self, team_id): return Rules(rules=())\n"
+        "o = SanitizationOrchestrator(\n"
+        "    None, InMemoryMappingStore(), L(),\n"
+        "    local_detectors=[RegexChecksumDetector()],\n"
+        "    gazetteer=Gazetteer({'nightingale': 'PRODUCT'}),\n"
+        "    allowlist=Allowlist(['ivan@example.com']),\n"
+        "    oracle_enabled=False,\n"
+        ")\n"
+        "print(o._policy_fingerprint)\n"
+    )
+
+    def run(seed: str) -> str:
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return out.stdout.strip()
+
+    first = run("0")
+    assert first and first != "None"
+    assert first == run("12345"), "fingerprint must be identical across processes"
+
+
+# Cache A — the gazetteer's LEMMATIZER capability is part of the policy --------
+
+# `term_signature()` covers the CONFIGURED terms, but matching runs through
+# `_lemmatize_word`, which depends on the lazily-loaded pymorphy3 / spaCy
+# handles. Those are absent without the `ner` extra (documented: NER needs
+# Python 3.12, 3.14 degrades gracefully), so two pods can hold IDENTICAL term
+# signatures and still match different text. If the model-less pod seeds Cache A
+# first, the model-backed pod replays its empty mapping for the ~10h TTL.
+
+_R11_TERM = "договор"
+_R11_TEXT = "подписан договоры сегодня"
+# Inflected form: matched only when a lemmatizer is available.
+_R11_SURFACE = "договоры"
+
+
+class _FakeParse:
+    def __init__(self, normal_form: str) -> None:
+        self.normal_form = normal_form
+
+
+class _FakeMorph:
+    """Stands in for pymorphy3 on a pod that HAS the `ner` extra installed."""
+
+    def parse(self, word: str) -> list[_FakeParse]:
+        return [_FakeParse(word.lower().removesuffix("ы"))]
+
+
+def _gaz_orch(store: InMemoryMappingStore, gazetteer: Gazetteer) -> SanitizationOrchestrator:
+    return SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        gazetteer=gazetteer,
+        oracle_enabled=False,
+    )
+
+
+async def test_cache_a_not_shared_across_gazetteer_lemmatizer_capability() -> None:
+    from corp_llm_gateway.rules import gazetteer as gaz_module
+
+    store = InMemoryMappingStore()  # ONE shared Cache A, as two pods share Redis
+
+    # Both capabilities are simulated, never taken from the ambient interpreter,
+    # so the test means the same thing with and without the `ner` extra.
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(gaz_module, "_try_load_ru_morph", lambda: None)
+        blind_gaz = Gazetteer({_R11_TERM: "REGULATED"})
+        blind = _gaz_orch(store, blind_gaz)
+        r_blind = await blind.sanitize(_R11_TEXT, team_id="t1", conversation_id="c-blind")
+        assert r_blind.pairs == (), "without a lemmatizer the inflected form is not matched"
+
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(gaz_module, "_try_load_ru_morph", _FakeMorph)
+        lemma_gaz = Gazetteer({_R11_TERM: "REGULATED"})
+        assert blind_gaz.term_signature() == lemma_gaz.term_signature(), (
+            "the terms are identical — only the lemmatizer differs"
+        )
+        lemma = _gaz_orch(store, lemma_gaz)
+        r_lemma = await lemma.sanitize(_R11_TEXT, team_id="t1", conversation_id="c-lemma")
+
+        assert r_lemma.cache_a_hit is False, "a model-less pod's entry must not be served"
+        assert _R11_SURFACE not in r_lemma.sanitized_text, (
+            "LEAK: the model-less entry replayed the gazetteer term unredacted"
+        )
+
+        # Control: against a COLD store the lemmatizing config really does redact,
+        # so the assertion above cannot pass by detection silently failing.
+        cold = _gaz_orch(InMemoryMappingStore(), Gazetteer({_R11_TERM: "REGULATED"}))
+        r_cold = await cold.sanitize(_R11_TEXT, team_id="t1", conversation_id="c-cold")
+        assert _R11_SURFACE not in r_cold.sanitized_text
+
+
+async def test_cache_a_still_shared_across_equal_lemmatizer_capability() -> None:
+    """The capability probe must not fragment the cache between equal pods."""
+    store = InMemoryMappingStore()
+    first = _gaz_orch(store, Gazetteer({_R11_TERM: "REGULATED"}))
+    second = _gaz_orch(store, Gazetteer({_R11_TERM: "REGULATED"}))
+
+    r1 = await first.sanitize(_R11_TEXT, team_id="t1", conversation_id="c1")
+    r2 = await second.sanitize(_R11_TEXT, team_id="t1", conversation_id="c2")
+    assert r1.cache_a_hit is False
+    assert r2.cache_a_hit is True
+
+
+# Cache A — dual_ner's ENGINE CAPABILITY is part of the policy ---------------
+
+# Same hole as the gazetteer's lemmatizer, on the PRIMARY NER path. With
+# `CORP_LLM_REQUIRE_NER` off (the default) a DualNerDetector whose engines
+# cannot load their models disables them, logs, and returns `[]` — so a
+# model-less pod seeds Cache A with an EMPTY mapping under a key that folds
+# only the class name. A model-backed pod on the same Redis replays it and a
+# PERSON only NER catches egresses in the clear for the ~10h TTL.
+
+_R12_TERM = "Иванов"
+_R12_TEXT = "договор подписал Иванов вчера"
+
+_FAKE_RU_MODELS = ("segmenter", "tagger")
+_FAKE_EN_NLP = "nlp"
+
+
+def _fake_infer_ru(_models: object, text: str) -> list[Finding]:
+    """Stands in for Natasha on a pod that HAS the `ner` extra installed."""
+    start = text.find(_R12_TERM)
+    if start < 0:
+        return []
+    return [
+        Finding(
+            text=_R12_TERM,
+            label="PERSON",
+            start=start,
+            end=start + len(_R12_TERM),
+            score=0.8,
+        )
+    ]
+
+
+def _no_ner_models(*_args: object, **_kwargs: object) -> object:
+    raise RuntimeError("ner_ru requires the 'ner' extra: pip install -e '.[ner]'")
+
+
+def _patch_ner_models_present(m: pytest.MonkeyPatch) -> None:
+    """Simulate a pod WITH both NER engines, never the ambient interpreter, so
+    the test means the same thing on 3.14 (no models) and on 3.12/CI."""
+    from corp_llm_gateway.detectors import ner_en, ner_ru
+
+    m.setattr(ner_ru, "_load_natasha", lambda: _FAKE_RU_MODELS)
+    m.setattr(ner_ru, "_infer_ru", _fake_infer_ru)
+    m.setattr(ner_en, "_load_spacy", lambda: _FAKE_EN_NLP)
+    m.setattr(ner_en, "_infer_en", lambda _nlp, _text: [])
+
+
+def _patch_ner_models_absent(m: pytest.MonkeyPatch) -> None:
+    from corp_llm_gateway.detectors import ner_en, ner_ru
+
+    m.setattr(ner_ru, "_load_natasha", _no_ner_models)
+    m.setattr(ner_en, "_load_spacy", _no_ner_models)
+
+
+def _dual_ner_orch(store: InMemoryMappingStore) -> SanitizationOrchestrator:
+    from corp_llm_gateway.detectors import DualNerDetector
+
+    return SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(Rules(rules=())),
+        # require_ner=False pins the DOCUMENTED default (fail open): a disabled
+        # engine returns [] instead of raising, which is what seeds the bad entry.
+        local_detectors=[DualNerDetector(require_ner=False)],
+        oracle_enabled=False,
+    )
+
+
+async def test_cache_a_not_shared_across_dual_ner_engine_capability() -> None:
+    store = InMemoryMappingStore()  # ONE shared Cache A, as two pods share Redis
+
+    with pytest.MonkeyPatch.context() as m:
+        _patch_ner_models_absent(m)
+        blind = _dual_ner_orch(store)
+        r_blind = await blind.sanitize(_R12_TEXT, team_id="t1", conversation_id="c-blind")
+        assert r_blind.pairs == (), "a model-less pod finds nothing and caches that"
+
+    with pytest.MonkeyPatch.context() as m:
+        _patch_ner_models_present(m)
+        full = _dual_ner_orch(store)
+        r_full = await full.sanitize(_R12_TEXT, team_id="t1", conversation_id="c-full")
+
+        assert r_full.cache_a_hit is False, "a model-less pod's entry must not be served"
+        assert _R12_TERM not in r_full.sanitized_text, (
+            "LEAK: the model-less entry replayed the PERSON unredacted"
+        )
+        assert any(o == _R12_TERM for o, _ in r_full.pairs)
+
+        # Control: against a COLD store the model-backed config really does
+        # redact, so the assertions above cannot pass by detection silently
+        # stopping.
+        cold = _dual_ner_orch(InMemoryMappingStore())
+        r_cold = await cold.sanitize(_R12_TEXT, team_id="t1", conversation_id="c-cold")
+        assert r_cold.cache_a_hit is False
+        assert _R12_TERM not in r_cold.sanitized_text
+        assert any(o == _R12_TERM for o, _ in r_cold.pairs)
+
+
+async def test_cache_a_still_shared_across_equal_dual_ner_capability() -> None:
+    """The capability probe must not fragment the cache between equal pods."""
+    with pytest.MonkeyPatch.context() as m:
+        _patch_ner_models_present(m)
+        store = InMemoryMappingStore()
+        first = _dual_ner_orch(store)
+        second = _dual_ner_orch(store)
+
+        r1 = await first.sanitize(_R12_TEXT, team_id="t1", conversation_id="c1")
+        r2 = await second.sanitize(_R12_TEXT, team_id="t1", conversation_id="c2")
+        assert r1.cache_a_hit is False
+        assert r2.cache_a_hit is True, "equal capability must derive the same Cache-A key"
+        assert r2.sanitized_text == r1.sanitized_text
+
+
+class _BadSignatureDetector(_ProjectTermDetector):
+    """A detector whose capability probe is broken."""
+
+    def policy_signature(self) -> tuple[str, ...]:
+        raise RuntimeError("capability probe unavailable")
+
+
+class _NonStringSignatureDetector(_ProjectTermDetector):
+    def policy_signature(self) -> tuple[str, ...]:
+        return (object(),)  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize(
+    "detector", [_BadSignatureDetector(), _NonStringSignatureDetector()], ids=["raises", "non-str"]
+)
+async def test_unusable_policy_signature_disables_cache_a(detector: PIIDetector) -> None:
+    """A detector that cannot state its capability must take Cache A OFF, never
+    fall back to class identity — that fallback is exactly the replay hole."""
+    store = InMemoryMappingStore()
+    orch = _r9_orch(store, [detector])
+    assert orch._policy_fingerprint is None
+
+    r1 = await orch.sanitize(_R9_TEXT, team_id="t1", conversation_id="c1")
+    r2 = await orch.sanitize(_R9_TEXT, team_id="t1", conversation_id="c2")
+    assert r1.cache_a_hit is False
+    assert r2.cache_a_hit is False
+    assert store._dedup == {}
+    assert _R9_TERM not in r2.sanitized_text
 
 
 # ---------------------------------------------------------------------------

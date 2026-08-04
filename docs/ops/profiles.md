@@ -49,13 +49,24 @@ pre_pass_down = "fail-closed"
   `[core, …, most-specific]`, guarded against cycles (`ProfileCycleError`) and
   depth > 8 (`ProfileDepthError`).
 - **`detectors`** — names resolved through `DETECTOR_REGISTRY`
-  (`profiles/registry.py`): `regex_checksum`, `dual_ner`, `ner_ru`, `ner_en`. An
+  (`profiles/registry.py`): `regex_checksum`, `dual_ner`, `ner_ru`, `ner_en`,
+  `corp_ner` (network-backed — needs `CORP_NER_ENDPOINT`, excluded from `CODE`
+  segments). An
   unknown name is a `ValueError` at build time. Adding a new algorithm = one
   in-tree `detectors/<name>.py` + one registry line + a contract test (see the
   `safe-extension-registry` skill).
 - **`[policy]`** knobs — `size_threshold_bytes`, `block_payloads`, `dlp_guard`,
   `oracle_mode`, `allowed_providers`, `canary_patterns`, `retention_*`, and
   `[policy.fail_policy]`.
+- **`oracle_mode`** — validated at parse time (same canonical forms as
+  `CORP_LLM_ORACLE_TRIGGER`: `gazetteer_hit` | `any_local_finding` | `always` |
+  `sampled:<pct>`); an unknown value is a `ProfileParseError`. The profiled
+  request runs on the **broader** of this and the global
+  `CORP_LLM_ORACLE_TRIGGER` — neither knob can narrow the other.
+- **`[policy.fail_policy]`** and **`retention_*`** are parsed, merged and folded
+  into the bundle fingerprint, but no runtime path reads them yet: the egress
+  path is unconditionally fail-closed and retention comes from `team_config`.
+  Setting them changes nothing today except the cache key.
 - **`content_hash`** — optional; see integrity below.
 - Any other key (e.g. `data_residency`) is advisory — `parse_manifest` ignores
   it and no code path reads it yet.
@@ -107,13 +118,17 @@ manifest parses, named detectors exist in `DETECTOR_REGISTRY`, term files and
 `replace.md` parse, and `extends` resolves without cycles. Wire it into CI when
 adding bundles.
 
-## Known follow-up — live activation
+## Live activation — bundles DO drive production
 
-The pieces exist — `ProfileAwareOrchestrator`
-(`sanitizer/profile_orchestrator.py`) and the `litellm_hook` support for it — but
-the production composition root **does not wire them yet**: `bootstrap.py`
-builds a plain `SanitizationOrchestrator` with no `ProfileResolver`. So bundles
-parse, lint, resolve, and merge correctly, but they do **not** drive a live
-gateway until `bootstrap` swaps in `ProfileAwareOrchestrator`. Adding a bundle
-today is inert at runtime; validate it with the lint + resolver, not by
-deploying.
+`bootstrap.py` builds a `ProfileResolver` (`:301`) and wraps the core
+orchestrator in a `ProfileAwareOrchestrator` (`:320`). A bundle assigned to a
+team via `TeamConfig.profile_ids` therefore **takes effect at runtime** — it can
+tighten the size threshold, the allowed providers, the detector set, the
+allowlist, the canary patterns and the oracle trigger for that team's traffic.
+
+Treat adding a bundle as a production change, not a parse-only exercise. Lint it
+first (above), then roll it out to one team before widening.
+
+Two knobs are exceptions — `[policy.fail_policy]` and `retention_*` parse and
+merge but have no runtime reader (see the `[policy]` notes above), so setting
+them changes only the cache key.

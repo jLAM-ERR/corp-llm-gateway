@@ -38,12 +38,18 @@ class ProfileParseError(Exception):
 # Oracle trigger modes ranked by detection coverage (least → most). Merge keeps
 # the highest-coverage mode across layers so a layer can only widen the oracle,
 # never narrow it (monotone-tightening). "sampled:<pct>" collapses to "sampled".
+#
+# This is the ONE ordering: `PolicyKnobs.merge` composes layers with it and
+# `sanitizer.profile_orchestrator` picks the request-time trigger with it. A
+# second ranking that drifts from this one would silently narrow the oracle.
 _ORACLE_COVERAGE: dict[str, int] = {
     "gazetteer_hit": 0,
     "sampled": 1,
     "any_local_finding": 2,
     "always": 3,
 }
+
+_SAMPLED_PREFIX = "sampled:"
 
 
 @dataclass(frozen=True)
@@ -72,12 +78,11 @@ class PolicyKnobs:
         """
         if not layers:
             return cls()
-        best_oracle = max(layers, key=lambda layer: _oracle_rank(layer.oracle_mode))
         return cls(
             size_threshold_bytes=min(layer.size_threshold_bytes for layer in layers),
             block_payloads=any(layer.block_payloads for layer in layers),
             dlp_guard=any(layer.dlp_guard for layer in layers),
-            oracle_mode=best_oracle.oracle_mode,
+            oracle_mode=broadest_oracle_mode(*(layer.oracle_mode for layer in layers)),
             allowed_providers=_intersect_providers(layers),
             canary_patterns=_union_canaries(layers),
             fail_policy=_merge_fail_policy(layers),
@@ -97,6 +102,10 @@ class ProfileBundle:
     allowlist: Allowlist
     policy: PolicyKnobs
     profile_ids: tuple[str, ...]
+    # DECLARED name of each entry in `detectors`, same order. Consumers key
+    # per-detector policy off it (which detectors may run on CODE segments — see
+    # `registry.CODE_SAFE_DETECTORS`); an unnamed detector is treated as unsafe.
+    detector_names: tuple[str, ...] = ()
 
 
 class ProfileLoader(ABC):
@@ -116,9 +125,57 @@ class StubProfileLoader(ProfileLoader):
         )
 
 
-def _oracle_rank(mode: str) -> int:
-    head = mode.split(":", 1)[0].strip().lower()
+def _sampled_pct(mode: str) -> int | None:
+    """The ``<pct>`` of a ``sampled:<pct>`` mode; None for any other mode.
+
+    Tolerant on purpose — canonicalization is not validation. An unparseable
+    percentage keeps its "sampled" rank here and is rejected later by
+    ``sanitizer.orchestrator.normalize_oracle_trigger``.
+    """
+    head, _, tail = mode.partition(":")
+    if head.strip().lower() != "sampled":
+        return None
+    try:
+        return int(tail.strip())
+    except ValueError:
+        return None
+
+
+def _canonical_oracle_mode(mode: str) -> str:
+    """Collapse the two degenerate sample percentages onto their exact equals.
+
+    ``_sample_selected`` returns True for every leaf at pct >= 100 and False for
+    every leaf at pct <= 0, so those are ``always`` / ``gazetteer_hit`` by
+    definition. Without this, ``sampled:100`` would rank BELOW
+    ``any_local_finding`` and picking the latter would narrow coverage.
+    """
+    pct = _sampled_pct(mode)
+    if pct is None:
+        return mode
+    if pct >= 100:
+        return "always"
+    if pct <= 0:
+        return "gazetteer_hit"
+    return mode
+
+
+def oracle_rank(mode: str) -> int:
+    """Coverage rank of one oracle trigger mode; unknown → -1."""
+    head = _canonical_oracle_mode(mode).split(":", 1)[0].strip().lower()
     return _ORACLE_COVERAGE.get(head, -1)
+
+
+def broadest_oracle_mode(*modes: str) -> str:
+    """The widest-coverage mode among *modes* (empty → the default).
+
+    Ties between two ``sampled`` modes go to the higher percentage: same rank,
+    strictly more leaves. Degenerate percentages are returned as the fixed mode
+    they are identical to.
+    """
+    if not modes:
+        return "gazetteer_hit"
+    canonical = [_canonical_oracle_mode(mode) for mode in modes]
+    return max(canonical, key=lambda mode: (oracle_rank(mode), _sampled_pct(mode) or 0))
 
 
 def _intersect_providers(layers: Sequence[PolicyKnobs]) -> frozenset[str] | None:

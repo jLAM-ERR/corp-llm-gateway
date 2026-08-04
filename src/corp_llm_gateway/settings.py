@@ -104,6 +104,14 @@ KEYS: tuple[Key, ...] = (
         help="forward allowlisted Codex OAuth headers to ChatGPT backend",
     ),
     Key(
+        "CORP_LLM_STRIP_INBOUND_HEADERS",
+        flag=True,
+        default="0",
+        help="strip inbound wire headers (Host, User-Agent, ...) before forwarding to "
+        "upstream; the guardrail sets data['headers'] unconditionally, so this matters "
+        "regardless of litellm's forward_client_headers_to_llm_api",
+    ),
+    Key(
         "CORP_LLM_FORWARD_ANTHROPIC_AUTH",
         flag=True,
         default="0",
@@ -140,6 +148,26 @@ KEYS: tuple[Key, ...] = (
         help="enable the corp-LLM oracle; off = local-first cascade only (solo/local mode)",
     ),
     Key("CORP_LLM_LOG_LEVEL", default="INFO", help="log level"),
+    # ── Corp NER service (detectors/corp_ner.py, B4) ─────────────────────────
+    # Default off so existing deploys are unaffected. No REQUIRE flag: corp NER
+    # is fail-closed unconditionally — an unscanned text never reads as clean.
+    Key("CORP_NER_ENABLED", flag=True, default="0", help="enable the corp NER detector"),
+    Key(
+        "CORP_NER_ENDPOINT",
+        help="corp NER base URL (client appends /v1/analyze); required when CORP_NER_ENABLED=1",
+    ),
+    Key(
+        "CORP_NER_TIMEOUT_S",
+        default="30",
+        help="corp NER request timeout, seconds; deliberately under the service's 60s",
+    ),
+    Key("CORP_NER_MAX_TEXTS", default="256", help="corp NER texts per batch (service limit)"),
+    Key(
+        "CORP_NER_MAX_INPUT_CHARS",
+        default="200000",
+        help="corp NER chars per batch (service limit); a longer single text fails closed",
+    ),
+    Key("CORP_NER_CA_BUNDLE", help="PEM CA bundle path; verify corp-NER TLS against it"),
     # ── Backends ─────────────────────────────────────────────────────────────
     Key("CORP_LLM_PG_DSN", secret=True, help="Postgres DSN; unset → in-memory stores"),
     Key("REDIS_URL", secret=True, help="Redis URL for the mapping store; unset → in-memory"),
@@ -362,6 +390,23 @@ def _check_oracle_endpoint(values: Mapping[str, str | None], problems: list[str]
         )
 
 
+def _check_corp_ner_endpoint(values: Mapping[str, str | None], problems: list[str]) -> None:
+    """CORP_NER_ENDPOINT is required only when corp NER is enabled.
+
+    Plain-Python for the same reason as :func:`_check_oracle_endpoint`:
+    ``required_when`` is exact-match string equality, while the flag parses
+    leniently, so ``true``/``yes``/``on`` would silently skip the requirement.
+    """
+    if not _as_flag(values.get("CORP_NER_ENABLED")):
+        return
+    key = _BY_NAME["CORP_NER_ENDPOINT"]
+    if not values.get(key.name):
+        problems.append(
+            f"{key.name}: required — set the env var or add it to the config file "
+            f"($CORP_LLM_GATEWAY_CONFIG_FILE / ~/.corp-llm-gateway/config.toml). {key.help}"
+        )
+
+
 # Shared with bootstrap.build_guardrail(), which enforces the same invariant
 # inline (non-k8s boot paths never run `validate()`); keep one message string.
 NO_OP_SANITIZER_MESSAGE = (
@@ -526,6 +571,7 @@ def validate() -> Settings:
     _check_oversize(values, problems)
     _check_oracle_trigger(values, problems)
     _check_oracle_endpoint(values, problems)
+    _check_corp_ner_endpoint(values, problems)
     _check_no_op_sanitizer(values, problems)
     _check_forward_auth_exclusive(values, problems)
     _check_master_key_conflict(values, problems)

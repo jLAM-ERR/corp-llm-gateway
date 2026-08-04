@@ -4,16 +4,24 @@ import ast
 import importlib
 import logging
 import sys
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 from corp_llm_gateway import bootstrap, config, settings
 from corp_llm_gateway.audit import StdoutSink
-from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+from corp_llm_gateway.corp_ner import E_CORP_NER_UNAVAILABLE
+from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.detectors.dual_ner import DualNerDetector
+from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
+from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.profile_orchestrator import ProfileAwareOrchestrator
+from corp_llm_gateway.sanitizer.segmenter import SegmentKind, split_segments
 from corp_llm_gateway.settings import ConfigError
 from corp_llm_gateway.storage import InMemoryMappingStore, RedisMappingStore
 from corp_llm_gateway.team_config import (
@@ -21,7 +29,12 @@ from corp_llm_gateway.team_config import (
     PostgresTeamConfigStore,
     TeamConfig,
 )
-from corp_llm_gateway.tokens import InMemoryTokenStore, InvalidTokenError, MissingTokenError
+from corp_llm_gateway.tokens import (
+    InMemoryTokenStore,
+    InvalidTokenError,
+    MissingTokenError,
+    TokenInfo,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -296,6 +309,51 @@ def test_forward_chatgpt_auth_explicit_argument_overrides_config(
     guardrail = bootstrap.build_guardrail(forward_chatgpt_auth=False)
 
     assert guardrail._forward_chatgpt_auth is False
+
+
+# ── strip_inbound_headers_to_upstream: build_guardrail must resolve
+# CORP_LLM_STRIP_INBOUND_HEADERS from config (compose's hosted_vllm/ route needs
+# this True or the corp ingress 503s on the forwarded Host header) ─────────────
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
+def test_strip_inbound_headers_truthy_spellings_enable_the_flag(
+    monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_STRIP_INBOUND_HEADERS", truthy)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._strip_inbound_headers_to_upstream is True
+
+
+@pytest.mark.parametrize("falsy", ["0", "off", "no", "false", "OFF"])
+def test_strip_inbound_headers_falsy_spellings_disable_the_flag(
+    monkeypatch: pytest.MonkeyPatch, falsy: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_STRIP_INBOUND_HEADERS", falsy)
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._strip_inbound_headers_to_upstream is False
+
+
+def test_strip_inbound_headers_unset_defaults_off() -> None:
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._strip_inbound_headers_to_upstream is False
+
+
+def test_strip_inbound_headers_explicit_argument_overrides_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit caller argument (e.g. the demo shim resolving its own copy)
+    # must win over whatever the env var says.
+    monkeypatch.setenv("CORP_LLM_STRIP_INBOUND_HEADERS", "1")
+
+    guardrail = bootstrap.build_guardrail(strip_inbound_headers_to_upstream=False)
+
+    assert guardrail._strip_inbound_headers_to_upstream is False
 
 
 # ── forward_anthropic_auth: same config-resolution contract as the Codex flag ─
@@ -771,3 +829,273 @@ def test_importing_demo_guardrail_with_pg_dsn_and_no_asyncpg_does_not_raise(
     module = importlib.import_module("corp_llm_gateway._demo_guardrail")
 
     assert isinstance(module.guardrail, CorpLlmGuardrail)
+
+
+# ── B4: corp NER wiring (default off) ────────────────────────────────────────
+
+
+@pytest.fixture
+def _isolate_registry() -> Iterator[None]:
+    """Snapshot/restore the module-level REGISTRY so a corp-NER registration
+    from build_guardrail never leaks into another test's health_all()."""
+    specs = dict(REGISTRY._specs)
+    factories = dict(REGISTRY._factories)
+    try:
+        yield
+    finally:
+        REGISTRY._specs.clear()
+        REGISTRY._specs.update(specs)
+        REGISTRY._factories.clear()
+        REGISTRY._factories.update(factories)
+
+
+def _enable_corp_ner(monkeypatch: pytest.MonkeyPatch, **extra: str) -> None:
+    monkeypatch.setenv("CORP_NER_ENABLED", "1")
+    monkeypatch.setenv("CORP_NER_ENDPOINT", "https://corp-ner.test")
+    for name, value in extra.items():
+        monkeypatch.setenv(name, value)
+
+
+def _local_pass(guardrail: CorpLlmGuardrail) -> object:
+    return guardrail._orch._core._local
+
+
+def test_corp_ner_disabled_by_default_changes_nothing() -> None:
+    guardrail = bootstrap.build_guardrail()
+
+    detectors = _local_pass(guardrail)._detectors
+    assert [type(d).__name__ for d in detectors] == [
+        "RegexChecksumDetector",
+        "DualNerDetector",
+    ]
+    assert ("detector", "corp_ner") not in REGISTRY._factories
+
+
+def test_only_network_backed_detectors_are_kept_off_code_segments() -> None:
+    # Every LOCAL detector scans CODE, local dual-NER included — that is what
+    # ran before code_safe_detectors was ever passed. Narrowing this list to
+    # regex-only let PERSON/ORG/LOCATION inside fenced JSON, SQL values and
+    # config examples egress unredacted (tests/sanitizer/test_code_segment_ner.py).
+    guardrail = bootstrap.build_guardrail()
+
+    code_detectors = _local_pass(guardrail)._code_detectors
+    assert [type(d).__name__ for d in code_detectors] == [
+        "RegexChecksumDetector",
+        "DualNerDetector",
+    ]
+    # Chunk mode pulls regex out and runs it over the full text, so its CODE list
+    # carries local NER only — NOT the default-to-everything fallback.
+    chunk_code = guardrail._orch._core._chunk_local._code_detectors
+    assert [type(d).__name__ for d in chunk_code] == ["DualNerDetector"]
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_enabled_appends_detector_off_the_code_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_corp_ner(monkeypatch)
+
+    guardrail = bootstrap.build_guardrail()
+
+    names = [type(d).__name__ for d in _local_pass(guardrail)._detectors]
+    assert names == ["RegexChecksumDetector", "DualNerDetector", "CorpNerDetector"]
+    # Corp NER is the ONLY detector kept off CODE: its regex half fires on code
+    # tokens and it would ship source code to an external service. The local
+    # detectors beside it stay code-safe.
+    assert [type(d).__name__ for d in _local_pass(guardrail)._code_detectors] == [
+        "RegexChecksumDetector",
+        "DualNerDetector",
+    ]
+
+
+class _RecordingCorpNerDetector(PIIDetector):
+    """Stand-in for CorpNerDetector that records every text handed to it."""
+
+    def __init__(self, client: object, *, metrics: object = None) -> None:
+        self._client = client
+        self._metrics = metrics
+        self.seen: list[str] = []
+
+    async def detect(self, text: str) -> list[Finding]:
+        self.seen.append(text)
+        return []
+
+    async def detect_batch(self, texts: list[str]) -> list[list[Finding]]:
+        self.seen.extend(texts)
+        return [[] for _ in texts]
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+async def test_corp_ner_never_receives_code_segment_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_corp_ner(monkeypatch)
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    recorded: list[_RecordingCorpNerDetector] = []
+
+    def _make(client: object, *, metrics: object = None) -> _RecordingCorpNerDetector:
+        recorded.append(_RecordingCorpNerDetector(client, metrics=metrics))
+        return recorded[-1]
+
+    monkeypatch.setattr(bootstrap, "CorpNerDetector", _make)
+    # No models on 3.14 and no model load on 3.12: local NER is not under test here.
+    monkeypatch.setattr(
+        bootstrap, "DualNerDetector", lambda: DualNerDetector(engines=[], require_ner=False)
+    )
+    text = "contact John Smith\n```py\nx = 1  # note alice\n```\n"
+
+    guardrail = bootstrap.build_guardrail()
+    await guardrail._orch._core.sanitize(text, team_id="t1", conversation_id="c1")
+
+    (detector,) = recorded
+    segments = split_segments(text)
+    assert detector.seen == [s.text for s in segments if s.kind is not SegmentKind.CODE]
+    assert not any("x = 1" in seen for seen in detector.seen)
+
+
+class _RecordingMetrics(MetricsExporter):
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+
+    def record_block(self, block_reason: str) -> None:
+        pass
+
+    def record_failure(self, component: str) -> None:
+        self.failures.append(component)
+
+    def observe_request_latency(self, seconds: float, *, status: str) -> None:
+        pass
+
+
+def _authorized(guardrail: CorpLlmGuardrail) -> dict[str, object]:
+    now = datetime.now(UTC)
+    guardrail._auth._store.upsert(
+        TokenInfo(
+            corp_token="tok-1",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    return {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "ping Мамонтов Пётр Ильич"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
+    }
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+async def test_a_corp_ner_outage_fires_gateway_failure_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The detector and the hook share one exporter, so a detector-side counter
+    # doubles every failed request in gateway_failure{component="corp_ner"} and
+    # inflates any alert built on it. The hook is the single request-level choke
+    # point (it also owns the error-code mapping).
+    _enable_corp_ner(monkeypatch)
+    metrics = _RecordingMetrics()
+    monkeypatch.setattr(bootstrap, "get_exporter", lambda: metrics)
+    # No models on 3.14 and no model load on 3.12: local NER is not under test.
+    monkeypatch.setattr(
+        bootstrap, "DualNerDetector", lambda: DualNerDetector(engines=[], require_ner=False)
+    )
+    guardrail = bootstrap.build_guardrail()
+    client = _local_pass(guardrail)._detectors[-1]._client
+    client._http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(503, json={"detail": "loading"}))
+    )
+
+    with pytest.raises(GuardrailHttpException) as excinfo:
+        await guardrail.pre_call(_authorized(guardrail))
+
+    assert excinfo.value.error_code == E_CORP_NER_UNAVAILABLE
+    assert metrics.failures == ["corp_ner"]
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_registers_a_detector_extension(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_corp_ner(monkeypatch)
+
+    guardrail = bootstrap.build_guardrail()
+
+    ext = REGISTRY.get("detector", "corp_ner")
+    assert ext.spec.kind == "detector"
+    assert ext.spec.fail_policy == "fail-closed"
+    REGISTRY.validate_api_version(EXTENSION_API_VERSION)
+    # One HTTP client for the request path and the readiness poll.
+    assert ext._http is _local_pass(guardrail)._detectors[-1]._client._http
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_client_reads_its_limits_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_corp_ner(
+        monkeypatch,
+        CORP_NER_TIMEOUT_S="7",
+        CORP_NER_MAX_TEXTS="11",
+        CORP_NER_MAX_INPUT_CHARS="1234",
+    )
+
+    guardrail = bootstrap.build_guardrail()
+
+    client = _local_pass(guardrail)._detectors[-1]._client
+    assert client._base_url == "https://corp-ner.test"
+    assert client._timeout == 7.0
+    assert client._max_texts == 11
+    assert client._max_input_chars == 1234
+
+
+def test_corp_ner_enabled_without_endpoint_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_NER_ENABLED", "1")
+
+    with pytest.raises(ConfigError, match="CORP_NER_ENDPOINT"):
+        bootstrap.build_guardrail()
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_corp_ner_reads_the_extensions_detector_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "with-corp-ner.toml"
+    cfg.write_text(
+        "[extensions.detector.corp_ner]\n"
+        "enabled = true\n"
+        'endpoint = "https://from-table.test"\n'
+        "max_texts = 9\n"
+    )
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    config.reset_cache()
+
+    guardrail = bootstrap.build_guardrail()
+
+    client = _local_pass(guardrail)._detectors[-1]._client
+    assert client._base_url == "https://from-table.test"
+    assert client._max_texts == 9
+
+
+@pytest.mark.usefixtures("_isolate_registry")
+def test_env_wins_over_the_extensions_detector_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "with-corp-ner.toml"
+    cfg.write_text(
+        '[extensions.detector.corp_ner]\nenabled = true\nendpoint = "https://from-table.test"\n'
+    )
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    monkeypatch.setenv("CORP_NER_ENDPOINT", "https://from-env.test")
+    config.reset_cache()
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert _local_pass(guardrail)._detectors[-1]._client._base_url == "https://from-env.test"
+
+
+def test_table_disabled_corp_ner_stays_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "corp-ner-off.toml"
+    cfg.write_text('[extensions.detector.corp_ner]\nenabled = false\nendpoint = "https://x.test"\n')
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    config.reset_cache()
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert len(_local_pass(guardrail)._detectors) == 2
+    assert ("detector", "corp_ner") not in REGISTRY._factories

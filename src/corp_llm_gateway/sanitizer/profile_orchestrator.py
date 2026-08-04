@@ -17,22 +17,29 @@ from typing import TYPE_CHECKING
 
 from corp_llm_gateway.payload import OVERSIZE_FAIL_CLOSED
 from corp_llm_gateway.profiles import (
+    CODE_SAFE_DETECTORS,
     PolicyKnobs,
     ProfileCycleError,
     ProfileDepthError,
     ProfileIntegrityError,
     ProfileNotFoundError,
     ProfileParseError,
+    broadest_oracle_mode,
     bundle_fingerprint,
 )
 from corp_llm_gateway.rules import Rules, RulesLoader
-from corp_llm_gateway.sanitizer.orchestrator import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.orchestrator import (
+    ORACLE_TRIGGER_GAZETTEER_HIT,
+    SanitizationOrchestrator,
+    normalize_oracle_trigger,
+)
 from corp_llm_gateway.team_config import TeamConfig, TeamNotFoundError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from corp_llm_gateway.corp_llm import CorpLlmClient
+    from corp_llm_gateway.detectors.base import PIIDetector
     from corp_llm_gateway.profiles import ProfileBundle, ProfileResolver
     from corp_llm_gateway.sanitizer.engine import CorpLlmSanitizer
     from corp_llm_gateway.sanitizer.orchestrator import SanitizeResult
@@ -105,6 +112,42 @@ class _LayeredRulesLoader(RulesLoader):
         return Rules(rules=base.rules + self._profile_rules.rules)
 
 
+def code_safe_detectors(bundle: ProfileBundle) -> list[PIIDetector]:
+    """The bundle's detectors that may run on raw CODE segments.
+
+    Keyed on the DECLARED name (``registry.CODE_SAFE_DETECTORS``): every LOCAL
+    detector the bundle declares stays on CODE — local NER is what catches
+    PERSON / ORG / LOCATION in fenced JSON and config examples — while a
+    NETWORK-backed one (``corp_ner``) is dropped, since a CODE segment would ship
+    the developer's source out of the process. A detector with no declared name
+    is treated as unsafe, so the list is never wider than what the bundle
+    declares.
+    """
+    return [
+        detector
+        for name, detector in zip(bundle.detector_names, bundle.detectors, strict=False)
+        if name in CODE_SAFE_DETECTORS
+    ]
+
+
+def effective_oracle_trigger(global_trigger: str, policy_mode: str) -> str:
+    """The broader of the global CORP_LLM_ORACLE_TRIGGER and a profile's oracle_mode.
+
+    Both knobs only WIDEN oracle coverage, so taking either one alone silently
+    narrows the other: a profile asking for ``any_local_finding`` under a global
+    ``gazetteer_hit`` would never reach the oracle, and a profile left at the
+    default would cancel a globally-widened trigger. Ranking is
+    ``profiles.base.broadest_oracle_mode`` (the single ordering, shared with
+    ``PolicyKnobs.merge``); both inputs go through ``normalize_oracle_trigger``
+    first, so an invalid profile value raises here exactly as an invalid env
+    value does — never a silent degrade to the narrowest mode.
+    """
+    return broadest_oracle_mode(
+        normalize_oracle_trigger(global_trigger),
+        normalize_oracle_trigger(policy_mode),
+    )
+
+
 def build_inner_orchestrator(
     bundle: ProfileBundle,
     *,
@@ -117,6 +160,7 @@ def build_inner_orchestrator(
     oversize_policy: str = OVERSIZE_FAIL_CLOSED,
     oversize_deliver_teams: frozenset[str] = frozenset(),
     oracle_enabled: bool = True,
+    oracle_trigger: str = ORACLE_TRIGGER_GAZETTEER_HIT,
 ) -> SanitizationOrchestrator:
     """Construct the inner orchestrator for one resolved bundle.
 
@@ -126,6 +170,12 @@ def build_inner_orchestrator(
     fingerprint keeps their shared Cache-A entries apart (D3). ``oracle_enabled``
     mirrors the core orchestrator's switch (CORP_LLM_ORACLE_ENABLED) — a
     disabled oracle means every profile's inner orchestrator is also client-less.
+    ``oracle_trigger`` is the GLOBAL trigger the core orchestrator got; the inner
+    one runs on the broader of it and ``bundle.policy.oracle_mode``.
+
+    ``code_safe_detectors`` is always passed (never left to its permissive None
+    default, which reads as "every detector is code-safe") so a bundle naming a
+    network-backed detector cannot reach a CODE segment.
     """
     return SanitizationOrchestrator(
         corp_llm,
@@ -138,9 +188,11 @@ def build_inner_orchestrator(
         oversize_policy=oversize_policy,
         oversize_deliver_teams=oversize_deliver_teams,
         local_detectors=list(bundle.detectors) or None,
+        code_safe_detectors=code_safe_detectors(bundle),
         gazetteer=bundle.gazetteer,
         allowlist=bundle.allowlist,
         oracle_enabled=oracle_enabled,
+        oracle_trigger=effective_oracle_trigger(oracle_trigger, bundle.policy.oracle_mode),
     )
 
 

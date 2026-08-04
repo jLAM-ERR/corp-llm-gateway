@@ -8,8 +8,10 @@ the `team_config` schema change, and the RS256 operator-token breaking change.
 Two SQL files define the Postgres schema. Both are idempotent
 (`CREATE ... IF NOT EXISTS`, `CREATE OR REPLACE`).
 
-- `src/corp_llm_gateway/tokens/schema.sql` — `corp_tokens` + the original
-  `team_config` (no `profile_ids` column).
+- `src/corp_llm_gateway/tokens/schema.sql` — `corp_tokens` + `team_config`.
+  It now creates `profile_ids` in the `CREATE TABLE` **and** carries its own
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS profile_ids`, so it converges an
+  older table on its own.
 - `src/corp_llm_gateway/team_config/schema.sql` (task B5) — `team_config` **with**
   a `profile_ids TEXT[]` column. Applied by
   `PostgresTeamConfigStore.init_schema()`.
@@ -28,11 +30,15 @@ action.
 
 ### Upgrading a database that already ran `tokens/schema.sql`
 
-**Action required.** The `team_config` table already exists (without
-`profile_ids`), so `CREATE TABLE IF NOT EXISTS` in `team_config/schema.sql` is a
-no-op and does **not** add the column. But `PostgresTeamConfigStore` now
-`SELECT`s and upserts `profile_ids` — so every `team get` / `list` / `upsert`
-fails with `column "profile_ids" does not exist` until you add it:
+**Usually handled for you.** Both schema files now carry an idempotent
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS profile_ids`, so re-running either one
+converges a `team_config` created before the column existed.
+
+The manual statement below is a **recovery command**, needed only if your
+deployed schema files predate those ALTERs. The symptom is every `team get` /
+`list` / `upsert` failing with `column "profile_ids" does not exist`, because
+`PostgresTeamConfigStore` selects and upserts that column. Running it against an
+already-converged database is harmless:
 
 ```
 ALTER TABLE team_config
@@ -141,6 +147,94 @@ fails if the sites disagree.
 - `CallTypes` still carries `aspeech` / `pass_through_endpoint` / `aresponses`
   (the hook's non-chat `input` denylist), and the router still treats `api_key`
   as a clientside credential (what the Codex and Anthropic bridges rely on).
+
+## Cache A is invalidated by this release (no action required *for the cache*)
+
+This release widens detector coverage: the Luhn-validated `BANK_CARD` label is
+new, local NER's participation in CODE segments changed, and corp NER can add a
+whole detector when enabled. A Cache-A hit applies the stored mapping **without
+running detectors**, so an entry written by the previous build would replay as
+unredacted for the rest of its ~10h TTL — a card number cached before the
+upgrade would egress in the clear.
+
+`_CACHE_A_ALGORITHM_VERSION` (`sanitizer/orchestrator.py`) is therefore bumped to
+`coverage-v2`. It is mixed into the Cache-A key, so old pods write and read
+`span-aware-v1` keys, new pods write and read `coverage-v2` keys, and the two key
+sets are disjoint: neither version can serve the other's entries, in either
+direction, even while both run against the same Redis. There is no cross-version
+contamination, so **the cache needs no zero-overlap cutover, no egress block and
+no operator action.** The same boundary covers the profile path: profile
+sanitization delegates to `SanitizationOrchestrator.sanitize()`, which is the only
+caller of `_content_hash`.
+
+Alongside the constant, each orchestrator folds a fingerprint of its **effective
+redaction policy** into the same key (`_POLICY_FINGERPRINT_VERSION`, currently
+`policy-v3`). It covers: detector class identity **plus each detector's optional
+`policy_signature()`**, the code-safe subset, gazetteer terms **and the
+gazetteer's lemmatizer capability**, allowlist entries, and the oracle trigger.
+
+The two capability inputs matter operationally: a pod **without** the `ner` extra
+lemmatizes and NER-detects differently from one that has it, while configuring
+identical terms and the same detector classes. Folding capability keeps those
+pods on disjoint keys instead of letting a model-less pod's empty mapping be
+served to a model-backed one. `dual_ner` reports its engines' real load state
+this way, so a partially-installed pod cannot poison the shared cache.
+
+**If the fingerprint cannot be computed, Cache A is switched off entirely** for
+that orchestrator — both reads and writes — and the gateway logs
+`cache_a_disabled reason=policy_fingerprint_failed` with the exception type only.
+That is deliberate fail-closed behaviour: dedup is a latency optimisation, and
+serving a key that ignores coverage is a leak. Operationally it looks like a
+sudden loss of cache hits, not an outage.
+
+The constant covers
+build-time changes made *inside* a component — adding `BANK_CARD` changed a rule
+table inside `RegexChecksumDetector` and nothing else. The fingerprint covers
+config-time changes to the *set* of components, which the constant cannot see:
+pods with different `CORP_NER_ENABLED` values run the same image and the same
+algorithm version, and they now derive disjoint keys and cannot serve each
+other's entries. A mid-rollout `CORP_NER_ENABLED` flip is therefore safe for the
+cache in the same way a version bump is.
+
+### What the cache guarantee does *not* cover
+
+Scope the claim above to Cache A. During a rolling deploy, requests routed to
+pods that have not been replaced yet are handled by the **old detectors**, so
+they are not covered by the new rules (no `BANK_CARD`, for example). That is
+inherent to rolling out any detection change and has nothing to do with Cache A —
+the old pods are not replaying stale entries, they are correctly applying the
+policy they were built with. If a specific detection rule must apply to 100% of
+traffic from a known instant, drain or scale the old ReplicaSet to zero before
+serving on the new one; otherwise accept the normal rollout window.
+
+### Optional: reclaim the orphaned memory
+
+The retired entries stay resident until their TTL expires (up to ~10h). Redis is
+configured `maxmemory-policy noeviction` (`compose/redis/redis.conf`), so on a
+tight `maxmemory` that dead set can push the instance to refuse writes. Deleting
+it is housekeeping only.
+
+Key prefixes, as defined in `src/corp_llm_gateway/storage/redis_store.py`:
+
+| Prefix | Cache | Safe to delete? |
+|---|---|---|
+| `dedup:` | A — content-keyed dedup | **Yes** |
+| `conv:o2p:` | B — original → placeholder | **No** |
+| `conv:p2o:` | B — placeholder → original | **No** |
+| `…:ttl` (suffix on Cache-B keys) | B — sliding-TTL bookkeeping | **No** |
+
+The prefixes separate cleanly: `dedup:` matches Cache A and nothing else.
+
+```
+docker compose exec redis sh -lc \
+  'redis-cli --scan --pattern "dedup:*" | xargs -r -n 500 redis-cli unlink'
+```
+
+**Never `FLUSHDB` / `FLUSHALL` here.** The gateway keeps both caches in the same
+Redis (`REDIS_URL=redis://redis:6379/0`). Dropping the `conv:*` keys destroys the
+per-conversation mappings that `post_call` desanitization requires, and every
+in-flight conversation then returns `[LABEL_NNN]` placeholders to the developer
+instead of the original text.
 
 ## Rolling deploy
 
