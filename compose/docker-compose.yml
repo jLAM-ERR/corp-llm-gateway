@@ -188,20 +188,43 @@ services:
       com.corp-llm-gateway.audit-source: "gateway-stdout"
     logging:
       # Pinned, not inherited. vector.yaml's source is a `file` source over
-      # /var/lib/docker/containers/*/*-json.log, which only exists under this
+      # /var/lib/docker/containers/*/*-json.log and its numbered rotations,
+      # which only exist under this
       # driver; on a host whose daemon defaults to `local`/`journald` the audit
       # pipeline would otherwise read nothing at all. Audit is not optional, so
       # this service names the driver it needs instead of trusting the host.
       #
-      # No max-size/max-file here on purpose: the daemon's own defaults are
-      # merged in for every option not set here, so a host-wide log-rotation
-      # policy still applies. Rotation is what BOUNDS the durability of the
-      # out-of-process audit path — vector's glob does not follow the rotated
-      # `-json.log.1` files, so a rotation that outruns vector loses audit
-      # records. See compose/README.md "Audit buffering is not fail-closed".
+      # max-size/max-file are set HERE and not left to the daemon, because
+      # pinning the driver above is exactly what stops the daemon's defaults
+      # from applying: moby merges daemon-level log-opts into a container ONLY
+      # when the container's driver equals the daemon's default driver
+      # (daemon/logs.go `mergeAndVerifyLogConfig`; the copy loop is inside
+      # `if cfg.Type == daemon.defaultLogConfig.Type`). On a `local`-default
+      # host this service would therefore get json-file with `labels` and
+      # NOTHING else, and json-file's own max-size default is -1, i.e. no
+      # rotation at all — an unbounded audit log on the same disk as Cache B
+      # and Postgres. Measured on a docker 29.7.1 daemon whose default was
+      # `local` + max-size=1m/max-file=3: a container pinning json-file got
+      # `{"labels":"..."}` and grew one 8 MB file; the same container with
+      # these two options got three ~1 MB files.
+      #
+      # The trade-off, stated: rotation is what BOUNDS durability of the
+      # out-of-process audit path, so a rotation that outruns vector can still
+      # lose records (vector.yaml's glob follows `-json.log.[0-9]`, which
+      # narrows but does not close that window). Unbounded growth is the worse
+      # of the two failure modes — it ends in a full disk, which takes Postgres,
+      # Cache B and the request path down and loses the log anyway — and a
+      # host-wide daemon default is typically 10m x 3, far tighter than the
+      # ~1 GiB below. Size these against the longest Langfuse outage you intend
+      # to survive; the default product (100m x 10) matches
+      # CORP_VECTOR_LANGFUSE_BUFFER_BYTES. See compose/README.md
+      # "Audit buffering is not fail-closed".
       driver: json-file
       options:
         labels: com.corp-llm-gateway.audit-source
+        max-size: ${LITELLM_LOG_MAX_SIZE:-100m}
+        # Quoted: docker requires log-opt values to be strings.
+        max-file: "${LITELLM_LOG_MAX_FILE:-10}"
     ports:
       # Loopback only — no TLS on this port until the nginx profile (C1)
       # lands; virtual keys + X-Corp-Auth must not cross a server-class
@@ -535,7 +558,8 @@ services:
       # plane, so read access to it is host root — a container holding it can
       # start a privileged sibling with / bind-mounted. This is a read-only bind
       # of the container LOG DIRECTORY instead: data in, no control plane, no
-      # write path. vector.yaml's file source globs only `*/*-json.log`, so the
+      # write path. vector.yaml's file source globs only the active log
+      # (`*/*-json.log`) and its numbered rotations (`…-json.log.[0-9]`), so the
       # sibling config.v2.json / hostconfig.json files (which hold every
       # container's environment) are never read.
       #

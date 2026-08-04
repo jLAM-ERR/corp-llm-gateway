@@ -374,21 +374,68 @@ stops Vector reading. Closing the gap needs a health/buffer gate in `src/`
 feeding the hook — not built.
 
 Residual risk, and what bounds it: while the sink is stalled, accepted audit
-records live only in the `litellm` container's docker json-file log plus
-whatever already reached Vector's disk buffer. Vector's file glob is
-`*/*-json.log` and does not follow rotated `-json.log.1` files, so **docker log
-retention, not the disk buffer, is what bounds audit durability here** — a
-rotation that outruns Vector loses those records permanently. Separately,
-Vector's HTTP sink retries only 408/429/5xx, so a wrong or rotated Langfuse
-project key (401) is dropped rather than buffered.
+records live only in the `litellm` container's docker json-file logs plus
+whatever already reached Vector's disk buffer. Vector's file glob covers the
+active `-json.log` **and** its numbered rotations (`-json.log.[0-9]`, two-digit
+form too), so a rotation no longer discards records on its own — but a file
+rotated past `max-file` is deleted by docker, so **docker log retention, not the
+disk buffer, is still what bounds audit durability here**. Separately, Vector's
+HTTP sink retries only 408/429/5xx, so a wrong or rotated Langfuse project key
+(401) is dropped rather than buffered — and the file source checkpoints on read,
+not on delivery, so those bytes are not re-read on a restart. Recovery means
+deleting the source's checkpoint under `data_dir`; records already rotated away
+are unrecoverable.
 
 Operators of that stack must therefore size docker log retention
-(`max-size` × `max-file` for the `litellm` container) against the longest
-tolerated Langfuse outage, and alert on buffer growth and on Vector's
-`Events dropped` errors. Concrete commands: `compose/README.md`
-"Audit buffering is not fail-closed".
+(`LITELLM_LOG_MAX_SIZE` × `LITELLM_LOG_MAX_FILE`, set on the `litellm` service's
+own `logging.options`) against the longest tolerated Langfuse outage, and alert
+on buffer growth and on Vector's `Events dropped` errors. Note that setting these
+in the **daemon's** `log-opts` does not work: docker merges daemon-level log-opts
+into a container only when the container's log driver equals the daemon's default
+driver, and that service pins `json-file` because the audit pipeline requires it.
+Concrete commands: `compose/README.md` "Audit buffering is not fail-closed".
 
 The Helm deployment is not covered by this note; it is a separate composition.
+
+### 8.2 Audit-source trust on the compose stack — a host precondition
+
+Additive note, same scope as §8.1: it records a precondition of one shipped
+deployment, and changes nothing in the matrix above.
+
+`compose/vector/vector.yaml` reads **every** container's log on the host (a
+read-only bind of `/var/lib/docker/containers`, chosen over mounting the docker
+socket, which is host root). Its `gateway_container_only` filter scopes the
+pipeline to the gateway by requiring the docker json-file `attrs` stamp that the
+`litellm` service's `com.corp-llm-gateway.audit-source` label plus its
+`logging.options.labels` produce.
+
+**That filter is a misconfiguration guard, not a security boundary.** The label
+name and value are public and unverified. Any container started on the same host
+with the same label and the same `--log-opt labels=…` receives the same `attrs`
+stamp; if it then prints `AuditEvent`-shaped JSON (`request_id` +
+`redaction_count`, no NEVER field), the line passes `gateway_container_only`, the
+NEVER-fields gate and `audit_only`, and lands in Langfuse as a genuine-looking
+audit record. The filter raises the attacker requirement from "can write a log
+line" to "can start a container on this host" — a real improvement, and the
+whole of it.
+
+Consequences to accept before deploying that stack:
+
+- **No untrusted `docker run` on the host.** Membership of the `docker` group,
+  and any CI runner, agent or sidecar with daemon access, is equivalent to write
+  access to the audit trail. Restrict it the way you would restrict the audit
+  store itself.
+- The exposure is **forgery (insertion), not disclosure**. Nothing here lets a
+  co-located container read gateway audit records, and invariant #1 / the
+  NEVER-fields gate are unaffected: a forged record still cannot carry a NEVER
+  field through, and originals still never reach any of these surfaces.
+- Closing it properly needs a **private channel** only the gateway can write — a
+  dedicated bind-mounted audit file, or a unix socket, in place of container
+  stdout. That is a change to the audit sink in `src/corp_llm_gateway/audit/`
+  plus the Vector source, not to the compose stack, and is not built.
+
+The Helm deployment is not covered: there the audit path is the pod's own log,
+scoped by the k8s log collector, and a different trust model applies.
 
 ## 9. Invariants — never weaken these
 
