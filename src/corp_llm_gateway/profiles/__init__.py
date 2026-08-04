@@ -33,12 +33,19 @@ from corp_llm_gateway.profiles.manifest import (
     verify_integrity,
     verify_signature,
 )
-from corp_llm_gateway.profiles.registry import DETECTOR_REGISTRY, build_detectors
+from corp_llm_gateway.profiles.registry import (
+    CODE_SAFE_DETECTORS,
+    DETECTOR_REGISTRY,
+    NETWORK_DETECTORS,
+    build_detectors,
+)
 from corp_llm_gateway.profiles.resolver import ProfileResolver, bundle_fingerprint
 
 __all__ = [
+    "CODE_SAFE_DETECTORS",
     "DETECTOR_REGISTRY",
     "MAX_EXTENDS_DEPTH",
+    "NETWORK_DETECTORS",
     "BundleLintError",
     "CachedProfileLoader",
     "FileProfileLoader",

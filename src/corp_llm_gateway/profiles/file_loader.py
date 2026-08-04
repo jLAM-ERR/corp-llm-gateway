@@ -126,6 +126,9 @@ def build_bundle(
         allowlist=Allowlist(allow_originals),
         policy=PolicyKnobs.merge([source.manifest.policy for source in sources]),
         profile_ids=tuple(source.profile_id for source in sources),
+        # build_detectors dedups the already-deduped name list order-preserving,
+        # so these stay index-aligned with `detectors`.
+        detector_names=tuple(detector_names),
     )
 
 

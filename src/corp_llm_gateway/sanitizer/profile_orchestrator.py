@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from corp_llm_gateway.payload import OVERSIZE_FAIL_CLOSED
 from corp_llm_gateway.profiles import (
+    CODE_SAFE_DETECTORS,
     PolicyKnobs,
     ProfileCycleError,
     ProfileDepthError,
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from corp_llm_gateway.corp_llm import CorpLlmClient
+    from corp_llm_gateway.detectors.base import PIIDetector
     from corp_llm_gateway.profiles import ProfileBundle, ProfileResolver
     from corp_llm_gateway.sanitizer.engine import CorpLlmSanitizer
     from corp_llm_gateway.sanitizer.orchestrator import SanitizeResult
@@ -105,6 +107,24 @@ class _LayeredRulesLoader(RulesLoader):
         return Rules(rules=base.rules + self._profile_rules.rules)
 
 
+def code_safe_detectors(bundle: ProfileBundle) -> list[PIIDetector]:
+    """The bundle's detectors that may run on raw CODE segments.
+
+    Keyed on the DECLARED name (``registry.CODE_SAFE_DETECTORS``): every LOCAL
+    detector the bundle declares stays on CODE — local NER is what catches
+    PERSON / ORG / LOCATION in fenced JSON and config examples — while a
+    NETWORK-backed one (``corp_ner``) is dropped, since a CODE segment would ship
+    the developer's source out of the process. A detector with no declared name
+    is treated as unsafe, so the list is never wider than what the bundle
+    declares.
+    """
+    return [
+        detector
+        for name, detector in zip(bundle.detector_names, bundle.detectors, strict=False)
+        if name in CODE_SAFE_DETECTORS
+    ]
+
+
 def build_inner_orchestrator(
     bundle: ProfileBundle,
     *,
@@ -126,6 +146,10 @@ def build_inner_orchestrator(
     fingerprint keeps their shared Cache-A entries apart (D3). ``oracle_enabled``
     mirrors the core orchestrator's switch (CORP_LLM_ORACLE_ENABLED) — a
     disabled oracle means every profile's inner orchestrator is also client-less.
+
+    ``code_safe_detectors`` is always passed (never left to its permissive None
+    default, which reads as "every detector is code-safe") so a bundle naming a
+    network-backed detector cannot reach a CODE segment.
     """
     return SanitizationOrchestrator(
         corp_llm,
@@ -138,6 +162,7 @@ def build_inner_orchestrator(
         oversize_policy=oversize_policy,
         oversize_deliver_teams=oversize_deliver_teams,
         local_detectors=list(bundle.detectors) or None,
+        code_safe_detectors=code_safe_detectors(bundle),
         gazetteer=bundle.gazetteer,
         allowlist=bundle.allowlist,
         oracle_enabled=oracle_enabled,

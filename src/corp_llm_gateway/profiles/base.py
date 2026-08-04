@@ -97,6 +97,10 @@ class ProfileBundle:
     allowlist: Allowlist
     policy: PolicyKnobs
     profile_ids: tuple[str, ...]
+    # DECLARED name of each entry in `detectors`, same order. Consumers key
+    # per-detector policy off it (which detectors may run on CODE segments — see
+    # `registry.CODE_SAFE_DETECTORS`); an unnamed detector is treated as unsafe.
+    detector_names: tuple[str, ...] = ()
 
 
 class ProfileLoader(ABC):
