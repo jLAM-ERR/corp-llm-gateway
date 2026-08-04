@@ -9,10 +9,11 @@ import pytest
 
 from corp_llm_gateway.corp_llm import SANITIZE_TOOL_NAME, CorpLlmClient
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
+from corp_llm_gateway.detectors.dual_ner import NerUnavailableError
 from corp_llm_gateway.detectors.regex_checksum import RegexChecksumDetector
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
-from corp_llm_gateway.sanitizer.local_pass import LocalDetectionPass
+from corp_llm_gateway.sanitizer.local_pass import DetectorContractError, LocalDetectionPass
 from corp_llm_gateway.sanitizer.orchestrator import _merge_local
 from corp_llm_gateway.sanitizer.segmenter import SegmentKind, split_segments
 from corp_llm_gateway.storage import InMemoryMappingStore
@@ -232,6 +233,39 @@ async def test_local_pass_batch_error_message_has_no_user_text() -> None:
     with pytest.raises(ValueError) as exc:
         await LocalDetectionPass([_OutOfRangeBatchDetector()]).findings(secret)
     assert secret not in str(exc.value)
+
+
+class _TextMismatchBatchDetector(_BatchDetector):
+    """In-range offsets, but Finding.text names a different original."""
+
+    async def detect_batch(self, texts: list[str]) -> list[list[Finding]]:
+        self.batch_calls.append(list(texts))
+        return [[Finding("bob", "PERSON", 0, 5, 1.0)] for _ in texts]
+
+
+async def test_local_pass_batch_text_mismatch_fails_closed() -> None:
+    """In-range offsets whose slice is not Finding.text corrupt the M1-9 bijection."""
+    det = _TextMismatchBatchDetector()
+    with pytest.raises(DetectorContractError, match="does not match"):
+        await LocalDetectionPass([det]).findings("alice smith")
+
+
+async def test_local_pass_batch_text_mismatch_is_ner_classified() -> None:
+    """The hook's fail-closed handler catches NerUnavailableError, not bare ValueError."""
+    assert issubclass(DetectorContractError, NerUnavailableError)
+    with pytest.raises(NerUnavailableError):
+        await LocalDetectionPass([_TextMismatchBatchDetector()]).findings("alice smith")
+
+
+async def test_local_pass_batch_text_mismatch_error_has_no_user_text() -> None:
+    """M1-14: neither the segment slice nor the finding's own text may appear."""
+    secret = "s3cret-passphrase"
+    with pytest.raises(DetectorContractError) as exc:
+        await LocalDetectionPass([_TextMismatchBatchDetector()]).findings(secret)
+    msg = str(exc.value)
+    assert secret not in msg
+    assert secret[:5] not in msg, "the segment slice is user content too"
+    assert "bob" not in msg, "the finding's own text is detector-reported user content"
 
 
 # ---- _merge_local unit tests -----------------------------------------------
