@@ -66,8 +66,16 @@
 #   docs/chatgpt-codex.md.
 # CORP_LLM_FORWARD_ANTHROPIC_AUTH = "0"  # opt-in Anthropic subscription (OAuth) forwarding
 #   Lifts the developer's `sk-ant-oat…` bearer into the upstream Anthropic call,
-#   so no ANTHROPIC_API_KEY is needed on the laptop. Only applied to requests
-#   routed to an Anthropic model.
+#   so no ANTHROPIC_API_KEY is needed on the laptop.
+#   SUPPORTED ONLY ON AN ANTHROPIC-ONLY DEPLOYMENT: a litellm config with no
+#   wildcard route (`model_name: "*"`) and no non-`anthropic/` route. That
+#   deployment shape is the binding control, NOT the code. The bridge does check
+#   that the request's model looks Anthropic, but it sees only the
+#   client-visible alias — litellm resolves the actual deployment after the
+#   hook runs — so the check is defence-in-depth, not a routing guarantee.
+#   On a multi-provider or wildcard stack a `claude-*` alias can still land on a
+#   non-Anthropic upstream and take the subscription token with it: enabling
+#   this flag there risks handing the credential to the wrong provider.
 #   MUTUALLY EXCLUSIVE with CORP_LLM_FORWARD_CHATGPT_AUTH: both consume the same
 #   inbound Authorization bearer, so setting both refuses to boot (and fails
 #   `gateway-admin config check`). Picking a bridge per provider is a v2 follow-up.
