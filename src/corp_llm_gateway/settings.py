@@ -377,6 +377,12 @@ def forward_auth_conflict(*, chatgpt: bool, anthropic: bool) -> str | None:
 
     Takes already-parsed flags so `build_guardrail()` can apply it to values that
     came from explicit kwargs rather than config.
+
+    Precedence: an explicit `build_guardrail()` kwarg resolves its flag BEFORE the
+    pair is checked, so a kwarg that turns one bridge off leaves a legal pair even
+    when both env vars are on (exactly one bridge ends up live — no credential
+    confusion; bootstrap logs the divergence). `validate()` sees no kwargs, so an
+    env-vs-env conflict is always a `config check` failure.
     """
     return FORWARD_AUTH_EXCLUSIVE_MESSAGE if chatgpt and anthropic else None
 

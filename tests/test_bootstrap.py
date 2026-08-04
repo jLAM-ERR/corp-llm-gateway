@@ -383,16 +383,41 @@ def test_both_forward_auth_flags_raise_when_one_comes_from_a_kwarg(
         bootstrap.build_guardrail(forward_anthropic_auth=True)
 
 
-def test_kwarg_off_disarms_the_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Both env vars on, but the caller explicitly turns one off — the resolved
-    # pair is legal, so the build succeeds with only the Anthropic bridge live.
+def test_explicit_kwarg_off_takes_precedence_over_a_conflicting_env_pair(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Documented precedence, not an oversight: the kwarg resolves first, so the
+    # pair the rule sees is legal and exactly one bridge ends up live. The env
+    # pair is still broken (`config check` rejects it), so the divergence is
+    # logged rather than silent.
     monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
     monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
 
-    guardrail = bootstrap.build_guardrail(forward_chatgpt_auth=False)
+    with caplog.at_level(logging.WARNING, logger="corp_llm_gateway.bootstrap"):
+        guardrail = bootstrap.build_guardrail(forward_chatgpt_auth=False)
 
     assert guardrail._forward_chatgpt_auth is False
     assert guardrail._forward_anthropic_auth is True
+    warning = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "CORP_LLM_FORWARD_CHATGPT_AUTH" in record.message
+    )
+    assert "CORP_LLM_FORWARD_ANTHROPIC_AUTH" in warning
+    assert "disarmed CORP_LLM_FORWARD_CHATGPT_AUTH" in warning
+    assert "config check" in warning
+
+
+def test_no_disarm_warning_when_the_env_pair_is_already_legal(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
+    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0")
+
+    with caplog.at_level(logging.WARNING, logger="corp_llm_gateway.bootstrap"):
+        bootstrap.build_guardrail(forward_chatgpt_auth=False)
+
+    assert not [r for r in caplog.records if "mutually exclusive" in r.getMessage()]
 
 
 @pytest.mark.parametrize(

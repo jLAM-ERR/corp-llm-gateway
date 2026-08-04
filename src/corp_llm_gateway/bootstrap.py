@@ -221,6 +221,37 @@ def _build_dlp_guard() -> DlpEgressGuard:
     return DlpEgressGuard(canary_patterns=canaries or None, secret_rescan=True)
 
 
+def _warn_on_disarmed_forward_auth_conflict(
+    *,
+    configured_chatgpt: bool,
+    configured_anthropic: bool,
+    resolved_chatgpt: bool,
+    resolved_anthropic: bool,
+) -> None:
+    # An explicit kwarg legally resolves a both-flags-on config down to one live
+    # bridge, but the deployment config stays broken and `config check` still
+    # refuses it — say so instead of diverging silently.
+    if forward_auth_conflict(chatgpt=configured_chatgpt, anthropic=configured_anthropic) is None:
+        return
+    disarmed = " and ".join(
+        name
+        for name, live in (
+            ("CORP_LLM_FORWARD_CHATGPT_AUTH", resolved_chatgpt),
+            ("CORP_LLM_FORWARD_ANTHROPIC_AUTH", resolved_anthropic),
+        )
+        if not live
+    )
+    _log.warning(
+        "CORP_LLM_FORWARD_CHATGPT_AUTH and CORP_LLM_FORWARD_ANTHROPIC_AUTH are both enabled in "
+        "config, which is mutually exclusive; an explicit build_guardrail() kwarg disarmed %s for "
+        "this process, so the running gateway disagrees with its own config. "
+        "`gateway-admin config check` still rejects this config — turn %s off in the deployment "
+        "config.",
+        disarmed,
+        disarmed,
+    )
+
+
 def build_guardrail(
     *,
     auth_middleware: AuthMiddleware | None = None,
@@ -286,15 +317,17 @@ def build_guardrail(
     # CORP_LLM_FORWARD_ANTHROPIC_AUTH) — a plain `bool = False` default would
     # silently override the env var in every real deploy, so only resolve from
     # config when the caller left the kwarg unset.
+    configured_forward_chatgpt_auth = _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
+    configured_forward_anthropic_auth = _flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0")
     resolved_forward_chatgpt_auth = (
         forward_chatgpt_auth
         if forward_chatgpt_auth is not None
-        else _flag("CORP_LLM_FORWARD_CHATGPT_AUTH", "0")
+        else configured_forward_chatgpt_auth
     )
     resolved_forward_anthropic_auth = (
         forward_anthropic_auth
         if forward_anthropic_auth is not None
-        else _flag("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "0")
+        else configured_forward_anthropic_auth
     )
     # Same reason as the no-op-sanitizer floor above: settings.validate() covers
     # `config check` only, and the compose/demo boots this bridge ships on skip it.
@@ -303,6 +336,12 @@ def build_guardrail(
     )
     if conflict is not None:
         raise ConfigError([conflict])
+    _warn_on_disarmed_forward_auth_conflict(
+        configured_chatgpt=configured_forward_chatgpt_auth,
+        configured_anthropic=configured_forward_anthropic_auth,
+        resolved_chatgpt=resolved_forward_chatgpt_auth,
+        resolved_anthropic=resolved_forward_anthropic_auth,
+    )
     return CorpLlmGuardrail(
         orchestrator,
         auth,
