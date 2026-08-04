@@ -18,8 +18,24 @@ from __future__ import annotations
 import asyncio
 
 from corp_llm_gateway.detectors.base import BatchPIIDetector, Finding, PIIDetector
+from corp_llm_gateway.detectors.dual_ner import NerUnavailableError
 from corp_llm_gateway.detectors.regex_checksum import _deduplicate
 from corp_llm_gateway.sanitizer.segmenter import Segment, SegmentKind, split_segments
+
+
+class DetectorContractError(NerUnavailableError, ValueError):
+    """A batch detector broke the ``BatchPIIDetector`` contract — fail closed.
+
+    Subclasses ``NerUnavailableError`` so the fail-closed handlers already on the
+    egress path (``litellm_hook._pre_call_impl`` / ``_sanitize_prompt_field``)
+    classify it as a detection failure (503) instead of letting it reach the F8
+    catch-all as an opaque 500; the log line carries the exception type, so a
+    contract bug stays distinguishable from a missing NER model. Also subclasses
+    ``ValueError`` (as ``StaleSpanError`` does) to keep existing
+    ``except ValueError`` call sites working.
+
+    Messages carry labels, offsets and lengths only — never text (M1-14).
+    """
 
 
 class LocalDetectionPass:
@@ -103,14 +119,22 @@ class LocalDetectionPass:
         for (_, eligible), per_text in zip(plans, results, strict=True):
             if len(per_text) != len(eligible):
                 # Counts only — never echo user text (M1-14).
-                raise ValueError(
+                raise DetectorContractError(
                     f"detect_batch returned {len(per_text)} result lists for {len(eligible)} texts"
                 )
             for seg, found in zip(eligible, per_text, strict=True):
                 for f in found:
                     if not 0 <= f.start <= f.end <= len(seg.text):
-                        raise ValueError(
+                        raise DetectorContractError(
                             "detect_batch returned a finding with an out-of-range offset"
+                        )
+                    if f.text != seg.text[f.start : f.end]:
+                        # Rebasing an inconsistent finding would let the real span
+                        # egress unredacted and break the M1-9 bijection.
+                        raise DetectorContractError(
+                            "detect_batch returned a finding whose text does not match its "
+                            f"own span: label={f.label} start={f.start} end={f.end} "
+                            f"text_len={len(f.text)} span_len={f.end - f.start}"
                         )
                     out.append(
                         Finding(
