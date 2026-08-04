@@ -17,7 +17,14 @@
 #      langfuse-redis surfaces as ingestion 5xx "which Vector retries"; that is
 #      only true with these two settings. An in-memory buffer, or
 #      when_full: drop_newest, would turn the loud rejection that `noeviction`
-#      exists to produce back into silent audit loss one layer up.
+#      exists to produce back into silent audit loss one layer up. That covers
+#      TRANSIENT failures; an auth failure is not one of them — see the sink's
+#      retry_attempts comment.
+#   3. SCOPE. The demo's docker_logs source is already limited to the container
+#      it names; a file source over the log DIRECTORY is not, so this config
+#      adds the `gateway_container_only` filter as its container identity
+#      boundary. It is a separate transform and leaves never_fields_gate /
+#      audit_only untouched.
 #
 # CORP_LANGFUSE_PUBLIC_KEY / CORP_LANGFUSE_SECRET_KEY are required by the
 # vector service in compose/docker-compose.yml (`:?` form), so a missing key
@@ -47,11 +54,8 @@ sources:
   # streams live only.
   #
   # This picks up EVERY container on the host, not just litellm: the log
-  # directory carries no container names, only ids, so there is nothing to
-  # filter on at this layer. The `audit_only` transform below is the scoping
-  # mechanism — a record reaches a sink only if it parses as JSON and carries
-  # both `request_id` and `redaction_count`, which nothing but our own
-  # StdoutSink emits.
+  # directory is keyed by container id, not name, so the glob cannot be narrowed
+  # here. `gateway_container_only` below is the container identity boundary.
   container_logs:
     type: file
     include:
@@ -59,6 +63,36 @@ sources:
     read_from: beginning
 
 transforms:
+  # CONTAINER IDENTITY BOUNDARY. Runs on the raw docker envelope, before any
+  # application log content is unwrapped, and is the only thing that decides
+  # WHICH container may feed the audit pipeline.
+  #
+  # `attrs` is written by the json-file driver only for labels named in that
+  # container's `--log-opt labels=...`. The litellm service in
+  # compose/docker-compose.yml sets both halves — the label and the log option —
+  # so passing this filter requires control over container creation on the host,
+  # not merely the ability to print a line. Both halves are load-bearing:
+  # drop either and this filter matches nothing and the audit pipeline goes
+  # silent.
+  #
+  # `audit_only` further down is a SCHEMA gate (is this an AuditEvent?), not a
+  # trust boundary: `request_id` + `redaction_count` are two ordinary keys that
+  # any co-located container could print. Keep the two jobs separate.
+  #
+  # Every chunk of a >16 KiB line carries `attrs`, so this runs safely ahead of
+  # merge_partial_lines: a split record is never half-admitted.
+  #
+  # Nothing here logs or re-emits the line (invariant #1) — a non-matching line
+  # is dropped silently, and the `??` guards mean a non-JSON or non-object line
+  # is a plain false rather than a VRL error carrying the text.
+  gateway_container_only:
+    type: filter
+    inputs: ["container_logs"]
+    condition: |
+      envelope = object(parse_json(.message) ?? {}) ?? {}
+      attrs = object(envelope.attrs) ?? {}
+      attrs."com.corp-llm-gateway.audit-source" == "gateway-stdout"
+
   # docker json-file envelope: {"log":"<one line of app output>\n",
   # "stream":"stdout","time":"..."}. Unwrap it so the demo's `parse` transform
   # below sees exactly what its `docker_logs` source used to hand it.
@@ -68,7 +102,7 @@ transforms:
   # `audit_only`, silently and without an error message carrying the text.
   unwrap_docker_envelope:
     type: remap
-    inputs: ["container_logs"]
+    inputs: ["gateway_container_only"]
     source: |
       envelope, err = parse_json(.message)
       if err == null {
@@ -203,6 +237,16 @@ sinks:
       # ingestion queue is at the langfuse-redis maxmemory cap; that is a
       # transient, operator-fixable state (compose/README.md "When the Langfuse
       # queue fills"), so give up on it and the audit record is gone.
+      #
+      # This covers TRANSIENT failures only. retry_attempts governs how many
+      # times a retriable response is retried, not which responses are
+      # retriable: Vector's HTTP sink retries 408/429/5xx and treats every other
+      # 4xx as final ("Not retriable; dropping the request"). A 401 from a wrong
+      # CORP_LANGFUSE_* key therefore DISCARDS the audit record, and 0.53 has no
+      # knob to change that — the `request` block silently ignores keys it does
+      # not know, so a made-up retry-policy option would look configured and do
+      # nothing. compose/README.md "First login" documents the first-boot order
+      # that keeps this sink from ever running with a placeholder key.
       retry_attempts: 4294967295
       retry_initial_backoff_secs: 1
       retry_max_duration_secs: 60

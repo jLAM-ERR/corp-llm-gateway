@@ -354,6 +354,42 @@ unaffected. `CORP_LLM_ORACLE_ENABLED=0` with `CORP_LLM_LOCAL_FIRST=0` refuses
 to boot rather than run with no deterministic floor at all — see
 `docs/plans/20260713-oracle-toggle-compose-quickstart.md`.
 
+### 8.1 `vectorBufferFull` on the compose stack — `continue`, not the default
+
+The matrix row above is unchanged and remains the source of truth. This note
+records where one shipped deployment sits on it, because the deviation was
+previously silent.
+
+**`compose/` takes the `audit_buffer_full=continue` opt and cannot do
+otherwise. That stack does NOT provide the matrix's default fail-closed (503)
+behaviour: requests keep egressing while audit delivery is stalled.**
+
+Why it cannot: `compose/docker-compose.yml` leaves `CORP_AUDIT_SINK` unset, so
+`audit/factory.py`'s default `StdoutSink` applies and the gateway's whole audit
+action is one line on its own stdout, which always succeeds. Vector then tails
+that log file **out of process**, from another container. No signal path exists
+from Vector's buffer state back into `pre_call` / `post_call`, so nothing in the
+request path can observe saturation and return 503; `when_full: block` only
+stops Vector reading. Closing the gap needs a health/buffer gate in `src/`
+feeding the hook — not built.
+
+Residual risk, and what bounds it: while the sink is stalled, accepted audit
+records live only in the `litellm` container's docker json-file log plus
+whatever already reached Vector's disk buffer. Vector's file glob is
+`*/*-json.log` and does not follow rotated `-json.log.1` files, so **docker log
+retention, not the disk buffer, is what bounds audit durability here** — a
+rotation that outruns Vector loses those records permanently. Separately,
+Vector's HTTP sink retries only 408/429/5xx, so a wrong or rotated Langfuse
+project key (401) is dropped rather than buffered.
+
+Operators of that stack must therefore size docker log retention
+(`max-size` × `max-file` for the `litellm` container) against the longest
+tolerated Langfuse outage, and alert on buffer growth and on Vector's
+`Events dropped` errors. Concrete commands: `compose/README.md`
+"Audit buffering is not fail-closed".
+
+The Helm deployment is not covered by this note; it is a separate composition.
+
 ## 9. Invariants — never weaken these
 
 | ID | Invariant | Enforced by |

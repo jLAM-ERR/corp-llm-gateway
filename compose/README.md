@@ -260,6 +260,10 @@ failed emit is contained by the safety net in `litellm_hook.audit()` — it
 never reaches the client body and never blocks desanitization. So a full
 Langfuse queue costs observability data, never live traffic.
 
+That last sentence is the whole trade-off, and it is a documented deviation from
+`docs/security.md` §8's default for `vectorBufferFull` — read "Audit buffering
+is not fail-closed" below before you rely on it.
+
 What it looks like:
 
 - `langfuse-redis` stays **healthy** — `redis-cli ping` is a read and still
@@ -326,13 +330,36 @@ Chicken-and-egg on a first boot: `vector` needs the project keys, and the
 project does not exist yet. The clean way out is headless init — set
 `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `_SECRET_KEY` to values you generate and
 copy the same two values into `CORP_LANGFUSE_PUBLIC_KEY` /
-`CORP_LANGFUSE_SECRET_KEY`. If you provision through the UI instead, put a
-placeholder in the two `CORP_LANGFUSE_*` keys first (they have no default —
-`docker compose config` fails while they are empty, whatever `--scale` you
-pass), create the real keys, then update `.env` and
-`docker compose up -d vector`. Audit records emitted with the wrong key are not
-lost: Langfuse answers 401, Vector retries into its disk buffer, and the log
-files it reads from are still on disk.
+`CORP_LANGFUSE_SECRET_KEY`. Everything is correct before the first container
+starts and there is nothing else to do.
+
+If you provision through the UI instead, **do not let `vector` run before the
+real keys are in `.env`.** Langfuse answers a wrong key with `401`, and Vector's
+HTTP sink does **not** retry an auth failure — 401 is not in its retriable set
+(408/429/5xx), so every audit record posted with a placeholder key is logged as
+`Events dropped` and gone. The disk buffer does not help: the record has already
+left it. The sequence is therefore:
+
+```
+# 1. placeholder values in the two CORP_LANGFUSE_* keys — they have no default,
+#    so `docker compose config` fails while they are empty
+# 2. bring the stack up WITHOUT the audit forwarder
+docker compose up -d --scale vector=0
+# 3. create the project API keys in the UI, put the real values in .env
+# 4. now start vector
+docker compose up -d
+```
+
+Step 4 loses nothing. `vector` has no read checkpoint yet, and its source is
+`read_from: beginning`, so its first run replays the `litellm` container's log
+file from byte 0 — including every audit record written during steps 2 and 3.
+That guarantee lasts exactly as long as those log lines do; see "Audit buffering
+is not fail-closed" for what bounds that.
+
+The same hazard applies after first boot: if the project keys are rotated in
+Langfuse and `.env` is not updated, `vector` keeps posting and keeps dropping.
+`docker compose logs vector | grep "Events dropped"` is the check that surfaces
+it.
 
 ## Audit pipeline
 
@@ -367,29 +394,111 @@ consequences worth knowing:
 
 - the glob is `*/*-json.log`, so the sibling `config.v2.json` / `hostconfig.json`
   files — which hold every container's environment — are never read;
-- the source sees **every** container's logs, not just `litellm`: the log
-  directory carries container ids, not names, so there is nothing to filter on
-  at that layer. `audit_only` is the scoping mechanism — a record reaches a sink
-  only if it parses as JSON and has both `request_id` and `redaction_count`,
-  which nothing but our own `StdoutSink` emits;
-- it requires docker's default **`json-file` logging driver**. Under `local`,
-  `journald` or a remote driver there are no `*-json.log` files and the audit
-  pipeline goes quiet. Check with
-  `docker info --format '{{.LoggingDriver}}'` before a real deploy.
+- the source sees **every** container's logs, not just `litellm`, because the
+  log directory is keyed by container id and the glob cannot be narrowed. The
+  scoping is done one transform later — see "Container identity boundary";
+- it needs the **`json-file` logging driver**, which is why the `litellm`
+  service pins `logging.driver: json-file` rather than inheriting the host
+  default. Under a daemon-wide `local`, `journald` or remote driver the other
+  containers produce no `*-json.log` files, but `litellm` — the only one this
+  pipeline reads — still does. Every option the service does not set (notably
+  `max-size` / `max-file`) is still merged in from the daemon's defaults.
+
+**Container identity boundary.** `docker-compose.yml` puts a
+`com.corp-llm-gateway.audit-source: gateway-stdout` label on the `litellm`
+service and names that label in the service's `logging.options.labels`. That
+second half is what makes docker's json-file driver copy the label into every
+log record it writes for that container:
+
+```
+{"log":"...","stream":"stdout",
+ "attrs":{"com.corp-llm-gateway.audit-source":"gateway-stdout"},"time":"..."}
+```
+
+Vector's first transform, `gateway_container_only`, admits a line only if that
+`attrs` stamp is present — before the application content is unwrapped, and
+before anything downstream sees it. So feeding the audit pipeline requires
+control over container creation on this host, not merely the ability to print a
+line. All three pieces (label, log option, filter) are one mechanism; remove any
+one and the pipeline either goes silent or loses its boundary.
+
+`audit_only` stays what it always was: a **schema** gate that keeps
+non-`AuditEvent` lines (litellm's own JSON wrappers, uvicorn access logs) out.
+It is not a trust boundary — `request_id` and `redaction_count` are two ordinary
+keys, and before this filter existed any co-located container that logged a JSON
+line carrying them was forwarded into the audit store.
 
 Vector runs with a read-only root filesystem and all capabilities dropped. It
 stays root (the image default) because the log directory is mode `0710
 root:root`; there is no `user:` override to add.
 
-**Delivery is durable.** Read checkpoints and the sink's disk buffer live on the
-`vector-data` named volume, so a Vector restart resumes at the exact byte it
-stopped at — records written while it was down are delivered, not skipped, and
-none are re-sent. The Langfuse sink buffers to disk with `when_full: block` and
-retries indefinitely with backoff; see "When the Langfuse queue fills" for why
-that combination is load-bearing rather than a default. If the disk buffer does
-fill, Vector back-pressures the file source and stops reading — the records stay
-in the docker log files and are picked up from the checkpoint once Langfuse
-recovers.
+**Delivery is durable against transient failure.** Read checkpoints and the
+sink's disk buffer live on the `vector-data` named volume, so a Vector restart
+resumes at the exact byte it stopped at — records written while it was down are
+delivered, not skipped, and none are re-sent. The Langfuse sink buffers to disk
+with `when_full: block` and retries indefinitely with backoff; see "When the
+Langfuse queue fills" for why that combination is load-bearing rather than a
+default. If the disk buffer does fill, Vector back-pressures the file source and
+stops reading — the records stay in the docker log files and are picked up from
+the checkpoint once Langfuse recovers.
+
+"Transient" is the operative word. Vector's HTTP sink retries `408`, `429` and
+`5xx`; every other `4xx` is final and the record is dropped with an
+`Events dropped` error in `docker compose logs vector`. In practice that means a
+**wrong or rotated `CORP_LANGFUSE_*` key** (`401`) is silent audit loss, not a
+retry — see "First login". Vector 0.53 has no setting that changes which status
+codes are retriable, and its `request:` block ignores unknown keys without
+complaining, so an invented option there would validate and do nothing.
+
+### Audit buffering is not fail-closed
+
+`docs/security.md` §8 lists `vectorBufferFull` as **fail-closed (503) by
+default, with `audit_buffer_full=continue` available as a per-team opt**. **This
+stack takes the `continue` opt, and cannot do otherwise.** Say it plainly: a
+stalled audit path here does **not** stop requests from egressing.
+
+Why: audit delivery is out-of-process. `CORP_AUDIT_SINK` is unset, so the
+gateway's only audit action is writing a line to its own stdout, which always
+succeeds. Vector reads that log file afterwards, from a different container.
+There is no signal path from Vector's buffer state back into `pre_call` /
+`post_call`, so nothing in the request path can see the stall, and `when_full:
+block` only stops Vector *reading* — it never reaches the gateway. A real
+request-path fail-closed needs a health/buffer gate inside
+`src/corp_llm_gateway/`; it does not exist yet.
+
+That is a deliberate deviation from the matrix default, not an oversight, and it
+is the price of not making the gateway process depend on the audit forwarder's
+health. The residual risk: while Langfuse is unreachable, accepted audit records
+live **only in the `litellm` container's docker json-file log** (plus whatever
+already made it into Vector's disk buffer). Log rotation — not the disk buffer —
+is therefore what actually bounds durability, because Vector's glob is
+`*/*-json.log` and does **not** follow the rotated `-json.log.1` files. A
+rotation that outruns Vector loses those audit records permanently.
+
+Two things an operator must configure before going live:
+
+1. **Size the docker log retention** for the `litellm` container against the
+   longest Langfuse outage you intend to survive, at your own audit volume. Set
+   `max-size` / `max-file` in the daemon's `log-opts` (they are merged into this
+   service, which sets neither) or add them to the service's `logging.options`.
+   The product `max-size * max-file` must exceed the audit bytes produced during
+   that window; the disk buffer's `CORP_VECTOR_LANGFUSE_BUFFER_BYTES` should be
+   sized for the same window.
+2. **Alert on a stalled or lossy audit path.** Nothing does this for you — the
+   `vector` healthcheck only proves the process is alive, and `langfuse-redis`
+   answers `PING` while full. The three checks that surface it:
+
+```
+# buffered but undelivered — grows while langfuse is unreachable
+docker compose exec vector du -sh /var/lib/vector/buffer
+
+# dropped outright — a wrong key, or any other non-retriable response
+docker compose logs vector | grep "Events dropped"
+
+# is the litellm log about to rotate away ahead of vector?
+docker compose exec vector du -sh \
+  "$(docker inspect -f '{{.LogPath}}' "$(docker compose ps -q litellm)")"
+```
 
 **Long records are reassembled.** The `json-file` driver splits any output line
 longer than 16 KiB across several records, and only the last one ends in a
