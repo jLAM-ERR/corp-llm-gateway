@@ -14,7 +14,14 @@ filename order, the first time the `gateway-postgres-data` volume is empty.
   the remote host. For a local run, do the same by hand:
 
 ```
-cp ../../src/corp_llm_gateway/tokens/schema.sql ./01-schema.sql
+# from compose/postgres/initdb (this directory) — three levels up to the repo root
+cp ../../../src/corp_llm_gateway/tokens/schema.sql ./01-schema.sql
+```
+
+Or, equivalently, from `compose/` (the form used in `compose/README.md`):
+
+```
+cp ../src/corp_llm_gateway/tokens/schema.sql postgres/initdb/01-schema.sql
 ```
 
 ## Upgrading a pre-existing deployment

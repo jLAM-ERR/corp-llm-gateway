@@ -67,7 +67,7 @@ ADR-003); the corp-LLM oracle is only a conditional fallback. Two failure modes:
 
 Action:
 1. Add detection capacity by scaling the **gateway** Deployment (it runs
-   detection in-process), not a pre-pass pod: `kubectl scale -n corp-llm-gateway deploy/gw --replicas=N`, or enable/raise the HPA (`autoscaling` in values.yaml).
+   detection in-process), not a pre-pass pod: `kubectl scale -n corp-llm-gateway deploy/gw-corp-llm-gateway --replicas=N`, or enable/raise the HPA (`autoscaling` in values.yaml).
 2. Investigate the pod (OOM? NER model load failure? unusually large payload —
    the M1-11 size threshold / `CORP_LLM_OVERSIZE_POLICY` governs those).
 
@@ -85,12 +85,27 @@ Action:
 
 Symptom: SIEM alert "vector_buffer_50pct".
 
-Behavior (default): fail-closed at 100% (per matrix).
+Behavior: **audit loss risk, NOT request blocking.** The M4 matrix lists
+`vectorBufferFull` as fail-closed, but no deployed topology can enforce that
+today: `CORP_AUDIT_SINK` is unset, so the gateway's only audit action is writing
+a line to its own stdout (`audit/factory.py` default → `StdoutSink`), which
+always succeeds. Vector reads that log file afterwards, from a different
+container. There is no signal path from Vector's buffer state back into
+`pre_call`/`post_call`, so a stalled audit path **cannot** return 503 — requests
+keep egressing. See `compose/README.md` "Audit buffering is not fail-closed".
 
 Action:
 1. Check downstream sinks. Likely Langfuse or SIEM is down/slow.
 2. If a single sink is down: the others continue. Pin which one via Vector metrics.
-3. If buffer fills: requests start returning 503. Revisit fail-policy override at team level if business-critical.
+3. If the buffer fills, Vector back-pressures and stops reading; records stay in
+   the container's log files. What actually bounds durability is **log
+   retention**, not the buffer — once docker rotates a file past
+   `LITELLM_LOG_MAX_FILE`, those audit records are gone permanently. Size
+   `LITELLM_LOG_MAX_SIZE` × `LITELLM_LOG_MAX_FILE` for the longest outage you
+   intend to survive.
+4. `docker compose logs vector | grep "Events dropped"` — a wrong or rotated
+   `CORP_LANGFUSE_*` key gives 401, which Vector does **not** retry. That is
+   silent audit loss and needs the key fixed, not more buffer.
 
 ### Unexpected internal error (F8 safety net)
 
@@ -158,9 +173,17 @@ The path is in `team_config.replace_md_path`. Read directly from the file or que
 
 ## Useful kubectl
 
+> **Deployment name.** The chart renders `<release>-corp-llm-gateway`
+> (`_helpers.tpl` `fullname`), so for `helm install gw ...` the object is
+> `deploy/gw-corp-llm-gateway` — not `deploy/gw` or `deploy/gateway`. The
+> release-independent form is a label selector:
+> `kubectl -n corp-llm-gateway -l app.kubernetes.io/name=corp-llm-gateway ...`.
+> Set `fullnameOverride` if you want a fixed name.
+
+
 ```
 kubectl -n corp-llm-gateway get pods
-kubectl -n corp-llm-gateway logs deploy/gateway -c litellm
-kubectl -n corp-llm-gateway logs deploy/gateway -c vector
-kubectl -n corp-llm-gateway exec -it deploy/gateway -c litellm -- python -m corp_llm_gateway.cli.admin team --help
+kubectl -n corp-llm-gateway logs deploy/gw-corp-llm-gateway -c litellm
+kubectl -n corp-llm-gateway logs deploy/gw-corp-llm-gateway -c vector
+kubectl -n corp-llm-gateway exec -it deploy/gw-corp-llm-gateway -c litellm -- python -m corp_llm_gateway.cli.admin team --help
 ```

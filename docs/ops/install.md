@@ -117,7 +117,7 @@ from before this fix.
 5. **Wait for readiness** on all pods:
 
    ```
-   kubectl -n corp-llm-gateway rollout status deploy/gw
+   kubectl -n corp-llm-gateway rollout status deploy/gw-corp-llm-gateway
    curl https://gateway-staging.corp.lan/healthz/ready
    curl https://gateway-staging.corp.lan/healthz/sanitization   # deep-check
    ```

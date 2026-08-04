@@ -8,8 +8,10 @@ the `team_config` schema change, and the RS256 operator-token breaking change.
 Two SQL files define the Postgres schema. Both are idempotent
 (`CREATE ... IF NOT EXISTS`, `CREATE OR REPLACE`).
 
-- `src/corp_llm_gateway/tokens/schema.sql` — `corp_tokens` + the original
-  `team_config` (no `profile_ids` column).
+- `src/corp_llm_gateway/tokens/schema.sql` — `corp_tokens` + `team_config`.
+  It now creates `profile_ids` in the `CREATE TABLE` **and** carries its own
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS profile_ids`, so it converges an
+  older table on its own.
 - `src/corp_llm_gateway/team_config/schema.sql` (task B5) — `team_config` **with**
   a `profile_ids TEXT[]` column. Applied by
   `PostgresTeamConfigStore.init_schema()`.
@@ -28,11 +30,15 @@ action.
 
 ### Upgrading a database that already ran `tokens/schema.sql`
 
-**Action required.** The `team_config` table already exists (without
-`profile_ids`), so `CREATE TABLE IF NOT EXISTS` in `team_config/schema.sql` is a
-no-op and does **not** add the column. But `PostgresTeamConfigStore` now
-`SELECT`s and upserts `profile_ids` — so every `team get` / `list` / `upsert`
-fails with `column "profile_ids" does not exist` until you add it:
+**Usually handled for you.** Both schema files now carry an idempotent
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS profile_ids`, so re-running either one
+converges a `team_config` created before the column existed.
+
+The manual statement below is a **recovery command**, needed only if your
+deployed schema files predate those ALTERs. The symptom is every `team get` /
+`list` / `upsert` failing with `column "profile_ids" does not exist`, because
+`PostgresTeamConfigStore` selects and upserts that column. Running it against an
+already-converged database is harmless:
 
 ```
 ALTER TABLE team_config
@@ -162,8 +168,26 @@ sanitization delegates to `SanitizationOrchestrator.sanitize()`, which is the on
 caller of `_content_hash`.
 
 Alongside the constant, each orchestrator folds a fingerprint of its **effective
-redaction policy** (detector classes, the code-safe subset, gazetteer terms,
-allowlist entries, oracle trigger) into the same key. The constant covers
+redaction policy** into the same key (`_POLICY_FINGERPRINT_VERSION`, currently
+`policy-v3`). It covers: detector class identity **plus each detector's optional
+`policy_signature()`**, the code-safe subset, gazetteer terms **and the
+gazetteer's lemmatizer capability**, allowlist entries, and the oracle trigger.
+
+The two capability inputs matter operationally: a pod **without** the `ner` extra
+lemmatizes and NER-detects differently from one that has it, while configuring
+identical terms and the same detector classes. Folding capability keeps those
+pods on disjoint keys instead of letting a model-less pod's empty mapping be
+served to a model-backed one. `dual_ner` reports its engines' real load state
+this way, so a partially-installed pod cannot poison the shared cache.
+
+**If the fingerprint cannot be computed, Cache A is switched off entirely** for
+that orchestrator — both reads and writes — and the gateway logs
+`cache_a_disabled reason=policy_fingerprint_failed` with the exception type only.
+That is deliberate fail-closed behaviour: dedup is a latency optimisation, and
+serving a key that ignores coverage is a leak. Operationally it looks like a
+sudden loss of cache hits, not an outage.
+
+The constant covers
 build-time changes made *inside* a component — adding `BANK_CARD` changed a rule
 table inside `RegexChecksumDetector` and nothing else. The fingerprint covers
 config-time changes to the *set* of components, which the constant cannot see:

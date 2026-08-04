@@ -43,7 +43,12 @@ Two special cases sit outside the table: **profiles** (pure declarative data —
 
 A detector finds spans to redact. The registry is `DETECTOR_REGISTRY` in
 `src/corp_llm_gateway/profiles/registry.py`; the built-ins are `regex_checksum`, `dual_ner`,
-`ner_ru`, `ner_en`.
+`ner_ru`, `ner_en`, `corp_ner`.
+
+`corp_ner` is the one **network-backed** built-in: selecting it requires
+`CORP_NER_ENDPOINT` (it is a boot refusal without one), and it is excluded from
+`CODE` segments — the local detectors are not, since local NER is what catches
+PERSON/ORG inside fenced JSON, SQL values and config examples.
 
 1. **Implement `PIIDetector`** (`detectors/base.py`) in `src/corp_llm_gateway/detectors/my_rule.py`:
 
