@@ -219,19 +219,66 @@ services:
     # maxmemory 512mb with noeviction. A Langfuse ingestion backlog on the
     # same instance would eat that budget and make Cache B writes fail with
     # OOM, i.e. an observability backlog would break live desanitization.
-    # Langfuse needs noeviction too: its queue holds not-yet-persisted
-    # events, which nothing can reconstruct.
+    #
+    # Splitting the instance removes that SHARED-QUOTA coupling but not the
+    # HOST one: an uncapped Redis grows until the kernel OOM killer picks a
+    # victim, and the victim can just as easily be litellm, postgres or
+    # Cache B itself. Both caps below are load-bearing; neither replaces the
+    # other.
+    #   --maxmemory                  Redis's own data accounting. At the cap
+    #                                Redis refuses writes — bounded and loud.
+    #   deploy.resources.limits      RSS backstop, honoured by `docker compose
+    #                                up`. Redis RSS runs ABOVE maxmemory
+    #                                (allocator fragmentation, client output
+    #                                buffers, and the fork copy-on-write of an
+    #                                AOF rewrite), so keep this ~2x the data
+    #                                cap. Setting them equal just moves the
+    #                                kill from the host to this container
+    #                                during an AOF rewrite.
+    # Defaults (.env.example: LANGFUSE_REDIS_MAXMEMORY / _MEM_LIMIT) hold a
+    # six-figure job backlog — hours of a fully stalled langfuse-worker.
+    #
+    # Policy stays noeviction and is hardcoded, NOT an .env key: it decides
+    # which data is lost, not how much memory is used. The trade-off, made
+    # explicit — at the cap Langfuse REJECTS new ingestion writes (loud,
+    # recoverable, visible as 5xx on its ingestion API) instead of silently
+    # deleting queue entries for events it already accepted, which would be
+    # silent audit loss plus a half-deleted BullMQ job. Each queue entry is a
+    # pointer to an event blob already uploaded to MinIO (`events/`), so the
+    # payload survives an eviction — but nothing re-enqueues it, so the trace
+    # never reaches ClickHouse and never appears in the audit view.
+    #
+    # A full queue does NOT reach the gateway REQUEST path. This stack leaves
+    # CORP_AUDIT_SINK unset (audit/factory.py default "stdout"), so gateway
+    # audit records go to stdout -> Vector, which retries against Langfuse;
+    # nothing in pre_call/post_call talks to this Redis. Even on a
+    # direct-to-Langfuse sink the audit_sink fail policy is "continue" (M4
+    # matrix, audit/factory.py) and a failed emit is contained by the F8
+    # safety net in litellm_hook.audit() — it never reaches the client body
+    # and never blocks desanitization. See compose/README.md "When the
+    # Langfuse queue fills".
     command:
       - redis-server
+      - --maxmemory
+      - ${LANGFUSE_REDIS_MAXMEMORY:-256mb}
       - --maxmemory-policy
       - noeviction
       - --appendonly
       - "yes"
       - --appendfsync
       - everysec
+    deploy:
+      resources:
+        limits:
+          memory: ${LANGFUSE_REDIS_MEM_LIMIT:-512mb}
     volumes:
       - langfuse-redis-data:/data
     healthcheck:
+      # PING is a read: a Redis at its maxmemory cap still answers PONG and
+      # this service stays "healthy". A full queue therefore shows up as
+      # Langfuse ingestion 5xx, not as an unhealthy container — see
+      # compose/README.md "When the Langfuse queue fills" for the
+      # `redis-cli info memory` check that does surface it.
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
