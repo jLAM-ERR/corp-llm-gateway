@@ -36,7 +36,7 @@ from corp_llm_gateway.detectors.corp_ner import CorpNerDetector
 from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
 from corp_llm_gateway.extensions.corp_ner import CorpNerExtension, register_corp_ner
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
-from corp_llm_gateway.metrics import MetricsExporter, get_exporter
+from corp_llm_gateway.metrics import get_exporter
 from corp_llm_gateway.profiles import FileProfileLoader, ProfileBundle, ProfileResolver
 from corp_llm_gateway.rules import (
     CachedRulesLoader,
@@ -182,15 +182,15 @@ def _corp_ner_int(table: dict[str, object], env_name: str, table_key: str, defau
         raise ConfigError([f"{env_name}={raw!r} is not an integer"]) from exc
 
 
-def build_corp_ner(*, metrics: MetricsExporter) -> tuple[CorpNerDetector, CorpNerExtension] | None:
+def build_corp_ner() -> tuple[CorpNerDetector, CorpNerExtension] | None:
     """Corp NER detector + its registry extension, or None when disabled.
 
     Off by default (``CORP_NER_ENABLED=0``) so existing deploys are untouched.
     When on, a missing endpoint is a boot-time refusal — `settings.validate()`
     covers `config check` only, and the compose/demo boots skip it.
 
-    ``metrics`` is the LIVE exporter (not the detector's Noop default), or
-    ``gateway_failure{component="corp_ner"}`` would never fire in production.
+    No metrics exporter is threaded in: ``gateway_failure{component="corp_ner"}``
+    is emitted once per request by ``litellm_hook._record_failure``.
 
     TLS verification is never disabled here (unlike ``SSL_VERIFY`` for the
     oracle): this call carries RAW user content. Point ``CORP_NER_CA_BUNDLE`` at
@@ -225,7 +225,7 @@ def build_corp_ner(*, metrics: MetricsExporter) -> tuple[CorpNerDetector, CorpNe
     )
     # The extension shares the client so readiness and the request path can never
     # disagree about how the service is reached.
-    return CorpNerDetector(client, metrics=metrics), CorpNerExtension(endpoint, http=http)
+    return CorpNerDetector(client), CorpNerExtension(endpoint, http=http)
 
 
 def _code_safe_detectors(
@@ -453,11 +453,10 @@ def build_guardrail(
         client = None
         _log.info("bootstrap oracle_enabled=false — local-first only")
     team_store = team_config_store if team_config_store is not None else build_team_config_store()
-    # One exporter instance for the hook AND the corp NER detector: get_exporter()
-    # builds a new one per call, and a second instance would emit to a registry
-    # nobody scrapes.
+    # One exporter instance for the hook: get_exporter() builds a new one per
+    # call, and a second instance would emit to a registry nobody scrapes.
     metrics = get_exporter()
-    corp_ner = build_corp_ner(metrics=metrics)
+    corp_ner = build_corp_ner()
     core = _build_orchestrator(
         client,
         store,

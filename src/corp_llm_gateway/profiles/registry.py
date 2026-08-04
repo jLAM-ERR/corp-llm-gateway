@@ -33,10 +33,6 @@ def _make_corp_ner(cfg: Mapping[str, Any]) -> PIIDetector:
     Endpoint from the bundle cfg, else the config chain. A missing endpoint is a
     refusal, not a detector pointed nowhere: that would fail every request as an
     outage instead of naming the misconfiguration.
-
-    The composition root (``bootstrap.build_corp_ner``) is the path that also
-    wires the live metrics exporter; a profile-declared instance keeps the
-    detector's own Noop default.
     """
     endpoint = str(cfg.get("corp_ner_endpoint") or config.get("CORP_NER_ENDPOINT") or "")
     if not endpoint:

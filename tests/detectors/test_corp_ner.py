@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import random
@@ -21,7 +22,6 @@ from corp_llm_gateway.corp_ner import (
 )
 from corp_llm_gateway.detectors.base import BatchPIIDetector, Finding
 from corp_llm_gateway.detectors.corp_ner import _MIN_COMPOSABLE_SECOND, CorpNerDetector
-from corp_llm_gateway.metrics.base import MetricsExporter
 
 BASE_URL = "http://corp-ner.corp.lan:8004"
 
@@ -32,21 +32,6 @@ _I_BREVE = "\u0438\u0306"
 _E_DIAERESIS = "\u0435\u0308"
 _DECOMPOSED = f"Андре{_I_BREVE} Корол{_E_DIAERESIS}в"
 _NFC = unicodedata.normalize("NFC", _DECOMPOSED)
-
-
-class _RecordingMetrics(MetricsExporter):
-    def __init__(self) -> None:
-        self.blocks: list[str] = []
-        self.failures: list[str] = []
-
-    def record_block(self, block_reason: str) -> None:
-        self.blocks.append(block_reason)
-
-    def record_failure(self, component: str) -> None:
-        self.failures.append(component)
-
-    def observe_request_latency(self, seconds: float, *, status: str) -> None:
-        return None
 
 
 class _StubClient:
@@ -165,65 +150,55 @@ async def test_zero_length_spans_are_dropped() -> None:
 
 
 async def test_truncated_result_fails_closed() -> None:
-    metrics = _RecordingMetrics()
-    detector = CorpNerDetector(_client(_fixed(truncated=True)), metrics=metrics)
+    detector = CorpNerDetector(_client(_fixed(truncated=True)))
 
     with pytest.raises(CorpNerUnavailableError):
         await detector.detect("some prose that was only partly scanned")
-    assert metrics.failures == ["corp_ner"]
 
 
-async def test_timeout_fails_closed_and_records_failure() -> None:
+async def test_timeout_fails_closed() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("", request=request)
 
-    metrics = _RecordingMetrics()
-    detector = CorpNerDetector(_client(handler), metrics=metrics)
+    detector = CorpNerDetector(_client(handler))
 
     with pytest.raises(CorpNerUnavailableError):
         await detector.detect("hello")
-    assert metrics.failures == ["corp_ner"]
 
 
-async def test_connect_error_fails_closed_and_records_failure() -> None:
+async def test_connect_error_fails_closed() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("", request=request)
 
-    metrics = _RecordingMetrics()
-    detector = CorpNerDetector(_client(handler), metrics=metrics)
+    detector = CorpNerDetector(_client(handler))
 
     with pytest.raises(CorpNerUnavailableError):
         await detector.detect_batch(["hello", "world"])
-    assert metrics.failures == ["corp_ner"]
 
 
-async def test_non_2xx_fails_closed_and_records_failure() -> None:
+async def test_non_2xx_fails_closed() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json={"detail": "model loading"})
 
-    metrics = _RecordingMetrics()
-    detector = CorpNerDetector(_client(handler), metrics=metrics)
+    detector = CorpNerDetector(_client(handler))
 
     with pytest.raises(CorpNerUnavailableError):
         await detector.detect("hello")
-    assert metrics.failures == ["corp_ner"]
 
 
 async def test_result_count_mismatch_fails_closed() -> None:
-    metrics = _RecordingMetrics()
-    detector = CorpNerDetector(_StubClient([]), metrics=metrics)
+    detector = CorpNerDetector(_StubClient([]))
 
     with pytest.raises(CorpNerUnavailableError):
         await detector.detect_batch(["a", "b"])
-    assert metrics.failures == ["corp_ner"]
 
 
-async def test_default_metrics_exporter_is_a_noop() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500)
-
-    with pytest.raises(CorpNerUnavailableError):
-        await CorpNerDetector(_client(handler)).detect("hello")
+async def test_the_detector_does_not_count_failures_itself() -> None:
+    # gateway_failure{component="corp_ner"} is emitted once per request by
+    # litellm_hook._record_failure. A second counter here double-counted every
+    # failed request, so the detector takes no exporter at all.
+    assert not hasattr(CorpNerDetector(_StubClient([])), "_metrics")
+    assert "metrics" not in inspect.signature(CorpNerDetector.__init__).parameters
 
 
 async def test_raw_httpx_error_from_the_client_is_wrapped() -> None:
@@ -233,13 +208,10 @@ async def test_raw_httpx_error_from_the_client_is_wrapped() -> None:
         async def analyze(self, texts: list[str], *, request_id: str | None = None) -> list:
             raise httpx.ReadTimeout("")
 
-    metrics = _RecordingMetrics()
-
     with pytest.raises(CorpNerUnavailableError) as excinfo:
-        await CorpNerDetector(_LeakyClient(), metrics=metrics).detect("hello")
+        await CorpNerDetector(_LeakyClient()).detect("hello")
 
     assert "ReadTimeout" in str(excinfo.value)
-    assert metrics.failures == ["corp_ner"]
 
 
 # ---------------------------------------------------------------------------
@@ -367,12 +339,10 @@ async def test_batch_chunks_at_max_input_chars() -> None:
 
 
 async def test_text_over_max_input_chars_fails_closed() -> None:
-    metrics = _RecordingMetrics()
-    detector = CorpNerDetector(_client(_fixed()), metrics=metrics)
+    detector = CorpNerDetector(_client(_fixed()))
 
     with pytest.raises(CorpNerUnavailableError):
         await detector.detect("y" * (MAX_INPUT_CHARS + 1))
-    assert metrics.failures == ["corp_ner"]
 
 
 async def test_empty_and_blank_texts_never_reach_the_service() -> None:

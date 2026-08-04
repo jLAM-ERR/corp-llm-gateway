@@ -2303,9 +2303,9 @@ _AUTH_ERROR_MESSAGES: dict[str, str] = {
 _FAILURE_COMPONENT: dict[str, str] = {
     "E_CORP_LLM_DOWN": "corp_llm",
     E_NER_UNAVAILABLE: "ner",
-    # Must match detectors.corp_ner.FAILURE_COMPONENT: the detector emits
-    # gateway_failure{component="corp_ner"} itself, and one outage must not
-    # split across two series. Pinned by tests/extensions/test_corp_ner_hook_codes.
+    # Must match detectors.corp_ner.FAILURE_COMPONENT, which names the series an
+    # operator alerts on. The detector does NOT count its own failures — this is
+    # the only counter for them. Pinned by tests/extensions/test_corp_ner_hook_codes.
     E_CORP_NER_UNAVAILABLE: "corp_ner",
     E_DETECTOR_CONTRACT: "sanitize",
     "E_PROFILE_UNAVAILABLE": "profile",
