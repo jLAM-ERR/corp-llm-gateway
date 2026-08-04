@@ -51,6 +51,8 @@ KNOWN_LABELS = frozenset(
     }
 )
 
+KNOWN_SOURCES = frozenset({"ner", "regex", "both"})
+
 _ENVELOPE_BYTES = len(b'{"texts":[]}')
 _SEPARATORS = (",", ":")
 _UNPARSEABLE = object()
@@ -187,7 +189,12 @@ class CorpNerClient:
 
 
 def _parse_results(raw: Any, expected: int) -> list[AnalyzeResult]:
-    items = raw.get("results") if isinstance(raw, dict) else raw
+    # Strict on purpose: anything that is not the confirmed schema means we
+    # cannot prove the text was scanned, and "cannot prove" must never read as
+    # "clean". A bare top-level list is not the contract.
+    if not isinstance(raw, dict):
+        raise CorpNerUnavailableError("corp-ner returned a malformed analyze response")
+    items = raw.get("results")
     if not isinstance(items, list):
         raise CorpNerUnavailableError("corp-ner returned a malformed analyze response")
     if len(items) != expected:
@@ -200,13 +207,13 @@ def _parse_results(raw: Any, expected: int) -> list[AnalyzeResult]:
 def _parse_result(item: Any) -> AnalyzeResult:
     if not isinstance(item, dict):
         raise CorpNerUnavailableError("corp-ner returned a malformed analyze result")
-    raw_spans = item.get("spans") or []
+    raw_spans = item.get("spans")
     if not isinstance(raw_spans, list):
-        raise CorpNerUnavailableError("corp-ner returned a malformed analyze result")
-    return AnalyzeResult(
-        spans=tuple(_parse_span(s) for s in raw_spans),
-        truncated=bool(item.get("truncated", False)),
-    )
+        raise CorpNerUnavailableError("corp-ner returned a malformed analyze result: spans")
+    truncated = item.get("truncated")
+    if not isinstance(truncated, bool):
+        raise CorpNerUnavailableError("corp-ner returned a malformed analyze result: truncated")
+    return AnalyzeResult(spans=tuple(_parse_span(s) for s in raw_spans), truncated=truncated)
 
 
 def _parse_span(raw: Any) -> Span:
@@ -218,19 +225,26 @@ def _parse_span(raw: Any) -> Span:
         or isinstance(start, bool)
         or not isinstance(end, int)
         or isinstance(end, bool)
-        or not isinstance(label, str)
         or start < 0
         or end < start
     ):
-        raise CorpNerUnavailableError("corp-ner returned a malformed span")
-    score = raw.get("score")
-    if score is not None and not isinstance(score, int | float):
-        raise CorpNerUnavailableError("corp-ner returned a malformed span")
+        raise CorpNerUnavailableError("corp-ner returned a malformed span: offsets")
+    # Never interpolate the offending label or source: an off-contract value is
+    # service-controlled text, not one of our constants (M1-14).
+    if label not in KNOWN_LABELS:
+        raise CorpNerUnavailableError("corp-ner returned a malformed span: unknown label")
     source = raw.get("source")
+    if source not in KNOWN_SOURCES:
+        raise CorpNerUnavailableError("corp-ner returned a malformed span: unknown source")
+    # An absent score is the one tolerated gap: None cannot hide a finding, and
+    # it is what the contract's `null` already means for regex spans.
+    score = raw.get("score")
+    if score is not None and (isinstance(score, bool) or not isinstance(score, int | float)):
+        raise CorpNerUnavailableError("corp-ner returned a malformed span: score")
     return Span(
         start=start,
         end=end,
         label=label,
         score=None if score is None else float(score),
-        source=source if isinstance(source, str) else "ner",
+        source=source,
     )
