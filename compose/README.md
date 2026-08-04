@@ -199,9 +199,26 @@ gateway's `redis` is Cache B — CLAUDE.md calls it *required* for `post_call`
 desanitization — and `redis/redis.conf` caps it at `maxmemory 512mb` with
 `noeviction`. Sharing it (as the demo does) means a Langfuse ingestion
 backlog can exhaust that budget and make Cache B writes fail with `OOM`: an
-observability backlog would break live desanitization. Both instances run
-`noeviction`; Langfuse's queue holds not-yet-persisted events that nothing
-can reconstruct.
+observability backlog would break live desanitization.
+
+Splitting the instance removes the shared-quota coupling but **not the host
+one**, so `langfuse-redis` is capped twice
+(`LANGFUSE_REDIS_MAXMEMORY` / `LANGFUSE_REDIS_MEM_LIMIT` in `.env.example`):
+
+- `--maxmemory 256mb` — Redis's own data cap;
+- a `512mb` container memory limit — the RSS backstop. Redis RSS runs *above*
+  `maxmemory` (allocator fragmentation, client output buffers, and the fork
+  copy-on-write of an AOF rewrite), which is why the container limit is ~2x
+  the data cap rather than equal to it.
+
+Without both, an uncapped queue grows until the kernel OOM killer picks a
+victim, and the victim can just as easily be `litellm`, `postgres` or Cache B
+— i.e. observability load becomes a request-path outage. Raise the two
+together; the defaults hold a six-figure job backlog against a steady state
+of a few MB. Both keys are optional in `.env` (the defaults live in
+`docker-compose.yml`), but **never set either to `0`** — `0` is "unlimited"
+to both Redis and docker, it renders without a warning, and it puts the host
+exposure straight back.
 
 `minio-init` is a one-shot job that creates the event-upload bucket, because
 **Langfuse v3 does not create it itself**. Without it, `langfuse-web` and
@@ -211,6 +228,55 @@ ClickHouse gets `langfuse/clickhouse-config.xml`, which deletes `query_log`,
 `query_thread_log`, `query_views_log` and `text_log`. Those system tables
 keep raw INSERT text — i.e. a second copy of trace content, on ClickHouse's
 own 30-day retention, in a store no NEVER-fields gate watches (invariant #1).
+
+### When the Langfuse queue fills
+
+`langfuse-redis` runs `noeviction` (hardcoded in `docker-compose.yml`, not an
+`.env` key). That is a **data-loss decision, not a sizing one**: at the cap
+Langfuse rejects new ingestion writes loudly instead of silently deleting
+queue entries for events it already accepted. Each entry is a pointer to an
+event blob already uploaded to MinIO under `events/`, so an eviction would not
+destroy the payload — but nothing re-enqueues it, so the trace would never
+reach ClickHouse and never appear in the audit view. A loud rejection you can
+retry beats a silent gap in the audit trail.
+
+**The request path is not affected.** Nothing in `pre_call`/`post_call` talks
+to this Redis: the gateway's audit sink defaults to `stdout`
+(`CORP_AUDIT_SINK` is unset on this stack — see `audit/factory.py`), and
+Vector forwards from there and retries. Even on a direct-to-Langfuse sink the
+`audit_sink` fail policy is `continue` (the M4 fail-policy matrix) and a
+failed emit is contained by the safety net in `litellm_hook.audit()` — it
+never reaches the client body and never blocks desanitization. So a full
+Langfuse queue costs observability data, never live traffic.
+
+What it looks like:
+
+- `langfuse-redis` stays **healthy** — `redis-cli ping` is a read and still
+  answers `PONG` at the cap;
+- `langfuse-web` logs ingestion errors and its `/api/public/ingestion`
+  endpoint starts returning 5xx;
+- traces stop appearing in the UI while requests keep succeeding.
+
+Check and fix:
+
+```
+# is it actually at the cap?
+docker compose exec langfuse-redis redis-cli info memory | grep -E 'used_memory_human|maxmemory_human'
+docker compose exec langfuse-redis redis-cli info keyspace
+
+# is the consumer alive? a full queue is usually a stalled worker, not a small cap
+docker compose ps langfuse-worker
+docker compose logs --tail=100 langfuse-worker
+```
+
+Fix the consumer first (`langfuse-worker` unhealthy, or ClickHouse/MinIO
+down) — the queue drains on its own once it recovers, and the AOF on
+`langfuse-redis-data` means a restart does not lose it. Only raise
+`LANGFUSE_REDIS_MAXMEMORY` **and** `LANGFUSE_REDIS_MEM_LIMIT` (keeping the
+~2x ratio) if the backlog is genuine sustained volume, then
+`docker compose up -d langfuse-redis`. Never "fix" it with `FLUSHALL`: that
+discards accepted-but-unprocessed audit events, which is the exact failure
+`noeviction` exists to prevent.
 
 ### Reaching the UI
 
