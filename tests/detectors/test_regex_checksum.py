@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from corp_llm_gateway.detectors import Finding, RegexChecksumDetector
-from corp_llm_gateway.detectors.regex_checksum import _luhn_ok
+from corp_llm_gateway.detectors.regex_checksum import _card_lengths, _luhn_ok
 
 pytestmark = pytest.mark.asyncio
 
@@ -341,6 +341,83 @@ async def test_grouped_card_followed_by_short_number(det: RegexChecksumDetector,
     f = get_label(findings, "BANK_CARD")
     assert f is not None, f"BANK_CARD missing from {text!r}, got {labels(findings)}"
     assert f.text == "2200 7701 2345 6784"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "2200770123456784123",  # ungrouped PAN + unseparated 3-digit tail
+        "2200 7701 2345 6784123",  # partly grouped PAN + unseparated tail
+        "22007701234567841234567",  # ungrouped PAN + long unseparated tail
+        "1232200770123456784",  # unseparated digits BEFORE the PAN
+        "1232200770123456784123",  # unseparated digits on BOTH sides
+        "2200 7701 2345 67841232200",  # grouped PAN, tail glued to the last group
+    ],
+)
+async def test_card_with_unseparated_adjacent_digits(det: RegexChecksumDetector, body: str) -> None:
+    """A valid PAN must not escape because extra digits touch it with no separator."""
+    text = f"карта {body} оплата"
+    findings = await det.detect(text)
+    f = get_label(findings, "BANK_CARD")
+    assert f is not None, f"BANK_CARD missing from {text!r}, got {labels(findings)}"
+    assert text[f.start : f.end] == f.text
+    assert _MIR16 in f.text.replace(" ", ""), f"finding does not cover the PAN: {f.label}"
+
+
+async def test_card_finding_covers_pan_when_a_longer_luhn_hit_overlaps(
+    det: RegexChecksumDetector,
+) -> None:
+    """A chance Luhn hit overlapping the PAN must not evict it and redact only part."""
+    text = f"оплата 123456789{_MIR16} готово"
+    findings = await det.detect(text)
+    f = get_label(findings, "BANK_CARD")
+    assert f is not None, f"BANK_CARD missing, got {labels(findings)}"
+    assert _MIR16 in f.text, "finding truncates the PAN"
+    assert text[f.start : f.end] == f.text
+
+
+async def test_card_glued_to_letters_detected(det: RegexChecksumDetector) -> None:
+    """No word boundary around the PAN — the \\b-anchored patterns cannot see it."""
+    text = f"ref{_MIR16}x"
+    findings = await det.detect(text)
+    f = get_label(findings, "BANK_CARD")
+    assert f is not None, f"BANK_CARD missing, got {labels(findings)}"
+    assert f.text == _MIR16
+    assert text[f.start : f.end] == f.text
+
+
+async def test_bank_account_wrong_key_not_matched_as_card(det: RegexChecksumDetector) -> None:
+    """A 20-digit account often holds a Luhn-valid PAN-length slice; accounts keep it."""
+    findings = await det.detect(_ACCT_WRONG)
+    assert has_label(findings, "BANK_ACCOUNT")
+    assert not has_label(findings, "BANK_CARD")
+
+
+async def test_account_shaped_card_run_is_still_redacted(det: RegexChecksumDetector) -> None:
+    """Synthetic Visa 4070000000000007 (Luhn ✓) + 4 glued digits looks like an account.
+
+    Either label redacts it; what must not happen is nothing at all.
+    """
+    text = "перевод 40700000000000070001 ок"
+    findings = await det.detect(text)
+    covering = [f for f in findings if "4070000000000007" in f.text]
+    assert covering, f"20-digit run left unredacted, got {labels(findings)}"
+    for f in findings:
+        assert text[f.start : f.end] == f.text
+
+
+def test_card_lengths_rejects_unassigned_iin() -> None:
+    assert _card_lengths("1234567890123456789") == ()
+    assert _card_lengths("9999999999999999") == ()
+    assert _card_lengths("012") == ()
+    assert _card_lengths("abcd1234567890") == ()
+
+
+def test_card_lengths_known_iins() -> None:
+    assert _card_lengths(_MIR16) == (16, 19)
+    assert _card_lengths(_AMEX15) == (15,)
+    assert _card_lengths(_VISA16) == (13, 16, 19)
+    assert _card_lengths(_MC16) == (16,)
 
 
 async def test_card_wrong_luhn_not_detected(det: RegexChecksumDetector) -> None:

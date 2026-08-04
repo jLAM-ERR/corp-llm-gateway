@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import NamedTuple
 
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
@@ -96,6 +96,41 @@ def _luhn_ok(s: str) -> bool:
                 d -= 9
         total += d
     return total % 10 == 0
+
+
+def _card_lengths(digits: str) -> tuple[int, ...]:
+    """PAN lengths the issuer of this IIN emits; empty if the IIN is unassigned.
+
+    Luhn passes on ~10% of random digit strings, so it cannot on its own decide
+    where a PAN starts inside a longer digit run. The IIN narrows both the start
+    offset and the length before Luhn is spent.
+    """
+    if len(digits) < 4 or not digits[:4].isdigit():
+        return ()
+    p4 = int(digits[:4])
+    p3 = p4 // 10
+    p2 = p4 // 100
+    if 2200 <= p4 <= 2204:  # Мир
+        return (16, 19)
+    if 2221 <= p4 <= 2720:  # Mastercard 2-series
+        return (16,)
+    if p2 in (34, 37):  # American Express
+        return (15,)
+    if 300 <= p3 <= 305 or p4 == 3095 or p2 in (36, 38, 39):  # Diners Club
+        return (14, 16)
+    if 3528 <= p4 <= 3589:  # JCB
+        return (16, 19)
+    if p2 // 10 == 4:  # Visa
+        return (13, 16, 19)
+    if 51 <= p2 <= 55:  # Mastercard
+        return (16,)
+    if p2 == 50 or 56 <= p2 <= 58:  # Maestro
+        return (16, 19)
+    if p2 in (62, 81):  # UnionPay
+        return (16, 19)
+    if p4 == 6011 or 644 <= p3 <= 649 or p2 == 65:  # Discover
+        return (16, 19)
+    return ()
 
 
 def _bik_ok(s: str) -> bool:
@@ -199,6 +234,17 @@ _CARD_PAT = re.compile(
 # is matched by a second rule; _deduplicate keeps whichever one validates.
 _CARD_GROUP16_PAT = re.compile(r"\b(\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4})\b")
 
+# Both patterns above are word-bounded, so a PAN with extra digits glued straight
+# onto it (a CVV, an amount) is invisible to them: the whole run fails Luhn and
+# \b blocks every shorter span. _card_candidates below scans inside such runs.
+_DIGIT_RUN_PAT = re.compile(r"\d(?:[ -]?\d)*")
+
+# Stray digits allowed between a candidate PAN and the middle of its run. A side
+# that reaches the run boundary is unbounded; this only caps how deep a PAN may
+# be buried with junk on BOTH sides, which keeps the candidate count (and the
+# false-positive rate) flat instead of growing with run length.
+_CARD_STRAY_MARGIN = 6
+
 # IPv4 — strict-octet validated below
 _IPV4_PAT = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
 
@@ -266,6 +312,46 @@ _PHONE_RU_PAT = re.compile(
     r"(?<!\d)((?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})(?!\d)"
 )
 _PHONE_INTL_PAT = re.compile(r"(?<!\d)(\+[2-9]\d{6,14})(?!\d)")
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Union overlapping spans.
+
+    _deduplicate keeps the longest of two overlapping findings, so a chance
+    Luhn hit that is longer than a real PAN would otherwise evict it and redact
+    only part of the PAN. Merging first makes the union the unit of redaction.
+    """
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _card_candidates(text: str) -> Iterator[tuple[int, int]]:
+    """Yield (start, end) spans of IIN-plausible, Luhn-valid PANs inside digit runs."""
+    for run in _DIGIT_RUN_PAT.finditer(text):
+        group = run.group()
+        offsets = [i for i, c in enumerate(group, run.start()) if c.isdigit()]
+        n = len(offsets)
+        if n < 13:
+            continue
+        digits = group.replace(" ", "").replace("-", "")
+        spans: list[tuple[int, int]] = []
+        for i in range(n - 12):
+            # Slice to 4: digits[i:] would copy the whole tail on every position.
+            for length in _card_lengths(digits[i : i + 4]):
+                tail = n - i - length
+                if tail < 0:
+                    continue
+                if i and tail and (i > _CARD_STRAY_MARGIN or tail > _CARD_STRAY_MARGIN):
+                    continue
+                if _luhn_ok(digits[i : i + length]):
+                    spans.append((offsets[i], offsets[i + length - 1] + 1))
+        yield from _merge_spans(spans)
+
 
 # ---------------------------------------------------------------------------
 # Rule table
@@ -361,10 +447,12 @@ class RegexChecksumDetector(PIIDetector):
 
         # Bank accounts: collect BIK positions first, then score accounts
         biks = [(m.group(1), m.start(1), m.end(1)) for m in _BIK_PAT.finditer(text)]
+        acct_spans: list[tuple[int, int]] = []
         for pat in (_ACCT_KW_PAT, _ACCT_BARE_PAT):
             for m in pat.finditer(text):
                 acct = m.group(1)
                 a_start, a_end = m.start(1), m.end(1)
+                acct_spans.append((a_start, a_end))
                 score = 0.7
                 for bv, bs, be in biks:
                     if min(abs(a_start - be), abs(bs - a_end)) < 300 and _bank_acct_key_ok(
@@ -375,5 +463,21 @@ class RegexChecksumDetector(PIIDetector):
                 raw.append(
                     Finding(text=acct, label="BANK_ACCOUNT", start=a_start, end=a_end, score=score)
                 )
+
+        # Cards hiding inside a longer digit run. A 20-digit account frequently
+        # contains a Luhn-valid PAN-length substring by chance, so anything the
+        # account rules already claimed is left to them — it is redacted either way.
+        for c_start, c_end in _card_candidates(text):
+            if any(a_start <= c_start and c_end <= a_end for a_start, a_end in acct_spans):
+                continue
+            raw.append(
+                Finding(
+                    text=text[c_start:c_end],
+                    label="BANK_CARD",
+                    start=c_start,
+                    end=c_end,
+                    score=1.0,
+                )
+            )
 
         return _deduplicate(raw)
