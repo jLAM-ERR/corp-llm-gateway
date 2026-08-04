@@ -70,7 +70,6 @@ from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
 from corp_llm_gateway.sanitizer.identity_preamble import (
     is_identity_preamble,
     leading_identity_block_index,
-    split_billing_marker,
 )
 from corp_llm_gateway.sanitizer.placeholder import (
     StaleSpanError,
@@ -1083,28 +1082,17 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     prompt_field,
                     exempt_index,
                 )
-                # What makes the identity block the LEADING one is that every
-                # block before it is a billing marker. Sanitizing those markers
-                # away would break that arrangement on the way out, so each
-                # marker prefix is held back — a fixed protocol string, not user
-                # content — and only the caller-controlled remainder goes
-                # through the walker, exactly like any other leaf.
-                split = [
-                    split_billing_marker(block["text"]) or ("", block["text"])
-                    for block in system[:exempt_index]
-                ]
-                rest: list[Any] = [
-                    {**block, "text": remainder}
-                    for block, (_, remainder) in zip(system[:exempt_index], split, strict=True)
-                ]
-                rest.extend(system[exempt_index + 1 :])
+                # Only the identity block is held out. The billing markers ahead
+                # of it go through the walker whole, marker text included: rules
+                # match by substring, so holding the fixed prefix back and
+                # reattaching it afterwards rebuilt the original over any rule
+                # that matched across the prefix/remainder boundary. A marker a
+                # rule rewrote stays rewritten — upstream may then refuse the
+                # request, which is the cheaper failure of the two.
+                rest: list[Any] = [*system[:exempt_index], *system[exempt_index + 1 :]]
                 new_rest, results = await sanitize_content(rest, sanitize_one)
-                new_head = [
-                    {**block, "text": prefix + block["text"]}
-                    for block, (prefix, _) in zip(new_rest[:exempt_index], split, strict=True)
-                ]
                 new_system = [
-                    *new_head,
+                    *new_rest[:exempt_index],
                     system[exempt_index],
                     *new_rest[exempt_index:],
                 ]

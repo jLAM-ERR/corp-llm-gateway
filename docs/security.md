@@ -515,6 +515,13 @@ harness sees both:
 | Logger emissions, error bodies, exception traces, metric labels, audit records, forwarded header buckets | `tests/invariants/test_no_originals_leak.py` (in-process) |
 | Upstream request headers and body, retained router deployments, the litellm process's own stdout/stderr | `tests/integration/test_anthropic_oauth_outbound.py` (runs the pinned litellm image against a capturing upstream) |
 
+Every assertion in the capture suite depends on docker, the pinned image and
+container → host reachability, so on a machine without them it skips. CI sets
+`CORP_REQUIRE_PROXY_CAPTURE=1`, which turns each of those skips into a failure —
+otherwise a daemon, registry or network fault produces a green job that verified
+none of it. The suite asserts that wiring against `.github/workflows/ci.yml`
+itself, so dropping the variable fails the run rather than silencing it.
+
 ### Provider gating is defence in depth, not a routing guarantee
 
 The bridge runs only when `_detect_provider(data) == "anthropic"`. That check
@@ -592,12 +599,20 @@ guard read it exactly as before, and the fail-closed size check runs before the
 carve-out can apply. This is the same rewrite-vs-scan split already used for
 block `signature` fields.
 
-Neighbouring `system` blocks are unaffected: the billing-marker prefix is held
-back as a fixed protocol string while the caller-controlled remainder goes
-through the walker like any other leaf. `tests/sanitizer/test_oauth_system_preamble.py`
-drives real `pre_call` with the production detectors, and the capture test
-asserts a redactable email in a neighbouring block still comes back as
-`[EMAIL_nnn]`, so the byte-identical assertions cannot go quietly vacuous.
+Neighbouring `system` blocks are unaffected, the billing-marker blocks ahead of
+the identity one included: those go through the walker **whole**, marker text and
+all. An earlier revision held the fixed `x-anthropic-billing-header:` prefix back
+and reattached it after sanitizing the remainder; because `replace.md` rules are
+literal substring matches over the text handed to the orchestrator, that hid every
+rule whose pattern reached across the prefix/remainder boundary and then rebuilt
+the full original on the way to Anthropic — an M1-14 violation Stage 5 cannot
+catch, since it does not replay `replace.md`. Nothing is reattached now. If a rule
+rewrites the marker the identity block stops being a *leading* one and Anthropic
+may refuse the request; a refused request is a UX cost, a reconstructed original
+is a leak. `tests/sanitizer/test_oauth_system_preamble.py` drives real `pre_call`
+with the production detectors — including a rule spanning that boundary — and the
+capture test asserts a redactable email in a neighbouring block still comes back
+as `[EMAIL_nnn]`, so the byte-identical assertions cannot go quietly vacuous.
 
 ### Credential retention in the litellm process
 
