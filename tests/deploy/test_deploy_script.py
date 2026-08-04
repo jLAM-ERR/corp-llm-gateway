@@ -34,6 +34,13 @@ HEALTHY_PS = [
 UNHEALTHY_PS = [
     {"Service": "litellm", "State": "restarting", "Health": "unhealthy"},
 ]
+STARTING_PS = [
+    {"Service": "litellm", "State": "running", "Health": "starting"},
+    {"Service": "postgres", "State": "running", "Health": "healthy"},
+]
+NO_HEALTHCHECK_PS = [
+    {"Service": "vector", "State": "running", "Health": ""},
+]
 
 
 @pytest.fixture(scope="module")
@@ -519,6 +526,37 @@ def test_unhealthy_stack_fails_after_the_timeout(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "litellm" in result.stderr, "the stuck service must be named"
+
+
+def test_a_starting_healthcheck_is_not_mistaken_for_healthy(tmp_path: Path) -> None:
+    # `state=running health=starting` on the first poll used to end the wait, so a
+    # service that flipped to unhealthy a second later still released the lock on a
+    # "successful" deploy.
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=STARTING_PS,
+        extra="HEALTH_MAX_WAIT=1\nHEALTH_INTERVAL=1\n",
+    )
+
+    assert result.returncode == 1
+    assert "litellm" in result.stderr, "the service still starting must be named"
+    assert "postgres" not in result.stderr.split("stuck:")[-1]
+
+
+def test_a_service_without_a_healthcheck_is_healthy_when_running(tmp_path: Path) -> None:
+    # The fallback the stricter rule must keep: compose reports an empty Health for
+    # a service that declares no healthcheck.
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=NO_HEALTHCHECK_PS,
+        extra="HEALTH_MAX_WAIT=5\nHEALTH_INTERVAL=1\n",
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_empty_ps_output_is_not_mistaken_for_healthy(tmp_path: Path) -> None:
