@@ -92,6 +92,55 @@ def test_validate_reports_every_problem_at_once(
     assert "CORP_LLM_OVERSIZE_POLICY" in joined
 
 
+# ── validate(): corp NER (B4) ───────────────────────────────────────────────
+
+
+def test_corp_ner_keys_are_registered() -> None:
+    assert {
+        "CORP_NER_ENABLED",
+        "CORP_NER_ENDPOINT",
+        "CORP_NER_TIMEOUT_S",
+        "CORP_NER_MAX_TEXTS",
+        "CORP_NER_MAX_INPUT_CHARS",
+        "CORP_NER_CA_BUNDLE",
+    } <= set(settings.all_keys())
+    # No REQUIRE flag: corp NER is fail-closed unconditionally.
+    assert not any(k.startswith("CORP_NER_REQUIRE") for k in settings.all_keys())
+
+
+def test_corp_ner_defaults_leave_existing_deploys_untouched(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    result = config.validate()
+    assert result.flag("CORP_NER_ENABLED") is False
+    assert result["CORP_NER_TIMEOUT_S"] == "30"  # deliberately under the service's 60s
+    assert result["CORP_NER_MAX_TEXTS"] == "256"
+    assert result["CORP_NER_MAX_INPUT_CHARS"] == "200000"
+    assert not result["CORP_NER_ENDPOINT"]
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on"])
+def test_validate_requires_corp_ner_endpoint_when_enabled(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, truthy: str
+) -> None:
+    # Same reason as the oracle endpoint: required_when is exact-match string
+    # equality and would miss these lenient truthy spellings.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_NER_ENABLED", truthy)
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+    assert any("CORP_NER_ENDPOINT" in p for p in exc.value.problems)
+
+    monkeypatch.setenv("CORP_NER_ENDPOINT", "https://corp-ner.corp.lan")
+    assert isinstance(config.validate(), Settings)
+
+
+def test_validate_ignores_corp_ner_endpoint_when_disabled(hermetic: Path) -> None:
+    _write(hermetic, 'CORP_LLM_ENDPOINT = "https://x/v1"\nCORP_NER_ENABLED = false\n')
+    assert isinstance(config.validate(), Settings)
+
+
 # ── validate(): oracle enabled switch (local mode) ──────────────────────────
 
 

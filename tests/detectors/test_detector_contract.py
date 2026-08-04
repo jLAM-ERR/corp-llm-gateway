@@ -8,6 +8,10 @@ contract — ``detect`` is a coroutine, returns the declared ``list[Finding]``
 
 NER-backed detectors (dual_ner / ner_ru / ner_en) skip when natasha/spaCy are
 absent so the suite is green on the 3.14 gate venv.
+
+corp_ner is registered but excluded here: it is the only network-backed detector,
+so every ``detect`` in this suite would be a live call. Its contract is covered
+against a mock transport in tests/detectors/test_corp_ner.py.
 """
 
 from __future__ import annotations
@@ -30,6 +34,8 @@ except ImportError:
 
 _NER_DETECTORS = {"dual_ner", "ner_ru", "ner_en"}
 
+_NETWORK_DETECTORS = {"corp_ner"}
+
 _TEXT = "write to ivan@example.com about ИНН 7707083893 and John Smith"
 
 
@@ -42,14 +48,22 @@ def _param(name: str):
     return pytest.param(name, id=name, marks=marks)
 
 
-@pytest.fixture(params=[_param(name) for name in sorted(DETECTOR_REGISTRY)])
+@pytest.fixture(
+    params=[_param(name) for name in sorted(DETECTOR_REGISTRY) if name not in _NETWORK_DETECTORS]
+)
 def detector(request: pytest.FixtureRequest) -> PIIDetector:
     (built,) = build_detectors([request.param])
     return built
 
 
 def test_registry_covers_every_known_detector() -> None:
-    assert set(DETECTOR_REGISTRY) == {"regex_checksum", "dual_ner", "ner_ru", "ner_en"}
+    assert set(DETECTOR_REGISTRY) == {
+        "regex_checksum",
+        "dual_ner",
+        "ner_ru",
+        "ner_en",
+        "corp_ner",
+    }
 
 
 def test_built_detector_is_pii_detector(detector: PIIDetector) -> None:
