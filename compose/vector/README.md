@@ -10,21 +10,45 @@ Mounted read-only at `/etc/vector` in the `vector` service. Full rationale in
 | `sinks-siem.yaml` | `CORP_AUDIT_SIEM_ENABLED=1` | SIEM forwarder; endpoint still an open item |
 
 Vector merges every `--config` file it is given into one topology, so the two
-optional files attach to `vector.yaml`'s `audit_only` transform and inherit the
-NEVER-fields gate. Point a new sink at `audit_only` (or at a transform
-downstream of it), never at `parse` or the source.
+optional files attach to `vector.yaml`'s `audit_only` transform and inherit both
+the container identity boundary and the NEVER-fields gate. Point a new sink at
+`audit_only` (or at a transform downstream of it), never at `parse`, at
+`never_fields_gate` or at the source.
 
-Two things in `vector.yaml` must not be edited casually:
+The full path every record takes, in order:
+
+```
+container_logs -> gateway_container_only -> unwrap_docker_envelope
+  -> merge_partial_lines -> to_message -> parse -> never_fields_gate
+  -> audit_only -> <sinks>
+```
+
+Three things in `vector.yaml` must not be edited casually:
 
 - **`never_fields_gate` and `audit_only`** are copied verbatim from
   `docker/demo-vector/vector.yaml` and match
   `helm/corp-llm-gateway/templates/configmap.yaml`. They are defence-in-depth
   for CLAUDE.md invariant #2. Do not paraphrase or restructure them.
+- **`gateway_container_only`** is the container identity boundary. The file
+  source reads every container's log on the host; this filter is what limits
+  the pipeline to the `litellm` container, by requiring the docker json-file
+  `attrs` stamp that `compose/docker-compose.yml` produces from that service's
+  `com.corp-llm-gateway.audit-source` label plus its
+  `logging.options.labels`. The label, the log option and this filter are one
+  mechanism in three files — change them together. `audit_only` is a schema
+  gate and is **not** a substitute: `request_id` and `redaction_count` are two
+  ordinary keys any co-located container can print.
 - **the Langfuse sink's disk buffer** (`when_full: block`) and its retry
   policy. `compose/README.md` tells operators that a full `langfuse-redis`
   surfaces as an ingestion 5xx "which Vector retries"; that is only true with
   those settings. An in-memory buffer or `drop_newest` turns it into silent
-  audit loss.
+  audit loss. It holds for transient failures only — a `401` is not retriable
+  in Vector 0.53 and the record is dropped, which is why
+  `compose/README.md` "First login" prescribes the first-boot order it does.
+
+Beware when editing a sink's `request:` block: Vector rejects an unknown key at
+the top level of a sink but **silently ignores** one inside `request:`, so a
+misspelled or invented retry option validates cleanly and does nothing.
 
 Validate before deploying:
 

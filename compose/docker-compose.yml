@@ -174,6 +174,34 @@ services:
           cat /etc/corp-llm-gateway/certs/corp-ca-bundle.pem >> /tmp/corp-ca-bundle.pem
         fi
         exec litellm --config /etc/litellm/config.yaml --port 4000
+    # Container identity for the audit pipeline. This label plus the
+    # `logging.options.labels` block below are what make docker's json-file
+    # driver stamp `"attrs":{"com.corp-llm-gateway.audit-source":
+    # "gateway-stdout"}` onto every log record of THIS container — the only
+    # thing vector.yaml's `gateway_container_only` filter admits. Both halves
+    # are load-bearing and neither does anything alone: drop the label and the
+    # driver has nothing to copy, drop the log option and the label stays in the
+    # container metadata and never reaches the log file. Either way the audit
+    # pipeline silently ships nothing, so change these two together or not at
+    # all.
+    labels:
+      com.corp-llm-gateway.audit-source: "gateway-stdout"
+    logging:
+      # Pinned, not inherited. vector.yaml's source is a `file` source over
+      # /var/lib/docker/containers/*/*-json.log, which only exists under this
+      # driver; on a host whose daemon defaults to `local`/`journald` the audit
+      # pipeline would otherwise read nothing at all. Audit is not optional, so
+      # this service names the driver it needs instead of trusting the host.
+      #
+      # No max-size/max-file here on purpose: the daemon's own defaults are
+      # merged in for every option not set here, so a host-wide log-rotation
+      # policy still applies. Rotation is what BOUNDS the durability of the
+      # out-of-process audit path — vector's glob does not follow the rotated
+      # `-json.log.1` files, so a rotation that outruns vector loses audit
+      # records. See compose/README.md "Audit buffering is not fail-closed".
+      driver: json-file
+      options:
+        labels: com.corp-llm-gateway.audit-source
     ports:
       # Loopback only — no TLS on this port until the nginx profile (C1)
       # lands; virtual keys + X-Corp-Auth must not cross a server-class
@@ -511,10 +539,16 @@ services:
       # sibling config.v2.json / hostconfig.json files (which hold every
       # container's environment) are never read.
       #
-      # Requires docker's default `json-file` logging driver. Under `local`,
-      # `journald` or a remote driver there are no *-json.log files and this
-      # source reads nothing — the audit pipeline goes quiet. See
-      # compose/README.md "Audit pipeline".
+      # The glob covers EVERY container on this host — the directory is keyed by
+      # container id, so it cannot be narrowed here. vector.yaml's first
+      # transform, `gateway_container_only`, is the boundary: it admits only
+      # lines carrying the json-file `attrs` stamp that the litellm service's
+      # label + logging.options.labels produce. Adding a service to this stack
+      # does NOT put its logs in the audit trail.
+      #
+      # Needs the `json-file` logging driver, which is why the litellm service
+      # pins it rather than inheriting the host default. See compose/README.md
+      # "Audit pipeline".
       #
       # No `user:` override: the log directory is mode 0710 root:root, so vector
       # must stay the image's default root to read it. Everything else is locked
