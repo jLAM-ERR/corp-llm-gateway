@@ -68,6 +68,16 @@ class LocalDetectionPass:
                 )
         self._batch_ids = {id(d) for d, _, _ in self._batch_specs}
 
+    @property
+    def detectors(self) -> tuple[PIIDetector, ...]:
+        """Detectors run on PROSE/COMMENT segments (the full configured set)."""
+        return tuple(self._detectors)
+
+    @property
+    def code_detectors(self) -> tuple[PIIDetector, ...]:
+        """Subset run on raw CODE segments."""
+        return tuple(self._code_detectors)
+
     async def findings(self, text: str) -> list[Finding]:
         if not self._detectors:
             return []

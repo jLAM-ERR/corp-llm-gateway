@@ -142,7 +142,7 @@ fails if the sites disagree.
   (the hook's non-chat `input` denylist), and the router still treats `api_key`
   as a clientside credential (what the Codex and Anthropic bridges rely on).
 
-## Cache A is invalidated by this release (no action required)
+## Cache A is invalidated by this release (no action required *for the cache*)
 
 This release widens detector coverage: the Luhn-validated `BANK_CARD` label is
 new, local NER's participation in CODE segments changed, and corp NER can add a
@@ -152,11 +152,36 @@ unredacted for the rest of its ~10h TTL — a card number cached before the
 upgrade would egress in the clear.
 
 `_CACHE_A_ALGORITHM_VERSION` (`sanitizer/orchestrator.py`) is therefore bumped to
-`coverage-v2`. It is mixed into the Cache-A key, so every pre-upgrade entry is
-already unreachable the moment the new image starts. **Correctness needs no
-operator action.** The same boundary covers the profile path: profile
+`coverage-v2`. It is mixed into the Cache-A key, so old pods write and read
+`span-aware-v1` keys, new pods write and read `coverage-v2` keys, and the two key
+sets are disjoint: neither version can serve the other's entries, in either
+direction, even while both run against the same Redis. There is no cross-version
+contamination, so **the cache needs no zero-overlap cutover, no egress block and
+no operator action.** The same boundary covers the profile path: profile
 sanitization delegates to `SanitizationOrchestrator.sanitize()`, which is the only
 caller of `_content_hash`.
+
+Alongside the constant, each orchestrator folds a fingerprint of its **effective
+redaction policy** (detector classes, the code-safe subset, gazetteer terms,
+allowlist entries, oracle trigger) into the same key. The constant covers
+build-time changes made *inside* a component — adding `BANK_CARD` changed a rule
+table inside `RegexChecksumDetector` and nothing else. The fingerprint covers
+config-time changes to the *set* of components, which the constant cannot see:
+pods with different `CORP_NER_ENABLED` values run the same image and the same
+algorithm version, and they now derive disjoint keys and cannot serve each
+other's entries. A mid-rollout `CORP_NER_ENABLED` flip is therefore safe for the
+cache in the same way a version bump is.
+
+### What the cache guarantee does *not* cover
+
+Scope the claim above to Cache A. During a rolling deploy, requests routed to
+pods that have not been replaced yet are handled by the **old detectors**, so
+they are not covered by the new rules (no `BANK_CARD`, for example). That is
+inherent to rolling out any detection change and has nothing to do with Cache A —
+the old pods are not replaying stale entries, they are correctly applying the
+policy they were built with. If a specific detection rule must apply to 100% of
+traffic from a known instant, drain or scale the old ReplicaSet to zero before
+serving on the new one; otherwise accept the normal rollout window.
 
 ### Optional: reclaim the orphaned memory
 
