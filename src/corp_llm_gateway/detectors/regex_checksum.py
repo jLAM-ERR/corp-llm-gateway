@@ -82,6 +82,22 @@ def _snils_ok(s: str) -> bool:
     return int(s[9:11]) == check
 
 
+def _luhn_ok(s: str) -> bool:
+    """Payment card Luhn (mod-10) check; tolerates space/hyphen grouping."""
+    digits = s.replace(" ", "").replace("-", "")
+    if not digits.isdigit() or not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for i, c in enumerate(reversed(digits)):
+        d = int(c)
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
 def _bik_ok(s: str) -> bool:
     """БИК structural: 9 digits, starts with 04, bank-code part ≠ 000."""
     return s.isdigit() and s.startswith("04") and s[-3:] != "000"
@@ -166,6 +182,22 @@ _ACCT_KW_PAT = re.compile(
 )
 # Bank account — bare 20-digit with common Russian account-prefix digits
 _ACCT_BARE_PAT = re.compile(r"\b((?:30|40|42|43|45)\d{18})\b")
+
+# Payment card — 13-19 digits, optionally grouped by single spaces/hyphens.
+# Word-bounded so a longer digit run (20-digit bank account) can never match a
+# 13-19 digit slice of itself; length + Luhn are enforced by the validator.
+_CARD_PAT = re.compile(
+    r"\b("
+    r"\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4}(?:[ -]\d{3})?"  # 4-4-4-4 (16) and 4-4-4-4-3 (19)
+    r"|\d{4}[ -]\d{6}[ -]\d{5}"  # 4-6-5 (15, Amex-style)
+    r"|\d{13,19}"  # ungrouped
+    r")\b"
+)
+
+# The greedy 4-4-4-4-3 branch above swallows a trailing 3-digit group (CVV, an
+# amount) and then fails Luhn on 19 digits, so the plain 16-digit grouped form
+# is matched by a second rule; _deduplicate keeps whichever one validates.
+_CARD_GROUP16_PAT = re.compile(r"\b(\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4})\b")
 
 # IPv4 — strict-octet validated below
 _IPV4_PAT = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
@@ -265,6 +297,10 @@ _RULES: tuple[_Rule, ...] = (
     _Rule("HOSTNAME", _HOSTNAME_PAT, _true, 0.7),
     _Rule("OGRN", _OGRN_PAT, _ogrn_ok, 1.0),
     _Rule("RU_INN", _INN_PAT, _inn_ok, 1.0),
+    # Listed after OGRN/RU_INN: same score, so on an identical span (a 13/15-digit
+    # number valid under both control checks) the earlier rule keeps the label.
+    _Rule("BANK_CARD", _CARD_PAT, _luhn_ok, 1.0),
+    _Rule("BANK_CARD", _CARD_GROUP16_PAT, _luhn_ok, 1.0),
     _Rule("SNILS", _SNILS_KW_PAT, _snils_ok, 1.0),
     # BIK (starts with 04) is more structurally specific than KPP → higher score wins dedup
     _Rule("BIK", _BIK_PAT, _bik_ok, 0.95),

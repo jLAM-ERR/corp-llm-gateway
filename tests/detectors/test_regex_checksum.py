@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from corp_llm_gateway.detectors import Finding, RegexChecksumDetector
+from corp_llm_gateway.detectors.regex_checksum import _luhn_ok
 
 pytestmark = pytest.mark.asyncio
 
@@ -240,6 +241,183 @@ async def test_bank_account_invalid_bik_key_falls_back(det: RegexChecksumDetecto
     f = get_label(findings, "BANK_ACCOUNT")
     assert f is not None
     assert f.score == 0.7
+
+
+# ---------------------------------------------------------------------------
+# Payment cards (BANK_CARD) — Luhn
+# ---------------------------------------------------------------------------
+# All card numbers below are synthetic: an arbitrary prefix plus the check digit
+# computed from Luhn. None of them is a real issued card.
+#   Mir    2200 7701 2345 678 → check 4 → 2200770123456784
+#   Visa   4276 1234 5678 901 → check 4 → 4276123456789014
+#   MC     5536 9137 0000 000 → check 9 → 5536913700000009
+#   Visa13 4000 0000 0012     → check 1 → 4000000000121   (OGRN-13 check: fails)
+#   Amex15 3782 822463 1000   → check 5 → 378282246310005 (OGRN-15 check: fails)
+#   Mir19  2204 1234 5678 9012 34 → check 3 → 2204123456789012343
+
+_MIR16 = "2200770123456784"
+_VISA16 = "4276123456789014"
+_MC16 = "5536913700000009"
+_VISA13 = "4000000000121"
+_AMEX15 = "378282246310005"
+_MIR19 = "2204123456789012343"
+
+# 13 digits, valid under BOTH Luhn and the ОГРН-13 control digit:
+#   int("400000000003") % 11 % 10 = 0 == d[12] ✓ and Luhn(4000000000030) = 0 ✓
+_LUHN_AND_OGRN13 = "4000000000030"
+
+
+@pytest.mark.parametrize("number", [_MIR16, _VISA16, _MC16, _VISA13, _AMEX15, _MIR19])
+def test_luhn_ok_accepts(number: str) -> None:
+    assert _luhn_ok(number)
+
+
+@pytest.mark.parametrize(
+    "number",
+    [
+        "2200770123456785",  # Мир, check digit 4→5
+        "4276123456789010",  # Visa, check digit 4→0
+        "5536913700000008",  # MC, check digit 9→8
+        "1234567890123",  # arbitrary 13-digit
+    ],
+)
+def test_luhn_ok_rejects_wrong_check_digit(number: str) -> None:
+    assert not _luhn_ok(number)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "0",
+        "000000000000",  # 12 digits — below the card range even though Luhn = 0
+        "00000000000000000000",  # 20 digits — above the card range
+        "4276 1234 5678 90ab",  # not all digits
+    ],
+)
+def test_luhn_ok_rejects_out_of_range(value: str) -> None:
+    assert not _luhn_ok(value)
+
+
+def test_luhn_ok_ignores_grouping() -> None:
+    assert _luhn_ok("2200 7701 2345 6784")
+    assert _luhn_ok("2200-7701-2345-6784")
+
+
+@pytest.mark.parametrize("number", [_MIR16, _VISA16, _MC16, _VISA13, _AMEX15, _MIR19])
+async def test_card_ungrouped_detected(det: RegexChecksumDetector, number: str) -> None:
+    findings = await det.detect(f"оплата картой {number} прошла")
+    f = get_label(findings, "BANK_CARD")
+    assert f is not None, f"BANK_CARD missing for {len(number)} digits, got {labels(findings)}"
+    assert f.text == number
+    assert f.score == 1.0
+
+
+@pytest.mark.parametrize(
+    "grouped",
+    [
+        "2200 7701 2345 6784",
+        "2200-7701-2345-6784",
+        "4276 1234 5678 9014",
+        "5536-9137-0000-0009",
+        "3782 822463 10005",  # Amex 4-6-5
+        "2204 1234 5678 9012 343",  # 19-digit 4-4-4-4-3
+    ],
+)
+async def test_card_grouped_detected(det: RegexChecksumDetector, grouped: str) -> None:
+    text = f"card: {grouped} exp 12/29"
+    findings = await det.detect(text)
+    f = get_label(findings, "BANK_CARD")
+    assert f is not None, f"BANK_CARD missing for {grouped!r}, got {labels(findings)}"
+    assert f.text == grouped
+    assert text[f.start : f.end] == f.text
+
+
+@pytest.mark.parametrize("tail", ["123", "500 руб", "999."])  # noqa: RUF001
+async def test_grouped_card_followed_by_short_number(det: RegexChecksumDetector, tail: str) -> None:
+    """A 4-4-4-4 card plus a trailing 3-digit group (CVV, amount) must still match."""
+    text = f"карта 2200 7701 2345 6784 {tail}"
+    findings = await det.detect(text)
+    f = get_label(findings, "BANK_CARD")
+    assert f is not None, f"BANK_CARD missing from {text!r}, got {labels(findings)}"
+    assert f.text == "2200 7701 2345 6784"
+
+
+async def test_card_wrong_luhn_not_detected(det: RegexChecksumDetector) -> None:
+    # Last digit 4→5 → Luhn fails
+    findings = await det.detect("card 2200770123456785 declined")
+    assert not has_label(findings, "BANK_CARD")
+
+
+async def test_card_grouped_wrong_luhn_not_detected(det: RegexChecksumDetector) -> None:
+    findings = await det.detect("card 2200 7701 2345 6785 declined")
+    assert not has_label(findings, "BANK_CARD")
+
+
+# --- collisions with the neighbouring numeric rules ------------------------
+
+
+async def test_card_does_not_shadow_ogrn(det: RegexChecksumDetector) -> None:
+    findings = await det.detect("ОГРН 1027700132195")
+    assert has_label(findings, "OGRN")
+    assert not has_label(findings, "BANK_CARD")
+
+
+async def test_card_does_not_shadow_ogrnip(det: RegexChecksumDetector) -> None:
+    findings = await det.detect("ОГРНИП 304010000000017")
+    assert has_label(findings, "OGRN")
+    assert not has_label(findings, "BANK_CARD")
+
+
+async def test_ogrn_wins_when_number_passes_both_checks(det: RegexChecksumDetector) -> None:
+    """13-digit string valid under both ОГРН-13 and Luhn: one finding, no overlap."""
+    text = f"номер {_LUHN_AND_OGRN13} в тексте"
+    findings = await det.detect(text)
+    covering = [f for f in findings if text[f.start : f.end] == _LUHN_AND_OGRN13]
+    assert len(covering) == 1, f"expected exactly one finding, got {labels(findings)}"
+    # Equal score (1.0) and equal span → the _RULES order breaks the tie; OGRN is
+    # listed first, and either label redacts the number.
+    assert covering[0].label == "OGRN"
+
+
+async def test_card_does_not_shadow_inn(det: RegexChecksumDetector) -> None:
+    findings = await det.detect("ИНН 7707083893 и ИНН 500100732259")
+    assert [f.label for f in findings] == ["RU_INN", "RU_INN"]
+    assert not has_label(findings, "BANK_CARD")
+
+
+async def test_inn_and_card_both_detected(det: RegexChecksumDetector) -> None:
+    text = f"ИНН 7707083893, карта {_MIR16}"
+    findings = await det.detect(text)
+    found = {f.label for f in findings}
+    assert "RU_INN" in found, f"RU_INN missing from {found}"
+    assert "BANK_CARD" in found, f"BANK_CARD missing from {found}"
+
+
+async def test_bank_account_not_matched_as_card(det: RegexChecksumDetector) -> None:
+    # 20 digits: outside the card length range, and no 13-19 digit slice may match
+    findings = await det.detect(_ACCT_WITH_BIK)
+    assert has_label(findings, "BANK_ACCOUNT")
+    assert not has_label(findings, "BANK_CARD")
+
+
+async def test_bank_account_and_card_both_detected(det: RegexChecksumDetector) -> None:
+    text = f"{_ACCT_WITH_BIK}, карта {_VISA16}"
+    findings = await det.detect(text)
+    found = {f.label for f in findings}
+    assert "BANK_ACCOUNT" in found, f"BANK_ACCOUNT missing from {found}"
+    assert "BIK" in found, f"BIK missing from {found}"
+    assert "BANK_CARD" in found, f"BANK_CARD missing from {found}"
+
+
+async def test_card_spans_do_not_overlap_other_findings(det: RegexChecksumDetector) -> None:
+    text = f"карта {_MIR16}, счёт 40702810000000000007, БИК 044525225, ИНН 7707083893"
+    findings = await det.detect(text)
+    for f in findings:
+        assert text[f.start : f.end] == f.text
+    for i, a in enumerate(findings):
+        for b in findings[i + 1 :]:
+            assert not (a.start < b.end and b.start < a.end), f"overlap: {a} / {b}"
 
 
 # ---------------------------------------------------------------------------
