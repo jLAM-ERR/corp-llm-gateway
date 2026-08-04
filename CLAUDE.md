@@ -33,6 +33,7 @@ src/corp_llm_gateway/
   providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
   rules/        replace.md parser + gazetteer + cached file loader
   sanitizer/    local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator (live profiles)
+                + identity_preamble (rewrite-vs-scan carve-out, see below)
   settings.py   single source of truth (typed KEYS registry + validate()); config.py delegates; backs `config check`
   storage/      MappingStore (in-memory + Redis)
   team_config/  TeamConfig (+ profile_ids) + store (in-memory + Postgres) + schema.sql
@@ -166,6 +167,12 @@ When adding a new tunable, plumb it through this loader — don't read
    first before replacement, otherwise short ones shadow long ones.
 6. **Fail-policy matrix in M4** is the source of truth for component
    failure behavior. Don't add ad-hoc fail-open paths.
+
+**Rewrite-vs-scan carve-out** (`sanitizer/identity_preamble.py`): a fixed client
+protocol literal may be exempt from *rewriting* when the provider matches it
+byte-exactly, but it must stay visible to the Stage-0 and Stage-5 scans. Claim
+the exemption at the call site that knows the field and its position, never in
+the per-leaf orchestrator — see `docs/security.md` §13.
 
 ## Conventions for new modules
 

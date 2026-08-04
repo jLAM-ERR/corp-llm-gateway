@@ -113,6 +113,25 @@ data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
 The developer's `Authorization: Bearer <byok-key>` is *not* touched —
 it passes through to upstream untouched (invariant #3).
 
+### With a subscription-auth bridge on
+
+`CORP_LLM_FORWARD_ANTHROPIC_AUTH` (and its ChatGPT Codex twin) changes
+nothing about `X-Corp-Auth`: it is still consumed in `pre_call`,
+still stripped from every forwarded header bucket, and is explicitly
+excluded from the bridge's upstream header allowlist as well.
+
+What changes is the *other* credential. The bridge **reads** the
+inbound `Authorization` bearer and copies its value into
+`data["api_key"]`, which is what makes litellm build the upstream
+`Authorization: Bearer` header from a subscription OAuth token. The
+inbound header itself is still left as it arrived, so invariant #3 is
+unchanged. The two credentials travel on separate headers and never
+collide — that separation is why the corp token has its own header in
+the first place.
+
+Setup and the full forward / do-not-forward list:
+[`ops/install.md`](ops/install.md) and [`security.md`](security.md) §13.
+
 ## Common failure modes
 
 | Symptom | Cause | Fix |

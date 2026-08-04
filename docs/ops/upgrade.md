@@ -131,7 +131,10 @@ fails if the sites disagree.
   `sk-ant-api…` key still yields `x-api-key` (which is why the gateway's
   selector accepts OAuth tokens only).
 - The `/v1/messages` pass-through transformer (the route Claude Code uses) still
-  supports `system` and still does **not** support `metadata`.
+  preserves `system`, and still lists `metadata` as unsupported. That list is
+  declarative only — nothing filters the request against it, so a caller-supplied
+  `metadata` still transforms through intact. The gateway's own scrub is what
+  removes it.
 - The chat-completions adapter still maps a top-level `user` to
   `metadata.user_id` and copies it into the outbound body — the reason the
   Anthropic bridge drops both fields.

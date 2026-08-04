@@ -83,6 +83,7 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 |-----|---------|---------|----------|
 | `CORP_LLM_FORWARD_CHATGPT_AUTH` | lift the inbound Codex OAuth bearer onto the upstream OpenAI Responses call | `0` | no |
 | `CORP_LLM_FORWARD_ANTHROPIC_AUTH` | lift the inbound `sk-ant-oat…` bearer onto the upstream Anthropic call | `0` | no |
+| `LITELLM_MASTER_KEY` | litellm's own virtual-key switch — **not** a gateway knob; registered only so `config check` can refuse it next to a bridge | unset | no |
 
 Both bridges consume the **same** inbound `Authorization` bearer, so they are
 **mutually exclusive**: setting both refuses to boot (`build_guardrail()` raises)
@@ -90,10 +91,25 @@ and fails `gateway-admin config check` with one shared message. The runtime chec
 matters because compose / demo / bare-litellm boots skip `settings.validate()`
 entirely. Selecting a bridge per provider is a v2 follow-up.
 
+`LITELLM_MASTER_KEY` is refused the same way while **either** bridge is on. With
+a master key set, litellm reads the inbound `Authorization` as one of its own
+virtual keys and answers `401` before `pre_call` runs, so the bridge could never
+see the developer's token. **Presence** is what counts, not truthiness: litellm
+keeps a blank `LITELLM_MASTER_KEY=` and enables proxy auth for any value that is
+not unset, so remove the line rather than blanking it. A master key with both
+bridges off is perfectly normal.
+
 `CORP_LLM_FORWARD_ANTHROPIC_AUTH` accepts only `sk-ant-oat…` OAuth tokens;
 anything else is `401 E_PROVIDER_AUTH`. A plain `sk-ant-api…` key would make
 litellm emit `x-api-key` while the inbound `Authorization` is still merged in —
 two competing auth schemes on one upstream request.
+
+With the bridge on, `pre_call` also drops `metadata` and a top-level `user` from
+the request. Both egress to Anthropic unsanitized otherwise, on the pass-through
+and chat-completions routes alike. litellm's own accounting metadata is lost on
+this route as a result — acceptable here because the route ships without virtual
+keys and therefore without spend tracking. See [`../security.md`](../security.md)
+§13 for the full forward/do-not-forward list.
 
 **Supported on the `anthropic-oauth` docker-compose overlay only.** Enabling it
 anywhere else risks handing the developer's subscription token to the wrong
@@ -112,9 +128,20 @@ binding control is the deployment shape: a litellm config with no `model_name:
 `docker/anthropic-oauth/litellm-config.yaml` ships and
 `tests/test_anthropic_oauth_profile.py` pins.
 
+Both unsupported cases are blocked on the same open decision — which header
+carries the litellm virtual key and which carries the OAuth token — not on
+missing code.
+
 Consequence to accept knowingly: that overlay has no litellm virtual keys, so
-subscription auth and native budget / rate-limit governance are not available at
-the same time today.
+**subscription auth and native budget / rate-limit governance are mutually
+exclusive today**. A deployment that needs both has to wait for the header-layout
+decision.
+
+Operationally, note that litellm keeps one deployment per distinct per-request
+`api_key` — raw value included — in `Router.model_list` for the lifetime of the
+proxy process, with no eviction. Restarting the process is the only way to clear
+them. This applies to the Codex bridge as well; see
+[`../security.md`](../security.md) §13.
 
 ### Backends
 
