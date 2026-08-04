@@ -28,12 +28,20 @@ Deliberately out of this harness's reach:
 The token's ONE authorized destination is the upstream ``Authorization`` header.
 A leak is the token appearing anywhere else — any other header, the body, the
 router's model list, or the proxy's log stream.
+
+Every environment dependency below (docker daemon, the pinned image, container →
+host reachability) skips on a laptop that lacks it. Skipping is exactly how this
+suite could report success while verifying nothing, so CI sets
+``CORP_REQUIRE_PROXY_CAPTURE=1``, which turns each of those skips into a
+failure. ``_skip_or_fail`` is the ONLY place any of them is raised.
 """
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -44,17 +52,33 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 import pytest
 import yaml
 
 from corp_llm_gateway.sanitizer.identity_preamble import CLAUDE_CODE_IDENTITY_PREAMBLES
+from corp_llm_gateway.settings import parse_flag
+
+REQUIRE_ENV_VAR = "CORP_REQUIRE_PROXY_CAPTURE"
+
+
+def capture_is_required() -> bool:
+    return parse_flag(os.environ.get(REQUIRE_ENV_VAR))
+
+
+def _skip_or_fail(reason: str) -> NoReturn:
+    """Skip on a machine that cannot run this, fail where it must run."""
+    if capture_is_required():
+        pytest.fail(f"{REQUIRE_ENV_VAR} is set but this harness cannot run: {reason}")
+    pytest.skip(reason)
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE_PATH = ROOT / "docker/anthropic-oauth/Dockerfile"
 CONFIG_PATH = ROOT / "docker/anthropic-oauth/litellm-config.yaml"
+CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 
 # Seeded by _demo_guardrail's in-memory token store, which the shipped config's
 # callback builds.
@@ -248,7 +272,7 @@ def _require_upstream_reachable(name: str, upstream_port: int) -> None:
         timeout=60,
     )
     if probe.returncode != 0:
-        pytest.skip(
+        _skip_or_fail(
             "container cannot reach the in-test capture server on host.docker.internal: "
             f"{probe.stderr.strip()[-300:]}"
         )
@@ -311,12 +335,12 @@ def upstream() -> Iterator[_CaptureServer]:
 @pytest.fixture(scope="module")
 def image() -> str:
     if not _docker_daemon_ready():
-        pytest.skip("docker daemon not reachable — outbound capture needs the pinned litellm image")
+        _skip_or_fail("docker daemon not reachable — capture needs the pinned litellm image")
     tag = pinned_base_image()
     if _docker("image", "inspect", tag, timeout=60).returncode != 0:
         pull = _docker("pull", tag, timeout=900)
         if pull.returncode != 0:
-            pytest.skip(f"cannot obtain {tag}: {pull.stderr.strip()[-300:]}")
+            _skip_or_fail(f"cannot obtain {tag}: {pull.stderr.strip()[-300:]}")
     return tag
 
 
@@ -420,6 +444,51 @@ def _assert_prompt_was_sanitized(body: dict[str, Any]) -> None:
 
 def test_identity_preamble_literal_matches_the_shipped_constant() -> None:
     assert IDENTITY_PREAMBLE in CLAUDE_CODE_IDENTITY_PREAMBLES
+
+
+def test_every_skip_path_in_this_module_goes_through_the_guard() -> None:
+    """One guarded fixture and one unguarded one is the same trap, one level down."""
+    tree = ast.parse(Path(__file__).read_text())
+    holders = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "skip"
+            for call in ast.walk(node)
+        )
+    }
+    # The other ways a test here could stop asserting without failing.
+    bypasses = sorted(
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in {"skipif", "xfail", "importorskip"}
+    )
+
+    assert holders == {"_skip_or_fail"}, holders
+    assert not bypasses, bypasses
+
+
+def test_ci_runs_this_suite_with_the_skip_guard_armed() -> None:
+    """The guard is worth only as much as its wiring.
+
+    Every assertion in this file sits behind a fixture that can skip on an
+    environment fault, and this test is one of the two that cannot — so it is the
+    one that has to catch a CI job which dropped the env var and went back to
+    reporting green over nothing.
+    """
+    job = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["test"]
+    steps = [step for step in job.get("steps", []) if "pytest" in (step.get("run") or "")]
+
+    assert steps, f"{CI_WORKFLOW.name}'s test job no longer runs pytest"
+    for step in steps:
+        env = {**(job.get("env") or {}), **(step.get("env") or {})}
+        assert parse_flag(str(env.get(REQUIRE_ENV_VAR, ""))), (
+            f"{CI_WORKFLOW.name} runs {step['run']!r} without {REQUIRE_ENV_VAR}: "
+            "the outbound capture assertions can all skip and still report green"
+        )
 
 
 def test_messages_route_sends_the_subscription_token_and_nothing_else(bridge_stack: _Stack) -> None:

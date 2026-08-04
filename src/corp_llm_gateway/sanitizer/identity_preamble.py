@@ -36,7 +36,8 @@ CLAUDE_CODE_IDENTITY_PREAMBLES: frozenset[str] = frozenset(
 # The one block Claude Code emits AHEAD of its identity block. litellm keeps it
 # on the first-party Anthropic route (`_filter_billing_headers_from_system` runs
 # only for providers that reject it), so it can still be sitting in front of the
-# identity block when the gateway sees the payload.
+# identity block when the gateway sees the payload. It is read here only to
+# locate the identity block — these blocks are sanitized whole, marker included.
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 
 
@@ -48,19 +49,6 @@ def is_identity_preamble(text: str) -> bool:
     let unbounded whitespace ride into an unsanitized, size-unchecked leaf.
     """
     return text in CLAUDE_CODE_IDENTITY_PREAMBLES
-
-
-def split_billing_marker(text: str) -> tuple[str, str] | None:
-    """Split a billing-header block into (fixed marker prefix, caller remainder).
-
-    ``None`` when ``text`` is not a billing-header block. The prefix is a fixed
-    protocol marker: rewriting it would strip the arrangement that makes the
-    identity block a LEADING one, so it is held back while the remainder — which
-    the caller controls — is sanitized like any other leaf.
-    """
-    if not text.startswith(_BILLING_HEADER_PREFIX):
-        return None
-    return _BILLING_HEADER_PREFIX, text[len(_BILLING_HEADER_PREFIX) :]
 
 
 def leading_identity_block_index(system: Any) -> int | None:

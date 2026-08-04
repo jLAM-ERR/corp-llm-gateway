@@ -15,9 +15,9 @@ tests drive the real ``pre_call`` — with the production detector set — over
 realistic ``system`` shapes and pin four things: the leading identity block is
 not rewritten; NOTHING ELSE is exempt (a padded copy, a later block,
 ``instructions``, a user message, a ``tool_result``, any request that cannot
-reach the OAuth route at all); the arrangement that makes the block *leading*
-survives sanitization; and the exempt block is still scanned by Stage 0 and
-Stage 5.
+reach the OAuth route at all); the billing-marker blocks ahead of it are
+sanitized WHOLE, so nothing is reconstructed over a redaction; and the exempt
+block is still scanned by Stage 0 and Stage 5.
 """
 
 from __future__ import annotations
@@ -41,7 +41,6 @@ from corp_llm_gateway.sanitizer.identity_preamble import (
     CLAUDE_CODE_IDENTITY_PREAMBLES,
     is_identity_preamble,
     leading_identity_block_index,
-    split_billing_marker,
 )
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
@@ -62,6 +61,13 @@ BILLING_BLOCK = {"type": "text", "text": f"{BILLING_MARKER} claude-code"}
 # — the arrangement that makes the identity block the leading one.
 MARKER_RULE_TERM = "anthropic"
 MARKER_RULE_REPLACEMENT = "[ORG_999]"
+# A confidential value a caller can park in a billing block, redacted ONLY by an
+# operator rule whose pattern spans the marker/remainder boundary: no other
+# detector touches it on either interpreter (checked with and without the NER
+# extras), so the leak assertion below cannot be satisfied by something else.
+BOUNDARY_SECRET = "Quadrant Seven"
+BOUNDARY_BLOCK = f"{BILLING_MARKER} cost-center={BOUNDARY_SECRET}, team=core"
+BOUNDARY_RULE_REPLACEMENT = "[PROJECT_007]"
 # The bridge the carve-out exists for: it applies only while this is armed AND
 # the model resolves to the Anthropic provider.
 OAUTH_TOKEN = "sk-ant-oat01-fake-preamble"
@@ -359,14 +365,46 @@ async def test_secret_behind_an_identity_block_is_redacted_off_the_bridge() -> N
     assert SECRET not in json.dumps(out["system"])
 
 
-# ---- what made the block "leading" must still hold on the way out ----------
+# ---- the billing blocks ahead of it are sanitized WHOLE ---------------------
 
 
-async def test_billing_marker_prefix_survives_a_rule_that_matches_it() -> None:
-    """A rule matching `anthropic` rewrote the marker to
-    `x-[ORG_999]-billing-header:`, so by the module's own rule the outbound
-    payload no longer had a leading identity block — and Anthropic's OAuth route
-    keys on exactly that arrangement."""
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        f"{BILLING_MARKER} cost-center={BOUNDARY_SECRET}",  # whole marker + remainder
+        f"header: cost-center={BOUNDARY_SECRET}",  # tail of the marker + remainder
+    ],
+)
+async def test_a_rule_spanning_the_billing_marker_boundary_redacts(pattern: str) -> None:
+    """The reason the marker is no longer held back and reattached.
+
+    Rules are literal substring matches over the text handed to the orchestrator.
+    Sanitizing only the caller remainder hid every pattern that reached back into
+    the marker, and reattaching the marker afterwards rebuilt the full original
+    on the way to Anthropic — a zero-originals-leak (M1-14) violation, and one
+    Stage 5 cannot catch because it does not replay replace.md rules.
+    """
+    rules = Rules(rules=(Rule(pattern=pattern, replacement=BOUNDARY_RULE_REPLACEMENT),))
+    g, _, _ = _guardrail(rules=rules)
+    system = [
+        {"type": "text", "text": BOUNDARY_BLOCK},
+        {"type": "text", "text": PREAMBLE},
+    ]
+    out = await g.pre_call(_data(system=system))
+
+    assert BOUNDARY_SECRET not in json.dumps(out["system"]), "boundary-spanning rule bypassed"
+    assert BOUNDARY_RULE_REPLACEMENT in out["system"][0]["text"]
+    assert out["system"][0]["text"].endswith(", team=core"), "the unmatched tail was dropped"
+    assert out["system"][1]["text"] == PREAMBLE
+
+
+async def test_a_rule_matching_the_billing_marker_keeps_its_rewrite() -> None:
+    """A rewritten marker is left rewritten, even though the identity block then
+    stops being a LEADING one and Anthropic's OAuth route may refuse the request.
+
+    Restoring the marker cannot be told apart from restoring the boundary-spanning
+    original above, so the refusal is the cheaper of the two failures.
+    """
     rules = Rules(rules=(Rule(pattern=MARKER_RULE_TERM, replacement=MARKER_RULE_REPLACEMENT),))
     g, _, _ = _guardrail(rules=rules)
     system = [
@@ -375,15 +413,16 @@ async def test_billing_marker_prefix_survives_a_rule_that_matches_it() -> None:
     ]
     out = await g.pre_call(_data(system=system))
 
-    assert out["system"][0]["text"].startswith(BILLING_MARKER), out["system"][0]["text"]
-    assert MARKER_RULE_REPLACEMENT not in out["system"][0]["text"]
-    assert leading_identity_block_index(out["system"]) == 1
+    rewritten = f"x-{MARKER_RULE_REPLACEMENT}-billing-header: cost-center=demo"
+    assert out["system"][0]["text"] == rewritten
+    assert leading_identity_block_index(out["system"]) is None
     assert out["system"][1]["text"] == PREAMBLE
 
 
 async def test_two_billing_markers_ahead_of_the_identity_block_all_survive() -> None:
-    rules = Rules(rules=(Rule(pattern=MARKER_RULE_TERM, replacement=MARKER_RULE_REPLACEMENT),))
-    g, _, _ = _guardrail(rules=rules)
+    """Nothing matches inside these blocks, so both reach egress byte-identical
+    and the identity block is still the leading one."""
+    g, _, _ = _guardrail(rules=_rules())
     system = [
         {"type": "text", "text": f"{BILLING_MARKER} a=1"},
         {"type": "text", "text": f"{BILLING_MARKER} b=2"},
@@ -399,8 +438,7 @@ async def test_two_billing_markers_ahead_of_the_identity_block_all_survive() -> 
 
 
 async def test_a_billing_block_with_no_remainder_is_unchanged() -> None:
-    rules = Rules(rules=(Rule(pattern=MARKER_RULE_TERM, replacement=MARKER_RULE_REPLACEMENT),))
-    g, _, _ = _guardrail(rules=rules)
+    g, _, _ = _guardrail(rules=_rules())
     system = [{"type": "text", "text": BILLING_MARKER}, {"type": "text", "text": PREAMBLE}]
     out = await g.pre_call(_data(system=system))
 
@@ -408,9 +446,9 @@ async def test_a_billing_block_with_no_remainder_is_unchanged() -> None:
     assert leading_identity_block_index(out["system"]) == 1
 
 
-async def test_other_keys_on_a_billing_block_survive_the_split() -> None:
-    """Claude Code hangs `cache_control` off these blocks; rebuilding the text
-    must not drop the rest of the block."""
+async def test_other_keys_on_a_billing_block_survive_sanitization() -> None:
+    """Claude Code hangs `cache_control` off these blocks; the walker must not
+    drop the rest of the block."""
     g, _, _ = _guardrail()
     system = [
         {
@@ -425,9 +463,9 @@ async def test_other_keys_on_a_billing_block_survive_the_split() -> None:
     assert out["system"][0] == system[0]
 
 
-async def test_the_billing_block_remainder_is_still_sanitized() -> None:
-    """Only the fixed marker is held back. Everything the caller wrote after it
-    goes through the detectors — the prefix must not become a smuggling lane."""
+async def test_a_secret_in_a_billing_block_is_still_redacted() -> None:
+    """Nothing about these blocks is exempt — the marker must not become a
+    smuggling lane."""
     g, _, _ = _guardrail()
     system = [
         {"type": "text", "text": f"{BILLING_MARKER} cost-center={SECRET}"},
@@ -587,25 +625,18 @@ def test_leading_identity_block_index_finds_the_head_block(system: Any, expected
 
 
 @pytest.mark.parametrize(
-    ("text", "expected"),
+    "text",
     [
-        (f"{BILLING_MARKER} cost-center=demo", (BILLING_MARKER, " cost-center=demo")),
-        (BILLING_MARKER, (BILLING_MARKER, "")),
-        ("x-anthropic-billing-header", None),  # prefix incomplete: no colon
-        (f"prefix {BILLING_MARKER} v", None),  # not at the head
-        ("X-Anthropic-Billing-Header: v", None),  # case differs
-        ("", None),
+        "x-anthropic-billing-header",  # marker incomplete: no colon
+        f"prefix {BILLING_MARKER} v",  # not at the head
+        "X-Anthropic-Billing-Header: v",  # case differs
+        "",
     ],
 )
-def test_split_billing_marker(text: str, expected: tuple[str, str] | None) -> None:
-    assert split_billing_marker(text) == expected
+def test_a_near_miss_marker_does_not_make_the_next_block_leading(text: str) -> None:
+    system = [{"type": "text", "text": text}, {"type": "text", "text": PREAMBLE}]
 
-
-def test_split_billing_marker_is_lossless() -> None:
-    text = f"{BILLING_MARKER} cost-center=demo"
-    prefix, remainder = split_billing_marker(text)  # type: ignore[misc]
-
-    assert prefix + remainder == text
+    assert leading_identity_block_index(system) is None
 
 
 # ---- why the carve-out is needed at all -----------------------------------
