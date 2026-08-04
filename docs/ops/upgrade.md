@@ -142,6 +142,51 @@ fails if the sites disagree.
   (the hook's non-chat `input` denylist), and the router still treats `api_key`
   as a clientside credential (what the Codex and Anthropic bridges rely on).
 
+## Cache A is invalidated by this release (no action required)
+
+This release widens detector coverage: the Luhn-validated `BANK_CARD` label is
+new, local NER's participation in CODE segments changed, and corp NER can add a
+whole detector when enabled. A Cache-A hit applies the stored mapping **without
+running detectors**, so an entry written by the previous build would replay as
+unredacted for the rest of its ~10h TTL — a card number cached before the
+upgrade would egress in the clear.
+
+`_CACHE_A_ALGORITHM_VERSION` (`sanitizer/orchestrator.py`) is therefore bumped to
+`coverage-v2`. It is mixed into the Cache-A key, so every pre-upgrade entry is
+already unreachable the moment the new image starts. **Correctness needs no
+operator action.** The same boundary covers the profile path: profile
+sanitization delegates to `SanitizationOrchestrator.sanitize()`, which is the only
+caller of `_content_hash`.
+
+### Optional: reclaim the orphaned memory
+
+The retired entries stay resident until their TTL expires (up to ~10h). Redis is
+configured `maxmemory-policy noeviction` (`compose/redis/redis.conf`), so on a
+tight `maxmemory` that dead set can push the instance to refuse writes. Deleting
+it is housekeeping only.
+
+Key prefixes, as defined in `src/corp_llm_gateway/storage/redis_store.py`:
+
+| Prefix | Cache | Safe to delete? |
+|---|---|---|
+| `dedup:` | A — content-keyed dedup | **Yes** |
+| `conv:o2p:` | B — original → placeholder | **No** |
+| `conv:p2o:` | B — placeholder → original | **No** |
+| `…:ttl` (suffix on Cache-B keys) | B — sliding-TTL bookkeeping | **No** |
+
+The prefixes separate cleanly: `dedup:` matches Cache A and nothing else.
+
+```
+docker compose exec redis sh -lc \
+  'redis-cli --scan --pattern "dedup:*" | xargs -r -n 500 redis-cli unlink'
+```
+
+**Never `FLUSHDB` / `FLUSHALL` here.** The gateway keeps both caches in the same
+Redis (`REDIS_URL=redis://redis:6379/0`). Dropping the `conv:*` keys destroys the
+per-conversation mappings that `post_call` desanitization requires, and every
+in-flight conversation then returns `[LABEL_NNN]` placeholders to the developer
+instead of the original text.
+
 ## Rolling deploy
 
 Follow `runbook.md`: tag → CI builds image + Helm artifacts → `helm upgrade` to

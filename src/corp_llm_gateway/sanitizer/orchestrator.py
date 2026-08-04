@@ -51,7 +51,18 @@ from corp_llm_gateway.sanitizer.strategies import (
 from corp_llm_gateway.storage import MappingStore, PlaceholderMapping
 
 _PLACEHOLDER_LABEL_RE = re.compile(r"^\[([A-Z_]+)_(\d+)\]$")
-_CACHE_A_ALGORITHM_VERSION = b"span-aware-v1"
+# Bump this on ANY change that widens what the request path redacts, not only on a
+# substitution-semantics change. A Cache-A hit applies the stored mapping WITHOUT
+# running detectors, so an entry written by a narrower build replays as unredacted
+# for the whole ~10h TTL. The version is part of the key, so a bump retires those
+# entries at upgrade with no cache flush needed. Log of boundaries:
+#   span-aware-v1  substitution moved from pair-global replace to span-aware
+#                  planning; old entries could have dropped a mapping.
+#   coverage-v2    detector coverage widened three ways: the Luhn-validated
+#                  BANK_CARD label is new (older entries never saw a card),
+#                  local NER's participation in CODE segments changed, and corp
+#                  NER can add a whole detector when enabled.
+_CACHE_A_ALGORITHM_VERSION = b"coverage-v2"
 
 # Chunk overlap sizing (F1 chunk policy). Regex/checksum patterns are LINEAR and
 # now run over the FULL text (see `_sanitize_chunked`), so the overlap no longer
@@ -1025,9 +1036,9 @@ def _content_hash(
     oracle_enabled: bool | None = None,
 ) -> str:
     h = hashlib.sha256()
-    # Security-sensitive substitution semantics changed from pair-global replace
-    # to span-aware planning. Old Cache-A entries may have dropped a mapping, so
-    # they must not survive this algorithm version boundary.
+    # Retires every Cache-A entry written by a build with different substitution
+    # semantics or narrower detector coverage — see the constant for what counts
+    # as a boundary and why replaying such an entry is a leak.
     h.update(_CACHE_A_ALGORITHM_VERSION)
     h.update(b"\x1c")
     h.update(team_id.encode("utf-8"))

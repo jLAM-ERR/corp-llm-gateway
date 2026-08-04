@@ -19,7 +19,7 @@ from corp_llm_gateway.rules import (
     RulesLoader,
 )
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
-from corp_llm_gateway.storage import InMemoryMappingStore
+from corp_llm_gateway.storage import InMemoryMappingStore, PlaceholderMapping
 
 
 class _StaticRulesLoader(RulesLoader):
@@ -1047,6 +1047,51 @@ async def test_none_fingerprint_preserves_dedup_behavior() -> None:
     assert r1.cache_a_hit is False
     assert r2.cache_a_hit is True
     assert len(captured) == 1
+
+
+# Cache A — a superseded algorithm version must not be replayed -------------
+
+# The value shipped before the detector-coverage boundary (BANK_CARD, CODE-segment
+# NER, corp NER). Pinned as a literal on purpose: it is the key an OLDER build
+# wrote under, so it must not track the current constant.
+_SUPERSEDED_CACHE_A_VERSION = b"span-aware-v1"
+
+# Synthetic Visa: 4276 1234 5678 901 + Luhn check digit 4. Not an issued card.
+_STALE_ENTRY_CARD = "4276123456789014"
+
+
+async def test_cache_a_entry_from_superseded_algorithm_version_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An entry written by a build with narrower detector coverage must miss.
+
+    Seeds the store exactly as the previous build would have: an empty mapping
+    (that build had no BANK_CARD rule) under that build's Cache-A key. Serving it
+    would egress the card unredacted until the ~10h TTL expired.
+    """
+    from corp_llm_gateway.sanitizer import orchestrator
+
+    store = InMemoryMappingStore()
+    rules = Rules(rules=())
+    text = f"Charge the pilot budget to {_STALE_ENTRY_CARD} tomorrow."
+
+    with monkeypatch.context() as m:
+        m.setattr(orchestrator, "_CACHE_A_ALGORITHM_VERSION", _SUPERSEDED_CACHE_A_VERSION)
+        stale_key = orchestrator._content_hash("t1", rules, text, None, False)
+    await store.set_dedup(stale_key, PlaceholderMapping(pairs=()), ttl_seconds=36000)
+
+    orch = SanitizationOrchestrator(
+        None,
+        store,
+        _StaticRulesLoader(rules),
+        local_detectors=[RegexChecksumDetector()],
+        oracle_enabled=False,
+    )
+    result = await orch.sanitize(text, team_id="t1", conversation_id="c1")
+
+    assert result.cache_a_hit is False, "a superseded-version entry must not be served"
+    assert _STALE_ENTRY_CARD not in result.sanitized_text, "LEAK: stale entry replayed the card"
+    assert any(o == _STALE_ENTRY_CARD for o, _ in result.pairs)
 
 
 # Cache A — oracle mode must not be replayed across a toggle (P1 fix) -------
