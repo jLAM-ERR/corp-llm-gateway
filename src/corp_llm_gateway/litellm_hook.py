@@ -67,6 +67,10 @@ from corp_llm_gateway.sanitizer.content_blocks import (
 )
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
+from corp_llm_gateway.sanitizer.identity_preamble import (
+    is_identity_preamble,
+    leading_identity_block_index,
+)
 from corp_llm_gateway.sanitizer.placeholder import (
     StaleSpanError,
     add_unwrapped_response_aliases,
@@ -1018,6 +1022,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         Extracted so `pre_call` can drive both fields through the identical
         fail-closed/audit behavior instead of picking one via a ternary.
+
+        Anthropic's OAuth ``/v1/messages`` route accepts a request as a Claude
+        Code request on the strength of the LEADING ``system`` block, matched by
+        exact equality, so that one block is exempt from rewriting (see
+        ``sanitizer/identity_preamble``). The exemption is claimed here, not in
+        the per-leaf orchestrator: the orchestrator has no field or position
+        context, so claiming it there also exempted an identity literal pasted
+        into ``instructions``, a user message, a ``tool_result`` or a
+        ``document`` — leaves an operator rule or gazetteer entry must still be
+        able to redact.
         """
         system = data.get(prompt_field)
         if not system:
@@ -1032,8 +1046,36 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             prompt_field,
             system_bytes,
         )
+        exempt_index: int | None = None
+        if prompt_field == "system":
+            if isinstance(system, str) and is_identity_preamble(system):
+                logger.info(
+                    "litellm_pre_call_identity_preamble_passthrough request_id=%s field=%s",
+                    request_id,
+                    prompt_field,
+                )
+                return
+            exempt_index = leading_identity_block_index(system)
         try:
-            new_system, results = await sanitize_content(system, sanitize_one)
+            if exempt_index is None:
+                new_system, results = await sanitize_content(system, sanitize_one)
+            else:
+                logger.info(
+                    "litellm_pre_call_identity_preamble_passthrough request_id=%s "
+                    "field=%s block_index=%d",
+                    request_id,
+                    prompt_field,
+                    exempt_index,
+                )
+                exempt_block = system[exempt_index]
+                rest = list(system)
+                del rest[exempt_index]
+                new_rest, results = await sanitize_content(rest, sanitize_one)
+                new_system = [
+                    *new_rest[:exempt_index],
+                    exempt_block,
+                    *new_rest[exempt_index:],
+                ]
         except ContentTooDeepError as exc:
             self._record_failure(request_id, error_code="E_BAD_REQUEST")
             _now = datetime.now(UTC)
