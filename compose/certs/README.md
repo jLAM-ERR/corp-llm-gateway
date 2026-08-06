@@ -1,4 +1,12 @@
-# Corporate CA bundle (operator-provided)
+# Corporate CA bundle (operator-provided) — runtime trust, production stack
+
+**Not to be confused with the repo-root `crt/`.** That directory holds the demo
+stacks' copy of the same corp-LLM bundle *and* `proxy-ca.crt`, the CA of a
+re-signing egress proxy — which is a **build-time** file, baked into the image by
+`Dockerfile.gateway` and invisible to a running container. This directory is
+**runtime** trust for the production `compose/` stack, mounted into the container.
+Different directory, different lifecycle. See
+[`../../crt/README.md`](../../crt/README.md).
 
 The data-plane litellm container verifies TLS to the corp vLLM against a
 corporate CA bundle. This directory is mounted read-only into the container
@@ -35,3 +43,9 @@ than leaving `SSL_CERT_FILE` pointing at a 0-byte or corp-CA-only file — see
 `.env.example` default) when the corp vLLM's certificate already chains to a
 publicly-trusted root — `CorpLlmClient` then falls back to its own default
 trust store, and the combined bundle still has the public roots either way.
+
+That combined bundle is also where a **re-signing egress proxy**'s CA belongs, if
+one sits between this stack and `api.anthropic.com`/`api.openai.com`: append it to
+`corp-ca-bundle.pem` here. The build-time `crt/proxy-ca.crt` does **not** cover the
+running container — the image is pulled prebuilt, so nothing from build time is in
+play at runtime.

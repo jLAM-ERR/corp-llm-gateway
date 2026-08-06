@@ -23,6 +23,30 @@ RUN python -m build --wheel
 FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
 # This base's /app/.venv is a uv venv with NO pip — ensurepip bootstraps it
 # below before installing the wheel (mirrors docker/demo-litellm/Dockerfile:13-18).
+
+# ── Re-signing-proxy CA (absent => ordinary open-internet build) ─────────────
+# If internet egress goes through a re-signing (TLS-intercepting) proxy, build-time
+# pip must trust the proxy's root CA instead of skipping TLS. Drop it at
+# crt/proxy-ca.crt (git-ignored; see crt/README.md). crt/ is COPYed whole (always
+# present — has README.md), so the build ALSO works with NO CA: append is skipped
+# and stock certifi stays. pip ships its own vendored certifi, so we point PIP_CERT
+# at the bundle we appended the CA to.
+#
+# Published images carry no CA: .github/workflows/build-image.yml builds from a
+# clean checkout where crt/ holds only README.md, and it passes no proxy args.
+# This block exists for local/corp builds behind an intercepting proxy.
+COPY crt/ /tmp/proxy-crt/
+RUN set -eux; \
+    certbundle="$(python -c 'import certifi; print(certifi.where())')"; \
+    if [ -f /tmp/proxy-crt/proxy-ca.crt ]; then \
+        cat /tmp/proxy-crt/proxy-ca.crt >> "$certbundle"; \
+    fi; \
+    mkdir -p /etc/corp-llm-gateway; \
+    cp "$certbundle" /etc/corp-llm-gateway/ca-bundle.pem; \
+    rm -rf /tmp/proxy-crt
+ENV PIP_CERT=/etc/corp-llm-gateway/ca-bundle.pem \
+    REQUESTS_CA_BUNDLE=/etc/corp-llm-gateway/ca-bundle.pem
+
 # Install onto the litellm base so the proxy can import
 # `corp_llm_gateway.bootstrap.guardrail`. NER_PROFILE selects how much of the
 # sanitizing (NER) stack is baked in:
@@ -43,6 +67,12 @@ FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
 # every knob to point at corp storage — Nexus/Artifactory/JFrog). Prod stays a
 # self-contained image: nothing is fetched at deploy or runtime.
 #   PIP_INDEX_URL    — corp PyPI mirror for the libraries; empty = public PyPI.
+#                      A mirror whose TLS chains to the proxy CA above needs no
+#                      further knob. One that does NOT is deliberately unsupported:
+#                      --trusted-host would disable verification for artifacts that
+#                      become executable code here, which contradicts the stack's
+#                      own rule (compose/.env.example, "TLS verification is always
+#                      ON"). Give the mirror a certificate we can chain instead.
 #   EN_MODEL_VERSION — spaCy EN model version to bake (the NER-version knob; bump
 #                      it + rebuild to ship a new NER version as a new image tag).
 #   EN_MODEL_URL     — full wheel URL for the EN model; empty = derive the public
