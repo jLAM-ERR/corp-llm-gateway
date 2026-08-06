@@ -15,6 +15,21 @@ ARG LITELLM_VERSION=v1.95.0
 
 FROM python:3.12-slim AS build
 WORKDIR /build
+# Proxy CA, same convention as the final stage (crt/proxy-ca.crt, git-ignored —
+# see crt/README.md). It has to be here too: `pip install build` below is the
+# FIRST network call of the whole build, so behind a TLS-intercepting proxy it
+# fails long before the final stage's CA handling is reached. This stage ships
+# nothing — only the built wheel is COPYed out — so the trust widening is
+# confined to the builder. Unlike the litellm base, python:3.12-slim has no
+# certifi, hence the system bundle.
+COPY crt/ /tmp/proxy-crt/
+RUN set -eux; \
+    if [ -f /tmp/proxy-crt/proxy-ca.crt ]; then \
+        cat /tmp/proxy-crt/proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt; \
+    fi; \
+    rm -rf /tmp/proxy-crt
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 RUN pip install --no-cache-dir build
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
@@ -23,6 +38,24 @@ RUN python -m build --wheel
 FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
 # This base's /app/.venv is a uv venv with NO pip — ensurepip bootstraps it
 # below before installing the wheel (mirrors docker/demo-litellm/Dockerfile:13-18).
+
+# ── Re-signing-proxy CA (absent => ordinary open-internet build) ─────────────
+# If internet egress goes through a re-signing (TLS-intercepting) proxy, build-time
+# pip must trust the proxy's root CA instead of skipping TLS. Drop it at
+# crt/proxy-ca.crt (git-ignored; see crt/README.md). crt/ is COPYed whole (always
+# present — has README.md), so the build ALSO works with NO CA.
+#
+# BUILD-TIME ONLY, and enforced as such: the append to certifi and the PIP_CERT /
+# REQUESTS_CA_BUNDLE exports live INSIDE the install RUN below, and certifi is
+# restored from a backup before that layer closes. Nothing about the proxy
+# survives into the shipped image — an image built behind one proxy must not keep
+# trusting that proxy's CA after it is deployed somewhere else. Runtime trust is a
+# separate, mounted concern: compose/certs/ (see compose/certs/README.md).
+#
+# Published images never carry a CA at all: .github/workflows/build-image.yml
+# builds from a clean checkout where crt/ holds only README.md.
+COPY crt/ /tmp/proxy-crt/
+
 # Install onto the litellm base so the proxy can import
 # `corp_llm_gateway.bootstrap.guardrail`. NER_PROFILE selects how much of the
 # sanitizing (NER) stack is baked in:
@@ -43,6 +76,12 @@ FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
 # every knob to point at corp storage — Nexus/Artifactory/JFrog). Prod stays a
 # self-contained image: nothing is fetched at deploy or runtime.
 #   PIP_INDEX_URL    — corp PyPI mirror for the libraries; empty = public PyPI.
+#                      A mirror whose TLS chains to the proxy CA above needs no
+#                      further knob. One that does NOT is deliberately unsupported:
+#                      --trusted-host would disable verification for artifacts that
+#                      become executable code here, which contradicts the stack's
+#                      own rule (compose/.env.example, "TLS verification is always
+#                      ON"). Give the mirror a certificate we can chain instead.
 #   EN_MODEL_VERSION — spaCy EN model version to bake (the NER-version knob; bump
 #                      it + rebuild to ship a new NER version as a new image tag).
 #   EN_MODEL_URL     — full wheel URL for the EN model; empty = derive the public
@@ -60,6 +99,12 @@ RUN set -eux; \
     en_model="${EN_MODEL_URL:-https://github.com/explosion/spacy-models/releases/download/en_core_web_md-${EN_MODEL_VERSION}/en_core_web_md-${EN_MODEL_VERSION}-py3-none-any.whl}"; \
     py=/app/.venv/bin/python; \
     "$py" -m ensurepip --upgrade; \
+    certbundle="$("$py" -c 'import certifi; print(certifi.where())')"; \
+    cp "$certbundle" /tmp/certifi.orig; \
+    if [ -f /tmp/proxy-crt/proxy-ca.crt ]; then \
+        cat /tmp/proxy-crt/proxy-ca.crt >> "$certbundle"; \
+    fi; \
+    export PIP_CERT="$certbundle" REQUESTS_CA_BUNDLE="$certbundle"; \
     case "${NER_PROFILE}" in \
       base)  "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" ;; \
       ru-en) "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" "${en_model}"; \
@@ -68,8 +113,10 @@ RUN set -eux; \
              "$py" -c "import spacy; spacy.load('en_core_web_md'); print('NER en OK')" ;; \
       *)     echo "unknown NER_PROFILE=${NER_PROFILE} (want: base|ru-en|en)" >&2; exit 1 ;; \
     esac; \
+    cp /tmp/certifi.orig "$certbundle"; \
     "$py" -c "import corp_llm_gateway.bootstrap; print('gateway bootstrap import OK')"; \
-    rm -f /tmp/*.whl
+    rm -f /tmp/*.whl /tmp/certifi.orig; \
+    rm -rf /tmp/proxy-crt
 # Record what got baked so ops can audit the running image with `docker inspect`.
 LABEL org.corp-llm-gateway.ner-profile="${NER_PROFILE}" \
       org.corp-llm-gateway.en-model-version="${EN_MODEL_VERSION}"
