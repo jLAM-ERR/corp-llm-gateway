@@ -15,6 +15,21 @@ ARG LITELLM_VERSION=v1.95.0
 
 FROM python:3.12-slim AS build
 WORKDIR /build
+# Proxy CA, same convention as the final stage (crt/proxy-ca.crt, git-ignored —
+# see crt/README.md). It has to be here too: `pip install build` below is the
+# FIRST network call of the whole build, so behind a TLS-intercepting proxy it
+# fails long before the final stage's CA handling is reached. This stage ships
+# nothing — only the built wheel is COPYed out — so the trust widening is
+# confined to the builder. Unlike the litellm base, python:3.12-slim has no
+# certifi, hence the system bundle.
+COPY crt/ /tmp/proxy-crt/
+RUN set -eux; \
+    if [ -f /tmp/proxy-crt/proxy-ca.crt ]; then \
+        cat /tmp/proxy-crt/proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt; \
+    fi; \
+    rm -rf /tmp/proxy-crt
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 RUN pip install --no-cache-dir build
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
@@ -28,24 +43,18 @@ FROM ghcr.io/berriai/litellm:${LITELLM_VERSION}
 # If internet egress goes through a re-signing (TLS-intercepting) proxy, build-time
 # pip must trust the proxy's root CA instead of skipping TLS. Drop it at
 # crt/proxy-ca.crt (git-ignored; see crt/README.md). crt/ is COPYed whole (always
-# present — has README.md), so the build ALSO works with NO CA: append is skipped
-# and stock certifi stays. pip ships its own vendored certifi, so we point PIP_CERT
-# at the bundle we appended the CA to.
+# present — has README.md), so the build ALSO works with NO CA.
 #
-# Published images carry no CA: .github/workflows/build-image.yml builds from a
-# clean checkout where crt/ holds only README.md, and it passes no proxy args.
-# This block exists for local/corp builds behind an intercepting proxy.
+# BUILD-TIME ONLY, and enforced as such: the append to certifi and the PIP_CERT /
+# REQUESTS_CA_BUNDLE exports live INSIDE the install RUN below, and certifi is
+# restored from a backup before that layer closes. Nothing about the proxy
+# survives into the shipped image — an image built behind one proxy must not keep
+# trusting that proxy's CA after it is deployed somewhere else. Runtime trust is a
+# separate, mounted concern: compose/certs/ (see compose/certs/README.md).
+#
+# Published images never carry a CA at all: .github/workflows/build-image.yml
+# builds from a clean checkout where crt/ holds only README.md.
 COPY crt/ /tmp/proxy-crt/
-RUN set -eux; \
-    certbundle="$(python -c 'import certifi; print(certifi.where())')"; \
-    if [ -f /tmp/proxy-crt/proxy-ca.crt ]; then \
-        cat /tmp/proxy-crt/proxy-ca.crt >> "$certbundle"; \
-    fi; \
-    mkdir -p /etc/corp-llm-gateway; \
-    cp "$certbundle" /etc/corp-llm-gateway/ca-bundle.pem; \
-    rm -rf /tmp/proxy-crt
-ENV PIP_CERT=/etc/corp-llm-gateway/ca-bundle.pem \
-    REQUESTS_CA_BUNDLE=/etc/corp-llm-gateway/ca-bundle.pem
 
 # Install onto the litellm base so the proxy can import
 # `corp_llm_gateway.bootstrap.guardrail`. NER_PROFILE selects how much of the
@@ -90,6 +99,12 @@ RUN set -eux; \
     en_model="${EN_MODEL_URL:-https://github.com/explosion/spacy-models/releases/download/en_core_web_md-${EN_MODEL_VERSION}/en_core_web_md-${EN_MODEL_VERSION}-py3-none-any.whl}"; \
     py=/app/.venv/bin/python; \
     "$py" -m ensurepip --upgrade; \
+    certbundle="$("$py" -c 'import certifi; print(certifi.where())')"; \
+    cp "$certbundle" /tmp/certifi.orig; \
+    if [ -f /tmp/proxy-crt/proxy-ca.crt ]; then \
+        cat /tmp/proxy-crt/proxy-ca.crt >> "$certbundle"; \
+    fi; \
+    export PIP_CERT="$certbundle" REQUESTS_CA_BUNDLE="$certbundle"; \
     case "${NER_PROFILE}" in \
       base)  "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" ;; \
       ru-en) "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" "${en_model}"; \
@@ -98,8 +113,10 @@ RUN set -eux; \
              "$py" -c "import spacy; spacy.load('en_core_web_md'); print('NER en OK')" ;; \
       *)     echo "unknown NER_PROFILE=${NER_PROFILE} (want: base|ru-en|en)" >&2; exit 1 ;; \
     esac; \
+    cp /tmp/certifi.orig "$certbundle"; \
     "$py" -c "import corp_llm_gateway.bootstrap; print('gateway bootstrap import OK')"; \
-    rm -f /tmp/*.whl
+    rm -f /tmp/*.whl /tmp/certifi.orig; \
+    rm -rf /tmp/proxy-crt
 # Record what got baked so ops can audit the running image with `docker inspect`.
 LABEL org.corp-llm-gateway.ner-profile="${NER_PROFILE}" \
       org.corp-llm-gateway.en-model-version="${EN_MODEL_VERSION}"
