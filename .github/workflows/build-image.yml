@@ -31,7 +31,7 @@ on:
       litellm_version:
         description: "litellm base image tag (pin; 'main-stable' floats)"
         required: false
-        default: "v1.95.0"
+        default: "v1.101.0"
 
 permissions:
   contents: read
@@ -94,7 +94,7 @@ jobs:
           build-args: |
             NER_PROFILE=${{ matrix.profile }}
             EN_MODEL_VERSION=${{ inputs.en_model_version || '3.8.0' }}
-            LITELLM_VERSION=${{ inputs.litellm_version || 'v1.95.0' }}
+            LITELLM_VERSION=${{ inputs.litellm_version || 'v1.101.0' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

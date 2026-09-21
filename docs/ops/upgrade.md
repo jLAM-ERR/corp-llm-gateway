@@ -84,25 +84,35 @@ unaffected — this is operator auth only.
 `CORP_GATEWAY_RBAC=0` still bypasses RBAC entirely — **local dev only**. Do not
 set it in staging or prod: it disables the operator claim check.
 
-## litellm base image pin: v1.95.0
+## litellm base image pin: v1.101.0
 
-The litellm base image is pinned in six places, all now on **`v1.95.0`** (the
-latest stable — `v1.95.0`, `main-stable` and `latest` resolve to byte-identical
-manifests, verified 2026-08-04):
+The litellm base image is pinned in six places, all now on **`v1.101.0`** (the
+release GitHub marks Latest, 2026-09-15):
 
 | Pin site | Previous | Now |
 |---|---|---|
-| `Dockerfile.gateway` (`ARG LITELLM_VERSION`) — the **published** image Helm and production compose run | `main-stable` | `v1.95.0` |
-| `.github/workflows/build-image.yml` (`litellm_version` input default + the `LITELLM_VERSION` build-arg fallback) | `v1.85.0` | `v1.95.0` |
-| `scripts/release/gates.sh` (`LITELLM_VERSION`) | `v1.85.0` | `v1.95.0` |
-| `docker/demo-litellm/Dockerfile` | `v1.85.0` | `v1.95.0` |
-| `docker/chatgpt-codex/Dockerfile` | `v1.89.3` | `v1.95.0` |
-| `docker/anthropic-oauth/Dockerfile` | `v1.89.3` | `v1.95.0` |
+| `Dockerfile.gateway` (`ARG LITELLM_VERSION`) — the **published** image Helm and production compose run | `v1.95.0` | `v1.101.0` |
+| `.github/workflows/build-image.yml` (`litellm_version` input default + the `LITELLM_VERSION` build-arg fallback) | `v1.95.0` | `v1.101.0` |
+| `scripts/release/gates.sh` (`LITELLM_VERSION`) | `v1.95.0` | `v1.101.0` |
+| `docker/demo-litellm/Dockerfile` | `v1.95.0` | `v1.101.0` |
+| `docker/chatgpt-codex/Dockerfile` | `v1.95.0` | `v1.101.0` |
+| `docker/anthropic-oauth/Dockerfile` | `v1.95.0` | `v1.101.0` |
+
+**The floating tags no longer match the pin.** At the v1.95.0 bump, `v1.95.0`,
+`main-stable` and `latest` resolved to byte-identical manifests. Re-checked with
+`docker manifest inspect` on 2026-09-22, that is no longer true: `main-stable`
+and `latest` are identical to each other (amd64 `sha256:9d60771c…`) but resolve
+to a **different** manifest than `v1.101.0` (amd64 `sha256:266180fb…`). Use the
+explicit tag; do not assume the floating ones are equivalent.
 
 `pyproject.toml` still declares `litellm>=1.40,<2.0` — a floor, deliberately not
-raised: nothing in `src/` needs a v1.95 API. The one litellm symbol the request
+raised: nothing in `src/` needs a v1.101 API. The one litellm symbol the request
 path imports, `ANTHROPIC_OAUTH_TOKEN_PREFIX`, has an in-tree fallback
 (`litellm_hook.py`) and is unchanged since v1.85.0.
+
+Note that litellm 1.101.0 raises its own dependency floors (`openai>=2.20`,
+`pydantic>=2.10`, `httpx>=0.28`, `pydantic-settings>=2.14.1`) and pulls in
+`boto3`/`botocore` transitively.
 
 `Dockerfile.gateway`'s default is now a fixed tag rather than `main-stable`, so
 two builds of the same commit produce the same proxy. Override per build with
@@ -118,18 +128,38 @@ rollback is a redeploy of the previous image or a rebuild with the old tag:
 helm upgrade corp-llm-gateway helm/corp-llm-gateway --set image.tag=<previous-tag>
 
 # or rebuild against the old base
-docker build -f Dockerfile.gateway --build-arg LITELLM_VERSION=v1.85.0 .
+docker build -f Dockerfile.gateway --build-arg LITELLM_VERSION=v1.95.0 .
 ```
 
-Previous pins, for a per-site revert: `Dockerfile.gateway` `main-stable`,
-release-workflow default `v1.85.0`, `scripts/release/gates.sh` `v1.85.0`,
-demo `v1.85.0`, chatgpt-codex `v1.89.3`, anthropic-oauth `v1.89.3`.
+Previous pins, for a per-site revert: all six sites were `v1.95.0`.
+
+Earlier lineage, if you need to go back further than one step: before the
+v1.95.0 bump the sites were `Dockerfile.gateway` `main-stable`, release-workflow
+default `v1.85.0`, `scripts/release/gates.sh` `v1.85.0`, demo `v1.85.0`,
+chatgpt-codex `v1.89.3`, anthropic-oauth `v1.89.3`.
 
 Revert `build-image.yml` and `gates.sh` **together** — `gates.sh` names the
 workflow as the source of truth for the pin, and `tests/test_litellm_pin.py`
 fails if the sites disagree.
 
 ### What was checked before the bump
+
+For **v1.101.0** the checks below were re-run against the installed 1.101.0 wheel
+(`.venv-bench`, Python 3.12) via `tests/litellm_hook/test_litellm_route_assumptions.py`
+and the rest of the suite — 2346 passed, 69 skipped, no failures. They were
+**not** re-probed inside the built v1.101.0 image: the outbound-capture suite
+(`tests/integration/test_anthropic_oauth_outbound.py`) needs a docker pull of the
+pinned image and skipped locally. CI arms it with `CORP_REQUIRE_PROXY_CAPTURE=1`,
+so that run is the one that proves the image itself — treat it as the gate that
+is still outstanding, together with `scripts/release/gates.sh`.
+
+Not a security fix. Two routes still bypass the guardrail hook in v1.101.0 —
+`/v1/messages/count_tokens` and the `/v1/responses` WebSocket — and this release
+adds a third of the same shape, `/v1/responses/input_tokens` (confirmed present
+in the 1.101.0 wheel; neither its handler nor `count_tokens`'s references
+`pre_call_hook`). Tracked separately in `docs/backlog.md`.
+
+The behavioural assertions themselves, originally probed in-image at v1.95.0:
 
 - litellm's Anthropic OAuth branch is unchanged: an `sk-ant-oat…` `api_key`
   yields `authorization: Bearer …` + `anthropic-beta: oauth-2025-04-20` +

@@ -6,12 +6,14 @@
 # the pin at build time: --build-arg LITELLM_VERSION=v1.40.x
 #
 # Pinned, not floating: `main-stable` moves under released tags, so two builds of
-# the same commit could ship different proxies. v1.95.0 is the latest stable —
-# `v1.95.0`, `main-stable` and `latest` resolve to byte-identical manifests
-# (verified 2026-08-04). Keep in sync with .github/workflows/build-image.yml,
+# the same commit could ship different proxies. v1.101.0 is the release GitHub
+# marks Latest (2026-09-15). Unlike at the v1.95.0 bump, the tags have since
+# diverged: `main-stable` and `latest` are identical to each other but resolve to
+# a DIFFERENT manifest than `v1.101.0` (checked 2026-09-22), which is exactly why
+# the pin is a fixed tag. Keep in sync with .github/workflows/build-image.yml,
 # scripts/release/gates.sh and the docker/*/Dockerfile demo profiles; the
 # previous pins and the rollback recipe are in docs/ops/upgrade.md.
-ARG LITELLM_VERSION=v1.95.0
+ARG LITELLM_VERSION=v1.101.0
 
 FROM python:3.12-slim AS build
 WORKDIR /build

@@ -1,7 +1,9 @@
 """Drift guards for the litellm behavior the two auth bridges depend on.
 
-Every assertion here was verified inside the pinned base image
-(`ghcr.io/berriai/litellm:v1.95.0`) as well as against the installed release.
+Every assertion here runs against whichever litellm release is installed, so the
+v1.101.0 bump (`ghcr.io/berriai/litellm:v1.101.0`, the current pin) is covered by
+the 3.12 suite. The in-image probe behind these assertions was last run inside
+`ghcr.io/berriai/litellm:v1.95.0`; v1.101.0 has not been probed in-image yet.
 They run wherever litellm is importable — the local 3.14 venv has no litellm and
 skips, CI's 3.12 job runs them.
 """

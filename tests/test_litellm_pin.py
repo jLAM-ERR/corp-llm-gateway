@@ -21,7 +21,7 @@ PROFILE_DOCKERFILES = (
 _FROM_PIN = re.compile(r"^FROM ghcr\.io/berriai/litellm:(\S+)\s*$", re.MULTILINE)
 _ARG_PIN = re.compile(r"^ARG LITELLM_VERSION=(\S+)\s*$", re.MULTILINE)
 _SHELL_PIN = re.compile(r'^LITELLM_VERSION="([^"]+)"\s*$', re.MULTILINE)
-# `LITELLM_VERSION=${{ inputs.litellm_version || 'v1.95.0' }}`
+# `LITELLM_VERSION=${{ inputs.litellm_version || 'v1.101.0' }}`
 _WORKFLOW_BUILD_ARG_PIN = re.compile(r"LITELLM_VERSION=\$\{\{[^}]*?'([^']+)'\s*\}\}")
 # Release images must be reproducible: a moving tag would let two builds of the
 # same commit ship different proxies.
@@ -64,7 +64,7 @@ def test_every_litellm_pin_site_names_the_same_tag() -> None:
     # Six sites, one version. A partial bump is the failure mode this catches:
     # the gateway image, the release workflow, the local gate and the three demo
     # profiles each pin independently.
-    assert set(_pins().values()) == {"v1.95.0"}
+    assert set(_pins().values()) == {"v1.101.0"}
 
 
 def test_release_workflow_and_local_gate_agree() -> None:
@@ -80,8 +80,8 @@ def test_release_workflow_and_local_gate_agree() -> None:
 
 
 def test_published_image_pin_is_immutable() -> None:
-    # `main-stable` and `latest` float; both resolve to v1.95.0 today and to
-    # something else after the next release.
+    # `main-stable` and `latest` float. As of 2026-09-22 they are identical to
+    # each other and resolve to a manifest that is NOT v1.101.0's.
     pin = _pins()["Dockerfile.gateway"]
 
     assert _IMMUTABLE_TAG.match(pin), f"{pin} is a floating tag"
@@ -91,7 +91,7 @@ def test_upgrade_doc_records_the_pin_and_the_rollback_versions() -> None:
     text = UPGRADE_DOC.read_text()
 
     assert _pins()["Dockerfile.gateway"] in text
-    for previous in ("main-stable", "v1.85.0", "v1.89.3"):
+    for previous in ("v1.95.0", "main-stable", "v1.85.0", "v1.89.3"):
         assert previous in text
 
 
