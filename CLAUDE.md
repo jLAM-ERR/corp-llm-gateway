@@ -115,7 +115,7 @@ docker compose run --rm e2e pytest -q tests/e2e
   `ruff --fix` + `ruff-format` in pre-commit; CI's lint job runs `ruff check`
   AND `ruff format --check` on every PR). No type checker is configured.
 - Async-first (LiteLLM hooks are async); pytest-asyncio mode = "auto"
-- Default branch: `master` (NOT main)
+- Default branch: `main`; the live release line is `release/1.0.x`
 - CI: GitHub Actions (`.github/workflows/`)
 - httpx for HTTP, Redis via `redis.asyncio`, fakeredis for tests
 - First-time setup: `pip install -e ".[dev]" && pre-commit install`
@@ -209,7 +209,7 @@ follow the established interface-registry pattern:
 
 ## Things NOT to do
 
-- Don't rename `master` to `main`.
+- Don't rename the default branch (`main`).
 - CI is GitHub Actions (`.github/workflows/`); git hosting is GitHub. Keep CI on
   GitHub Actions — don't add other CI systems.
 - Don't add GPU deps.

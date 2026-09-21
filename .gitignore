@@ -60,3 +60,7 @@ scripts/bench_local_first.py
 # Corp NER connection doc — holds the internal endpoint/credentials. Never commit.
 connect-corp-ner.pdf
 *-corp-ner.pdf
+
+# revmux review archive — per-round agent transcripts, local only. The project
+# profile (.revmux/profile.md) IS tracked; only the task archive is ignored.
+.revmux/tasks/
