@@ -32,7 +32,7 @@ from corp_llm_gateway.route_gate.classify import (
     ROUTE_GATE_WEBSOCKET,
     classify,
 )
-from corp_llm_gateway.route_gate.table import Entry, Verdict
+from corp_llm_gateway.route_gate.table import HTTP_METHODS, Entry, Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ class RouteGateMiddleware:
         app: ASGIApp,
         *,
         metrics: MetricsExporter,
-        audit_logger: AuditLogger | None,
+        audit_logger: AuditLogger,
         extras: Mapping[tuple[str, str], Entry] | None = None,
     ) -> None:
         self.app = app
@@ -120,8 +120,14 @@ class RouteGateMiddleware:
                 upgrade_header=_upgrade_header(scope),
                 extras=self._extras,
             )
-        except Exception:
-            logger.exception("route_gate_classify_failed method=%s", method)
+        except Exception as exc:
+            # Neither the path nor a traceback: an exception message can quote
+            # the input it choked on, and gateway stdout is an audited surface.
+            logger.error(
+                "route_gate_classify_failed method=%s error=%s",
+                _safe_method(method),
+                type(exc).__name__,
+            )
             await self._refuse(scope, receive, send, method, path, ROUTE_GATE_ERROR, _ERROR_WHY)
             return
 
@@ -132,7 +138,12 @@ class RouteGateMiddleware:
         if decision.verdict is Verdict.REWRITTEN and not self.armed:
             await self._refuse(scope, receive, send, method, path, ROUTE_GATE_UNARMED, _UNARMED_WHY)
             return
-        await self.app(scope, receive, send)
+        if decision.verdict is Verdict.PASSTHROUGH or decision.verdict is Verdict.REWRITTEN:
+            await self.app(scope, receive, send)
+            return
+        # A verdict this middleware does not know is a gate defect, not a pass.
+        logger.error("route_gate_unknown_verdict method=%s", _safe_method(method))
+        await self._refuse(scope, receive, send, method, path, ROUTE_GATE_ERROR, _ERROR_WHY)
 
     async def _refuse(
         self,
@@ -147,12 +158,20 @@ class RouteGateMiddleware:
         self._metrics.record_block(reason)
         if reason in _FAILURES:
             self._metrics.record_failure(COMPONENT)
-        # No path and no request byte in the log line: the audit pipeline reads
-        # gateway stdout, and a path can carry caller content (M1-14).
-        logger.warning("route_gate_blocked method=%s block_reason=%s why=%s", method, reason, why)
+        scope_type = str(scope["type"])
+        # No path, no header and no request byte: gateway stdout is an audited
+        # surface (M1-14) and a path can carry caller content. The method is
+        # narrowed to the known verbs because an HTTP method is a caller-chosen
+        # token; `why` is a fixed string in every branch, never a request byte.
+        logger.warning(
+            "route_gate_blocked method=%s scope=%s block_reason=%s why=%s",
+            _safe_method(method),
+            scope_type,
+            reason,
+            why,
+        )
         await self._emit_audit(reason)
 
-        scope_type = scope["type"]
         if scope_type == "websocket":
             await self._refuse_handshake(scope, receive, send, method, path, reason)
         elif scope_type == "http":
@@ -168,6 +187,8 @@ class RouteGateMiddleware:
         path: str,
         reason: str,
     ) -> None:
+        # The block is already counted: a handshake that disconnects instead of
+        # connecting is still a refused route, and it must never be forwarded.
         # ASGI forbids sending anything before the connect event is received.
         message = await receive()
         if message["type"] != "websocket.connect":
@@ -187,8 +208,6 @@ class RouteGateMiddleware:
         await send({"type": "websocket.close", "code": 1008})
 
     async def _emit_audit(self, reason: str) -> None:
-        if self._audit is None:
-            return
         # The gate refuses before litellm assigns a call id, so the record gets
         # its own id. ALWAYS fields only — there is no request identity yet.
         event = AuditEvent(
@@ -240,6 +259,10 @@ async def _send_json(send: Send, status: int, payload: dict[str, Any]) -> None:
     body = _encode(payload)
     await send({"type": "http.response.start", "status": status, "headers": _headers(body)})
     await send({"type": "http.response.body", "body": body})
+
+
+def _safe_method(method: str) -> str:
+    return method if method in HTTP_METHODS else "other"
 
 
 def _upgrade_header(scope: Scope) -> str | None:

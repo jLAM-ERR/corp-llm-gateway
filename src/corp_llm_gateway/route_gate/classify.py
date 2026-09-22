@@ -63,7 +63,7 @@ def classify(
             "websocket frames never reach the hook, so nothing is rewritten",
         )
     if scope_type != "http":
-        return Decision(Verdict.REFUSE, ROUTE_GATE_ERROR, f"unknown scope type {scope_type!r}")
+        return Decision(Verdict.REFUSE, ROUTE_GATE_ERROR, "unsupported ASGI scope type")
     if _malformed(path, raw_path):
         return Decision(
             Verdict.REFUSE,
@@ -74,7 +74,11 @@ def classify(
     verb = method.upper()
     entry = _resolve(verb, path, extras)
     if entry is None:
-        return Decision(Verdict.REFUSE, ROUTE_GATE_UNLISTED, f"no table entry for {verb} {path}")
+        # Static on purpose: `why` is logged, and the path can carry caller
+        # content (M1-14, pod stdout). The refusal body already names the route.
+        return Decision(
+            Verdict.REFUSE, ROUTE_GATE_UNLISTED, "no table entry for this method and path"
+        )
     if entry.verdict is Verdict.REFUSE:
         return Decision(Verdict.REFUSE, ROUTE_GATE_LISTED, entry.why)
     return Decision(entry.verdict, None, entry.why)

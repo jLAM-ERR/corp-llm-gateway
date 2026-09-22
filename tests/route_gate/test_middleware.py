@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -87,7 +88,7 @@ def _gate(
     gate = RouteGateMiddleware(
         stub,
         metrics=metrics if metrics is not None else _RecordingMetrics(),
-        audit_logger=AuditLogger(sink, "test") if sink is not None else None,
+        audit_logger=AuditLogger(sink if sink is not None else ListSink(), "test"),
         extras=extras,
     )
     if armed:
@@ -240,7 +241,7 @@ async def test_every_documented_block_reason_is_reachable() -> None:
         {"type": "websocket", "path": "/v1/responses", "headers": []},
         incoming=[{"type": "websocket.connect"}],
     )
-    await _drive(gate, _http_scope("POST", "/v1/messages", headers=[(b"upgrade", b"h2c")]))
+    await _drive(gate, _http_scope("POST", "/v1/messages", headers=[(b"upgrade", b"websocket")]))
     assert set(metrics.blocks) <= BLOCK_REASONS
     assert set(metrics.blocks) == {
         ROUTE_GATE_UNLISTED,
@@ -396,7 +397,59 @@ async def test_an_unknown_scope_type_is_not_forwarded() -> None:
     sent = await _drive(_gate(stub, metrics=metrics, armed=True), {"type": "quic", "headers": []})
     assert sent == []
     assert metrics.blocks == [ROUTE_GATE_ERROR]
+    assert metrics.failures == [COMPONENT]
     assert not stub.called
+
+
+# ── logging ─────────────────────────────────────────────────────────────────
+
+
+def _log_text(caplog: pytest.LogCaptureFixture) -> str:
+    return "\n".join(record.getMessage() for record in caplog.records) + caplog.text
+
+
+async def test_an_unlisted_refusal_logs_no_path(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="corp_llm_gateway.route_gate.middleware")
+    await _drive(_gate(_Stub()), _http_scope("POST", f"/v1/{CANARY}/route"))
+    text = _log_text(caplog)
+    assert ROUTE_GATE_UNLISTED in text
+    assert CANARY not in text
+
+
+async def test_a_malformed_refusal_logs_no_path(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="corp_llm_gateway.route_gate.middleware")
+    path = f"/v1/messages/../{CANARY}"
+    await _drive(
+        _gate(_Stub()),
+        _http_scope("POST", path, raw_path=f"/v1/messages/..%2f{CANARY}".encode()),
+    )
+    text = _log_text(caplog)
+    assert ROUTE_GATE_MALFORMED in text
+    assert CANARY not in text
+
+
+async def test_a_classifier_failure_logs_neither_path_nor_exception_message(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(f"cannot parse {CANARY}")
+
+    monkeypatch.setattr("corp_llm_gateway.route_gate.middleware.classify", boom)
+    caplog.set_level(logging.DEBUG, logger="corp_llm_gateway.route_gate.middleware")
+    await _drive(_gate(_Stub()), _http_scope("POST", f"/v1/{CANARY}"))
+    text = _log_text(caplog)
+    assert "route_gate_classify_failed" in text
+    assert "RuntimeError" in text
+    assert CANARY not in text
+
+
+async def test_a_refusal_logs_only_a_known_method(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="corp_llm_gateway.route_gate.middleware")
+    # An HTTP method is a caller-chosen token, so it is narrowed before logging.
+    await _drive(_gate(_Stub()), _http_scope(CANARY, "/v1/models"))
+    text = _log_text(caplog)
+    assert "method=other" in text
+    assert CANARY not in text
 
 
 # ── audit ───────────────────────────────────────────────────────────────────

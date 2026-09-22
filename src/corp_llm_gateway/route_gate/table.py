@@ -26,7 +26,7 @@ HTTP_METHODS: frozenset[str] = frozenset(
 
 # An extra is matched against the decoded path exactly as received, so a path
 # carrying any of these never matches anything — it is an operator typo.
-_BAD_EXTRA_PATH_TOKENS: tuple[str, ...] = ("..", "//", "%", "?", "#")
+_BAD_EXTRA_PATH_TOKENS: tuple[str, ...] = ("..", "//", "%", "?", "#", "\x00")
 
 
 class Verdict(Enum):

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 
 from corp_llm_gateway.route_gate import (
@@ -210,3 +213,21 @@ def test_a_justification_on_a_non_passthrough_entry_is_rejected() -> None:
 def test_an_entry_whose_verdict_is_not_a_verdict_is_rejected() -> None:
     with pytest.raises(ValueError, match="needs a Verdict"):
         Entry("passthrough", "why")  # type: ignore[arg-type]
+
+
+def test_the_table_imports_without_pulling_in_audit_or_metrics() -> None:
+    # `config check` resolves the extras key; it must not drag the middleware's
+    # audit/metrics stack in through the package __init__.
+    source = (
+        "import sys\n"
+        "from corp_llm_gateway.route_gate.table import parse_extras\n"
+        "parse_extras('GET /internal/ops-status')\n"
+        "print(','.join(m for m in sys.modules if m.startswith('corp_llm_gateway.')))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True, check=True
+    ).stdout
+    loaded = set(out.strip().split(","))
+    assert not {
+        m for m in loaded if m.startswith(("corp_llm_gateway.audit", "corp_llm_gateway.metrics"))
+    }

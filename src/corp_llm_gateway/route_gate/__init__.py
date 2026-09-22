@@ -1,5 +1,7 @@
 """Default-deny route gate: classify every request before litellm's router."""
 
+from typing import TYPE_CHECKING
+
 from corp_llm_gateway.route_gate.classify import (
     BLOCK_REASONS,
     ROUTE_GATE_ERROR,
@@ -11,7 +13,6 @@ from corp_llm_gateway.route_gate.classify import (
     Decision,
     classify,
 )
-from corp_llm_gateway.route_gate.middleware import COMPONENT, RouteGateMiddleware
 from corp_llm_gateway.route_gate.table import (
     GATEWAY_ROUTE_TABLE,
     HTTP_METHODS,
@@ -22,6 +23,22 @@ from corp_llm_gateway.route_gate.table import (
     lookup,
     parse_extras,
 )
+
+if TYPE_CHECKING:
+    from corp_llm_gateway.route_gate.middleware import RouteGateMiddleware
+
+# `middleware` pulls in audit + metrics; `config check` and settings.validate()
+# only need the table, so the import happens on first attribute access.
+_LAZY = {"COMPONENT", "RouteGateMiddleware"}
+
+
+def __getattr__(name: str) -> object:
+    if name not in _LAZY:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from corp_llm_gateway.route_gate import middleware
+
+    return getattr(middleware, name)
+
 
 __all__ = [
     "BLOCK_REASONS",

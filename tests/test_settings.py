@@ -385,7 +385,9 @@ def test_validate_accepts_route_gate_extras_and_resolves_them(
     assert all(entry.verdict is Verdict.PASSTHROUGH for entry in extras.values())
 
 
-def test_route_gate_extras_default_to_none(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_route_gate_extras_default_to_empty(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
     assert config.route_gate_extras() == {}
 
