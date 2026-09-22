@@ -55,6 +55,23 @@ def test_every_exact_key_is_an_uppercase_method_and_an_absolute_path() -> None:
             assert path.startswith("/"), f"{method} {path}"
 
 
+def test_every_regex_row_is_an_uppercase_method_and_an_absolute_pattern() -> None:
+    for method, pattern, _ in LITELLM_REGEX_TABLE:
+        assert method in HTTP_METHODS, f"{method} {pattern.pattern}"
+        assert method == method.upper(), f"{method} {pattern.pattern}"
+        assert pattern.pattern.startswith("\\A/"), f"{method} {pattern.pattern}"
+
+
+def test_no_head_route_is_rewritten() -> None:
+    # HEAD carries no body; a REWRITTEN HEAD row would promise a rewrite that
+    # cannot happen. classify() downgrades one, but none may exist.
+    rows = [(method, entry) for table in EXACT_TABLES for (method, _), entry in table.items()]
+    rows += [(method, entry) for method, _, entry in LITELLM_REGEX_TABLE]
+    assert [
+        method for method, entry in rows if method == "HEAD" and entry.verdict is Verdict.REWRITTEN
+    ] == []
+
+
 def test_no_table_lists_a_websocket_route() -> None:
     # Handshakes are refused at scope level; a WEBSOCKET row could only mislead.
     methods = {method for table in EXACT_TABLES for method, _ in table}
@@ -162,11 +179,16 @@ def test_regex_table_resolves_path_parameters(method: str, path: str, verdict: V
     assert entry is not None and entry.verdict is verdict
 
 
-def test_gateway_routes_answer_for_get_and_head() -> None:
-    for method in ("GET", "HEAD"):
-        assert lookup(method, "/healthz/live") is not None
-        assert lookup(method, "/healthz/ready") is not None
-    assert lookup("GET", "/metrics") is not None
+def test_the_gateway_owned_routes_are_listed_for_get() -> None:
+    # HEAD needs no row of its own — classify() inherits the GET verdict.
+    for path in ("/healthz/live", "/healthz/ready", "/metrics"):
+        assert lookup("GET", path) is not None, path
+    assert lookup("HEAD", "/healthz/live") is None
+
+
+def test_issue_token_is_not_in_the_gateway_table() -> None:
+    # Task 4 mounts /healthz/* and /metrics only; issuance stays unlisted.
+    assert lookup("POST", "/internal/issue-token") is None
 
 
 def test_lookup_returns_none_for_an_unknown_pair() -> None:
@@ -183,3 +205,8 @@ def test_an_entry_without_a_why_is_rejected() -> None:
 def test_a_justification_on_a_non_passthrough_entry_is_rejected() -> None:
     with pytest.raises(ValueError, match="PASSTHROUGH entries only"):
         Entry(Verdict.REWRITTEN, "why", justification="no egress")
+
+
+def test_an_entry_whose_verdict_is_not_a_verdict_is_rejected() -> None:
+    with pytest.raises(ValueError, match="needs a Verdict"):
+        Entry("passthrough", "why")  # type: ignore[arg-type]

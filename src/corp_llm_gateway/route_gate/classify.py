@@ -63,7 +63,7 @@ def classify(
             "websocket frames never reach the hook, so nothing is rewritten",
         )
     if scope_type != "http":
-        return Decision(Verdict.REFUSE, ROUTE_GATE_UNLISTED, f"unknown scope type {scope_type!r}")
+        return Decision(Verdict.REFUSE, ROUTE_GATE_ERROR, f"unknown scope type {scope_type!r}")
     if _malformed(path, raw_path):
         return Decision(
             Verdict.REFUSE,
@@ -95,19 +95,25 @@ def _malformed(path: str, raw_path: bytes | None) -> bool:
     return any(token in path for token in _DECODED_MALFORMED)
 
 
+_HEAD_NEVER_REWRITTEN = Entry(
+    Verdict.REFUSE, "HEAD carries no body to rewrite; a REWRITTEN verdict cannot apply to it"
+)
+
+
 def _resolve(
     method: str, path: str, extras: Mapping[tuple[str, str], Entry] | None
 ) -> Entry | None:
     entry = _direct(method, path, extras)
-    if entry is not None or method != "HEAD":
+    if method != "HEAD":
         return entry
-    # Starlette answers HEAD on every route that declares GET.
-    inherited = _direct("GET", path, extras)
-    if inherited is None:
+    if entry is None:
+        # Starlette answers HEAD on every route that declares GET.
+        entry = _direct("GET", path, extras)
+    if entry is None:
         return None
-    if inherited.verdict is Verdict.REWRITTEN:
-        return Entry(Verdict.REFUSE, "HEAD carries no body to rewrite; the GET entry is REWRITTEN")
-    return inherited
+    if entry.verdict is Verdict.REWRITTEN:
+        return _HEAD_NEVER_REWRITTEN
+    return entry
 
 
 def _direct(method: str, path: str, extras: Mapping[tuple[str, str], Entry] | None) -> Entry | None:
@@ -116,4 +122,9 @@ def _direct(method: str, path: str, extras: Mapping[tuple[str, str], Entry] | No
         return entry
     if extras is None:
         return None
-    return extras.get((method, path))
+    extra = extras.get((method, path))
+    # An extra may only widen PASSTHROUGH; it can neither promise a rewrite nor
+    # carry a refusal of its own.
+    if extra is None or extra.verdict is not Verdict.PASSTHROUGH:
+        return None
+    return extra

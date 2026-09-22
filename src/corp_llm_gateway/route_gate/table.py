@@ -24,6 +24,10 @@ HTTP_METHODS: frozenset[str] = frozenset(
     {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 )
 
+# An extra is matched against the decoded path exactly as received, so a path
+# carrying any of these never matches anything — it is an operator typo.
+_BAD_EXTRA_PATH_TOKENS: tuple[str, ...] = ("..", "//", "%", "?", "#")
+
 
 class Verdict(Enum):
     PASSTHROUGH = "passthrough"
@@ -42,6 +46,8 @@ class Entry:
     justification: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.verdict, Verdict):
+            raise ValueError(f"route table entry needs a Verdict, got {self.verdict!r}")
         if not self.why.strip():
             raise ValueError("route table entry needs a non-empty why")
         if self.justification is not None and not self.justification.strip():
@@ -204,23 +210,25 @@ LITELLM_REGEX_TABLE: list[tuple[str, re.Pattern[str], Entry]] = [
     ),
 ]
 
+# Only what Task 4 mounts on litellm's app: `build_health_router()` at
+# /healthz/* and the metrics exposition at /metrics. HEAD needs no row — it
+# inherits the GET verdict in classify.py, and the router answers 405 to it.
+# POST /internal/issue-token is deliberately absent: the router is not mounted
+# for it, so the gate refuses it as unlisted.
 GATEWAY_ROUTE_TABLE: dict[tuple[str, str], Entry] = {
     ("GET", "/healthz/extensions"): _passthrough("gateway-owned health check; no user text"),
     ("GET", "/healthz/live"): _passthrough("gateway-owned liveness probe; Helm probes it"),
     ("GET", "/healthz/ready"): _passthrough("gateway-owned readiness probe; Helm probes it"),
     ("GET", "/healthz/sanitization"): _passthrough("gateway-owned health check; no user text"),
     ("GET", "/metrics"): _passthrough("gateway-owned Prometheus exposition; no user text"),
-    ("HEAD", "/healthz/extensions"): _passthrough("gateway-owned health check; no user text"),
-    ("HEAD", "/healthz/live"): _passthrough("gateway-owned liveness probe; Helm probes it"),
-    ("HEAD", "/healthz/ready"): _passthrough("gateway-owned readiness probe; Helm probes it"),
-    ("HEAD", "/healthz/sanitization"): _passthrough("gateway-owned health check; no user text"),
-    ("HEAD", "/metrics"): _passthrough("gateway-owned Prometheus exposition; no user text"),
 }
 
 
 def lookup(method: str, path: str) -> Entry | None:
-    """Exact litellm table, then gateway table, then the anchored regex table.
-    Returns ``None`` when no table knows the pair — the caller must refuse."""
+    """Exact tables (litellm, then gateway), then the anchored regex table — the
+    order Technical Details fixes. The exact tables are disjoint, so which of
+    the two answers first is not observable. Returns ``None`` when no table
+    knows the pair — the caller must refuse."""
     verb = method.upper()
     entry = LITELLM_ROUTE_TABLE.get((verb, path)) or GATEWAY_ROUTE_TABLE.get((verb, path))
     if entry is not None:
@@ -251,6 +259,13 @@ def parse_extras(raw: str | Iterable[str] | None) -> dict[tuple[str, str], Entry
             raise ValueError(f"route gate extra has unknown method {fields[0]!r} in {item!r}")
         if not path.startswith("/"):
             raise ValueError(f"route gate extra path must start with '/', got {item!r}")
+        bad = [token for token in _BAD_EXTRA_PATH_TOKENS if token in path]
+        if bad or any(char.isspace() for char in path):
+            offending = ", ".join(bad) or "whitespace"
+            raise ValueError(
+                f"route gate extra path must be a plain absolute path — {offending} "
+                f"in {item!r} matches nothing; the gate matches the decoded path as received"
+            )
         extras[(method, path)] = _passthrough(
             f"operator extra: CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH lists {method} {path}"
         )

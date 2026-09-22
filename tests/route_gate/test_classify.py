@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from corp_llm_gateway.route_gate import (
+    LITELLM_ROUTE_TABLE,
+    ROUTE_GATE_ERROR,
     ROUTE_GATE_LISTED,
     ROUTE_GATE_MALFORMED,
     ROUTE_GATE_UNLISTED,
@@ -58,10 +60,10 @@ def test_an_upgrade_header_on_an_admitted_path_is_refused() -> None:
     assert decision.block_reason == ROUTE_GATE_WEBSOCKET
 
 
-def test_an_unknown_scope_type_is_refused() -> None:
+def test_an_unknown_scope_type_is_refused_as_a_gate_error() -> None:
     decision = classify("POST", "/v1/messages", b"/v1/messages", scope_type="quic")
     assert decision.verdict is Verdict.REFUSE
-    assert decision.block_reason == ROUTE_GATE_UNLISTED
+    assert decision.block_reason == ROUTE_GATE_ERROR
 
 
 @pytest.mark.parametrize(
@@ -89,8 +91,24 @@ def test_encoded_and_traversing_paths_are_refused_as_malformed(path: str, raw_pa
     assert decision.block_reason == ROUTE_GATE_MALFORMED
 
 
+def test_a_decoded_traversal_is_malformed_even_without_a_raw_path() -> None:
+    decision = classify("POST", "/v1/messages/../key/generate", None)
+    assert decision.verdict is Verdict.REFUSE
+    assert decision.block_reason == ROUTE_GATE_MALFORMED
+
+
 def test_head_inherits_the_get_entry() -> None:
     decision = classify("HEAD", "/health/liveliness", b"/health/liveliness")
+    assert decision.verdict is Verdict.PASSTHROUGH
+
+
+def test_head_inherits_a_get_entry_from_the_regex_table() -> None:
+    decision = classify("HEAD", "/v1/responses/resp_1", b"/v1/responses/resp_1")
+    assert decision.verdict is Verdict.PASSTHROUGH
+
+
+def test_head_on_a_gateway_route_inherits_its_get_entry() -> None:
+    decision = classify("HEAD", "/healthz/live", b"/healthz/live")
     assert decision.verdict is Verdict.PASSTHROUGH
 
 
@@ -100,10 +118,16 @@ def test_head_on_a_route_with_no_get_entry_is_unlisted() -> None:
     assert decision.block_reason == ROUTE_GATE_UNLISTED
 
 
-def test_head_never_inherits_a_rewritten_verdict() -> None:
-    # No shipped GET entry is REWRITTEN, so the rule is asserted on a synthetic one.
-    extras = {("GET", "/synthetic/rewrite"): Entry(Verdict.REWRITTEN, "synthetic")}
-    decision = classify("HEAD", "/synthetic/rewrite", b"/synthetic/rewrite", extras=extras)
+@pytest.mark.parametrize("seeded_method", ["GET", "HEAD"])
+def test_head_is_never_rewritten(monkeypatch: pytest.MonkeyPatch, seeded_method: str) -> None:
+    # No shipped entry is HEAD- or GET-REWRITTEN, so the rule is asserted on a
+    # synthetic table row — both the inherited and the direct spelling.
+    monkeypatch.setitem(
+        LITELLM_ROUTE_TABLE,
+        (seeded_method, "/synthetic/rewrite"),
+        Entry(Verdict.REWRITTEN, "synthetic"),
+    )
+    decision = classify("HEAD", "/synthetic/rewrite", b"/synthetic/rewrite")
     assert decision.verdict is Verdict.REFUSE
     assert decision.block_reason == ROUTE_GATE_LISTED
 
@@ -120,13 +144,27 @@ def test_extras_can_only_be_passthrough() -> None:
         assert entry.verdict is Verdict.PASSTHROUGH
 
 
-def test_an_extra_never_overrides_a_listed_refusal() -> None:
-    extras = parse_extras(["POST /v1/messages/count_tokens"])
-    decision = classify(
-        "POST", "/v1/messages/count_tokens", b"/v1/messages/count_tokens", extras=extras
-    )
+@pytest.mark.parametrize("path", ["/v1/messages/count_tokens", "/search/brave"])
+def test_an_extra_never_overrides_a_listed_refusal(path: str) -> None:
+    # The second path is refused by the regex table, which extras never reach.
+    extras = parse_extras([f"POST {path}"])
+    decision = classify("POST", path, path.encode(), extras=extras)
     assert decision.verdict is Verdict.REFUSE
     assert decision.block_reason == ROUTE_GATE_LISTED
+
+
+def test_an_extra_can_never_promise_a_rewrite() -> None:
+    extras = {("POST", "/internal/ops-webhook"): Entry(Verdict.REWRITTEN, "hand-built")}
+    decision = classify("POST", "/internal/ops-webhook", b"/internal/ops-webhook", extras=extras)
+    assert decision.verdict is Verdict.REFUSE
+    assert decision.block_reason == ROUTE_GATE_UNLISTED
+
+
+def test_issue_token_is_unlisted_because_nothing_mounts_it() -> None:
+    # The health router is mounted for /healthz/* only; issuance stays refused.
+    decision = classify("POST", "/internal/issue-token", b"/internal/issue-token")
+    assert decision.verdict is Verdict.REFUSE
+    assert decision.block_reason == ROUTE_GATE_UNLISTED
 
 
 @pytest.mark.parametrize(
@@ -138,6 +176,11 @@ def test_an_extra_never_overrides_a_listed_refusal() -> None:
         "POST internal/ops",
         "WEBSOCKET /v1/responses",
         "TRACE /internal/ops",
+        "POST /internal/../v1/messages",
+        "POST //internal/ops",
+        "POST /internal/%2fops",
+        "POST /internal/ops?x=1",
+        "POST /internal/ops#frag",
     ],
 )
 def test_a_malformed_extra_raises_at_load(raw: str) -> None:
