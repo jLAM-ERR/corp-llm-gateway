@@ -406,7 +406,12 @@ def test_the_route_gate_reasons_match_the_gate_itself() -> None:
 
 
 def _returned_string_literals(module: object) -> set[str]:
-    """Every `return "literal"` in a module — the reason codes it can produce."""
+    """Every `return "literal"` in a module — the reason codes it can produce.
+
+    Literal returns only: a reason built at runtime (an f-string, a name) is
+    invisible here, so a block site that stops returning literals silently
+    narrows this check.
+    """
     source = Path(module.__file__).read_text(encoding="utf-8")  # type: ignore[attr-defined]
     return {
         node.value.value
@@ -437,7 +442,10 @@ def test_every_enumerated_block_reason_is_documented_in_the_audit_schema() -> No
     schema = (Path(gateway_package.__file__).parents[2] / "docs" / "audit-schema.md").read_text(
         encoding="utf-8"
     )
-    row = next(line for line in schema.splitlines() if line.startswith("| `block_reason` |"))
+    row = next(
+        (line for line in schema.splitlines() if line.startswith("| `block_reason` |")), None
+    )
+    assert row is not None, "docs/audit-schema.md has no `block_reason` row"
     missing = [reason for reason in ALL_BLOCK_REASONS if f"`{reason}`" not in row]
 
     assert not missing, missing

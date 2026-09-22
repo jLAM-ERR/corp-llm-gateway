@@ -68,9 +68,13 @@ Four steps, run in order:
 
 1. **`bash scripts/release/gates.sh`** — pre-push gate battery. Builds both
    image profiles (`ru-en`, `en`) locally against `Dockerfile.gateway`, runs
-   a runtime import + NER-load check inside each built image, smoke-tests
-   the entrypoint (`--help`), and parses `build-image.yml` as YAML. Run this
-   before shipping — it catches image-build breakage before CI does.
+   a runtime import + NER-load check inside each built image, runs the `en`
+   image with **no litellm config mounted** and requires exit **78**
+   (`EX_CONFIG` — the fail-closed startup path of
+   `python -m corp_llm_gateway.serve`, see
+   [`security.md §14`](../security.md#14-the-route-gate)), and parses
+   `build-image.yml` as YAML. Run this before shipping — it catches
+   image-build breakage before CI does.
 
 2. **`bash scripts/release/ship.sh <topic-branch>`** — pushes the branch,
    opens a PR against the discovered `release/*` branch (`gh pr create

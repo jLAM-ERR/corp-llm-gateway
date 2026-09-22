@@ -77,11 +77,12 @@ echo "== gate: entrypoint smoke =="
 # (EX_CONFIG) instead of serving: litellm's own lifespan would have started with
 # no guardrail callback at all.
 smoke_status=0
-docker run --rm gw-test:en >/dev/null 2>&1 || smoke_status=$?
+smoke_out=$(docker run --rm gw-test:en 2>&1) || smoke_status=$?
 if [[ "${smoke_status}" -eq 78 ]]; then
   pass "entrypoint refuses to serve without litellm's config (exit 78, en)"
 else
-  fail "entrypoint smoke (en): expected exit 78 without a config, got ${smoke_status}"
+  fail "entrypoint smoke (en): expected exit 78 without a config, got ${smoke_status}
+${smoke_out}"
 fi
 
 echo "ALL GATES PASSED"

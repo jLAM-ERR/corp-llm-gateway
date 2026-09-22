@@ -77,9 +77,8 @@ from corp_llm_gateway.route_gate import RouteGateMiddleware
 
 # `corp_llm_gateway.bootstrap` is NOT imported here: it reaches
 # `litellm_hook`, which imports litellm itself (the guardrail has to subclass
-# `CustomLogger`), and importing litellm fetches the model cost map. Step 3 is
-# where that belongs — after the config has been accepted. It is imported at
-# step 4 instead.
+# `CustomLogger`), and importing litellm fetches the model cost map. litellm is
+# imported at step 3, after the config has been accepted; `bootstrap` at step 4.
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +102,11 @@ class _BootJsonFormatter(logging.Formatter):
     docstring defines — the import at step 3 is what fetches the cost map, after
     the config has been accepted. The keys are the ones litellm's formatter
     writes first (``litellm/_logging.py:459-502``).
+
+    It has **no redaction filter** — litellm's own handler carries
+    ``_secret_filter``, this one cannot (same import bar). So a boot line must
+    never carry a DSN, a token or any other credential: log the setting's name
+    and the decision, never its value.
     """
 
     def format(self, record: logging.LogRecord) -> str:

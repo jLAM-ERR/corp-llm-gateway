@@ -57,10 +57,11 @@ pre-scan sees exactly what will be sanitized.
 ### Refused at the route gate (never reaches a provider)
 
 Coverage above describes what the guardrail rewrites on the routes it runs on.
-**Nine** litellm handlers that take user text never call `pre_call_hook` at all —
-the three confirmed bypasses (both token counters and the Responses WebSocket)
-plus the six utility routes found in review — and a further class reaches the
-hook but is not rewritten, because the hook reads only `messages` / `input`.
+A class of litellm handlers takes user text and never calls `pre_call_hook` at
+all — the three confirmed bypasses (both token counters and the Responses
+WebSocket) and every other hook-less handler the table refuses — and a further
+class reaches the hook but is not rewritten, because the hook reads only
+`messages` / `input`.
 Since the route gate (§14) all of them are refused before litellm's router sees
 the request — default-deny, so a route litellm adds in a future release is
 refused too until it is classified.
@@ -778,14 +779,14 @@ A rollout that needs both has to wait for the header-layout decision.
 ## 14. The route gate
 
 `CorpLlmGuardrail` is a litellm **callback**, and litellm calls it only from the
-handlers that go through its shared request processor. **Nine** handlers in the
-pinned litellm (1.101.0) do not — the three confirmed bypasses plus six utility
-routes — and reached a provider with **no `X-Corp-Auth` check, no sanitization,
-no Stage-5 DLP scan and no audit record**; a further class reached the hook but
-was never rewritten, because the hook reads only `messages` and `input`. §2 lists
-all of them. The route gate closes that class of hole for
-good: whatever litellm's routers do, a request now has to be classified before
-one of them can answer it.
+handlers that go through its shared request processor. Handlers in the pinned
+litellm (1.101.0) that do not — the three confirmed bypasses and every other
+hook-less handler the table refuses — reached a provider with **no
+`X-Corp-Auth` check, no sanitization, no Stage-5 DLP scan and no audit
+record**; a further class reached the hook but was never rewritten, because the
+hook reads only `messages` and `input`. §2 lists all of them. The route gate
+closes that class of hole for good: whatever litellm's routers do, a request now
+has to be classified before one of them can answer it.
 
 ### Where it runs
 

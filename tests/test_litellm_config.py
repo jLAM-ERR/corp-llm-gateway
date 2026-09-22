@@ -177,7 +177,13 @@ def test_pass_through_endpoints_is_refused(tmp_path: Path, document: str) -> Non
     assert found and "pass_through_endpoints is refused" in found[0]
 
 
-def test_json_logs_is_read_from_the_file(valid: Path, tmp_path: Path) -> None:
+def test_json_logs_is_read_from_the_file(
+    valid: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The env var wins over the file, so a shell carrying it would make the
+    # two `is False` assertions below describe the shell, not the loader.
+    monkeypatch.delenv("JSON_LOGS", raising=False)
+
     assert litellm_config.json_logs(valid) is True
 
     without = tmp_path / "plain.yaml"

@@ -169,20 +169,23 @@ _REFUSAL_SCRIPT = f"""
 """
 
 
-def test_a_missing_config_exits_78_before_litellms_app_is_imported(tmp_path: Path) -> None:
-    result = _run(_REFUSAL_SCRIPT, tmp_path / "absent.yaml")
-
-    assert result["exit_code"] == 78
-    assert result["proxy_imported"] is False
+@pytest.fixture(scope="module")
+def missing_config_boot(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    return _run(_REFUSAL_SCRIPT, tmp_path_factory.mktemp("absent") / "absent.yaml")
 
 
-def test_step_1_refuses_before_litellm_itself_is_imported(tmp_path: Path) -> None:
+def test_a_missing_config_exits_78_before_litellms_app_is_imported(
+    missing_config_boot: dict,
+) -> None:
+    assert missing_config_boot["exit_code"] == 78
+    assert missing_config_boot["proxy_imported"] is False
+
+
+def test_step_1_refuses_before_litellm_itself_is_imported(missing_config_boot: dict) -> None:
     # Not just the app: importing `litellm` at all fetches the model cost map and
     # installs its logging. Step 3 is where that belongs, so nothing the boot
     # window needs — the JSON formatter included — may pull it in earlier.
-    result = _run(_REFUSAL_SCRIPT, tmp_path / "absent.yaml")
-
-    assert result["litellm_imported"] is False
+    assert missing_config_boot["litellm_imported"] is False
 
 
 def test_a_config_that_is_not_yaml_exits_78(tmp_path: Path) -> None:
@@ -438,9 +441,23 @@ def _lines_carrying(stdout: str, needle: str) -> list[str]:
     return [line for line in stdout.splitlines() if needle in line]
 
 
-@pytest.fixture(scope="module")
-def json_boot(valid_config: Path) -> dict:
-    return _run(_BOOT_LOG_SCRIPT, valid_config)
+# JSON mode has two sources and they behave differently inside litellm: with the
+# env var set, litellm's import-time branch (`_logging.py:581`) has already put a
+# JSON formatter on its own handler before `asgi.py` calls `_turn_on_json()` a
+# second time; with the YAML flag only, that call is the first. Both have to end
+# with one root handler and every boot line written once.
+_JSON_BOOT_MODES = {
+    "yaml": (VALID_CONFIG, {}),
+    "env": (PLAIN_LOG_CONFIG, {"JSON_LOGS": "true"}),
+}
+
+
+@pytest.fixture(scope="module", params=sorted(_JSON_BOOT_MODES))
+def json_boot(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> dict:
+    document, env = _JSON_BOOT_MODES[request.param]
+    path = tmp_path_factory.mktemp(f"json-boot-{request.param}") / "config.yaml"
+    path.write_text(document)
+    return _run(_BOOT_LOG_SCRIPT, path, env=env)
 
 
 def test_a_boot_line_is_written_once_not_twice(json_boot: dict) -> None:
