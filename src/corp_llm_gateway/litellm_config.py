@@ -7,11 +7,19 @@ silently skips a missing or non-YAML file, which starts the proxy with no
 guardrail callback at all), and ``settings.validate()`` runs the content half so
 ``gateway-admin config check`` reports the same problems before a pod starts.
 
-``pass_through_endpoints`` is refused outright: litellm's ``SafeRouteAdder``
-(``pass_through_endpoints/pass_through_endpoints.py:2781``) registers routes from
-that block at runtime, with paths no static read of litellm's source can know.
-The route gate default-denies whatever they would add, so configuring them
-produces routes that can only 404 — refusing the config says so at boot instead.
+Two blocks are refused outright:
+
+* ``pass_through_endpoints`` — litellm's ``SafeRouteAdder``
+  (``pass_through_endpoints/pass_through_endpoints.py:2781``) registers routes from
+  that block at runtime, with paths no static read of litellm's source can know.
+  The route gate default-denies whatever they would add, so configuring them
+  produces routes that can only 404 — refusing the config says so at boot instead.
+* ``general_settings.database_url`` — litellm's CLI reads a DSN from there and
+  from the ``DATABASE_HOST``/``DATABASE_USERNAME``/``DATABASE_NAME`` composition
+  (``proxy_cli.py:1183-1190``) before it runs the Prisma schema sequence.
+  ``asgi.py`` replicates the sequence but reads ``DATABASE_URL``/``DIRECT_URL``
+  only, so a config-only DSN would boot a proxy that connects to a database whose
+  schema was never set up. Refuse it; ``DATABASE_URL`` is the supported source.
 """
 
 from __future__ import annotations
@@ -27,9 +35,16 @@ DEFAULT_CONFIG_PATH = "/etc/litellm/config.yaml"
 
 CONFIG_PATH_KEY = "CORP_LLM_LITELLM_CONFIG"
 
+# sysexits.h EX_CONFIG. Both entrypoint modules exit with it — `asgi.py` when the
+# litellm config is unusable, `serve.py` when a gateway setting is. The runbook
+# and the container tests key off the number, so it has one definition.
+EXIT_CONFIG = 78
+
 _YAML_SUFFIXES = (".yaml", ".yml")
 
 PASS_THROUGH_KEY = "pass_through_endpoints"
+
+DATABASE_URL_KEY = "database_url"
 
 
 def config_path() -> Path:
@@ -76,11 +91,22 @@ def content_problems(path: Path) -> list[str]:
         return [f"{CONFIG_PATH_KEY}={path}: empty; litellm would load no callbacks"]
     if not isinstance(document, dict):
         return [f"{CONFIG_PATH_KEY}={path}: top level must be a mapping"]
-    if PASS_THROUGH_KEY in (document.get("general_settings") or {}) or PASS_THROUGH_KEY in document:
+    general = document.get("general_settings")
+    # A scalar `general_settings:` is litellm's own shape error; `in` on an int
+    # would be a traceback instead of exit 78.
+    general = general if isinstance(general, dict) else {}
+    if PASS_THROUGH_KEY in general or PASS_THROUGH_KEY in document:
         return [
             f"{CONFIG_PATH_KEY}={path}: general_settings.{PASS_THROUGH_KEY} is refused. "
             "litellm registers those routes at runtime from config, so the route gate "
             "cannot classify them and default-deny refuses every one; remove the block"
+        ]
+    if DATABASE_URL_KEY in general:
+        return [
+            f"{CONFIG_PATH_KEY}={path}: general_settings.{DATABASE_URL_KEY} is refused. "
+            "The entrypoint's Prisma schema setup reads the DATABASE_URL / DIRECT_URL "
+            "environment only, so a DSN that lives only in this file would let litellm "
+            "connect to a database whose schema was never set up; set DATABASE_URL instead"
         ]
     return []
 

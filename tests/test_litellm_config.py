@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -80,6 +81,57 @@ def test_a_scalar_document_is_refused(tmp_path: Path) -> None:
     path.write_text("just-a-string\n")
 
     assert "mapping" in litellm_config.problems(path, require_file=True)[0]
+
+
+def test_a_scalar_general_settings_is_a_problem_not_a_traceback(tmp_path: Path) -> None:
+    # `"pass_through_endpoints" in 7` raises TypeError; the entrypoint must exit
+    # 78 with a readable line instead.
+    path = tmp_path / "config.yaml"
+    path.write_text("model_list: []\ngeneral_settings: 7\n")
+
+    assert litellm_config.problems(path, require_file=True) == []
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root reads a 000 file")
+def test_an_unreadable_file_is_refused(tmp_path: Path) -> None:
+    # A config mounted with the wrong mode must exit 78, not raise PermissionError
+    # out of the entrypoint's first statement.
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID)
+    path.chmod(0o000)
+    try:
+        found = litellm_config.problems(path, require_file=True)
+    finally:
+        path.chmod(0o600)
+
+    assert found and "unreadable (PermissionError)" in found[0]
+
+
+DATABASE_URL_IN_CONFIG = """
+model_list: []
+general_settings:
+  database_url: "postgresql://u:p@db:5432/litellm"
+"""
+
+
+def test_a_config_only_database_url_is_refused(tmp_path: Path) -> None:
+    # litellm's CLI would export it to DATABASE_URL before running the Prisma
+    # schema sequence; the entrypoint reads the environment only, so this config
+    # would boot a proxy connected to a database whose schema was never set up.
+    path = tmp_path / "config.yaml"
+    path.write_text(DATABASE_URL_IN_CONFIG)
+
+    found = litellm_config.problems(path, require_file=True)
+
+    assert found and "general_settings.database_url is refused" in found[0]
+
+
+def test_a_database_url_elsewhere_in_the_config_is_fine(tmp_path: Path) -> None:
+    # Only `general_settings.database_url` is the DSN litellm's CLI reads.
+    path = tmp_path / "config.yaml"
+    path.write_text('model_list: []\nlitellm_settings:\n  database_url: "not-the-dsn"\n')
+
+    assert litellm_config.problems(path, require_file=True) == []
 
 
 UNDER_GENERAL_SETTINGS = """
@@ -166,6 +218,17 @@ def test_config_check_refuses_a_pass_through_endpoints_config(
     problems = _validate(monkeypatch, CORP_LLM_LITELLM_CONFIG=str(path))
 
     assert any("pass_through_endpoints is refused" in problem for problem in problems)
+
+
+def test_config_check_refuses_a_config_only_database_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(DATABASE_URL_IN_CONFIG)
+
+    problems = _validate(monkeypatch, CORP_LLM_LITELLM_CONFIG=str(path))
+
+    assert any("general_settings.database_url is refused" in problem for problem in problems)
 
 
 def test_config_check_passes_on_a_valid_config(

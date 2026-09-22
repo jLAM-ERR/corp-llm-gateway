@@ -20,7 +20,6 @@ lazily on first await.
 from __future__ import annotations
 
 import logging
-import uuid
 from collections.abc import Awaitable, Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -356,10 +355,13 @@ def _sanitization_probe() -> Callable[[], Awaitable[bool]]:
         from corp_llm_gateway import bootstrap
 
         orchestrator = bootstrap.guardrail.orchestrator
+        # One fixed id, not a fresh one per scrape: the probe text is constant, so
+        # a new conversation each time would add a mapping entry per scrape to the
+        # in-memory store and never reclaim it.
         result = await orchestrator.sanitize(
             _SANITIZATION_PROBE,
             team_id="healthz-probe",
-            conversation_id=f"healthz-probe-{uuid.uuid4().hex}",
+            conversation_id="healthz-probe",
         )
         return bool(result.pairs) and _SANITIZATION_PROBE_SECRET not in result.sanitized_text
 

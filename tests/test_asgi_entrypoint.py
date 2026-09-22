@@ -70,6 +70,22 @@ general_settings:
 """
 )
 
+DATABASE_URL_CONFIG = (
+    VALID_CONFIG
+    + """
+general_settings:
+  database_url: "postgresql://u:p@db.invalid:5432/litellm"
+"""
+)
+
+NO_SCHEMA_UPDATE_CONFIG = (
+    VALID_CONFIG
+    + """
+general_settings:
+  disable_prisma_schema_update: true
+"""
+)
+
 
 def _require_fastapi() -> None:
     if find_spec("fastapi") is None:
@@ -79,11 +95,24 @@ def _require_fastapi() -> None:
         )
 
 
-def _run(script: str, config_path: Path | str, *, extra_path: Path | None = None) -> dict:
+# The boot subprocess gets a whitelist, never `os.environ`: importing the module
+# IS the boot, and a developer shell carrying DEBUG, REDIS_URL, CORP_LLM_PG_DSN,
+# CORP_METRICS_EXPORTER, DATABASE_URL or CORP_LLM_GATEWAY_CONFIG_FILE would change
+# what boots — these assertions would then describe that shell, not the gateway.
+_INHERITED = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
+
+
+def _run(
+    script: str,
+    config_path: Path | str,
+    *,
+    extra_path: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict:
     _require_fastapi()
     search = [str(ROOT / "src")] + ([str(extra_path)] if extra_path else [])
-    env = dict(os.environ)
-    env.update(
+    child_env = {name: os.environ[name] for name in _INHERITED if name in os.environ}
+    child_env.update(
         {
             "PYTHONPATH": os.pathsep.join(search),
             "CORP_LLM_LITELLM_CONFIG": str(config_path),
@@ -93,13 +122,12 @@ def _run(script: str, config_path: Path | str, *, extra_path: Path | None = None
             "CORP_AUDIT_SINK": "stdout",
         }
     )
-    env.pop("DATABASE_URL", None)
-    env.pop("DIRECT_URL", None)
+    child_env.update(env or {})
     completed = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],
         capture_output=True,
         text=True,
-        env=env,
+        env=child_env,
         timeout=300,
         check=False,
     )
@@ -153,6 +181,19 @@ def test_a_config_that_is_not_yaml_exits_78(tmp_path: Path) -> None:
     assert result["proxy_imported"] is False
 
 
+def test_a_config_only_database_url_exits_78(tmp_path: Path) -> None:
+    # litellm's CLI exports general_settings.database_url to DATABASE_URL before
+    # its Prisma sequence; this entrypoint reads the environment only, so the
+    # config-only spelling would connect litellm to an unmigrated database.
+    path = tmp_path / "config.yaml"
+    path.write_text(DATABASE_URL_CONFIG)
+
+    result = _run(_REFUSAL_SCRIPT, path)
+
+    assert result["exit_code"] == 78
+    assert result["proxy_imported"] is False
+
+
 def test_a_config_with_pass_through_endpoints_exits_78(tmp_path: Path) -> None:
     # SafeRouteAdder registers those paths at runtime; the route gate cannot
     # classify them, so default-deny would 404 every one. Refuse the config.
@@ -163,6 +204,118 @@ def test_a_config_with_pass_through_endpoints_exits_78(tmp_path: Path) -> None:
 
     assert result["exit_code"] == 78
     assert result["proxy_imported"] is False
+
+
+# ── step 2: the Prisma sequence, with litellm's four guards ──────────────────
+
+_PRISMA_SCRIPT = f"""
+    import json, subprocess
+
+    calls = []
+
+    class _Completed:
+        returncode = 0
+
+    def _fake_run(args, **kwargs):
+        # litellm's runnability probe. asgi.py holds the module, not the
+        # function, so replacing the attribute is what it calls.
+        calls.append(["probe", list(args)])
+        return _Completed()
+
+    subprocess.run = _fake_run
+
+    from litellm.proxy.db import check_migration, prisma_client
+
+    def _fake_diff(db_url=None):
+        calls.append(["diff", db_url])
+
+    check_migration.check_prisma_schema_diff = _fake_diff
+
+    OUTCOME = {{outcome!r}}
+
+    def _fake_setup(use_migrate=None, use_v2_resolver=None):
+        calls.append(["setup", use_migrate, use_v2_resolver])
+        if OUTCOME == "raise":
+            raise RuntimeError("prisma db push against a partitioned LiteLLM_SpendLogs")
+        return OUTCOME == "ok"
+
+    prisma_client.PrismaManager.setup_database = staticmethod(_fake_setup)
+
+    code = None
+    booted = False
+    try:
+        import corp_llm_gateway.asgi  # noqa: F401
+        booted = True
+    except SystemExit as exc:
+        code = exc.code
+    print("{SENTINEL}" + json.dumps(
+        {{{{"exit_code": code, "calls": calls, "booted": booted}}}}
+    ))
+"""
+
+DSN = "postgresql://u:p@db.invalid:5432/litellm"
+
+
+def _prisma(config_path: Path, outcome: str, **env: str) -> dict:
+    return _run(
+        _PRISMA_SCRIPT.format(outcome=outcome),
+        config_path,
+        env={"DATABASE_URL": DSN, **env},
+    )
+
+
+def test_without_a_database_url_the_prisma_sequence_is_skipped(valid_config: Path) -> None:
+    result = _run(_PRISMA_SCRIPT.format(outcome="ok"), valid_config)
+
+    assert result["calls"] == []
+    assert result["booted"] is True
+
+
+def test_the_prisma_setup_runs_with_the_cli_arguments(valid_config: Path) -> None:
+    result = _prisma(valid_config, "ok")
+
+    assert ["probe", ["prisma"]] in result["calls"]
+    # proxy_cli.py:1349-1352: use_migrate = not --use_prisma_db_push, and the
+    # v2 resolver flag as click resolved it.
+    assert ["setup", True, False] in result["calls"]
+    assert result["booted"] is True
+
+
+def test_an_unrecoverable_migration_error_exits_2(valid_config: Path) -> None:
+    # proxy_cli.py:1353-1362 — RuntimeError out of setup_database is sys.exit(2).
+    result = _prisma(valid_config, "raise")
+
+    assert result["exit_code"] == 2
+    assert result["booted"] is False
+
+
+def test_a_failed_setup_exits_1_when_the_check_is_enforced(valid_config: Path) -> None:
+    # proxy_cli.py:1364-1370 — ENFORCE_PRISMA_MIGRATION_CHECK, resolved by click.
+    result = _prisma(valid_config, "fail", ENFORCE_PRISMA_MIGRATION_CHECK="true")
+
+    assert result["exit_code"] == 1
+    assert result["booted"] is False
+
+
+def test_a_failed_setup_warns_and_continues_by_default(valid_config: Path) -> None:
+    # proxy_cli.py:1371-1375 — the same fail-open litellm ships, deliberately
+    # replicated: compose's database is optional and the proxy serves without it.
+    result = _prisma(valid_config, "fail")
+
+    assert result["exit_code"] is None
+    assert result["booted"] is True
+
+
+def test_disable_prisma_schema_update_checks_the_diff_instead(tmp_path: Path) -> None:
+    # proxy_cli.py:1338-1340 — the guard that replaces setup with a diff report.
+    path = tmp_path / "config.yaml"
+    path.write_text(NO_SCHEMA_UPDATE_CONFIG)
+
+    result = _prisma(path, "ok")
+
+    assert ["diff", None] in result["calls"]
+    assert not [call for call in result["calls"] if call[0] == "setup"]
+    assert result["booted"] is True
 
 
 # ── steps 3-5: what a successful import leaves behind ────────────────────────

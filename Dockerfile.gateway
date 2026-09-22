@@ -2,8 +2,12 @@
 # as a callback. The sibling `Dockerfile` builds the `gateway-admin` CLI image;
 # this one runs the request path.
 #
-# Base must ship Python >=3.12 (the wheel is `requires-python >=3.12`). Override
-# the pin at build time: --build-arg LITELLM_VERSION=v1.40.x
+# Base must ship Python >=3.12 (the wheel is `requires-python >=3.12`).
+# --build-arg LITELLM_VERSION=vX.Y.Z still selects the base, but the install below
+# now FAILS unless the litellm it ends up with equals that tag: pyproject pins
+# `litellm==1.101.0` exactly, so a different base would be silently reinstalled
+# over, and the route gate is generated against ONE litellm's route source. Bump
+# the base and the wheel pin together (tests/test_litellm_pin.py lists all sites).
 #
 # Pinned, not floating: `main-stable` moves under released tags, so two builds of
 # the same commit could ship different proxies. v1.101.0 is the release GitHub
@@ -72,7 +76,9 @@ COPY crt/ /tmp/proxy-crt/
 #            the regex floor.
 # The GitHub Actions build (.github/workflows/build-image.yml) publishes the ru-en
 # and en variants — it runs on cloud runners that CAN reach github.com for the
-# model wheel. [metrics] is intentionally left out of every profile to stay lean.
+# model wheel. [metrics] is in every profile: the entrypoint serves /metrics from
+# one shared exporter, and Helm's `metrics.exporter: prometheus` would otherwise
+# fail at boot on the missing prometheus-client.
 # Build-time knobs so the SAME Dockerfile builds both internet-connected (the
 # GitHub Actions build, defaults below) and air-gapped/corp-mirror (ops override
 # every knob to point at corp storage — Nexus/Artifactory/JFrog). Prod stays a
@@ -93,6 +99,9 @@ ARG NER_PROFILE=base
 ARG PIP_INDEX_URL=
 ARG EN_MODEL_VERSION=3.8.0
 ARG EN_MODEL_URL=
+# Re-declared so the RUN below can read the global pin and check it against what
+# is actually installed.
+ARG LITELLM_VERSION
 COPY --from=build /build/dist/*.whl /tmp/
 RUN set -eux; \
     whl="$(ls /tmp/*.whl)"; \
@@ -108,14 +117,21 @@ RUN set -eux; \
     fi; \
     export PIP_CERT="$certbundle" REQUESTS_CA_BUNDLE="$certbundle"; \
     case "${NER_PROFILE}" in \
-      base)  "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" ;; \
-      ru-en) "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc]" "${en_model}"; \
+      base)  "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc,metrics]" ;; \
+      ru-en) "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[ner,postgres,oidc,metrics]" "${en_model}"; \
              "$py" -c "import spacy, natasha; spacy.load('en_core_web_md'); print('NER ru-en OK')" ;; \
-      en)    "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[postgres,oidc]" "spacy>=3.8,<3.9" "${en_model}"; \
+      en)    "$py" -m pip install --no-cache-dir ${pip_idx} "${whl}[postgres,oidc,metrics]" "spacy>=3.8,<3.9" "${en_model}"; \
              "$py" -c "import spacy; spacy.load('en_core_web_md'); print('NER en OK')" ;; \
       *)     echo "unknown NER_PROFILE=${NER_PROFILE} (want: base|ru-en|en)" >&2; exit 1 ;; \
     esac; \
     cp /tmp/certifi.orig "$certbundle"; \
+    want="${LITELLM_VERSION#v}"; \
+    got="$("$py" -c 'import litellm; print(litellm.__version__)')"; \
+    if [ "$got" != "$want" ]; then \
+        echo "litellm ${got} is installed but this image is built FROM ${LITELLM_VERSION}: the wheel pins litellm==${want} and pip reinstalled it over the base. The route gate is generated against ONE litellm's routes — rebuild with a matching --build-arg LITELLM_VERSION, or move all pin sites (tests/test_litellm_pin.py)." >&2; \
+        exit 1; \
+    fi; \
+    echo "litellm ${got} matches the base image tag"; \
     "$py" -c "import corp_llm_gateway.bootstrap; print('gateway bootstrap import OK')"; \
     rm -f /tmp/*.whl /tmp/certifi.orig; \
     rm -rf /tmp/proxy-crt

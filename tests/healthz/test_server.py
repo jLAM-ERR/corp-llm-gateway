@@ -237,6 +237,30 @@ async def test_wrong_method_returns_405() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/healthz/live", "/healthz/ready"])
+async def test_head_follows_get(path: str) -> None:
+    # The route gate's table says `GET|HEAD /healthz/*` (Starlette registers HEAD
+    # for every GET route), and probes that use HEAD must see the same status.
+    async with _client(_router()) as client:
+        head = await client.head(path)
+        get = await client.get(path)
+
+    assert head.status_code == get.status_code == 200
+    assert head.content == b""
+    # The length the GET would have — RFC 9110 allows it on a HEAD response.
+    assert head.headers["content-length"] == get.headers["content-length"]
+
+
+@pytest.mark.asyncio
+async def test_head_reports_an_unhealthy_check_too() -> None:
+    async with _client(_router(ready=ReadyCheck(check_redis=_fail, check_postgres=_ok))) as client:
+        head = await client.head("/healthz/ready")
+
+    assert head.status_code == 503
+    assert head.content == b""
+
+
+@pytest.mark.asyncio
 async def test_fallthrough_delegates_unknown_paths_but_serves_health() -> None:
     seen: dict[str, str] = {}
 

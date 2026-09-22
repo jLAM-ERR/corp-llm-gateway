@@ -2,11 +2,11 @@
 
 `build_health_router` returns a dependency-injected ASGI app that serves:
 
-    GET  /healthz/live            -> LiveCheck
-    GET  /healthz/ready           -> ReadyCheck          (503 when unhealthy)
-    GET  /healthz/sanitization    -> SanitizationCheck   (503 when unhealthy)
-    GET  /healthz/extensions      -> ExtensionsCheck     (503 when unhealthy)
-    POST /internal/issue-token    -> TokenIssuer         (fixes install.sh:149)
+    GET|HEAD /healthz/live         -> LiveCheck
+    GET|HEAD /healthz/ready        -> ReadyCheck          (503 when unhealthy)
+    GET|HEAD /healthz/sanitization -> SanitizationCheck   (503 when unhealthy)
+    GET|HEAD /healthz/extensions   -> ExtensionsCheck     (503 when unhealthy)
+    POST     /internal/issue-token -> TokenIssuer         (fixes install.sh:149)
 
 Framework choice: a framework-free ASGI app. LiteLLM is built on
 FastAPI/Starlette, but neither (nor litellm) ships wheels for the 3.14
@@ -93,10 +93,13 @@ class HealthRouter:
 
         check = self._checks.get(path)
         if check is not None:
-            if method != "GET":
+            # HEAD follows GET: Starlette registers one for every GET route, the
+            # route gate's table lists `GET|HEAD /healthz/*`, and probes that use
+            # HEAD (curl -I, some ingress controllers) must get the same status.
+            if method not in ("GET", "HEAD"):
                 await _send_json(send, 405, {"error": "method not allowed"})
                 return
-            await self._handle_health(check, send)
+            await self._handle_health(check, send, body=method == "GET")
             return
 
         if path == _ISSUE_TOKEN_PATH and self._issuer is not None:
@@ -111,13 +114,14 @@ class HealthRouter:
             return
         await _send_json(send, 404, {"error": "not found"})
 
-    async def _handle_health(self, check: HealthCheck, send: Send) -> None:
+    async def _handle_health(self, check: HealthCheck, send: Send, *, body: bool = True) -> None:
         status = await check.check()
         code = 200 if status.healthy else 503
         await _send_json(
             send,
             code,
             {"status": "healthy" if status.healthy else "unhealthy", "detail": status.detail},
+            body=body,
         )
 
     async def _handle_issue_token(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -213,16 +217,19 @@ async def _read_body(receive: Receive) -> bytes:
     return b"".join(chunks)
 
 
-async def _send_json(send: Send, status: int, payload: dict[str, Any]) -> None:
-    body = json.dumps(payload).encode("utf-8")
+async def _send_json(
+    send: Send, status: int, payload: dict[str, Any], *, body: bool = True
+) -> None:
+    encoded = json.dumps(payload).encode("utf-8")
     await send(
         {
             "type": "http.response.start",
             "status": status,
             "headers": [
                 (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode("ascii")),
+                # The length the GET would have, as RFC 9110 allows for HEAD.
+                (b"content-length", str(len(encoded)).encode("ascii")),
             ],
         }
     )
-    await send({"type": "http.response.body", "body": body})
+    await send({"type": "http.response.body", "body": encoded if body else b""})

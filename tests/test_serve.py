@@ -48,9 +48,25 @@ def test_the_defaults_match_the_litellm_cli(litellm_config_file: Path) -> None:
 
 
 def test_one_worker_only(litellm_config_file: Path) -> None:
-    # The gate arms in the lifespan of the process that serves; a second worker
-    # would answer 503 on every rewritten route until it armed itself.
+    # A second uvicorn worker is a second process importing the entrypoint: it
+    # would re-run the Prisma schema sequence against the same database and build
+    # a second Prometheus registry, so /metrics would report one worker's counts.
     assert serve.uvicorn_arguments()["workers"] == 1
+
+
+@pytest.mark.parametrize("port", ["four-thousand", "0", "70000", "-1", "80.5"])
+def test_a_bad_serve_port_exits_78(
+    litellm_config_file: Path, monkeypatch: pytest.MonkeyPatch, port: str
+) -> None:
+    # The same refusal `gateway-admin config check` gives, not a ValueError
+    # traceback out of int().
+    monkeypatch.setenv("CORP_LLM_SERVE_PORT", port)
+    config.reset_cache()
+
+    with pytest.raises(SystemExit) as raised:
+        serve.uvicorn_arguments()
+
+    assert raised.value.code == 78
 
 
 def test_host_and_port_come_from_config(

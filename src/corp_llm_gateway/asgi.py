@@ -1,7 +1,7 @@
 """The gateway's ASGI entrypoint: litellm's app behind the route gate.
 
-**``litellm.proxy.proxy_server:app`` and the ``litellm`` CLI must never be the
-served target again.** Either one serves litellm's routers with nothing in front
+**litellm's ``proxy_server`` app and the ``litellm`` CLI must never be the served
+target again.** Either one serves litellm's routers with nothing in front
 of them, and three of those routers reach a provider without ever calling
 ``pre_call_hook`` — raw user text out of the corp boundary, unsanitized and
 unaudited (see ``docs/plans/20260922-litellm-route-gate.md``). This module is the
@@ -13,8 +13,9 @@ In order —
 
 1. resolve and check litellm's config (``CORP_LLM_LITELLM_CONFIG``); exit 78
    (``EX_CONFIG``) if it is missing, unreadable, not YAML or configures
-   ``pass_through_endpoints``. litellm's own lifespan skips a missing config in
-   silence (``proxy_server.py:1088-1095``) and would serve with NO guardrail;
+   ``pass_through_endpoints`` or ``general_settings.database_url``. litellm's own
+   lifespan skips a missing config in silence (``proxy_server.py:1088-1095``) and
+   would serve with NO guardrail;
 2. run litellm's Prisma schema sequence when ``DATABASE_URL`` is set, with the
    same four guards and the same exit codes as ``proxy_cli.py:1326-1375``;
 3. ``save_worker_config(...)`` so litellm's lifespan takes the
@@ -34,14 +35,27 @@ In order —
 
 What moved here from the ``litellm`` CLI: the config-load check, the Prisma
 sequence, ``WORKER_CONFIG``, and (in ``serve.py``) uvicorn's arguments.
-Deliberately NOT carried over: the DB connection-URL rewriting
-(``proxy_cli.py:1241-1325`` — pool/timeout query params this deployment sets on
-its own DSN), the ``--num_workers``/gunicorn/granian/hypercorn runners (the gate
-arms in the lifespan, so the gateway runs one uvicorn worker), the random-port
-fallback when 4000 is busy (a port collision must fail, not move), the
-prometheus-multiproc directory (this process exposes one registry at
-``/metrics``), and ``--skip_server_startup``/``--test``/``--health`` (developer
-affordances).
+Deliberately NOT carried over:
+
+* the two extra DSN sources the CLI reads before the Prisma sequence
+  (``proxy_cli.py:1183-1190``) — ``general_settings.database_url`` from the YAML,
+  and the ``DATABASE_HOST``/``DATABASE_USERNAME``/``DATABASE_PASSWORD``/
+  ``DATABASE_NAME``/``DATABASE_SCHEMA`` composition
+  (``proxy/utils.py:7276``). This entrypoint's Prisma step reads ``DATABASE_URL``
+  and ``DIRECT_URL`` only, so either of the other two would let litellm connect to
+  a database whose schema was never set up. The YAML one is refused at step 1
+  (exit 78); the env composition is documented here and in
+  ``docs/ops/configuration.md`` — set ``DATABASE_URL`` instead;
+* the DB connection-URL rewriting (``proxy_cli.py:1241-1325`` — pool/timeout
+  query params this deployment sets on its own DSN);
+* the ``--num_workers``/gunicorn/granian/hypercorn runners: each worker would run
+  this module, hence the Prisma schema sequence, concurrently against one
+  database, and each would build its own Prometheus registry so ``/metrics``
+  would report whichever worker answered the scrape. Scale with replicas;
+* the random-port fallback when 4000 is busy (a port collision must fail, not
+  move), the prometheus-multiproc directory (this process exposes one registry at
+  ``/metrics``), and ``--skip_server_startup``/``--test``/``--health`` (developer
+  affordances).
 """
 
 from __future__ import annotations
@@ -61,9 +75,10 @@ from corp_llm_gateway.route_gate import RouteGateMiddleware
 
 log = logging.getLogger(__name__)
 
-# sysexits.h. 78 = the config is wrong; 70 = the software is wrong (the
-# guardrail did not register). The container tests and the runbook key off these.
-EXIT_CONFIG = 78
+# sysexits.h. 78 = the config is wrong (defined in litellm_config, which serve.py
+# also exits with); 70 = the software is wrong — the guardrail did not register.
+# The container tests and the runbook key off these.
+EXIT_CONFIG = litellm_config.EXIT_CONFIG
 EXIT_NO_CALLBACK = 70
 
 _MOUNT_HEALTHZ = "/healthz"
@@ -99,6 +114,7 @@ def _setup_prisma(config_path: Any) -> None:
     general = litellm_config.general_settings(config_path)
     if should_update_prisma_schema(general.get("disable_prisma_schema_update")) is False:
         check_prisma_schema_diff(db_url=None)
+        log.info("prisma schema update disabled by config; diff checked only")
         return
 
     options = litellm_cli.option_values(litellm_cli.PRISMA_KEYS)
@@ -111,6 +127,7 @@ def _setup_prisma(config_path: Any) -> None:
         log.error("database migration cannot proceed: %s", exc)
         raise SystemExit(2) from exc
     if setup_ok:
+        log.info("prisma schema setup complete")
         return
     if options["enforce_prisma_migration_check"]:
         log.error("database setup failed after retries; refusing to start")
@@ -134,6 +151,7 @@ CONFIG_PATH = litellm_config.config_path()
 _problems = litellm_config.problems(CONFIG_PATH, require_file=True)
 if _problems:
     _fail_config(_problems)
+log.info("litellm config accepted: %s", CONFIG_PATH)
 
 # ── 2. Prisma schema setup ───────────────────────────────────────────────────
 
@@ -146,15 +164,20 @@ _worker_config = litellm_cli.option_values(litellm_cli.WORKER_CONFIG_KEYS) | {
 }
 
 import litellm  # noqa: E402 - step order is the contract of this module
-from litellm.proxy.proxy_server import app as _app  # noqa: E402
-from litellm.proxy.proxy_server import save_worker_config  # noqa: E402
 
-save_worker_config(**_worker_config)
 if litellm_config.json_logs(CONFIG_PATH):
-    # The CLI does this before uvicorn starts (proxy_cli.py:1158-1165); the
-    # lifespan's initialize() sets the log LEVEL but not the JSON formatter.
+    # Before proxy_server is imported, as the CLI does it (proxy_cli.py:1158-1165
+    # runs well ahead of the app import): the handlers that module installs at
+    # import time otherwise keep the plain formatter. The lifespan's initialize()
+    # sets the log LEVEL, never the JSON formatter.
     litellm.json_logs = True
     litellm._turn_on_json()
+
+from litellm.proxy.proxy_server import app as _app  # noqa: E402
+from litellm.proxy.proxy_server import proxy_startup_event, save_worker_config  # noqa: E402
+
+save_worker_config(**_worker_config)
+log.info("litellm WORKER_CONFIG set from %s", CONFIG_PATH)
 
 # ── 4. gateway-owned routes + the lifespan wrapper ───────────────────────────
 
@@ -219,6 +242,7 @@ def _mount_gateway_routes() -> None:
 
 
 _mount_gateway_routes()
+log.info("gateway routes mounted: %s/*, %s", _MOUNT_HEALTHZ, _MOUNT_METRICS)
 
 gate = RouteGateMiddleware(
     _app,
@@ -244,6 +268,7 @@ async def _armed_lifespan(scoped_app: Any) -> AsyncIterator[None]:
     async with _litellm_lifespan(scoped_app):
         if _guardrail_registered():
             gate.arm()
+            log.info("CorpLlmGuardrail found in litellm.callbacks; route gate armed")
         else:
             log.error(
                 "no CorpLlmGuardrail in litellm.callbacks after startup — the config at %s "
@@ -257,8 +282,13 @@ async def _armed_lifespan(scoped_app: Any) -> AsyncIterator[None]:
 
 
 _app.router.lifespan_context = _armed_lifespan
+# Both names: `_litellm_lifespan` is whatever the app was built with, and
+# `proxy_startup_event` is what litellm builds it with today. If a future release
+# wraps its own lifespan, the first check still holds.
 if _app.router.lifespan_context is _litellm_lifespan:
     raise RuntimeError("the arming lifespan did not install; the gate would never arm")
+if _app.router.lifespan_context is proxy_startup_event:
+    raise RuntimeError("litellm's own lifespan is still installed; the gate would never arm")
 
 # ── 5. the gate, outermost ───────────────────────────────────────────────────
 

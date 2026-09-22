@@ -61,10 +61,10 @@ def option_values(names: tuple[str, ...]) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for name in names:
         param = params[name]
-        raw = (
-            param.value_from_envvar(ctx)
-            if param.resolve_envvar_value(ctx) is not None
-            else param.default
-        )
-        values[name] = param.type_cast_value(ctx, raw)
+        if param.resolve_envvar_value(ctx) is not None:
+            values[name] = param.type_cast_value(ctx, param.value_from_envvar(ctx))
+        else:
+            # get_default, not `.default`: click resolves a callable default and
+            # casts it exactly as a real invocation would.
+            values[name] = param.get_default(ctx)
     return values

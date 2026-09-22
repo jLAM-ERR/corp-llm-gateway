@@ -12,6 +12,7 @@ the unshared factory for callers that want their own registry (tests).
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 from corp_llm_gateway import config
@@ -41,6 +42,9 @@ _KNOWN_EXPORTERS = tuple(_EXPORTER_FACTORIES)
 
 
 _shared: MetricsExporter | None = None
+# PrometheusExporter registers its collectors on construction, and a duplicate
+# name raises. Two threads racing the first call would build two exporters.
+_shared_lock = threading.Lock()
 
 
 def build_exporter() -> MetricsExporter:
@@ -65,14 +69,17 @@ def get_exporter() -> MetricsExporter:
     """
     global _shared
     if _shared is None:
-        _shared = build_exporter()
+        with _shared_lock:
+            if _shared is None:
+                _shared = build_exporter()
     return _shared
 
 
 def reset_exporter() -> None:
     """Drop the shared instance (tests; a re-read of ``CORP_METRICS_EXPORTER``)."""
     global _shared
-    _shared = None
+    with _shared_lock:
+        _shared = None
 
 
 __all__ = [
