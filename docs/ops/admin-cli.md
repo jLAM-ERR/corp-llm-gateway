@@ -112,7 +112,7 @@ Validate the resolved config and probe dependencies. Nonzero exit on any
 problem — use it as a pre-deploy gate or an initContainer.
 
 ```
-gateway-admin config check [--no-probe] [--json]
+gateway-admin config check [--no-probe] [--routes] [--json]
 ```
 
 ```
@@ -135,6 +135,32 @@ $ echo $?
 `--no-probe` validates config only (skips the Postgres / Redis / corp-LLM
 reachability probes). `--json` emits a machine-readable report and still sets
 the exit code.
+
+`--routes` also prints the effective route-gate table — row counts per verdict,
+the REWRITTEN routes (the only ones whose body the guardrail rewrites), and every
+`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` entry the operator added:
+
+```
+$ gateway-admin config check --no-probe --routes
+config: OK
+
+route gate: 551 exact + 362 regex litellm rows, 5 gateway rows (no off switch)
+VERDICT      ROWS
+PASSTHROUGH  501
+REWRITTEN    8
+REFUSE       409
+
+REWRITTEN (the only routes whose body the guardrail rewrites):
+  POST /chat/completions
+  ...
+
+CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH:
+  (none)
+```
+
+A malformed extra prints `INVALID: …` on stderr and makes the whole check exit
+nonzero — the same value already fails `validate()`. See
+[`../security.md`](../security.md) §14 for what the gate refuses and why.
 
 ## `sanitize`
 

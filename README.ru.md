@@ -29,7 +29,7 @@
 
 ## Обзор
 
-Харнесс на ноутбуке (Claude Code, Codex, Cursor) общается по HTTP с `gateway.corp.lan`. Шлюз — это прокси LiteLLM с кастомным guardrail (`corp_llm_gateway.litellm_hook.CorpLlmGuardrail`), зарегистрированным как callback. Каждый запрос санитизируется в `pre_call`, форвардится в Anthropic / OpenAI с сохранённым BYOK-ключом разработчика, де-санитизируется в `post_call` и аудируется. В сетевом трафике важны два заголовка:
+Харнесс на ноутбуке (Claude Code, Codex, Cursor) общается по HTTP с `gateway.corp.lan`. Шлюз — это прокси LiteLLM с кастомным guardrail (`corp_llm_gateway.litellm_hook.CorpLlmGuardrail`), зарегистрированным как callback. Каждый запрос санитизируется в `pre_call`, форвардится в Anthropic / OpenAI с сохранённым BYOK-ключом разработчика, де-санитизируется в `post_call` и аудируется. Образ обслуживает приложение LiteLLM через собственную точку входа шлюза (`python -m corp_llm_gateway.serve`), которая ставит перед роутером LiteLLM **route gate** с запретом по умолчанию — callback выполняется только на тех маршрутах, которые LiteLLM через него пропускает, поэтому всё остальное отклоняется. В сетевом трафике важны два заголовка:
 
 | Заголовок | Источник | Назначение |
 |---|---|---|
@@ -53,6 +53,23 @@
 - **Блокировка до egress (Stage 0)** — сигнатуры `.env`, kubeconfig, nginx.conf, лог-дампов → HTTP 422 с `block_reason`; upstream не вызывается
 - **Stage 5 DLP egress guard** — независимый пере-скан вторым слоем санитизированного payload на canary-строки и высоконадёжные секреты; блокирует всё, что уцелело
 
+### Route gate (запрет по умолчанию)
+
+Guardrail — это *callback* LiteLLM, и LiteLLM вызывает его только на тех обработчиках, которые идут через общий процессор запросов. Поэтому каждый запрос классифицируется по паре `(метод, путь)` **до** того, как его увидит роутер LiteLLM; маршрут, которого нет в таблице, отклоняется. До провайдера доходят только восемь написаний маршрутов — генерационные эндпоинты, тело которых guardrail доказуемо переписывает. Полное обоснование, коды причин и последствия: [`docs/security.md`](docs/security.md) §14.
+
+Что заметит разработчик и почему:
+
+| Отклоняется | Почему |
+|---|---|
+| `POST /v1/messages/count_tokens`, `POST /v1/responses/input_tokens`, `POST /utils/token_counter` | Предварительный подсчёт токенов отправлял сырые `messages` / `system` / `tools` / `prompt` в API подсчёта провайдера, ни разу не вызвав хук. `usage.input_tokens` в каждом реальном ответе — это точный счёт уже после санитизации; Claude Code для индикатора контекста откатывается на собственную оценку |
+| `WEBSOCKET /v1/responses`, `/v1/realtime`, `/openai/v1/realtime` | До хука доходит только handshake, и он не несёт контента — все кадры после него обходят санитизацию целиком. Отклоняется на handshake; клиенты используют HTTP-транспорт |
+| `POST /v1/completions` | Доходит до хука, но хук читает `messages` / `input` — `prompt` текстового completion не переписывается никогда |
+| `POST /v1/embeddings`, `/v1/moderations`, `/v1/audio/speech` | Документированный набор LiteLLM «без перезаписи»: раньше только DLP-скан, а DLP-скан блокирует *известный* паттерн, но не санитизирует |
+| `POST /anthropic/…`, `/openai/…`, `/{provider}/…` и остальные нативные деревья провайдеров | Сырой passthrough к провайдеру — тело уходит как прислано |
+| всё, чего нет в таблице, включая mount'ы админского **UI** LiteLLM | Запрет по умолчанию: маршрут, который добавит будущий релиз LiteLLM, отклоняется, пока его кто-нибудь не классифицирует. JSON-API администрирования (`/key/*`, `/team/*`, …) закреплён маршрут за маршрутом и продолжает отвечать |
+
+Выключателя нет. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` умеет добавить PASSTHROUGH-маршруты, которыми владеет оператор, и ничего больше; `gateway-admin config check --routes` печатает действующую таблицу. Старт тоже fail-closed: шлюз завершается, а не обслуживает запросы, если его конфиг отсутствует (78) или callback guardrail не зарегистрирован (70).
+
 ### Аутентификация и соответствие требованиям
 
 - **X-Corp-Auth + хранилище токенов на Postgres** — `AuthMiddleware` валидирует токены против `PostgresTokenStore` (asyncpg); верхняя граница распространения отзыва — 60 s
@@ -74,6 +91,8 @@
 
 ```
 src/corp_llm_gateway/   Python-guardrail (кастомные хуки LiteLLM + движок санитайзера)
+  asgi.py / serve.py    собственная ASGI-точка входа шлюза (`python -m corp_llm_gateway.serve`) — проверяет конфиг
+                        litellm, взводит route gate в его lifespan, оборачивает приложение litellm
   auth/                 провайдер аутентификации corp-LLM (по умолчанию Noop; Bearer/mTLS/OIDC) + фабрика
   audit/                AuditEvent + Logger + Sinks + фабрика + генератор retention + гейт NEVER-полей
   bootstrap.py          production composition root — build_guardrail() из конфига; ленивый синглтон `guardrail`
@@ -88,6 +107,7 @@ src/corp_llm_gateway/   Python-guardrail (кастомные хуки LiteLLM + 
   payload/              порог размера + gzip + квота на команду + политика oversize
   profiles/             плагин-бандлы: ProfileBundle/PolicyKnobs + resolver + DETECTOR_REGISTRY + hash-integrity + defaults/
   providers/            ProviderRegistry + исполняемый v1-guard (anthropic / openai / corp-vllm)
+  route_gate/           таблица маршрутов с запретом по умолчанию (сгенерирована из исходников litellm) + классификатор + ASGI-middleware
   rules/                парсер replace.md + газеттир + кэширующий загрузчик файлов
   sanitizer/            local-first движок + сегментатор + StreamingDesanitizer + DLP guard + оркестратор + ProfileAwareOrchestrator
   storage/              MappingStore (in-memory + Redis)
@@ -102,7 +122,7 @@ examples/compose/       лёгкий локальный санитизирующ
 docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      установщик для ноутбука (bash/zsh/fish, macOS/Linux)
 scripts/deploy/         подготовка сервера (bootstrap-server.sh + systemd-юнит) + deploy.sh (развёртывание/обновление хоста)
-tests/                  pytest, pytest-asyncio mode=auto (~2274 passed / 107 skipped; 3.14 грациозный NER, полный на 3.12/CI)
+tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipped на 3.12 + litellm; на 3.14 — грациозный NER)
 ```
 
 ## Быстрый старт для разработчика (ноутбук)
@@ -403,10 +423,12 @@ CLI оператора, обычно запускается через `kubectl 
 Требует Python 3.12+.
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]"     # dev тянет ещё и extras asgi + metrics
 pre-commit install
-PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~2274 passed / 107 skipped, ~76с (3.14 грациозный NER; полный NER + RS256 crypto на 3.12/CI)
+PYTHONPATH=src .venv/bin/pytest tests/ -q     # 2558 passed / 201 skipped, ~2min (3.14, без litellm: грациозный NER)
+PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs   # 2767 / 40 (3.12 + litellm: NER, RS256, точка входа, route guard)
 PYTHONPATH=src .venv/bin/ruff check src tests
+PYTHONPATH=src .venv/bin/ruff format --check src tests
 ```
 
 Соглашения, инварианты и «чего НЕ делать» закреплены в [`CLAUDE.md`](CLAUDE.md). CI — GitHub Actions (`.github/workflows/`).

@@ -477,6 +477,7 @@ scoped by the k8s log collector, and a different trust model applies.
 | — | **Per-request placeholder bijection** (same original → one token; distinct originals → distinct tokens) | `placeholder_allocator.py` |
 | — | **Depth-guard fail-closed** (`_MAX_JSON_DEPTH=64` → `400 E_BAD_REQUEST` on sanitize) | `content_blocks.py`, `litellm_hook.py` |
 | — | **NEVER gate, in-process (recursive, primary) + Vector (flat backstop)** (defense in depth) | `audit/invariants.py` + Vector VRL |
+| 7 | **Default-deny route gate**: no request reaches a provider unless the table says the hook rewrites its body, and the gateway does not serve at all unless that hook is registered. An unclassified `(method, path)` is refused; an unarmed gate refuses every rewritten route; startup exits rather than serve half-configured (§14) | `route_gate/table.py` + `tests/route_gate/test_litellm_route_guard.py` + `asgi.py` (exit 78 / 70) |
 
 ## 10. Forensic breadcrumbs (incident investigation)
 
@@ -881,7 +882,13 @@ There is no off switch. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` takes
 entries only: it can never admit a route as rewritten, never override a REFUSE,
 and never disable the gate. A malformed item is a boot-time config problem, not a
 silent widening. Use it for an operator route that provably sends no user text
-anywhere — the litellm admin UI mounts are the expected case.
+anywhere.
+
+Each item is **one exact `(method, path)` pair** — there is no prefix form, so
+widening cannot open a tree by accident. That is also why it cannot re-open the
+admin UI: a mounted sub-app serves many paths under its prefix, and listing them
+one by one is not a widening anyone should write. `gateway-admin config check
+--routes` prints the effective table and every extra.
 
 The nginx front door (`docs/plans/20260806-nginx-profile-tls.md`) denies the same
 routes at the edge. That is defence in depth, not a substitute: the gate runs

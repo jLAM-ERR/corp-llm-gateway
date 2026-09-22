@@ -37,11 +37,13 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 | `CORP_LLM_ORACLE_TRIGGER` | `gazetteer_hit` (default) | When the conditional oracle runs. Widen to `any_local_finding` to backstop local misses (latency cost). | yes |
 | `CORP_PROFILE_REQUIRE_SIGNATURE` | leave unset | Gated no-op: setting it fails profile load closed (no PKI yet). | **no** — read in `profiles/manifest.py` |
 
-> **`CORP_METRICS_EXPORTER` is not shipped yet.** The metrics module (plan task
-> B4) and its exporter-selection key are pending. `/metrics`, the
-> `ServiceMonitor`, and the alert series (`corp_llm_gateway_blocked_requests_total`,
-> `gateway_failure`) are referenced by the chart but not emitted until B4 lands.
-> Do not set this key — it has no reader today.
+> **`CORP_METRICS_EXPORTER` defaults to `noop`, which emits nothing.** The
+> exporter is selected by that key (`noop` | `prometheus`); only `prometheus`
+> renders `corp_llm_gateway_blocked_requests_total` and `gateway_failure` at
+> `/metrics` for the `ServiceMonitor` to scrape, and it needs the `metrics`
+> extra (`prometheus-client`). One process-wide exporter is shared by the
+> guardrail, the route gate and the `/metrics` endpoint (`get_exporter()`), so
+> a block counted anywhere is visible on the same scrape.
 
 ## Full key list
 
@@ -241,6 +243,73 @@ auth is config-only.
 
 `CORP_GATEWAY_OIDC_ALG` is still in the registry but no longer honored: RBAC
 verification is RS256-only. See `upgrade.md` for the HS256 breaking change.
+
+### Server entrypoint (`asgi.py` / `serve.py`)
+
+`python -m corp_llm_gateway.serve` is the only supported launch command — it is
+the image `ENTRYPOINT`, and compose and Helm run it. The `litellm` CLI and
+`litellm.proxy.proxy_server:app` must never be the served target again: both
+serve litellm's routers with no route gate in front. See
+[`../security.md`](../security.md) §14.
+
+| Key | Purpose | Default | Required |
+|-----|---------|---------|----------|
+| `CORP_LLM_LITELLM_CONFIG` | path to litellm's proxy config YAML | `/etc/litellm/config.yaml` | no |
+| `CORP_LLM_SERVE_HOST` | address uvicorn binds | `0.0.0.0` | no |
+| `CORP_LLM_SERVE_PORT` | port uvicorn binds | `4000` | no |
+
+The entrypoint refuses to start (**exit 78**, `EX_CONFIG`) when
+`CORP_LLM_LITELLM_CONFIG` is missing, not a file, not named `.yaml`/`.yml`,
+unreadable, empty, not a YAML mapping, or when it configures
+`general_settings.pass_through_endpoints` or `general_settings.database_url`.
+litellm's own lifespan skips a missing config **in silence**, which starts the
+proxy with no guardrail callback at all — that is the fail-open this check
+closes. `gateway-admin config check` applies the same content checks, but a
+config file that is simply absent is not a `config check` problem (laptops
+mount none).
+
+**Two DSN sources litellm's CLI reads are deliberately NOT carried over.** The
+entrypoint's Prisma schema step reads `DATABASE_URL` and `DIRECT_URL` from the
+environment only:
+
+- `general_settings.database_url` in litellm's YAML — **refused** at boot
+  (exit 78). The CLI exported it to `DATABASE_URL` before its Prisma sequence;
+  this entrypoint does not, so litellm would connect to a database whose schema
+  was never set up.
+- the `DATABASE_HOST` / `DATABASE_USERNAME` / `DATABASE_PASSWORD` /
+  `DATABASE_NAME` / `DATABASE_SCHEMA` composition (litellm's
+  `proxy/utils.py`) — **not read**. Same failure mode, no boot-time signal, so
+  set `DATABASE_URL` instead.
+
+### Route gate (`route_gate/`)
+
+| Key | Purpose | Default | Required |
+|-----|---------|---------|----------|
+| `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` | extra PASSTHROUGH routes, `"METHOD /path"`, comma- or newline-separated | `""` | no |
+
+This is the gate's **only** knob, and it can only widen the table with
+PASSTHROUGH entries. It can never admit a route as REWRITTEN, never override a
+REFUSE, and there is no off switch. A malformed item is a boot-time config
+problem (`validate()` rejects it), not a silent widening.
+
+Use it for an operator route that provably sends no user text anywhere — a
+sidecar status endpoint, an extra probe path. Each item admits **one exact
+`(method, path)` pair**; there is no prefix form, on purpose, so widening cannot
+open a tree by accident.
+
+```
+CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH="GET /internal/ops-status"
+```
+
+That exactness is also why litellm's admin **UI** cannot be re-opened with this
+key: `/ui`, `/swagger`, `/docs` and `/openapi.json` are mounted sub-apps and
+FastAPI internals, each serving many paths the `ast` collector cannot see, so
+they get no table entry and are refused as unlisted. The JSON admin API
+(`/key/*`, `/team/*`, …) is pinned route by route and answers without any
+widening — that is the supported admin surface.
+
+`gateway-admin config check --routes` prints the effective table — row counts
+per verdict, the REWRITTEN routes, and every extra (see `admin-cli.md`).
 
 ### Providers (`providers/registry.py`)
 

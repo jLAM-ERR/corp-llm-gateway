@@ -368,6 +368,71 @@ async def _gather_probes() -> list[tuple[str, bool, str]]:
     return results
 
 
+def _route_gate_summary() -> dict[str, Any]:
+    """The effective route-gate table: what the gate will admit at runtime.
+
+    Built from the same tables the middleware consults, so an operator can see
+    the effect of `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` before a deploy
+    instead of after a 404.
+    """
+    from corp_llm_gateway.route_gate import (
+        GATEWAY_ROUTE_TABLE,
+        LITELLM_REGEX_TABLE,
+        LITELLM_ROUTE_TABLE,
+        Verdict,
+    )
+
+    verdicts = (
+        [entry.verdict for entry in LITELLM_ROUTE_TABLE.values()]
+        + [row.entry.verdict for row in LITELLM_REGEX_TABLE]
+        + [entry.verdict for entry in GATEWAY_ROUTE_TABLE.values()]
+    )
+    try:
+        extras = config.route_gate_extras()
+        extras_problem = None
+    except ValueError as exc:
+        extras, extras_problem = {}, str(exc)
+
+    return {
+        "exact_rows": len(LITELLM_ROUTE_TABLE),
+        "regex_rows": len(LITELLM_REGEX_TABLE),
+        "gateway_rows": len(GATEWAY_ROUTE_TABLE),
+        "counts": {v.name: verdicts.count(v) for v in Verdict},
+        "rewritten": sorted(
+            f"{method} {path}"
+            for (method, path), entry in LITELLM_ROUTE_TABLE.items()
+            if entry.verdict is Verdict.REWRITTEN
+        )
+        + sorted(
+            f"{row.method} {row.template}"
+            for row in LITELLM_REGEX_TABLE
+            if row.entry.verdict is Verdict.REWRITTEN
+        ),
+        "extras": sorted(f"{method} {path}" for method, path in extras),
+        "extras_problem": extras_problem,
+    }
+
+
+def _print_route_gate(summary: dict[str, Any]) -> None:
+    print(
+        f"route gate: {summary['exact_rows']} exact + {summary['regex_rows']} regex litellm "
+        f"rows, {summary['gateway_rows']} gateway rows (no off switch)"
+    )
+    rows: list[tuple[str, ...]] = [("VERDICT", "ROWS")]
+    rows += [(name, str(count)) for name, count in summary["counts"].items()]
+    _print_table(rows)
+    print("\nREWRITTEN (the only routes whose body the guardrail rewrites):")
+    for route in summary["rewritten"]:
+        print(f"  {route}")
+    print("\nCORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH:")
+    if summary["extras_problem"]:
+        print(f"  INVALID: {summary['extras_problem']}", file=sys.stderr)
+    elif not summary["extras"]:
+        print("  (none)")
+    for route in summary["extras"]:
+        print(f"  {route}  PASSTHROUGH")
+
+
 def _dispatch_config(args: argparse.Namespace) -> int:
     problems: list[str] = []
     try:
@@ -382,21 +447,21 @@ def _dispatch_config(args: argparse.Namespace) -> int:
         probes = asyncio.run(_gather_probes())
 
     healthy = config_ok and all(ok for _, ok, _ in probes)
+    routes = _route_gate_summary() if args.routes else None
 
     if args.json_output:
-        print(
-            json.dumps(
-                {
-                    "config_valid": config_ok,
-                    "problems": problems,
-                    "probes": [
-                        {"dependency": name, "reachable": ok, "detail": detail}
-                        for name, ok, detail in probes
-                    ],
-                    "healthy": healthy,
-                }
-            )
-        )
+        payload: dict[str, Any] = {
+            "config_valid": config_ok,
+            "problems": problems,
+            "probes": [
+                {"dependency": name, "reachable": ok, "detail": detail}
+                for name, ok, detail in probes
+            ],
+            "healthy": healthy,
+        }
+        if routes is not None:
+            payload["route_gate"] = routes
+        print(json.dumps(payload))
         return 0 if healthy else 1
 
     if config_ok:
@@ -409,6 +474,9 @@ def _dispatch_config(args: argparse.Namespace) -> int:
         rows: list[tuple[str, ...]] = [("DEPENDENCY", "STATUS", "DETAIL")]
         rows += [(name, "OK" if ok else "UNREACHABLE", detail) for name, ok, detail in probes]
         _print_table(rows)
+    if routes is not None:
+        print()
+        _print_route_gate(routes)
     return 0 if healthy else 1
 
 
@@ -761,6 +829,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_check.add_argument(
         "--no-probe", action="store_true", help="validate config only; skip dependency probes"
+    )
+    config_check.add_argument(
+        "--routes",
+        action="store_true",
+        help="also print the effective route-gate table and every operator extra",
     )
     config_check.add_argument("--json", dest="json_output", action="store_true")
 

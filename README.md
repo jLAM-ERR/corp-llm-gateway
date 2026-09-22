@@ -29,7 +29,7 @@ Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances
 
 ## Overview
 
-A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. The gateway is a LiteLLM proxy with a custom guardrail (`corp_llm_gateway.litellm_hook.CorpLlmGuardrail`) registered as a callback. Every request is sanitized in `pre_call`, forwarded to Anthropic / OpenAI with the developer's BYOK key intact, de-sanitized in `post_call`, and audited. Two headers matter on the wire:
+A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. The gateway is a LiteLLM proxy with a custom guardrail (`corp_llm_gateway.litellm_hook.CorpLlmGuardrail`) registered as a callback. Every request is sanitized in `pre_call`, forwarded to Anthropic / OpenAI with the developer's BYOK key intact, de-sanitized in `post_call`, and audited. The image serves LiteLLM's app through the gateway's own entrypoint (`python -m corp_llm_gateway.serve`), which puts a default-deny **route gate** in front of LiteLLM's router — the callback only runs on the routes LiteLLM sends through it, so everything else is refused. Two headers matter on the wire:
 
 | Header | Source | Purpose |
 |---|---|---|
@@ -53,6 +53,23 @@ A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. 
 - **Stage 0 pre-egress block** — `.env`, kubeconfig, nginx.conf, log-dump signatures → HTTP 422 with `block_reason`; upstream is never called
 - **Stage 5 DLP egress guard** — independent second-layer re-scan of the sanitized payload for canary strings and high-confidence secrets; blocks any survivor
 
+### Route gate (default-deny)
+
+The guardrail is a LiteLLM *callback*, and LiteLLM calls it only from the handlers that go through its shared request processor. Every request is therefore classified by `(method, path)` **before** LiteLLM's router sees it; a route the table does not list is refused. Only eight route spellings — the generation endpoints whose body the guardrail provably rewrites — reach a provider. Full rationale, reason codes and consequences: [`docs/security.md`](docs/security.md) §14.
+
+What a developer notices, and why:
+
+| Refused | Why |
+|---|---|
+| `POST /v1/messages/count_tokens`, `POST /v1/responses/input_tokens`, `POST /utils/token_counter` | Pre-flight token counting sent the raw `messages` / `system` / `tools` / `prompt` to the provider's counting API without ever calling the hook. `usage.input_tokens` on every real turn is the exact, post-sanitization count; Claude Code falls back to its own estimate for the context indicator |
+| `WEBSOCKET /v1/responses`, `/v1/realtime`, `/openai/v1/realtime` | Only the handshake reaches the hook, and it carries no content — every frame after it bypasses sanitization entirely. Refused at the handshake; clients use the HTTP transport |
+| `POST /v1/completions` | Reaches the hook, but the hook reads `messages` / `input` — a text-completion `prompt` is never rewritten |
+| `POST /v1/embeddings`, `/v1/moderations`, `/v1/audio/speech` | LiteLLM's documented no-rewrite set: previously DLP-scanned only, and a DLP scan blocks a *known* pattern rather than sanitizing |
+| `POST /anthropic/…`, `/openai/…`, `/{provider}/…` and the other provider-native trees | Raw passthrough to the provider — the body is forwarded as sent |
+| anything not in the table, including LiteLLM's admin **UI** mounts | Default-deny, so a route a future LiteLLM release adds is refused until someone classifies it. The JSON admin API (`/key/*`, `/team/*`, …) is pinned route by route and still answers |
+
+There is no off switch. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` can add PASSTHROUGH routes an operator owns and nothing else; `gateway-admin config check --routes` prints the effective table. Startup is fail-closed too: the gateway exits rather than serve with its config missing (78) or its guardrail callback unregistered (70).
+
 ### Auth & compliance
 
 - **X-Corp-Auth + Postgres token store** — `AuthMiddleware` validates tokens against `PostgresTokenStore` (asyncpg); 60 s revocation-propagation upper bound
@@ -74,6 +91,8 @@ Detection maps to the corp ИБ requirement set: structural-entity checksums, ma
 
 ```
 src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engine)
+  asgi.py / serve.py    the gateway's own ASGI entrypoint (`python -m corp_llm_gateway.serve`) — checks
+                        litellm's config, arms the route gate in its lifespan, wraps litellm's app
   auth/                 corp-LLM auth provider (Noop default; Bearer/mTLS/OIDC) + factory
   audit/                AuditEvent + Logger + Sinks + factory + retention generator + NEVER-fields gate
   bootstrap.py          production composition root — build_guardrail() from config; lazy `guardrail` singleton
@@ -88,6 +107,7 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
   payload/              size threshold + gzip + per-team quota + oversize policy
   profiles/             plugin bundles: ProfileBundle/PolicyKnobs + resolver + DETECTOR_REGISTRY + hash-integrity + defaults/
   providers/            ProviderRegistry + executable v1-guard (anthropic / openai / corp-vllm)
+  route_gate/           default-deny route table (generated from litellm's source) + classifier + ASGI middleware
   rules/                replace.md parser + gazetteer + cached file loader
   sanitizer/            local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator
   storage/              MappingStore (in-memory + Redis)
@@ -102,7 +122,7 @@ examples/compose/       lightweight local sanitizing proxy (one container, oracl
 docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
 scripts/deploy/         server bootstrap (bootstrap-server.sh + systemd unit) + deploy.sh (push/upgrade a host)
-tests/                  pytest, pytest-asyncio mode=auto (~2274 passed / 107 skipped; 3.14 graceful NER, full on 3.12/CI)
+tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipped on 3.12 + litellm; 3.14 = graceful NER)
 ```
 
 ## Developer quickstart (laptop)
@@ -402,10 +422,12 @@ Full per-surface guide (sinks, providers, the extensions registry, safety rules,
 Requires Python 3.12+.
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]"     # dev pulls the asgi + metrics extras too
 pre-commit install
-PYTHONPATH=src .venv/bin/pytest tests/ -q     # ~2274 passed / 107 skipped, ~76s (3.14 graceful NER; full NER + RS256 crypto on 3.12/CI)
+PYTHONPATH=src .venv/bin/pytest tests/ -q     # 2558 passed / 201 skipped, ~2min (3.14, no litellm: graceful NER)
+PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs   # 2767 / 40 (3.12 + litellm: NER, RS256, entrypoint, route guard)
 PYTHONPATH=src .venv/bin/ruff check src tests
+PYTHONPATH=src .venv/bin/ruff format --check src tests
 ```
 
 Conventions, invariants, and "things NOT to do" are pinned in [`CLAUDE.md`](CLAUDE.md). CI is GitHub Actions (`.github/workflows/`).
