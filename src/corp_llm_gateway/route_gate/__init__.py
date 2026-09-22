@@ -11,6 +11,7 @@ from corp_llm_gateway.route_gate.classify import (
     Decision,
     classify,
 )
+from corp_llm_gateway.route_gate.middleware import COMPONENT, RouteGateMiddleware
 from corp_llm_gateway.route_gate.table import (
     GATEWAY_ROUTE_TABLE,
     HTTP_METHODS,
@@ -24,6 +25,7 @@ from corp_llm_gateway.route_gate.table import (
 
 __all__ = [
     "BLOCK_REASONS",
+    "COMPONENT",
     "GATEWAY_ROUTE_TABLE",
     "HTTP_METHODS",
     "LITELLM_REGEX_TABLE",
@@ -36,6 +38,7 @@ __all__ = [
     "ROUTE_GATE_WEBSOCKET",
     "Decision",
     "Entry",
+    "RouteGateMiddleware",
     "Verdict",
     "classify",
     "lookup",

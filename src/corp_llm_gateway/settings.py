@@ -263,6 +263,16 @@ KEYS: tuple[Key, ...] = (
         choices=TRACING_EXPORTERS,
         help="tracing exporter (reserved): noop",
     ),
+    # ── Route gate (route_gate/) ─────────────────────────────────────────────
+    # The only knob the gate has. It can widen the table with PASSTHROUGH routes
+    # an operator owns; it can never add REWRITTEN and there is no off switch.
+    Key(
+        "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+        default="",
+        help="extra passthrough routes for the route gate, 'METHOD /path' "
+        "comma- or newline-separated (e.g. 'GET /internal/ops-status'); "
+        "PASSTHROUGH only — it can never admit a route as rewritten",
+    ),
     # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────
     Key("CORP_LLM_TESTDATA_ALLOWLIST", default="", help="inline never-redact test values"),
     Key("CORP_LLM_TESTDATA_ALLOWLIST_FILE", default="", help="never-redact test values file"),
@@ -361,6 +371,15 @@ def _check_oversize(values: Mapping[str, str | None], problems: list[str]) -> No
         normalize_oversize_policy(values.get("CORP_LLM_OVERSIZE_POLICY"))
     except ValueError as exc:
         problems.append(f"CORP_LLM_OVERSIZE_POLICY: {exc}")
+
+
+def _check_route_gate_extras(values: Mapping[str, str | None], problems: list[str]) -> None:
+    from corp_llm_gateway.route_gate.table import parse_extras
+
+    try:
+        parse_extras(values.get("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH"))
+    except ValueError as exc:
+        problems.append(f"CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH: {exc}")
 
 
 def _check_oracle_trigger(values: Mapping[str, str | None], problems: list[str]) -> None:
@@ -569,6 +588,7 @@ def validate() -> Settings:
         _check_choices(values, problems)
     _check_conditional(values, problems)
     _check_oversize(values, problems)
+    _check_route_gate_extras(values, problems)
     _check_oracle_trigger(values, problems)
     _check_oracle_endpoint(values, problems)
     _check_corp_ner_endpoint(values, problems)
