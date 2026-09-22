@@ -399,14 +399,16 @@ def _route_gate_summary() -> dict[str, Any]:
         "gateway_rows": len(GATEWAY_ROUTE_TABLE),
         "counts": {v.name: verdicts.count(v) for v in Verdict},
         "rewritten": sorted(
-            f"{method} {path}"
-            for (method, path), entry in LITELLM_ROUTE_TABLE.items()
-            if entry.verdict is Verdict.REWRITTEN
-        )
-        + sorted(
-            f"{row.method} {row.template}"
-            for row in LITELLM_REGEX_TABLE
-            if row.entry.verdict is Verdict.REWRITTEN
+            [
+                f"{method} {path}"
+                for (method, path), entry in LITELLM_ROUTE_TABLE.items()
+                if entry.verdict is Verdict.REWRITTEN
+            ]
+            + [
+                f"{row.method} {row.template}"
+                for row in LITELLM_REGEX_TABLE
+                if row.entry.verdict is Verdict.REWRITTEN
+            ]
         ),
         "extras": sorted(f"{method} {path}" for method, path in extras),
         "extras_problem": extras_problem,
@@ -416,7 +418,8 @@ def _route_gate_summary() -> dict[str, Any]:
 def _print_route_gate(summary: dict[str, Any]) -> None:
     print(
         f"route gate: {summary['exact_rows']} exact + {summary['regex_rows']} regex litellm "
-        f"rows, {summary['gateway_rows']} gateway rows (no off switch)"
+        f"rows, {summary['gateway_rows']} gateway rows (no off switch). The verdict counts "
+        "below cover those litellm + gateway rows; operator extras are listed separately."
     )
     rows: list[tuple[str, ...]] = [("VERDICT", "ROWS")]
     rows += [(name, str(count)) for name, count in summary["counts"].items()]
@@ -426,7 +429,9 @@ def _print_route_gate(summary: dict[str, Any]) -> None:
         print(f"  {route}")
     print("\nCORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH:")
     if summary["extras_problem"]:
-        print(f"  INVALID: {summary['extras_problem']}", file=sys.stderr)
+        invalid = f"  INVALID: {summary['extras_problem']}"
+        print(invalid)
+        print(invalid, file=sys.stderr)
     elif not summary["extras"]:
         print("  (none)")
     for route in summary["extras"]:

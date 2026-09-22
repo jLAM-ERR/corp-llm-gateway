@@ -144,6 +144,8 @@ issue_corp_token() {
         exit 1
     fi
 
+    # NOTE: not served today — the gateway leaves /internal/issue-token unlisted (404
+    # route_gate_unlisted); mint tokens with `gateway-admin token issue` out-of-band.
     log "exchanging OIDC token for 30-day corp token"
     local issue_resp corp_token
     issue_resp="$(curl -fsSL -X POST "$GATEWAY_URL/internal/issue-token" \

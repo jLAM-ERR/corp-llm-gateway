@@ -55,6 +55,10 @@ MANAGED_ENV: tuple[str, ...] = (
     "CORP_ENV",
     "CORP_LLM_STRIP_INBOUND_HEADERS",
     "CORP_LLM_GATEWAY_CONFIG_FILE",
+    "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+    "CORP_LLM_LITELLM_CONFIG",
+    "CORP_LLM_SERVE_HOST",
+    "CORP_LLM_SERVE_PORT",
     # decoy aliases (must be ignored):
     "DATABASE_URL",
     "POSTGRES_DSN",

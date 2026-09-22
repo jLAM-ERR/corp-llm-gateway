@@ -29,12 +29,14 @@ src/corp_llm_gateway/
   corp_llm/     httpx client speaking vLLM /v1/chat/completions
   detectors/    PIIDetector + regex_checksum + dual_ner (RU Natasha + EN spaCy); NerUnavailableError (fail-closed)
   extensions/   ExtensionRegistry + ExtensionSpec (kind/api_version/fail_policy); fail-closed register; api-version gate
-  healthz/      live / ready / sanitization / extensions checks + ASGI server (build_health_router, serves /healthz/* + /internal/issue-token)
+  healthz/      live / ready / sanitization / extensions checks + ASGI server (build_health_router, serves /healthz/*)
+                token issuance is not an HTTP route today — operators mint tokens with `gateway-admin token issue`
   metrics/      MetricsExporter (noop default / prometheus); emits blocked_requests_total{block_reason} + gateway_failure{component}
   payload/      size threshold + gzip + per-team quota + oversize policy (fail-closed default)
   profiles/     plugin bundles — ProfileBundle/PolicyKnobs(merge) + loaders/resolver + DETECTOR_REGISTRY + manifest (hash-integrity) + defaults/
   providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
-  route_gate/   default-deny gate: table.py (generated from litellm's source) + classify.py + middleware.py
+  route_gate/   default-deny gate: table.py (hand-classified against litellm's source, guarded by the
+                collector test) + classify.py + middleware.py
   rules/        replace.md parser + gazetteer + cached file loader
   sanitizer/    local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator (live profiles)
                 + identity_preamble (rewrite-vs-scan carve-out, see below)
@@ -47,7 +49,7 @@ helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto (2558 passed / 201 skipped on 3.14; 2767 / 40 on 3.12 + litellm 1.101.0,
+tests/                   pytest, pytest-asyncio mode=auto (2559 passed / 201 skipped on 3.14; 2768 / 40 on 3.12 + litellm 1.101.0,
                          where NER, RS256 crypto and the entrypoint/route-gate suites actually run)
 ```
 
@@ -65,7 +67,7 @@ decision `docs/adr/ADR-003-ner-orchestration.md`). Old order was LLM-oracle-firs
 
 ```
 route gate (OUTERMOST, before litellm's router — `route_gate/middleware.py`):
-           classify (METHOD, path) against the generated table → PASSTHROUGH / REWRITTEN / REFUSE.
+           classify (METHOD, path) against the hand-classified table → PASSTHROUGH / REWRITTEN / REFUSE.
            Unlisted ⇒ 404, listed-REFUSE / websocket / malformed ⇒ 403, both E_ROUTE_BLOCKED;
            REWRITTEN while unarmed ⇒ 503. Only then does litellm's router run pre_call_hook.
            ↓

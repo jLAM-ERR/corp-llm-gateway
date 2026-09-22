@@ -107,7 +107,8 @@ src/corp_llm_gateway/   Python-guardrail (кастомные хуки LiteLLM + 
   payload/              порог размера + gzip + квота на команду + политика oversize
   profiles/             плагин-бандлы: ProfileBundle/PolicyKnobs + resolver + DETECTOR_REGISTRY + hash-integrity + defaults/
   providers/            ProviderRegistry + исполняемый v1-guard (anthropic / openai / corp-vllm)
-  route_gate/           таблица маршрутов с запретом по умолчанию (сгенерирована из исходников litellm) + классификатор + ASGI-middleware
+  route_gate/           таблица маршрутов с запретом по умолчанию (классифицирована вручную по исходникам litellm,
+                        сверяется тестом-коллектором) + классификатор + ASGI-middleware
   rules/                парсер replace.md + газеттир + кэширующий загрузчик файлов
   sanitizer/            local-first движок + сегментатор + StreamingDesanitizer + DLP guard + оркестратор + ProfileAwareOrchestrator
   storage/              MappingStore (in-memory + Redis)

@@ -646,6 +646,9 @@ def test_config_check_routes_json_carries_the_counts(
     gate = json.loads(capsys.readouterr().out)["route_gate"]
     assert gate["exact_rows"] == len(LITELLM_ROUTE_TABLE)
     assert set(gate["counts"]) == {v.name for v in Verdict}
+    # the eight generation spellings, the only routes whose body is rewritten
+    assert gate["counts"]["REWRITTEN"] == 8
+    assert len(gate["rewritten"]) == 8
     assert gate["extras"] == []
     assert gate["extras_problem"] is None
 
@@ -665,7 +668,27 @@ def test_config_check_routes_reports_a_malformed_extra_rather_than_raising(
     captured = capsys.readouterr()
     assert rc == 1
     assert "route gate:" in captured.out
+    # both streams carry it: a stdout-only reader must not see an empty section
+    assert "INVALID" in captured.out
     assert "INVALID" in captured.err
+
+
+def test_config_check_routes_json_reports_a_malformed_extra(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", "GET without-a-slash")
+
+    rc = main(["config", "check", "--no-probe", "--routes", "--json"])
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    gate = payload["route_gate"]
+    assert gate["extras_problem"] is not None
+    assert gate["extras"] == []
+    assert gate["counts"]["REWRITTEN"] == 8
 
 
 def test_config_check_without_routes_prints_no_table(

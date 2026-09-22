@@ -140,8 +140,13 @@ The gateway image mounts these onto LiteLLM's ASGI app (probes target them):
 - `GET  /healthz/ready` — readiness (503 when unhealthy; reflects the deep-check)
 - `GET  /healthz/sanitization` — sanitization deep-check
 - `GET  /healthz/extensions` — registered-extension health (does not gate readiness)
-- `POST /internal/issue-token` — developer onboarding token issuance
 - `GET  /metrics` — Prometheus scrape (the series ship with the metrics module; see `configuration.md`)
+
+`POST /internal/issue-token` is **not served today**, although `scripts/install.sh`
+still calls it: the health router is mounted without a `TokenIssuer`, and the route
+gate leaves the path unlisted, so it answers 404 `route_gate_unlisted`. Until it is
+wired, mint tokens with `gateway-admin token issue` (see `admin-cli.md`) and hand
+them to developers out-of-band.
 
 ## Rollback
 

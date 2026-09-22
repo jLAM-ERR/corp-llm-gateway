@@ -140,8 +140,8 @@ Action — read `reason` first, it names the cause:
 
 | `reason` | Status | What happened | What to do |
 |---|---|---|---|
-| `route_gate_listed` | 403 | the table refuses this route (token counting, embeddings, `/v1/completions`, provider-native passthrough, the telemetry batch, …) | Nothing. Expected. For token counting, see §11 (i): clients use `usage.input_tokens`. |
-| `route_gate_unlisted` | 404 | no table entry — default-deny | Either the client asked for a route litellm does not have, or a litellm bump added one and the table was not regenerated (`docs/extending.md`). For an operator route you own, widen with `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`. |
+| `route_gate_listed` | 403 | the table refuses this route (token counting, embeddings, `/v1/completions`, provider-native passthrough, the telemetry batch, …) | Nothing. Expected. For token counting, see [`../security.md`](../security.md) §11 (i): clients use `usage.input_tokens`. |
+| `route_gate_unlisted` | 404 | no table entry — default-deny | Either the client asked for a route litellm does not have, or a litellm bump added one and the table has no row for it yet — rows are hand-classified against litellm's source, guarded by the collector test (`docs/extending.md`). For an operator route you own, widen with `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`. |
 | `route_gate_websocket` | 403 | a `websocket` scope, or `Upgrade: websocket` on any path | Expected: frames after the handshake never reach the hook. Clients must use the HTTP transport. |
 | `route_gate_malformed` | 403 | the raw path carries `%2f`, `%00`, `%2e%2e` or a non-ASCII byte, or the decoded path carries `..`, `//` or NUL | Not a config problem. A normal client does not send these — treat a sustained rate as probing and check the audit records. |
 

@@ -107,7 +107,8 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
   payload/              size threshold + gzip + per-team quota + oversize policy
   profiles/             plugin bundles: ProfileBundle/PolicyKnobs + resolver + DETECTOR_REGISTRY + hash-integrity + defaults/
   providers/            ProviderRegistry + executable v1-guard (anthropic / openai / corp-vllm)
-  route_gate/           default-deny route table (generated from litellm's source) + classifier + ASGI middleware
+  route_gate/           default-deny route table (hand-classified against litellm's source, guarded by the collector test)
+                        + classifier + ASGI middleware
   rules/                replace.md parser + gazetteer + cached file loader
   sanitizer/            local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator
   storage/              MappingStore (in-memory + Redis)
