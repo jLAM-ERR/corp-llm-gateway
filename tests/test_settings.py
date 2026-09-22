@@ -357,6 +357,41 @@ def test_validate_rejects_unknown_oversize_policy(
         config.validate()
 
 
+@pytest.mark.parametrize(
+    "raw",
+    ["/internal/ops", "POST", "TRACE /internal/ops", "GET internal/ops", "GET /internal/../key"],
+)
+def test_validate_rejects_a_malformed_route_gate_extra(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", raw)
+    with pytest.raises(ConfigError, match="CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH"):
+        config.validate()
+
+
+def test_validate_accepts_route_gate_extras_and_resolves_them(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from corp_llm_gateway.route_gate import Verdict
+
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv(
+        "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", "GET /internal/ops-status, POST /internal/ops"
+    )
+    assert isinstance(config.validate(), Settings)
+    extras = config.route_gate_extras()
+    assert set(extras) == {("GET", "/internal/ops-status"), ("POST", "/internal/ops")}
+    assert all(entry.verdict is Verdict.PASSTHROUGH for entry in extras.values())
+
+
+def test_route_gate_extras_default_to_empty(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    assert config.route_gate_extras() == {}
+
+
 def test_validate_rejects_unknown_auth_provider(
     hermetic: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

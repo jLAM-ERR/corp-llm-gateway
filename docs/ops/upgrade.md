@@ -1,7 +1,9 @@
 # Upgrade notes
 
-Read before upgrading an existing deployment. Two items need operator action:
-the `team_config` schema change, and the RS256 operator-token breaking change.
+Read before upgrading an existing deployment. Three items need operator action:
+the `team_config` schema change, the RS256 operator-token breaking change, and
+the new launch command (`python -m corp_llm_gateway.serve`) that the route gate
+requires.
 
 ## Database schema
 
@@ -84,25 +86,41 @@ unaffected — this is operator auth only.
 `CORP_GATEWAY_RBAC=0` still bypasses RBAC entirely — **local dev only**. Do not
 set it in staging or prod: it disables the operator claim check.
 
-## litellm base image pin: v1.95.0
+## litellm base image pin: v1.101.0
 
-The litellm base image is pinned in six places, all now on **`v1.95.0`** (the
-latest stable — `v1.95.0`, `main-stable` and `latest` resolve to byte-identical
-manifests, verified 2026-08-04):
+The litellm version is pinned in **seven** places, all now on **`v1.101.0`** (the
+release GitHub marks Latest, 2026-09-15):
 
 | Pin site | Previous | Now |
 |---|---|---|
-| `Dockerfile.gateway` (`ARG LITELLM_VERSION`) — the **published** image Helm and production compose run | `main-stable` | `v1.95.0` |
-| `.github/workflows/build-image.yml` (`litellm_version` input default + the `LITELLM_VERSION` build-arg fallback) | `v1.85.0` | `v1.95.0` |
-| `scripts/release/gates.sh` (`LITELLM_VERSION`) | `v1.85.0` | `v1.95.0` |
-| `docker/demo-litellm/Dockerfile` | `v1.85.0` | `v1.95.0` |
-| `docker/chatgpt-codex/Dockerfile` | `v1.89.3` | `v1.95.0` |
-| `docker/anthropic-oauth/Dockerfile` | `v1.89.3` | `v1.95.0` |
+| `Dockerfile.gateway` (`ARG LITELLM_VERSION`) — the **published** image Helm and production compose run | `v1.95.0` | `v1.101.0` |
+| `.github/workflows/build-image.yml` (`litellm_version` input default + the `LITELLM_VERSION` build-arg fallback) | `v1.95.0` | `v1.101.0` |
+| `scripts/release/gates.sh` (`LITELLM_VERSION`) | `v1.95.0` | `v1.101.0` |
+| `docker/demo-litellm/Dockerfile` | `v1.95.0` | `v1.101.0` |
+| `docker/chatgpt-codex/Dockerfile` | `v1.95.0` | `v1.101.0` |
+| `docker/anthropic-oauth/Dockerfile` | `v1.95.0` | `v1.101.0` |
+| `pyproject.toml` (`litellm==1.101.0`) — **new seventh site** | `>=1.40,<2.0` | `==1.101.0` |
 
-`pyproject.toml` still declares `litellm>=1.40,<2.0` — a floor, deliberately not
-raised: nothing in `src/` needs a v1.95 API. The one litellm symbol the request
-path imports, `ANTHROPIC_OAUTH_TOKEN_PREFIX`, has an in-tree fallback
-(`litellm_hook.py`) and is unchanged since v1.85.0.
+**The floating tags no longer match the pin.** At the v1.95.0 bump, `v1.95.0`,
+`main-stable` and `latest` resolved to byte-identical manifests. Re-checked with
+`docker manifest inspect` on 2026-09-22, that is no longer true: `main-stable`
+and `latest` are identical to each other (amd64 `sha256:9d60771c…`) but resolve
+to a **different** manifest than `v1.101.0` (amd64 `sha256:266180fb…`). Use the
+explicit tag; do not assume the floating ones are equivalent.
+
+**`pyproject.toml` is now an exact pin, not a floor** — the route gate's table is
+generated from ONE litellm's route source and guarded against it
+(`tests/route_gate/`). With the old `>=1.40,<2.0` range, CI's `pip install -e .`
+resolved whatever PyPI called latest, so the guard read a different litellm than
+the image ships and would have passed against routes the gateway never serves.
+Move it with the other six; `tests/test_litellm_pin.py` fails if the sites
+disagree. The one litellm symbol the request path imports,
+`ANTHROPIC_OAUTH_TOKEN_PREFIX`, has an in-tree fallback (`litellm_hook.py`) and
+is unchanged since v1.85.0.
+
+Note that litellm 1.101.0 raises its own dependency floors (`openai>=2.20`,
+`pydantic>=2.10`, `httpx>=0.28`, `pydantic-settings>=2.14.1`) and pulls in
+`boto3`/`botocore` transitively.
 
 `Dockerfile.gateway`'s default is now a fixed tag rather than `main-stable`, so
 two builds of the same commit produce the same proxy. Override per build with
@@ -118,18 +136,38 @@ rollback is a redeploy of the previous image or a rebuild with the old tag:
 helm upgrade corp-llm-gateway helm/corp-llm-gateway --set image.tag=<previous-tag>
 
 # or rebuild against the old base
-docker build -f Dockerfile.gateway --build-arg LITELLM_VERSION=v1.85.0 .
+docker build -f Dockerfile.gateway --build-arg LITELLM_VERSION=v1.95.0 .
 ```
 
-Previous pins, for a per-site revert: `Dockerfile.gateway` `main-stable`,
-release-workflow default `v1.85.0`, `scripts/release/gates.sh` `v1.85.0`,
-demo `v1.85.0`, chatgpt-codex `v1.89.3`, anthropic-oauth `v1.89.3`.
+Previous pins, for a per-site revert: all six sites were `v1.95.0`.
+
+Earlier lineage, if you need to go back further than one step: before the
+v1.95.0 bump the sites were `Dockerfile.gateway` `main-stable`, release-workflow
+default `v1.85.0`, `scripts/release/gates.sh` `v1.85.0`, demo `v1.85.0`,
+chatgpt-codex `v1.89.3`, anthropic-oauth `v1.89.3`.
 
 Revert `build-image.yml` and `gates.sh` **together** — `gates.sh` names the
 workflow as the source of truth for the pin, and `tests/test_litellm_pin.py`
 fails if the sites disagree.
 
 ### What was checked before the bump
+
+For **v1.101.0** the checks below were re-run against the installed 1.101.0 wheel
+(`.venv-bench`, Python 3.12) via `tests/litellm_hook/test_litellm_route_assumptions.py`
+and the rest of the suite — 2346 passed, 69 skipped, no failures. They were
+**not** re-probed inside the built v1.101.0 image: the outbound-capture suite
+(`tests/integration/test_anthropic_oauth_outbound.py`) needs a docker pull of the
+pinned image and skipped locally. CI arms it with `CORP_REQUIRE_PROXY_CAPTURE=1`,
+so that run is the one that proves the image itself — treat it as the gate that
+is still outstanding, together with `scripts/release/gates.sh`.
+
+Not a security fix in itself. Three routes bypass the guardrail hook in v1.101.0
+— `/v1/messages/count_tokens`, the `/v1/responses` WebSocket, and the new
+`/v1/responses/input_tokens` — and none of them references `pre_call_hook`.
+**They are closed by the route gate that ships in the same release line** (see
+"Route gate" below and `../security.md` §14), not by the bump.
+
+The behavioural assertions themselves, originally probed in-image at v1.95.0:
 
 - litellm's Anthropic OAuth branch is unchanged: an `sk-ant-oat…` `api_key`
   yields `authorization: Bearer …` + `anthropic-beta: oauth-2025-04-20` +
@@ -147,6 +185,80 @@ fails if the sites disagree.
 - `CallTypes` still carries `aspeech` / `pass_through_endpoint` / `aresponses`
   (the hook's non-chat `input` denylist), and the router still treats `api_key`
   as a clientside credential (what the Codex and Anthropic bridges rely on).
+
+## Route gate: the launch command changed (breaking for custom `command`)
+
+**Breaking for any deployment that overrides the container command.** The image
+`ENTRYPOINT` is now `python -m corp_llm_gateway.serve`; it was
+`litellm --config /etc/litellm/config.yaml --port 4000`. compose runs the same
+module, and the Helm chart sets no `command`, so it inherits the new ENTRYPOINT
+with no values change. A stack that pins its own `command`/`entrypoint` to the
+`litellm` CLI keeps running **without the route gate** — fix it before rolling
+out, or the bypass routes stay open.
+
+The entrypoint took over what litellm's CLI did and nothing more: it validates
+the config file (litellm's own lifespan skips a missing one *in silence*, which
+starts the proxy with no guardrail at all), runs the Prisma schema sequence with
+the CLI's four guards, sets `WORKER_CONFIG`, and passes the same uvicorn
+arguments. It then puts a default-deny route gate in front of litellm's router.
+Rationale and the full refused set: [`../security.md`](../security.md) §14.
+
+### What changes for operators
+
+- **New exit codes at boot**, all fail-closed: **78** (litellm's config missing /
+  not YAML / unreadable / configuring `pass_through_endpoints` or
+  `general_settings.database_url`), **70** (litellm started but no
+  `CorpLlmGuardrail` in `litellm.callbacks`), **2** / **1** (Prisma schema setup,
+  same conditions as litellm's CLI). `runbook.md` has the triage table.
+- **`general_settings.database_url` in litellm's YAML is now refused** (exit 78),
+  and the `DATABASE_HOST`/`DATABASE_USERNAME`/… env composition is not read. The
+  Prisma step reads `DATABASE_URL` / `DIRECT_URL` only — move the DSN there.
+- **`general_settings.pass_through_endpoints` is refused** (exit 78): litellm
+  registers those routes at runtime from config, the table cannot know them, and
+  default-deny would 404 every one. Better a boot error than dead routes.
+- **Pre-flight token counting is gone.** `POST /v1/messages/count_tokens`,
+  `/v1/responses/input_tokens` and `/utils/token_counter` answer 403. Clients use
+  `usage.input_tokens` from each real turn; Claude Code falls back to its own
+  estimate for the context indicator. `../security.md` §11 (i) records the trade.
+- **litellm's admin UI is no longer served.** `ast` cannot see inside a mounted
+  ASGI app, so `/ui`, `/swagger`, `/docs` and `/openapi.json` get no table entry
+  and are refused as unlisted. The JSON admin API (`/key/*`, `/team/*`, …) is
+  pinned route by route and still answers. The escape hatch is
+  `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` — but it
+  admits one exact `(method, path)` per item and has no prefix form, so it fits a
+  single operator route, not a mounted SPA.
+- **`/healthz/*` and `/metrics` are now served by the gateway itself**, ahead of
+  litellm's app. Helm's probes and the ServiceMonitor answer without a litellm
+  credential (litellm's `PrometheusAuthMiddleware` 401s any path containing
+  `/metrics` when a master key is set). compose's healthcheck moved to
+  `/healthz/live`.
+- **`HEAD` on a litellm route answers 405**, not a refusal: the gate admits it
+  (HEAD inherits its path's GET verdict) but FastAPI's `APIRoute` does not
+  register HEAD for a GET route. The gateway's own `HEAD /healthz/*` answers 200.
+- **Scale with replicas, never uvicorn workers.** `serve.py` pins `workers=1`:
+  each worker would re-run the Prisma sequence against one database and build its
+  own Prometheus registry.
+
+No data migration. Rollback is a redeploy of the previous image tag, which
+carries the old ENTRYPOINT — and the open bypass routes with it.
+
+## `CORP_LLM_STRIP_INBOUND_HEADERS` now defaults to `1`
+
+**Behaviour change, no action needed unless you set it explicitly.** The flag was
+absent from the Helm chart and defaulted to `0`, so the guardrail carried the
+client's inbound wire headers into litellm's upstream call — including the
+client's `Content-Length` beside litellm's own, longer, **sanitized** body. The
+provider then read the request truncated at the client's length. Wire-captured on
+both `/v1/messages` and `/v1/chat/completions`: a `"stream": true` cut off that
+way came back non-streamed, and any request whose sanitized body grew (a
+placeholder longer than the original) was corrupted. Every Helm deploy was
+affected.
+
+It now defaults **on** (`bootstrap.build_guardrail`) and the chart sets it
+explicitly. The dropped set (`_WIRE_HEADERS_TO_DROP`) is hop-by-hop / wire-level
+only and never contains `authorization`, so BYOK passthrough is untouched, and
+`X-Corp-Auth` was already stripped unconditionally one step earlier. Set it to
+`0` only to reproduce the old behaviour. Recorded as `../security.md` §11 (h).
 
 ## Cache A is invalidated by this release (no action required *for the cache*)
 

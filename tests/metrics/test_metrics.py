@@ -8,22 +8,30 @@ venv and run under CI's ``[metrics]`` extra.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
+import corp_llm_gateway as gateway_package
 from corp_llm_gateway import config
+from corp_llm_gateway import metrics as metrics_module
 from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.corp_llm import CorpLlmClient
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.metrics import (
+    BLOCK_REASONS,
+    FAILURE_COMPONENTS,
     MetricsDependencyError,
     MetricsExporter,
     NoopExporter,
     PrometheusExporter,
+    build_exporter,
     get_exporter,
+    reset_exporter,
 )
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
@@ -314,3 +322,224 @@ async def test_hook_default_noop_leaves_block_path_unchanged() -> None:
     assert ei.value.error_code == "E_POLICY_BLOCKED"
     # The Stage-0 block still audits inline exactly once — unchanged by the noop path.
     assert len(sink.records) == 1
+
+
+# ── One exporter per process (the /metrics route and the gate share it) ──────
+
+
+def test_get_exporter_returns_the_same_instance_every_time() -> None:
+    # PrometheusExporter gives each instance its OWN registry, so a second one
+    # would count into a registry nothing scrapes. The route gate, the guardrail
+    # and asgi.py's /metrics route all resolve through here.
+    assert get_exporter() is get_exporter()
+
+
+def test_build_exporter_returns_a_new_instance_each_time() -> None:
+    assert build_exporter() is not build_exporter()
+
+
+def test_reset_exporter_re_reads_the_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Other(NoopExporter):
+        pass
+
+    first = get_exporter()
+    assert isinstance(first, NoopExporter)
+
+    monkeypatch.setitem(metrics_module._EXPORTER_FACTORIES, "noop", _Other)
+    assert get_exporter() is first, "a cached exporter must not change under a live process"
+
+    reset_exporter()
+    assert isinstance(get_exporter(), _Other)
+
+
+# ── the /metrics ASGI app ────────────────────────────────────────────────────
+
+
+async def _call(app: object) -> tuple[int, bytes, dict[bytes, bytes]]:
+    messages: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        messages.append(message)
+
+    await app({"type": "http", "method": "GET", "path": "/metrics", "headers": []}, receive, send)  # type: ignore[operator]
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], body, dict(start["headers"])
+
+
+async def test_the_noop_exporter_still_serves_metrics() -> None:
+    # A 404 here is indistinguishable from a dead pod to a scrape; answer 200
+    # with nothing instead.
+    status, body, headers = await _call(NoopExporter().asgi_app())
+
+    assert status == 200
+    assert body == b""
+    assert headers[b"content-type"] == b"text/plain; charset=utf-8"
+
+
+async def test_the_prometheus_exporter_serves_its_own_registry() -> None:
+    exporter = _prom()
+    exporter.record_block("route_gate_listed")
+
+    status, body, _ = await _call(exporter.asgi_app())
+
+    assert status == 200
+    assert b'corp_llm_gateway_blocked_requests_total{block_reason="route_gate_listed"}' in body
+
+
+# ── the label values the series can carry ────────────────────────────────────
+
+ALL_BLOCK_REASONS: tuple[str, ...] = tuple(
+    reason for site in BLOCK_REASONS.values() for reason in site
+)
+
+
+def test_the_route_gate_reasons_match_the_gate_itself() -> None:
+    # The gate's set is the source; base.py restates it (importing route_gate
+    # there would be a cycle), so the restatement has to be pinned.
+    from corp_llm_gateway.route_gate.classify import BLOCK_REASONS as GATE_REASONS
+
+    assert set(BLOCK_REASONS["route_gate"]) == set(GATE_REASONS)
+
+
+def _returned_string_literals(module: object) -> set[str]:
+    """Every `return "literal"` in a module — the reason codes it can produce.
+
+    Literal returns only: a reason built at runtime (an f-string, a name) is
+    invisible here, so a block site that stops returning literals silently
+    narrows this check.
+    """
+    source = Path(module.__file__).read_text(encoding="utf-8")  # type: ignore[attr-defined]
+    return {
+        node.value.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+
+
+def test_the_stage0_reasons_match_the_payload_classifier() -> None:
+    # `dlp:secret` sat in docs/audit-schema.md for a release while the guard
+    # emitted `dlp:secret_leak`. Both block sites are now read off their own
+    # source, so a renamed code fails here instead of silencing an alert.
+    from corp_llm_gateway.payload import classifier
+
+    assert set(BLOCK_REASONS["stage0"]) == _returned_string_literals(classifier)
+
+
+def test_the_stage5_reasons_match_the_dlp_guard() -> None:
+    from corp_llm_gateway.sanitizer import dlp_guard
+
+    assert set(BLOCK_REASONS["stage5"]) == _returned_string_literals(dlp_guard)
+
+
+def test_every_enumerated_block_reason_is_documented_in_the_audit_schema() -> None:
+    # docs/audit-schema.md is where the audit-side reader looks up a reason code.
+    schema = (Path(gateway_package.__file__).parents[2] / "docs" / "audit-schema.md").read_text(
+        encoding="utf-8"
+    )
+    row = next(
+        (line for line in schema.splitlines() if line.startswith("| `block_reason` |")), None
+    )
+    assert row is not None, "docs/audit-schema.md has no `block_reason` row"
+    missing = [reason for reason in ALL_BLOCK_REASONS if f"`{reason}`" not in row]
+
+    assert not missing, missing
+
+
+def test_every_recorded_block_reason_literal_is_enumerated() -> None:
+    # A new `record_block("...")` anywhere in src has to appear in the
+    # enumeration, or an alert written from it silently never fires.
+    literals = set()
+    for path in Path(gateway_package.__file__).parent.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "record_block"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                literals.add(node.args[0].value)
+
+    assert literals, "no record_block call with a literal reason was found; re-read the walker"
+    assert literals <= set(ALL_BLOCK_REASONS), literals - set(ALL_BLOCK_REASONS)
+
+
+def test_the_failure_components_match_the_hooks_own_map() -> None:
+    from corp_llm_gateway.litellm_hook import _FAILURE_COMPONENT
+    from corp_llm_gateway.route_gate.middleware import COMPONENT
+
+    assert set(FAILURE_COMPONENTS) == set(_FAILURE_COMPONENT.values()) | {"other", COMPONENT}
+
+
+@pytest.mark.parametrize("reason", ALL_BLOCK_REASONS)
+def test_every_enumerated_block_reason_renders_on_the_real_series(reason: str) -> None:
+    exporter = _prom()
+
+    exporter.record_block(reason)
+
+    text = exporter.render().decode()
+    assert f'corp_llm_gateway_blocked_requests_total{{block_reason="{reason}"}}' in text
+
+
+@pytest.mark.parametrize("component", FAILURE_COMPONENTS)
+def test_every_enumerated_failure_component_renders_on_the_real_series(component: str) -> None:
+    exporter = _prom()
+
+    exporter.record_failure(component)
+
+    text = exporter.render().decode()
+    assert f'gateway_failure{{component="{component}"}}' in text
+
+
+async def test_the_gate_records_its_reason_and_component_through_the_exporter() -> None:
+    # End to end through the middleware, not a hand-called exporter: the gate is
+    # what an operator's `route_gate_*` alert actually counts.
+    from corp_llm_gateway.route_gate import RouteGateMiddleware
+    from corp_llm_gateway.route_gate.middleware import COMPONENT
+
+    exporter = _prom()
+
+    async def _never_called(scope: object, receive: object, send: object) -> None:
+        raise AssertionError("the gate forwarded a request it had to refuse")
+
+    gate = RouteGateMiddleware(
+        _never_called,
+        metrics=exporter,
+        audit_logger=AuditLogger(ListSink(), gateway_version="0.0.1"),
+    )
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        return None
+
+    for method, path in (
+        ("POST", "/v1/messages/count_tokens"),
+        ("POST", "/v1/some/future/route"),
+        ("POST", "/v1/messages"),  # REWRITTEN, and the gate is not armed
+    ):
+        await gate(
+            {
+                "type": "http",
+                "method": method,
+                "path": path,
+                "raw_path": path.encode(),
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+
+    text = exporter.render().decode()
+    for reason in ("route_gate_listed", "route_gate_unlisted", "route_gate_unarmed"):
+        assert f'corp_llm_gateway_blocked_requests_total{{block_reason="{reason}"}} 1.0' in text
+    assert f'gateway_failure{{component="{COMPONENT}"}} 1.0' in text

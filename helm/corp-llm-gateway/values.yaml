@@ -103,8 +103,15 @@ failPolicy:
 # CORP_ENV, CORP_LLM_REQUIRE_NER, CORP_LLM_ORACLE_TRIGGER, CORP_LLM_OVERSIZE_POLICY,
 # CORP_GATEWAY_OIDC_AUDIENCE / CORP_GATEWAY_OIDC_ISSUER, … (see values-prod.yaml
 # and docs/ops/configuration.md). Secrets go in `secret:` / `existingSecret`,
-# NEVER here. Empty by default so dev renders unchanged.
-config: {}
+# NEVER here.
+config:
+  # Not a preference — correctness. The guardrail writes the inbound wire
+  # headers into data["headers"] and litellm forwards that bucket, so with this
+  # off the client's Content-Length goes upstream beside litellm's own, longer,
+  # sanitized body and the provider truncates the request. The chart never set
+  # it, so every Helm deploy took the old off-by-default. Never drops
+  # Authorization (invariant 3).
+  CORP_LLM_STRIP_INBOUND_HEADERS: "1"
 
 # Set to the name of an external (Vault / external-secrets) Secret to source the
 # sensitive env contract from it. When set, the chart renders no Secret and the

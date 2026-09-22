@@ -64,11 +64,12 @@
 #   Resolved by bootstrap.build_guardrail() in every deployment (k8s/Helm
 #   included), not just the docker-compose Codex demo overlay. See
 #   docs/chatgpt-codex.md.
-# CORP_LLM_STRIP_INBOUND_HEADERS = "0"  # strip inbound wire headers before upstream
-#   Set "1" when routing through litellm's hosted_vllm/ provider (corp-*
-#   models): it forwards proxy_server_request headers (incl. Host) upstream,
-#   and an unknown vhost 503s the corp ingress. Off by default to preserve
-#   existing anthropic/openai routing behaviour.
+# CORP_LLM_STRIP_INBOUND_HEADERS = "1"  # strip inbound wire headers before upstream
+#   ON by default, and it is a correctness knob, not a preference: litellm
+#   forwards the headers the guardrail puts in data["headers"], so with this
+#   off the client's Content-Length travels with litellm's own, longer,
+#   sanitized body and the provider truncates the request. Also what keeps an
+#   inbound Host off the corp ingress on the hosted_vllm/ (corp-*) route.
 # CORP_LLM_FORWARD_ANTHROPIC_AUTH = "0"  # opt-in Anthropic subscription (OAuth) forwarding
 #   Lifts the developer's `sk-ant-oat…` bearer into the upstream Anthropic call,
 #   so no ANTHROPIC_API_KEY is needed on the laptop.
@@ -234,6 +235,28 @@
 # runbook reference). CORP_TRACING_EXPORTER is reserved (noop only for now).
 # CORP_METRICS_EXPORTER     = "noop"
 # CORP_TRACING_EXPORTER     = "noop"
+
+# ── Server entrypoint (asgi.py / serve.py) ───────────────────────────────────
+#
+# `python -m corp_llm_gateway.serve` is the only supported launch command: it
+# runs litellm's proxy behind the route gate. CORP_LLM_LITELLM_CONFIG is
+# litellm's own YAML (model_list + the guardrail callback). The entrypoint
+# refuses to start with exit 78 when it is missing, unreadable, not YAML or
+# configures `pass_through_endpoints`, and with exit 70 when the guardrail
+# callback did not register — litellm alone would serve unsanitized in both
+# cases. Host and port are litellm's CLI defaults.
+# CORP_LLM_LITELLM_CONFIG   = "/etc/litellm/config.yaml"
+# CORP_LLM_SERVE_HOST       = "0.0.0.0"
+# CORP_LLM_SERVE_PORT       = "4000"
+
+# ── Route gate (route_gate/) ─────────────────────────────────────────────────
+#
+# The gate classifies every (method, path) before litellm's router sees it and
+# refuses anything the table does not list. This is its only knob: extra routes
+# an operator owns, admitted as PASSTHROUGH. "METHOD /path", comma- or
+# newline-separated. It can never admit a route as rewritten, and there is no
+# off switch. A malformed entry fails `gateway-admin config check` at boot.
+# CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH = "GET /internal/ops-status"
 
 # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────────
 #

@@ -6,6 +6,12 @@ Plan ref: M8-2.
 
 ### Deploying a new version
 
+0. Run the pre-push gates: `bash scripts/release/gates.sh`. It builds both image
+   profiles and — since the route gate landed — runs the built image with **no
+   litellm config** and requires exit **78**, which proves the fail-closed
+   startup path on the real image. No launch path anywhere runs the `litellm`
+   CLI any more; the only serve command is `python -m corp_llm_gateway.serve`
+   (`release.md`).
 1. Tag the release: `git tag v0.x.y && git push origin v0.x.y`.
 2. GitHub Actions builds and publishes the gateway image on the tag (`.github/workflows/build-image.yml`). The wheel and Helm chart are built locally for now (those CI jobs are not yet ported).
 3. Apply to staging: `helm upgrade --install gw helm/corp-llm-gateway -f values-staging.yaml --version v0.x.y`.
@@ -29,7 +35,7 @@ Revisions list: `helm history gw`. Default Helm keeps the last 10.
 
 The fail-policy matrix in the plan (M4) is the source of truth for what "should" happen on each component failure. When reality disagrees, that's the bug.
 
-Metrics note: the alert series `gateway_failure{component}` and `corp_llm_gateway_blocked_requests_total{block_reason}` are emitted by the metrics module (plan task B4) and scraped via the ServiceMonitor. Until B4 lands, the same conditions surface in the gateway's structured logs — grep `error_code=` (e.g. `E_CORP_LLM_DOWN`, `E_NER_UNAVAILABLE`, `E_OVERSIZE_BLOCKED`, `E_DLP_BLOCKED`, `E_INTERNAL`) and `block_reason=` (`litellm_pre_call_blocked` / `litellm_egress_blocked`).
+Metrics note: the alert series `gateway_failure{component}` and `corp_llm_gateway_blocked_requests_total{block_reason}` are emitted by the metrics module and scraped via the ServiceMonitor — with `CORP_METRICS_EXPORTER=prometheus` (default `noop` emits nothing). The same conditions also surface in the gateway's structured logs — grep `error_code=` (e.g. `E_CORP_LLM_DOWN`, `E_NER_UNAVAILABLE`, `E_OVERSIZE_BLOCKED`, `E_DLP_BLOCKED`, `E_INTERNAL`, `E_ROUTE_BLOCKED`, `E_ROUTE_GATE_UNARMED`, `E_ROUTE_GATE_ERROR`) and `block_reason=` (`litellm_pre_call_blocked` / `litellm_egress_blocked` / `route_gate_*`).
 
 ### Corp-LLM unreachable
 
@@ -118,6 +124,75 @@ Action:
 2. If `exc_type` points at a known dependency (Postgres, Redis, the audit sink), treat it as that component's own incident instead — this path is the safety net, not the root cause.
 3. A request already blocked/failed by a specific component (e.g. `E_DLP_BLOCKED`) does NOT also count as `internal` — the wrapper skips the internal counter when a component-specific failure was already recorded for that request.
 4. An upstream provider/transport failure mid-stream (e.g. `httpx.RemoteProtocolError`) also does NOT count as `internal` — `post_call_stream` only wraps its own desanitization work; fetching the next chunk from the upstream iterator is deliberately outside that guard, so a provider failure propagates to litellm's own failure handling untouched. `internal` rising means a bug in the gateway's own pre/post-call code, not a downstream provider outage and not a duplicate of a component-specific block.
+
+### A client gets 403 / 404 `E_ROUTE_BLOCKED`
+
+Symptom: a request answers `{"error": {"type": "route_blocked", "code":
+"E_ROUTE_BLOCKED", "route": "<METHOD> <path>", "reason": "<block_reason>"}}`;
+`corp_llm_gateway_blocked_requests_total{block_reason="route_gate_*"}` rises.
+
+Behavior: **working as designed, not an outage.** The route gate classifies
+every request by `(method, path)` before litellm's router sees it, and refuses
+anything the guardrail does not provably rewrite. Full rationale, the refused
+set and the reason-code table: [`../security.md`](../security.md) §14.
+
+Action — read `reason` first, it names the cause:
+
+| `reason` | Status | What happened | What to do |
+|---|---|---|---|
+| `route_gate_listed` | 403 | the table refuses this route (token counting, embeddings, `/v1/completions`, provider-native passthrough, the telemetry batch, …) | Nothing. Expected. For token counting, see [`../security.md`](../security.md) §11 (i): clients use `usage.input_tokens`. |
+| `route_gate_unlisted` | 404 | no table entry — default-deny | Either the client asked for a route litellm does not have, or a litellm bump added one and the table has no row for it yet — rows are hand-classified against litellm's source, guarded by the collector test (`docs/extending.md`). For an operator route you own, widen with `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`. |
+| `route_gate_websocket` | 403 | a `websocket` scope, or `Upgrade: websocket` on any path | Expected: frames after the handshake never reach the hook. Clients must use the HTTP transport. |
+| `route_gate_malformed` | 403 | the raw path carries `%2f`, `%00`, `%2e%2e` or a non-ASCII byte, or the decoded path carries `..`, `//` or NUL | Not a config problem. A normal client does not send these — treat a sustained rate as probing and check the audit records. |
+
+There is **no off switch.** The only knob is
+`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` (`configuration.md`), it adds
+PASSTHROUGH entries only, and `gateway-admin config check --routes` prints the
+effective table plus every extra. If a route genuinely needs to be *rewritten*,
+that is a code change: a `table.py` row plus the guard test, never a knob.
+
+### 503 `E_ROUTE_GATE_UNARMED` / 500 `E_ROUTE_GATE_ERROR`
+
+Symptom: every generation route answers 503 with `E_ROUTE_GATE_UNARMED`, or some
+answer 500 with `E_ROUTE_GATE_ERROR`; `gateway_failure{component="route_gate"}`
+rises. Nothing is forwarded upstream in either case.
+
+Behavior: fail-closed. `E_ROUTE_GATE_UNARMED` means the gate never armed — it
+arms inside litellm's lifespan, only after `CorpLlmGuardrail` is confirmed in
+`litellm.callbacks`. `E_ROUTE_GATE_ERROR` means classification itself raised.
+
+Action:
+1. **Unarmed** is defence in depth, not a steady state: uvicorn finishes lifespan
+   startup before it binds, so with `workers=1` no request can arrive unarmed.
+   Seeing it means something runs more than one worker or a reloader. Check the
+   launch command is `python -m corp_llm_gateway.serve` with nothing overriding
+   it — scale with replicas, never with workers.
+2. If the pod instead **exited** at boot, see the exit codes below; that is the
+   ordinary failure mode for a missing callback.
+3. `E_ROUTE_GATE_ERROR` is a gateway bug. The log line carries the reason, the
+   scope type and a narrowed method — no path, no headers, no exception text
+   (M1-14). Reproduce against `route_gate/classify.py` with the client's method
+   and path; it is a code fix, and there is no fail-open to fall back on.
+
+### The gateway pod exits at startup
+
+Symptom: the container never listens on 4000; the process exits with a fixed
+code and one log line. `python -m corp_llm_gateway.serve` refuses to serve
+half-configured rather than start litellm with no guardrail.
+
+| Exit | Meaning | What to check |
+|---|---|---|
+| **78** (`EX_CONFIG`) | litellm's config is unusable | `CORP_LLM_LITELLM_CONFIG` (default `/etc/litellm/config.yaml`): file present, named `.yaml`/`.yml`, readable, a non-empty YAML mapping. Also refused: `general_settings.pass_through_endpoints` (registered at runtime, so the gate cannot classify them) and `general_settings.database_url` (the Prisma step reads `DATABASE_URL`/`DIRECT_URL` only). Same code when `CORP_LLM_SERVE_PORT` is not a port number. |
+| **70** (`EX_SOFTWARE`) | litellm started, but no `CorpLlmGuardrail` in `litellm.callbacks` | The `litellm_settings.callbacks` line in the config — it must name `corp_llm_gateway.bootstrap.guardrail`. This is the fail-open that used to start a proxy with no sanitization at all. |
+| **2** | Prisma schema migration cannot proceed | `DATABASE_URL` / `DIRECT_URL` reachable? The log line carries the RuntimeError text from litellm's `PrismaManager`. Same condition litellm's own CLI exits on. |
+| **1** | Prisma schema setup failed after retries, with `ENFORCE_PRISMA_MIGRATION_CHECK` set | The database. Unset that variable to downgrade it to a warning — only if you accept booting against an unmigrated schema. |
+
+Boot lines are on stdout in litellm's JSON record shape when the config sets
+`json_logs: true` (or `JSON_LOGS=true`), so Vector parses them like any other
+record. `prisma schema setup complete` is the proof the Prisma step ran.
+
+`bash scripts/release/gates.sh` exercises exactly this path before a release: it
+runs the built image with no config mounted and requires exit 78.
 
 ### Token revocation didn't take effect immediately
 

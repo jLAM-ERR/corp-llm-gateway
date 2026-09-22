@@ -17,6 +17,9 @@ in the 90 days post-GA.
 
 ```
 src/corp_llm_gateway/
+  asgi.py       THE serve target: checks litellm's config (exit 78), runs its Prisma sequence, sets WORKER_CONFIG,
+                imports litellm's app, wraps its lifespan (arm the gate or exit 70), wraps it in RouteGateMiddleware
+  serve.py      `python -m corp_llm_gateway.serve` — uvicorn.run(asgi:app), workers=1; the image/compose/Helm ENTRYPOINT
   auth/         CorpLlmAuthProvider (Noop default; Bearer/mTLS/OIDC) + get_auth_provider factory
   audit/        AuditEvent + Logger + Sinks + get_sink factory + retention generator + NEVER-fields gate
   bootstrap.py  production composition root: build_guardrail() from config; lazy PEP-562 `guardrail` singleton
@@ -26,11 +29,14 @@ src/corp_llm_gateway/
   corp_llm/     httpx client speaking vLLM /v1/chat/completions
   detectors/    PIIDetector + regex_checksum + dual_ner (RU Natasha + EN spaCy); NerUnavailableError (fail-closed)
   extensions/   ExtensionRegistry + ExtensionSpec (kind/api_version/fail_policy); fail-closed register; api-version gate
-  healthz/      live / ready / sanitization / extensions checks + ASGI server (build_health_router, serves /healthz/* + /internal/issue-token)
+  healthz/      live / ready / sanitization / extensions checks + ASGI server (build_health_router, serves /healthz/*)
+                token issuance is not an HTTP route today — operators mint tokens with `gateway-admin token issue`
   metrics/      MetricsExporter (noop default / prometheus); emits blocked_requests_total{block_reason} + gateway_failure{component}
   payload/      size threshold + gzip + per-team quota + oversize policy (fail-closed default)
   profiles/     plugin bundles — ProfileBundle/PolicyKnobs(merge) + loaders/resolver + DETECTOR_REGISTRY + manifest (hash-integrity) + defaults/
   providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
+  route_gate/   default-deny gate: table.py (hand-classified against litellm's source, guarded by the
+                collector test) + classify.py + middleware.py
   rules/        replace.md parser + gazetteer + cached file loader
   sanitizer/    local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator (live profiles)
                 + identity_preamble (rewrite-vs-scan carve-out, see below)
@@ -43,7 +49,8 @@ helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto (~2274 passed / 107 skipped on 3.14; full NER + RS256 crypto run on 3.12/CI)
+tests/                   pytest, pytest-asyncio mode=auto (2559 passed / 201 skipped on 3.14; 2768 / 40 on 3.12 + litellm 1.101.0,
+                         where NER, RS256 crypto and the entrypoint/route-gate suites actually run)
 ```
 
 The GA-readiness / security / extensibility build is `docs/plans/20260708-ga-readiness-security-extensibility.md`
@@ -59,6 +66,11 @@ The cascade was **inverted to local-first** (plan `docs/plans/20260630-bilingual
 decision `docs/adr/ADR-003-ner-orchestration.md`). Old order was LLM-oracle-first; now:
 
 ```
+route gate (OUTERMOST, before litellm's router — `route_gate/middleware.py`):
+           classify (METHOD, path) against the hand-classified table → PASSTHROUGH / REWRITTEN / REFUSE.
+           Unlisted ⇒ 404, listed-REFUSE / websocket / malformed ⇒ 403, both E_ROUTE_BLOCKED;
+           REWRITTEN while unarmed ⇒ 503. Only then does litellm's router run pre_call_hook.
+           ↓
 pre_call:  Stage 0 — payload classifier: config/log shape → refuse before egress (422 + block_reason)
            ↓
            local-first cascade (per text leaf, ~6ms p50 on CPU):
@@ -79,6 +91,12 @@ post_call: StreamingDesanitizer rebuilds originals using the per-conversation ma
            audit: Vector → Langfuse + S3 + SIEM (NEVER-fields gate; + block_reason)
 ```
 
+The process that serves this is **ours**: `python -m corp_llm_gateway.serve` → `asgi.py`, which
+checks litellm's config, then imports litellm at step 3 (`save_worker_config`) and its app + our
+`bootstrap` at step 4. Neither the `litellm` CLI nor litellm's own `proxy_server` app may ever be a
+serve target again — both run litellm's routers with no gate in front (`tests/test_launch_command.py`
+greps the tree for either). Details: `docs/security.md` §14.
+
 The old three tiers (FunctionCall → JSON → Regex, `sanitizer/engine.py`) still parse the oracle's
 response when it IS called; they are no longer the primary detection path. Local detectors live in
 `detectors/` (`regex_checksum`, `ner_ru`/`ner_en`/`dual_ner`) + `rules/gazetteer.py` +
@@ -96,10 +114,13 @@ Two caches:
 ## Running tests
 
 ```
-# Full unit suite. Local .venv is Python 3.14 (graceful NER degradation): last known
-# 817 passed + 39 skipped, ~20s. Authoritative NER run is Python 3.12 (.venv-bench,
-# with the `ner`/`postgres`/`oidc` extras): 875 passed. Always run before committing.
+# Full unit suite. Local .venv is Python 3.14, no litellm (graceful NER degradation):
+# last known 2558 passed + 201 skipped, ~2min. Authoritative run is Python 3.12
+# (.venv-bench, with the `ner`/`postgres`/`oidc`/`asgi`/`metrics` extras + litellm
+# 1.101.0): 2767 passed + 40 skipped, ~3min — the entrypoint and route-guard suites
+# only RUN there. Always run both before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
+PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs
 
 # Single test / file / node
 PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py -q
@@ -115,14 +136,17 @@ docker compose run --rm e2e pytest -q tests/e2e
   `ruff --fix` + `ruff-format` in pre-commit; CI's lint job runs `ruff check`
   AND `ruff format --check` on every PR). No type checker is configured.
 - Async-first (LiteLLM hooks are async); pytest-asyncio mode = "auto"
-- Default branch: `master` (NOT main)
+- Default branch: `main`; the live release line is `release/1.0.x`
 - CI: GitHub Actions (`.github/workflows/`)
 - httpx for HTTP, Redis via `redis.asyncio`, fakeredis for tests
-- First-time setup: `pip install -e ".[dev]" && pre-commit install`
+- First-time setup: `pip install -e ".[dev]" && pre-commit install` — `dev` pulls
+  `asgi` (litellm[proxy] + fastapi + uvicorn, so `tests/test_asgi_entrypoint.py`
+  runs instead of skipping) and `metrics` (prometheus-client)
 - `.github/workflows/ci.yml` gates every PR: a lint job (`ruff check` AND
   `ruff format --check` — running only `ruff check` locally can still leave
   you with a CI format failure) and a test job running the full pytest suite
-  on Python 3.12 with the `ner`/`postgres`/`oidc` extras + helm render tests
+  on Python 3.12 with the `ner`/`postgres`/`oidc`/`asgi`/`metrics` extras + helm
+  render tests
 
 ## CLI entry points
 
@@ -167,6 +191,14 @@ When adding a new tunable, plumb it through this loader — don't read
    first before replacement, otherwise short ones shadow long ones.
 6. **Fail-policy matrix in M4** is the source of truth for component
    failure behavior. Don't add ad-hoc fail-open paths.
+7. **Default-deny route gate**: no route reaches a provider unless
+   `route_gate/table.py` says the hook rewrites its body, and the gateway
+   does not serve unless that hook is registered. Adding a route to the
+   table is a security decision, not a config change; there is no off
+   switch (`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` adds PASSTHROUGH rows
+   only). Startup exits 78 without litellm's config and 70 without a
+   `CorpLlmGuardrail` in `litellm.callbacks` — `docs/security.md` §14,
+   invariant row 7 in §9.
 
 **Rewrite-vs-scan carve-out** (`sanitizer/identity_preamble.py`): a fixed client
 protocol literal may be exempt from *rewriting* when the provider matches it
@@ -209,7 +241,7 @@ follow the established interface-registry pattern:
 
 ## Things NOT to do
 
-- Don't rename `master` to `main`.
+- Don't rename the default branch (`main`).
 - CI is GitHub Actions (`.github/workflows/`); git hosting is GitHub. Keep CI on
   GitHub Actions — don't add other CI systems.
 - Don't add GPU deps.

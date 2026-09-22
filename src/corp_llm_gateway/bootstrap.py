@@ -20,6 +20,7 @@ lazily on first await.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -39,8 +40,16 @@ from corp_llm_gateway.detectors.base import PIIDetector
 from corp_llm_gateway.detectors.corp_ner import CorpNerDetector
 from corp_llm_gateway.extensions import EXTENSION_API_VERSION, REGISTRY
 from corp_llm_gateway.extensions.corp_ner import CorpNerExtension, register_corp_ner
+from corp_llm_gateway.healthz import (
+    ExtensionsCheck,
+    HealthRouter,
+    LiveCheck,
+    ReadyCheck,
+    SanitizationCheck,
+)
+from corp_llm_gateway.healthz import build_health_router as make_health_router
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
-from corp_llm_gateway.metrics import get_exporter
+from corp_llm_gateway.metrics import MetricsExporter, get_exporter
 from corp_llm_gateway.profiles import FileProfileLoader, ProfileBundle, ProfileResolver
 from corp_llm_gateway.rules import (
     CachedRulesLoader,
@@ -289,6 +298,99 @@ def _build_dlp_guard() -> DlpEgressGuard:
     return DlpEgressGuard(canary_patterns=canaries or None, secret_rescan=True)
 
 
+# A synthetic secret the regex detector matches with no network and no model —
+# proof the local cascade ran, not just that the process is up.
+_SANITIZATION_PROBE = "healthz probe key sk-corpllmgatewayhealthprobe0000000000"
+_SANITIZATION_PROBE_SECRET = "sk-corpllmgatewayhealthprobe0000000000"
+
+
+def _redis_ready_probe() -> Callable[[], Awaitable[bool]]:
+    url = config.get("REDIS_URL")
+    if not url:
+
+        async def _in_memory() -> bool:
+            # No Redis configured means the in-memory mapping store; there is
+            # nothing to reach and readiness must not fail on its absence.
+            return True
+
+        return _in_memory
+
+    from redis.asyncio import from_url
+
+    client = from_url(url)
+
+    async def _ping() -> bool:
+        return bool(await client.ping())
+
+    return _ping
+
+
+def _postgres_ready_probe() -> Callable[[], Awaitable[bool]]:
+    dsn = config.get("CORP_LLM_PG_DSN")
+    if not dsn:
+
+        async def _in_memory() -> bool:
+            return True
+
+        return _in_memory
+
+    async def _connect() -> bool:
+        import asyncpg
+
+        conn = await asyncpg.connect(dsn, timeout=5.0)
+        try:
+            return True
+        finally:
+            await conn.close()
+
+    return _connect
+
+
+def _sanitization_probe() -> Callable[[], Awaitable[bool]]:
+    async def _round_trip() -> bool:
+        # Resolves the SAME lazy singleton litellm's `callbacks:` entry names,
+        # so this checks the engine serving requests, not a second copy. Lazily,
+        # inside the coroutine: the entrypoint must not build the guardrail at
+        # import.
+        from corp_llm_gateway import bootstrap
+
+        orchestrator = bootstrap.guardrail.orchestrator
+        # One fixed id, not a fresh one per scrape: the probe text is constant, so
+        # a new conversation each time would add a mapping entry per scrape to the
+        # in-memory store and never reclaim it.
+        result = await orchestrator.sanitize(
+            _SANITIZATION_PROBE,
+            team_id="healthz-probe",
+            conversation_id="healthz-probe",
+        )
+        return bool(result.pairs) and _SANITIZATION_PROBE_SECRET not in result.sanitized_text
+
+    return _round_trip
+
+
+def build_health_router(fallthrough: object | None = None) -> HealthRouter:
+    """The `/healthz/*` router the gateway server mounts, wired from config.
+
+    Readiness probes Redis and Postgres only. NER readiness
+    (`CORP_LLM_REQUIRE_NER`) and corp-NER readiness (`CORP_NER_ENABLED`) are NOT
+    wired here: both need a detector built at import, and the entrypoint's
+    contract is that nothing on the request path is constructed before litellm's
+    lifespan runs. They stay a follow-up.
+
+    `POST /internal/issue-token` is deliberately unserved — see
+    `healthz.build_health_router`.
+    """
+    return make_health_router(
+        live_check=LiveCheck(),
+        ready_check=ReadyCheck(
+            check_redis=_redis_ready_probe(), check_postgres=_postgres_ready_probe()
+        ),
+        sanitization_check=SanitizationCheck(run_round_trip=_sanitization_probe()),
+        extensions_check=ExtensionsCheck(health_all=REGISTRY.health_all),
+        fallthrough=fallthrough,  # type: ignore[arg-type]
+    )
+
+
 def _warn_on_disarmed_forward_auth_conflict(
     *,
     configured_chatgpt: bool,
@@ -332,6 +434,7 @@ def build_guardrail(
     strip_inbound_headers_to_upstream: bool | None = None,
     forward_chatgpt_auth: bool | None = None,
     forward_anthropic_auth: bool | None = None,
+    metrics: MetricsExporter | None = None,
 ) -> CorpLlmGuardrail:
     """Assemble a `CorpLlmGuardrail` from config, with optional dep overrides.
 
@@ -368,10 +471,17 @@ def build_guardrail(
         else configured_forward_anthropic_auth
     )
     # Independent of the chatgpt/anthropic pair: not part of their mutual exclusivity.
+    # Defaults ON. The guardrail writes the inbound wire headers into
+    # data["headers"] and litellm forwards that bucket, so with the flag off the
+    # client's `content-length` rides along beside litellm's own, longer,
+    # sanitized body and the provider reads the request truncated at the client's
+    # length (wire-captured on /v1/messages and /v1/chat/completions). Any request
+    # whose sanitized body grew is corrupted. The dropped set is hop-by-hop /
+    # wire-level only and never `authorization` (invariant 3).
     resolved_strip_inbound_headers_to_upstream = (
         strip_inbound_headers_to_upstream
         if strip_inbound_headers_to_upstream is not None
-        else _flag("CORP_LLM_STRIP_INBOUND_HEADERS", "0")
+        else _flag("CORP_LLM_STRIP_INBOUND_HEADERS", "1")
     )
     # Same reason as the no-op-sanitizer floor below: settings.validate() covers
     # `config check` only, and the compose/demo boots these bridges ship on skip it.
@@ -414,9 +524,10 @@ def build_guardrail(
         client = None
         _log.info("bootstrap oracle_enabled=false — local-first only")
     team_store = team_config_store if team_config_store is not None else build_team_config_store()
-    # One exporter instance for the hook: get_exporter() builds a new one per
-    # call, and a second instance would emit to a registry nobody scrapes.
-    metrics = get_exporter()
+    # One exporter for the whole process: get_exporter() caches, so the hook,
+    # the route gate and the /metrics route all write to and read from the same
+    # registry. A second instance would emit where nobody scrapes.
+    exporter = metrics if metrics is not None else get_exporter()
     corp_ner = build_corp_ner()
     core = _build_orchestrator(
         client,
@@ -446,7 +557,7 @@ def build_guardrail(
         forward_chatgpt_auth=resolved_forward_chatgpt_auth,
         forward_anthropic_auth=resolved_forward_anthropic_auth,
         dlp_guard=dlp_guard if dlp_guard is not None else _build_dlp_guard(),
-        metrics=metrics,
+        metrics=exporter,
     )
 
 

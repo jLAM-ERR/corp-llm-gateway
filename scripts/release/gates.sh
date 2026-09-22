@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # .github/workflows/build-image.yml is the source of truth for this pin — keep in sync.
-LITELLM_VERSION="v1.95.0"
+LITELLM_VERSION="v1.101.0"
 
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; exit 1; }
@@ -71,10 +71,18 @@ build_and_check en "NER en OK"
 build_and_check ru-en "NER ru-en OK"
 
 echo "== gate: entrypoint smoke =="
-if docker run --rm gw-test:en --help >/dev/null; then
-  pass "entrypoint --help (en)"
+# The image ENTRYPOINT is `python -m corp_llm_gateway.serve` — the route gate's
+# only supported serve target, in place of the `litellm` CLI (whose `--help` this
+# gate used to call). With no litellm config mounted it must refuse with 78
+# (EX_CONFIG) instead of serving: litellm's own lifespan would have started with
+# no guardrail callback at all.
+smoke_status=0
+smoke_out=$(docker run --rm gw-test:en 2>&1) || smoke_status=$?
+if [[ "${smoke_status}" -eq 78 ]]; then
+  pass "entrypoint refuses to serve without litellm's config (exit 78, en)"
 else
-  fail "entrypoint --help (en)"
+  fail "entrypoint smoke (en): expected exit 78 without a config, got ${smoke_status}
+${smoke_out}"
 fi
 
 echo "ALL GATES PASSED"

@@ -597,3 +597,108 @@ def test_config_check_probe_ok_only_configured_deps(
     data = json.loads(capsys.readouterr().out)
     assert [p["dependency"] for p in data["probes"]] == ["corp-llm"]
     assert data["healthy"] is True
+
+
+def test_config_check_routes_prints_the_effective_table(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", "GET /internal/ops-status")
+
+    rc = main(["config", "check", "--no-probe", "--routes"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "route gate:" in out
+    # The eight generation spellings are the operator-visible claim: everything
+    # else either carries no user text or is refused.
+    assert "POST /v1/messages" in out
+    assert "GET /internal/ops-status  PASSTHROUGH" in out
+
+
+def test_config_check_routes_without_extras_says_none(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+
+    rc = main(["config", "check", "--no-probe", "--routes"])
+
+    assert rc == 0
+    assert "(none)" in capsys.readouterr().out
+
+
+def test_config_check_routes_json_carries_the_counts(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from corp_llm_gateway.route_gate import LITELLM_ROUTE_TABLE, Verdict
+
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+
+    rc = main(["config", "check", "--no-probe", "--routes", "--json"])
+
+    assert rc == 0
+    gate = json.loads(capsys.readouterr().out)["route_gate"]
+    assert gate["exact_rows"] == len(LITELLM_ROUTE_TABLE)
+    assert set(gate["counts"]) == {v.name for v in Verdict}
+    # the eight generation spellings, the only routes whose body is rewritten
+    assert gate["counts"]["REWRITTEN"] == 8
+    assert len(gate["rewritten"]) == 8
+    assert gate["extras"] == []
+    assert gate["extras_problem"] is None
+
+
+def test_config_check_routes_reports_a_malformed_extra_rather_than_raising(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # `validate()` already fails the check; --routes must still print the table
+    # instead of dying on the same value, or the operator cannot see the typo.
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", "GET without-a-slash")
+
+    rc = main(["config", "check", "--no-probe", "--routes"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "route gate:" in captured.out
+    # both streams carry it: a stdout-only reader must not see an empty section
+    assert "INVALID" in captured.out
+    assert "INVALID" in captured.err
+
+
+def test_config_check_routes_json_reports_a_malformed_extra(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", "GET without-a-slash")
+
+    rc = main(["config", "check", "--no-probe", "--routes", "--json"])
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    gate = payload["route_gate"]
+    assert gate["extras_problem"] is not None
+    assert gate["extras"] == []
+    assert gate["counts"]["REWRITTEN"] == 8
+
+
+def test_config_check_without_routes_prints_no_table(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+
+    rc = main(["config", "check", "--no-probe", "--json"])
+
+    assert rc == 0
+    assert "route_gate" not in json.loads(capsys.readouterr().out)

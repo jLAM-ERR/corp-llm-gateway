@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from corp_llm_gateway.route_gate.table import Entry
     from corp_llm_gateway.settings import Settings
 
 _DEFAULT_PATHS: tuple[str, ...] = (
@@ -125,6 +126,19 @@ def oracle_trigger() -> str:
     from corp_llm_gateway.sanitizer.orchestrator import normalize_oracle_trigger
 
     return normalize_oracle_trigger(get("CORP_LLM_ORACLE_TRIGGER"))
+
+
+def route_gate_extras() -> dict[tuple[str, str], Entry]:
+    """Resolve ``CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`` into route-gate entries.
+
+    ``"METHOD /path"``, comma- or newline-separated. PASSTHROUGH only — the key
+    can never admit a route as rewritten, and it cannot disable the gate. A
+    malformed item raises ``ValueError`` (``validate()`` reports it as a config
+    problem, so a typo fails at boot rather than widening the gate).
+    """
+    from corp_llm_gateway.route_gate.table import parse_extras
+
+    return parse_extras(get("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH"))
 
 
 _TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})

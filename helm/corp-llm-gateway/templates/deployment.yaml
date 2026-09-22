@@ -55,6 +55,15 @@ spec:
         - name: litellm
           # The gateway server image (litellm proxy + guardrail callback), NOT
           # stock berriai/litellm — the stock image never loads the guardrail.
+          #
+          # No `command`/`args` on purpose: the container inherits the image
+          # ENTRYPOINT, `python -m corp_llm_gateway.serve`, which is litellm's
+          # proxy behind the default-deny route gate. Overriding it with the
+          # bare `litellm` CLI would serve three routes that reach a provider
+          # without the guardrail. The probes below are served by that module
+          # too (it mounts /healthz/* and /metrics onto litellm's ASGI app);
+          # they 404'd against the stock CLI. A pod pinned to an image tag
+          # older than this chart still runs the CLI — bump the tag.
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:

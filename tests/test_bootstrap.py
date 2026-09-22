@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import logging
 import sys
 from collections.abc import Iterator
@@ -116,6 +117,76 @@ def test_build_guardrail_carries_metrics_exporter_noop_by_default() -> None:
 
     assert isinstance(guardrail._metrics, MetricsExporter)
     assert isinstance(guardrail._metrics, NoopExporter)
+
+
+def test_build_guardrail_takes_an_explicit_metrics_exporter() -> None:
+    # asgi.py hands the route gate and the guardrail ONE exporter, so a block
+    # counted by either shows up in the registry /metrics exposes.
+    exporter = NoopExporter()
+
+    guardrail = bootstrap.build_guardrail(metrics=exporter)
+
+    assert guardrail._metrics is exporter
+
+
+def test_build_guardrail_defaults_to_the_shared_exporter() -> None:
+    from corp_llm_gateway.metrics import get_exporter
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._metrics is get_exporter()
+
+
+# ── Task 4: the /healthz router the gateway server mounts ────────────────────
+
+
+def test_build_health_router_wires_the_four_checks_and_no_issuer() -> None:
+    router = bootstrap.build_health_router()
+
+    assert sorted(router._checks) == [
+        "/healthz/extensions",
+        "/healthz/live",
+        "/healthz/ready",
+        "/healthz/sanitization",
+    ]
+    # Issuance is `gateway-admin token issue`; the route gate refuses the path.
+    assert router._issuer is None
+
+
+async def test_the_health_router_is_ready_without_redis_or_postgres() -> None:
+    # No REDIS_URL / CORP_LLM_PG_DSN means the in-memory backends; there is
+    # nothing to reach, so readiness must not fail on their absence.
+    status = await bootstrap.build_health_router()._checks["/healthz/ready"].check()
+
+    assert status.healthy is True
+
+
+async def test_the_sanitization_probe_round_trips_through_the_live_guardrail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The probe must exercise the engine serving requests, not a second one.
+    monkeypatch.setattr(bootstrap, "_guardrail", None)
+    status = await bootstrap.build_health_router()._checks["/healthz/sanitization"].check()
+
+    assert status.healthy is True, status.detail
+    assert bootstrap._guardrail is not None
+
+
+async def test_the_sanitization_probe_reports_a_failing_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Broken:
+        async def sanitize(self, text: str, **_: object) -> object:
+            raise RuntimeError("engine down")
+
+    class _Guardrail:
+        orchestrator = _Broken()
+
+    monkeypatch.setattr(bootstrap, "_guardrail", _Guardrail())
+    status = await bootstrap.build_health_router()._checks["/healthz/sanitization"].check()
+
+    assert status.healthy is False
+    assert "sanitization_error" in status.detail
 
 
 # ── D4: profiles activated in the composition root ───────────────────────────
@@ -338,10 +409,65 @@ def test_strip_inbound_headers_falsy_spellings_disable_the_flag(
     assert guardrail._strip_inbound_headers_to_upstream is False
 
 
-def test_strip_inbound_headers_unset_defaults_off() -> None:
+def test_strip_inbound_headers_unset_defaults_on() -> None:
+    # ON, because OFF corrupts the upstream request: litellm forwards the
+    # client's Content-Length beside its own, longer, sanitized body.
     guardrail = bootstrap.build_guardrail()
 
-    assert guardrail._strip_inbound_headers_to_upstream is False
+    assert guardrail._strip_inbound_headers_to_upstream is True
+
+
+@pytest.mark.asyncio
+async def test_a_grown_sanitized_body_goes_upstream_without_the_inbound_length() -> None:
+    # The whole reason the default flipped. The inbound Content-Length describes
+    # the body the CLIENT sent; sanitization replaces an original with a longer
+    # placeholder, so litellm's body is longer — and a provider that believes the
+    # forwarded header reads the request truncated at the client's length.
+    guardrail = bootstrap.build_guardrail()
+    guardrail._auth._store.upsert(  # type: ignore[attr-defined]
+        TokenInfo(
+            corp_token="tok-len",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC) + timedelta(days=30),
+        )
+    )
+    inbound_body = json.dumps(
+        {
+            "model": "claude",
+            "messages": [{"role": "user", "content": "mail a@b.lan now"}],
+        }
+    )
+    headers = {
+        "X-Corp-Auth": "tok-len",
+        "Authorization": "Bearer byok-developer-key",
+        "Content-Length": str(len(inbound_body)),
+        "Host": "127.0.0.1:4000",
+    }
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "mail a@b.lan now"}],
+        "headers": dict(headers),
+        "proxy_server_request": {"headers": dict(headers)},
+        "litellm_metadata": {"headers": dict(headers)},
+    }
+
+    out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    upstream_body = json.dumps({"model": out["model"], "messages": out["messages"]})
+    assert "a@b.lan" not in upstream_body
+    assert len(upstream_body) > len(inbound_body), "this corpus no longer grows; pick another"
+    for bucket in (
+        out["headers"],
+        out["proxy_server_request"]["headers"],
+        out["litellm_metadata"]["headers"],
+    ):
+        assert not [name for name in bucket if name.lower() == "content-length"]
+        assert not [name for name in bucket if name.lower() == "host"]
+    # The one header the strip must never take (invariant 3).
+    assert out["headers"]["Authorization"] == "Bearer byok-developer-key"
 
 
 def test_strip_inbound_headers_explicit_argument_overrides_config(

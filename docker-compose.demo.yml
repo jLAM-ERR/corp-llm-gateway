@@ -34,7 +34,7 @@ services:
       retries: 5
 
   litellm:
-    # Demo image = litellm v1.95 + the `ner` extra baked in (see
+    # Demo image = litellm v1.101 + the `ner` extra baked in (see
     # docker/demo-litellm/Dockerfile) so bilingual NER runs instead of degrading.
     build:
       context: .
@@ -85,7 +85,7 @@ services:
     entrypoint: sh
     command:
       - "-c"
-      - "python3 -m ensurepip --upgrade >/dev/null 2>&1 && python3 -m pip install --no-cache-dir -e /pkg --quiet && { cat \"$(python3 -c 'import certifi; print(certifi.where())')\"; if [ -f /etc/corp-llm-gateway/crt/corp-ca-bundle.pem ]; then cat /etc/corp-llm-gateway/crt/corp-ca-bundle.pem; fi; } > /tmp/corp-ca-bundle.pem && exec litellm --config /etc/litellm/config.yaml --port 4000"
+      - "python3 -m ensurepip --upgrade >/dev/null 2>&1 && python3 -m pip install --no-cache-dir -e /pkg --quiet && { cat \"$(python3 -c 'import certifi; print(certifi.where())')\"; if [ -f /etc/corp-llm-gateway/crt/corp-ca-bundle.pem ]; then cat /etc/corp-llm-gateway/crt/corp-ca-bundle.pem; fi; } > /tmp/corp-ca-bundle.pem && exec python3 -m corp_llm_gateway.serve"
     depends_on:
       redis:
         condition: service_healthy

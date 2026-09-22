@@ -121,6 +121,54 @@ sink regardless.
    `prometheus`).
 3. **Select it** with `CORP_METRICS_EXPORTER=<name>` (default `noop`); built by `get_exporter()`.
 
+## Classify a litellm route (after a litellm bump)
+
+`src/corp_llm_gateway/route_gate/table.py` is the **single place** a litellm
+route is classified. Nothing else may decide whether a request reaches a
+provider: the middleware enforces the table and refuses anything it does not
+know (default-deny). See [`security.md`](security.md) §14 for what the gate is
+and why.
+
+Bumping litellm means re-running the classification, because the guard test
+(`tests/route_gate/test_litellm_route_guard.py`) reads litellm's installed
+`proxy/` source with `ast` on every CI run and fails on:
+
+- a `(method, path)` the tables do not know — **every new or moved route**;
+- a REWRITTEN entry whose handler no longer reaches `pre_call_hook`;
+- a hook-less `POST`/`PUT`/`PATCH` marked PASSTHROUGH without a written
+  `justification` — and the justification is re-checked against the `ast`, so a
+  handler that calls `litellm.acompletion`, `aresponses`, `token_counter`,
+  `router.a*` or `pass_through_request` cannot be excused by a comment;
+- a **dynamic registration site** (a path the collector cannot resolve to a
+  literal) that is new or has moved line — `KNOWN_DYNAMIC_REGISTRATIONS` in
+  `tests/route_gate/litellm_routes.py` pins each one by `(file, line)` with its
+  policy.
+
+The loop:
+
+1. Bump the pin in all **seven** sites at once (`tests/test_litellm_pin.py`
+   names them; `pyproject.toml` is one of them, so CI's `pip install -e .`
+   reads the same proxy the image ships) and install it into `.venv-bench`.
+2. Run the guard: `PYTHONPATH=src .venv-bench/bin/python -m pytest
+   tests/route_gate/test_litellm_route_guard.py -q`. Its failure message names
+   each unclassified route or moved dynamic site.
+3. **Add a row by hand** to `table.py` for each one, applying the five ordered
+   rules in that module's docstring (REWRITTEN generation spellings → stored
+   responses by id → any other provider-reaching handler is REFUSE → named
+   user-text trees are REFUSE → the rest is the admin surface, PASSTHROUGH with
+   a `justification` when it writes). There is no generator script: the
+   collector is a test helper, and a row is a security decision.
+   A path with a `{parameter}` becomes a `LITELLM_REGEX_TABLE` row, ordered
+   longest-static-prefix first.
+4. **Fail closed when unsure.** REFUSE is one line to flip later; a wrong
+   PASSTHROUGH is a leak. Record the judgement in the row's `why`.
+5. Re-run the guard on both venvs plus `tests/route_gate/` and
+   `tests/test_asgi_entrypoint.py`.
+
+`GATEWAY_ROUTE_TABLE` (the gateway's own `/healthz/*` and `/metrics`) is
+hand-written and exempt from the source guard — it describes routes litellm does
+not register.
+
 ## Add a provider (style 2)
 
 Providers are egress targets. They use their **own** `ProviderRegistry`

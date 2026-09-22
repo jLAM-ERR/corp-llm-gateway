@@ -269,6 +269,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # for one request; the histogram must only see it once.
         self._latency_observed_ids: OrderedDict[str, None] = OrderedDict()
 
+    @property
+    def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
+        """The sanitization engine this guardrail runs.
+
+        Exposed for `/healthz/sanitization`, whose round trip must exercise the
+        engine the request path actually uses — a second one built from config
+        would prove nothing about this process.
+        """
+        return self._orch
+
     # ---- LiteLLM hook entry points ----------------------------------------
 
     async def async_pre_call_hook(
@@ -2073,7 +2083,7 @@ def _anthropic_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
 # `input` would make the synthesized speech say the placeholder token aloud,
 # permanently (the `call_type="aspeech"` / `proxy_server.py:9440` routing was
 # verified in a scratch venv against a litellm 1.94.1 install; `pyproject.toml`
-# declares the floor `litellm>=1.40,<2.0` and every image now pins v1.95.0 —
+# declares the floor `litellm>=1.40,<2.0` and every image now pins v1.101.0 —
 # `tests/litellm_hook/test_litellm_route_assumptions.py` re-checks these
 # call_type names against whichever litellm is installed).
 #
