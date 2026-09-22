@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import socket
 import time
 import uuid
@@ -319,6 +320,34 @@ def test_mode_a_ran_the_prisma_schema_setup_at_boot(mode_a: Mode) -> None:
         timeout=60,
     )
     assert answered.status_code == 200, answered.text
+
+
+_ACCESS_LINE = re.compile(r'"(GET|POST|HEAD) \S+ HTTP/1\.1" \d{3}')
+
+
+def test_uvicorns_own_lines_are_json_records_too(mode: Mode) -> None:
+    # Vector parses this container's stdout record by record, so uvicorn's
+    # access and error lines have to be JSON as well — that is what `serve.py`
+    # passes litellm's JSON `log_config` for. A plain access line would be an
+    # unparseable record between parseable ones.
+    probe = httpx.get(f"{mode.stack.base_url}/healthz/live", timeout=60)
+    assert probe.status_code == 200
+
+    logs = mode.stack.gateway_logs()
+    records = [record for record in _json_log_records(logs) if isinstance(record, dict)]
+
+    access = [r for r in records if _ACCESS_LINE.search(str(r.get("message", "")))]
+    assert access, "no uvicorn access line was written as a JSON record"
+    plain = [
+        line
+        for line in logs.splitlines()
+        if _ACCESS_LINE.search(line) and not line.strip().startswith("{")
+    ]
+    assert not plain, plain[:3]
+
+    assert [r for r in records if "Uvicorn running on" in str(r.get("message", ""))], (
+        "uvicorn's own startup line is not a JSON record"
+    )
 
 
 # ── the bypass routes: refused, in both modes ────────────────────────────────
