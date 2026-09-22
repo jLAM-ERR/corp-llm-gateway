@@ -126,7 +126,7 @@ RUN set -eux; \
     esac; \
     cp /tmp/certifi.orig "$certbundle"; \
     want="${LITELLM_VERSION#v}"; \
-    got="$("$py" -c 'import litellm; print(litellm.__version__)')"; \
+    got="$("$py" -c 'from importlib.metadata import version; print(version("litellm"))')"; \
     if [ "$got" != "$want" ]; then \
         echo "litellm ${got} is installed but this image is built FROM ${LITELLM_VERSION}: the wheel pins litellm==${want} and pip reinstalled it over the base. The route gate is generated against ONE litellm's routes — rebuild with a matching --build-arg LITELLM_VERSION, or move all pin sites (tests/test_litellm_pin.py)." >&2; \
         exit 1; \

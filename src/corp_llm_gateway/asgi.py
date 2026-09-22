@@ -23,13 +23,13 @@ In order —
    ``drop_params``, the request timeout, telemetry and the log level.
    ``CONFIG_FILE_PATH`` is deliberately NOT set: that branch skips
    ``initialize()`` entirely;
-4. import litellm's app, mount the gateway-owned ``/healthz/*`` and ``/metrics``
-   routes, and wrap the app's **lifespan** (not ``on_startup``, which Starlette
-   never runs for an app built with an explicit ``lifespan=``) so that after
-   litellm's startup has run, a ``CorpLlmGuardrail`` must be in
+4. import litellm's app, put the gateway-owned ``/healthz/*`` and ``/metrics``
+   routes in front of it, and wrap the app's **lifespan** (not ``on_startup``,
+   which Starlette never runs for an app built with an explicit ``lifespan=``) so
+   that after litellm's startup has run, a ``CorpLlmGuardrail`` must be in
    ``litellm.callbacks``. If it is not, the process exits 70 (``EX_SOFTWARE``)
    rather than serve unsanitized;
-5. wrap the whole app in ``RouteGateMiddleware`` — by wrapping, not
+5. wrap the whole chain in ``RouteGateMiddleware`` — by wrapping, not
    ``add_middleware``, so the gate is outermost. Every middleware litellm adds
    sits inside it and none can answer ahead of the gate.
 
@@ -63,6 +63,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -83,6 +84,31 @@ EXIT_NO_CALLBACK = 70
 
 _MOUNT_HEALTHZ = "/healthz"
 _MOUNT_METRICS = "/metrics"
+
+
+def _open_the_boot_log() -> logging.Handler:
+    """Make the step lines below visible, at INFO, before litellm configures logging.
+
+    uvicorn's log config names only its own loggers, and litellm installs the
+    root JSON handler at step 3 — so without this the boot would be silent up to
+    that point and filtered by the root WARNING level after it.
+    """
+    level = (config.get("CORP_LLM_LOG_LEVEL", "INFO") or "INFO").upper()
+    package = logging.getLogger("corp_llm_gateway")
+    package.setLevel(getattr(logging, level, logging.INFO))
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    package.addHandler(handler)
+    return handler
+
+
+def _close_the_boot_log(handler: logging.Handler) -> None:
+    """Hand the package logger back to whatever litellm installed on the root."""
+    if logging.getLogger().handlers:
+        logging.getLogger("corp_llm_gateway").removeHandler(handler)
+
+
+_boot_log = _open_the_boot_log()
 
 
 def _fail_config(problems: list[str]) -> None:
@@ -178,74 +204,49 @@ from litellm.proxy.proxy_server import proxy_startup_event, save_worker_config  
 
 save_worker_config(**_worker_config)
 log.info("litellm WORKER_CONFIG set from %s", CONFIG_PATH)
+_close_the_boot_log(_boot_log)
 
 # ── 4. gateway-owned routes + the lifespan wrapper ───────────────────────────
 
 _exporter = get_exporter()
 
 
-class _AsgiSubApp:
-    """A raw ASGI app Starlette will route to as an app, not as an endpoint.
+class _MetricsRoute:
+    """Serve ``GET|HEAD /metrics`` from the shared exporter; forward the rest.
 
-    Two reasons this is a class and not the callable itself: Starlette wraps a
-    plain function endpoint in request/response handling, and a ``Mount`` may
-    strip its own prefix from ``scope["path"]``. ``HealthRouter`` matches
-    absolute paths (`/healthz/live`), so the prefix is put back when it is gone.
+    A raw ASGI hop rather than a Starlette route on litellm's app, for the same
+    reason ``_GATEWAY_ROUTES`` is one at all (see below).
     """
 
-    def __init__(self, app: Any, prefix: str = "") -> None:
+    def __init__(self, app: Any, fallthrough: Any) -> None:
         self._app = app
-        self._prefix = prefix
+        self._fallthrough = fallthrough
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        path = scope.get("path", "")
-        # Starlette changed this: older releases hand the sub-app the remainder
-        # (`/live`), 1.x keeps the full path and moves the prefix to root_path.
-        # Restore only when it was actually stripped.
         if (
-            self._prefix
-            and scope["type"] in ("http", "websocket")
-            and not path.startswith(self._prefix)
+            scope["type"] == "http"
+            and scope.get("path") == _MOUNT_METRICS
+            and str(scope.get("method") or "").upper() in ("GET", "HEAD")
         ):
-            scope = dict(scope)
-            scope["path"] = self._prefix + path
-        await self._app(scope, receive, send)
+            await self._app(scope, receive, send)
+            return
+        await self._fallthrough(scope, receive, send)
 
 
-def _mount_gateway_routes() -> None:
-    from starlette.routing import Mount, Route
-
-    # Index 0, not append: litellm registers first-segment catch-alls
-    # (`/{mcp_server_name}/mcp`, `/{provider}/v1/files`) and Starlette matches in
-    # registration order, so an appended mount could be shadowed.
-    #
-    # /metrics is a Route, not a Mount: a Mount's pattern is `<prefix>/...`, so
-    # the bare `/metrics` a Prometheus scrape asks for would fall through to the
-    # router's trailing-slash redirect and answer 307.
-    _app.router.routes.insert(
-        0,
-        Route(
-            _MOUNT_METRICS,
-            endpoint=_AsgiSubApp(_exporter.asgi_app()),
-            methods=["GET", "HEAD"],
-            name="corp_llm_gateway_metrics",
-        ),
-    )
-    _app.router.routes.insert(
-        0,
-        Mount(
-            _MOUNT_HEALTHZ,
-            app=_AsgiSubApp(build_health_router(), _MOUNT_HEALTHZ),
-            name="corp_llm_gateway_healthz",
-        ),
-    )
-
-
-_mount_gateway_routes()
-log.info("gateway routes mounted: %s/*, %s", _MOUNT_HEALTHZ, _MOUNT_METRICS)
+# The gateway's own routes sit BETWEEN the gate and litellm's app, not on
+# litellm's router. Every middleware litellm adds with `add_middleware` wraps the
+# whole router, and one of them — `PrometheusAuthMiddleware`
+# (`proxy/middleware/prometheus_auth_middleware.py:37-44`) — answers 401 on any
+# path containing `/metrics` before routing, whenever a master key is set. Helm's
+# ServiceMonitor and the kubelet probes carry no litellm credential, so a
+# gateway-owned route mounted inside litellm's router would be unscrapable in
+# Mode A. `HealthRouter` already takes a `fallthrough`, so the chain is:
+# /healthz/* -> /metrics -> litellm.
+_GATEWAY_ROUTES = build_health_router(fallthrough=_MetricsRoute(_exporter.asgi_app(), _app))
+log.info("gateway routes served ahead of litellm: %s/*, %s", _MOUNT_HEALTHZ, _MOUNT_METRICS)
 
 gate = RouteGateMiddleware(
-    _app,
+    _GATEWAY_ROUTES,
     metrics=_exporter,
     audit_logger=AuditLogger(get_sink(), gateway_version=gateway_version()),
     extras=config.route_gate_extras(),

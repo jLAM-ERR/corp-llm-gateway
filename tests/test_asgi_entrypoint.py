@@ -328,6 +328,7 @@ _IMPORT_SCRIPT = f"""
     from corp_llm_gateway.route_gate import RouteGateMiddleware
 
     routes = [getattr(r, "path", None) for r in asgi._app.router.routes]
+    metrics_hop = asgi._GATEWAY_ROUTES._fallthrough
     print("{SENTINEL}" + json.dumps({{
         "worker_config": os.environ.get("WORKER_CONFIG") is not None,
         "worker_config_names_our_path": json.loads(
@@ -335,16 +336,17 @@ _IMPORT_SCRIPT = f"""
         )["config"] == os.environ["CORP_LLM_LITELLM_CONFIG"],
         "config_file_path": "CONFIG_FILE_PATH" in os.environ,
         "app_is_gate": isinstance(asgi.app, RouteGateMiddleware),
-        "gate_wraps_litellm": asgi.app.app is asgi._app,
+        "gate_wraps_gateway_routes": asgi.app.app is asgi._GATEWAY_ROUTES,
+        "gateway_routes_reach_litellm": metrics_hop._fallthrough is asgi._app,
         "lifespan_replaced": asgi._app.router.lifespan_context is not proxy_startup_event,
         "lifespan_not_original": (
             asgi._app.router.lifespan_context is not asgi._litellm_lifespan
         ),
         "guardrail_built": bootstrap._guardrail is not None,
         "armed": asgi.gate.armed,
-        "healthz_mounted": "/healthz" in routes,
-        "metrics_mounted": "/metrics" in routes,
-        "healthz_first": routes[:2],
+        "gateway_routes_not_on_litellms_router": not [
+            path for path in routes if path in ("/healthz", "/metrics")
+        ],
         "shared_exporter": asgi._exporter is __import__(
             "corp_llm_gateway.metrics", fromlist=["x"]
         ).get_exporter(),
@@ -367,7 +369,8 @@ def test_the_import_sets_worker_config_and_not_config_file_path(imported: dict) 
 
 def test_the_exported_app_is_the_gate_wrapping_litellms_app(imported: dict) -> None:
     assert imported["app_is_gate"] is True
-    assert imported["gate_wraps_litellm"] is True
+    assert imported["gate_wraps_gateway_routes"] is True
+    assert imported["gateway_routes_reach_litellm"] is True
 
 
 def test_the_lifespan_is_wrapped(imported: dict) -> None:
@@ -385,11 +388,12 @@ def test_the_gate_starts_unarmed(imported: dict) -> None:
     assert imported["armed"] is False
 
 
-def test_the_gateway_owned_routes_are_mounted_ahead_of_litellms(imported: dict) -> None:
-    assert imported["healthz_mounted"] is True
-    assert imported["metrics_mounted"] is True
-    # First two, so litellm's first-segment catch-alls cannot shadow them.
-    assert imported["healthz_first"] == ["/healthz", "/metrics"]
+def test_the_gateway_owned_routes_are_served_ahead_of_litellm(imported: dict) -> None:
+    # Not on litellm's router: its PrometheusAuthMiddleware wraps the router and
+    # 401s any path containing /metrics whenever a master key is set, and the
+    # kubelet probes and Helm's ServiceMonitor carry no litellm credential.
+    # `_REQUEST_SCRIPT` below proves both paths answer through the chain.
+    assert imported["gateway_routes_not_on_litellms_router"] is True
 
 
 def test_the_gate_and_the_guardrail_share_one_exporter(imported: dict) -> None:
