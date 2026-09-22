@@ -9,6 +9,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 GATEWAY_DOCKERFILE = ROOT / "Dockerfile.gateway"
+PYPROJECT = ROOT / "pyproject.toml"
 BUILD_WORKFLOW = ROOT / ".github/workflows/build-image.yml"
 RELEASE_GATES = ROOT / "scripts/release/gates.sh"
 UPGRADE_DOC = ROOT / "docs/ops/upgrade.md"
@@ -23,6 +24,9 @@ _ARG_PIN = re.compile(r"^ARG LITELLM_VERSION=(\S+)\s*$", re.MULTILINE)
 _SHELL_PIN = re.compile(r'^LITELLM_VERSION="([^"]+)"\s*$', re.MULTILINE)
 # `LITELLM_VERSION=${{ inputs.litellm_version || 'v1.101.0' }}`
 _WORKFLOW_BUILD_ARG_PIN = re.compile(r"LITELLM_VERSION=\$\{\{[^}]*?'([^']+)'\s*\}\}")
+# `"litellm==1.101.0",` in [project].dependencies. An exact pin, so CI installs
+# the same proxy the image ships and the route guard reads the same routes.
+_PYPROJECT_PIN = re.compile(r'^\s*"litellm==(\S+?)"\s*,\s*$', re.MULTILINE)
 # Release images must be reproducible: a moving tag would let two builds of the
 # same commit ship different proxies.
 _IMMUTABLE_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
@@ -52,6 +56,9 @@ def _pins() -> dict[str, str]:
             _WORKFLOW_BUILD_ARG_PIN, BUILD_WORKFLOW.read_text(), "build-image.yml"
         ),
         "gates.sh": _extract(_SHELL_PIN, RELEASE_GATES.read_text(), "gates.sh"),
+        # PyPI versions carry no leading `v`; the docker tags do. Normalised here
+        # so one assertion covers all seven sites.
+        "pyproject.toml": "v" + _extract(_PYPROJECT_PIN, PYPROJECT.read_text(), "pyproject.toml"),
     }
     for path in PROFILE_DOCKERFILES:
         pins[str(path.relative_to(ROOT))] = _extract(
@@ -61,9 +68,11 @@ def _pins() -> dict[str, str]:
 
 
 def test_every_litellm_pin_site_names_the_same_tag() -> None:
-    # Six sites, one version. A partial bump is the failure mode this catches:
-    # the gateway image, the release workflow, the local gate and the three demo
-    # profiles each pin independently.
+    # Seven sites, one version. A partial bump is the failure mode this catches:
+    # the gateway image, the release workflow, the local gate, the three demo
+    # profiles and the wheel's own dependency each pin independently. The
+    # seventh is what keeps CI's `pip install -e .` on the proxy the image
+    # ships, so the route guard reads the routes the gateway actually serves.
     assert set(_pins().values()) == {"v1.101.0"}
 
 
@@ -102,6 +111,7 @@ def test_upgrade_doc_records_the_pin_and_the_rollback_versions() -> None:
         pytest.param(_ARG_PIN, "ARG NER_PROFILE=base\n", id="arg"),
         pytest.param(_SHELL_PIN, 'IMAGE="gw-test"\n', id="shell"),
         pytest.param(_WORKFLOW_BUILD_ARG_PIN, "NER_PROFILE=ru-en\n", id="workflow"),
+        pytest.param(_PYPROJECT_PIN, '    "litellm>=1.40,<2.0",\n', id="pyproject-range"),
     ],
 )
 def test_pin_extraction_refuses_a_file_without_a_pin(pattern: re.Pattern[str], text: str) -> None:

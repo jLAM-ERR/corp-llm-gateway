@@ -110,10 +110,21 @@ KNOWN_DYNAMIC_REGISTRATIONS: dict[tuple[str, int], str] = {
 }
 
 
+# Lazy routers are included on the first request that matches their prefix, so
+# their routes land after every eagerly included one however early their
+# `include_router` line sits.
+LAZY_ORDER = 10**9
+
+
 @dataclass(frozen=True, order=True)
 class Route:
     """One registered route. ``module`` is the path relative to litellm's
-    package root, so a guard failure names the file to read."""
+    package root, so a guard failure names the file to read.
+
+    ``order`` is the chain of ``include_router`` line numbers from the app down
+    to this route's own registration line. Starlette matches in registration
+    order, so comparing two routes' ``order`` says which one answers a path both
+    patterns match."""
 
     method: str
     path: str
@@ -123,6 +134,7 @@ class Route:
     registration_kind: str
     call_type: str | None = None
     provider_calls: tuple[str, ...] = ()
+    order: tuple[int, ...] = ()
 
     @property
     def key(self) -> tuple[str, str]:
@@ -185,7 +197,7 @@ def collect(litellm_root: Path) -> Collection:
         unresolved_includes.extend(module.unresolved_includes)
         for raw in module.raw_routes:
             own = module.routers.get(raw.router, "")
-            for outer in sorted(prefixes.get((module.dotted, raw.router), {""})):
+            for outer, chain in sorted(prefixes.get((module.dotted, raw.router), {("", ())})):
                 for method in raw.methods:
                     routes.add(
                         Route(
@@ -197,6 +209,7 @@ def collect(litellm_root: Path) -> Collection:
                             registration_kind=raw.kind,
                             call_type=module.call_type(raw.handler),
                             provider_calls=module.provider_calls(raw.handler),
+                            order=(*chain, raw.line),
                         )
                     )
 
@@ -233,6 +246,7 @@ def _with_head(routes: Iterable[Route]) -> Iterator[Route]:
                 registration_kind=route.registration_kind,
                 call_type=route.call_type,
                 provider_calls=route.provider_calls,
+                order=route.order,
             )
 
 
@@ -258,6 +272,7 @@ class _Include:
     target_module: str
     target_name: str
     prefix: str
+    line: int
 
 
 class _Universe:
@@ -332,7 +347,12 @@ class _Module:
             elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
                 for alias in node.names:
                     self.imports[alias.asname or alias.name] = (node.module, alias.name)
-            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        # Module level only: an `ast.walk` would index a nested def or a class
+        # method under its bare name, and the first one found would answer for
+        # the module-level handler of the same name. `GET /get/config/callbacks`
+        # was read against `ProxyConfig.get_config` that way.
+        for node in self.tree.body:
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 self.functions[node.name] = node
 
     def _bind(self, targets: list[ast.expr], value: ast.expr) -> None:
@@ -386,7 +406,7 @@ class _Module:
         paths = self._paths(decorator, "decorator", attr)
         if not paths:
             return
-        methods = self._methods(decorator, attr)
+        methods = self._methods(decorator, "decorator", attr)
         for path in paths:
             self.raw_routes.append(
                 _RawRoute(router, methods, path, handler, decorator.lineno, "decorator")
@@ -416,7 +436,7 @@ class _Module:
         if not paths:
             return
         handler = self._endpoint_name(call)
-        methods = self._methods(call, attr)
+        methods = self._methods(call, kind, attr)
         for path in paths:
             self.raw_routes.append(_RawRoute(router, methods, path, handler, call.lineno, kind))
 
@@ -426,11 +446,11 @@ class _Module:
         prefix = self.resolve_str(prefix_node) if prefix_node is not None else ""
         target = call.args[0] if call.args else None
         if isinstance(target, ast.Name) and target.id in self.routers:
-            self.includes.append(_Include(host, self.dotted, target.id, prefix or ""))
+            self.includes.append(_Include(host, self.dotted, target.id, prefix or "", call.lineno))
             return
         if isinstance(target, ast.Name) and target.id in self.imports:
             module, name = self.imports[target.id]
-            self.includes.append(_Include(host, module, name, prefix or ""))
+            self.includes.append(_Include(host, module, name, prefix or "", call.lineno))
             return
         # An include whose router this cannot name only loses a prefix — unless
         # the site sets one, in which case the paths would be wrong.
@@ -453,17 +473,28 @@ class _Module:
             )
         return [item for item in items if item is not None]
 
-    def _methods(self, call: ast.Call, attr: str) -> tuple[str, ...]:
+    def _methods(self, call: ast.Call, kind: str, attr: str) -> tuple[str, ...]:
         if attr == "websocket" or attr == "add_websocket_route":
             return (WEBSOCKET,)
         if attr in _VERB_DECORATORS:
             return (attr.upper(),)
         node = next((k.value for k in call.keywords if k.arg == "methods"), None)
-        if isinstance(node, ast.List | ast.Tuple):
-            verbs = [self.resolve_str(element) for element in node.elts]
-            return tuple(sorted(verb.upper() for verb in verbs if verb))
-        # api_route without methods= is GET, as FastAPI documents.
-        return ("GET",)
+        if node is None:
+            # api_route without methods= is GET, as FastAPI documents.
+            return ("GET",)
+        verbs = (
+            [self.resolve_str(element) for element in node.elts]
+            if isinstance(node, ast.List | ast.Tuple)
+            else [None]
+        )
+        if any(verb is None for verb in verbs):
+            # A computed methods= would otherwise fall through to GET, and the
+            # POST spelling of the same path would be served and never listed.
+            self.dynamic_sites.append(
+                DynamicSite(self.rel, call.lineno, f"{kind}:{attr}:methods", self._segment(call))
+            )
+            return ()
+        return tuple(sorted(verb.upper() for verb in verbs if verb))
 
     def _endpoint_name(self, call: ast.Call) -> str:
         node = self._argument(call, 1, "endpoint")
@@ -527,19 +558,29 @@ class _Module:
         return None
 
 
-def _called_names(function: ast.AST) -> set[str]:
+def _called_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     names: set[str] = set()
-    for node in ast.walk(function):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Name):
-            names.add(func.id)
-        elif isinstance(func, ast.Attribute):
-            names.add(func.attr)
-            if isinstance(func.value, ast.Name):
-                names.add(f"{func.value.id}.{func.attr}")
+    # `function.body`, not the whole node: `ast.walk` would also read the
+    # decorator calls, whose `Depends(...)` arguments are not what the handler
+    # does when it runs.
+    for statement in function.body:
+        for node in ast.walk(statement):
+            names |= _call_name(node)
     return names
+
+
+def _call_name(node: ast.AST) -> set[str]:
+    if not isinstance(node, ast.Call):
+        return set()
+    func = node.func
+    if isinstance(func, ast.Name):
+        return {func.id}
+    if isinstance(func, ast.Attribute):
+        names = {func.attr}
+        if isinstance(func.value, ast.Name):
+            names.add(f"{func.value.id}.{func.attr}")
+        return names
+    return set()
 
 
 def _is_api_router(node: ast.expr) -> bool:
@@ -554,35 +595,41 @@ def _is_api_router(node: ast.expr) -> bool:
 # ── include graph ───────────────────────────────────────────────────────────
 
 
+_Node = tuple[str, str, str, tuple[int, ...]]
+
+
 def _resolve_prefixes(
     universe: _Universe, modules: list[_Module]
-) -> dict[tuple[str, str], set[str]]:
-    """Accumulated prefixes per ``(module, router variable)``.
+) -> dict[tuple[str, str], set[tuple[str, tuple[int, ...]]]]:
+    """Accumulated ``(prefix, include-line chain)`` per ``(module, router variable)``.
 
     FastAPI bakes a router's own ``prefix=`` into its routes at decoration
     time and prepends the ``include_router(prefix=…)`` of every site above it,
     so a node's value is what sits in front of ``own prefix + decorated path``.
+    The chain records the line of every ``include_router`` on the way down,
+    because Starlette matches routes in registration order and the gate needs to
+    know which of two matching patterns litellm reaches first.
     """
-    roots: list[tuple[str, str, str]] = []
+    roots: list[_Node] = []
     server = universe.get(f"{universe.package}.proxy.proxy_server")
     if server is not None:
-        roots.append((server.dotted, "app", ""))
+        roots.append((server.dotted, "app", "", ()))
     roots.extend(_lazy_roots(universe))
 
-    prefixes: dict[tuple[str, str], set[str]] = {}
+    prefixes: dict[tuple[str, str], set[tuple[str, tuple[int, ...]]]] = {}
     by_dotted = {module.dotted: module for module in modules}
     queue = list(roots)
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[_Node] = set()
     while queue:
-        dotted, var, accum = queue.pop()
-        if (dotted, var, accum) in seen:
+        dotted, var, accum, chain = queue.pop()
+        if (dotted, var, accum, chain) in seen:
             continue
-        seen.add((dotted, var, accum))
+        seen.add((dotted, var, accum, chain))
         module = by_dotted.get(dotted) or universe.get(dotted)
         if module is None:
             continue
         own = module.routers.get(var, "")
-        prefixes.setdefault((dotted, var), set()).add(accum)
+        prefixes.setdefault((dotted, var), set()).add((accum, chain))
         for include in module.includes:
             if include.host != var:
                 continue
@@ -593,17 +640,19 @@ def _resolve_prefixes(
             if name not in target.routers:
                 # `from x import router as y`: the alias is the name in x.
                 name = "router" if "router" in target.routers else name
-            queue.append((target.dotted, name, accum + own + include.prefix))
+            queue.append(
+                (target.dotted, name, accum + own + include.prefix, (*chain, include.line))
+            )
     return prefixes
 
 
-def _lazy_roots(universe: _Universe) -> list[tuple[str, str, str]]:
+def _lazy_roots(universe: _Universe) -> list[_Node]:
     """``LAZY_FEATURES`` entries: module + router attribute, mounted at no
     prefix (``_include_router``) or as their own ASGI app (``_mount_app``)."""
     lazy = universe.get(f"{universe.package}.proxy._lazy_features")
     if lazy is None:
         return []
-    roots: list[tuple[str, str, str]] = []
+    roots: list[_Node] = []
     for node in ast.walk(lazy.tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
             continue
@@ -623,5 +672,5 @@ def _lazy_roots(universe: _Universe) -> list[tuple[str, str, str]]:
             if register.func.id == "_include_router":
                 named = _Module._argument(register, 0, "attr_name")
                 attr = (lazy.resolve_str(named) if named is not None else None) or "router"
-        roots.append((module_path, attr, ""))
+        roots.append((module_path, attr, "", (LAZY_ORDER, node.lineno)))
     return roots

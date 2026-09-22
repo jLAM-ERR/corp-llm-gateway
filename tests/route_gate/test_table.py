@@ -140,6 +140,46 @@ def test_the_hook_backed_routes_are_rewritten(path: str) -> None:
     assert entry is not None and entry.verdict is Verdict.REWRITTEN
 
 
+def test_the_rewritten_set_is_exactly_eight_spellings() -> None:
+    # Eight, not eleven: the three `/openai/…` spellings are also matched by
+    # litellm's hook-less `/openai/{endpoint:path}` raw passthrough, so their
+    # rewrite would rest on include order. They are REFUSE.
+    rewritten = [
+        f"{method} {path}"
+        for table in EXACT_TABLES
+        for (method, path), entry in table.items()
+        if entry.verdict is Verdict.REWRITTEN
+    ]
+    rewritten += [
+        f"{row.method} {row.template}"
+        for row in LITELLM_REGEX_TABLE
+        if row.entry.verdict is Verdict.REWRITTEN
+    ]
+    assert sorted(rewritten) == [
+        "POST /chat/completions",
+        "POST /engines/{model:path}/chat/completions",
+        "POST /responses",
+        "POST /responses/compact",
+        "POST /v1/chat/completions",
+        "POST /v1/messages",
+        "POST /v1/responses",
+        "POST /v1/responses/compact",
+    ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/openai/v1/responses",
+        "/openai/v1/responses/compact",
+        "/openai/deployments/gpt-4o/chat/completions",
+    ],
+)
+def test_the_openai_generation_spellings_are_refused(path: str) -> None:
+    entry = lookup("POST", path)
+    assert entry is not None and entry.verdict is Verdict.REFUSE
+
+
 def test_every_body_carrying_passthrough_carries_a_justification() -> None:
     # A POST/PUT/PATCH the hook never sees is admitted only with a written
     # no-egress reason; "admin" alone is not one.
@@ -172,7 +212,7 @@ def test_regex_entries_are_anchored() -> None:
         ("DELETE", "/openai/v1/responses/resp_123", Verdict.PASSTHROUGH),
         ("POST", "/v1/responses/resp_123/cancel", Verdict.PASSTHROUGH),
         ("POST", "/engines/gpt-4o/chat/completions", Verdict.REWRITTEN),
-        ("POST", "/openai/deployments/gpt-4o/chat/completions", Verdict.REWRITTEN),
+        ("POST", "/openai/deployments/gpt-4o/chat/completions", Verdict.REFUSE),
         ("POST", "/lazy/warm/mcp", Verdict.PASSTHROUGH),
     ],
 )
@@ -184,10 +224,12 @@ def test_regex_table_resolves_path_parameters(method: str, path: str, verdict: V
 def test_every_regex_row_is_reachable() -> None:
     # A catch-all row ordered ahead of a specific one would silently swallow it;
     # each row must still answer for the template it was generated from.
+    # Identity, not equality: `Entry` is a value object, so two rows that happen
+    # to share a verdict and a `why` compare equal and a shadow would pass.
     shadowed = [
         f"{row.method} {row.template}"
         for row in LITELLM_REGEX_TABLE
-        if lookup(row.method, row.template) != row.entry
+        if lookup(row.method, row.template) is not row.entry
     ]
     assert shadowed == []
 

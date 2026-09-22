@@ -8,6 +8,7 @@ exactly the silence this test exists to prevent.
 
 from __future__ import annotations
 
+import re
 import shutil
 from collections.abc import Iterator
 from importlib.util import find_spec
@@ -25,6 +26,7 @@ from corp_llm_gateway.route_gate import (
     classify,
     lookup,
 )
+from corp_llm_gateway.route_gate.table import template_matcher
 
 from .litellm_routes import (
     KNOWN_DYNAMIC_REGISTRATIONS,
@@ -121,10 +123,16 @@ def test_every_collected_route_is_listed(collection: Collection) -> None:
 # ── (b) a REWRITTEN entry is backed by the hook ─────────────────────────────
 
 
+def _rewritten_rows() -> list[tuple[str, str]]:
+    return sorted(
+        (method, path)
+        for method, path, entry in _table_rows()
+        if entry.verdict is Verdict.REWRITTEN  # type: ignore[attr-defined]
+    )
+
+
 def test_every_rewritten_entry_reaches_the_hook(collection: Collection) -> None:
-    for method, path, entry in _table_rows():
-        if entry.verdict is not Verdict.REWRITTEN:  # type: ignore[attr-defined]
-            continue
+    for method, path in _rewritten_rows():
         routes = collection.by_key(method, path)
         assert routes, f"{method} {path} is REWRITTEN but litellm no longer registers it"
         for route in routes:
@@ -136,6 +144,98 @@ def test_every_rewritten_entry_reaches_the_hook(collection: Collection) -> None:
                 f"{method} {path} is REWRITTEN but its call type {route.call_type!r} "
                 "is in the hook's no-rewrite set"
             )
+
+
+def test_the_rewritten_set_is_the_eight_generation_spellings() -> None:
+    # Three more spellings reach the hook (`/openai/v1/responses`,
+    # `/openai/v1/responses/compact`, `/openai/deployments/{model:path}/chat/completions`)
+    # and are REFUSE anyway — see the ordering test below.
+    assert _rewritten_rows() == [
+        ("POST", "/chat/completions"),
+        ("POST", "/engines/{model:path}/chat/completions"),
+        ("POST", "/responses"),
+        ("POST", "/responses/compact"),
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/responses/compact"),
+    ]
+
+
+def _sample(template: str) -> str:
+    return re.sub(r"\{[^{}]+\}", "sample", template)
+
+
+def _hookless_shadows(collection: Collection, method: str, template: str) -> list[Route]:
+    """Hook-less routes whose own pattern also matches this template's path."""
+    sample = _sample(template)
+    return sorted(
+        route
+        for route in _http(collection)
+        if route.method == method
+        and route.path != template
+        and not route.reaches_hook
+        and template_matcher(route.path).match(sample)
+    )
+
+
+def outranked_rewritten_rows(collection: Collection, rows: list[tuple[str, str]]) -> list[str]:
+    """REWRITTEN rows a hook-less route would answer first."""
+    offenders: list[str] = []
+    for method, template in rows:
+        winners = collection.by_key(method, template)
+        if not winners:
+            offenders.append(f"{method} {template}: litellm no longer registers it")
+            continue
+        first = min(route.order for route in winners)
+        offenders += [
+            f"{method} {template} (order {first}) is shadowed by hook-less "
+            f"{route.path} (order {route.order}, {route.module}:{route.handler})"
+            for route in _hookless_shadows(collection, method, template)
+            if route.order < first
+        ]
+    return offenders
+
+
+def test_no_hookless_route_can_outrank_a_rewritten_one(collection: Collection) -> None:
+    """A REWRITTEN verdict promises the hook rewrote the body. litellm registers
+    catch-all raw passthroughs (`/openai/{endpoint:path}`) whose pattern also
+    matches admitted spellings; they lose only because `include_router` runs
+    later. A bump that reorders the includes would send a REWRITTEN path to a
+    hook-less handler, so the gate would admit a body nothing sanitized."""
+    offenders = outranked_rewritten_rows(collection, _rewritten_rows())
+    assert offenders == [], (
+        "litellm now reaches a hook-less handler first on a REWRITTEN path; refuse "
+        "the spelling or re-read the include order:\n" + "\n".join(offenders)
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/openai/v1/responses",
+        "/openai/v1/responses/compact",
+        "/openai/deployments/{model:path}/chat/completions",
+    ],
+)
+def test_the_openai_spellings_are_refused_because_a_raw_passthrough_matches_them(
+    collection: Collection, path: str
+) -> None:
+    # The positive control for the test above: these three DO reach the hook, and
+    # the only thing keeping the raw `/openai/{endpoint:path}` passthrough off
+    # them is that its router is included later. They are REFUSE for that reason.
+    sample = re.sub(r"\{[^{}]+\}", "sample", path)
+    shadows = [
+        route
+        for route in _http(collection)
+        if route.method == "POST"
+        and route.path != path
+        and not route.reaches_hook
+        and template_matcher(route.path).match(sample)
+    ]
+    assert [route.path for route in shadows] == ["/openai/{endpoint:path}"]
+    assert all(route.reaches_hook for route in collection.by_key("POST", path))
+    assert lookup("POST", sample).verdict is Verdict.REFUSE  # type: ignore[union-attr]
 
 
 # ── (c) a hook-less body route is refused, or justified and provably inert ──
@@ -275,6 +375,51 @@ def test_drift_adds_an_unknown_dynamic_registration(drifted: Collection) -> None
     unknown = unknown_dynamic_sites(drifted)
     assert [site.module for site in unknown] == ["proxy/drift_endpoints.py"]
     assert all(site.key not in KNOWN_DYNAMIC_REGISTRATIONS for site in unknown)
+
+
+def _route(method: str, path: str, *, hook: bool, order: tuple[int, ...]) -> Route:
+    return Route(
+        method=method,
+        path=path,
+        module="proxy/fake.py",
+        handler="fake",
+        reaches_hook=hook,
+        registration_kind="decorator",
+        order=order,
+    )
+
+
+def test_the_include_order_check_fires_when_a_raw_passthrough_is_included_first() -> None:
+    # The real guard above is satisfied by litellm 1.101.0's include order, so
+    # this fabricates the reorder it exists to catch: same paths, passthrough
+    # first.
+    shadowed = Collection(
+        routes=frozenset(
+            {
+                _route("POST", "/openai/{endpoint:path}", hook=False, order=(10, 1)),
+                _route("POST", "/openai/v1/responses", hook=True, order=(20, 1)),
+            }
+        ),
+        dynamic_sites=(),
+        mounts=(),
+        unresolved_includes=(),
+    )
+    rows = [("POST", "/openai/v1/responses")]
+
+    assert len(outranked_rewritten_rows(shadowed, rows)) == 1
+    # Flip the two include lines back and the same collection is clean.
+    ordered = Collection(
+        routes=frozenset(
+            {
+                _route("POST", "/openai/{endpoint:path}", hook=False, order=(20, 1)),
+                _route("POST", "/openai/v1/responses", hook=True, order=(10, 1)),
+            }
+        ),
+        dynamic_sites=(),
+        mounts=(),
+        unresolved_includes=(),
+    )
+    assert outranked_rewritten_rows(ordered, rows) == []
 
 
 def test_drift_does_not_move_the_known_dynamic_registrations(drifted: Collection) -> None:

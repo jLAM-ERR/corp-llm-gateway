@@ -11,7 +11,7 @@ mounts (``/healthz/*``, ``/metrics``) and is exempt from the source guard.
 The litellm tables are generated from litellm 1.101.0's own source with the
 collector in ``tests/route_gate/litellm_routes.py`` and these rules, in order:
 
-1. the eleven generation spellings whose body the hook rewrites are REWRITTEN;
+1. the eight generation spellings whose body the hook rewrites are REWRITTEN;
 2. a stored-response route addressed by id is PASSTHROUGH — it sends no
    inbound text;
 3. a handler that reaches ``pre_call_hook`` or calls a provider any other way
@@ -106,7 +106,13 @@ _PARAMETER = re.compile(r"\{[^{}]+\}")
 
 
 def _regex(method: str, template: str, entry: Entry) -> RegexEntry:
-    return RegexEntry(method, template, _anchored(_pattern(template)), entry)
+    return RegexEntry(method, template, template_matcher(template), entry)
+
+
+def template_matcher(template: str) -> re.Pattern[str]:
+    """Anchored matcher for a FastAPI path template. Public so the litellm guard
+    can ask whether one registered template also matches another's path."""
+    return _anchored(_pattern(template))
 
 
 def _pattern(template: str) -> str:
@@ -134,6 +140,11 @@ _WHY_NO_REWRITE = "hook no-rewrite set (_NON_CHAT_INPUT_CALL_TYPES); a DLP scan 
 _WHY_PROMPT = "prompt is never read by the hook, so nothing is rewritten"
 _WHY_COUNT = "handler never calls pre_call_hook; clients use usage.input_tokens from the real turn"
 _WHY_NO_HOOK = "carries user text to a provider or a store without reaching the hook"
+_WHY_OPENAI_SHADOWED = (
+    "the hook-less /openai/{endpoint:path} raw passthrough matches this path too; it loses only "
+    "because litellm includes its router later, so the rewrite rests on include order no bump "
+    "guarantees. No client here uses the /openai/ spelling"
+)
 _WHY_CURSOR = (
     "cursor-compat chat spelling; it does reach the hook, but no client here uses it and "
     "default-deny keeps the admitted set minimal"
@@ -577,8 +588,8 @@ LITELLM_ROUTE_TABLE: dict[tuple[str, str], Entry] = {
     ("POST", "/openai/v1/realtime/calls"): _refuse(_WHY_NOT_REWRITTEN),
     ("POST", "/openai/v1/realtime/client_secrets"): _refuse(_WHY_NOT_REWRITTEN),
     ("POST", "/openai/v1/realtime/transcription_sessions"): _refuse(_WHY_NOT_REWRITTEN),
-    ("POST", "/openai/v1/responses"): _rewritten(_WHY_RESPONSES),
-    ("POST", "/openai/v1/responses/compact"): _rewritten(_WHY_COMPACT),
+    ("POST", "/openai/v1/responses"): _refuse(_WHY_OPENAI_SHADOWED),
+    ("POST", "/openai/v1/responses/compact"): _refuse(_WHY_OPENAI_SHADOWED),
     ("POST", "/openai/v1/responses/input_tokens"): _refuse(_WHY_COUNT),
     ("POST", "/organization/info"): _passthrough(_WHY_ADMIN, _JUST_ADMIN),
     ("POST", "/organization/member_add"): _passthrough(_WHY_ADMIN, _JUST_ADMIN),
@@ -797,7 +808,11 @@ LITELLM_REGEX_TABLE: tuple[RegexEntry, ...] = (
     _regex(
         "POST", "/openai/deployments/{model:path}/images/generations", _refuse(_WHY_NOT_REWRITTEN)
     ),
-    _regex("POST", "/openai/deployments/{model:path}/chat/completions", _rewritten(_WHY_CHAT)),
+    _regex(
+        "POST",
+        "/openai/deployments/{model:path}/chat/completions",
+        _refuse(_WHY_OPENAI_SHADOWED),
+    ),
     _regex("POST", "/openai/deployments/{model:path}/images/edits", _refuse(_WHY_NOT_REWRITTEN)),
     _regex("POST", "/openai/deployments/{model:path}/completions", _refuse(_WHY_PROMPT)),
     _regex("POST", "/openai/deployments/{model:path}/embeddings", _refuse(_WHY_NO_REWRITE)),
