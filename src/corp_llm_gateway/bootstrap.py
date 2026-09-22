@@ -471,10 +471,17 @@ def build_guardrail(
         else configured_forward_anthropic_auth
     )
     # Independent of the chatgpt/anthropic pair: not part of their mutual exclusivity.
+    # Defaults ON. The guardrail writes the inbound wire headers into
+    # data["headers"] and litellm forwards that bucket, so with the flag off the
+    # client's `content-length` rides along beside litellm's own, longer,
+    # sanitized body and the provider reads the request truncated at the client's
+    # length (wire-captured on /v1/messages and /v1/chat/completions). Any request
+    # whose sanitized body grew is corrupted. The dropped set is hop-by-hop /
+    # wire-level only and never `authorization` (invariant 3).
     resolved_strip_inbound_headers_to_upstream = (
         strip_inbound_headers_to_upstream
         if strip_inbound_headers_to_upstream is not None
-        else _flag("CORP_LLM_STRIP_INBOUND_HEADERS", "0")
+        else _flag("CORP_LLM_STRIP_INBOUND_HEADERS", "1")
     )
     # Same reason as the no-op-sanitizer floor below: settings.validate() covers
     # `config check` only, and the compose/demo boots these bridges ship on skip it.

@@ -105,7 +105,7 @@ cascade above, on the already-sanitized request.
 
 | Key | Purpose | Default | Required |
 |-----|---------|---------|----------|
-| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Type`, ...) before forwarding to upstream | `0` | no |
+| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Length`, `Content-Type`, ...) before forwarding to upstream | `1` | no |
 
 `CorpLlmGuardrail._pre_call_impl` (reached via `async_pre_call_hook`) sets
 `data["headers"]` **unconditionally**, independent of litellm's own
@@ -114,6 +114,14 @@ in `data["headers"]` regardless of how it got there. This flag is
 load-bearing wherever the guardrail runs in front of any litellm provider,
 not a no-op reserved for a future config: see `compose/README.md` "Why not
 BYOK" for a wire-verified writeup. It never touches `Authorization`.
+
+It defaults **on** because it is a correctness knob as well as a
+confidentiality one: with it off, the client's `Content-Length` is forwarded
+beside litellm's own, longer, sanitized body, and the provider reads the
+request truncated at the client's length — a `"stream": true` cut off that way
+comes back non-streamed. Any request whose sanitized body grew (a placeholder
+longer than the original it replaced) is corrupted on the wire. Set it to `0`
+only to reproduce that.
 
 ### Subscription-auth bridges
 

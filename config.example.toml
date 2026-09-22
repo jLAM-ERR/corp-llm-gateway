@@ -64,11 +64,12 @@
 #   Resolved by bootstrap.build_guardrail() in every deployment (k8s/Helm
 #   included), not just the docker-compose Codex demo overlay. See
 #   docs/chatgpt-codex.md.
-# CORP_LLM_STRIP_INBOUND_HEADERS = "0"  # strip inbound wire headers before upstream
-#   Set "1" when routing through litellm's hosted_vllm/ provider (corp-*
-#   models): it forwards proxy_server_request headers (incl. Host) upstream,
-#   and an unknown vhost 503s the corp ingress. Off by default to preserve
-#   existing anthropic/openai routing behaviour.
+# CORP_LLM_STRIP_INBOUND_HEADERS = "1"  # strip inbound wire headers before upstream
+#   ON by default, and it is a correctness knob, not a preference: litellm
+#   forwards the headers the guardrail puts in data["headers"], so with this
+#   off the client's Content-Length travels with litellm's own, longer,
+#   sanitized body and the provider truncates the request. Also what keeps an
+#   inbound Host off the corp ingress on the hosted_vllm/ (corp-*) route.
 # CORP_LLM_FORWARD_ANTHROPIC_AUTH = "0"  # opt-in Anthropic subscription (OAuth) forwarding
 #   Lifts the developer's `sk-ant-oat…` bearer into the upstream Anthropic call,
 #   so no ANTHROPIC_API_KEY is needed on the laptop.

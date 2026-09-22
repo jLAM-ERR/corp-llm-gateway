@@ -92,6 +92,23 @@ def test_deployment_projects_both_files_and_mounts_litellm_config(
     assert mount["mountPath"] == "/etc/litellm"
 
 
+def _env_of(deployment: dict[str, Any], container: str) -> dict[str, Any]:
+    containers = deployment["spec"]["template"]["spec"]["containers"]
+    found = next(c for c in containers if c["name"] == container)
+    return {entry["name"]: entry.get("value") for entry in found["env"]}
+
+
+def test_the_gateway_strips_inbound_wire_headers_by_default(
+    rendered_docs: list[dict[str, Any]],
+) -> None:
+    # Without it the client's Content-Length is forwarded with litellm's own,
+    # longer, sanitized body and the provider truncates the request. The chart
+    # never set it, so every Helm deploy ran with it off.
+    deployment = _first_of_kind(rendered_docs, "Deployment")
+
+    assert _env_of(deployment, "litellm")["CORP_LLM_STRIP_INBOUND_HEADERS"] == "1"
+
+
 def test_callback_dotted_path_matches_items_projection_path(
     rendered_docs: list[dict[str, Any]],
 ) -> None:

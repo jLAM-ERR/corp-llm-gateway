@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import logging
 import sys
 from collections.abc import Iterator
@@ -408,10 +409,65 @@ def test_strip_inbound_headers_falsy_spellings_disable_the_flag(
     assert guardrail._strip_inbound_headers_to_upstream is False
 
 
-def test_strip_inbound_headers_unset_defaults_off() -> None:
+def test_strip_inbound_headers_unset_defaults_on() -> None:
+    # ON, because OFF corrupts the upstream request: litellm forwards the
+    # client's Content-Length beside its own, longer, sanitized body.
     guardrail = bootstrap.build_guardrail()
 
-    assert guardrail._strip_inbound_headers_to_upstream is False
+    assert guardrail._strip_inbound_headers_to_upstream is True
+
+
+@pytest.mark.asyncio
+async def test_a_grown_sanitized_body_goes_upstream_without_the_inbound_length() -> None:
+    # The whole reason the default flipped. The inbound Content-Length describes
+    # the body the CLIENT sent; sanitization replaces an original with a longer
+    # placeholder, so litellm's body is longer — and a provider that believes the
+    # forwarded header reads the request truncated at the client's length.
+    guardrail = bootstrap.build_guardrail()
+    guardrail._auth._store.upsert(  # type: ignore[attr-defined]
+        TokenInfo(
+            corp_token="tok-len",
+            user_id="alice",
+            team_id="t1",
+            scopes=("read",),
+            issued_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC) + timedelta(days=30),
+        )
+    )
+    inbound_body = json.dumps(
+        {
+            "model": "claude",
+            "messages": [{"role": "user", "content": "mail a@b.lan now"}],
+        }
+    )
+    headers = {
+        "X-Corp-Auth": "tok-len",
+        "Authorization": "Bearer byok-developer-key",
+        "Content-Length": str(len(inbound_body)),
+        "Host": "127.0.0.1:4000",
+    }
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "mail a@b.lan now"}],
+        "headers": dict(headers),
+        "proxy_server_request": {"headers": dict(headers)},
+        "litellm_metadata": {"headers": dict(headers)},
+    }
+
+    out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    upstream_body = json.dumps({"model": out["model"], "messages": out["messages"]})
+    assert "a@b.lan" not in upstream_body
+    assert len(upstream_body) > len(inbound_body), "this corpus no longer grows; pick another"
+    for bucket in (
+        out["headers"],
+        out["proxy_server_request"]["headers"],
+        out["litellm_metadata"]["headers"],
+    ):
+        assert not [name for name in bucket if name.lower() == "content-length"]
+        assert not [name for name in bucket if name.lower() == "host"]
+    # The one header the strip must never take (invariant 3).
+    assert out["headers"]["Authorization"] == "Bearer byok-developer-key"
 
 
 def test_strip_inbound_headers_explicit_argument_overrides_config(
