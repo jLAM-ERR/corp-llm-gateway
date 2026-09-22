@@ -46,7 +46,7 @@ EXACT_TABLES = (LITELLM_ROUTE_TABLE, GATEWAY_ROUTE_TABLE)
 
 ALL_ENTRIES = [
     *(entry for table in EXACT_TABLES for entry in table.values()),
-    *(entry for _, _, entry in LITELLM_REGEX_TABLE),
+    *(row.entry for row in LITELLM_REGEX_TABLE),
 ]
 
 
@@ -59,17 +59,18 @@ def test_every_exact_key_is_an_uppercase_method_and_an_absolute_path() -> None:
 
 
 def test_every_regex_row_is_an_uppercase_method_and_an_absolute_pattern() -> None:
-    for method, pattern, _ in LITELLM_REGEX_TABLE:
-        assert method in HTTP_METHODS, f"{method} {pattern.pattern}"
-        assert method == method.upper(), f"{method} {pattern.pattern}"
-        assert pattern.pattern.startswith("\\A/"), f"{method} {pattern.pattern}"
+    for row in LITELLM_REGEX_TABLE:
+        assert row.method in HTTP_METHODS, row.template
+        assert row.method == row.method.upper(), row.template
+        assert row.template.startswith("/"), row.template
+        assert row.pattern.pattern.startswith("\\A/"), row.template
 
 
 def test_no_head_route_is_rewritten() -> None:
     # HEAD carries no body; a REWRITTEN HEAD row would promise a rewrite that
     # cannot happen. classify() downgrades one, but none may exist.
     rows = [(method, entry) for table in EXACT_TABLES for (method, _), entry in table.items()]
-    rows += [(method, entry) for method, _, entry in LITELLM_REGEX_TABLE]
+    rows += [(row.method, row.entry) for row in LITELLM_REGEX_TABLE]
     assert [
         method for method, entry in rows if method == "HEAD" and entry.verdict is Verdict.REWRITTEN
     ] == []
@@ -78,7 +79,7 @@ def test_no_head_route_is_rewritten() -> None:
 def test_no_table_lists_a_websocket_route() -> None:
     # Handshakes are refused at scope level; a WEBSOCKET row could only mislead.
     methods = {method for table in EXACT_TABLES for method, _ in table}
-    methods |= {method for method, _, _ in LITELLM_REGEX_TABLE}
+    methods |= {row.method for row in LITELLM_REGEX_TABLE}
     assert "WEBSOCKET" not in methods
 
 
@@ -147,9 +148,7 @@ def test_every_body_carrying_passthrough_carries_a_justification() -> None:
         for table in EXACT_TABLES
         for (method, path), entry in table.items()
     ]
-    routes += [
-        (f"{method} {pattern.pattern}", entry) for method, pattern, entry in LITELLM_REGEX_TABLE
-    ]
+    routes += [(f"{row.method} {row.template}", row.entry) for row in LITELLM_REGEX_TABLE]
     offenders = [
         route
         for route, entry in routes
@@ -161,9 +160,9 @@ def test_every_body_carrying_passthrough_carries_a_justification() -> None:
 
 
 def test_regex_entries_are_anchored() -> None:
-    for _, pattern, _ in LITELLM_REGEX_TABLE:
-        assert pattern.pattern.startswith("\\A")
-        assert pattern.pattern.endswith("\\Z")
+    for row in LITELLM_REGEX_TABLE:
+        assert row.pattern.pattern.startswith("\\A")
+        assert row.pattern.pattern.endswith("\\Z")
 
 
 @pytest.mark.parametrize(
@@ -180,6 +179,29 @@ def test_regex_entries_are_anchored() -> None:
 def test_regex_table_resolves_path_parameters(method: str, path: str, verdict: Verdict) -> None:
     entry = lookup(method, path)
     assert entry is not None and entry.verdict is verdict
+
+
+def test_every_regex_row_is_reachable() -> None:
+    # A catch-all row ordered ahead of a specific one would silently swallow it;
+    # each row must still answer for the template it was generated from.
+    shadowed = [
+        f"{row.method} {row.template}"
+        for row in LITELLM_REGEX_TABLE
+        if lookup(row.method, row.template) != row.entry
+    ]
+    assert shadowed == []
+
+
+def test_the_regex_rows_are_ordered_specific_first() -> None:
+    statics = [len(row.template.split("{", 1)[0]) for row in LITELLM_REGEX_TABLE]
+    assert statics == sorted(statics, reverse=True)
+
+
+def test_the_table_is_the_whole_collected_surface() -> None:
+    # Regenerated from litellm 1.101.0; a table this small would mean the
+    # generator ran against a partial parse.
+    assert len(LITELLM_ROUTE_TABLE) > 500
+    assert len(LITELLM_REGEX_TABLE) > 300
 
 
 def test_the_gateway_owned_routes_are_listed_for_get() -> None:
