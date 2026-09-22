@@ -405,6 +405,44 @@ def test_the_route_gate_reasons_match_the_gate_itself() -> None:
     assert set(BLOCK_REASONS["route_gate"]) == set(GATE_REASONS)
 
 
+def _returned_string_literals(module: object) -> set[str]:
+    """Every `return "literal"` in a module — the reason codes it can produce."""
+    source = Path(module.__file__).read_text(encoding="utf-8")  # type: ignore[attr-defined]
+    return {
+        node.value.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+
+
+def test_the_stage0_reasons_match_the_payload_classifier() -> None:
+    # `dlp:secret` sat in docs/audit-schema.md for a release while the guard
+    # emitted `dlp:secret_leak`. Both block sites are now read off their own
+    # source, so a renamed code fails here instead of silencing an alert.
+    from corp_llm_gateway.payload import classifier
+
+    assert set(BLOCK_REASONS["stage0"]) == _returned_string_literals(classifier)
+
+
+def test_the_stage5_reasons_match_the_dlp_guard() -> None:
+    from corp_llm_gateway.sanitizer import dlp_guard
+
+    assert set(BLOCK_REASONS["stage5"]) == _returned_string_literals(dlp_guard)
+
+
+def test_every_enumerated_block_reason_is_documented_in_the_audit_schema() -> None:
+    # docs/audit-schema.md is where the audit-side reader looks up a reason code.
+    schema = (Path(gateway_package.__file__).parents[2] / "docs" / "audit-schema.md").read_text(
+        encoding="utf-8"
+    )
+    row = next(line for line in schema.splitlines() if line.startswith("| `block_reason` |"))
+    missing = [reason for reason in ALL_BLOCK_REASONS if f"`{reason}`" not in row]
+
+    assert not missing, missing
+
+
 def test_every_recorded_block_reason_literal_is_enumerated() -> None:
     # A new `record_block("...")` anywhere in src has to appear in the
     # enumeration, or an alert written from it silently never fires.

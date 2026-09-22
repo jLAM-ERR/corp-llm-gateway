@@ -164,6 +164,7 @@ _REFUSAL_SCRIPT = f"""
     print("{SENTINEL}" + json.dumps({{
         "exit_code": code,
         "proxy_imported": "litellm.proxy.proxy_server" in sys.modules,
+        "litellm_imported": "litellm" in sys.modules,
     }}))
 """
 
@@ -173,6 +174,15 @@ def test_a_missing_config_exits_78_before_litellms_app_is_imported(tmp_path: Pat
 
     assert result["exit_code"] == 78
     assert result["proxy_imported"] is False
+
+
+def test_step_1_refuses_before_litellm_itself_is_imported(tmp_path: Path) -> None:
+    # Not just the app: importing `litellm` at all fetches the model cost map and
+    # installs its logging. Step 3 is where that belongs, so nothing the boot
+    # window needs — the JSON formatter included — may pull it in earlier.
+    result = _run(_REFUSAL_SCRIPT, tmp_path / "absent.yaml")
+
+    assert result["litellm_imported"] is False
 
 
 def test_a_config_that_is_not_yaml_exits_78(tmp_path: Path) -> None:
@@ -443,12 +453,16 @@ def test_a_boot_line_is_written_once_not_twice(json_boot: dict) -> None:
 def test_the_boot_lines_are_json_when_the_config_asks_for_json_logs(
     json_boot: dict, needle: str
 ) -> None:
-    # Vector parses this stdout. The step-1 line predates litellm's handler, so
-    # it is the boot handler's own formatter that has to be JSON.
+    # Vector parses this stdout. The step-1 line predates litellm's handler AND
+    # litellm's import, so it is the gateway's own boot formatter that has to
+    # write it — in litellm's record shape, which is what this pins.
     carrying = _lines_carrying(json_boot["stdout"], needle)
 
     assert len(carrying) == 1, carrying
-    assert json.loads(carrying[0])["message"].startswith(needle)
+    record = json.loads(carrying[0])
+    assert record["message"].startswith(needle)
+    assert {"message", "level", "timestamp"} <= set(record)
+    assert record["level"] == "INFO"
 
 
 def test_the_boot_handler_is_handed_back_in_json_mode(json_boot: dict) -> None:

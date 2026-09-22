@@ -57,8 +57,10 @@ pre-scan sees exactly what will be sanitized.
 ### Refused at the route gate (never reaches a provider)
 
 Coverage above describes what the guardrail rewrites on the routes it runs on.
-Three litellm handlers never call `pre_call_hook` at all, and a fourth class
-reaches it but is not rewritten because the hook reads only `messages` / `input`.
+**Nine** litellm handlers that take user text never call `pre_call_hook` at all —
+the three confirmed bypasses (both token counters and the Responses WebSocket)
+plus the six utility routes found in review — and a further class reaches the
+hook but is not rewritten, because the hook reads only `messages` / `input`.
 Since the route gate (§14) all of them are refused before litellm's router sees
 the request — default-deny, so a route litellm adds in a future release is
 refused too until it is classified.
@@ -68,10 +70,10 @@ refused too until it is classified.
 | `POST /v1/messages/count_tokens` | No hook: raw `messages`/`system`/`tools` went to Anthropic's CountTokens API unsanitized, unaudited. Claude Code calls it for its context display | `route_gate_listed` |
 | `POST /v1/responses/input_tokens` | No hook: raw Responses `input` went to the provider's token counter | `route_gate_listed` |
 | `WEBSOCKET /v1/responses`, `/v1/realtime`, `/openai/v1/realtime` | The handshake reaches the hook with no content and every `response.create` frame after it never does. Refused at the handshake, before connect | `route_gate_websocket` |
-| `POST /utils/token_counter?call_endpoint=true` | Reads like an admin utility; `call_endpoint` is a query parameter, and with it the raw `messages`/`prompt` go to the provider's counting API | `route_gate_listed` |
+| `POST /utils/token_counter` | Refused on every call, whatever the query string: the gate classifies `(method, path)` only. `call_endpoint` is a query **parameter**, so `?call_endpoint=true` sends the raw `messages`/`prompt` to the provider's counting API from a path that reads like an admin utility | `route_gate_listed` |
 | `POST /queue/chat/completions`, `/mcp-rest/tools/call`, `/search/{tool}`, `/apply_guardrail`, `/health/test_connection` | Take user text and reach a provider without the hook | `route_gate_listed` |
 | `POST /v1/completions` | Reaches the hook, but the hook never reads `prompt`, so nothing is rewritten | `route_gate_listed` |
-| `/v1/embeddings`, `/v1/moderations`, `/v1/audio/speech`, the provider-native passthrough trees (`/anthropic/…`, `/openai/…`, `/{provider}/…`) and the rest of `_NON_CHAT_INPUT_CALL_TYPES` (`litellm_hook.py:2089`) | Reach the hook as the documented no-rewrite set: previously DLP-scanned only, now refused outright — a DLP scan blocks a *known* pattern, it does not sanitize | `route_gate_listed` |
+| `/v1/embeddings`, `/v1/moderations`, `/v1/audio/speech`, the provider-native passthrough trees (`/anthropic/…`, `/openai/…`, `/{provider}/…`) and the rest of `_NON_CHAT_INPUT_CALL_TYPES` (`litellm_hook.py:2099`) | Reach the hook as the documented no-rewrite set: previously DLP-scanned only, now refused outright — a DLP scan blocks a *known* pattern, it does not sanitize | `route_gate_listed` |
 | `POST /api/event_logging/batch` | Claude Code's telemetry batch. No hook, and it carries whatever the client chose to put in it | `route_gate_listed` |
 | Anything absent from the table, including litellm's mounted sub-apps (the admin **UI**, `/swagger`, `/docs`, `/openapi.json`) | Default-deny. `ast` cannot see inside a mounted ASGI app, so it gets no entry | `route_gate_unlisted` |
 
@@ -366,7 +368,7 @@ of truth** — do not add ad-hoc fail-open paths):
 | `profileUnavailable` (D4, when `profile_ids` set) | **fail-closed** (503 `E_PROFILE_UNAVAILABLE`) — a team's resolved profile bundle is missing or malformed; never fall through to un-profiled egress (invariant 6). Empty `profile_ids` → passthrough (no profile resolution, no 503) |
 | `providerBlocked` (D4) | **block** (403 `E_PROVIDER_BLOCKED`) — the merged `allowed_providers` policy rejects the upstream target; a clean policy denial before any content processing, no raw body |
 | `spanApplyFailed` | **fail-closed** (500 `E_SPAN_INVALID`) — `apply_spans` rejects a pre-selected replacement span that no longer matches the segment text (e.g. a stale Cache-A/allocator remap); `StaleSpanError` (`sanitizer/placeholder.py`) is mapped to an audit record + `gateway_failure{component="sanitize"}` rather than escaping as a generic, undocumented 500 |
-| `routeGate` | **default-deny, fail-closed.** Every request is classified by `(method, path)` before litellm's router sees it (`route_gate/table.py`, generated from litellm's own source). A route the table marks REFUSE is 403 `E_ROUTE_BLOCKED`; a route with no entry at all is 404, same error code; a websocket handshake is refused before connect; a percent-encoded or traversing path is 403 without ever being matched. The gate's OWN faults are failures, not refusals: a REWRITTEN route while the guardrail callback is not registered is 503 `E_ROUTE_GATE_UNARMED` and is never forwarded, and any exception in classification is 500 `E_ROUTE_GATE_ERROR` — both also record `gateway_failure{component="route_gate"}`. No off switch: the only widening is `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`, which can add PASSTHROUGH entries and nothing else. The process exits 70 at startup rather than serve with the callback absent |
+| `routeGate` | **default-deny, fail-closed.** Every request is classified by `(method, path)` before litellm's router sees it (`route_gate/table.py`, generated from litellm's own source). A route the table marks REFUSE is 403 `E_ROUTE_BLOCKED`; a route with no entry at all is 404, same error code; a websocket handshake is refused before connect; a path is 403 without ever being matched when its raw bytes carry `%2f`, `%00` or `%2e%2e` (any case) or any non-ASCII byte, or its decoded form carries `..`, `//` or NUL. The gate's OWN faults are failures, not refusals: a REWRITTEN route while the guardrail callback is not registered is 503 `E_ROUTE_GATE_UNARMED` and is never forwarded, and any exception in classification is 500 `E_ROUTE_GATE_ERROR` — both also record `gateway_failure{component="route_gate"}`. No off switch: the only widening is `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`, which can add PASSTHROUGH entries and nothing else. The process exits 70 at startup rather than serve with the callback absent |
 | `internalError` (F8) | **fail-closed** (500 `E_INTERNAL`) — an unexpected exception in `pre_call`/`post_call_unary`/`post_call_stream` (a DB error, a bug, an audit-sink outage) is never echoed to the client, the log, or the audit record: only the opaque error_code + `gateway_failure{component="internal"}`. The safety net that maps this is guarded against re-entrancy — a failure while recording the failure itself (e.g. the audit sink is also down) is caught and logged rather than replacing the client-visible 500. A request that already recorded a component-specific failure (e.g. `dlp`) is not double-counted as `internal` too |
 
 See plan §M4 for the full matrix (Redis transient retry, Cache A/C miss
@@ -509,12 +511,9 @@ by construction; if one appears to, that is an M1-14 regression.
 | (d) | ✅ **By design (not a gap)** — `thinking` / `redacted_thinking` are passed through UNMODIFIED: Anthropic signs thinking blocks and rejects modified ones on multi-turn replay, and the model only ever sees placeholders (no original reaches them). | **Resolved (by design)** |
 | (e) | **`_corp_gateway_request_id` reaches the outbound Anthropic body on `/v1/chat/completions`.** `pre_call` writes this correlation key to four places in `data`, one of them the top level, and litellm's chat-completions adapter carries unknown top-level keys into the request it sends. Observed with the subscription bridge **off** as well as on, so it is independent of that bridge. The value is a request id (litellm's call id or a generated UUID), never user content, so it is not an M1-14 leak. The primary `/v1/messages` route — the one Claude Code uses — is unaffected. Not fixed opportunistically because the key is the audit-attribution fallback chain (`_REQUEST_ID_LOOKUP_PATHS`), which has its own regression history. | **Low** — correlation id only; affects the chat-completions route's acceptance upstream, not confidentiality |
 | (f) | **F9 only guards the corp-LLM oracle client, not litellm's own global TLS switch.** `corp_llm_verify()` (`config.py`) is reached only through `bootstrap.build_corp_llm_client()`, itself called only when `CORP_LLM_ORACLE_ENABLED=1`. But litellm reads the SAME `SSL_VERIFY` env var directly, via `get_ssl_verify()` — at higher priority than `SSL_CERT_FILE` — for every upstream provider (`anthropic/`, `openai/`, `hosted_vllm/`), with no `CORP_ENV=prod` guard on that read. `SSL_VERIFY=false` therefore disables certificate verification stack-wide on any deployment fronted by litellm with the oracle off (the default posture — see `compose/docker-compose.yml`). Widening F9 to cover litellm's read is a `src` follow-up; `compose/` mitigates today by not exposing `SSL_VERIFY` as an operator-set `.env` key and hardcoding it `true`. | **Medium** — silent TLS-verification bypass for any deployment that sets `SSL_VERIFY=false` outside the documented `.env` surface |
-
 | (g) | **A payment card buried between stray digits on both sides is not detected.** `BANK_CARD` scans inside a glued digit run, but only for a PAN that reaches at least one end of the run (`_CARD_STRAY_MARGIN = 0`, `detectors/regex_checksum.py`). A PAN with junk digits on BOTH sides — `123` + PAN + `123` — is missed, and so is any deliberately padded one. The threat model for this detector is **accidental paste** (a developer drops a card into a prompt), not a determined insider: every realistic paste shape is still caught — a bare PAN, a PAN with a CVV or amount glued to either end, a grouped PAN with a glued tail, and a PAN glued to letters. Closing the gap needs unbounded-depth scanning, measured at **65.8% false positives on random 32-digit runs** (79.3% at 40) and climbing with run length, while a finite margin closes nothing — 7 junk digits in front escape at margin 6 exactly as at 0. Margin 6 cost 2-3x the false positives of 0 on ordinary long digit runs (19-digit nanosecond timestamps 27.9% → 18.4%; 20-digit 24.1% → 10.4%; 23-digit 34.1% → 11.9%) and bought no coverage against a padder, so it was dropped. Anyone deliberately obfuscating a card would equally defeat a regex with base64 or unusual spacing, so chasing depth in `regex_checksum` is unbounded work for no real adversary gain. The layers that can catch a card in prose context are **corp NER** (Workstream B, in progress) and the **Stage 5 DLP egress guard**. Pinned by `test_card_buried_between_stray_digits_is_a_known_limitation`. | **Low** — accepted; accidental paste is covered, deliberate obfuscation is out of this detector's scope |
-
 | (h) | ✅ **FIXED** — **Helm deploys sent the client's `Content-Length` upstream with a longer, sanitized body.** `CORP_LLM_STRIP_INBOUND_HEADERS` was absent from the chart and defaulted to `0`, so the guardrail's `data["headers"]` bucket carried the inbound wire headers into litellm's upstream call; the provider then read the request truncated at the client's length (wire-captured on `/v1/messages` and `/v1/chat/completions` — a `"stream": true` cut off that way came back non-streamed). Every request whose sanitized body grew was corrupted. The flag now defaults **on** (`bootstrap.build_guardrail`) and the chart sets it explicitly. The dropped set (`_WIRE_HEADERS_TO_DROP`) is hop-by-hop / wire-level only and never includes `authorization` — BYOK passthrough (invariant 3) is unaffected, and `X-Corp-Auth` was already stripped unconditionally one step earlier (invariant 4). | **Resolved** |
-
-| (i) | **Pre-flight token counting is unavailable — accepted, not a gap to close here.** `POST /v1/messages/count_tokens`, `POST /v1/responses/input_tokens` and `POST /utils/token_counter?call_endpoint=true` are refused at the route gate (§14), so a client cannot ask the gateway what a prompt will cost before sending it. Reasons: litellm's upstream counter cannot carry the per-request credential (it uses the deployment key and the hard-coded public URL) and its local counter uses an OpenAI/Claude-2 vocabulary that undercounts current Claude models by 15-35 %. `usage.input_tokens` on every real turn is an exact, post-sanitization count, and Claude Code falls back to its own estimate for the context indicator. A gateway-side adapter that runs the pre-call pipeline and then calls the provider's counter with the request's own credential is on the backlog. | **Accepted** — no confidentiality impact; a client-side estimate replaces an exact pre-flight count |
+| (i) | **Pre-flight token counting is unavailable — accepted, not a gap to close here.** `POST /v1/messages/count_tokens`, `POST /v1/responses/input_tokens` and `POST /utils/token_counter` (refused whatever the query string — `?call_endpoint=true` is the shape that leaks, but the gate classifies `(method, path)` only) are refused at the route gate (§14), so a client cannot ask the gateway what a prompt will cost before sending it. Reasons: litellm's upstream counter cannot carry the per-request credential (it uses the deployment key and the hard-coded public URL) and its local counter uses an OpenAI/Claude-2 vocabulary that undercounts current Claude models by 15-35 %. `usage.input_tokens` on every real turn is an exact, post-sanitization count, and Claude Code falls back to its own estimate for the context indicator. A gateway-side adapter that runs the pre-call pipeline and then calls the provider's counter with the request's own credential is on the backlog. | **Accepted** — no confidentiality impact; a client-side estimate replaces an exact pre-flight count |
 
 **(a), (c) and (h) are fixed; (d) is correct by design; (g) and (i) are accepted
 with no fix planned.** The remaining open items are **(b)** — wiring the SIEM sink (gated on
@@ -779,11 +778,12 @@ A rollout that needs both has to wait for the header-layout decision.
 ## 14. The route gate
 
 `CorpLlmGuardrail` is a litellm **callback**, and litellm calls it only from the
-handlers that go through its shared request processor. Three handlers in the
-pinned litellm (1.101.0) do not, and reached a provider with **no `X-Corp-Auth`
-check, no sanitization, no Stage-5 DLP scan and no audit record**; a fourth class
-reached the hook but was never rewritten, because the hook reads only `messages`
-and `input`. §2 lists all of them. The route gate closes that class of hole for
+handlers that go through its shared request processor. **Nine** handlers in the
+pinned litellm (1.101.0) do not — the three confirmed bypasses plus six utility
+routes — and reached a provider with **no `X-Corp-Auth` check, no sanitization,
+no Stage-5 DLP scan and no audit record**; a further class reached the hook but
+was never rewritten, because the hook reads only `messages` and `input`. §2 lists
+all of them. The route gate closes that class of hole for
 good: whatever litellm's routers do, a request now has to be classified before
 one of them can answer it.
 
@@ -821,7 +821,7 @@ that justification against the `ast`: a handler whose body calls
 | `route_gate_listed` | 403 | `E_ROUTE_BLOCKED` | the table refuses this `(method, path)` |
 | `route_gate_unlisted` | 404 | `E_ROUTE_BLOCKED` | no table entry — default-deny |
 | `route_gate_websocket` | 403 | `E_ROUTE_BLOCKED` | a websocket scope or an `Upgrade: websocket` header, on any path |
-| `route_gate_malformed` | 403 | `E_ROUTE_BLOCKED` | a percent-encoded, NUL-bearing or traversing path; never matched against the table at all |
+| `route_gate_malformed` | 403 | `E_ROUTE_BLOCKED` | raw path carrying `%2f`, `%00`, `%2e%2e` (any case) or a non-ASCII byte, or decoded path carrying `..`, `//` or NUL (`route_gate/classify.py`); never matched against the table at all |
 | `route_gate_unarmed` | 503 | `E_ROUTE_GATE_UNARMED` | a REWRITTEN route while the guardrail callback is not registered; never forwarded |
 | `route_gate_error` | 500 | `E_ROUTE_GATE_ERROR` | classification raised; never forwarded |
 
@@ -850,9 +850,10 @@ rewritten route rather than forward it.
 ### Consequences to know
 
 - **Pre-flight token counting is gone.** The two token-count routes and
-  `/utils/token_counter?call_endpoint=true` are refused. `usage.input_tokens` on
-  every real turn is the exact post-sanitization count; §11 (i) records the
-  trade and the backlog item.
+  `POST /utils/token_counter` (unconditionally — the gate reads `(method, path)`,
+  never the query string) are refused. `usage.input_tokens` on every real turn is
+  the exact post-sanitization count; §11 (i) records the trade and the backlog
+  item.
 - **`POST /api/event_logging/batch` answers 403.** That is Claude Code's
   telemetry batch: no hook, and it carries whatever the client chose to put in
   it. Client-side telemetry is therefore dropped at the gateway — accepted, since

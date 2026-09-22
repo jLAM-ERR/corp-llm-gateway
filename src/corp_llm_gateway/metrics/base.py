@@ -54,7 +54,8 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
 # to its component (``litellm_hook._FAILURE_COMPONENT``, ``other`` for anything
 # unmapped); ``route_gate`` is the one recorded outside that map — the gate
 # refuses a route it should have forwarded (the guardrail callback never
-# registered) or cannot classify one at all. Pinned against both sources in
+# registered), cannot classify one at all, or loses the refusal's audit record
+# (``route_gate/middleware.py:228-233``). Pinned against both sources in
 # tests/metrics/test_metrics.py.
 FAILURE_COMPONENTS: tuple[str, ...] = (
     "auth",

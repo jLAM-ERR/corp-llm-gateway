@@ -12,9 +12,9 @@ entrypoint's Prisma schema sequence concurrently against the same database, and
 would build its own Prometheus registry — ``/metrics`` would then report
 whichever worker happened to answer the scrape. Scale out with replicas.
 
-The app is passed as an import string, and `json_logs` is read from the YAML
-rather than from `litellm.json_logs`, because uvicorn configures logging before
-it imports the app.
+The app is passed as an import string, and `json_logs` is read from the YAML (or
+litellm's own `JSON_LOGS` env var) rather than from `litellm.json_logs`, because
+uvicorn configures logging before it imports the app.
 """
 
 from __future__ import annotations

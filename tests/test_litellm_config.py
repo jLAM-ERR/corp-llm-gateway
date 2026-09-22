@@ -186,6 +186,24 @@ def test_json_logs_is_read_from_the_file(valid: Path, tmp_path: Path) -> None:
     assert litellm_config.json_logs(tmp_path / "absent.yaml") is False
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [("true", True), ("TRUE", True), ("false", False), ("1", False), ("", False)],
+)
+def test_litellms_own_json_logs_env_var_is_honoured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+) -> None:
+    # litellm reads JSON_LOGS at import with this exact rule
+    # (`litellm/_logging.py:374`) and goes JSON whatever the YAML says, so the
+    # boot handler and uvicorn's log config have to agree with it or one stdout
+    # carries two record shapes.
+    without = tmp_path / "plain.yaml"
+    without.write_text("litellm_settings:\n  callbacks: []\n")
+    monkeypatch.setenv("JSON_LOGS", value)
+
+    assert litellm_config.json_logs(without) is expected
+
+
 def test_general_settings_are_read_the_way_the_cli_reads_them(valid: Path, tmp_path: Path) -> None:
     assert litellm_config.general_settings(valid) == {"disable_prisma_schema_update": True}
     assert litellm_config.general_settings(tmp_path / "absent.yaml") == {}

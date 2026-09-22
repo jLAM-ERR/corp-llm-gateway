@@ -60,19 +60,26 @@ Deliberately NOT carried over:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from corp_llm_gateway import config, litellm_cli, litellm_config
 from corp_llm_gateway.audit import AuditLogger, get_sink
-from corp_llm_gateway.bootstrap import build_health_router, gateway_version
 from corp_llm_gateway.metrics import get_exporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware
+
+# `corp_llm_gateway.bootstrap` is NOT imported here: it reaches
+# `litellm_hook`, which imports litellm itself (the guardrail has to subclass
+# `CustomLogger`), and importing litellm fetches the model cost map. Step 3 is
+# where that belongs — after the config has been accepted. It is imported at
+# step 4 instead.
 
 log = logging.getLogger(__name__)
 
@@ -86,17 +93,34 @@ _MOUNT_HEALTHZ = "/healthz"
 _MOUNT_METRICS = "/metrics"
 
 
-def _boot_formatter(json_logs: bool) -> logging.Formatter:
-    """litellm's own JSON formatter when the config asks for JSON logs.
+class _BootJsonFormatter(logging.Formatter):
+    """litellm's JSON record shape, written without importing litellm.
 
-    Vector parses this container's stdout, and the boot lines go to that same
-    stream: a plain line here would be an unparseable record inside a JSON one.
+    Vector parses this container's stdout and the boot lines go to that same
+    stream, so a plain line here would be an unparseable record inside JSON
+    ones. It cannot be ``litellm._logging.JsonFormatter``: this runs before step
+    1, and importing litellm there would break the step order this module's
+    docstring defines — the import at step 3 is what fetches the cost map, after
+    the config has been accepted. The keys are the ones litellm's formatter
+    writes first (``litellm/_logging.py:459-502``).
     """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps(
+            {
+                "message": record.getMessage(),
+                "level": record.levelname,
+                "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+                "component": record.name,
+                "logger": f"{record.filename}:{record.lineno}",
+            }
+        )
+
+
+def _boot_formatter(json_logs: bool) -> logging.Formatter:
     if not json_logs:
         return logging.Formatter("%(levelname)s %(name)s %(message)s")
-    from litellm._logging import JsonFormatter
-
-    return JsonFormatter()
+    return _BootJsonFormatter()
 
 
 def _open_the_boot_log(*, json_logs: bool) -> logging.Handler:
@@ -118,9 +142,10 @@ def _open_the_boot_log(*, json_logs: bool) -> logging.Handler:
 def _hand_over_the_boot_log(handler: logging.Handler, *, json_logs: bool) -> None:
     """End the boot window: give the package logger to litellm, or keep it.
 
-    JSON mode — ``_turn_on_json`` has put a JSON handler on the ROOT logger and
-    this package still propagates to it, so the boot handler has to go or every
-    line is written twice, once plain and once JSON.
+    JSON mode (``litellm_settings.json_logs`` in the YAML, or litellm's own
+    ``JSON_LOGS=true``) — ``_turn_on_json`` has put a JSON handler on the ROOT
+    logger and this package still propagates to it, so the boot handler has to
+    go or every line is written twice, once plain and once JSON.
 
     Plain mode — litellm installs no root handler at all, so the package keeps
     this handler deliberately and stops propagating: without it every line from
@@ -235,6 +260,8 @@ save_worker_config(**_worker_config)
 log.info("litellm WORKER_CONFIG set from %s", CONFIG_PATH)
 
 # ── 4. gateway-owned routes + the lifespan wrapper ───────────────────────────
+
+from corp_llm_gateway.bootstrap import build_health_router, gateway_version  # noqa: E402
 
 _exporter = get_exporter()
 

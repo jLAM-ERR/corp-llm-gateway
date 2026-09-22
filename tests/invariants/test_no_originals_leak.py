@@ -2381,55 +2381,139 @@ async def _drive(
     return status, body.decode()
 
 
-@pytest.mark.parametrize(
-    "method,path,reason",
-    [
-        ("POST", "/v1/messages/count_tokens", "route_gate_listed"),
-        ("POST", "/v1/some/future/route", "route_gate_unlisted"),
-        ("POST", "/v1/messages", "route_gate_unarmed"),
-        ("GET", "/v1/../key/generate", "route_gate_malformed"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_a_refused_route_leaks_no_original_on_any_of_the_six_surfaces(
-    caplog: pytest.LogCaptureFixture, method: str, path: str, reason: str
+async def _drive_handshake(
+    gate: object, path: str, *, headers: list[tuple[bytes, bytes]]
+) -> tuple[int, str]:
+    """A websocket handshake, as uvicorn delivers it: a `websocket` scope whose
+    first event is `websocket.connect`. ASGI forbids sending before that event,
+    and reading anything after it would be reading the caller's frames."""
+    sent: list[dict] = []
+    read = 0
+
+    async def receive() -> dict:
+        nonlocal read
+        read += 1
+        assert read == 1, "the gate read past the connect event of a refused handshake"
+        return {"type": "websocket.connect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await gate(  # type: ignore[operator]
+        {
+            "type": "websocket",
+            "path": path,
+            "raw_path": path.encode(),
+            "headers": headers,
+            "scheme": "ws",
+            # uvicorn advertises the denial-response extension, so the refusal
+            # is a 403 with a body rather than a bare close.
+            "extensions": {"websocket.http.response": {}},
+        },
+        receive,
+        send,
+    )
+    assert read == 1, "the gate never received the connect event"
+    status = next(m["status"] for m in sent if m["type"] == "websocket.http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "websocket.http.response.body")
+    return status, body.decode()
+
+
+_GATE_HEADERS: list[tuple[bytes, bytes]] = [
+    (b"x-corp-auth", _CORP_TOKEN.encode()),
+    (b"authorization", f"Bearer {ORIGINAL_CORPUS[5]}".encode()),
+    (b"user-agent", ORIGINAL_CORPUS[3].encode()),
+    (b"x-probe", ORIGINAL_CORPUS[0].encode()),
+]
+
+
+def _assert_gate_surfaces_are_clean(
+    *, body: str, log_text: str, sink: ListSink, metrics: _RecordingMetrics, reason: str
 ) -> None:
-    """M1-14, all six, for the gate: (i) audit record, (ii) the refusal body,
-    (iii) no trace at all, (iv) the block/failure metric labels, (v) nothing is
-    forwarded, (vi) the log lines. The originals ride in the headers, which is
-    the only caller content the gate is handed."""
-    gate, sink, metrics = _gated()
-    headers = [
-        (b"x-corp-auth", _CORP_TOKEN.encode()),
-        (b"authorization", f"Bearer {ORIGINAL_CORPUS[5]}".encode()),
-        (b"user-agent", ORIGINAL_CORPUS[3].encode()),
-        (b"x-probe", ORIGINAL_CORPUS[0].encode()),
-    ]
-
-    with caplog.at_level(logging.DEBUG):
-        status, body = await _drive(gate, method, path, headers=headers)
-
-    assert status in (403, 404, 503)
+    """M1-14, all six, for one gate refusal: (i) audit record, (ii) the refusal
+    body, (iii) no trace at all, (iv) the metric labels, (v) nothing forwarded
+    (the stub app raises), (vi) the log lines."""
     assert json.loads(body)["error"]["reason"] == reason
-
-    # (ii) the refusal body
     assert _haystack_contains_any_original(body) is None, "original leaked into the refusal body"
     assert _CORP_TOKEN not in body
-    # (vi) pod stdout
-    assert _haystack_contains_any_original(caplog.text) is None, "original leaked into a log line"
-    assert _CORP_TOKEN not in caplog.text
-    # (i) the audit record
+    assert _haystack_contains_any_original(log_text) is None, "original leaked into a log line"
+    assert _CORP_TOKEN not in log_text
     assert len(sink.records) == 1
     serialized = json.dumps(sink.records[0])
     assert _haystack_contains_any_original(serialized) is None, "original leaked into the audit"
     assert _CORP_TOKEN not in serialized
     assert_no_never_fields(sink.records[0])
     assert sink.records[0]["block_reason"] == reason
-    # (iv) metric labels
     labels = json.dumps(metrics.blocks + metrics.failures)
     assert _haystack_contains_any_original(labels) is None, "original leaked into a metric label"
     assert metrics.blocks == [reason]
+
+
+@pytest.mark.parametrize(
+    "method,path,reason,status,extra",
+    [
+        ("POST", "/v1/messages/count_tokens", "route_gate_listed", 403, []),
+        ("POST", "/v1/some/future/route", "route_gate_unlisted", 404, []),
+        ("POST", "/v1/messages", "route_gate_unarmed", 503, []),
+        ("GET", "/v1/../key/generate", "route_gate_malformed", 403, []),
+        # An `http` scope carrying the upgrade header: uvicorn delivers a real
+        # handshake as a `websocket` scope (the test below), so this is the
+        # defence-in-depth branch for a server that does not.
+        (
+            "GET",
+            "/v1/responses",
+            "route_gate_websocket",
+            403,
+            [(b"upgrade", b"websocket")],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_refused_route_leaks_no_original_on_any_of_the_six_surfaces(
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    path: str,
+    reason: str,
+    status: int,
+    extra: list[tuple[bytes, bytes]],
+) -> None:
+    """The originals ride in the headers, which is the only caller content the
+    gate is handed: a refusal never reads the body (`_drive` asserts that)."""
+    gate, sink, metrics = _gated()
+
+    with caplog.at_level(logging.DEBUG):
+        got, body = await _drive(gate, method, path, headers=[*_GATE_HEADERS, *extra])
+
+    assert got == status
+    _assert_gate_surfaces_are_clean(
+        body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason=reason
+    )
     # (v) nothing forwarded — `_never_called` would have raised.
+
+
+@pytest.mark.asyncio
+async def test_a_refused_handshake_leaks_no_original_on_any_of_the_six_surfaces(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The websocket scope is its own surface: refused before connect, with the
+    caller's originals in the handshake headers."""
+    gate, sink, metrics = _gated()
+
+    with caplog.at_level(logging.DEBUG):
+        status, body = await _drive_handshake(
+            gate,
+            "/v1/responses",
+            headers=[*_GATE_HEADERS, (b"upgrade", b"websocket"), (b"connection", b"Upgrade")],
+        )
+
+    assert status == 403
+    _assert_gate_surfaces_are_clean(
+        body=body,
+        log_text=caplog.text,
+        sink=sink,
+        metrics=metrics,
+        reason="route_gate_websocket",
+    )
 
 
 @pytest.mark.asyncio

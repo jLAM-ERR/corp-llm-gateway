@@ -240,16 +240,34 @@ _CONNECT_PROBE = "import socket; socket.create_connection(('1.1.1.1', 443), time
 _DNS_PROBE = "import socket; socket.getaddrinfo('api.anthropic.com', 443)"
 
 
+# What a blocked socket looks like from inside the container. A `docker exec`
+# that cannot run at all also exits non-zero (126/127), so the failure has to be
+# provably the network's, not the harness's.
+_NETWORK_ERRORS = ("OSError", "gaierror", "timed out", "Network is unreachable")
+
+
 @pytest.mark.parametrize("probe", [_CONNECT_PROBE, _DNS_PROBE], ids=["connect", "dns"])
 def test_the_gateway_container_cannot_reach_the_internet(mode: Mode, probe: str) -> None:
     # Everything else in this file reads "the stub saw nothing" as "nothing
     # leaked". That only holds while the gateway's only network is `--internal`:
     # if docker ever attached a default bridge as well, a refusal that leaked
     # would reach the real provider and every assertion here would still pass.
+    control = docker(
+        "exec", mode.stack.gateway, "/app/.venv/bin/python", "-c", "print(1)", timeout=60
+    )
+    assert control.returncode == 0, (
+        f"`docker exec` itself cannot run in this container, so the probe below "
+        f"proves nothing\n{control.stdout}\n{control.stderr}"
+    )
+    assert control.stdout.strip() == "1"
+
     result = docker("exec", mode.stack.gateway, "/app/.venv/bin/python", "-c", probe, timeout=60)
 
     assert result.returncode != 0, (
         f"the gateway container reached off its network: {probe}\n{result.stdout}"
+    )
+    assert any(marker in result.stderr for marker in _NETWORK_ERRORS), (
+        f"the probe failed for a reason other than the blocked network: {probe}\n{result.stderr}"
     )
 
 

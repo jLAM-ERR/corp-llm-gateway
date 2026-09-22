@@ -24,6 +24,7 @@ Two blocks are refused outright:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -139,11 +140,20 @@ def general_settings(path: Path) -> dict[str, Any]:
 
 
 def json_logs(path: Path) -> bool:
-    """``litellm_settings.json_logs`` — read before the app is imported.
+    """``litellm_settings.json_logs``, or litellm's ``JSON_LOGS`` env var.
 
-    ``serve.py`` needs it to pick uvicorn's log config, and uvicorn configures
-    logging before it imports the app, so it cannot be read off ``litellm``.
+    ``serve.py`` needs it to pick uvicorn's log config and ``asgi.py`` to pick
+    the boot handler's formatter; both run before litellm is imported, so it
+    cannot be read off ``litellm.json_logs``.
+
+    The env var is litellm's own (``litellm/_logging.py:374``, strict ``"true"``
+    — read here, not through the gateway config chain, for the same reason
+    ``DATABASE_URL`` is): litellm's logging goes JSON at import whenever it is
+    set, whatever the YAML says, so reading only the YAML would put two record
+    shapes on one stdout that Vector parses.
     """
+    if (os.getenv("JSON_LOGS") or "").lower() == "true":
+        return True
     settings = _document(path).get("litellm_settings") or {}
     return isinstance(settings, dict) and settings.get("json_logs") is True
 
