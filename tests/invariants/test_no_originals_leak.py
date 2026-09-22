@@ -2326,3 +2326,135 @@ async def test_non_token_store_exception_origin_returns_opaque_500(
     serialized = json.dumps(sink.records[0])
     assert "team_rules" not in serialized, "backend DB detail leaked into audit record"
     assert _haystack_contains_any_original(serialized) is None, "original leaked into audit record"
+
+
+# (xviii) the route gate: a refusal happens BEFORE the hook, so none of the
+# surfaces above are produced by code that has ever seen the body. Pin that it
+# stays that way — the gate reads the scope, and a scope carries caller content
+# in its headers as surely as a body does. --------------------------------------
+
+
+def _gated(inner: object | None = None) -> tuple[object, ListSink, _RecordingMetrics]:
+    from corp_llm_gateway.route_gate import RouteGateMiddleware
+
+    async def _never_called(scope: object, receive: object, send: object) -> None:
+        raise AssertionError("the gate forwarded a request it had to refuse")
+
+    sink = ListSink()
+    metrics = _RecordingMetrics()
+    gate = RouteGateMiddleware(
+        inner or _never_called,
+        metrics=metrics,
+        audit_logger=AuditLogger(sink, gateway_version="0.0.1"),
+    )
+    return gate, sink, metrics
+
+
+async def _drive(
+    gate: object, method: str, path: str, *, headers: list[tuple[bytes, bytes]]
+) -> tuple[int, str]:
+    sent: list[dict] = []
+    read = 0
+
+    async def receive() -> dict:
+        nonlocal read
+        read += 1
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await gate(  # type: ignore[operator]
+        {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "raw_path": path.encode(),
+            "headers": headers,
+        },
+        receive,
+        send,
+    )
+    assert read == 0, "the gate read the request body of a refused request"
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return status, body.decode()
+
+
+@pytest.mark.parametrize(
+    "method,path,reason",
+    [
+        ("POST", "/v1/messages/count_tokens", "route_gate_listed"),
+        ("POST", "/v1/some/future/route", "route_gate_unlisted"),
+        ("POST", "/v1/messages", "route_gate_unarmed"),
+        ("GET", "/v1/../key/generate", "route_gate_malformed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_refused_route_leaks_no_original_on_any_of_the_six_surfaces(
+    caplog: pytest.LogCaptureFixture, method: str, path: str, reason: str
+) -> None:
+    """M1-14, all six, for the gate: (i) audit record, (ii) the refusal body,
+    (iii) no trace at all, (iv) the block/failure metric labels, (v) nothing is
+    forwarded, (vi) the log lines. The originals ride in the headers, which is
+    the only caller content the gate is handed."""
+    gate, sink, metrics = _gated()
+    headers = [
+        (b"x-corp-auth", _CORP_TOKEN.encode()),
+        (b"authorization", f"Bearer {ORIGINAL_CORPUS[5]}".encode()),
+        (b"user-agent", ORIGINAL_CORPUS[3].encode()),
+        (b"x-probe", ORIGINAL_CORPUS[0].encode()),
+    ]
+
+    with caplog.at_level(logging.DEBUG):
+        status, body = await _drive(gate, method, path, headers=headers)
+
+    assert status in (403, 404, 503)
+    assert json.loads(body)["error"]["reason"] == reason
+
+    # (ii) the refusal body
+    assert _haystack_contains_any_original(body) is None, "original leaked into the refusal body"
+    assert _CORP_TOKEN not in body
+    # (vi) pod stdout
+    assert _haystack_contains_any_original(caplog.text) is None, "original leaked into a log line"
+    assert _CORP_TOKEN not in caplog.text
+    # (i) the audit record
+    assert len(sink.records) == 1
+    serialized = json.dumps(sink.records[0])
+    assert _haystack_contains_any_original(serialized) is None, "original leaked into the audit"
+    assert _CORP_TOKEN not in serialized
+    assert_no_never_fields(sink.records[0])
+    assert sink.records[0]["block_reason"] == reason
+    # (iv) metric labels
+    labels = json.dumps(metrics.blocks + metrics.failures)
+    assert _haystack_contains_any_original(labels) is None, "original leaked into a metric label"
+    assert metrics.blocks == [reason]
+    # (v) nothing forwarded — `_never_called` would have raised.
+
+
+@pytest.mark.asyncio
+async def test_a_classifier_exception_leaks_neither_its_message_nor_a_trace(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-14 surface (iii): the gate's own failure path. An exception message can
+    quote the input it choked on, so the gate logs the type name and answers a
+    fixed body — never `str(exc)`, never a traceback."""
+    from corp_llm_gateway.route_gate import middleware as gate_module
+
+    def _explode(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(f"cannot classify {ORIGINAL_CORPUS[0]} / {ORIGINAL_CORPUS[5]}")
+
+    monkeypatch.setattr(gate_module, "classify", _explode)
+    gate, sink, metrics = _gated()
+
+    with caplog.at_level(logging.DEBUG):
+        status, body = await _drive(gate, "POST", "/v1/messages", headers=[])
+
+    assert status == 500
+    assert json.loads(body)["error"]["code"] == "E_ROUTE_GATE_ERROR"
+    assert _haystack_contains_any_original(body) is None, "exception text leaked into the body"
+    assert _haystack_contains_any_original(caplog.text) is None, "exception text leaked into a log"
+    assert "Traceback" not in caplog.text
+    assert _haystack_contains_any_original(json.dumps(sink.records)) is None
+    assert metrics.blocks == ["route_gate_error"]
+    assert metrics.failures == ["route_gate"]

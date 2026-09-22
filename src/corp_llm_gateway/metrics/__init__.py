@@ -16,7 +16,12 @@ import threading
 from collections.abc import Callable
 
 from corp_llm_gateway import config
-from corp_llm_gateway.metrics.base import MetricsDependencyError, MetricsExporter
+from corp_llm_gateway.metrics.base import (
+    BLOCK_REASONS,
+    FAILURE_COMPONENTS,
+    MetricsDependencyError,
+    MetricsExporter,
+)
 from corp_llm_gateway.metrics.noop import NoopExporter
 from corp_llm_gateway.metrics.prometheus import PrometheusExporter
 
@@ -83,6 +88,8 @@ def reset_exporter() -> None:
 
 
 __all__ = [
+    "BLOCK_REASONS",
+    "FAILURE_COMPONENTS",
     "MetricsDependencyError",
     "MetricsExporter",
     "NoopExporter",
