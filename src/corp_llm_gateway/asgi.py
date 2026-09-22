@@ -44,8 +44,8 @@ Deliberately NOT carried over:
   (``proxy/utils.py:7276``). This entrypoint's Prisma step reads ``DATABASE_URL``
   and ``DIRECT_URL`` only, so either of the other two would let litellm connect to
   a database whose schema was never set up. The YAML one is refused at step 1
-  (exit 78); the env composition is documented here and in
-  ``docs/ops/configuration.md`` — set ``DATABASE_URL`` instead;
+  (exit 78); the env composition is documented here — set ``DATABASE_URL``
+  instead;
 * the DB connection-URL rewriting (``proxy_cli.py:1241-1325`` — pool/timeout
   query params this deployment sets on its own DSN);
 * the ``--num_workers``/gunicorn/granian/hypercorn runners: each worker would run
@@ -86,7 +86,20 @@ _MOUNT_HEALTHZ = "/healthz"
 _MOUNT_METRICS = "/metrics"
 
 
-def _open_the_boot_log() -> logging.Handler:
+def _boot_formatter(json_logs: bool) -> logging.Formatter:
+    """litellm's own JSON formatter when the config asks for JSON logs.
+
+    Vector parses this container's stdout, and the boot lines go to that same
+    stream: a plain line here would be an unparseable record inside a JSON one.
+    """
+    if not json_logs:
+        return logging.Formatter("%(levelname)s %(name)s %(message)s")
+    from litellm._logging import JsonFormatter
+
+    return JsonFormatter()
+
+
+def _open_the_boot_log(*, json_logs: bool) -> logging.Handler:
     """Make the step lines below visible, at INFO, before litellm configures logging.
 
     uvicorn's log config names only its own loggers, and litellm installs the
@@ -97,18 +110,28 @@ def _open_the_boot_log() -> logging.Handler:
     package = logging.getLogger("corp_llm_gateway")
     package.setLevel(getattr(logging, level, logging.INFO))
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    handler.setFormatter(_boot_formatter(json_logs))
     package.addHandler(handler)
     return handler
 
 
-def _close_the_boot_log(handler: logging.Handler) -> None:
-    """Hand the package logger back to whatever litellm installed on the root."""
-    if logging.getLogger().handlers:
-        logging.getLogger("corp_llm_gateway").removeHandler(handler)
+def _hand_over_the_boot_log(handler: logging.Handler, *, json_logs: bool) -> None:
+    """End the boot window: give the package logger to litellm, or keep it.
 
+    JSON mode — ``_turn_on_json`` has put a JSON handler on the ROOT logger and
+    this package still propagates to it, so the boot handler has to go or every
+    line is written twice, once plain and once JSON.
 
-_boot_log = _open_the_boot_log()
+    Plain mode — litellm installs no root handler at all, so the package keeps
+    this handler deliberately and stops propagating: without it every line from
+    step 3 on (including "route gate armed") would be dropped, and with it plus
+    propagation a root handler installed later by anything else would double them.
+    """
+    package = logging.getLogger("corp_llm_gateway")
+    if json_logs:
+        package.removeHandler(handler)
+        return
+    package.propagate = False
 
 
 def _fail_config(problems: list[str]) -> None:
@@ -174,6 +197,11 @@ def _guardrail_registered() -> bool:
 # ── 1. litellm's config ──────────────────────────────────────────────────────
 
 CONFIG_PATH = litellm_config.config_path()
+# Read before the boot log opens: the formatter depends on it, and a file this
+# step is about to refuse still reads as "no JSON logs" rather than raising.
+JSON_LOGS = litellm_config.json_logs(CONFIG_PATH)
+_boot_log = _open_the_boot_log(json_logs=JSON_LOGS)
+
 _problems = litellm_config.problems(CONFIG_PATH, require_file=True)
 if _problems:
     _fail_config(_problems)
@@ -191,20 +219,20 @@ _worker_config = litellm_cli.option_values(litellm_cli.WORKER_CONFIG_KEYS) | {
 
 import litellm  # noqa: E402 - step order is the contract of this module
 
-if litellm_config.json_logs(CONFIG_PATH):
+if JSON_LOGS:
     # Before proxy_server is imported, as the CLI does it (proxy_cli.py:1158-1165
     # runs well ahead of the app import): the handlers that module installs at
     # import time otherwise keep the plain formatter. The lifespan's initialize()
     # sets the log LEVEL, never the JSON formatter.
     litellm.json_logs = True
     litellm._turn_on_json()
+_hand_over_the_boot_log(_boot_log, json_logs=JSON_LOGS)
 
 from litellm.proxy.proxy_server import app as _app  # noqa: E402
 from litellm.proxy.proxy_server import proxy_startup_event, save_worker_config  # noqa: E402
 
 save_worker_config(**_worker_config)
 log.info("litellm WORKER_CONFIG set from %s", CONFIG_PATH)
-_close_the_boot_log(_boot_log)
 
 # ── 4. gateway-owned routes + the lifespan wrapper ───────────────────────────
 

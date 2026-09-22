@@ -45,7 +45,7 @@ jobs:
       # Unconditional: tests/helm render tests are skipif-helm — without this step
       # they'd silently skip instead of gating the chart.
       - uses: azure/setup-helm@v4
-      - run: pip install -e ".[dev,ner,postgres,oidc,asgi]"
+      - run: pip install -e ".[dev,ner,postgres,oidc,asgi,metrics]"
       # Model wheel version mirrors Dockerfile.gateway's EN_MODEL_VERSION default
       # and build-image.yml's default (3.8.0) — keep all three in sync.
       - run: pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl

@@ -41,7 +41,7 @@ def _port() -> int:
     # The same check `gateway-admin config check` runs, so a port the CLI would
     # have rejected fails here with the same message and exit code instead of a
     # ValueError traceback out of `int()`.
-    settings._check_serve_port({PORT_KEY: raw}, problems)
+    settings.check_serve_port({PORT_KEY: raw}, problems)
     if problems:
         for problem in problems:
             log.error("%s", problem)

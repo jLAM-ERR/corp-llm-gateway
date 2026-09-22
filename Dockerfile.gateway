@@ -4,8 +4,11 @@
 #
 # Base must ship Python >=3.12 (the wheel is `requires-python >=3.12`).
 # --build-arg LITELLM_VERSION=vX.Y.Z still selects the base, but the install below
-# now FAILS unless the litellm it ends up with equals that tag: pyproject pins
-# `litellm==1.101.0` exactly, so a different base would be silently reinstalled
+# now FAILS unless the litellm it ends up with equals that tag. Only the plain
+# `vX.Y.Z` spelling is accepted: the check strips one leading `v` and compares the
+# rest to the installed version, so `main-vX.Y.Z-stable`, `main-stable` or
+# `latest` fail the build instead of pinning to whatever they resolve to.
+# pyproject pins `litellm==1.101.0` exactly, so a different base would be reinstalled
 # over, and the route gate is generated against ONE litellm's route source. Bump
 # the base and the wheel pin together (tests/test_litellm_pin.py lists all sites).
 #

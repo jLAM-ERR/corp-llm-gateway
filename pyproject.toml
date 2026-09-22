@@ -36,7 +36,7 @@ dev = [
     "PyYAML>=6.0",
     "ruff==0.15.14",
     "pre-commit>=3.7",
-    "corp-llm-gateway[asgi]",
+    "corp-llm-gateway[asgi,metrics]",
 ]
 # What `python -m corp_llm_gateway.serve` needs to serve litellm's ASGI app.
 # `litellm[proxy]` is the whole set: `litellm.proxy.proxy_server` imports

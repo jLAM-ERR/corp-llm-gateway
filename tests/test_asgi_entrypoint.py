@@ -120,6 +120,9 @@ def _run(
             "CORP_LLM_ORACLE_ENABLED": "0",
             "CORP_LLM_LOCAL_FIRST": "1",
             "CORP_AUDIT_SINK": "stdout",
+            # litellm downloads its model cost map from raw.githubusercontent.com
+            # at import unless this is set; these boots must not need the network.
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
         }
     )
     child_env.update(env or {})
@@ -138,6 +141,7 @@ def _run(
     )
     payload = json.loads(lines[-1][len(SENTINEL) :])
     payload["returncode"] = completed.returncode
+    payload["stdout"] = completed.stdout
     return payload
 
 
@@ -398,6 +402,75 @@ def test_the_gateway_owned_routes_are_served_ahead_of_litellm(imported: dict) ->
 
 def test_the_gate_and_the_guardrail_share_one_exporter(imported: dict) -> None:
     assert imported["shared_exporter"] is True
+
+
+# ── the boot window's own log handler ────────────────────────────────────────
+
+PLAIN_LOG_CONFIG = VALID_CONFIG.replace("  json_logs: true\n", "")
+
+_BOOT_LOG_SCRIPT = f"""
+    import json, logging
+    import corp_llm_gateway.asgi  # noqa: F401
+
+    package = logging.getLogger("corp_llm_gateway")
+    print("{SENTINEL}" + json.dumps({{
+        "package_handlers": len(package.handlers),
+        "propagate": package.propagate,
+        "root_handlers": len(logging.getLogger().handlers),
+    }}))
+"""
+
+STEP_1_LINE = "litellm config accepted:"
+STEP_3_LINE = "litellm WORKER_CONFIG set from"
+
+
+def _lines_carrying(stdout: str, needle: str) -> list[str]:
+    return [line for line in stdout.splitlines() if needle in line]
+
+
+@pytest.fixture(scope="module")
+def json_boot(valid_config: Path) -> dict:
+    return _run(_BOOT_LOG_SCRIPT, valid_config)
+
+
+def test_a_boot_line_is_written_once_not_twice(json_boot: dict) -> None:
+    # The package logger propagates, and `_turn_on_json` puts a handler on the
+    # root: leaving the boot handler in place writes every later line twice.
+    assert len(_lines_carrying(json_boot["stdout"], STEP_3_LINE)) == 1
+
+
+@pytest.mark.parametrize("needle", [STEP_1_LINE, STEP_3_LINE])
+def test_the_boot_lines_are_json_when_the_config_asks_for_json_logs(
+    json_boot: dict, needle: str
+) -> None:
+    # Vector parses this stdout. The step-1 line predates litellm's handler, so
+    # it is the boot handler's own formatter that has to be JSON.
+    carrying = _lines_carrying(json_boot["stdout"], needle)
+
+    assert len(carrying) == 1, carrying
+    assert json.loads(carrying[0])["message"].startswith(needle)
+
+
+def test_the_boot_handler_is_handed_back_in_json_mode(json_boot: dict) -> None:
+    assert json_boot["package_handlers"] == 0
+    assert json_boot["root_handlers"] >= 1
+    assert json_boot["propagate"] is True
+
+
+def test_plain_mode_keeps_one_handler_and_stops_propagating(tmp_path: Path) -> None:
+    # litellm installs no root handler without `json_logs`, so the package keeps
+    # its own — and stops propagating, so a root handler added later by anything
+    # else cannot double the lines.
+    path = tmp_path / "config.yaml"
+    path.write_text(PLAIN_LOG_CONFIG)
+
+    result = _run(_BOOT_LOG_SCRIPT, path)
+
+    carrying = _lines_carrying(result["stdout"], STEP_3_LINE)
+    assert len(carrying) == 1, carrying
+    assert carrying[0].startswith("INFO corp_llm_gateway.asgi")
+    assert result["package_handlers"] == 1
+    assert result["propagate"] is False
 
 
 # ── step 4: the arming check ─────────────────────────────────────────────────

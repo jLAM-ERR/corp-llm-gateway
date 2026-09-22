@@ -416,7 +416,8 @@ def _check_litellm_config(values: Mapping[str, str | None], problems: list[str])
     problems.extend(litellm_problems(Path(raw.strip()), require_file=False))
 
 
-def _check_serve_port(values: Mapping[str, str | None], problems: list[str]) -> None:
+def check_serve_port(values: Mapping[str, str | None], problems: list[str]) -> None:
+    """Public: `serve.py` runs this one check on its own before it binds."""
     raw = (values.get("CORP_LLM_SERVE_PORT") or "").strip()
     if raw and not (raw.isdigit() and 1 <= int(raw) <= 65535):
         problems.append(f"CORP_LLM_SERVE_PORT={raw!r} is not a TCP port number")
@@ -630,7 +631,7 @@ def validate() -> Settings:
     _check_oversize(values, problems)
     _check_route_gate_extras(values, problems)
     _check_litellm_config(values, problems)
-    _check_serve_port(values, problems)
+    check_serve_port(values, problems)
     _check_oracle_trigger(values, problems)
     _check_oracle_endpoint(values, problems)
     _check_corp_ner_endpoint(values, problems)

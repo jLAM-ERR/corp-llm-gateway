@@ -83,11 +83,23 @@ def test_a_scalar_document_is_refused(tmp_path: Path) -> None:
     assert "mapping" in litellm_config.problems(path, require_file=True)[0]
 
 
-def test_a_scalar_general_settings_is_a_problem_not_a_traceback(tmp_path: Path) -> None:
-    # `"pass_through_endpoints" in 7` raises TypeError; the entrypoint must exit
-    # 78 with a readable line instead.
+def test_a_scalar_general_settings_is_refused(tmp_path: Path) -> None:
+    # litellm's own load_config does `general_settings.get("search_tools")`
+    # (proxy_server.py:5118) on anything truthy, so a scalar is an
+    # AttributeError mid-startup. Exit 78 with a readable line instead.
     path = tmp_path / "config.yaml"
     path.write_text("model_list: []\ngeneral_settings: 7\n")
+
+    found = litellm_config.problems(path, require_file=True)
+
+    assert found and "general_settings must be a mapping, not int" in found[0]
+
+
+def test_an_empty_general_settings_is_not_a_problem(tmp_path: Path) -> None:
+    # `general_settings:` with nothing under it parses as None — litellm's
+    # `or {}` handles that, and so does the check.
+    path = tmp_path / "config.yaml"
+    path.write_text("model_list: []\ngeneral_settings:\n")
 
     assert litellm_config.problems(path, require_file=True) == []
 

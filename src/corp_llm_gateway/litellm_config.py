@@ -92,9 +92,15 @@ def content_problems(path: Path) -> list[str]:
     if not isinstance(document, dict):
         return [f"{CONFIG_PATH_KEY}={path}: top level must be a mapping"]
     general = document.get("general_settings")
-    # A scalar `general_settings:` is litellm's own shape error; `in` on an int
-    # would be a traceback instead of exit 78.
-    general = general if isinstance(general, dict) else {}
+    if general is not None and not isinstance(general, dict):
+        # litellm's own loader would take it: `load_config` does
+        # `general_settings.get("search_tools")` (proxy_server.py:5118) on
+        # anything truthy, so a scalar is an AttributeError mid-startup.
+        return [
+            f"{CONFIG_PATH_KEY}={path}: general_settings must be a mapping, "
+            f"not {type(general).__name__}; litellm reads keys off it at startup"
+        ]
+    general = general or {}
     if PASS_THROUGH_KEY in general or PASS_THROUGH_KEY in document:
         return [
             f"{CONFIG_PATH_KEY}={path}: general_settings.{PASS_THROUGH_KEY} is refused. "

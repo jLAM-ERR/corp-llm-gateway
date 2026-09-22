@@ -35,7 +35,14 @@ from typing import Any
 import httpx
 import pytest
 
-from tests.integration.conftest import Stack, booting_gateway, running_stack, wait_for_exit
+from tests.integration.conftest import (
+    Stack,
+    booting_gateway,
+    docker,
+    running_stack,
+    skip_or_fail,
+    wait_for_exit,
+)
 
 # An email, so the local-first regex floor redacts it without the NER extras the
 # `base` image profile leaves out. Whatever the stub receives must carry the
@@ -179,6 +186,19 @@ def _raw_get(
     return status, body.decode("utf-8", "replace")
 
 
+def _json_log_records(logs: str) -> list[Any]:
+    records = []
+    for line in logs.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+    return records
+
+
 def _write(tmp_path_factory: pytest.TempPathFactory, name: str, text: str) -> Path:
     path = tmp_path_factory.mktemp(name) / "config.yaml"
     path.write_text(text)
@@ -214,13 +234,38 @@ def mode(request: pytest.FixtureRequest) -> Mode:
     return request.getfixturevalue(request.param)
 
 
+# ── the harness's own premise: the gateway has no route off the network ──────
+
+_CONNECT_PROBE = "import socket; socket.create_connection(('1.1.1.1', 443), timeout=3)"
+_DNS_PROBE = "import socket; socket.getaddrinfo('api.anthropic.com', 443)"
+
+
+@pytest.mark.parametrize("probe", [_CONNECT_PROBE, _DNS_PROBE], ids=["connect", "dns"])
+def test_the_gateway_container_cannot_reach_the_internet(mode: Mode, probe: str) -> None:
+    # Everything else in this file reads "the stub saw nothing" as "nothing
+    # leaked". That only holds while the gateway's only network is `--internal`:
+    # if docker ever attached a default bridge as well, a refusal that leaked
+    # would reach the real provider and every assertion here would still pass.
+    result = docker("exec", mode.stack.gateway, "/app/.venv/bin/python", "-c", probe, timeout=60)
+
+    assert result.returncode != 0, (
+        f"the gateway container reached off its network: {probe}\n{result.stdout}"
+    )
+
+
 # ── startup negatives: the gateway does not serve half-configured ────────────
+
+
+MISSING_CONFIG = "/nonexistent/config.yaml"
 
 
 def test_a_missing_litellm_config_exits_78(gateway_image: str) -> None:
     # litellm's own lifespan skips a missing config in silence and would serve
-    # with no guardrail at all; the entrypoint refuses first.
-    with booting_gateway(gateway_image, "/nonexistent/config.yaml", BASE_ENV) as name:
+    # with no guardrail at all; the entrypoint refuses first. The env var is set
+    # as well as the mount left out, so the refusal is provably about the path
+    # this test names and not about the image's default mount point.
+    env = {**BASE_ENV, "CORP_LLM_LITELLM_CONFIG": MISSING_CONFIG}
+    with booting_gateway(gateway_image, MISSING_CONFIG, env) as name:
         assert wait_for_exit(name, timeout=90) == 78
 
 
@@ -238,9 +283,16 @@ def test_a_config_without_the_callback_exits_70(
 def test_mode_a_ran_the_prisma_schema_setup_at_boot(mode_a: Mode) -> None:
     # DATABASE_URL is set, so the entrypoint replicates the CLI's Prisma
     # sequence; `/key/info` for a key that exists proves the schema is there.
-    logs = mode_a.stack.gateway_logs()
+    # The line is read as a JSON record, not as a substring: this config sets
+    # `json_logs: true` and Vector parses this stdout, so a boot line that is
+    # plain text there is a defect of its own.
+    messages = [
+        record.get("message")
+        for record in _json_log_records(mode_a.stack.gateway_logs())
+        if isinstance(record, dict)
+    ]
 
-    assert "prisma schema setup complete" in logs
+    assert "prisma schema setup complete" in messages
 
     answered = httpx.get(
         f"{mode_a.stack.base_url}/key/info",
@@ -596,7 +648,9 @@ def test_background_responses_are_sanitized_but_their_round_trip_is_unsupported(
         assert CANARY not in json.dumps(capture["body"])
 
     if created.status_code != 200:
-        pytest.skip(f"litellm refused the background request itself: {created.text[:200]}")
+        # skip_or_fail, not pytest.skip: on a machine where this harness must
+        # run, a silently skipped half of the round trip is not a passed gate.
+        skip_or_fail(f"litellm refused the background request itself: {created.text[:200]}")
     polled = mode_a.get(f"/v1/responses/{created.json()['id']}")
     assert "E_ROUTE_BLOCKED" not in polled.text
     assert CANARY not in polled.text
