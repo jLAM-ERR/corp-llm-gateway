@@ -1,0 +1,445 @@
+"""The startup invariants of `corp_llm_gateway.asgi`, proven by importing it.
+
+Every case runs in a subprocess: importing the module IS the boot sequence, so
+two scenarios cannot share an interpreter. Each script prints one sentinel line
+of JSON, which is all this file reads — litellm writes a banner to stdout.
+
+Skips only when litellm is absent (the 3.14 venv). litellm present without
+fastapi FAILS: the `asgi` extra is part of the dev install from this task on, and
+a skipped startup-invariant test is not a passed gate.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from importlib.util import find_spec
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    find_spec("litellm") is None, reason="litellm is not installed in this interpreter"
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+SENTINEL = "@@RESULT@@"
+
+VALID_CONFIG = """
+model_list:
+  - model_name: "corp-*"
+    litellm_params:
+      model: "hosted_vllm/probe"
+      api_base: "http://127.0.0.1:1"
+      api_key: "probe"
+litellm_settings:
+  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+  drop_params: true
+  json_logs: true
+"""
+
+STRANGER_CONFIG = """
+model_list:
+  - model_name: "corp-*"
+    litellm_params:
+      model: "hosted_vllm/probe"
+      api_base: "http://127.0.0.1:1"
+      api_key: "probe"
+litellm_settings:
+  callbacks: ["stranger_callback.handler"]
+  drop_params: true
+"""
+
+STRANGER_MODULE = """
+from litellm.integrations.custom_logger import CustomLogger
+
+handler = CustomLogger()
+"""
+
+PASS_THROUGH_CONFIG = (
+    VALID_CONFIG
+    + """
+general_settings:
+  pass_through_endpoints:
+    - path: "/adapter"
+      target: "https://example.invalid"
+"""
+)
+
+
+def _require_fastapi() -> None:
+    if find_spec("fastapi") is None:
+        pytest.fail(
+            "litellm is installed but fastapi is not: install the asgi extra "
+            '(pip install -e ".[dev,asgi]"). These invariants must run, not skip.'
+        )
+
+
+def _run(script: str, config_path: Path | str, *, extra_path: Path | None = None) -> dict:
+    _require_fastapi()
+    search = [str(ROOT / "src")] + ([str(extra_path)] if extra_path else [])
+    env = dict(os.environ)
+    env.update(
+        {
+            "PYTHONPATH": os.pathsep.join(search),
+            "CORP_LLM_LITELLM_CONFIG": str(config_path),
+            # Offline and deterministic: no oracle client, local-first floor on.
+            "CORP_LLM_ORACLE_ENABLED": "0",
+            "CORP_LLM_LOCAL_FIRST": "1",
+            "CORP_AUDIT_SINK": "stdout",
+        }
+    )
+    env.pop("DATABASE_URL", None)
+    env.pop("DIRECT_URL", None)
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+        check=False,
+    )
+    lines = [line for line in completed.stdout.splitlines() if line.startswith(SENTINEL)]
+    assert lines, (
+        f"the boot script printed no result line\n--- stdout ---\n{completed.stdout}\n"
+        f"--- stderr ---\n{completed.stderr}"
+    )
+    payload = json.loads(lines[-1][len(SENTINEL) :])
+    payload["returncode"] = completed.returncode
+    return payload
+
+
+@pytest.fixture(scope="module")
+def valid_config(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("litellm") / "config.yaml"
+    path.write_text(VALID_CONFIG)
+    return path
+
+
+# ── step 1: the config gate, before litellm's app is imported ────────────────
+
+_REFUSAL_SCRIPT = f"""
+    import json, sys
+    code = None
+    try:
+        import corp_llm_gateway.asgi  # noqa: F401
+    except SystemExit as exc:
+        code = exc.code
+    print("{SENTINEL}" + json.dumps({{
+        "exit_code": code,
+        "proxy_imported": "litellm.proxy.proxy_server" in sys.modules,
+    }}))
+"""
+
+
+def test_a_missing_config_exits_78_before_litellms_app_is_imported(tmp_path: Path) -> None:
+    result = _run(_REFUSAL_SCRIPT, tmp_path / "absent.yaml")
+
+    assert result["exit_code"] == 78
+    assert result["proxy_imported"] is False
+
+
+def test_a_config_that_is_not_yaml_exits_78(tmp_path: Path) -> None:
+    path = tmp_path / "config.txt"
+    path.write_text(VALID_CONFIG)
+
+    result = _run(_REFUSAL_SCRIPT, path)
+
+    assert result["exit_code"] == 78
+    assert result["proxy_imported"] is False
+
+
+def test_a_config_with_pass_through_endpoints_exits_78(tmp_path: Path) -> None:
+    # SafeRouteAdder registers those paths at runtime; the route gate cannot
+    # classify them, so default-deny would 404 every one. Refuse the config.
+    path = tmp_path / "config.yaml"
+    path.write_text(PASS_THROUGH_CONFIG)
+
+    result = _run(_REFUSAL_SCRIPT, path)
+
+    assert result["exit_code"] == 78
+    assert result["proxy_imported"] is False
+
+
+# ── steps 3-5: what a successful import leaves behind ────────────────────────
+
+_IMPORT_SCRIPT = f"""
+    import json, os, sys
+    import corp_llm_gateway.asgi as asgi
+    import corp_llm_gateway.bootstrap as bootstrap
+    from litellm.proxy.proxy_server import proxy_startup_event
+    from corp_llm_gateway.route_gate import RouteGateMiddleware
+
+    routes = [getattr(r, "path", None) for r in asgi._app.router.routes]
+    print("{SENTINEL}" + json.dumps({{
+        "worker_config": os.environ.get("WORKER_CONFIG") is not None,
+        "worker_config_names_our_path": json.loads(
+            os.environ["WORKER_CONFIG"]
+        )["config"] == os.environ["CORP_LLM_LITELLM_CONFIG"],
+        "config_file_path": "CONFIG_FILE_PATH" in os.environ,
+        "app_is_gate": isinstance(asgi.app, RouteGateMiddleware),
+        "gate_wraps_litellm": asgi.app.app is asgi._app,
+        "lifespan_replaced": asgi._app.router.lifespan_context is not proxy_startup_event,
+        "lifespan_not_original": (
+            asgi._app.router.lifespan_context is not asgi._litellm_lifespan
+        ),
+        "guardrail_built": bootstrap._guardrail is not None,
+        "armed": asgi.gate.armed,
+        "healthz_mounted": "/healthz" in routes,
+        "metrics_mounted": "/metrics" in routes,
+        "healthz_first": routes[:2],
+        "shared_exporter": asgi._exporter is __import__(
+            "corp_llm_gateway.metrics", fromlist=["x"]
+        ).get_exporter(),
+    }}))
+"""
+
+
+@pytest.fixture(scope="module")
+def imported(valid_config: Path) -> dict:
+    return _run(_IMPORT_SCRIPT, valid_config)
+
+
+def test_the_import_sets_worker_config_and_not_config_file_path(imported: dict) -> None:
+    # CONFIG_FILE_PATH makes litellm's lifespan skip initialize(), which is what
+    # applies drop_params, the request timeout, telemetry and the log level.
+    assert imported["worker_config"] is True
+    assert imported["worker_config_names_our_path"] is True
+    assert imported["config_file_path"] is False
+
+
+def test_the_exported_app_is_the_gate_wrapping_litellms_app(imported: dict) -> None:
+    assert imported["app_is_gate"] is True
+    assert imported["gate_wraps_litellm"] is True
+
+
+def test_the_lifespan_is_wrapped(imported: dict) -> None:
+    assert imported["lifespan_replaced"] is True
+    assert imported["lifespan_not_original"] is True
+
+
+def test_the_import_does_not_build_the_guardrail(imported: dict) -> None:
+    # litellm builds it when the lifespan resolves the callback; importing the
+    # entrypoint must stay free of network clients and model loads.
+    assert imported["guardrail_built"] is False
+
+
+def test_the_gate_starts_unarmed(imported: dict) -> None:
+    assert imported["armed"] is False
+
+
+def test_the_gateway_owned_routes_are_mounted_ahead_of_litellms(imported: dict) -> None:
+    assert imported["healthz_mounted"] is True
+    assert imported["metrics_mounted"] is True
+    # First two, so litellm's first-segment catch-alls cannot shadow them.
+    assert imported["healthz_first"] == ["/healthz", "/metrics"]
+
+
+def test_the_gate_and_the_guardrail_share_one_exporter(imported: dict) -> None:
+    assert imported["shared_exporter"] is True
+
+
+# ── step 4: the arming check ─────────────────────────────────────────────────
+
+_LIFESPAN_SCRIPT = f"""
+    import asyncio, contextlib, json, os
+    import corp_llm_gateway.asgi as asgi
+
+    exits = []
+    os._exit = exits.append
+
+    MODE = {{mode!r}}
+    if MODE != "real":
+        import litellm
+
+        @contextlib.asynccontextmanager
+        async def _no_startup(app):
+            # litellm's own startup would re-register the callback; this
+            # isolates the check itself.
+            yield
+
+        asgi._litellm_lifespan = _no_startup
+        litellm.callbacks = [object()] if MODE == "stranger" else []
+
+    async def drive():
+        async with asgi._app.router.lifespan_context(asgi._app):
+            pass
+
+    asyncio.run(drive())
+    print("{SENTINEL}" + json.dumps({{{{"exits": exits, "armed": asgi.gate.armed}}}}))
+"""
+
+
+def test_the_gate_arms_when_the_guardrail_registered(valid_config: Path) -> None:
+    result = _run(_LIFESPAN_SCRIPT.format(mode="real"), valid_config)
+
+    assert result["exits"] == []
+    assert result["armed"] is True
+
+
+@pytest.mark.parametrize("mode", ["stranger", "empty"])
+def test_the_process_exits_70_when_the_guardrail_is_not_registered(
+    valid_config: Path, mode: str
+) -> None:
+    result = _run(_LIFESPAN_SCRIPT.format(mode=mode), valid_config)
+
+    assert result["exits"] == [70]
+    assert result["armed"] is False
+
+
+_CONFIG_WITHOUT_CALLBACK_SCRIPT = f"""
+    import asyncio, json, os
+    import corp_llm_gateway.asgi as asgi
+
+    exits = []
+    os._exit = exits.append
+
+    async def drive():
+        async with asgi._app.router.lifespan_context(asgi._app):
+            pass
+
+    asyncio.run(drive())
+    import litellm
+    print("{SENTINEL}" + json.dumps({{
+        "exits": exits,
+        "armed": asgi.gate.armed,
+        "callbacks": [type(cb).__name__ for cb in litellm.callbacks],
+    }}))
+"""
+
+
+def test_a_config_listing_a_different_callback_exits_70(tmp_path: Path) -> None:
+    # The fail-open this plan exists to close: litellm starts happily with some
+    # other callback registered and sanitizes nothing.
+    path = tmp_path / "config.yaml"
+    path.write_text(STRANGER_CONFIG)
+    (tmp_path / "stranger_callback.py").write_text(STRANGER_MODULE)
+
+    result = _run(_CONFIG_WITHOUT_CALLBACK_SCRIPT, path, extra_path=tmp_path)
+
+    assert result["exits"] == [70]
+    assert result["armed"] is False
+    assert "CorpLlmGuardrail" not in result["callbacks"]
+
+
+# ── the gateway-owned routes answer through the gate ─────────────────────────
+
+_REQUEST_SCRIPT = f"""
+    import asyncio, json
+    import corp_llm_gateway.asgi as asgi
+
+    async def call(method, path):
+        messages = []
+
+        async def receive():
+            return {{"type": "http.request", "body": b"", "more_body": False}}
+
+        async def send(message):
+            messages.append(message)
+
+        await asgi.app(
+            {{
+                "type": "http",
+                "method": method,
+                "path": path,
+                "raw_path": path.encode(),
+                "headers": [],
+            }},
+            receive,
+            send,
+        )
+        status = next(m["status"] for m in messages if m["type"] == "http.response.start")
+        body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+        return status, body.decode()
+
+    async def main():
+        async with asgi._app.router.lifespan_context(asgi._app):
+            live = await call("GET", "/healthz/live")
+            metrics = await call("GET", "/metrics")
+            issue = await call("POST", "/internal/issue-token")
+            counts = await call("POST", "/v1/messages/count_tokens")
+        print("{SENTINEL}" + json.dumps({{
+            "live": live, "metrics": metrics, "issue": issue[0], "count_tokens": counts[0],
+        }}))
+
+    asyncio.run(main())
+"""
+
+
+@pytest.fixture(scope="module")
+def served(valid_config: Path) -> dict:
+    return _run(_REQUEST_SCRIPT, valid_config)
+
+
+def test_healthz_live_answers_through_the_gate(served: dict) -> None:
+    status, body = served["live"]
+
+    assert status == 200
+    assert json.loads(body)["status"] == "healthy"
+
+
+def test_metrics_answers_through_the_gate(served: dict) -> None:
+    status, _ = served["metrics"]
+
+    assert status == 200
+
+
+def test_issue_token_stays_refused(served: dict) -> None:
+    # Not in GATEWAY_ROUTE_TABLE on purpose; issuance is `gateway-admin token issue`.
+    assert served["issue"] == 404
+
+
+def test_a_bypass_route_is_refused_on_the_real_app(served: dict) -> None:
+    assert served["count_tokens"] == 403
+
+
+# ── the worker-config argument list cannot drift ─────────────────────────────
+
+
+def _save_worker_config_keywords() -> list[str]:
+    import litellm.proxy.proxy_cli as proxy_cli
+
+    tree = ast.parse(Path(proxy_cli.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "save_worker_config"
+        ):
+            return [keyword.arg for keyword in node.keywords if keyword.arg]
+    pytest.fail("litellm's CLI no longer calls save_worker_config; re-read proxy_cli.py")
+
+
+def test_the_worker_config_keys_are_the_ones_the_cli_passes() -> None:
+    # A key litellm adds would otherwise silently keep initialize()'s own
+    # default instead of the CLI's, and the gateway would boot differently from
+    # the proxy it replaces.
+    from corp_llm_gateway.litellm_cli import WORKER_CONFIG_KEYS
+
+    assert sorted(_save_worker_config_keywords()) == sorted(WORKER_CONFIG_KEYS)
+
+
+def test_the_cli_defaults_are_read_off_click_including_envvars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from corp_llm_gateway.litellm_cli import WORKER_CONFIG_KEYS, option_values
+
+    values = option_values(WORKER_CONFIG_KEYS)
+    # What `litellm --config … --port 4000` would pass today.
+    assert values["telemetry"] is True
+    assert values["debug"] is False
+    assert values["config"] is None
+
+    monkeypatch.setenv("DEBUG", "true")
+    assert option_values(("debug",))["debug"] is True
+
+
+def test_an_option_litellm_renamed_fails_loudly() -> None:
+    from corp_llm_gateway.litellm_cli import option_values
+
+    with pytest.raises(KeyError):
+        option_values(("an_option_litellm_does_not_have",))

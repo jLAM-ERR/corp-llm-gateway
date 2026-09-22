@@ -6,6 +6,17 @@ from pathlib import Path
 import pytest
 
 from corp_llm_gateway import config
+from corp_llm_gateway.metrics import reset_exporter
+
+
+@pytest.fixture(autouse=True)
+def _fresh_metrics_exporter() -> Iterator[None]:
+    """`get_exporter()` caches one exporter per process; drop it between tests
+    so a `CORP_METRICS_EXPORTER` a test sets is actually re-read."""
+    reset_exporter()
+    yield
+    reset_exporter()
+
 
 # Every config key the composition root reads, plus decoy aliases a naive
 # implementation might read instead of the canonical names. Cleared before each

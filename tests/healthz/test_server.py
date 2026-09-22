@@ -261,3 +261,36 @@ async def test_fallthrough_delegates_unknown_paths_but_serves_health() -> None:
     # The router still owns its own routes; they are not delegated.
     assert health.status_code == 200
     assert health.json()["status"] == "healthy"
+
+
+# ── issuance is optional (the gateway server does not serve it) ──────────────
+
+
+async def test_without_an_issuer_the_issue_token_path_is_not_served() -> None:
+    # The gateway mounts this router at /healthz only and the route gate refuses
+    # POST /internal/issue-token; wiring an issuer there would be a second,
+    # unreachable copy of `gateway-admin token issue`.
+    router = build_health_router(
+        live_check=LiveCheck(),
+        ready_check=ReadyCheck(check_redis=_ok, check_postgres=_ok),
+        sanitization_check=SanitizationCheck(run_round_trip=_ok),
+        extensions_check=ExtensionsCheck(health_all=_ext_healthy),
+    )
+
+    async with _client(router) as client:
+        response = await client.post("/internal/issue-token", json={"oidc_token": "x"})
+
+    assert response.status_code == 404
+
+
+async def test_without_an_issuer_the_health_routes_still_answer() -> None:
+    router = build_health_router(
+        live_check=LiveCheck(),
+        ready_check=ReadyCheck(check_redis=_ok, check_postgres=_ok),
+        sanitization_check=SanitizationCheck(run_round_trip=_ok),
+        extensions_check=ExtensionsCheck(health_all=_ext_healthy),
+    )
+
+    async with _client(router) as client:
+        assert (await client.get("/healthz/live")).status_code == 200
+        assert (await client.get("/healthz/ready")).status_code == 200

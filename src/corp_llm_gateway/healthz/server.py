@@ -66,7 +66,7 @@ class HealthRouter:
         ready_check: HealthCheck,
         sanitization_check: HealthCheck,
         extensions_check: HealthCheck,
-        token_issuer: TokenIssuer,
+        token_issuer: TokenIssuer | None = None,
         fallthrough: ASGIApp | None = None,
     ) -> None:
         self._checks: dict[str, HealthCheck] = {
@@ -99,7 +99,7 @@ class HealthRouter:
             await self._handle_health(check, send)
             return
 
-        if path == _ISSUE_TOKEN_PATH:
+        if path == _ISSUE_TOKEN_PATH and self._issuer is not None:
             if method != "POST":
                 await _send_json(send, 405, {"error": "method not allowed"})
                 return
@@ -156,10 +156,16 @@ def build_health_router(
     ready_check: HealthCheck,
     sanitization_check: HealthCheck,
     extensions_check: HealthCheck,
-    token_issuer: TokenIssuer,
+    token_issuer: TokenIssuer | None = None,
     fallthrough: ASGIApp | None = None,
 ) -> HealthRouter:
-    """Build the ASGI router with all dependencies injected as parameters."""
+    """Build the ASGI router with all dependencies injected as parameters.
+
+    ``token_issuer=None`` leaves ``POST /internal/issue-token`` unserved: the
+    gateway server mounts this router at ``/healthz`` only, and the route gate
+    refuses the issuance path, so wiring an issuer there would be a second,
+    unreachable copy of `gateway-admin token issue`.
+    """
     return HealthRouter(
         live_check=live_check,
         ready_check=ready_check,

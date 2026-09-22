@@ -235,6 +235,19 @@
 # CORP_METRICS_EXPORTER     = "noop"
 # CORP_TRACING_EXPORTER     = "noop"
 
+# ── Server entrypoint (asgi.py / serve.py) ───────────────────────────────────
+#
+# `python -m corp_llm_gateway.serve` is the only supported launch command: it
+# runs litellm's proxy behind the route gate. CORP_LLM_LITELLM_CONFIG is
+# litellm's own YAML (model_list + the guardrail callback). The entrypoint
+# refuses to start with exit 78 when it is missing, unreadable, not YAML or
+# configures `pass_through_endpoints`, and with exit 70 when the guardrail
+# callback did not register — litellm alone would serve unsanitized in both
+# cases. Host and port are litellm's CLI defaults.
+# CORP_LLM_LITELLM_CONFIG   = "/etc/litellm/config.yaml"
+# CORP_LLM_SERVE_HOST       = "0.0.0.0"
+# CORP_LLM_SERVE_PORT       = "4000"
+
 # ── Route gate (route_gate/) ─────────────────────────────────────────────────
 #
 # The gate classifies every (method, path) before litellm's router sees it and

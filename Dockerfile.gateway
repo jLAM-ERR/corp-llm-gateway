@@ -123,6 +123,14 @@ RUN set -eux; \
 LABEL org.corp-llm-gateway.ner-profile="${NER_PROFILE}" \
       org.corp-llm-gateway.en-model-version="${EN_MODEL_VERSION}"
 
-# The pod mounts the litellm proxy config (with the guardrail callback) here via
-# the configmap-litellm.yaml ConfigMap.
-ENTRYPOINT ["litellm", "--config", "/etc/litellm/config.yaml", "--port", "4000"]
+# The pod mounts the litellm proxy config (with the guardrail callback) at
+# /etc/litellm/config.yaml via the configmap-litellm.yaml ConfigMap;
+# CORP_LLM_LITELLM_CONFIG overrides the path.
+#
+# NOT `litellm --config ...`: that CLI serves litellm's routers with nothing in
+# front of them, and three of those reach a provider without ever calling
+# pre_call_hook — raw user text out of the corp boundary, unsanitized and
+# unaudited. `corp_llm_gateway.serve` runs the same proxy behind the default-deny
+# route gate and refuses to serve at all unless the guardrail callback registered
+# (exit 78 = bad config, exit 70 = callback missing). See src/corp_llm_gateway/asgi.py.
+ENTRYPOINT ["python", "-m", "corp_llm_gateway.serve"]

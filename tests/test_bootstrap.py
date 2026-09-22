@@ -118,6 +118,76 @@ def test_build_guardrail_carries_metrics_exporter_noop_by_default() -> None:
     assert isinstance(guardrail._metrics, NoopExporter)
 
 
+def test_build_guardrail_takes_an_explicit_metrics_exporter() -> None:
+    # asgi.py hands the route gate and the guardrail ONE exporter, so a block
+    # counted by either shows up in the registry /metrics exposes.
+    exporter = NoopExporter()
+
+    guardrail = bootstrap.build_guardrail(metrics=exporter)
+
+    assert guardrail._metrics is exporter
+
+
+def test_build_guardrail_defaults_to_the_shared_exporter() -> None:
+    from corp_llm_gateway.metrics import get_exporter
+
+    guardrail = bootstrap.build_guardrail()
+
+    assert guardrail._metrics is get_exporter()
+
+
+# ── Task 4: the /healthz router the gateway server mounts ────────────────────
+
+
+def test_build_health_router_wires_the_four_checks_and_no_issuer() -> None:
+    router = bootstrap.build_health_router()
+
+    assert sorted(router._checks) == [
+        "/healthz/extensions",
+        "/healthz/live",
+        "/healthz/ready",
+        "/healthz/sanitization",
+    ]
+    # Issuance is `gateway-admin token issue`; the route gate refuses the path.
+    assert router._issuer is None
+
+
+async def test_the_health_router_is_ready_without_redis_or_postgres() -> None:
+    # No REDIS_URL / CORP_LLM_PG_DSN means the in-memory backends; there is
+    # nothing to reach, so readiness must not fail on their absence.
+    status = await bootstrap.build_health_router()._checks["/healthz/ready"].check()
+
+    assert status.healthy is True
+
+
+async def test_the_sanitization_probe_round_trips_through_the_live_guardrail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The probe must exercise the engine serving requests, not a second one.
+    monkeypatch.setattr(bootstrap, "_guardrail", None)
+    status = await bootstrap.build_health_router()._checks["/healthz/sanitization"].check()
+
+    assert status.healthy is True, status.detail
+    assert bootstrap._guardrail is not None
+
+
+async def test_the_sanitization_probe_reports_a_failing_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Broken:
+        async def sanitize(self, text: str, **_: object) -> object:
+            raise RuntimeError("engine down")
+
+    class _Guardrail:
+        orchestrator = _Broken()
+
+    monkeypatch.setattr(bootstrap, "_guardrail", _Guardrail())
+    status = await bootstrap.build_health_router()._checks["/healthz/sanitization"].check()
+
+    assert status.healthy is False
+    assert "sanitization_error" in status.detail
+
+
 # ── D4: profiles activated in the composition root ───────────────────────────
 
 

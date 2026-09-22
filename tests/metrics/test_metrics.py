@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from corp_llm_gateway import config
+from corp_llm_gateway import metrics as metrics_module
 from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.corp_llm import CorpLlmClient
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
@@ -23,7 +24,9 @@ from corp_llm_gateway.metrics import (
     MetricsExporter,
     NoopExporter,
     PrometheusExporter,
+    build_exporter,
     get_exporter,
+    reset_exporter,
 )
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
@@ -314,3 +317,69 @@ async def test_hook_default_noop_leaves_block_path_unchanged() -> None:
     assert ei.value.error_code == "E_POLICY_BLOCKED"
     # The Stage-0 block still audits inline exactly once — unchanged by the noop path.
     assert len(sink.records) == 1
+
+
+# ── One exporter per process (the /metrics route and the gate share it) ──────
+
+
+def test_get_exporter_returns_the_same_instance_every_time() -> None:
+    # PrometheusExporter gives each instance its OWN registry, so a second one
+    # would count into a registry nothing scrapes. The route gate, the guardrail
+    # and asgi.py's /metrics route all resolve through here.
+    assert get_exporter() is get_exporter()
+
+
+def test_build_exporter_returns_a_new_instance_each_time() -> None:
+    assert build_exporter() is not build_exporter()
+
+
+def test_reset_exporter_re_reads_the_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Other(NoopExporter):
+        pass
+
+    first = get_exporter()
+    assert isinstance(first, NoopExporter)
+
+    monkeypatch.setitem(metrics_module._EXPORTER_FACTORIES, "noop", _Other)
+    assert get_exporter() is first, "a cached exporter must not change under a live process"
+
+    reset_exporter()
+    assert isinstance(get_exporter(), _Other)
+
+
+# ── the /metrics ASGI app ────────────────────────────────────────────────────
+
+
+async def _call(app: object) -> tuple[int, bytes, dict[bytes, bytes]]:
+    messages: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        messages.append(message)
+
+    await app({"type": "http", "method": "GET", "path": "/metrics", "headers": []}, receive, send)  # type: ignore[operator]
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], body, dict(start["headers"])
+
+
+async def test_the_noop_exporter_still_serves_metrics() -> None:
+    # A 404 here is indistinguishable from a dead pod to a scrape; answer 200
+    # with nothing instead.
+    status, body, headers = await _call(NoopExporter().asgi_app())
+
+    assert status == 200
+    assert body == b""
+    assert headers[b"content-type"] == b"text/plain; charset=utf-8"
+
+
+async def test_the_prometheus_exporter_serves_its_own_registry() -> None:
+    exporter = _prom()
+    exporter.record_block("route_gate_listed")
+
+    status, body, _ = await _call(exporter.asgi_app())
+
+    assert status == 200
+    assert b'corp_llm_gateway_blocked_requests_total{block_reason="route_gate_listed"}' in body

@@ -263,6 +263,24 @@ KEYS: tuple[Key, ...] = (
         choices=TRACING_EXPORTERS,
         help="tracing exporter (reserved): noop",
     ),
+    # ── Server entrypoint (asgi.py / serve.py) ───────────────────────────────
+    Key(
+        "CORP_LLM_LITELLM_CONFIG",
+        default="/etc/litellm/config.yaml",
+        help="path to litellm's proxy config YAML; the entrypoint refuses to "
+        "start (exit 78) when it is missing, unreadable or not YAML",
+    ),
+    Key(
+        "CORP_LLM_SERVE_HOST",
+        # The container's own interface, as litellm's CLI defaults to.
+        default="0.0.0.0",
+        help="address `python -m corp_llm_gateway.serve` binds (litellm CLI default)",
+    ),
+    Key(
+        "CORP_LLM_SERVE_PORT",
+        default="4000",
+        help="port `python -m corp_llm_gateway.serve` binds (litellm CLI default)",
+    ),
     # ── Route gate (route_gate/) ─────────────────────────────────────────────
     # The only knob the gate has. It can widen the table with PASSTHROUGH routes
     # an operator owns; it can never add REWRITTEN and there is no off switch.
@@ -380,6 +398,28 @@ def _check_route_gate_extras(values: Mapping[str, str | None], problems: list[st
         parse_extras(values.get("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH"))
     except ValueError as exc:
         problems.append(f"CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH: {exc}")
+
+
+def _check_litellm_config(values: Mapping[str, str | None], problems: list[str]) -> None:
+    """Check litellm's own proxy config when it is present.
+
+    Absence is NOT a problem here: `config check` runs on operator laptops where
+    nothing is mounted at /etc/litellm. The entrypoint (`asgi.py`) is what
+    refuses to serve without it, with exit 78.
+    """
+    from pathlib import Path
+
+    from corp_llm_gateway.litellm_config import DEFAULT_CONFIG_PATH
+    from corp_llm_gateway.litellm_config import problems as litellm_problems
+
+    raw = values.get("CORP_LLM_LITELLM_CONFIG") or DEFAULT_CONFIG_PATH
+    problems.extend(litellm_problems(Path(raw.strip()), require_file=False))
+
+
+def _check_serve_port(values: Mapping[str, str | None], problems: list[str]) -> None:
+    raw = (values.get("CORP_LLM_SERVE_PORT") or "").strip()
+    if raw and not (raw.isdigit() and 1 <= int(raw) <= 65535):
+        problems.append(f"CORP_LLM_SERVE_PORT={raw!r} is not a TCP port number")
 
 
 def _check_oracle_trigger(values: Mapping[str, str | None], problems: list[str]) -> None:
@@ -589,6 +629,8 @@ def validate() -> Settings:
     _check_conditional(values, problems)
     _check_oversize(values, problems)
     _check_route_gate_extras(values, problems)
+    _check_litellm_config(values, problems)
+    _check_serve_port(values, problems)
     _check_oracle_trigger(values, problems)
     _check_oracle_endpoint(values, problems)
     _check_corp_ner_endpoint(values, problems)

@@ -36,6 +36,21 @@ dev = [
     "PyYAML>=6.0",
     "ruff==0.15.14",
     "pre-commit>=3.7",
+    "corp-llm-gateway[asgi]",
+]
+# What `python -m corp_llm_gateway.serve` needs to serve litellm's ASGI app.
+# `litellm[proxy]` is the whole set: `litellm.proxy.proxy_server` imports
+# websockets, orjson, apscheduler, mcp and a dozen more at module level, so
+# fastapi + uvicorn alone cannot import the app. The gateway image needs none
+# of this (its base IS the litellm proxy image); the extra exists so CI and
+# .venv-bench can RUN tests/test_asgi_entrypoint.py instead of skipping it —
+# a skipped startup-invariant test is not a passed gate.
+# fastapi/uvicorn are named explicitly because asgi.py and serve.py import them
+# directly; the floors are the ones litellm 1.101.0's own `proxy` extra sets.
+asgi = [
+    "litellm[proxy]==1.101.0",
+    "fastapi>=0.136,<1",
+    "uvicorn>=0.33,<1",
 ]
 # Postgres token store backend. Keeps the default install lean.
 postgres = ["asyncpg>=0.29"]

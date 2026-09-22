@@ -16,6 +16,7 @@ without updating them together:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 _DEFAULT_CONTENT_TYPE = "text/plain; charset=utf-8"
 
@@ -47,3 +48,30 @@ class MetricsExporter(ABC):
     def content_type(self) -> str:
         """Content-Type a ``/metrics`` route should return alongside :meth:`render`."""
         return _DEFAULT_CONTENT_TYPE
+
+    def asgi_app(self) -> Any:
+        """ASGI app serving :meth:`render` — mounted at ``/metrics`` by ``asgi.py``.
+
+        Framework-free so the route exists whatever the exporter is: a noop
+        exporter answers 200 with an empty body, which keeps a scrape from
+        alerting on a 404 it cannot distinguish from a dead pod.
+        """
+        render, content_type = self.render, self.content_type
+
+        async def app(scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] != "http":
+                return
+            body = render()
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", content_type.encode("latin-1")),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+
+        return app

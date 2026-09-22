@@ -66,9 +66,11 @@ services:
     # to get CORP_LLM_STRIP_INBOUND_HEADERS and Workstream B's corp NER
     # work, neither of which is in the published GATEWAY_IMAGE_TAG below.
     # Built from Dockerfile.gateway, whose ENTRYPOINT is
-    # `litellm --config /etc/litellm/config.yaml --port 4000`; the
-    # entrypoint/command override below runs the same command, prefixed with
-    # the SSL_CERT_FILE bundle build (see the environment block).
+    # `python -m corp_llm_gateway.serve` (litellm's proxy behind the default-deny
+    # route gate -- the bare `litellm` CLI serves three routes that reach a
+    # provider without the guardrail). The entrypoint/command override below runs
+    # the same module, prefixed with the SSL_CERT_FILE bundle build (see the
+    # environment block).
     image: ghcr.io/jlam-err/corp-llm-gateway:${GATEWAY_IMAGE_TAG:?set GATEWAY_IMAGE_TAG in .env}
     volumes:
       - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
@@ -252,7 +254,7 @@ services:
         if [ -f /etc/corp-llm-gateway/certs/corp-ca-bundle.pem ]; then
           cat /etc/corp-llm-gateway/certs/corp-ca-bundle.pem >> /tmp/corp-ca-bundle.pem
         fi
-        exec litellm --config /etc/litellm/config.yaml --port 4000
+        exec python -m corp_llm_gateway.serve
     # Container identity for the audit pipeline. This label plus the
     # `logging.options.labels` block below are what make docker's json-file
     # driver stamp `"attrs":{"com.corp-llm-gateway.audit-source":
@@ -332,14 +334,14 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      # The litellm image has no curl/wget; use Python stdlib. litellm's own
-      # built-in liveliness route — /healthz/* wiring onto litellm's ASGI app
-      # is a separate, not-yet-landed concern (see healthz/server.py).
+      # The litellm image has no curl/wget; use Python stdlib. /healthz/live is
+      # the gateway's own probe, mounted on litellm's ASGI app by
+      # corp_llm_gateway.asgi and admitted by the route gate.
       test:
         - "CMD"
         - "python3"
         - "-c"
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness',timeout=2).status==200 else 1)"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/healthz/live',timeout=2).status==200 else 1)"
       interval: 5s
       timeout: 3s
       retries: 10

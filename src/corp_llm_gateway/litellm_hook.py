@@ -269,6 +269,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # for one request; the histogram must only see it once.
         self._latency_observed_ids: OrderedDict[str, None] = OrderedDict()
 
+    @property
+    def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
+        """The sanitization engine this guardrail runs.
+
+        Exposed for `/healthz/sanitization`, whose round trip must exercise the
+        engine the request path actually uses — a second one built from config
+        would prove nothing about this process.
+        """
+        return self._orch
+
     # ---- LiteLLM hook entry points ----------------------------------------
 
     async def async_pre_call_hook(
