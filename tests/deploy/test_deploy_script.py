@@ -162,6 +162,10 @@ def _fake_repo(tmp_path: Path) -> Path:
     (compose / "docker-compose.yml").write_text("services: {}\n")
     (compose / "docker-compose.build.yml").write_text("services: {}\n")
     (compose / "docker-compose.oauth.yml").write_text("services: {}\n")
+    (compose / "docker-compose.issuance.yml").write_text("services: {}\n")
+    (compose / "gateway").mkdir()
+    (compose / "gateway" / "config.toml.example").write_text("# example team map\n")
+    (compose / "gateway" / "config.toml").write_text("# laptop copy\n")
     (compose / "certs" / "server.key").write_text("-----BEGIN PRIVATE KEY-----\n")
     (compose / "postgres" / "initdb" / "README.md").write_text("staged at deploy time\n")
 
@@ -588,14 +592,23 @@ def test_status_summary_lists_services_without_env_values(tmp_path: Path) -> Non
 # --------------------------------------------------------------------------- #
 
 
-def _run(repo: Path, tmp_path: Path, argv: list[str], ps: object = None, stdin: str = "") -> object:
+def _run(
+    repo: Path,
+    tmp_path: Path,
+    argv: list[str],
+    ps: object = None,
+    stdin: str = "",
+    env_extra: dict[str, str] | None = None,
+) -> object:
     bin_dir = _stub_bin(tmp_path, ssh_mode="exec")
+    env = _env(tmp_path, bin_dir, ps)  # type: ignore[arg-type]
+    env.update(env_extra or {})
     return subprocess.run(
         [str(repo / "scripts" / "deploy" / "deploy.sh"), *argv],
         capture_output=True,
         text=True,
         input=stdin,
-        env=_env(tmp_path, bin_dir, ps),  # type: ignore[arg-type]
+        env=env,
     )
 
 
@@ -792,3 +805,211 @@ def test_an_unknown_mode_is_refused_before_anything_remote_happens(
     assert result.returncode == 1  # type: ignore[attr-defined]
     assert "--mode must be virtual-keys or oauth" in result.stderr  # type: ignore[attr-defined]
     assert _log(tmp_path, "ssh.log") == ""
+
+
+# --------------------------------------------------------------------------- #
+# --issuance: the third overlay and the server-owned gateway/config.toml
+# --------------------------------------------------------------------------- #
+
+THREE_FILES = f"{BOTH_FILES} -f docker-compose.issuance.yml"
+
+
+def _server_config(remote: Path) -> Path:
+    (remote / "gateway").mkdir(exist_ok=True)
+    config = remote / "gateway" / "config.toml"
+    config.write_text("# server copy\n")
+    return config
+
+
+def _compose_lines(tmp_path: Path) -> list[str]:
+    lines = _log(tmp_path, "docker.log").splitlines()
+    return [line for line in lines if line.startswith("compose ")]
+
+
+def test_the_default_run_carries_no_issuance_overlay(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "up"], ps=HEALTHY_PS)
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert f"compose {BOTH_FILES} up -d" in _log(tmp_path, "docker.log")
+    assert "docker-compose.issuance.yml" not in _log(tmp_path, "docker.log")
+
+
+@pytest.mark.parametrize(
+    ("argv", "env_extra"),
+    [
+        (["--issuance"], {}),
+        (["--issuance", "--mode", "oauth"], {}),
+        ([], {"DEPLOY_ISSUANCE": "1"}),
+    ],
+    ids=["flag", "flag-explicit-oauth", "env"],
+)
+def test_issuance_layers_the_third_overlay_after_oauth_on_every_call(
+    argv: list[str], env_extra: dict[str, str], tmp_path: Path
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    _server_config(remote)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), *argv, "up"],
+        ps=HEALTHY_PS,
+        env_extra=env_extra,
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    docker_log = _log(tmp_path, "docker.log")
+    assert f"compose {THREE_FILES} pull" in docker_log
+    assert f"compose {THREE_FILES} up -d" in docker_log
+    assert f"compose {THREE_FILES} ps --all" in docker_log
+    lines = _compose_lines(tmp_path)
+    assert lines
+    for line in lines:
+        assert line.startswith(f"compose {THREE_FILES} "), line
+    assert (remote / "docker-compose.issuance.yml").exists()
+
+
+def test_issuance_keeps_the_file_list_on_read_only_runs(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    argv = ["--host", HOST, "--dir", str(remote), "--issuance", "status"]
+
+    result = _run(repo, tmp_path, argv, ps=HEALTHY_PS)
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert f"compose {THREE_FILES} ps --all" in _log(tmp_path, "docker.log")
+
+
+@pytest.mark.parametrize(
+    ("argv", "env_extra"),
+    [
+        (["--issuance", "--mode", "virtual-keys"], {}),
+        (["--mode", "virtual-keys", "--issuance"], {}),
+        (["--mode=virtual-keys"], {"DEPLOY_ISSUANCE": "1"}),
+    ],
+    ids=["flag-first", "mode-first", "env"],
+)
+def test_issuance_is_refused_outside_the_subscription_mode(
+    argv: list[str], env_extra: dict[str, str], tmp_path: Path
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    _server_config(remote)
+
+    result = _run(
+        repo, tmp_path, ["--host", HOST, "--dir", str(remote), *argv, "up"], env_extra=env_extra
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    assert "--issuance needs --mode oauth" in result.stderr  # type: ignore[attr-defined]
+    assert _log(tmp_path, "ssh.log") == ""
+    assert _log(tmp_path, "rsync.log") == ""
+
+
+@pytest.mark.parametrize("value", ["yes", "true", "2", "on"])
+def test_a_bad_deploy_issuance_value_is_refused(value: str, tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "status"],
+        env_extra={"DEPLOY_ISSUANCE": value},
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    assert "DEPLOY_ISSUANCE must be 0 or 1" in result.stderr  # type: ignore[attr-defined]
+    assert _log(tmp_path, "ssh.log") == ""
+
+
+@pytest.mark.parametrize("value", ["0", ""])
+def test_deploy_issuance_off_values_keep_two_files(value: str, tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "status"],
+        ps=HEALTHY_PS,
+        env_extra={"DEPLOY_ISSUANCE": value},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert f"compose {BOTH_FILES} ps --all" in _log(tmp_path, "docker.log")
+    assert "docker-compose.issuance.yml" not in _log(tmp_path, "docker.log")
+
+
+@pytest.mark.parametrize("shape", ["absent", "directory"])
+def test_issuance_up_without_a_server_config_fails_before_anything_changes(
+    shape: str, tmp_path: Path
+) -> None:
+    # A missing bind-mount source can come up as an empty directory, which the
+    # config loader skips: issuance would boot silently off.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    if shape == "directory":
+        (remote / "gateway" / "config.toml").mkdir(parents=True)
+
+    result = _run(
+        repo, tmp_path, ["--host", HOST, "--dir", str(remote), "--issuance", "up"], ps=HEALTHY_PS
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    assert "compose/gateway/config.toml.example" in result.stderr  # type: ignore[attr-defined]
+    assert f"{remote}/gateway/config.toml" in result.stderr  # type: ignore[attr-defined]
+    assert _log(tmp_path, "rsync.log") == "", "nothing may be synced before the check passes"
+    assert "pull" not in _log(tmp_path, "docker.log")
+    assert "up -d" not in _log(tmp_path, "docker.log")
+    assert not (remote / ".deploy.lock").exists()
+
+
+def test_sync_never_overwrites_the_servers_config_toml(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    config = _server_config(remote)
+
+    result = _call(
+        "sync_compose",
+        tmp_path,
+        remote_dir=remote,
+        compose_dir=repo / "compose",
+        script=repo / "scripts" / "deploy" / "deploy.sh",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert config.read_text() == "# server copy\n"
+    assert (remote / "gateway" / "config.toml.example").read_text() == "# example team map\n"
+    assert "--exclude=gateway/config.toml\n" in _log(tmp_path, "rsync.log")
+
+
+def test_sync_never_creates_a_server_config_toml_from_the_laptop(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _call(
+        "sync_compose",
+        tmp_path,
+        remote_dir=remote,
+        compose_dir=repo / "compose",
+        script=repo / "scripts" / "deploy" / "deploy.sh",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert not (remote / "gateway" / "config.toml").exists()
+    assert (remote / "gateway" / "config.toml.example").exists()
+
+
+def test_help_documents_issuance() -> None:
+    result = subprocess.run([str(SCRIPT), "--help"], capture_output=True, text=True)
+
+    assert result.returncode == 0
+    assert re.search(r"^\s+--issuance\b", result.stderr, re.M)
+    assert "DEPLOY_ISSUANCE=1" in result.stderr
+    assert "gateway/config.toml" in result.stderr

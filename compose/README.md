@@ -822,24 +822,29 @@ A bad value is a boot refusal (exit 78) with the key named in the log.
 `CORP_GATEWAY_ISSUE_*` key and mounts no config file, so a subscription deploy
 without Keycloak is unaffected. To turn issuance on:
 
-1. `cp gateway/config.toml.example gateway/config.toml` and edit the team map
+1. On the server, in the deploy directory: `cp gateway/config.toml.example
+   gateway/config.toml` and edit the team map
    (`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`). It is a TOML table, so it can only live
    in this file. Order matters: the first listed group the user belongs to wins.
-   `gateway/config.toml` is gitignored.
+   `gateway/config.toml` is gitignored, and `deploy.sh` never syncs it: the
+   server's copy is the only copy.
 2. Set the scalar keys — at least `CORP_GATEWAY_ISSUE_OIDC_ISSUER`, `_AUDIENCE`
    and `_CLIENT_ID` — in `.env` (the commented block in `.env.example`) or in
    `gateway/config.toml`. The overlay passes them by bare name, so an unset key
    in `.env` does not shadow the file; set each key in one place only.
-3. Start with the overlay:
-   `docker compose -f docker-compose.yml -f docker-compose.oauth.yml -f docker-compose.issuance.yml up -d`
-   (or uncomment the three-file `COMPOSE_FILE` line in `.env` for the autostart
-   unit).
+3. Deploy with the overlay from your laptop:
+   `scripts/deploy/deploy.sh --host user@server --issuance up`
+   (or `DEPLOY_ISSUANCE=1`). It refuses before it changes anything if
+   `gateway/config.toml` is missing on the server, and refuses `--mode
+   virtual-keys`. Pass `--issuance` to every later `logs`/`status`/`down`/
+   `restart` run too. Without the script, run this on the server:
+   `docker compose -f docker-compose.yml -f docker-compose.oauth.yml -f docker-compose.issuance.yml up -d`.
+   For the autostart unit, uncomment the three-file `COMPOSE_FILE` line in `.env`.
 
 The overlay mounts `./gateway/config.toml` read-only at
 `/etc/corp-llm-gateway/config.toml` and sets `CORP_LLM_GATEWAY_CONFIG_FILE` to
 that path. A missing `gateway/config.toml` fails `up` rather than booting with
-issuance off. `scripts/deploy/deploy.sh` does not add this overlay yet: run the
-command above on the server. Keys, defaults and ranges:
+issuance off. Keys, defaults and ranges:
 `docs/ops/configuration.md`, "Developer token issuance"; Keycloak setup:
 `docs/ops/install.md`, "Developer onboarding". The `corp_tokens` schema staged
 by `deploy.sh` carries the issuance columns, but init scripts run only on an

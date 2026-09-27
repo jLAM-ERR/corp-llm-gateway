@@ -203,6 +203,9 @@ waits for the healthchecks.
 # mode B — subscription, the production mode (the default)
 scripts/deploy/deploy.sh --host user@server up
 
+# mode B + developer token issuance (docker-compose.issuance.yml)
+scripts/deploy/deploy.sh --host user@server --issuance up
+
 # mode A — API keys, a test posture only
 scripts/deploy/deploy.sh --host user@server --mode virtual-keys up
 ```
@@ -210,14 +213,21 @@ scripts/deploy/deploy.sh --host user@server --mode virtual-keys up
 **The same `--mode` must be passed to every later run against that host** —
 `logs`, `status`, `down` and `restart` all resolve the stack through this file
 list. On a mode A host, a run without `--mode virtual-keys` reports on (or
-recreates) a different stack.
+recreates) a different stack. The same holds for `--issuance`
+(`DEPLOY_ISSUANCE=1`).
+
+`--issuance` works in mode B only. It needs `gateway/config.toml` in the
+server's deploy directory (start from `compose/gateway/config.toml.example`);
+`up` refuses before it syncs or starts anything if the file is missing. The
+sync never uploads or overwrites that file. Setup and the manual three-file
+command: `compose/README.md`, "Developer token issuance".
 
 Other subcommands: `down` (volumes survive, asks for confirmation), `restart`,
 `logs`, `status`. Useful flags: `--dry-run`, `--yes`, `--dir PATH`,
 `--force-unlock`.
 
-The local `.env` is never uploaded; the server's `.env` is never touched. Keys
-and certificates are excluded from the sync.
+The local `.env` is never uploaded; the server's `.env` is never touched. Keys,
+certificates and `gateway/config.toml` are excluded from the sync.
 
 > If you deploy by hand, without the script, stage the schema before the first
 > start:

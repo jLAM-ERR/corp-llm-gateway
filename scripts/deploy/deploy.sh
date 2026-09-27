@@ -13,7 +13,8 @@
 #      scripts/deploy/bootstrap-server.sh (day 0). The local .env is NEVER
 #      sent and the server's .env is never touched: secrets live only in the
 #      server's copy. Local key material and the dev-only build overlay are
-#      excluded for the same reason.
+#      excluded for the same reason, and so is gateway/config.toml: the
+#      server owns it, a laptop copy must never overwrite it.
 #   3. Over SSH: docker compose pull && docker compose up -d, then polls the
 #      compose healthchecks and prints a status summary.
 #
@@ -34,6 +35,12 @@ COMPOSE_FILE="docker-compose.yml"
 DEPLOY_MODE="oauth"
 OAUTH_OVERLAY_FILE="docker-compose.oauth.yml"
 COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE} -f ${OAUTH_OVERLAY_FILE}"
+# --issuance (or DEPLOY_ISSUANCE=1) layers the developer token issuance overlay
+# on top of the oauth one. It mounts gateway/config.toml, which only the server
+# holds.
+DEPLOY_ISSUANCE="${DEPLOY_ISSUANCE:-0}"
+ISSUANCE_OVERLAY_FILE="docker-compose.issuance.yml"
+ISSUANCE_CONFIG="gateway/config.toml"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/compose"
@@ -92,6 +99,12 @@ Options:
                       only (nothing can issue a litellm virtual key). Pass the
                       SAME --mode to every later run against that host —
                       logs/status/down resolve the stack through this file list.
+  --issuance          Also apply docker-compose.issuance.yml (developer token
+                      issuance). oauth mode only. `up` refuses to start unless
+                      gateway/config.toml already exists in the remote deploy
+                      directory; start from compose/gateway/config.toml.example.
+                      The sync never uploads that file. Env equivalent:
+                      DEPLOY_ISSUANCE=1. Pass it to every later run, like --mode.
   --tail N            Lines of history for `logs` (default 200)
   --dry-run           Print what would change; transfers and starts nothing
   --yes               Skip the confirmation prompt (needed for `down`)
@@ -139,6 +152,10 @@ parse_args() {
                 ;;
             --mode=*)
                 DEPLOY_MODE="${1#*=}"
+                shift
+                ;;
+            --issuance)
+                DEPLOY_ISSUANCE=1
                 shift
                 ;;
             --tail)
@@ -212,6 +229,21 @@ parse_args() {
             ;;
     esac
 
+    case "$DEPLOY_ISSUANCE" in
+        0|"")
+            DEPLOY_ISSUANCE=0
+            ;;
+        1)
+            [[ "$DEPLOY_MODE" == "oauth" ]] \
+                || fatal "--issuance needs --mode oauth (got: ${DEPLOY_MODE}); the issuance
+       overlay mints X-Corp-Auth tokens for the subscription mode only."
+            COMPOSE_FILE_ARGS="${COMPOSE_FILE_ARGS} -f ${ISSUANCE_OVERLAY_FILE}"
+            ;;
+        *)
+            fatal "DEPLOY_ISSUANCE must be 0 or 1 (got: ${DEPLOY_ISSUANCE})"
+            ;;
+    esac
+
     local arg
     for arg in ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"}; do
         [[ "$arg" =~ ^[A-Za-z0-9._-]+$ ]] \
@@ -279,6 +311,20 @@ elif [ ! -f ${REMOTE_DIR}/.env ]; then echo no-env; else echo ok; fi")" \
             fatal "unexpected probe answer from ${HOST}: ${probe}"
             ;;
     esac
+}
+
+# A missing bind-mount source can come up as an empty directory, which the
+# config loader skips: issuance would boot silently off. Hence -f, checked
+# before the lock and the sync so a refused run changes nothing.
+ensure_issuance_config() {
+    (( DEPLOY_ISSUANCE )) || return 0
+    local target="${REMOTE_DIR}/${ISSUANCE_CONFIG}"
+    if ! ssh_capture "[ -f ${target} ]"; then
+        fatal "--issuance needs ${target} on ${HOST}, and this script never
+       uploads it — the server's copy is the only copy. Copy
+       compose/gateway/config.toml.example from your checkout to that path,
+       fill in the team map, then re-run this deploy."
+    fi
 }
 
 # mkdir is atomic on POSIX filesystems, so two operators cannot both win it.
@@ -354,6 +400,7 @@ rsync_args() {
         --exclude=.env \
         --exclude=.env.* \
         --exclude=docker-compose.build.yml \
+        --exclude="${ISSUANCE_CONFIG}" \
         --exclude=*.pem \
         --exclude=*.crt \
         --exclude=*.key \
@@ -378,7 +425,7 @@ sync_compose() {
     assert_env_excluded "${args[@]}"
 
     [[ -d "$COMPOSE_DIR" ]] || fatal "no compose/ directory at ${COMPOSE_DIR}"
-    info "syncing compose/ to ${HOST}:${REMOTE_DIR}/ (.env, certs and keys excluded)"
+    info "syncing compose/ to ${HOST}:${REMOTE_DIR}/ (.env, ${ISSUANCE_CONFIG}, certs and keys excluded)"
     rsync "${args[@]}" "${COMPOSE_DIR}/" "${HOST}:${REMOTE_DIR}/"
 }
 
@@ -494,6 +541,7 @@ confirm() {
 cmd_up() {
     stage_schema
     ensure_remote_ready
+    ensure_issuance_config
     acquire_lock
     sync_compose
     if (( DRY_RUN )); then

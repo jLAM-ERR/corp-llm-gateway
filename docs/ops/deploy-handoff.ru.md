@@ -205,6 +205,9 @@ HTTP-клиентом, а не через маршрут litellm.
 # режим B — подписка, production-режим (по умолчанию)
 scripts/deploy/deploy.sh --host user@server up
 
+# режим B + выдача токенов разработчикам (docker-compose.issuance.yml)
+scripts/deploy/deploy.sh --host user@server --issuance up
+
 # режим A — API-ключи, только тестовая поза
 scripts/deploy/deploy.sh --host user@server --mode virtual-keys up
 ```
@@ -212,14 +215,21 @@ scripts/deploy/deploy.sh --host user@server --mode virtual-keys up
 **Тот же `--mode` нужно передавать во все последующие запуски по этому хосту** —
 `logs`, `status`, `down`, `restart` резолвят стек через этот список файлов. На
 хосте в режиме A запуск без `--mode virtual-keys` покажет (или пересоздаст)
-другой стек.
+другой стек. То же касается `--issuance` (`DEPLOY_ISSUANCE=1`).
+
+`--issuance` работает только в режиме B. Ему нужен `gateway/config.toml` в
+каталоге развёртывания на сервере (за основу берите
+`compose/gateway/config.toml.example`); без этого файла `up` отказывает до
+синхронизации и запуска. Синхронизация этот файл никогда не загружает и не
+перезаписывает. Настройка и ручная команда с тремя файлами —
+`compose/README.ru.md`, «Выдача токенов разработчикам».
 
 Остальные подкоманды: `down` (тома сохраняются, спрашивает подтверждение),
 `restart`, `logs`, `status`. Полезные флаги: `--dry-run`, `--yes`,
 `--dir PATH`, `--force-unlock`.
 
 Локальный `.env` наверх не уезжает никогда; серверный `.env` не трогается.
-Ключи и сертификаты из синхронизации исключены.
+Ключи, сертификаты и `gateway/config.toml` из синхронизации исключены.
 
 > Если разворачиваете руками, без скрипта, — перед первым стартом положите схему:
 > `cp src/corp_llm_gateway/tokens/schema.sql compose/postgres/initdb/01-schema.sql`.

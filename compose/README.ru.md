@@ -838,25 +838,31 @@ deployment».
 `CORP_GATEWAY_ISSUE_*` и не монтирует файл конфигурации, так что развёртывание
 в режиме подписки без Keycloak это не затрагивает. Чтобы включить выдачу:
 
-1. `cp gateway/config.toml.example gateway/config.toml` и поправьте карту
-   команд (`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`). Это TOML-таблица, поэтому она
-   может жить только в этом файле. Порядок важен: побеждает первая группа из
-   списка, в которой состоит пользователь. `gateway/config.toml` в `.gitignore`.
+1. На сервере, в каталоге развёртывания: `cp gateway/config.toml.example
+   gateway/config.toml` и поправьте карту команд
+   (`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`). Это TOML-таблица, поэтому она может
+   жить только в этом файле. Порядок важен: побеждает первая группа из списка,
+   в которой состоит пользователь. `gateway/config.toml` в `.gitignore`, и
+   `deploy.sh` его никогда не синхронизирует: серверная копия — единственная.
 2. Задайте скалярные ключи — как минимум `CORP_GATEWAY_ISSUE_OIDC_ISSUER`,
    `_AUDIENCE` и `_CLIENT_ID` — в `.env` (закомментированный блок в
    `.env.example`) или в `gateway/config.toml`. Оверлей передаёт их голыми
    именами, поэтому не заданный в `.env` ключ не перекрывает файл; задавайте
    каждый ключ в одном месте.
-3. Запустите с оверлеем:
-   `docker compose -f docker-compose.yml -f docker-compose.oauth.yml -f docker-compose.issuance.yml up -d`
-   (или раскомментируйте строку `COMPOSE_FILE` с тремя файлами в `.env` для
-   юнита автозапуска).
+3. Разверните с оверлеем со своего ноутбука:
+   `scripts/deploy/deploy.sh --host user@server --issuance up`
+   (или `DEPLOY_ISSUANCE=1`). Скрипт отказывает, ничего не меняя, если на
+   сервере нет `gateway/config.toml`, и отказывает при `--mode virtual-keys`.
+   Передавайте `--issuance` и во все последующие запуски `logs`/`status`/
+   `down`/`restart`. Без скрипта выполните на сервере:
+   `docker compose -f docker-compose.yml -f docker-compose.oauth.yml -f docker-compose.issuance.yml up -d`.
+   Для юнита автозапуска раскомментируйте строку `COMPOSE_FILE` с тремя
+   файлами в `.env`.
 
 Оверлей монтирует `./gateway/config.toml` только для чтения в
 `/etc/corp-llm-gateway/config.toml` и выставляет `CORP_LLM_GATEWAY_CONFIG_FILE`
 на этот путь. Без `gateway/config.toml` падает `up`, а не старт с выключенной
-выдачей. `scripts/deploy/deploy.sh` этот оверлей пока не добавляет: выполните
-команду выше на сервере. Ключи, значения по умолчанию и диапазоны —
+выдачей. Ключи, значения по умолчанию и диапазоны —
 `docs/ops/configuration.md`, «Developer token issuance»; настройка Keycloak —
 `docs/ops/install.md`, «Developer onboarding». Схема `corp_tokens`, которую
 подкладывает `deploy.sh`, содержит issuance-колонки, но init-скрипты
