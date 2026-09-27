@@ -14,9 +14,12 @@ from __future__ import annotations
 import ast
 import json
 import os
+import socket
+import struct
 import subprocess
 import sys
 import textwrap
+import threading
 from collections.abc import Callable, Iterator
 from importlib.util import find_spec
 from pathlib import Path
@@ -603,6 +606,85 @@ def test_a_dsn_postgres_cannot_parse_exits_78_and_never_prints_it(
     assert result["litellm_imported"] is False
     assert "Postgres refused CORP_LLM_PG_DSN (ClientConfigurationError)" in result["stdout"]
     assert _NOT_A_DSN not in result["stdout"]
+
+
+_SSL_REQUEST = 80877103
+
+
+class _RejectingPgBouncer:
+    """Answers every startup message the way PgBouncer answers one carrying a
+    parameter it does not know: ErrorResponse 08P01, then close."""
+
+    def __init__(self) -> None:
+        self.startups: list[bytes] = []
+        self._sock = socket.create_server(("127.0.0.1", 0))
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            with conn:
+                self._answer(conn)
+
+    def _answer(self, conn: socket.socket) -> None:
+        def read_message() -> bytes:
+            (length,) = struct.unpack("!I", _read_exactly(conn, 4))
+            return _read_exactly(conn, length - 4)
+
+        try:
+            message = read_message()
+            if struct.unpack("!I", message[:4])[0] == _SSL_REQUEST:
+                conn.sendall(b"N")
+                message = read_message()
+        except (OSError, EOFError):
+            return
+        self.startups.append(message)
+        fields = b"SFATAL\0VFATAL\0C08P01\0Munsupported startup parameter: tcp_keepalives_idle\0\0"
+        conn.sendall(b"E" + struct.pack("!I", len(fields) + 4) + fields)
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def _read_exactly(conn: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            raise EOFError
+        data += chunk
+    return data
+
+
+def test_a_pgbouncer_that_rejects_the_keepalive_parameters_exits_78(
+    valid_config: Path, tmp_path: Path
+) -> None:
+    # Booting would answer 503 on every request until an operator changed PgBouncer.
+    _require_issuance_extras()
+    bouncer = _RejectingPgBouncer()
+    dsn = f"postgresql://gateway:pgb-pass-81d0@127.0.0.1:{bouncer.port}/gateway"
+    try:
+        result = _run(
+            _REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=dsn)
+        )
+    finally:
+        bouncer.close()
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert bouncer.startups and b"tcp_keepalives_idle" in bouncer.startups[0]
+    assert (
+        "Postgres/PgBouncer rejected a startup parameter; add tcp_keepalives_idle,"
+        "tcp_keepalives_interval,tcp_keepalives_count to ignore_startup_parameters"
+    ) in result["stdout"]
+    assert "issuance schema check skipped" not in result["stdout"]
+    assert "pgb-pass-81d0" not in result["stdout"]
+    assert "unsupported startup parameter" not in result["stdout"]
 
 
 def _blocking(module: str, script: str) -> str:

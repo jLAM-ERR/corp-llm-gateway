@@ -227,6 +227,9 @@ _TOKEN_SCHEMA_REFUSED = {
         "issuance schema check: the CORP_LLM_PG_DSN role lacks SELECT on corp_tokens ({}) "
         "— grant the gateway role SELECT, INSERT and UPDATE on corp_tokens"
     ),
+    pg_session.BOOT_REFUSE_STARTUP_PARAMETER: (
+        "issuance schema check: " + pg_session.STARTUP_PARAMETER_REJECTED + " ({})"
+    ),
 }
 
 # The index the store's replay mapping names, proven to be what the name claims:
@@ -251,7 +254,10 @@ async def _token_schema_state(dsn: str) -> str | None:
     """The schema problem to refuse on; ``None`` when the table is current."""
     import asyncpg
 
-    conn = await asyncpg.connect(dsn, timeout=_TOKEN_SCHEMA_TIMEOUT_S)
+    # The pools' own startup parameters: a PgBouncer that rejects them refuses here.
+    conn = await pg_session.connect_with_keepalives(
+        asyncpg.connect, dsn, timeout=_TOKEN_SCHEMA_TIMEOUT_S
+    )
     try:
         try:
             # Resolved the way the store's own unqualified queries resolve it.

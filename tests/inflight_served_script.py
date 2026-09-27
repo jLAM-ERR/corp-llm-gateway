@@ -163,7 +163,9 @@ class StallOnceSink(ListSink):
         self.records.append(record)
 
 
-async def _open(port: int, *, stream: bool, token: str | None, close: bool = False) -> Any:
+async def _open(
+    port: int, *, stream: bool, token: str | None, close: bool = False, call_id: str | None = None
+) -> Any:
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     body = json.dumps(
         {
@@ -176,6 +178,7 @@ async def _open(port: int, *, stream: bool, token: str | None, close: bool = Fal
         "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway\r\n"
         f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
         + (f"X-Corp-Auth: {token}\r\n" if token else "")
+        + (f"X-LiteLLM-Call-Id: {call_id}\r\n" if call_id else "")
         + ("Connection: close\r\n" if close else "")
         + "\r\n"
     )
@@ -256,6 +259,7 @@ async def main() -> None:
         return
     if SCENARIO == "isolation":
         results["shared_lookup"] = await _shared_lookup(port, stub, guardrail, sink, limiter)
+        results["shared_call_id"] = await _shared_call_id(port, stub, guardrail, sink, limiter)
         results["idle_bodies"] = await _idle_bodies(port, stub, limiter)
         await _finish(results, port, limiter, server, serving, stub_server)
         return
@@ -416,6 +420,48 @@ async def _shared_lookup(port: int, stub: Stub, guardrail: Any, sink: Any, limit
         "b_completion": b"chat.completion" in b_rest,
         "records": sorted([r["status"], r["user_id"]] for r in records),
         "pending_request_tasks": len(inflight.pending_request_tasks()),
+        "req_state_delta": len(guardrail._req_state) - base_state,
+        "inflight_after": limiter.inflight,
+    }
+
+
+CLIENT_CALL_ID = "client-chosen-call-id"
+
+
+async def _shared_call_id(port: int, stub: Stub, guardrail: Any, sink: Any, limiter: Any) -> Any:
+    """A and B send one x-litellm-call-id; A's client leaves while both are upstream."""
+    base_records = len(sink.records)
+    base_state = len(guardrail._req_state)
+    base_requests = stub.requests
+    stub.hold_release = asyncio.Event()
+    stub.reset("hold")
+    _, a_writer = await _open(port, stream=False, token=TOKEN, call_id=CLIENT_CALL_ID)
+    b_reader, b_writer = await _open(
+        port, stream=False, token=TOKEN, close=True, call_id=CLIENT_CALL_ID
+    )
+    await _until(lambda: stub.requests >= base_requests + 2)
+
+    a_writer.close()
+    await _until(lambda: limiter.inflight <= 1)
+    await asyncio.sleep(0.2)
+    stub.hold_release.set()
+    try:
+        b_status = await _status(b_reader)
+        b_rest = await asyncio.wait_for(b_reader.read(), BOUND_S)
+    finally:
+        b_writer.close()
+    stub.reset("ok")
+    await _until(lambda: limiter.inflight <= 0)
+    await asyncio.sleep(0.5)
+    records = sink.records[base_records:]
+    head = b_rest.split(b"\r\n\r\n", 1)[0].decode("latin-1").lower()
+    return {
+        "b_status": b_status,
+        "b_completion": b"chat.completion" in b_rest,
+        "b_echoed_client_call_id": CLIENT_CALL_ID in head,
+        "statuses": sorted(r["status"] for r in records),
+        "distinct_request_ids": len({r["request_id"] for r in records}),
+        "client_call_id_recorded": any(r["request_id"] == CLIENT_CALL_ID for r in records),
         "req_state_delta": len(guardrail._req_state) - base_state,
         "inflight_after": limiter.inflight,
     }

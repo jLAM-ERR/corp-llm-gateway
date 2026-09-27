@@ -9,11 +9,13 @@ response headers while litellm awaits the stalled upstream, (b) mid-SSE, (c)
 during a non-streaming call, (d) inside our pre-call hook, (e) on a zero-chunk
 stream, (f) while an audit emit is in flight.
 
-A second run (scenario ``isolation``, the default cap of 64) proves two things
-the disconnect cases cannot: a token lookup shared by two requests survives the
-disconnect of the one that started it, and 64+1 clients that announce a body and
-never send it hold no slot — a normal request is served while they idle, and each
-of them gets 408 once the body-read deadline passes.
+A second run (scenario ``isolation``, the default cap of 64) proves what the
+disconnect cases cannot: a token lookup shared by two requests survives the
+disconnect of the one that started it; two requests that send one
+``x-litellm-call-id`` each get their own id, so one's disconnect never ends the
+other; and 64+1 clients that announce a body and never send it hold no slot — a
+normal request is served while they idle, and each of them gets 408 once the
+body-read deadline passes.
 
 A third run (scenario ``budget``) sets the body byte budget to its floor, 25 MiB:
 two admitted 10 MiB bodies hold it, a third that declares 10 MiB gets 429 unread,
@@ -232,6 +234,21 @@ def test_a_shared_lookup_survives_the_disconnect_of_the_request_that_started_it(
     # A was cancelled inside its auth lookup, before it had an identity.
     assert result["records"] == [["cancelled", "unknown"], ["ok", "local-dev"]]
     assert result["pending_request_tasks"] == 0
+    assert result["req_state_delta"] == 0
+    assert result["inflight_after"] == 0
+
+
+def test_a_client_call_id_never_lets_one_disconnect_end_another_request(
+    isolated: dict[str, Any],
+) -> None:
+    result = isolated["shared_call_id"]
+
+    # litellm minted its own id for each request: the header never reached it.
+    assert result["client_call_id_recorded"] is False
+    assert result["b_echoed_client_call_id"] is False
+    assert (result["b_status"], result["b_completion"]) == (200, True)
+    assert result["statuses"] == ["cancelled", "ok"]
+    assert result["distinct_request_ids"] == 2
     assert result["req_state_delta"] == 0
     assert result["inflight_after"] == 0
 

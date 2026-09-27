@@ -48,7 +48,7 @@ from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.payload.size_threshold import OversizeContentError, should_skip_sanitization
 from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.providers import detect_provider
-from corp_llm_gateway.route_gate.inflight import bind_call_id, current_ticket
+from corp_llm_gateway.route_gate.inflight import RequestTicket, bind_call_id, current_ticket
 from corp_llm_gateway.sanitizer import (
     OpenAiToolCallDesanitizer,
     ResponsesStreamDesanitizer,
@@ -288,6 +288,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Cancelled requests whose `cancelled` record never landed, counts only:
         # a later audit() or cancel for one of them writes it.
         self._cancel_pending: OrderedDict[str, _CancelRecord] = OrderedDict()
+        # Ids whose `cancelled` record is being written; set once the write resolves.
+        self._cancel_emitting: dict[str, asyncio.Event] = {}
 
     @property
     def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
@@ -1590,6 +1592,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         error_code: str | None = None,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
+        # A `cancelled` record in flight decides the terminal record: wait for it.
+        await self._cancel_emit_resolved(request_id)
         if request_id in self._audited_ids:
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
             return
@@ -1693,8 +1697,19 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         in a bounded queue, and a later litellm event for the call, or the next
         cancel, writes the record from them. A request whose terminal record
         already went out gets nothing.
+
+        Only the cancelled request's own state is touched: state another request
+        registered under the same call id is left alone, and nothing is written.
         """
-        state = self._req_state.pop(request_id, None)
+        state = self._req_state.get(request_id)
+        if state is not None and not _cancel_reaches(state.ticket):
+            self._metrics.record_failure("route_gate")
+            logger.error(
+                "route_gate_cancel_call_id_mismatch redaction_count=%d", state.redaction_count
+            )
+            return
+        self._req_state.pop(request_id, None)
+        await self._cancel_emit_resolved(request_id)
         if request_id in self._audited_ids:
             self._cancel_pending.pop(request_id, None)
             return
@@ -1703,7 +1718,21 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             record = _CancelRecord.of(state, latency_ms)
         await self._emit_cancelled(request_id, record)
 
+    async def _cancel_emit_resolved(self, request_id: str) -> None:
+        while (emitting := self._cancel_emitting.get(request_id)) is not None:
+            await emitting.wait()
+
     async def _emit_cancelled(self, request_id: str, record: _CancelRecord) -> None:
+        resolved = asyncio.Event()
+        self._cancel_emitting[request_id] = resolved
+        try:
+            await self._emit_cancelled_once(request_id, record)
+        finally:
+            if self._cancel_emitting.get(request_id) is resolved:
+                del self._cancel_emitting[request_id]
+            resolved.set()
+
+    async def _emit_cancelled_once(self, request_id: str, record: _CancelRecord) -> None:
         event = record.event(request_id)
         try:
             await self._audit.emit(event)
@@ -2341,6 +2370,7 @@ class _RequestState:
         "request_id",
         "response_alias_exclusions",
         "team_id",
+        "ticket",
         "user_id",
     )
 
@@ -2367,11 +2397,23 @@ class _RequestState:
         self.cache_a_hit = cache_a_hit
         self.mapping = mapping
         self.response_alias_exclusions: set[str] = set()
+        # The route gate's request this state belongs to, when one is being served.
+        self.ticket: RequestTicket | None = current_ticket()
         self.error_code: str | None = None
         self.block_reason: str | None = None
         # Resolved profile layer-key (D4) — metadata for the audit trail; set
         # after profile resolution in pre_call. Empty == no profile applied.
         self.profile_ids: tuple[str, ...] = ()
+
+
+def _cancel_reaches(owner: RequestTicket | None) -> bool:
+    """Whether a cancel may end the state ``owner``'s request registered."""
+    if owner is None:
+        return True
+    canceller = current_ticket()
+    if canceller is not None:
+        return canceller is owner
+    return owner.cancelled
 
 
 def _response_mapping(state: _RequestState, *, include_bare_aliases: bool) -> StrategyResult:

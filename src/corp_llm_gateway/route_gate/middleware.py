@@ -58,6 +58,11 @@ COMPONENT = "route_gate"
 
 _BLOCKED = "E_ROUTE_BLOCKED"
 
+# litellm 1.101.0 takes litellm_call_id from this header when a client sends it
+# (proxy/common_request_processing.py). The guardrail keys per-request state and
+# the audit record on that id, so the gateway owns it: litellm always mints one.
+CALL_ID_HEADER = b"x-litellm-call-id"
+
 _STATUS: dict[str, int] = {
     ROUTE_GATE_UNLISTED: 404,
     ROUTE_GATE_LISTED: 403,
@@ -178,10 +183,10 @@ class RouteGateMiddleware:
             await self._refuse(scope, receive, send, method, path, ROUTE_GATE_UNARMED, _UNARMED_WHY)
             return
         if decision.verdict is Verdict.REWRITTEN and self.limiter is not None:
-            await self._admit(self.limiter, scope, receive, send, method, path)
+            await self._admit(self.limiter, _without_call_id(scope), receive, send, method, path)
             return
         if decision.verdict is Verdict.PASSTHROUGH or decision.verdict is Verdict.REWRITTEN:
-            await self.app(scope, receive, send)
+            await self.app(_without_call_id(scope), receive, send)
             return
         # A verdict this middleware does not know is a gate defect, not a pass.
         logger.error("route_gate_unknown_verdict method=%s", _safe_method(method))
@@ -328,6 +333,14 @@ async def _send_json(
 
 def _safe_method(method: str) -> str:
     return method if method in HTTP_METHODS else "other"
+
+
+def _without_call_id(scope: Scope) -> Scope:
+    headers = list(scope.get("headers") or ())
+    kept = [(name, value) for name, value in headers if bytes(name).lower() != CALL_ID_HEADER]
+    if len(kept) == len(headers):
+        return scope
+    return {**scope, "headers": kept}
 
 
 def _upgrade_header(scope: Scope) -> str | None:

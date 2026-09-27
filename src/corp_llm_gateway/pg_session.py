@@ -5,6 +5,12 @@ issuance schema check. asyncpg
 is optional: nothing here imports it, and an asyncpg class is only consulted when
 something already imported the driver — without it, none of its errors can be in
 flight.
+
+Every connection asks for :data:`KEEPALIVE_SERVER_SETTINGS` at startup. PgBouncer
+rejects a startup parameter it does not know ("unsupported startup parameter",
+08P01); the boot probe asks for the same ones and refuses the boot on that
+rejection. Operator remedy: add tcp_keepalives_idle,tcp_keepalives_interval,
+tcp_keepalives_count to PgBouncer's ``ignore_startup_parameters``.
 """
 
 from __future__ import annotations
@@ -33,6 +39,36 @@ KEEPALIVE_SERVER_SETTINGS = {
     "tcp_keepalives_interval": "5",
     "tcp_keepalives_count": "3",
 }
+
+STARTUP_PARAMETER_REJECTED = (
+    "Postgres/PgBouncer rejected a startup parameter; add "
+    + ",".join(KEEPALIVE_SERVER_SETTINGS)
+    + " to ignore_startup_parameters"
+)
+
+
+class StartupParameterRejectedError(Exception):
+    """The server, or a PgBouncer in front of it, refused a connect-time parameter."""
+
+    def __init__(self) -> None:
+        super().__init__(STARTUP_PARAMETER_REJECTED)
+
+
+async def connect_with_keepalives[T](
+    connect: Callable[..., Awaitable[T]], dsn: str, *, timeout: float
+) -> T:
+    """``connect(dsn)`` asking for the pools' startup parameters.
+
+    A protocol violation while connecting is the startup-parameter rejection:
+    it raises :class:`StartupParameterRejectedError`, without the driver's message.
+    """
+    try:
+        return await connect(dsn, timeout=timeout, server_settings=KEEPALIVE_SERVER_SETTINGS)
+    except Exception as exc:
+        asyncpg = sys.modules.get("asyncpg")
+        if asyncpg is not None and isinstance(exc, asyncpg.ProtocolViolationError):
+            raise StartupParameterRejectedError from None
+        raise
 
 
 async def run_on_connection[T](
@@ -187,12 +223,16 @@ BOOT_WARN = "warn"
 BOOT_REFUSE = "refuse"
 BOOT_REFUSE_TLS = "refuse-tls"
 BOOT_REFUSE_PRIVILEGE = "refuse-privilege"
+BOOT_REFUSE_STARTUP_PARAMETER = "refuse-startup-parameter"
 
 BOOT_PROBE_OUTCOMES: tuple[tuple[str, str], ...] = (
+    (f"{__name__}.StartupParameterRejectedError", BOOT_REFUSE_STARTUP_PARAMETER),
     ("ssl.SSLError", BOOT_REFUSE_TLS),  # an OSError; incl. SSLCertVerificationError
     ("asyncpg.QueryCanceledError", BOOT_REFUSE),  # 57014, an OperatorInterventionError
     ("asyncpg.InsufficientPrivilegeError", BOOT_REFUSE_PRIVILEGE),  # 42501
-    ("asyncpg.PostgresConnectionError", BOOT_WARN),  # 08xxx: dropped, failed, rejected
+    # 08xxx: dropped, failed, rejected; a mid-query 08P01 too (at connect it is
+    # StartupParameterRejectedError, above)
+    ("asyncpg.PostgresConnectionError", BOOT_WARN),
     ("asyncpg.OperatorInterventionError", BOOT_WARN),  # 57P0x: shutdown, crash, starting up
     ("asyncpg.TooManyConnectionsError", BOOT_WARN),  # 53300
     ("builtins.OSError", BOOT_WARN),  # refused, reset, unreachable, TimeoutError

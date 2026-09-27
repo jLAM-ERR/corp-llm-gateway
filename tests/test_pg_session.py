@@ -14,9 +14,14 @@ from corp_llm_gateway import pg_session
 from corp_llm_gateway.pg_session import (
     BOOT_REFUSE,
     BOOT_REFUSE_PRIVILEGE,
+    BOOT_REFUSE_STARTUP_PARAMETER,
     BOOT_REFUSE_TLS,
     BOOT_WARN,
+    KEEPALIVE_SERVER_SETTINGS,
+    STARTUP_PARAMETER_REJECTED,
+    StartupParameterRejectedError,
     boot_probe_outcome,
+    connect_with_keepalives,
     in_transaction,
     run_on_connection,
     store_unavailable,
@@ -493,3 +498,85 @@ def test_each_subclass_in_the_matrix_precedes_its_base() -> None:
     for i, earlier in enumerate(classes):
         for later in classes[i + 1 :]:
             assert not issubclass(later, earlier), (later, earlier)
+
+
+# ── the startup-parameter rejection (PgBouncer) ──────────────────────────────
+
+_PGBOUNCER_DSN = "postgresql://gw:pgb-password-3a9e@pgbouncer:6432/gw"
+
+
+def _connect_raising(exc: BaseException) -> tuple[list[dict[str, object]], object]:
+    calls: list[dict[str, object]] = []
+
+    async def connect(dsn: str, **kwargs: object) -> object:
+        calls.append({"dsn": dsn, **kwargs})
+        raise exc
+
+    return calls, connect
+
+
+async def test_the_probe_connects_with_the_pools_startup_parameters() -> None:
+    calls: list[dict[str, object]] = []
+
+    async def connect(dsn: str, **kwargs: object) -> str:
+        calls.append({"dsn": dsn, **kwargs})
+        return "conn"
+
+    assert await connect_with_keepalives(connect, _PGBOUNCER_DSN, timeout=3.0) == "conn"
+    assert calls == [
+        {"dsn": _PGBOUNCER_DSN, "timeout": 3.0, "server_settings": KEEPALIVE_SERVER_SETTINGS}
+    ]
+
+
+async def test_a_protocol_violation_at_connect_is_the_startup_parameter_rejection() -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+    rejected = asyncpg.ProtocolViolationError(
+        f"unsupported startup parameter: tcp_keepalives_idle ({_PGBOUNCER_DSN})"
+    )
+    _, connect = _connect_raising(rejected)
+
+    with pytest.raises(StartupParameterRejectedError) as caught:
+        await connect_with_keepalives(connect, _PGBOUNCER_DSN, timeout=1.0)
+
+    assert str(caught.value) == STARTUP_PARAMETER_REJECTED
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert "pgb-password-3a9e" not in str(caught.value)
+    assert boot_probe_outcome(caught.value, _PGBOUNCER_DSN) == BOOT_REFUSE_STARTUP_PARAMETER
+
+
+def test_the_rejection_names_every_startup_parameter_to_ignore() -> None:
+    assert STARTUP_PARAMETER_REJECTED == (
+        "Postgres/PgBouncer rejected a startup parameter; add tcp_keepalives_idle,"
+        "tcp_keepalives_interval,tcp_keepalives_count to ignore_startup_parameters"
+    )
+    assert all(name in STARTUP_PARAMETER_REJECTED for name in KEEPALIVE_SERVER_SETTINGS)
+
+
+def test_a_protocol_violation_mid_query_still_warns_and_boots() -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+    assert boot_probe_outcome(asyncpg.ProtocolViolationError("x")) == BOOT_WARN
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [ConnectionRefusedError("refused"), RuntimeError("x")],
+    ids=["refused", "unexpected"],
+)
+async def test_any_other_connect_failure_passes_through_unchanged(exc: BaseException) -> None:
+    _, connect = _connect_raising(exc)
+
+    with pytest.raises(type(exc)) as caught:
+        await connect_with_keepalives(connect, _PGBOUNCER_DSN, timeout=1.0)
+
+    assert caught.value is exc
+
+
+async def test_other_asyncpg_connect_failures_pass_through_unchanged() -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+    exc = asyncpg.InvalidPasswordError("x")
+    _, connect = _connect_raising(exc)
+
+    with pytest.raises(asyncpg.InvalidPasswordError) as caught:
+        await connect_with_keepalives(connect, _PGBOUNCER_DSN, timeout=1.0)
+
+    assert caught.value is exc

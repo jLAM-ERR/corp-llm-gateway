@@ -46,7 +46,7 @@ import uuid
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
-from contextvars import ContextVar, copy_context
+from contextvars import Context, ContextVar, copy_context
 from typing import Any, Protocol
 
 from corp_llm_gateway.metrics import MetricsExporter
@@ -125,11 +125,12 @@ def current_ticket() -> RequestTicket | None:
     return _TICKET.get()
 
 
-def bind_call_id(call_id: str) -> None:
-    """Record litellm's per-call id on the request being served; no-op outside one."""
+def bind_call_id(call_id: str) -> RequestTicket | None:
+    """Record litellm's per-call id on the request being served; that request's ticket."""
     ticket = _TICKET.get()
     if ticket is not None and call_id not in ticket.call_ids:
         ticket.call_ids.append(call_id)
+    return ticket
 
 
 def pending_request_tasks() -> list[asyncio.Task[Any]]:
@@ -198,6 +199,10 @@ class _Replay:
         return self._disconnected.is_set()
 
     def disconnect(self) -> None:
+        self._disconnected.set()
+
+    def complete(self) -> None:
+        # uvicorn answers http.disconnect from receive once the response is complete.
         self._disconnected.set()
 
     async def receive(self) -> Message:
@@ -304,12 +309,19 @@ class InflightLimiter:
         if self._max and self._inflight >= self._max:
             return False
         self._inflight += 1
-        self._metrics.set_inflight(self._inflight)
+        self._metric("set_inflight", self._inflight)
         return True
 
     def _release(self) -> None:
         self._inflight -= 1
-        self._metrics.set_inflight(self._inflight)
+        self._metric("set_inflight", self._inflight)
+
+    def _metric(self, name: str, *args: Any) -> None:
+        """An exporter call that never raises: a slot, a release or a hook never hangs on it."""
+        try:
+            getattr(self._metrics, name)(*args)
+        except Exception as exc:
+            logger.error("route_gate_metrics_error class=%s", type(exc).__name__)
 
     def _hold(self, held: _Held, size: int) -> bool:
         """Grow what ``held`` holds to ``size`` bytes, if the budget has room."""
@@ -320,14 +332,14 @@ class InflightLimiter:
             return False
         self._buffered += more
         held.bytes = size
-        self._metrics.set_draining_bytes(self._buffered)
+        self._metric("set_draining_bytes", self._buffered)
         return True
 
     def _give_back(self, held: _Held) -> None:
         if held.bytes:
             self._buffered -= held.bytes
             held.bytes = 0
-            self._metrics.set_draining_bytes(self._buffered)
+            self._metric("set_draining_bytes", self._buffered)
 
     async def run(
         self, scope: Scope, receive: Receive, send: Send, app: ASGIApp, *, refuse: Refuse
@@ -458,7 +470,11 @@ class InflightLimiter:
             return
         watcher.cancel()
         await _settle(watcher)
-        await downstream
+        try:
+            await downstream
+        finally:
+            if response_complete:
+                replay.complete()
 
     @staticmethod
     def _start(ticket: RequestTicket, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
@@ -531,15 +547,14 @@ class InflightLimiter:
         left = _stragglers(ticket, downstream)
         for task in left:
             _retrieve_when_done(task)
-        if not unwound or left:
-            self._metrics.record_failure(_COMPONENT)
+        incomplete = not unwound or bool(left)
+        if incomplete:
             logger.error(
                 "route_gate_cancel_incomplete request_id=%s downstream_unwound=%s pending_tasks=%d",
                 ticket.gateway_id,
                 unwound,
                 len(left),
             )
-        self._metrics.record_cancelled()
         latency_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "route_gate_request_cancelled request_id=%s phase=%s stragglers=%d latency_ms=%d",
@@ -548,15 +563,24 @@ class InflightLimiter:
             len(stragglers),
             latency_ms,
         )
-        await self._notify(ticket, latency_ms, deadline)
+        # The hook first: it is what frees the request's content.
+        try:
+            await self._notify(ticket, latency_ms, deadline)
+        finally:
+            if incomplete:
+                self._metric("record_failure", _COMPONENT)
+            self._metric("record_cancelled")
 
     async def _notify(self, ticket: RequestTicket, latency_ms: int, deadline: float) -> None:
         hook = self._cancel_hook
         if hook is None:
             return
         loop = asyncio.get_running_loop()
+        # In the request's context: the guardrail ends only state that request owns.
         calls = [
-            loop.create_task(_call_hook(hook, request_id, latency_ms))
+            loop.create_task(
+                _call_hook(hook, request_id, latency_ms), context=_ticket_context(ticket)
+            )
             for request_id in ticket.request_ids()
         ]
         # Started even with no budget left: each runs up to its first suspension.
@@ -578,10 +602,16 @@ class InflightLimiter:
                     continue
                 error = type(exc).__name__
             # Type only: an exception message can quote request content.
-            self._metrics.record_failure(_COMPONENT)
+            self._metric("record_failure", _COMPONENT)
             logger.error(
                 "route_gate_cancel_hook_failed request_id=%s error=%s", ticket.gateway_id, error
             )
+
+
+def _ticket_context(ticket: RequestTicket) -> Context:
+    context = copy_context()
+    context.run(_TICKET.set, ticket)
+    return context
 
 
 async def _call_hook(hook: CancelHook, request_id: str, latency_ms: int) -> None:
