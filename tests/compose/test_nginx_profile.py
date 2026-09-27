@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 import yaml
 
+from corp_llm_gateway.tokens.issuance import default_token_factory
 from tests.compose.nginx_allowlist import (
     GATEWAY_SNIPPET,
     RATE_LIMITED,
@@ -780,8 +781,12 @@ EDGE_ZONES = [
     "limit_conn_zone $corp_token_key zone=corp_conn:10m",
     "limit_req_zone $binary_remote_addr zone=corp_issue:1m rate=${NGINX_ISSUE_RATE}r/m",
 ]
+# Keyed on the token's shape (`ct_` + token_urlsafe(32)): limit_conn skips a key
+# over 255 bytes, and a repeated header joins into a fresh key.
 TOKEN_KEY_MAP = (
-    'map $http_x_corp_auth $corp_token_key { "" $binary_remote_addr; default $http_x_corp_auth; }'
+    "map $http_x_corp_auth $corp_token_key {"
+    ' "~^ct_[A-Za-z0-9_-]{43}$" $http_x_corp_auth;'
+    " default $binary_remote_addr; }"
 )
 
 
@@ -799,6 +804,14 @@ def test_the_http_context_defines_the_three_zones_and_the_token_key() -> None:
     for path in _every_config_file():
         if path != HTTP_TEMPLATE:
             assert not re.search(r"\blimit_(req|conn)_zone\b", path.read_text()), path.name
+
+
+def test_every_issued_token_matches_the_key_map_shape() -> None:
+    # A token the map does not recognise is keyed by address: every developer
+    # behind one NAT would share a bucket.
+    shape = re.search(r'"~\^(ct_[^"]*)\$"', HTTP_TEMPLATE.read_text()).group(1)
+    for _ in range(200):
+        assert re.fullmatch(shape, default_token_factory())
 
 
 def test_the_token_is_in_no_log_format_and_the_key_only_in_the_zones() -> None:

@@ -20,7 +20,9 @@ map $http_upgrade $connection_upgrade {
     ''      close;
 }
 
-# $host drops the port, which breaks NextAuth on a non-default port.
+# $host drops the port, which breaks NextAuth on a non-default port. Its
+# consumer is the Langfuse snippet's proxy block, not the gateway snippet
+# (which sends $host) -- not dead config.
 map $http_host $proxy_host_header {
     default $http_host;
     ''      $host;
@@ -29,9 +31,13 @@ map $http_host $proxy_host_header {
 # Per-token fairness at the edge: keyed by the corp token itself, or by the
 # client address (the real client's, via real_ip) when there is none. The key
 # lives only in these shared zones; it is in no log_format.
+# Keyed on the token's shape (`ct_` + token_urlsafe(32)), not on "any value":
+# limit_conn skips a key over 255 bytes instead of truncating it, and a repeated
+# header joins into "A, A" -- a fresh bucket, while the gateway reads the first.
+# Empty, oversize, repeated or garbage values all share the address bucket.
 map $http_x_corp_auth $corp_token_key {
-    ""      $binary_remote_addr;
-    default $http_x_corp_auth;
+    "~^ct_[A-Za-z0-9_-]{43}$" $http_x_corp_auth;
+    default                   $binary_remote_addr;
 }
 limit_req_zone $corp_token_key zone=corp_token:10m rate=${NGINX_TOKEN_RATE}r/s;
 limit_conn_zone $corp_token_key zone=corp_conn:10m;

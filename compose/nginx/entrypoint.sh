@@ -143,6 +143,8 @@ if [ "$NGINX_TLS_MODE" = behind-proxy ] && [ "$trusted_count" -eq 0 ]; then
 fi
 # The listeners are IPv4 (listen 8080) and neither geo nor set_real_ip_from
 # matches across address families: an IPv6-only list would refuse every peer.
+# This guards the family mismatch only, not reachability: 0.0.0.0/8,
+# 127.0.0.0/8 or 224.0.0.0/4 pass here and still 444 every real peer.
 if [ "$NGINX_TLS_MODE" = behind-proxy ] && [ "$ipv4_count" -eq 0 ]; then
     fail 66 "NGINX_TRUSTED_PROXIES has no IPv4 entry: the behind-proxy listeners are IPv4, so at least one dotted-quad IPv4 address/CIDR is required (::ffff:a.b.c.d never matches an IPv4 peer)"
 fi

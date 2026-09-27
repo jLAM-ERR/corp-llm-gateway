@@ -23,7 +23,7 @@ import socket
 import subprocess
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -532,7 +532,9 @@ def test_a_trusted_list_with_an_ipv4_entry_starts(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub, trusted: str
 ) -> None:
     # trust_client=False: the list is exactly this one, and the IPv4 entry in it
-    # is what admits the client — served, not just started.
+    # is what admits the client — served, not just started. This proves service
+    # for a mixed list, not the inverted IPv4 check: the three
+    # `trusted-v4-mapped-only*` refusal rows are the regression pins for that.
     trusted = trusted.format(peer=network.client_peer)
     env = {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": trusted}
     seen = len(stub_upstream.requests())
@@ -1337,19 +1339,28 @@ BIG_RESPONSE_BYTES = 8 * 1024 * 1024
 BIG_TARGET = f"/v1/models?big=1&code={PROXY_CANARY}"
 
 
-def _read_slowly(port: int, target: str) -> bytes:
-    """GET ``target`` and stall before reading, so nginx is left holding far more
-    response than its memory buffers take."""
+def _read_slowly(port: int, target: str, stalled: Callable[[], None]) -> bytes:
+    """GET ``target`` and run ``stalled`` before reading, so nginx is left holding
+    far more response than its memory buffers take."""
     request = _raw_request("GET", target, *(f"{k}: {v}" for k, v in CREDENTIALS.items()))
-    with socket.create_connection(("127.0.0.1", port), timeout=30) as conn:
+    with socket.socket() as conn:
+        # Before connect(), so the SYN already advertises the small window.
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        conn.settimeout(30)
+        conn.connect(("127.0.0.1", port))
         conn.sendall(request)
-        time.sleep(3)
+        stalled()
         chunks = []
         with contextlib.suppress(ConnectionResetError):
             while chunk := conn.recv(65536):
                 chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _wait_for_crit(nginx: Running) -> None:
+    deadline = time.monotonic() + 10
+    while "[crit]" not in nginx.log_streams()[1] and time.monotonic() < deadline:
+        time.sleep(0.1)
 
 
 def test_a_temp_file_fault_cannot_write_the_request_line_for_a_large_response(
@@ -1359,7 +1370,7 @@ def test_a_temp_file_fault_cannot_write_the_request_line_for_a_large_response(
     where a buffering proxy spills to proxy_temp."""
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         _fault_temp_files(nginx)
-        response = _read_slowly(nginx.ports[8080], BIG_TARGET)
+        response = _read_slowly(nginx.ports[8080], BIG_TARGET, lambda: time.sleep(3))
         nginx.access_log(expected=1)
         _assert_no_secret_in(nginx)
         stdout, stderr = nginx.log_streams()
@@ -1388,7 +1399,7 @@ def test_the_response_temp_file_fault_is_real_on_a_buffering_location(
     )
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         _fault_temp_files(nginx)
-        _read_slowly(nginx.ports[8080], BIG_TARGET)
+        _read_slowly(nginx.ports[8080], BIG_TARGET, lambda: _wait_for_crit(nginx))
         nginx.access_log(expected=1)
         stderr = nginx.log_streams()[1]
 
@@ -1473,12 +1484,24 @@ class Answer:
     body: bytes
 
 
-def _send_post(port: int, target: str, token: str | None = None) -> socket.socket:
-    """Send a whole request and leave its answer unread."""
-    headers = [f"X-Corp-Auth: {token}"] if token else []
+def _send_post(port: int, target: str, *tokens: str) -> socket.socket:
+    """Send a whole request, one ``X-Corp-Auth`` line per token, and leave its
+    answer unread."""
+    headers = [f"X-Corp-Auth: {token}" for token in tokens]
     conn = socket.create_connection(("127.0.0.1", port), timeout=30)
     conn.sendall(_raw_request("POST", target, *headers, body=b"{}"))
     return conn
+
+
+def _send_together(port: int, count: int, *tokens: str) -> list[socket.socket]:
+    """``count`` requests to ``/v1/messages`` written microseconds apart."""
+    request = _raw_request(
+        "POST", "/v1/messages", *(f"X-Corp-Auth: {t}" for t in tokens), body=b"{}"
+    )
+    conns = [socket.create_connection(("127.0.0.1", port), timeout=30) for _ in range(count)]
+    for conn in conns:
+        conn.sendall(request)
+    return conns
 
 
 def _answer(conn: socket.socket) -> Answer:
@@ -1515,16 +1538,16 @@ def test_a_burst_over_the_limit_is_refused_per_token_and_logs_no_token(
 ) -> None:
     """nginx admits 1 + burst at once, then one per 1/rate. At 1 r/s a burst of 3
     admits four and refuses the fifth, as long as the five arrive within a
-    second; the admitted four are held a second at the stub, so all are open
-    before any completes."""
+    second: the sockets are opened first and the requests written in a tight
+    loop. limit_req counts arrivals, not open requests, so nothing is held."""
     env = {**VALID_BEHIND_PROXY, "NGINX_TOKEN_RATE": "1", "NGINX_TOKEN_BURST": "3"}
     seen = len(stub_upstream.requests())
     with started(specs["host"], project, network, env) as nginx:
         port = nginx.ports[8080]
         boot_stderr = nginx.log_streams()[1]
-        token_a = [_send_post(port, "/v1/messages?delay=1", TOKEN_A) for _ in range(5)]
+        token_a = _send_together(port, 5, TOKEN_A)
         token_b = _send_post(port, "/v1/messages", TOKEN_B)
-        no_token = [_send_post(port, "/v1/messages?delay=1") for _ in range(5)]
+        no_token = _send_together(port, 5)
         answers_a = [_answer(conn) for conn in token_a]
         answer_b = _answer(token_b)
         answers_none = [_answer(conn) for conn in no_token]
@@ -1617,3 +1640,66 @@ def test_an_upstream_failure_on_a_limited_route_logs_no_token(
     assert answer.status == 502
     assert [(e["uri"], e["status"]) for e in entries] == [("/v1/messages", "502")]
     assert "LEAK-TOKEN" not in stdout + stderr
+
+
+# nginx's limit_conn skips a key over 255 bytes (no truncation, no limit), and
+# joins a repeated header into one value — "A, A" and "A, A, A" are two fresh
+# buckets, while the gateway authenticates the first. Only a key shaped like a
+# corp token gets its own bucket; anything else shares the address's.
+OVERSIZE_TOKEN = "ct_LEAK-TOKEN-OVERSIZE-" + "o" * 277
+
+
+@pytest.mark.parametrize(
+    ("held", "second"),
+    [
+        pytest.param((OVERSIZE_TOKEN,), (OVERSIZE_TOKEN,), id="oversize"),
+        pytest.param((TOKEN_A, TOKEN_A), (TOKEN_A, TOKEN_A, TOKEN_A), id="duplicated"),
+        pytest.param(("ct_LEAK-TOKEN-short",), ("ct_LEAK-TOKEN-other",), id="malformed"),
+    ],
+)
+def test_a_key_not_shaped_like_a_corp_token_shares_the_address_bucket(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    stub_upstream: Stub,
+    held: tuple[str, ...],
+    second: tuple[str, ...],
+) -> None:
+    assert len(OVERSIZE_TOKEN) == 300
+    env = {**VALID_BEHIND_PROXY, "NGINX_TOKEN_CONN": "1"}
+    seen = len(stub_upstream.requests())
+    with started(specs["host"], project, network, env) as nginx:
+        port = nginx.ports[8080]
+        holding = _send_post(port, "/v1/messages?delay=3", *held)
+        _wait_for_requests(stub_upstream, seen, 1)
+        refused = _answer(_send_post(port, "/v1/messages", *second))
+        tokenless = _answer(_send_post(port, "/v1/messages"))
+        # A well-formed token still has a bucket of its own.
+        own = _answer(_send_post(port, "/v1/messages", TOKEN_B))
+        first = _answer(holding)
+        stdout, stderr = nginx.log_streams()
+
+    _assert_rate_limited(refused)
+    _assert_rate_limited(tokenless)
+    assert (first.status, own.status) == (200, 200)
+    assert len(stub_upstream.requests_since(seen)) == 2
+    assert "LEAK-TOKEN" not in stdout + stderr
+
+
+def test_a_gateway_429_passes_through_the_edge_untouched(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    """``error_page 429`` answers only nginx's own refusals: the gateway's
+    ``E_CAPACITY`` reaches the client as the gateway sent it."""
+    seen = len(stub_upstream.requests())
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        answer = _answer(_send_post(nginx.ports[8080], "/v1/messages?status=429", TOKEN_A))
+        entries = nginx.access_log(expected=1)
+
+    assert answer.status == 429
+    assert json.loads(answer.body) == {"error": "E_CAPACITY"}
+    assert answer.headers["retry-after"] == "7"
+    assert answer.headers["content-type"] == "application/json"
+    assert b"E_RATE_LIMITED" not in answer.body
+    assert len(stub_upstream.requests_since(seen)) == 1
+    assert [(e["status"], e["upstream_status"]) for e in entries] == [("429", "429")]

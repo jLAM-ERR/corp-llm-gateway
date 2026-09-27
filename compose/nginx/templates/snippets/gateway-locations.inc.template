@@ -23,6 +23,9 @@ proxy_set_header Upgrade "";
 proxy_set_header Connection "";
 # $host, not the Host header: an absolute-form request line selects the server
 # by its authority, and litellm must see that name, never a foreign Host.
+# Under port routing (server_name _) any name selects the server, so $host is
+# whatever the client chose (request-line authority or Host header): an
+# explicit trade, not a bypass -- the allow-list below is the same either way.
 proxy_set_header Host $host;
 proxy_set_header X-Forwarded-Proto https;
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -86,6 +89,9 @@ location / {
     return 404;
 }
 
+# add_header here REPLACES every add_header of an enclosing level, it does not
+# merge with them: a server-level header (HSTS) must be repeated here or set at
+# the http level.
 location @rate_limited {
     default_type application/json;
     add_header Retry-After 1 always;

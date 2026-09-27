@@ -218,3 +218,24 @@ def test_the_invariant_table_has_the_same_rows_in_both_languages() -> None:
         ]
 
     assert ids(SECURITY_EN) == ids(SECURITY_RU)
+
+
+# The docs call the nginx `crit` level load-bearing for the corp token and name
+# the test that pins it; a renamed test would leave them citing nothing.
+CRIT_PIN = (
+    "tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level"
+)
+EDGE_DOCS = (
+    SECURITY_EN,
+    SECURITY_RU,
+    ROOT / "docs/ops/capacity.md",
+    ROOT / "docs/ops/capacity.ru.md",
+)
+
+
+@pytest.mark.parametrize("doc", EDGE_DOCS, ids=lambda p: str(p.relative_to(ROOT)))
+def test_the_edge_docs_cite_the_crit_pin_and_it_exists(doc: Path) -> None:
+    path, _, name = CRIT_PIN.partition("::")
+
+    assert CRIT_PIN in doc.read_text()
+    assert re.search(rf"^def {name}\(", (ROOT / path).read_text(), re.MULTILINE)

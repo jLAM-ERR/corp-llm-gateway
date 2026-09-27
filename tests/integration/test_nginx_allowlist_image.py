@@ -364,6 +364,7 @@ def test_count_tokens_is_nginxs_404_and_reaches_nothing(oauth_front_door: FrontD
         if counted or time.monotonic() > deadline:
             break
         time.sleep(0.2)
+    assert counted, f"no /v1/messages/count_tokens entry within 10 s: {entries}"
     assert [e["status"] for e in counted] == ["404"]
     assert counted[0]["upstream_status"] in ("", "-")
 

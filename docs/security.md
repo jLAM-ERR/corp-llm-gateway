@@ -1033,7 +1033,25 @@ never reaches the gateway, so it is neither audited nor counted here. The two
 codes say which layer answered: `E_RATE_LIMITED` is one token over its share,
 `E_CAPACITY` is this pod full. The token is the limiter's key only in nginx's
 shared memory; it is in no access-log field, and nginx's own "limiting requests"
-line is written at `error`, below the front door's `crit` log level.
+line is written at `error`, below the front door's `crit` log level. Only a
+value shaped like a corp token (`ct_` + 43 url-safe characters) is a key of its
+own; an empty, oversize, repeated or malformed `X-Corp-Auth` is keyed by the
+client address, because `limit_conn` skips a key over 255 bytes instead of
+limiting it, and a repeated header joins into a fresh key.
+
+**The `crit` level is what keeps the token out of stderr.** Two nginx lines at
+`error` carry the key bytes themselves: `limit_conn`'s `the value of the "…" key
+is more than 255 bytes: "<key>"` and `limit_req`'s twin at 65535 bytes. The
+shape-keyed map keeps every key far below both, so neither fires today; but a
+future change that relaxes `error_log /dev/stderr crit` (in `nginx.conf`) or
+sets `limit_req_log_level` / `limit_conn_log_level` turns the next oversize key
+into a token in the container log.
+`tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`
+pins both: `error_log` is `crit`, and no config sets either `*_log_level`. The
+one `[crit]` the limits can reach: a full `corp_conn` zone writes
+`[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone "corp_conn"` once
+per refused request, with no request context and no key, and the request gets the edge's 429. At 10m that takes on the order
+of 10^5 distinct keys in flight at once, more than nginx's `worker_connections`.
 
 **Disconnects end the request.** The limiter replays the body to litellm and
 watches the socket. A client that disconnects — during our pre-call hook, before

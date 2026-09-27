@@ -3,7 +3,8 @@
 :4000 stands in for the gateway (the harness aliases this container as
 ``litellm``): it answers 200 to any method and records what arrived; a
 ``big=1`` query parameter makes the answer 8 MiB instead of ``ok``, and
-``delay=<seconds>`` holds the answer that long after the request is recorded.
+``delay=<seconds>`` holds the answer that long after the request is recorded,
+and ``status=429`` answers the gateway's own capacity refusal instead.
 Prints one ``stub-hit`` line per request that reaches it; a :4000 line carries
 ``stub-hit <json>`` with the method, the request target exactly as sent, the
 headers, and the body's length and sha256."""
@@ -73,12 +74,24 @@ class Recording(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if "delay" in query:
             time.sleep(float(query["delay"][0]))
+        if query.get("status") == ["429"]:
+            self._capacity_refusal()
+            return
         answer = BIG_RESPONSE if query.get("big") == ["1"] else b"ok"
         self.send_response(200)
         self.send_header("Content-Length", str(len(answer)))
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(answer)
+
+    def _capacity_refusal(self) -> None:
+        answer = b'{"error":"E_CAPACITY"}'
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Retry-After", "7")
+        self.send_header("Content-Length", str(len(answer)))
+        self.end_headers()
+        self.wfile.write(answer)
 
     def __getattr__(self, name: str):
         # BaseHTTPRequestHandler dispatches to do_<METHOD>: record every method.

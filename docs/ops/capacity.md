@@ -212,11 +212,27 @@ else stops nginx at startup (exit 64, naming the key). `/healthz/live` is never
 limited: a load balancer's probe must not be told 429. The limits live in
 nginx's memory and start empty when the container restarts.
 
-- **The key.** The `X-Corp-Auth` token itself; a request without one is keyed
-  by the client address (the real client's, via `real_ip`). The token lives
-  only in nginx's shared memory: it is in no access-log field, and nginx's own
-  "limiting requests" line is written at `error`, below the front door's `crit`
-  log level, so it is never emitted.
+- **The key.** The `X-Corp-Auth` token itself when it has a corp token's shape
+  (`ct_` + 43 url-safe characters); a request without one — or with an empty,
+  oversize, repeated or malformed value — is keyed by the client address (the
+  real client's, via `real_ip`). nginx's `limit_conn` skips a key over 255
+  bytes rather than limiting it, and a repeated header joins into a fresh key,
+  so neither may be a key of its own. The token lives only in nginx's shared
+  memory: it is in no access-log field, and nginx's own "limiting requests"
+  line is written at `error`, below the front door's `crit` log level, so it is
+  never emitted.
+- **The `crit` level keeps the token out of stderr.** Two nginx lines at `error`
+  carry the key bytes themselves (`limit_conn`'s `… is more than 255 bytes:
+  "<key>"` and `limit_req`'s twin at 65535 bytes). The shape-keyed map keeps
+  them from firing today; relaxing `error_log … crit` or setting
+  `limit_req_log_level` / `limit_conn_log_level` would put tokens in the
+  container log.
+  `tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`
+  pins both. The one `[crit]` the limits can reach: a full `corp_conn` zone
+  writes `[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone
+  "corp_conn"` per refused request — no request context, no
+  key; the request gets 429. At 10m that needs about 10^5 distinct keys in
+  flight at once, more than `worker_connections`.
 - **Which answers first.** The edge. A request over a per-token limit gets
   **429** from nginx with `Retry-After: 1`, rate or in-flight alike:
 
@@ -236,8 +252,8 @@ nginx's memory and start empty when the container restarts.
 - **Behind two proxies.** nginx trusts one hop (`real_ip` without
   `real_ip_recursive`). When a request passes two proxies before nginx
   (`X-Forwarded-For: client, lb-internal`), the address nginx sees is the
-  internal load balancer's, so every request **without** a token shares one
-  bucket. That is accepted: the gateway refuses a request without a token
+  internal load balancer's, so every request **without** a well-formed token
+  shares one bucket. That is accepted: the gateway refuses a request without a token
   anyway. Requests with a token are keyed by the token and are not affected.
 - **What it does not stop.** A client that sends a different `X-Corp-Auth` on
   every request gets a new bucket each time. The per-token limits bound an
