@@ -102,6 +102,33 @@ async def test_a_receive_left_waiting_after_the_downstream_returned_gets_disconn
     assert message["type"] == "http.disconnect"
 
 
+@pytest.mark.parametrize("ending", ["returns", "raises"])
+async def test_a_receive_left_waiting_by_an_unfinished_response_gets_disconnect(
+    ending: str,
+) -> None:
+    # uvicorn answers http.disconnect once the app has returned, finished response or not.
+    leftover: list[asyncio.Future[Any]] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"a", "more_body": True})
+        leftover.append(asyncio.ensure_future(receive()))
+        if ending == "raises":
+            raise RuntimeError("downstream failed")
+
+    gate, _, _, _ = _stack(app)
+    client = _Client()
+    with contextlib.suppress(RuntimeError):
+        await gate(_scope(), client.receive, client.send)
+
+    try:
+        message = await asyncio.wait_for(leftover[0], 1)
+    finally:
+        leftover[0].cancel()
+    assert message["type"] == "http.disconnect"
+
+
 class _DeadExporter(_Metrics):
     """Every gauge and counter the limiter touches raises, every time."""
 

@@ -214,3 +214,98 @@ async def test_a_litellm_event_waiting_on_a_failed_cancel_emit_writes_the_cancel
     assert (record["status"], record["redaction_count"]) == ("cancelled", 1)
     assert guardrail._cancel_pending == {}
     assert guardrail._cancel_emitting == {}
+
+
+async def _served_with_slow_sink(
+    guardrail: Any, sink: Any, *, fail_first: bool = False
+) -> tuple[RequestTicket, asyncio.Event]:
+    ticket = RequestTicket("a" * 32)
+    await _pre_call_in(guardrail, ticket, "call-1")
+    writing = asyncio.Event()
+    write = sink.write
+    calls = 0
+
+    async def slow(record: dict[str, Any]) -> None:
+        nonlocal calls
+        calls += 1
+        writing.set()
+        await asyncio.sleep(0.1)
+        if fail_first and calls == 1:
+            raise OSError("sink down")
+        await write(record)
+
+    sink.write = slow
+    return ticket, writing
+
+
+def _worker_success_event(guardrail: Any) -> asyncio.Task[None]:
+    # litellm's logging worker: a task outside any request the route gate serves.
+    now = datetime.now(UTC)
+    return asyncio.create_task(
+        guardrail.async_log_success_event({"litellm_call_id": "call-1"}, None, now, now)
+    )
+
+
+async def test_a_cancel_during_an_in_flight_audit_emit_adds_no_cancelled_record() -> None:
+    guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
+    ticket, writing = await _served_with_slow_sink(guardrail, sink)
+    worker = _worker_success_event(guardrail)
+    await asyncio.wait_for(writing.wait(), 2)
+
+    await _cancel_in(guardrail, ticket, "call-1")
+    await worker
+
+    assert [r["status"] for r in sink.records] == ["ok"]
+    assert guardrail._req_state == {}
+    assert guardrail._audit_emitting == {}
+
+
+async def test_an_audit_during_an_in_flight_cancel_emit_adds_no_ok_record() -> None:
+    guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
+    ticket, writing = await _served_with_slow_sink(guardrail, sink)
+    cancel = asyncio.create_task(_cancel_in(guardrail, ticket, "call-1"))
+    await asyncio.wait_for(writing.wait(), 2)
+
+    await _worker_success_event(guardrail)
+    await cancel
+
+    assert [r["status"] for r in sink.records] == ["cancelled"]
+    assert guardrail._cancel_emitting == {}
+
+
+async def test_a_cancel_waiting_on_a_failed_audit_emit_writes_the_cancelled_record() -> None:
+    guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
+    ticket, writing = await _served_with_slow_sink(guardrail, sink, fail_first=True)
+    worker = _worker_success_event(guardrail)
+    await asyncio.wait_for(writing.wait(), 2)
+
+    await _cancel_in(guardrail, ticket, "call-1")
+
+    with pytest.raises(OSError):
+        await worker
+    (record,) = sink.records
+    assert (record["status"], record["redaction_count"]) == ("cancelled", 1)
+    assert guardrail._audit_emitting == {}
+
+
+async def test_a_cancel_cut_short_on_an_audit_emit_leaves_its_counts_for_the_retry() -> None:
+    guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
+    ticket, writing = await _served_with_slow_sink(guardrail, sink, fail_first=True)
+    worker = _worker_success_event(guardrail)
+    await asyncio.wait_for(writing.wait(), 2)
+    cancel = asyncio.create_task(_cancel_in(guardrail, ticket, "call-1"))
+    await asyncio.sleep(0.01)
+    # The route gate's deadline ends the hook while the audit emit still runs.
+    cancel.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancel
+    with pytest.raises(OSError):
+        await worker
+    assert guardrail._req_state == {}
+
+    now = datetime.now(UTC)
+    await guardrail.async_log_success_event({"litellm_call_id": "call-1"}, None, now, now)
+
+    (record,) = sink.records
+    assert (record["status"], record["redaction_count"]) == ("cancelled", 1)
+    assert guardrail._cancel_pending == {}

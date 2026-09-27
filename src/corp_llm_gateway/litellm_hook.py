@@ -290,6 +290,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         self._cancel_pending: OrderedDict[str, _CancelRecord] = OrderedDict()
         # Ids whose `cancelled` record is being written; set once the write resolves.
         self._cancel_emitting: dict[str, asyncio.Event] = {}
+        # Ids whose audit() record is being written; set once the write resolves.
+        self._audit_emitting: dict[str, asyncio.Event] = {}
 
     @property
     def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
@@ -1592,8 +1594,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         error_code: str | None = None,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
-        # A `cancelled` record in flight decides the terminal record: wait for it.
-        await self._cancel_emit_resolved(request_id)
+        # A record in flight decides the terminal record: wait for it.
+        await self._emits_resolved(request_id)
         if request_id in self._audited_ids:
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
             return
@@ -1655,7 +1657,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             profile_ids=(state.profile_ids if state else ()),
         )
         try:
-            await self._audit.emit(event)
+            with _emitting(self._audit_emitting, request_id):
+                await self._audit.emit(event)
         except AuditWriteAmbiguousError:
             # The sink may have already persisted this record before raising
             # (e.g. an HTTP response was accepted but reading the ack timed
@@ -1709,28 +1712,38 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             )
             return
         self._req_state.pop(request_id, None)
-        await self._cancel_emit_resolved(request_id)
+        own = _CancelRecord.of(state, latency_ms)
+        try:
+            # A record in flight (an audit() from litellm's logging worker, or
+            # another cancel) decides the terminal record: wait for it.
+            await self._emits_resolved(request_id)
+        except asyncio.CancelledError:
+            # The route gate's deadline ended the wait: if that write fails,
+            # the next litellm event for the call writes these counts.
+            if request_id not in self._audited_ids and request_id not in self._cancel_pending:
+                self._queue_cancelled(request_id, own)
+            raise
         if request_id in self._audited_ids:
             self._cancel_pending.pop(request_id, None)
             return
-        record = self._cancel_pending.get(request_id)
-        if record is None:
-            record = _CancelRecord.of(state, latency_ms)
-        await self._emit_cancelled(request_id, record)
+        await self._emit_cancelled(request_id, self._cancel_pending.get(request_id) or own)
 
-    async def _cancel_emit_resolved(self, request_id: str) -> None:
-        while (emitting := self._cancel_emitting.get(request_id)) is not None:
+    async def _emits_resolved(self, request_id: str) -> None:
+        while (
+            emitting := self._cancel_emitting.get(request_id)
+            or self._audit_emitting.get(request_id)
+        ) is not None:
             await emitting.wait()
 
     async def _emit_cancelled(self, request_id: str, record: _CancelRecord) -> None:
-        resolved = asyncio.Event()
-        self._cancel_emitting[request_id] = resolved
-        try:
+        with _emitting(self._cancel_emitting, request_id):
             await self._emit_cancelled_once(request_id, record)
-        finally:
-            if self._cancel_emitting.get(request_id) is resolved:
-                del self._cancel_emitting[request_id]
-            resolved.set()
+
+    def _queue_cancelled(self, request_id: str, record: _CancelRecord) -> None:
+        self._cancel_pending[request_id] = record
+        self._cancel_pending.move_to_end(request_id)
+        while len(self._cancel_pending) > _CANCEL_PENDING_CAP:
+            self._cancel_pending.popitem(last=False)
 
     async def _emit_cancelled_once(self, request_id: str, record: _CancelRecord) -> None:
         event = record.event(request_id)
@@ -1742,10 +1755,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             raise
         except (Exception, asyncio.CancelledError) as exc:
             # The class name only: a sink's message can quote what it was writing.
-            self._cancel_pending[request_id] = record
-            self._cancel_pending.move_to_end(request_id)
-            while len(self._cancel_pending) > _CANCEL_PENDING_CAP:
-                self._cancel_pending.popitem(last=False)
+            self._queue_cancelled(request_id, record)
             logger.error(
                 "litellm_audit_cancelled_emit_failed request_id=%s error=%s",
                 request_id,
@@ -2404,6 +2414,19 @@ class _RequestState:
         # Resolved profile layer-key (D4) — metadata for the audit trail; set
         # after profile resolution in pre_call. Empty == no profile applied.
         self.profile_ids: tuple[str, ...] = ()
+
+
+@contextlib.contextmanager
+def _emitting(table: dict[str, asyncio.Event], request_id: str) -> Iterator[None]:
+    """Mark ``request_id`` as being written in ``table`` until the write resolves."""
+    resolved = asyncio.Event()
+    table[request_id] = resolved
+    try:
+        yield
+    finally:
+        if table.get(request_id) is resolved:
+            del table[request_id]
+        resolved.set()
 
 
 def _cancel_reaches(owner: RequestTicket | None) -> bool:

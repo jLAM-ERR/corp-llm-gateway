@@ -468,6 +468,21 @@ async def _shared_call_id(port: int, stub: Stub, guardrail: Any, sink: Any, limi
 
 
 IDLE_SOCKETS = 65
+# Slack past the body-read deadline for the refusals to reach the client.
+REFUSAL_SLACK_S = 3.0
+
+
+async def _response(reader: asyncio.StreamReader, bound: float) -> tuple[int, bytes]:
+    """One whole HTTP response: status, then the body its Content-Length names."""
+    async with asyncio.timeout(max(bound, 0.0)):
+        status = int((await reader.readline()).split()[1])
+        length = None
+        while (line := await reader.readline()) not in (b"\r\n", b""):
+            name, _, value = line.decode("latin-1").partition(":")
+            if name.strip().lower() == "content-length":
+                length = int(value.strip())
+        body = await (reader.readexactly(length) if length is not None else reader.read())
+    return status, body
 
 
 async def _idle_bodies(port: int, stub: Stub, limiter: Any) -> Any:
@@ -483,7 +498,10 @@ async def _idle_bodies(port: int, stub: Stub, limiter: Any) -> Any:
         writer.write(head)
         await writer.drain()
         idle.append((reader, writer))
+    # Every body-read deadline has started once all of them count as draining.
     await _until(lambda: limiter.draining >= IDLE_SOCKETS)
+    all_draining = time.monotonic()
+    refusals_due = all_draining + limiter.body_read_s + REFUSAL_SLACK_S
     samples: list[int] = []
     sampling = True
 
@@ -505,13 +523,20 @@ async def _idle_bodies(port: int, stub: Stub, limiter: Any) -> Any:
     draining_after_normal = limiter.draining
     await _until(lambda: limiter.inflight <= 0)
     sampling = True
-    statuses = []
-    first_body = b""
-    for index, (reader, _) in enumerate(idle):
-        statuses.append(await _status(reader))
-        if index == 0:
-            first_body = await asyncio.wait_for(reader.read(65536), BOUND_S)
-    refused_s = time.monotonic() - opened
+    statuses: list[int | None] = []
+    timeout_codes = 0
+    first_refused_s = None
+    for reader, _ in idle:
+        try:
+            status, body = await _response(reader, refusals_due - time.monotonic())
+        except (TimeoutError, OSError, ValueError, IndexError, asyncio.IncompleteReadError):
+            statuses.append(None)
+            continue
+        if first_refused_s is None:
+            first_refused_s = time.monotonic() - opened
+        statuses.append(status)
+        timeout_codes += b"E_BODY_TIMEOUT" in body
+    refused_after_draining_s = time.monotonic() - all_draining
     sampler.cancel()
     for _, writer in idle:
         writer.close()
@@ -529,10 +554,11 @@ async def _idle_bodies(port: int, stub: Stub, limiter: Any) -> Any:
         "normal_done_s": normal_done,
         "normal_latency_s": normal_latency,
         "draining_after_normal": draining_after_normal,
-        "statuses": sorted(set(statuses)),
+        "statuses": sorted({str(status) for status in statuses}),
         "count": len(statuses),
-        "refused_s": refused_s,
-        "body_timeout_code": b"E_BODY_TIMEOUT" in first_body,
+        "first_refused_s": first_refused_s,
+        "refused_after_draining_s": refused_after_draining_s,
+        "body_timeout_codes": timeout_codes,
         "draining_after": limiter.draining,
     }
 

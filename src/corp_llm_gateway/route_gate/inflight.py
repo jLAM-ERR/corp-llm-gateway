@@ -202,7 +202,7 @@ class _Replay:
         self._disconnected.set()
 
     def complete(self) -> None:
-        # uvicorn answers http.disconnect from receive once the response is complete.
+        # uvicorn answers http.disconnect from receive once the app has returned.
         self._disconnected.set()
 
     async def receive(self) -> Message:
@@ -473,8 +473,7 @@ class InflightLimiter:
         try:
             await downstream
         finally:
-            if response_complete:
-                replay.complete()
+            replay.complete()
 
     @staticmethod
     def _start(ticket: RequestTicket, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:

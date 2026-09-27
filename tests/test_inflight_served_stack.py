@@ -272,9 +272,11 @@ def test_idle_bodies_get_408_once_the_deadline_passes(isolated: dict[str, Any]) 
     result = isolated["idle_bodies"]
 
     assert result["count"] == 65
-    assert result["statuses"] == [408]
-    assert result["body_timeout_code"] is True
-    assert BODY_READ_S <= result["refused_s"] < BODY_READ_S + 5
+    assert result["statuses"] == ["408"]
+    assert result["body_timeout_codes"] == 65
+    # No refusal before the first deadline; all of them within 3 s of the last one.
+    assert result["first_refused_s"] >= BODY_READ_S
+    assert result["refused_after_draining_s"] <= BODY_READ_S + 3
     assert result["draining_after"] == 0
     text = isolated["metrics"]["text"]
     assert 'corp_llm_gateway_blocked_requests_total{block_reason="body_timeout"} 65.0' in text
