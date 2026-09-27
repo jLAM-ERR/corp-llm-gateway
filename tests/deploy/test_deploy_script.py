@@ -86,8 +86,15 @@ def _stub_bin(tmp_path: Path, *, ssh_mode: str = "exec") -> Path:
     _write_stub(
         bin_dir / "docker",
         'printf \'%s\\n\' "$*" >> "$DOCKER_LOG"\n'
+        'if [ -n "${COMPOSE_PROFILES+set}" ]; then\n'
+        '    printf \'%s\\n\' "COMPOSE_PROFILES=${COMPOSE_PROFILES}" >> "$DOCKER_ENV_LOG"\n'
+        "fi\n"
         'for a in "$@"; do\n'
         '    if [ "$a" = "ps" ]; then printf \'%s\\n\' "${FAKE_PS_JSON:-[]}"; exit 0; fi\n'
+        '    if [ "$a" = "config" ]; then\n'
+        '        [ -z "${FAKE_CONFIG_FAIL:-}" ] || exit 1\n'
+        "        printf '%s\\n' \"$FAKE_SERVICES\"; exit 0\n"
+        "    fi\n"
         "done\n",
     )
     return bin_dir
@@ -102,10 +109,15 @@ def _env(tmp_path: Path, bin_dir: Path, ps: list[dict[str, str]] | str | None = 
     import os
 
     env = dict(os.environ)
+    # The laptop's own value would reach the exec-mode ssh stub, which a real
+    # ssh never forwards.
+    env.pop("COMPOSE_PROFILES", None)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["SSH_LOG"] = str(tmp_path / "ssh.log")
     env["RSYNC_LOG"] = str(tmp_path / "rsync.log")
     env["DOCKER_LOG"] = str(tmp_path / "docker.log")
+    env["DOCKER_ENV_LOG"] = str(tmp_path / "docker-env.log")
+    env["FAKE_SERVICES"] = "\n".join(row["Service"] for row in HEALTHY_PS)
     real_rsync = shutil.which("rsync", path="/usr/bin:/bin:/usr/local/bin")
     env["RSYNC_REAL"] = real_rsync or "/usr/bin/rsync"
     env["RSYNC_HOST_PREFIX"] = f"{HOST}:"
@@ -1013,3 +1025,343 @@ def test_help_documents_issuance() -> None:
     assert re.search(r"^\s+--issuance\b", result.stderr, re.M)
     assert "DEPLOY_ISSUANCE=1" in result.stderr
     assert "gateway/config.toml" in result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# the nginx front door: .env-driven profile, out-of-band certificates
+# --------------------------------------------------------------------------- #
+
+CERT_EXCLUDES = ("*.pem", "*.crt", "*.key", "*.p12", "*.pfx")
+# Names NGINX_TLS_CERT / NGINX_TLS_KEY accept that no extension rule catches.
+NGINX_CERT_FILES = ("x.pem", "x.key", "privkey", "server.cer")
+UNIT = ROOT / "scripts" / "deploy" / "corp-llm-gateway.service"
+
+
+def _with_nginx_tree(repo: Path) -> Path:
+    """The real compose/nginx/ with a laptop's certificate files in certs/."""
+    nginx = repo / "compose" / "nginx"
+    shutil.copytree(
+        ROOT / "compose" / "nginx",
+        nginx,
+        ignore=lambda folder, names: (
+            [name for name in names if name != "README.md"]
+            if Path(folder).name == "certs"
+            else ["__pycache__"]
+        ),
+    )
+    for name in NGINX_CERT_FILES:
+        (nginx / "certs" / name).write_text("-----BEGIN PRIVATE KEY-----\n")
+    return nginx
+
+
+def _itemized_files(stdout: str) -> set[str]:
+    return set(re.findall(r"^>f\S*\s+(\S.*)$", stdout, re.M))
+
+
+def test_rsync_keeps_the_five_extension_excludes_and_adds_the_certs_dir(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "--dry-run", "up"])
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    args = _log(tmp_path, "rsync.log").splitlines()
+    for pattern in CERT_EXCLUDES:
+        assert f"--exclude={pattern}" in args, pattern
+    # rsync applies the first matching rule: the README include must come first.
+    readme = args.index("--include=nginx/certs/README.md")
+    assert readme < args.index("--exclude=nginx/certs/*")
+
+
+def test_a_dry_run_would_send_the_nginx_config_and_no_certificate(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    nginx = _with_nginx_tree(repo)
+    (nginx / "leftover.pem").write_text("-----BEGIN CERTIFICATE-----\n")
+
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "--dry-run", "up"])
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    sent = _itemized_files(result.stdout)  # type: ignore[attr-defined]
+    templates = {
+        path.relative_to(repo / "compose").as_posix()
+        for path in (nginx / "templates").rglob("*")
+        if path.is_file()
+    }
+    assert templates, "the copied tree has no templates"
+    expected = {"nginx/nginx.conf", "nginx/entrypoint.sh", "nginx/certs/README.md", *templates}
+    assert expected <= sent, expected - sent
+    for name in NGINX_CERT_FILES:
+        assert f"nginx/certs/{name}" not in sent, name
+    assert "nginx/leftover.pem" not in sent, "the extension excludes still hold outside certs/"
+    assert not (remote / "nginx").exists(), "a dry run transfers nothing"
+
+
+def test_a_sync_keeps_the_servers_certificates_and_sends_none_of_the_laptops(
+    tmp_path: Path,
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    _with_nginx_tree(repo)
+    (remote / "nginx" / "certs").mkdir(parents=True)
+    (remote / "nginx" / "certs" / "gateway.key").write_text("server key\n")
+
+    result = _call(
+        "sync_compose",
+        tmp_path,
+        remote_dir=remote,
+        compose_dir=repo / "compose",
+        script=repo / "scripts" / "deploy" / "deploy.sh",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    certs = remote / "nginx" / "certs"
+    assert sorted(path.name for path in certs.iterdir()) == ["README.md", "gateway.key"]
+    assert (certs / "gateway.key").read_text() == "server key\n"
+    assert (remote / "nginx" / "entrypoint.sh").exists()
+
+
+def test_the_script_never_sets_a_profile(script_text: str) -> None:
+    code = _code_lines(script_text)
+    assert "--profile" not in code
+    for pattern in (
+        r"\bCOMPOSE_PROFILES=",
+        r"\bexport\s+[^\n]*\bCOMPOSE_PROFILES\b",
+        r"\bunset\s+[^\n]*\bCOMPOSE_PROFILES\b",
+    ):
+        assert not re.search(pattern, code), pattern
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["up"], ["--yes", "down"], ["--yes", "restart"], ["logs"], ["status"]],
+    ids=["up", "down", "restart", "logs", "status"],
+)
+def test_no_remote_command_carries_a_profile(argv: list[str], tmp_path: Path) -> None:
+    # The server's .env is the only switch; a flag or an environment value here
+    # would override it and diverge from what the boot-time unit starts.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), *argv], ps=HEALTHY_PS)
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    remote_commands = _log(tmp_path, "ssh.log") + _log(tmp_path, "docker.log")
+    assert "compose" in _log(tmp_path, "docker.log")
+    assert "--profile" not in remote_commands
+    assert "COMPOSE_PROFILES" not in remote_commands
+    assert _log(tmp_path, "docker-env.log") == "", "COMPOSE_PROFILES reached docker"
+
+
+def test_up_refuses_both_front_doors_before_the_pull(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=HEALTHY_PS,
+        env_extra={"FAKE_SERVICES": "litellm\nnginx\npostgres\nnginx-ports"},
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    stderr = result.stderr  # type: ignore[attr-defined]
+    assert "both nginx nginx-ports" in stderr
+    assert "Pick ONE" in stderr
+    docker_log = _log(tmp_path, "docker.log")
+    assert f"compose {BOTH_FILES} config --services" in docker_log
+    assert "pull" not in docker_log
+    assert "up -d" not in docker_log
+    assert not (remote / ".deploy.lock").exists(), "the lock must be released on a refusal"
+
+
+@pytest.mark.parametrize("front_door", ["nginx", "nginx-ports"])
+def test_up_accepts_one_front_door(front_door: str, tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    ps = [*HEALTHY_PS, {"Service": front_door, "State": "running", "Health": "healthy"}]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": f"litellm\n{front_door}\npostgres"},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert f"compose {BOTH_FILES} up -d" in _log(tmp_path, "docker.log")
+
+
+def test_up_stops_before_the_pull_when_compose_cannot_resolve_the_stack(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=HEALTHY_PS,
+        env_extra={"FAKE_CONFIG_FAIL": "1"},
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    assert "could not resolve the stack" in result.stderr  # type: ignore[attr-defined]
+    assert "pull" not in _log(tmp_path, "docker.log")
+
+
+def test_a_dry_run_does_not_check_profiles_against_the_old_files(tmp_path: Path) -> None:
+    # Nothing was synced, so the server still holds the previous compose files.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "--dry-run", "up"],
+        env_extra={"FAKE_SERVICES": "nginx\nnginx-ports"},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert "config --services" not in _log(tmp_path, "docker.log")
+
+
+@pytest.mark.parametrize(
+    ("service", "state", "health"),
+    [
+        ("nginx", "exited", ""),
+        ("nginx", "restarting", ""),
+        ("nginx", "restarting", "unhealthy"),
+        ("nginx", "running", "unhealthy"),
+        ("nginx-ports", "exited", ""),
+        ("nginx-ports", "restarting", "starting"),
+    ],
+)
+def test_up_fails_at_once_on_a_dead_front_door_and_names_it(
+    service: str, state: str, health: str, tmp_path: Path
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    # litellm still starting sorts first: the dead front door must be named anyway.
+    ps = [
+        {"Service": "litellm", "State": "running", "Health": "starting"},
+        {"Service": service, "State": state, "Health": health},
+    ]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": f"litellm\n{service}", "CORP_GATEWAY_HEALTH_MAX_WAIT": "10"},
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    stderr = result.stderr  # type: ignore[attr-defined]
+    assert f"the nginx front door is down: {service} (state={state}" in stderr
+    assert f"scripts/deploy/deploy.sh --host {HOST} logs {service}\n" in stderr
+    # One poll plus the status table: an entrypoint refusal never heals by waiting.
+    assert _log(tmp_path, "docker.log").count("ps --all") == 2
+    assert not (remote / ".deploy.lock").exists()
+
+
+@pytest.mark.parametrize(
+    ("state", "health"),
+    [("running", "healthy"), ("running", "starting"), ("created", "")],
+)
+def test_a_live_front_door_is_polled_like_any_service(
+    state: str, health: str, tmp_path: Path
+) -> None:
+    ps = [*HEALTHY_PS, {"Service": "nginx", "State": state, "Health": health}]
+
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=ps,
+        extra="HEALTH_MAX_WAIT=1\nHEALTH_INTERVAL=1\n",
+    )
+
+    if health == "healthy":
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1
+        assert "within 1s — stuck: nginx" in result.stderr
+        assert "front door is down" not in result.stderr
+
+
+def test_only_the_front_door_fails_fast_on_exited(tmp_path: Path) -> None:
+    ps = [*HEALTHY_PS, {"Service": "litellm-exited-lookalike", "State": "exited", "Health": ""}]
+
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=ps,
+        extra="HEALTH_MAX_WAIT=1\nHEALTH_INTERVAL=1\n",
+    )
+
+    assert result.returncode == 1
+    assert "front door is down" not in result.stderr
+
+
+def test_the_boot_time_unit_still_runs_a_bare_compose_up() -> None:
+    exec_start = [line for line in UNIT.read_text().splitlines() if line.startswith("ExecStart=")]
+    assert exec_start == ["ExecStart=/usr/bin/docker compose up -d"]
+
+
+@pytest.mark.parametrize(
+    "compose_file",
+    [
+        None,
+        "docker-compose.yml:docker-compose.oauth.yml",
+        "docker-compose.yml:docker-compose.oauth.yml:docker-compose.issuance.yml",
+    ],
+    ids=["mode-a", "mode-b", "mode-b-issuance"],
+)
+@pytest.mark.parametrize("profiles", [None, "nginx", "nginx-ports"])
+def test_the_reboot_path_starts_what_the_env_file_selects(
+    profiles: str | None, compose_file: str | None, tmp_path: Path
+) -> None:
+    # The unit's bare command, no -f and no --profile: only the .env decides.
+    import os
+
+    from tests.compose.nginx_support import (
+        CONFIG_EXAMPLE,
+        ENTRYPOINT_KEYS,
+        _interpolated_names,
+        require_compose_cli,
+    )
+    from tests.compose.test_oauth_overlay import MODE_A_ONLY_KEYS, REQUIRED_ENV
+
+    require_compose_cli()
+    project = tmp_path / "compose"
+    shutil.copytree(ROOT / "compose", project)
+    shutil.copy(CONFIG_EXAMPLE, project / "gateway" / "config.toml")
+    lines = [f"{key}=render-fixture" for key in REQUIRED_ENV]
+    if compose_file is not None:
+        lines.append(f"COMPOSE_FILE={compose_file}")
+    if profiles is not None:
+        lines.append(f"COMPOSE_PROFILES={profiles}")
+    (project / ".env").write_text("\n".join(lines) + "\n")
+    stripped = _interpolated_names() | set(MODE_A_ONLY_KEYS) | set(ENTRYPOINT_KEYS)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in stripped and not key.startswith("COMPOSE_")
+    }
+
+    result = subprocess.run(
+        ["docker", "compose", "config", "--services"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    services = set(result.stdout.split())
+    assert "litellm" in services
+    assert services & {"nginx", "nginx-ports"} == ({profiles} if profiles else set())

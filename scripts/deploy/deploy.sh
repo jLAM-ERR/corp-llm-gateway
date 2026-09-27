@@ -41,6 +41,15 @@ COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE} -f ${OAUTH_OVERLAY_FILE}"
 DEPLOY_ISSUANCE="${DEPLOY_ISSUANCE:-0}"
 ISSUANCE_OVERLAY_FILE="docker-compose.issuance.yml"
 ISSUANCE_CONFIG="gateway/config.toml"
+# The front door's TLS certificate and key are installed on the server by hand;
+# only the README in that directory is synced.
+NGINX_CERTS_DIR="nginx/certs"
+NGINX_CERTS_README="${NGINX_CERTS_DIR}/README.md"
+# The two front-door services. COMPOSE_PROFILES in the server's .env picks at
+# most one of them; this script never sets, exports or clears it, because a
+# value here would override that file and diverge from what the boot-time
+# unit (a bare `docker compose up -d`) starts.
+NGINX_SERVICES=(nginx nginx-ports)
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/compose"
@@ -390,7 +399,10 @@ assert_env_excluded() {
 }
 
 rsync_args() {
-    # Order matters: the include is matched before the .env* excludes.
+    # Order matters: rsync applies the first rule that matches, so each include
+    # sits before the exclude it carves out of. nginx/certs/ is excluded by
+    # name, not by extension: NGINX_TLS_CERT / NGINX_TLS_KEY may name a file
+    # `privkey` or `server.cer` (mirrors .gitignore).
     printf '%s\n' \
         --archive \
         --compress \
@@ -401,6 +413,8 @@ rsync_args() {
         --exclude=.env.* \
         --exclude=docker-compose.build.yml \
         --exclude="${ISSUANCE_CONFIG}" \
+        --include="${NGINX_CERTS_README}" \
+        --exclude="${NGINX_CERTS_DIR}/*" \
         --exclude=*.pem \
         --exclude=*.crt \
         --exclude=*.key \
@@ -425,7 +439,7 @@ sync_compose() {
     assert_env_excluded "${args[@]}"
 
     [[ -d "$COMPOSE_DIR" ]] || fatal "no compose/ directory at ${COMPOSE_DIR}"
-    info "syncing compose/ to ${HOST}:${REMOTE_DIR}/ (.env, ${ISSUANCE_CONFIG}, certs and keys excluded)"
+    info "syncing compose/ to ${HOST}:${REMOTE_DIR}/ (.env, ${ISSUANCE_CONFIG}, ${NGINX_CERTS_DIR}/, certs and keys excluded)"
     rsync "${args[@]}" "${COMPOSE_DIR}/" "${HOST}:${REMOTE_DIR}/"
 }
 
@@ -443,6 +457,24 @@ service_states() {
                     | @tsv'
 }
 
+is_front_door() {
+    local name
+    for name in "${NGINX_SERVICES[@]}"; do
+        if [[ "$1" == "$name" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The front door's entrypoint exits 64-69 on a bad NGINX_* key or a missing
+# certificate, and `restart: unless-stopped` then cycles it through
+# "restarting". Neither heals by waiting, so neither waits out the timeout.
+front_door_is_down() {
+    local state="$1" health="$2"
+    [[ "$state" == "exited" || "$state" == "restarting" || "$health" == "unhealthy" ]]
+}
+
 wait_for_healthcheck() {
     local max_wait="$HEALTH_MAX_WAIT"
     local interval="$HEALTH_INTERVAL"
@@ -453,7 +485,7 @@ wait_for_healthcheck() {
 
     while (( elapsed < max_wait )); do
         local all_healthy=true
-        local states service state health
+        local states service state health down_service=""
         stuck=""
         states="$(service_states || true)"
 
@@ -462,6 +494,11 @@ wait_for_healthcheck() {
             stuck="none reported"
         else
             while IFS=$'\t' read -r service state health; do
+                if is_front_door "$service" && front_door_is_down "$state" "$health"; then
+                    down_service="$service"
+                    stuck="${service} (state=${state:-?} health=${health:-none})"
+                    break
+                fi
                 # A service that DECLARES a healthcheck must actually report
                 # "healthy": "starting" is not healthy yet and can still flip to
                 # "unhealthy", so accepting it ended the wait on the first poll.
@@ -475,9 +512,15 @@ wait_for_healthcheck() {
                     continue
                 fi
                 all_healthy=false
-                stuck="${service} (state=${state:-?} health=${health:-none})"
-                break
+                [[ -n "$stuck" ]] || stuck="${service} (state=${state:-?} health=${health:-none})"
             done <<< "$states"
+        fi
+
+        if [[ -n "$down_service" ]]; then
+            print_status
+            fatal "the nginx front door is down: ${stuck}.
+       Its entrypoint names the setting it refused in one log line. Read it with:
+       scripts/deploy/deploy.sh --host ${HOST} logs ${down_service}"
         fi
 
         if [[ "$all_healthy" == "true" ]]; then
@@ -538,6 +581,26 @@ confirm() {
 # that combination at boot with a named cause
 # (settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE), and wait_for_healthcheck below
 # surfaces it as a failed deploy. See docs/ops/deployment-modes.md.
+# Runs after the sync, so it checks the compose files `up` is about to start.
+# `config --services` prints service names only, never a value, so the
+# server's .env stays unread here too.
+ensure_one_front_door() {
+    local services name enabled=()
+    services="$(ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} config --services")" \
+        || fatal "docker compose could not resolve the stack in ${HOST}:${REMOTE_DIR} (its
+       error is above); nothing was pulled or started."
+    while IFS= read -r name; do
+        if is_front_door "$name"; then
+            enabled+=("$name")
+        fi
+    done <<< "$services"
+    if (( ${#enabled[@]} > 1 )); then
+        fatal "COMPOSE_PROFILES in ${HOST}:${REMOTE_DIR}/.env enables both ${enabled[*]}.
+       Pick ONE: nginx (host routing) or nginx-ports (no DNS). Both publish
+       NGINX_PORT, so the second would fail to start. Nothing was pulled or started."
+    fi
+}
+
 cmd_up() {
     stage_schema
     ensure_remote_ready
@@ -548,6 +611,7 @@ cmd_up() {
         info "[dry-run] would pull images and start the stack in ${REMOTE_DIR}"
         return 0
     fi
+    ensure_one_front_door
     ssh_run "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} pull \
 && docker compose ${COMPOSE_FILE_ARGS} up -d"
     wait_for_healthcheck
