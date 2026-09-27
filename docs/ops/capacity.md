@@ -153,9 +153,13 @@ mid-stream — the gateway:
    `E_CLIENT_DISCONNECTED` (counts only), counted in
    `gateway_cancelled_requests_total`; steps 2 and 3 share one more grace, so a
    slot is held **at most 2 × `CORP_LLM_CANCEL_GRACE_SECONDS`** after a
-   disconnect. If the audit sink fails or runs out of that budget, the
-   request's state is kept and the next litellm event for it writes the terminal
-   record instead;
+   disconnect. The request's content (its placeholder mapping) is dropped at
+   once, whatever the sink does. If the sink fails or runs out of that budget,
+   only the record's counts are kept (at most 4096 such requests, oldest dropped
+   first) and the next litellm event for the request, or the next cancel, writes
+   the record from them. A pre-call litellm reaches after the cancel is refused
+   with 408 `E_CLIENT_DISCONNECTED` and writes no second record (litellm 1.101.0
+   serves any status outside 400-599 as 500, so not 499);
 4. frees the slot — once, whatever happened above.
 
 Measured on a real socket (loopback, stalled upstream stub): the slot is back

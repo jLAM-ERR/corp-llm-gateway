@@ -452,7 +452,9 @@ async def _idle_bodies(port: int, stub: Stub, limiter: Any) -> Any:
     _, gauge_text = await _metrics(port)
     sampling = False
     normal_started = time.monotonic() - opened
+    request_start = time.monotonic()
     normal = await _complete(port, stub, stream=False)
+    normal_latency = time.monotonic() - request_start
     normal_done = time.monotonic() - opened
     draining_after_normal = limiter.draining
     await _until(lambda: limiter.inflight <= 0)
@@ -479,6 +481,7 @@ async def _idle_bodies(port: int, stub: Stub, limiter: Any) -> Any:
         "normal_status": normal[0],
         "normal_started_s": normal_started,
         "normal_done_s": normal_done,
+        "normal_latency_s": normal_latency,
         "draining_after_normal": draining_after_normal,
         "statuses": sorted(set(statuses)),
         "count": len(statuses),

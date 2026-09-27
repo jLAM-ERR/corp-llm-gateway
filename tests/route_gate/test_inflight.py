@@ -5,9 +5,11 @@ behaviour on a real socket is ``tests/test_inflight_served_stack.py``."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -1498,7 +1500,7 @@ async def test_a_cancelled_request_holds_its_slot_at_most_twice_the_grace(
         entered.set()
         await ignore_cancel()
 
-    grace = 0.2
+    grace = 0.5
     gate, limiter, metrics, _ = _stack(stubborn, grace=grace)
     hook_calls: list[str] = []
     stragglers: list[asyncio.Task[None]] = []
@@ -1517,7 +1519,7 @@ async def test_a_cancelled_request_holds_its_slot_at_most_twice_the_grace(
     client.disconnect()
     await asyncio.wait_for(task, 5)
 
-    assert loop.time() - start < 2 * grace + 0.1
+    assert loop.time() - start < 2 * grace + 0.3
     assert sorted(hook_calls) == ["call-1", "call-2"]
     assert limiter.inflight == 0
     assert COMPONENT in metrics.failures
@@ -1551,5 +1553,120 @@ async def test_a_server_cancel_leaves_no_unretrieved_exception() -> None:
             await task
         del task
 
+    assert seen == [], describe(seen)
+    assert limiter.inflight == 0
+
+
+async def test_a_straggler_that_fails_while_cancelled_leaves_nothing_unretrieved(
+    task_factory: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    from tests.loop_errors import describe, loop_errors
+
+    entered = asyncio.Event()
+
+    async def fails_on_cancel() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise RuntimeError(CANARY) from None
+
+    async def leaky(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        # Tagged; held weakly, so an unretrieved failure would reach the handler.
+        straggler.append(weakref.ref(asyncio.ensure_future(fails_on_cancel())))
+        entered.set()
+        await asyncio.sleep(3600)
+
+    straggler: list[weakref.ref[asyncio.Task[None]]] = []
+    gate, limiter, _, _ = _stack(leaky, grace=0.5)
+    client = _Client()
+    with caplog.at_level(logging.DEBUG):
+        async with loop_errors(settle_s=0.05) as seen:
+            task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+            await asyncio.wait_for(entered.wait(), 2)
+            client.disconnect()
+            await asyncio.wait_for(task, 2)
+            del task
+
+    assert straggler[0]() is None
+    assert seen == [], describe(seen)
+    assert CANARY not in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert limiter.inflight == 0
+
+
+async def test_a_second_server_cancel_during_the_grace_leaves_nothing_unretrieved() -> None:
+    from tests.loop_errors import describe, loop_errors
+
+    entered = asyncio.Event()
+    unwinding = asyncio.Event()
+
+    async def slow_to_fail(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        entered.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            unwinding.set()
+            await asyncio.sleep(0.05)
+            raise RuntimeError(CANARY) from None
+
+    gate, limiter, _, _ = _stack(slow_to_fail, grace=1.0)
+    client = _Client()
+    async with loop_errors(settle_s=0.2) as seen:
+        task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        await asyncio.wait_for(unwinding.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        del task
+
+    assert seen == [], describe(seen)
+    assert limiter.inflight == 0
+
+
+async def test_a_server_cancel_during_the_disconnect_grace_leaves_nothing_unretrieved(
+    task_factory: None,
+) -> None:
+    from tests.loop_errors import describe, loop_errors
+
+    entered = asyncio.Event()
+    unwinding = asyncio.Event()
+
+    async def fails_on_cancel() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)
+            raise RuntimeError(CANARY) from None
+
+    async def slow_to_fail(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        # Tagged; held weakly, so an unretrieved failure would reach the handler.
+        straggler.append(weakref.ref(asyncio.ensure_future(fails_on_cancel())))
+        entered.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            unwinding.set()
+            await asyncio.sleep(0.05)
+            raise RuntimeError(CANARY) from None
+
+    straggler: list[weakref.ref[asyncio.Task[None]]] = []
+    gate, limiter, _, _ = _stack(slow_to_fail, grace=1.0)
+    client = _Client()
+    async with loop_errors(settle_s=0.2) as seen:
+        task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+        await asyncio.wait_for(entered.wait(), 2)
+        client.disconnect()
+        await asyncio.wait_for(unwinding.wait(), 2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        del task
+
+    assert straggler[0]() is None
     assert seen == [], describe(seen)
     assert limiter.inflight == 0

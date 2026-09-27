@@ -445,9 +445,12 @@ class InflightLimiter:
         except asyncio.CancelledError:
             watcher.cancel()
             downstream.cancel()
-            await asyncio.wait({downstream, watcher}, timeout=self._grace)
-            _retrieve_when_done(downstream)
-            _retrieve_when_done(watcher)
+            try:
+                await asyncio.wait({downstream, watcher}, timeout=self._grace)
+            finally:
+                # Also when a second cancel cuts the grace short.
+                _retrieve_when_done(downstream)
+                _retrieve_when_done(watcher)
             raise
         if replay.disconnected and not response_complete:
             await self._cancelled(ticket, started, downstream=downstream)
@@ -492,7 +495,16 @@ class InflightLimiter:
         unwound = True
         if downstream is not None:
             downstream.cancel()
-            await asyncio.wait({downstream}, timeout=self._grace)
+            try:
+                await asyncio.wait({downstream}, timeout=self._grace)
+            except asyncio.CancelledError:
+                # The server is cancelling us too: nothing is awaited any more,
+                # so every task the request left behind is retrieved when it ends.
+                _retrieve_when_done(downstream)
+                for task in _stragglers(ticket, downstream):
+                    task.cancel()
+                    _retrieve_when_done(task)
+                raise
             unwound = downstream.done()
             if unwound and not downstream.cancelled():
                 # The client is gone: whatever the downstream raised on its way
@@ -507,16 +519,18 @@ class InflightLimiter:
         # One budget for the stragglers AND the guardrail: a slot is held at most
         # 2 x grace after a disconnect.
         deadline = loop.time() + self._grace
-        stragglers = [
-            task for task in ticket.pending() if task is not downstream and task not in _SHARED
-        ]
+        stragglers = _stragglers(ticket, downstream)
         for task in stragglers:
             task.cancel()
-        if stragglers:
-            await asyncio.wait(stragglers, timeout=self._grace)
-        left = [task for task in ticket.pending() if task is not downstream and task not in _SHARED]
+        try:
+            if stragglers:
+                await asyncio.wait(stragglers, timeout=self._grace)
+        finally:
+            for task in stragglers:
+                _retrieve_straggler(task)
+        left = _stragglers(ticket, downstream)
         for task in left:
-            task.add_done_callback(_retrieve)
+            _retrieve_when_done(task)
         if not unwound or left:
             self._metrics.record_failure(_COMPONENT)
             logger.error(
@@ -546,7 +560,13 @@ class InflightLimiter:
             for request_id in ticket.request_ids()
         ]
         # Started even with no budget left: each runs up to its first suspension.
-        _, pending = await asyncio.wait(calls, timeout=max(0.0, deadline - loop.time()))
+        try:
+            _, pending = await asyncio.wait(calls, timeout=max(0.0, deadline - loop.time()))
+        except asyncio.CancelledError:
+            for call in calls:
+                call.cancel()
+                _retrieve_when_done(call)
+            raise
         for call in calls:
             if call in pending:
                 call.cancel()
@@ -584,9 +604,27 @@ def _count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _stragglers(
+    ticket: RequestTicket, downstream: asyncio.Task[None] | None
+) -> list[asyncio.Task[Any]]:
+    return [task for task in ticket.pending() if task is not downstream and task not in _SHARED]
+
+
 def _retrieve(task: asyncio.Task[Any]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _retrieve_straggler(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.add_done_callback(_retrieve)
+        return
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        # The class name only: the task's message can quote request content.
+        logger.info("route_gate_straggler_error error=%s", type(exc).__name__)
 
 
 def _retrieve_when_done(task: asyncio.Task[Any]) -> None:

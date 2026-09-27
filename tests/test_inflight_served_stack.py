@@ -245,7 +245,8 @@ def test_idle_bodies_hold_no_slot_and_a_normal_request_is_served(
     assert result["inflight_samples_max"] == 0
     assert result["gauge_while_idle"] == ["gateway_inflight_requests 0.0"]
     assert result["normal_status"] == 200
-    assert result["normal_done_s"] < BODY_READ_S
+    # The request's own round trip, not the idle sockets' setup before it.
+    assert result["normal_latency_s"] < 1.5
     # The stall was still on when the normal request finished.
     assert result["draining_after_normal"] == 65
 

@@ -58,11 +58,12 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
 
 # Every ``gateway_failure{component}`` label value. The hook maps an error code
 # to its component (``litellm_hook._FAILURE_COMPONENT``, ``other`` for anything
-# unmapped); ``route_gate`` is the one recorded outside that map — the gate
+# unmapped); ``route_gate`` is recorded outside that map — the gate
 # refuses a route it should have forwarded (the guardrail callback never
 # registered), cannot classify one at all, or loses the refusal's audit record
-# (``route_gate/middleware.py:228-233``). Pinned against both sources in
-# tests/metrics/test_metrics.py.
+# (``route_gate/middleware.py:228-233``) — and so is ``team_config``, a team
+# config the store could not return (``litellm_hook.TEAM_CONFIG_COMPONENT``).
+# Pinned against every source in tests/metrics/test_metrics.py.
 FAILURE_COMPONENTS: tuple[str, ...] = (
     "auth",
     "corp_llm",
@@ -78,6 +79,7 @@ FAILURE_COMPONENTS: tuple[str, ...] = (
     "request",
     "route_gate",
     "sanitize",
+    "team_config",
     "token_store",
 )
 

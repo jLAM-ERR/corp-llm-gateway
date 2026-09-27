@@ -5,6 +5,7 @@ litellm's call id."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from datetime import UTC, datetime
@@ -12,11 +13,25 @@ from typing import Any
 
 import pytest
 
+from corp_llm_gateway import litellm_hook
 from corp_llm_gateway.litellm_hook import GuardrailHttpException
 from corp_llm_gateway.route_gate.inflight import _TICKET, RequestTicket
 from tests.test_litellm_hook import _build_guardrail, _data_with_token
 
 EMAIL = "alice.secret@corp.example"
+# What a pending `cancelled` record may hold: audit-safe identity and counts.
+_COUNTS_ONLY_FIELDS = {
+    "user_id",
+    "team_id",
+    "provider",
+    "model",
+    "latency_ms",
+    "redaction_count",
+    "finding_label_counts",
+    "cache_a_hit",
+    "block_reason",
+    "profile_ids",
+}
 
 
 async def _pre_called(call_id: str = "call-1") -> tuple[Any, Any, dict[str, Any]]:
@@ -91,7 +106,7 @@ async def test_an_unknown_request_id_still_gets_one_record() -> None:
     )
 
 
-async def test_a_failed_cancel_emit_keeps_the_state_for_a_later_terminal_record(
+async def test_a_failed_cancel_emit_keeps_counts_only_for_a_later_terminal_record(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     guardrail, sink, _ = await _pre_called()
@@ -101,10 +116,11 @@ async def test_a_failed_cancel_emit_keeps_the_state_for_a_later_terminal_record(
 
     sink.write = broken  # type: ignore[method-assign]
     with caplog.at_level(logging.DEBUG), pytest.raises(OSError):
-        await guardrail.on_request_cancelled("call-1")
+        await guardrail.on_request_cancelled("call-1", latency_ms=77)
 
-    # Nothing was written, so nothing is marked and the state stays.
-    assert "call-1" in guardrail._req_state
+    # The content went with the cancel; only the counts wait for a sink.
+    assert "call-1" not in guardrail._req_state
+    assert "call-1" in guardrail._cancel_pending
     assert "call-1" not in guardrail._audited_ids
     assert EMAIL not in caplog.text
     assert "OSError" in caplog.text
@@ -114,9 +130,14 @@ async def test_a_failed_cancel_emit_keeps_the_state_for_a_later_terminal_record(
     await guardrail.async_log_failure_event({"litellm_call_id": "call-1"}, None, now, now)
 
     (record,) = sink.records
-    assert record["status"] == "failed"
+    assert record["status"] == "cancelled"
+    assert record["error_code"] == "E_CLIENT_DISCONNECTED"
     assert (record["user_id"], record["team_id"], record["redaction_count"]) == ("alice", "t1", 1)
+    assert record["finding_label_counts"] == {"EMAIL": 1}
+    assert record["latency_ms"] == 77
+    assert "placeholder_list" not in record
     assert guardrail._req_state == {}
+    assert guardrail._cancel_pending == {}
     await guardrail.on_request_cancelled("call-1")
     assert len(sink.records) == 1
 
@@ -142,11 +163,13 @@ async def test_a_failed_cancel_emit_lets_a_late_event_inside_the_cancelled_reque
     finally:
         _TICKET.reset(token)
 
-    assert [r["status"] for r in sink.records] == ["failed"]
+    assert [r["status"] for r in sink.records] == ["cancelled"]
+    assert sink.records[0]["redaction_count"] == 1
     assert guardrail._req_state == {}
+    assert guardrail._cancel_pending == {}
 
 
-async def test_a_cancel_emit_cut_short_by_a_timeout_keeps_the_state() -> None:
+async def test_a_cancel_emit_cut_short_by_a_timeout_keeps_counts_only() -> None:
     guardrail, sink, _ = await _pre_called()
 
     async def stalled(record: dict[str, Any]) -> None:
@@ -156,11 +179,75 @@ async def test_a_cancel_emit_cut_short_by_a_timeout_keeps_the_state() -> None:
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(guardrail.on_request_cancelled("call-1"), 0.05)
 
-    assert "call-1" in guardrail._req_state
+    assert guardrail._req_state == {}
+    assert "call-1" in guardrail._cancel_pending
     del sink.write
     now = datetime.now(UTC)
     await guardrail.async_log_failure_event({"litellm_call_id": "call-1"}, None, now, now)
-    assert [r["status"] for r in sink.records] == ["failed"]
+    assert [r["status"] for r in sink.records] == ["cancelled"]
+    assert guardrail._cancel_pending == {}
+
+
+async def test_the_next_cancel_call_writes_a_pending_record() -> None:
+    guardrail, sink, _ = await _pre_called()
+
+    async def broken(record: dict[str, Any]) -> None:
+        raise OSError("sink down")
+
+    sink.write = broken  # type: ignore[method-assign]
+    with pytest.raises(OSError):
+        await guardrail.on_request_cancelled("call-1", latency_ms=5)
+    del sink.write
+
+    await guardrail.on_request_cancelled("call-1", latency_ms=999)
+
+    (record,) = sink.records
+    assert (record["status"], record["user_id"], record["redaction_count"]) == (
+        "cancelled",
+        "alice",
+        1,
+    )
+    assert record["latency_ms"] == 5
+    assert guardrail._cancel_pending == {}
+    assert "call-1" in guardrail._audited_ids
+
+
+async def test_a_sink_outage_during_a_disconnect_keeps_no_content() -> None:
+    guardrail, sink, _ = await _pre_called()
+    placeholders = list(guardrail._req_state["call-1"].placeholders)
+    assert placeholders
+
+    async def broken(record: dict[str, Any]) -> None:
+        raise OSError("sink down")
+
+    sink.write = broken  # type: ignore[method-assign]
+    with pytest.raises(OSError):
+        await guardrail.on_request_cancelled("call-1")
+
+    assert guardrail._req_state == {}
+    (pending,) = guardrail._cancel_pending.values()
+    held = repr(pending) + repr(dataclasses.asdict(pending))
+    assert EMAIL not in held
+    for placeholder in placeholders:
+        assert placeholder not in held
+    assert {f.name for f in dataclasses.fields(pending)} <= _COUNTS_ONLY_FIELDS
+
+
+async def test_pending_cancel_records_are_capped_oldest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(litellm_hook, "_CANCEL_PENDING_CAP", 2)
+    guardrail, sink = _build_guardrail()
+
+    async def broken(record: dict[str, Any]) -> None:
+        raise OSError("sink down")
+
+    sink.write = broken  # type: ignore[method-assign]
+    for request_id in ("a" * 32, "b" * 32, "c" * 32):
+        with pytest.raises(OSError):
+            await guardrail.on_request_cancelled(request_id)
+
+    assert list(guardrail._cancel_pending) == ["b" * 32, "c" * 32]
 
 
 async def test_an_ambiguous_cancel_emit_counts_as_written() -> None:
@@ -201,7 +288,7 @@ async def test_a_pre_call_reached_after_the_request_was_cancelled_is_refused_wit
     finally:
         _TICKET.reset(token)
 
-    assert exc.value.error_code == "E_CLIENT_DISCONNECTED"
+    assert (exc.value.status_code, exc.value.error_code) == (408, "E_CLIENT_DISCONNECTED")
     assert ticket.call_ids == []
     assert guardrail._req_state == {}
     assert sink.records == []

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from corp_llm_gateway.payload import OVERSIZE_FAIL_CLOSED
+from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.profiles import (
     CODE_SAFE_DETECTORS,
     PolicyKnobs,
@@ -48,14 +49,28 @@ if TYPE_CHECKING:
 
     InnerBuilder = Callable[[ProfileBundle], SanitizationOrchestrator]
 
+
+class TeamConfigUnavailableError(Exception):
+    """The team-config store could not be reached, or did not answer within its bound.
+
+    Carries the driver's exception class name only, never its message.
+    """
+
+    def __init__(self, error_class: str) -> None:
+        super().__init__(error_class)
+        self.error_class = error_class
+
+
 # Any profile-resolution failure is fail-closed (invariant 6): a misconfigured
-# profile must never fall through to un-profiled egress. The hook catches these.
+# profile, or a team config that cannot be read, must never fall through to
+# un-profiled egress. The hook catches these.
 PROFILE_ERRORS: tuple[type[Exception], ...] = (
     ProfileCycleError,
     ProfileDepthError,
     ProfileIntegrityError,
     ProfileNotFoundError,
     ProfileParseError,
+    TeamConfigUnavailableError,
 )
 
 # Mirror SanitizationOrchestrator's own TTL defaults so an inner orchestrator
@@ -261,3 +276,11 @@ class ProfileAwareOrchestrator:
         except TeamNotFoundError:
             # Unknown team → no profiles → the core orchestrator (today's behavior).
             return TeamConfig(team_id=team_id, name=team_id)
+        except Exception as exc:
+            # Refused, reset, or past the store's per-call bound (TimeoutError).
+            if not store_unavailable(exc):
+                raise
+            error_class = type(exc).__name__
+        # Raised outside the handler: the driver's exception, and its message,
+        # stay off the chain.
+        raise TeamConfigUnavailableError(error_class)

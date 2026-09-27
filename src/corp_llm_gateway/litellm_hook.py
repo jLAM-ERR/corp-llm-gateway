@@ -29,6 +29,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -97,6 +98,7 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     PROFILE_ERRORS,
     ProfileAwareOrchestrator,
     ResolvedProfile,
+    TeamConfigUnavailableError,
     passthrough_resolved,
 )
 from corp_llm_gateway.sanitizer.streaming import _json_string_escape, coerce_tool_index
@@ -141,6 +143,11 @@ _AUDIT_DEDUP_CAP = 4096
 
 # The error code of a request the route gate cancelled because its client left.
 E_CLIENT_DISCONNECTED = "E_CLIENT_DISCONNECTED"
+# A pre-call reached after its request was cancelled. litellm 1.101.0 serves any
+# status outside 400-599 as 500, so not nginx's 499: a client-side 4xx.
+LATE_PRE_CALL_STATUS = 408
+# `cancelled` records whose emit failed, waiting for a retry; oldest dropped past it.
+_CANCEL_PENDING_CAP = 4096
 
 # The auth lookup's own bound on the request path; past it: 503 E_STORE_UNAVAILABLE.
 AUTH_LOOKUP_BOUND_S = LOOKUP_TIMEOUT_S + 1.0
@@ -278,9 +285,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # via audit() — a failed emit + safety-net retry call audit() twice
         # for one request; the histogram must only see it once.
         self._latency_observed_ids: OrderedDict[str, None] = OrderedDict()
-        # Bounded set of cancelled request_ids whose `cancelled` record never
-        # landed: a later audit() for one of them writes instead of standing down.
-        self._cancel_unrecorded: OrderedDict[str, None] = OrderedDict()
+        # Cancelled requests whose `cancelled` record never landed, counts only:
+        # a later audit() or cancel for one of them writes it.
+        self._cancel_pending: OrderedDict[str, _CancelRecord] = OrderedDict()
 
     @property
     def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
@@ -437,7 +444,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             logger.error(
                 "route_gate_cancel_incomplete request_id=%s late_pre_call=true", request_id
             )
-            raise GuardrailHttpException(499, E_CLIENT_DISCONNECTED, "client disconnected")
+            raise GuardrailHttpException(
+                LATE_PRE_CALL_STATUS, E_CLIENT_DISCONNECTED, "client disconnected"
+            )
         # The route gate's ticket for this HTTP request learns litellm's call id,
         # so a client disconnect can find this request's state.
         bind_call_id(request_id)
@@ -745,12 +754,17 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         try:
             resolved = await self._resolve_profile(ctx.team_id)
         except PROFILE_ERRORS as exc:
-            self._record_failure(request_id, error_code="E_PROFILE_UNAVAILABLE")
+            store_down = isinstance(exc, TeamConfigUnavailableError)
+            self._record_failure(
+                request_id,
+                error_code="E_PROFILE_UNAVAILABLE",
+                component=TEAM_CONFIG_COMPONENT if store_down else None,
+            )
             logger.warning(
                 "litellm_pre_call_profile_unavailable request_id=%s team_id=%s exception=%s",
                 request_id,
                 ctx.team_id,
-                type(exc).__name__,
+                exc.error_class if store_down else type(exc).__name__,
             )
             _now = datetime.now(UTC)
             await self.audit(data, None, _now, _now, status="failed")
@@ -1579,8 +1593,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if request_id in self._audited_ids:
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
             return
+        pending = self._cancel_pending.get(request_id)
+        if pending is not None:
+            # The client left and that record never landed: it is the terminal one.
+            await self._emit_cancelled(request_id, pending)
+            return
         ticket = current_ticket()
-        if ticket is not None and ticket.cancelled and request_id not in self._cancel_unrecorded:
+        if ticket is not None and ticket.cancelled:
             # The route gate is cancelling this request; its terminal record is
             # the `cancelled` one `on_request_cancelled` writes.
             logger.debug("litellm_audit_deferred_to_cancel request_id=%s", request_id)
@@ -1667,46 +1686,37 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     async def on_request_cancelled(self, request_id: str, *, latency_ms: int = 0) -> None:
         """The terminal record of a request the route gate cancelled (client gone).
 
-        Emits one ``cancelled`` record with counts only — no placeholder list,
-        nothing of the content. Like :meth:`audit`, the id is marked audited and
-        its state popped only once the emit is confirmed (or ambiguous); after a
-        failed or cut-short emit the state stays, and a later litellm event for
-        the call writes the terminal record instead. A request whose terminal
-        record already went out gets nothing.
+        The request's state goes at once: its content never outlives the request.
+        One ``cancelled`` record is emitted with counts only — no placeholder list,
+        nothing of the content. The id is marked audited only once the emit is
+        confirmed (or ambiguous); after a failed or cut-short emit the counts wait
+        in a bounded queue, and a later litellm event for the call, or the next
+        cancel, writes the record from them. A request whose terminal record
+        already went out gets nothing.
         """
+        state = self._req_state.pop(request_id, None)
         if request_id in self._audited_ids:
-            self._req_state.pop(request_id, None)
+            self._cancel_pending.pop(request_id, None)
             return
-        state = self._req_state.get(request_id)
-        event = AuditEvent(
-            timestamp=datetime.now(UTC),
-            request_id=request_id,
-            user_id=state.user_id if state else "unknown",
-            team_id=state.team_id if state else "unknown",
-            provider=state.provider if state else "unknown",
-            model=state.model if state else "unknown",
-            latency_ms=max(0, latency_ms),
-            prompt_token_count=0,
-            completion_token_count=0,
-            redaction_count=state.redaction_count if state else 0,
-            finding_label_counts=_label_counts(state.placeholders) if state else {},
-            cache_a_hit=state.cache_a_hit if state else False,
-            status="cancelled",
-            error_code=E_CLIENT_DISCONNECTED,
-            block_reason=state.block_reason if state else None,
-            profile_ids=state.profile_ids if state else (),
-        )
+        record = self._cancel_pending.get(request_id)
+        if record is None:
+            record = _CancelRecord.of(state, latency_ms)
+        await self._emit_cancelled(request_id, record)
+
+    async def _emit_cancelled(self, request_id: str, record: _CancelRecord) -> None:
+        event = record.event(request_id)
         try:
             await self._audit.emit(event)
         except AuditWriteAmbiguousError:
             logger.error("litellm_audit_cancelled_emit_ambiguous request_id=%s", request_id)
             self._mark_audited(request_id)
             raise
-        except BaseException as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             # The class name only: a sink's message can quote what it was writing.
-            self._cancel_unrecorded[request_id] = None
-            if len(self._cancel_unrecorded) > _AUDIT_DEDUP_CAP:
-                self._cancel_unrecorded.popitem(last=False)
+            self._cancel_pending[request_id] = record
+            self._cancel_pending.move_to_end(request_id)
+            while len(self._cancel_pending) > _CANCEL_PENDING_CAP:
+                self._cancel_pending.popitem(last=False)
             logger.error(
                 "litellm_audit_cancelled_emit_failed request_id=%s error=%s",
                 request_id,
@@ -1723,7 +1733,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
     def _mark_audited(self, request_id: str) -> None:
         self._req_state.pop(request_id, None)
-        self._cancel_unrecorded.pop(request_id, None)
+        self._cancel_pending.pop(request_id, None)
         self._audited_ids[request_id] = None
         if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
             self._audited_ids.popitem(last=False)
@@ -1830,7 +1840,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         self._req_state[request_id] = state
         return state
 
-    def _record_failure(self, request_id: str, *, error_code: str) -> None:
+    def _record_failure(
+        self, request_id: str, *, error_code: str, component: str | None = None
+    ) -> None:
         if request_id in self._req_state:
             self._req_state[request_id].error_code = error_code
         self._failure_recorded_ids[request_id] = None
@@ -1838,7 +1850,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             self._failure_recorded_ids.popitem(last=False)
         # gateway_failure{component} — the single failure choke point. Fires even
         # when no _RequestState exists yet (e.g. an auth failure before state is built).
-        self._metrics.record_failure(_failure_component(error_code))
+        self._metrics.record_failure(component or _failure_component(error_code))
 
     async def _guard_unmanaged_input_size(
         self,
@@ -2262,6 +2274,59 @@ def _is_responses_event(chunk: Any) -> bool:
     return isinstance(event_type, str) and event_type.startswith("response.")
 
 
+@dataclass(frozen=True)
+class _CancelRecord:
+    """What a ``cancelled`` record carries: audit-safe identity and counts, no content."""
+
+    user_id: str
+    team_id: str
+    provider: Provider
+    model: str
+    latency_ms: int
+    redaction_count: int
+    finding_label_counts: dict[str, int] = field(default_factory=dict)
+    cache_a_hit: bool = False
+    block_reason: str | None = None
+    profile_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def of(cls, state: _RequestState | None, latency_ms: int) -> _CancelRecord:
+        if state is None:
+            return cls("unknown", "unknown", "unknown", "unknown", max(0, latency_ms), 0)
+        return cls(
+            user_id=state.user_id,
+            team_id=state.team_id,
+            provider=state.provider,
+            model=state.model,
+            latency_ms=max(0, latency_ms),
+            redaction_count=state.redaction_count,
+            finding_label_counts=_label_counts(state.placeholders),
+            cache_a_hit=state.cache_a_hit,
+            block_reason=state.block_reason,
+            profile_ids=state.profile_ids,
+        )
+
+    def event(self, request_id: str) -> AuditEvent:
+        return AuditEvent(
+            timestamp=datetime.now(UTC),
+            request_id=request_id,
+            user_id=self.user_id,
+            team_id=self.team_id,
+            provider=self.provider,
+            model=self.model,
+            latency_ms=self.latency_ms,
+            prompt_token_count=0,
+            completion_token_count=0,
+            redaction_count=self.redaction_count,
+            finding_label_counts=dict(self.finding_label_counts),
+            cache_a_hit=self.cache_a_hit,
+            status="cancelled",
+            error_code=E_CLIENT_DISCONNECTED,
+            block_reason=self.block_reason,
+            profile_ids=self.profile_ids,
+        )
+
+
 class _RequestState:
     __slots__ = (
         "block_reason",
@@ -2441,6 +2506,11 @@ _FAILURE_COMPONENT: dict[str, str] = {
     "E_SPAN_INVALID": "sanitize",
     "E_INTERNAL": "internal",
 }
+
+
+# The component of a failure one error code cannot name alone: a team config that
+# cannot be read answers E_PROFILE_UNAVAILABLE, like a broken profile.
+TEAM_CONFIG_COMPONENT = "team_config"
 
 
 def _failure_component(error_code: str) -> str:

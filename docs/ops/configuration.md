@@ -193,6 +193,11 @@ them. This applies to the Codex bridge as well; see
 | `CORP_LLM_PG_DSN` | Postgres DSN (token + team stores); unset → in-memory | — | prod: **yes** |
 | `REDIS_URL` | Redis URL (mapping store / Cache B); unset → in-memory | — | prod: **yes** |
 
+Put `sslmode` in the DSN (`?sslmode=verify-full`), not only in `PGSSLMODE` or a pg
+service file, so the boot probe can classify a declined TLS upgrade: it reads the
+DSN alone, and a server that declines TLS then refuses the boot (exit 78) instead
+of booting with a warning.
+
 ### TLS to corp-LLM
 
 | Key | Purpose | Default | Required |

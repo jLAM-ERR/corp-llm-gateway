@@ -212,7 +212,9 @@ def boot_probe_outcome(exc: BaseException, dsn: str = "") -> str:
 
     A DSN that demands TLS from a server that declines it fails with a plain
     ``ConnectionError`` (an OSError), which would otherwise warn and boot; it never
-    heals, so it refuses as a TLS failure.
+    heals, so it refuses as a TLS failure. Only the DSN's own ``sslmode`` is seen:
+    asyncpg also honours ``PGSSLMODE`` and a pg service file, and a TLS demand made
+    there alone warns and boots.
     """
     if _requires_tls(dsn) and isinstance(exc, ConnectionError) and "ssl" in str(exc).lower():
         return BOOT_REFUSE_TLS
