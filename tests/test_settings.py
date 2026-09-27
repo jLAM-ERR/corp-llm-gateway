@@ -370,6 +370,16 @@ def test_validate_rejects_a_malformed_route_gate_extra(
         config.validate()
 
 
+@pytest.mark.parametrize("raw", ["GET /key/list", "POST /lazy/warm/mcp", "HEAD /health"])
+def test_validate_rejects_a_route_gate_extra_naming_a_refused_row(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", raw)
+    with pytest.raises(ConfigError, match="refused"):
+        config.validate()
+
+
 def test_validate_accepts_route_gate_extras_and_resolves_them(
     hermetic: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -394,6 +394,22 @@ def test_a_boot_refusal_never_prints_the_dsn(valid_config: Path, tmp_path: Path)
     assert "dsn-password-7f1e" not in result["stdout"]
 
 
+@pytest.mark.parametrize(
+    ("raw", "needle"),
+    [("GET /key/list", "refused"), ("GET without-a-slash", "must start with '/'")],
+    ids=["names-a-refused-row", "malformed"],
+)
+def test_a_bad_route_gate_extra_exits_78_before_litellm_is_imported(
+    valid_config: Path, raw: str, needle: str
+) -> None:
+    result = _run(_REFUSAL_SCRIPT, valid_config, env={"CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH": raw})
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH" in result["stdout"]
+    assert needle in result["stdout"]
+
+
 def _boot_record(stdout: str, needle: str) -> dict:
     carrying = _lines_carrying(stdout, needle)
     assert len(carrying) == 1, stdout

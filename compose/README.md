@@ -20,18 +20,23 @@ The optional nginx front door lands in a later revision of this stack — see
 Read `docs/ops/deployment-modes.md` (RU: `deployment-modes.ru.md`) first. It
 covers the two **mutually exclusive** auth modes — API keys vs subscription/OAuth
 — and exactly how to turn the corp-LLM oracle and the corp NER service on and
-off. Both are production modes and both run **this** stack. Short version:
+off. Both run **this** stack. Short version:
 
-- **API-key mode (default).** `docker compose up -d`. `LITELLM_MASTER_KEY` is
-  required; developers use LiteLLM virtual keys. `ANTHROPIC_API_KEY` /
-  `OPENAI_API_KEY` are **optional** — set only the routes you use, or neither if
-  you only call `corp-*`.
-- **Subscription mode.** `docker compose -f docker-compose.yml -f
-  docker-compose.oauth.yml up -d`. Requires that no `LITELLM_MASTER_KEY` exist at
-  all, serves `claude-*` only, and forwards the developer's own Anthropic
-  subscription token upstream. Everything below about virtual keys applies to
-  the API-key mode only; the rest of this file (audit, NER, oracle, Vector,
-  volumes, TLS) is identical in both.
+- **Subscription mode — the production mode.** `docker compose -f
+  docker-compose.yml -f docker-compose.oauth.yml up -d`. Requires that no
+  `LITELLM_MASTER_KEY` exist at all, serves `claude-*` only, and forwards the
+  developer's own Anthropic subscription token upstream. Developers get their
+  `X-Corp-Auth` token from `scripts/install.sh` (Keycloak login →
+  `POST /internal/issue-token`).
+- **API-key mode (the compose default) — a test posture only.** `docker compose
+  up -d`. `LITELLM_MASTER_KEY` is required and requests carry a LiteLLM virtual
+  key, but there is **no way to issue one**: the route gate refuses `/key/*`, the
+  admin UI and the rest of litellm's management surface
+  (`docs/security.md` §14). The master key exists for the container tests
+  (`tests/integration/test_route_gate_container.py`), which seed a key straight
+  into litellm's database. Do not deploy this mode for developers. Everything
+  below about virtual keys describes this test posture; the rest of this file
+  (audit, NER, oracle, Vector, volumes, TLS) is identical in both.
   The root-level `docker-compose.anthropic-oauth.yml` is a **demo-only** variant
   of the same idea over `docker-compose.demo.yml` — not a deployment target.
 - **Oracle:** `CORP_LLM_ORACLE_ENABLED` (default `0`), needs `CORP_LLM_ENDPOINT`
@@ -120,20 +125,20 @@ per-request rather than failing config load.
 
 ## Virtual keys
 
-**API-key mode only.** In subscription mode there is no master key, so there are
-no virtual keys and no Admin UI; the developer's OAuth bearer is the credential
-and `X-Corp-Auth` remains the team identity. See `docs/ops/deployment-modes.md`.
+**API-key mode only, and that mode is a test posture.** In subscription mode
+there is no master key, so there are no virtual keys; the developer's OAuth
+bearer is the credential and `X-Corp-Auth` remains the team identity. See
+`docs/ops/deployment-modes.md`.
 
-Developers authenticate with a **LiteLLM virtual key**
-(`Authorization: Bearer sk-...`), issued from the litellm Admin UI or API and
-consumed at the proxy — not forwarded, not logged. This is why
-`LITELLM_MASTER_KEY` + `DATABASE_URL` + `STORE_MODEL_IN_DB=True` +
-`UI_USERNAME`/`UI_PASSWORD` are set on this instance: virtual keys ARE the
-developer credential here, giving per-developer revocation and traffic
-accounting through the Admin UI. There is no second admin-only instance —
-that pattern existed only to keep the master key away from a BYOK data
-plane, and BYOK against Anthropic/OpenAI directly isn't possible (next
-section), so the tradeoff that motivated it no longer applies.
+In API-key mode litellm checks a **LiteLLM virtual key**
+(`Authorization: Bearer sk-...`) at the proxy — not forwarded, not logged —
+which is why `LITELLM_MASTER_KEY` + `DATABASE_URL` + `STORE_MODEL_IN_DB=True` +
+`UI_USERNAME`/`UI_PASSWORD` are set on this instance. **Nothing can issue one.**
+The route gate answers `403 E_ROUTE_BLOCKED` on `/key/*`, the admin UI and every
+other litellm management route, in both modes, so there is no per-developer
+revocation or spend accounting through litellm (`docs/security.md` §14,
+"The management surface is refused"). Per-developer revocation is the corp
+token: `gateway-admin token revoke`.
 
 `X-Corp-Auth` is **unchanged** and unrelated to virtual keys — it still
 carries team → profile → rules → audit identity through the guardrail
@@ -238,23 +243,24 @@ mount already available to the container works).
 Note the published `GATEWAY_IMAGE_TAG` predates this work — see "Building from
 this branch".
 
-## Two UIs — which one answers which question
+## Which tool answers which question
 
-The stack ships two web UIs. They do not overlap; reaching for the wrong one
-is the usual reason an operator concludes "the gateway has no data".
+The stack ships one web UI, Langfuse. litellm's own UI is refused at the route
+gate; reaching for it is the usual reason an operator concludes "the gateway has
+no data".
 
 | Question | Where |
 |---|---|
-| Who has a virtual key, and is it still valid? | LiteLLM UI |
-| How much has a developer/team spent, and what are their rate limits? | LiteLLM UI |
-| Which models does this proxy expose, and is a route healthy? | LiteLLM UI |
+| Who holds a corp token, and is it still valid? | `gateway-admin token list` (the LiteLLM UI is refused at the route gate) |
+| Which models does this proxy expose? | `GET /v1/models` |
 | What did request `<id>` look like end to end — latency, token counts, upstream error? | Langfuse |
 | Was that request sanitized, and how many redactions did it carry (`redaction_count`, `finding_label_counts`)? | Langfuse |
 | Why was a request blocked (`block_reason`), and which team was it? | Langfuse |
 | What is the audit trail for the last 90 days? | Langfuse |
 
-Short version: **LiteLLM = keys, models, spend. Langfuse = request-level
-traces and the audit trail.** Neither ever holds original user content —
+Short version: **the LiteLLM UI is not served** — the route gate refuses it
+with the rest of litellm's management surface (`docs/security.md` §14).
+**Langfuse = request-level traces and the audit trail.** Neither ever holds original user content —
 audit records pass the NEVER-fields gate (`audit/invariants.py`) plus
 Vector's VRL gate before they reach Langfuse (invariant #2).
 

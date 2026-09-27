@@ -14,6 +14,7 @@ from corp_llm_gateway.route_gate import (
     Verdict,
     lookup,
 )
+from corp_llm_gateway.route_gate import table as route_table
 
 # The trees litellm keeps for its own admin surface. A REWRITTEN entry here
 # would mean the gate promised sanitization on a route that has no hook.
@@ -213,7 +214,7 @@ def test_regex_entries_are_anchored() -> None:
         ("POST", "/v1/responses/resp_123/cancel", Verdict.PASSTHROUGH),
         ("POST", "/engines/gpt-4o/chat/completions", Verdict.REWRITTEN),
         ("POST", "/openai/deployments/gpt-4o/chat/completions", Verdict.REFUSE),
-        ("POST", "/lazy/warm/mcp", Verdict.PASSTHROUGH),
+        ("POST", "/lazy/warm/mcp", Verdict.REFUSE),
     ],
 )
 def test_regex_table_resolves_path_parameters(method: str, path: str, verdict: Verdict) -> None:
@@ -324,3 +325,182 @@ def test_the_table_imports_without_pulling_in_audit_or_metrics() -> None:
     assert not {
         m for m in loaded if m.startswith(("corp_llm_gateway.audit", "corp_llm_gateway.metrics"))
     }
+
+
+# ── the management surface is refused (docs/security.md §14) ─────────────────
+
+REFUSED_FAMILY_REASONS = (
+    route_table._WHY_ADMIN_OFF,
+    route_table._WHY_SPEND_OFF,
+    route_table._WHY_AUTH_OFF,
+    route_table._WHY_PUBLIC_OFF,
+    route_table._WHY_UI_OFF,
+    route_table._WHY_HOME_OFF,
+    route_table._WHY_LAZY_OFF,
+    route_table._WHY_HEALTH_CHECK_OFF,
+    route_table._WHY_HEALTH_DRAIN_OFF,
+    route_table._WHY_HEALTH_OPS_OFF,
+)
+
+# The only reasons a litellm row may still be admitted for.
+RETAINED_PASSTHROUGH_REASONS = (
+    route_table._WHY_HEALTH,
+    route_table._WHY_MODELS,
+    route_table._WHY_STORED_RESPONSE,
+)
+
+REFUSED_HEALTH_PATHS = (
+    "/health",
+    "/health/backlog",
+    "/health/drain",
+    "/health/history",
+    "/health/latest",
+    "/health/license",
+    "/health/readiness/details",
+    "/health/shared-status",
+)
+
+KEPT_HEALTH_ROWS = (
+    ("GET", "/health/liveliness"),
+    ("GET", "/health/liveness"),
+    ("GET", "/health/readiness"),
+    ("OPTIONS", "/health/liveliness"),
+    ("OPTIONS", "/health/liveness"),
+    ("OPTIONS", "/health/readiness"),
+)
+
+
+def _litellm_rows() -> list[tuple[str, str, Entry]]:
+    rows = [(method, path, entry) for (method, path), entry in LITELLM_ROUTE_TABLE.items()]
+    rows += [(row.method, row.template, row.entry) for row in LITELLM_REGEX_TABLE]
+    return rows
+
+
+def _is_one_of(why: str, reasons: tuple[str, ...]) -> bool:
+    # Identity, not equality: a reason is a named constant, so a row that
+    # re-spells a retained string by hand does not count as retained.
+    return any(why is reason for reason in reasons)
+
+
+def test_no_passthrough_row_carries_a_refused_family_reason() -> None:
+    offenders = [
+        f"{method} {path}"
+        for method, path, entry in _litellm_rows()
+        if entry.verdict is not Verdict.REFUSE and _is_one_of(entry.why, REFUSED_FAMILY_REASONS)
+    ]
+    assert offenders == []
+
+
+def test_every_admitted_litellm_row_has_a_retained_reason() -> None:
+    offenders = [
+        f"{method} {path}: {entry.why}"
+        for method, path, entry in _litellm_rows()
+        if entry.verdict is Verdict.PASSTHROUGH
+        and not _is_one_of(entry.why, RETAINED_PASSTHROUGH_REASONS)
+    ]
+    assert offenders == []
+
+
+def test_every_refused_family_reason_is_used() -> None:
+    used = [entry.why for _, _, entry in _litellm_rows()]
+    unused = [reason for reason in REFUSED_FAMILY_REASONS if not _is_one_of(reason, tuple(used))]
+    assert unused == []
+
+
+def test_the_refused_family_reasons_point_at_the_decision() -> None:
+    for reason in REFUSED_FAMILY_REASONS:
+        assert "docs/security.md §14" in reason, reason
+
+
+@pytest.mark.parametrize("path", REFUSED_HEALTH_PATHS)
+def test_the_management_shaped_health_rows_are_refused(path: str) -> None:
+    entry = lookup("GET", path)
+    assert entry is not None and entry.verdict is Verdict.REFUSE, path
+    assert _is_one_of(entry.why, REFUSED_FAMILY_REASONS), path
+
+
+@pytest.mark.parametrize(("method", "path"), KEPT_HEALTH_ROWS)
+def test_the_probe_shaped_health_rows_are_kept(method: str, path: str) -> None:
+    entry = lookup(method, path)
+    assert entry is not None and entry.verdict is Verdict.PASSTHROUGH
+    assert entry.why is route_table._WHY_HEALTH
+
+
+def test_the_kept_health_rows_are_exactly_the_probes() -> None:
+    kept = sorted(
+        (method, path)
+        for method, path, entry in _litellm_rows()
+        if entry.verdict is Verdict.PASSTHROUGH and entry.why is route_table._WHY_HEALTH
+    )
+    assert kept == sorted(KEPT_HEALTH_ROWS)
+
+
+def _verdict_counts(entries: list[Entry]) -> dict[Verdict, int]:
+    return {verdict: sum(e.verdict is verdict for e in entries) for verdict in Verdict}
+
+
+def test_the_exact_litellm_verdict_counts() -> None:
+    assert _verdict_counts(list(LITELLM_ROUTE_TABLE.values())) == {
+        Verdict.PASSTHROUGH: 12,
+        Verdict.REFUSE: 532,
+        Verdict.REWRITTEN: 7,
+    }
+    assert _verdict_counts([row.entry for row in LITELLM_REGEX_TABLE]) == {
+        Verdict.PASSTHROUGH: 14,
+        Verdict.REFUSE: 347,
+        Verdict.REWRITTEN: 1,
+    }
+
+
+def test_the_combined_litellm_verdict_counts() -> None:
+    entries = [entry for _, _, entry in _litellm_rows()]
+    assert len(entries) == 913
+    assert _verdict_counts(entries) == {
+        Verdict.PASSTHROUGH: 26,
+        Verdict.REFUSE: 879,
+        Verdict.REWRITTEN: 8,
+    }
+
+
+def test_the_gateway_table_verdict_counts() -> None:
+    assert _verdict_counts(list(GATEWAY_ROUTE_TABLE.values())) == {
+        Verdict.PASSTHROUGH: 6,
+        Verdict.REFUSE: 0,
+        Verdict.REWRITTEN: 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/key/list"),
+        ("POST", "/key/generate"),
+        ("GET", "/key/info"),
+        ("POST", "/policies"),
+        ("PUT", "/policies/p1/status"),
+        ("PUT", "/guardrails/g1"),
+        ("POST", "/guardrails"),
+        ("POST", "/guardrails/apply_guardrail"),
+        ("POST", "/login"),
+        ("GET", "/sso/key/generate"),
+        ("GET", "/"),
+        ("GET", "/routes"),
+        ("GET", "/global/spend"),
+        ("GET", "/public/model_hub"),
+        ("GET", "/get_logo_url"),
+        ("POST", "/lazy/warm/mcp"),
+        ("POST", "/team/t1/disable_logging"),
+    ],
+)
+def test_the_management_routes_are_refused(method: str, path: str) -> None:
+    entry = lookup(method, path)
+    assert entry is not None and entry.verdict is Verdict.REFUSE, f"{method} {path}"
+
+
+def test_no_justification_constant_outlives_its_rows() -> None:
+    # A `_JUST_*` excuse exists only for a body-carrying PASSTHROUGH row.
+    used = {
+        entry.justification for _, _, entry in _litellm_rows() if entry.justification is not None
+    }
+    declared = {value for name, value in vars(route_table).items() if name.startswith("_JUST_")}
+    assert declared == used

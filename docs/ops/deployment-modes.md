@@ -7,8 +7,12 @@ off. Russian mirror: `deployment-modes.ru.md`.
 There are two authentication modes and they are **mutually exclusive**. Pick one
 before you write `.env`.
 
-Both are production modes. They run the same stack, the same sanitization
-cascade and the same audit chain; what differs is the upstream credential.
+**Mode B is the production mode. Mode A is a test posture only** (DRI decision,
+2026-09-27): the route gate refuses litellm's whole management surface,
+`POST /key/generate` and the admin UI included, so there is no way to hand a
+developer a virtual key (`../security.md` §14). Both modes run the same stack,
+the same sanitization cascade and the same audit chain; what differs is the
+upstream credential.
 
 | | Mode A — API keys | Mode B — subscription (OAuth) |
 |---|---|---|
@@ -18,7 +22,8 @@ cascade and the same audit chain; what differs is the upstream credential.
 | Team identity | `X-Corp-Auth: <team token>` | `X-Corp-Auth: <team token>` |
 | `LITELLM_MASTER_KEY` | **required** | **must be absent** |
 | Routes served | `claude-*`, `gpt-*`, `corp-*` | `claude-*` only |
-| Per-developer revocation / spend | yes, via the LiteLLM Admin UI | no |
+| Per-developer revocation / spend | no — `/key/*` and the admin UI are refused | no |
+| Status | **test posture only** | **production** |
 | Audit trail | Vector → Langfuse / S3 / SIEM | same |
 
 There is also a **demo-only** OAuth stack — `docker-compose.demo.yml` +
@@ -29,10 +34,14 @@ subscription bridge on a laptop and is **not** a deployment target: it runs
 
 ---
 
-## Mode A — API keys
+## Mode A — API keys (test posture only)
 
-The stack in `compose/`. Developers authenticate with a **LiteLLM virtual key**;
-the gateway holds the provider credentials.
+The stack in `compose/`. Requests authenticate with a **LiteLLM virtual key**;
+the gateway holds the provider credentials. There is no onboarding path for that
+key: `/key/*`, the admin UI and every other litellm management route answer
+`403 E_ROUTE_BLOCKED` at the route gate. The container tests write a key's hash
+straight into litellm's `LiteLLM_VerificationToken` table; nothing else should.
+Do not deploy this mode for developers.
 
 ```
 cd compose
@@ -140,16 +149,14 @@ are unchanged: developers still send `X-Corp-Auth: <team token>`, which the
 gateway validates in `pre_call` against the Postgres token store, and a request
 without a valid one is refused (`MissingTokenError` / `InvalidTokenError`).
 
-**Litellm's own management endpoints are unauthenticated in this mode.** Its
-proxy auth is skipped entirely when the master key is `None`, which is precisely
-the posture this mode requires. That covers `/key/*`, `/model/*`, `/user/*` and
-the UI — *not* the LLM routes, which the gateway's `X-Corp-Auth` check in
-`pre_call` still gates. Today the port is published as
-`127.0.0.1:${GATEWAY_PORT:-4000}` (loopback only), so the surface is reachable
-only from the host itself; anyone with a shell on that host can reach it. When
-the nginx front door lands, that management surface must be blocked there before
-the port is exposed beyond loopback. Mode A does not have this gap — the master
-key authenticates those endpoints.
+**Litellm's own management endpoints are refused, in both modes.** Without a
+master key litellm accepts any caller as an internal user
+(`user_api_key_auth.py:1622-1633` in 1.101.0), so much of `/key/*`, `/model/*`,
+`/user/*`, `/policies*`, `/guardrails*` and the UI would otherwise answer anyone
+who reaches the port. The route gate refuses all of them (`403
+E_ROUTE_BLOCKED`) before litellm sees the request, on every path in — loopback,
+SSH tunnel or a future nginx front door. The LLM routes are still gated by the
+gateway's `X-Corp-Auth` check in `pre_call`. See `../security.md` §14.
 
 ---
 

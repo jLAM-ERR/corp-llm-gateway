@@ -122,6 +122,7 @@ class Stack:
     stub: str
     relay: str
     network: str
+    postgres: str | None = None
     seen: int = field(default=0)
 
     def gateway_logs(self) -> str:
@@ -154,6 +155,29 @@ class Stack:
                 if isinstance(record, dict) and "request_id" in record:
                     records.append(record)
         return records
+
+    def psql(self, sql: str) -> str:
+        """Run one statement in the stack's Postgres; the unaligned result rows."""
+        if self.postgres is None:
+            pytest.fail("this stack runs without Postgres")
+        result = docker(
+            "exec",
+            self.postgres,
+            "psql",
+            "-U",
+            "gw",
+            "-d",
+            "litellm",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-At",
+            "-c",
+            sql,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            pytest.fail(f"psql failed:\n{result.stderr}")
+        return result.stdout.strip()
 
     def metrics(self) -> str:
         return httpx.get(f"{self.base_url}/metrics", timeout=30).text
@@ -308,6 +332,7 @@ def running_stack(
             stub=stub,
             relay=relay,
             network=network,
+            postgres=postgres if with_postgres else None,
         )
         _wait_for_health(stack)
         yield stack

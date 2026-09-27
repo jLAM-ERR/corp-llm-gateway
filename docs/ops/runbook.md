@@ -140,14 +140,14 @@ Action — read `reason` first, it names the cause:
 
 | `reason` | Status | What happened | What to do |
 |---|---|---|---|
-| `route_gate_listed` | 403 | the table refuses this route (token counting, embeddings, `/v1/completions`, provider-native passthrough, the telemetry batch, …) | Nothing. Expected. For token counting, see [`../security.md`](../security.md) §11 (i): clients use `usage.input_tokens`. |
+| `route_gate_listed` | 403 | the table refuses this route (token counting, embeddings, `/v1/completions`, provider-native passthrough, the telemetry batch, litellm's management surface — `/key/*`, the admin API, `GET /health`, …) | Nothing. Expected. For token counting, see [`../security.md`](../security.md) §11 (i): clients use `usage.input_tokens`. For litellm's admin API or UI: refused by design, use `gateway-admin` (§14). |
 | `route_gate_unlisted` | 404 | no table entry — default-deny | Either the client asked for a route litellm does not have, or a litellm bump added one and the table has no row for it yet — rows are hand-classified against litellm's source, guarded by the collector test (`docs/extending.md`). For an operator route you own, widen with `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`. |
 | `route_gate_websocket` | 403 | a `websocket` scope, or `Upgrade: websocket` on any path | Expected: frames after the handshake never reach the hook. Clients must use the HTTP transport. |
 | `route_gate_malformed` | 403 | the raw path carries `%2f`, `%00`, `%2e%2e` or a non-ASCII byte, or the decoded path carries `..`, `//` or NUL | Not a config problem. A normal client does not send these — treat a sustained rate as probing and check the audit records. |
 
 There is **no off switch.** The only knob is
 `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` (`configuration.md`), it adds
-PASSTHROUGH entries only, and `gateway-admin config check --routes` prints the
+PASSTHROUGH entries only — an item naming a refused route exits 78 at boot — and `gateway-admin config check --routes` prints the
 effective table plus every extra. If a route genuinely needs to be *rewritten*,
 that is a code change: a `table.py` row plus the guard test, never a knob.
 

@@ -222,8 +222,9 @@ Rationale and the full refused set: [`../security.md`](../security.md) §14.
   estimate for the context indicator. `../security.md` §11 (i) records the trade.
 - **litellm's admin UI is no longer served.** `ast` cannot see inside a mounted
   ASGI app, so `/ui`, `/swagger`, `/docs` and `/openapi.json` get no table entry
-  and are refused as unlisted. The JSON admin API (`/key/*`, `/team/*`, …) is
-  pinned route by route and still answers. The escape hatch is
+  and are refused as unlisted. The JSON admin API (`/key/*`, `/team/*`, …) was
+  pinned route by route and still answered in that release; it is refused now —
+  see "litellm's management surface is refused" below. The escape hatch is
   `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` — but it
   admits one exact `(method, path)` per item and has no prefix form, so it fits a
   single operator route, not a mounted SPA.
@@ -241,6 +242,28 @@ Rationale and the full refused set: [`../security.md`](../security.md) §14.
 
 No data migration. Rollback is a redeploy of the previous image tag, which
 carries the old ENTRYPOINT — and the open bypass routes with it.
+
+## litellm's management surface is refused
+
+**Breaking for anyone who used litellm's admin API or UI.** Every litellm route
+that is not generation, model listing, a stored response by id or one of the
+probes `/health/liveliness`, `/health/liveness`, `/health/readiness` now answers
+`403 E_ROUTE_BLOCKED` — `/key/*`, `/team/*`, `/user/*`, `/model/*` writes,
+`/policies*`, `/guardrails*`, spend, login/SSO, the public catalogue, `GET /`,
+`GET /health` and the other `/health/*` routes. Rationale and the health-row
+review: `../security.md` §14, "The management surface is refused".
+
+- **API-key mode (virtual keys) is a test posture only.** Nothing can mint a
+  virtual key any more. Move developers to subscription mode
+  (`deployment-modes.md`); corp tokens come from `scripts/install.sh` and are
+  revoked with `gateway-admin token revoke`.
+- **A probe or dashboard on `GET /health` breaks.** Use `/healthz/live` and
+  `/healthz/ready`, which the shipped Helm and compose probes already do.
+- **`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` naming a refused route now exits 78
+  at boot** (and `config check` reports it), as does a malformed item — it used
+  to crash the import. Remove any such item before rolling out.
+
+No data migration. Rollback is a redeploy of the previous image tag.
 
 ## `CORP_LLM_STRIP_INBOUND_HEADERS` now defaults to `1`
 

@@ -76,6 +76,7 @@ refused too until it is classified.
 | `POST /v1/completions` | Reaches the hook, but the hook never reads `prompt`, so nothing is rewritten | `route_gate_listed` |
 | `/v1/embeddings`, `/v1/moderations`, `/v1/audio/speech`, the provider-native passthrough trees (`/anthropic/…`, `/openai/…`, `/{provider}/…`) and the rest of `_NON_CHAT_INPUT_CALL_TYPES` (`litellm_hook.py:2099`) | Reach the hook as the documented no-rewrite set: previously DLP-scanned only, now refused outright — a DLP scan blocks a *known* pattern, it does not sanitize | `route_gate_listed` |
 | `POST /api/event_logging/batch` | Claude Code's telemetry batch. No hook, and it carries whatever the client chose to put in it | `route_gate_listed` |
+| litellm's management surface: the admin JSON API (`/key/*`, `/team/*`, `/model/*`, `/policies*`, `/guardrails*`, …), spend analytics, login / SSO / invitations, the public catalogue, UI assets, `GET /`, lazy warm-up, and every `/health/*` route except the three probes | Refused by design: identity is `X-Corp-Auth` in the gateway's own store and observability is Langfuse, so none of it is needed at runtime — and several of these routes can switch the sanitizer off after boot (§14, "The management surface is refused") | `route_gate_listed` |
 | Anything absent from the table, including litellm's mounted sub-apps (the admin **UI**, `/swagger`, `/docs`, `/openapi.json`) | Default-deny. `ast` cannot see inside a mounted ASGI app, so it gets no entry | `route_gate_unlisted` |
 
 **Pre-flight token counting is therefore unavailable** — a deliberate trade, see
@@ -757,25 +758,24 @@ Bounds and mitigation:
   knob. Treat process lifetime as the retention window when sizing how long a
   compromised subscription token stays resident.
 
-### Topology: demo overlay only
+### Topology
 
-Subscription auth runs on the `anthropic-oauth` docker-compose overlay
-(`docker-compose.demo.yml` + `docker-compose.anthropic-oauth.yml`) and nowhere
-else.
+Subscription auth is the production mode. It runs on the production compose
+stack with the `docker-compose.oauth.yml` override, and on the demo
+`anthropic-oauth` overlay (`docker-compose.demo.yml` +
+`docker-compose.anthropic-oauth.yml`).
 
 | Deployment | Status | Why |
 |---|---|---|
-| `anthropic-oauth` compose overlay | **Supported** | Anthropic-only routes, no wildcard, no `LITELLM_MASTER_KEY`, so the inbound bearer reaches `pre_call` |
-| Production compose | **Unsupported** | `Authorization` there already carries the litellm virtual key. Putting the OAuth token on the wire needs a second header, and which header carries which credential is an open governance decision |
+| Production compose + `docker-compose.oauth.yml` | **Supported** | Anthropic-only routes, no wildcard, no `LITELLM_MASTER_KEY`, so the inbound bearer reaches `pre_call` |
+| `anthropic-oauth` demo overlay | **Supported (demo)** | Same shape over the demo stack |
 | Helm chart | **Unsupported** | Its litellm ConfigMap routes `"*"` to the corp vLLM and has no `anthropic/` route, so litellm's OAuth branch is unreachable — and that wildcard is exactly the shape the alias gate cannot protect |
 
-Both unsupported cases are blocked on the same header-layout decision (the
-deferred litellm-governance plan's first gate), not on missing code.
-
-**Consequence to accept knowingly:** the supported overlay has no litellm
-virtual keys, and therefore no native budget, rate-limit or quota enforcement.
-**Subscription auth and virtual-key governance are mutually exclusive today.**
-A rollout that needs both has to wait for the header-layout decision.
+**Consequence to accept knowingly:** there are no litellm virtual keys, and
+therefore no native budget, rate-limit or quota enforcement. That is by design,
+not a gap waiting for a header decision: litellm's management surface, `/key/*`
+included, is refused at the route gate (§14), so no virtual key can be minted.
+API-key mode (virtual keys) survives only as a test posture.
 
 ## 14. The route gate
 
@@ -844,8 +844,9 @@ litellm's own lifespan skips a missing config file in silence, which starts the
 proxy with **no guardrail callback at all** — the fail-open this gate exists to
 close. The entrypoint refuses first: exit 78 (`EX_CONFIG`) when litellm's config
 is missing, unreadable, not YAML, or configures `pass_through_endpoints` or
-`general_settings.database_url`; exit 70 (`EX_SOFTWARE`) when litellm's startup
-completes without a `CorpLlmGuardrail` in `litellm.callbacks`. Until that check
+`general_settings.database_url`, and when `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`
+is malformed or names a refused route; exit 70 (`EX_SOFTWARE`) when litellm's
+startup completes without a `CorpLlmGuardrail` in `litellm.callbacks`. Until that check
 passes the gate is **unarmed**, and an unarmed gate answers 503 on every
 rewritten route rather than forward it.
 
@@ -869,6 +870,65 @@ table that predates `tokens/schema.sql`'s issuance columns, the entrypoint exits
 `CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS` (503 `E_ISSUE_STORE_TIMEOUT`; a
 connection-class store failure is 503 `E_ISSUE_STORE_UNAVAILABLE`).
 
+### The management surface is refused
+
+Every litellm route that is not generation, model listing, a stored response by
+id or one of three probes answers **403 `E_ROUTE_BLOCKED`**
+(`route_gate_listed`), from everywhere and in both auth modes: the admin JSON
+API, spend analytics, login / SSO / invitations, the unauthenticated public
+catalogue, UI assets, `GET /` and `GET /routes`, lazy-router warm-up and the
+non-probe `/health/*` rows — 462 admin-family rows plus 8 health rows. In
+litellm 1.101.0 the litellm tables hold 26 PASSTHROUGH / 879 REFUSE / 8
+REWRITTEN rows (913); `tests/route_gate/test_table.py` pins those counts and
+that no admitted row carries a refused-family reason.
+
+**Why refuse, not gate by network.** Nothing the gateway needs at runtime lives
+in litellm's management plane. Identity is the opaque `X-Corp-Auth` token in the
+gateway's own store — minted by `POST /internal/issue-token` from a Keycloak
+login, revoked with `gateway-admin token revoke` — and observability is the
+audit pipeline into Langfuse. What the surface would add is a way to change the
+sanitizer's behaviour after boot. The litellm adoption plan
+(`docs/plans/20260926-litellm-guardrail-api-adoption.md`) found three such paths,
+each probe-confirmed:
+
+- **hazard 9** — `POST /guardrails/apply_guardrail` logs the original text and
+  swallows post-call exceptions (it was already REFUSE; it stays so);
+- **hazard 14** — `POST /policies` / `PUT /policies/{id}/status` can create a
+  pipeline naming our guardrail, which the pre-call loop then skips: zero
+  sanitizer invocations, originals egress;
+- **hazard 15b** — registering a second guardrail under our name
+  (`POST /guardrails`, `PUT|PATCH /guardrails/{id}`) makes litellm's load
+  balancing run the other callback instead of ours.
+
+A network rule (loopback, tunnel, nginx allow-list) would leave all three one
+misconfiguration away. A REFUSE row holds inside the image, on every path in.
+
+**Health rows, one by one.** Shipped probes use only the gateway's own
+`/healthz/live` and `/healthz/ready`.
+
+| Route | Verdict | Why |
+|---|---|---|
+| `GET` / `OPTIONS /health/liveliness`, `/health/liveness` | kept | Read the shutdown flag and return a constant (`_health_endpoints.py:1847-1865`, OPTIONS `:1884-1901`) |
+| `GET` / `OPTIONS /health/readiness` | kept | Verified in litellm 1.101.0 (`_health_endpoints.py:1740-1760`): reads the shutdown flag and, when litellm has a database, a Prisma ping cached for 15 s and bounded at 4 s (`:1410-1458`, `:1720-1737`). It never calls a provider; neither does the opt-in `allow_public_health_readiness_details` branch (`:1585-1667`). OPTIONS (`:1868-1881`) returns a constant |
+| `GET /health` | refused | Runs model health checks **against providers** when background checks are off (`:1036-1048`), and without a master key litellm accepts an empty identity (`user_api_key_auth.py:1622-1633`) |
+| `GET /health/drain` | refused | Flips litellm's process-wide shutdown state (`:1799-1843`) |
+| `GET /health/backlog`, `/history`, `/latest`, `/license`, `/readiness/details`, `/shared-status` | refused | Operator diagnostics, not probes |
+
+`GET /health/services` and `POST /health/test_connection` were already refused
+(they reach providers).
+
+**API-key mode is a test posture** (DRI decision, 2026-09-27). Its developers
+held a litellm virtual key minted through `POST /key/generate`; with `/key/*`
+refused there is no onboarding path, and handing developers the master key is
+not an option. Subscription mode is the production mode. The container suite
+(`tests/integration/test_route_gate_container.py`) keeps API-key mode covered —
+exit 70 and the route gate — by inserting the sha256 of a synthetic `sk-…` key
+straight into litellm's `LiteLLM_VerificationToken`, which is how litellm looks
+a key up.
+
+`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` cannot re-open any of this (see
+"Widening it").
+
 ### Consequences to know
 
 - **Pre-flight token counting is gone.** The two token-count routes and
@@ -880,10 +940,11 @@ connection-class store failure is 503 `E_ISSUE_STORE_UNAVAILABLE`).
   telemetry batch: no hook, and it carries whatever the client chose to put in
   it. Client-side telemetry is therefore dropped at the gateway — accepted, since
   the alternative is an unclassified body leaving the boundary.
-- **litellm's admin UI is not served.** `ast` cannot see inside a mounted ASGI
-  app, so `/ui`, `/swagger`, `/docs`, `/openapi.json` and the other mounts get no
-  table entry and are refused as unlisted. The JSON admin API (`/key/*`,
-  `/team/*`, …) is pinned route by route and still answers.
+- **litellm's admin UI and admin API are not served.** `ast` cannot see inside
+  a mounted ASGI app, so `/ui`, `/swagger`, `/docs`, `/openapi.json` and the
+  other mounts get no table entry and are refused as unlisted. The JSON admin
+  API (`/key/*`, `/team/*`, …) is pinned route by route as REFUSE — see "The
+  management surface is refused" below.
 - **`HEAD` on a litellm route answers 405, not a refusal.** The gate's rule is
   that HEAD inherits its path's GET verdict, so it is admitted — but FastAPI's
   `APIRoute`, unlike a plain Starlette `Route`, does not add HEAD to a GET route,
@@ -900,13 +961,16 @@ connection-class store failure is 503 `E_ISSUE_STORE_UNAVAILABLE`).
 There is no off switch. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` takes
 `"METHOD /path"` items, comma- or newline-separated, and can add **PASSTHROUGH**
 entries only: it can never admit a route as rewritten, never override a REFUSE,
-and never disable the gate. A malformed item is a boot-time config problem, not a
-silent widening. Use it for an operator route that provably sends no user text
-anywhere.
+and never disable the gate. Both are enforced twice. At load, an item that is
+malformed or names a refused route — including a `HEAD` on a path whose `GET`
+is refused — is a config problem: `config check` reports it and the entrypoint
+exits 78. At runtime, the tables answer before any extra, for `HEAD` too, so an
+extra only ever reaches a pair no table lists. Use it for an operator route that
+provably sends no user text anywhere.
 
 Each item is **one exact `(method, path)` pair** — there is no prefix form, so
 widening cannot open a tree by accident. That is also why it cannot re-open the
-admin UI: a mounted sub-app serves many paths under its prefix, and listing them
+admin UI either: a mounted sub-app serves many paths under its prefix, and listing them
 one by one is not a widening anyone should write. `gateway-admin config check
 --routes` prints the effective table and every extra.
 

@@ -107,12 +107,13 @@ _HEAD_NEVER_REWRITTEN = Entry(
 def _resolve(
     method: str, path: str, extras: Mapping[tuple[str, str], Entry] | None
 ) -> Entry | None:
-    entry = _direct(method, path, extras)
     if method != "HEAD":
-        return entry
+        return _direct(method, path, extras)
+    # Starlette answers HEAD on every route that declares GET, so both tables
+    # speak before any extra: a HEAD extra cannot re-open a refused GET.
+    entry = lookup("HEAD", path) or lookup("GET", path)
     if entry is None:
-        # Starlette answers HEAD on every route that declares GET.
-        entry = _direct("GET", path, extras)
+        entry = _direct("HEAD", path, extras) or _direct("GET", path, extras)
     if entry is None:
         return None
     if entry.verdict is Verdict.REWRITTEN:

@@ -144,11 +144,11 @@ the REWRITTEN routes (the only ones whose body the guardrail rewrites), and ever
 $ gateway-admin config check --no-probe --routes
 config: OK
 
-route gate: 551 exact + 362 regex litellm rows, 5 gateway rows (no off switch)
+route gate: 551 exact + 362 regex litellm rows, 6 gateway rows (no off switch). The verdict counts below cover those litellm + gateway rows; operator extras are listed separately.
 VERDICT      ROWS
-PASSTHROUGH  501
+PASSTHROUGH  32
 REWRITTEN    8
-REFUSE       409
+REFUSE       879
 
 REWRITTEN (the only routes whose body the guardrail rewrites):
   POST /chat/completions
@@ -158,8 +158,9 @@ CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH:
   (none)
 ```
 
-A malformed extra prints `INVALID: …` on stderr and makes the whole check exit
-nonzero — the same value already fails `validate()`. See
+A malformed extra, or one naming a route the table refuses, prints `INVALID: …`
+on stderr and makes the whole check exit nonzero — the same value already fails
+`validate()`, and the gateway exits 78 on it at boot. See
 [`../security.md`](../security.md) §14 for what the gate refuses and why.
 
 ## `sanitize`

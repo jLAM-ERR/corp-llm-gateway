@@ -147,7 +147,11 @@ def test_extras_can_only_be_passthrough() -> None:
 @pytest.mark.parametrize("path", ["/v1/messages/count_tokens", "/search/brave"])
 def test_an_extra_never_overrides_a_listed_refusal(path: str) -> None:
     # The second path is refused by the regex table, which extras never reach.
-    extras = parse_extras([f"POST {path}"])
+    # parse_extras refuses the item at load; a hand-built extra proves the
+    # runtime holds on its own.
+    with pytest.raises(ValueError, match="refused"):
+        parse_extras([f"POST {path}"])
+    extras = {("POST", path): Entry(Verdict.PASSTHROUGH, "hand-built extra")}
     decision = classify("POST", path, path.encode(), extras=extras)
     assert decision.verdict is Verdict.REFUSE
     assert decision.block_reason == ROUTE_GATE_LISTED

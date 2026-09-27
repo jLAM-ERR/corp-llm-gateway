@@ -21,7 +21,9 @@ In order —
    naming an unreadable ``CORP_LLM_CA_BUNDLE``, exits 78; so does a Postgres that
    refuses the DSN (credentials, database name, DSN syntax) or whose
    ``corp_tokens`` lacks the issuance columns or the unique ``oidc_jti`` index. A
-   Postgres the network cannot reach does not refuse the boot — readiness reports it;
+   Postgres the network cannot reach does not refuse the boot — readiness reports it.
+   Last, ``CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH``: a malformed item, or one naming
+   a route the table refused, exits 78;
 2. run litellm's Prisma schema sequence when ``DATABASE_URL`` is set, with the
    same four guards and the same exit codes as ``proxy_cli.py:1326-1375``;
 3. ``save_worker_config(...)`` so litellm's lifespan takes the
@@ -284,6 +286,15 @@ def _check_issuance() -> bool:
     return True
 
 
+def _route_gate_extras() -> dict[Any, Any]:
+    """Refuse (exit 78) a malformed extra, or one naming a route the table refused."""
+    try:
+        return config.route_gate_extras()
+    except ValueError as exc:
+        _fail_gateway_config([f"CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH: {exc}"])
+        return {}
+
+
 def _setup_prisma(config_path: Any) -> None:
     """litellm's boot-time Prisma schema setup — ``proxy_cli.py:1326-1375``.
 
@@ -351,6 +362,7 @@ if _problems:
     _fail_config(_problems)
 log.info("litellm config accepted: %s", CONFIG_PATH)
 ISSUANCE_ENABLED = _check_issuance()
+ROUTE_GATE_EXTRAS = _route_gate_extras()
 
 # ── 2. Prisma schema setup ───────────────────────────────────────────────────
 
@@ -429,7 +441,7 @@ gate = RouteGateMiddleware(
     _GATEWAY_ROUTES,
     metrics=_exporter,
     audit_logger=AuditLogger(get_sink(), gateway_version=gateway_version()),
-    extras=config.route_gate_extras(),
+    extras=ROUTE_GATE_EXTRAS,
 )
 
 _litellm_lifespan = _app.router.lifespan_context

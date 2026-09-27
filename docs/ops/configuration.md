@@ -159,14 +159,13 @@ this route as a result — acceptable here because the route ships without virtu
 keys and therefore without spend tracking. See [`../security.md`](../security.md)
 §13 for the full forward/do-not-forward list.
 
-**Supported on the `anthropic-oauth` docker-compose overlay only.** Enabling it
-anywhere else risks handing the developer's subscription token to the wrong
-provider:
+**Supported on the production compose stack with `docker-compose.oauth.yml`, and
+on the demo `anthropic-oauth` overlay.** Enabling it anywhere else risks handing
+the developer's subscription token to the wrong provider:
 
 | Deployment | Why not |
 |-----|-----|
 | Helm chart | Its litellm ConfigMap routes `"*"` to the corp vLLM and has no `anthropic/` route, so litellm's OAuth branch is unreachable — and a `claude-…` alias on that wildcard would carry the token to the corp vLLM. |
-| Production compose | `Authorization` there is already spoken for by litellm virtual keys, so the OAuth token has no header to travel on. Picking a second header is a governance decision that has not been made. |
 
 The guardrail does check that the request looks Anthropic-routed, but it reads
 only the **client-visible model alias**; litellm resolves the real deployment
@@ -176,14 +175,10 @@ binding control is the deployment shape: a litellm config with no `model_name:
 `docker/anthropic-oauth/litellm-config.yaml` ships and
 `tests/test_anthropic_oauth_profile.py` pins.
 
-Both unsupported cases are blocked on the same open decision — which header
-carries the litellm virtual key and which carries the OAuth token — not on
-missing code.
-
-Consequence to accept knowingly: that overlay has no litellm virtual keys, so
-**subscription auth and native budget / rate-limit governance are mutually
-exclusive today**. A deployment that needs both has to wait for the header-layout
-decision.
+Consequence to accept knowingly: there are no litellm virtual keys, so no native
+budget / rate-limit governance. That is by design: litellm's management surface,
+`/key/*` included, is refused at the route gate (`../security.md` §14), and
+API-key mode survives only as a test posture.
 
 Operationally, note that litellm keeps one deployment per distinct per-request
 `api_key` — raw value included — in `Router.model_list` for the lifetime of the
@@ -305,8 +300,12 @@ That exactness is also why litellm's admin **UI** cannot be re-opened with this
 key: `/ui`, `/swagger`, `/docs` and `/openapi.json` are mounted sub-apps and
 FastAPI internals, each serving many paths the `ast` collector cannot see, so
 they get no table entry and are refused as unlisted. The JSON admin API
-(`/key/*`, `/team/*`, …) is pinned route by route and answers without any
-widening — that is the supported admin surface.
+(`/key/*`, `/team/*`, …), spend, login/SSO, the public catalogue and the
+non-probe `/health/*` routes are pinned route by route as **REFUSE**, and an
+extra naming any refused route — or a `HEAD` on a path whose `GET` is refused —
+is a config error: `config check` reports it and the gateway exits 78 at boot.
+There is no supported litellm admin surface; operators use `gateway-admin`
+(`docs/security.md` §14, "The management surface is refused").
 
 `gateway-admin config check --routes` prints the effective table — row counts
 per verdict, the REWRITTEN routes, and every extra (see `admin-cli.md`).

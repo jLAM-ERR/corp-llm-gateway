@@ -188,11 +188,10 @@ client side below applies unchanged to it.
 and that wildcard is the one shape where a `claude-…` alias could carry the
 subscription token to the wrong upstream.
 
-Subscription auth and litellm virtual-key governance (budgets, rate limits,
-quotas) **cannot be used at the same time**, in any stack: both would need the
-`Authorization` header, and the subscription mode is the one that gets it. Moving
-one of the two credentials to another header is an open decision, not a missing
-feature. See `configuration.md` for the operator view and
+There is no litellm virtual-key governance (budgets, rate limits, quotas) in any
+stack: litellm's management surface, `/key/*` included, is refused at the route
+gate, so no virtual key can be issued ([`../security.md`](../security.md) §14).
+API-key mode survives only as a test posture. See `configuration.md` for the operator view and
 [`../security.md`](../security.md) §13 for what the bridge does and does not
 forward.
 
