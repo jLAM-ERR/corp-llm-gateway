@@ -638,7 +638,11 @@ def test_the_one_shot_list_is_every_restart_no_service(script_text: str) -> None
     # Only a listed service counts as done once it exits 0, so a new `restart: "no"`
     # service must land here too, or every deploy times out waiting for it.
     base = ROOT / "compose" / "docker-compose.yml"
-    overlays = sorted(path for path in base.parent.glob("docker-compose*.yml") if path != base)
+    # deploy.sh never syncs the build overlay, so only the production files count.
+    skipped = {base.name, "docker-compose.build.yml"}
+    overlays = sorted(
+        path for path in base.parent.glob("docker-compose*.yml") if path.name not in skipped
+    )
     restart: dict[str, object] = {}
     for path in (base, *overlays):
         services = (yaml.safe_load(path.read_text()) or {}).get("services") or {}
@@ -647,7 +651,7 @@ def test_the_one_shot_list_is_every_restart_no_service(script_text: str) -> None
                 restart[name] = spec["restart"]
     one_shots = {name for name, value in restart.items() if value in ("no", False)}
 
-    assert one_shots, "the stack has no one-shot any more; the list should go too"
+    assert one_shots == {"minio-init"}
     assert set(_shell_array(script_text, "ONE_SHOT_SERVICES")) == one_shots
 
 
@@ -1442,7 +1446,13 @@ def test_up_fails_at_once_on_a_dead_front_door_and_names_it(
 
 @pytest.mark.parametrize(
     ("state", "health"),
-    [("running", "healthy"), ("running", "starting"), ("created", ""), ("running", "")],
+    [
+        ("running", "healthy"),
+        ("running", "starting"),
+        ("created", ""),
+        ("running", ""),
+        ("paused", "healthy"),
+    ],
 )
 def test_a_live_front_door_is_polled_like_any_service(
     state: str, health: str, tmp_path: Path
@@ -1460,11 +1470,11 @@ def test_a_live_front_door_is_polled_like_any_service(
         extra="HEALTH_MAX_WAIT=1\nHEALTH_INTERVAL=1\n",
     )
 
-    if health == "healthy":
+    if (state, health) == ("running", "healthy"):
         assert result.returncode == 0, result.stderr
     else:
         assert result.returncode == 1
-        assert "within 1s — stuck: nginx" in result.stderr
+        assert f"within 1s — stuck: nginx (state={state}" in result.stderr
         assert "front door is down" not in result.stderr
 
 

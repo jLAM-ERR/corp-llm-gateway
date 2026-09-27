@@ -937,7 +937,7 @@ The entrypoint writes one line naming the key it refused, then exits:
 | 66 | an `NGINX_TRUSTED_PROXIES` entry is not an IP/CIDR with a prefix of at least `/8` (IPv4) or `/16` (IPv6); or, in `behind-proxy`, the list is empty or has no IPv4 entry |
 | 67 | a template is missing, or names a variable the entrypoint does not render — a damaged `nginx/templates/`, not a setting |
 | 68 | `behind-proxy` with `NGINX_BIND_ADDR` set to the unspecified address in any spelling |
-| 69 | `LANGFUSE_PUBLIC_URL` is not `https://<host>[:port][/]` — a `:` with no port, a path, credentials, a bracketed IPv6 literal or a host that is neither a DNS name nor a valid IPv4 address is refused; or, under `nginx`, it names a host other than `langfuse.<GATEWAY_DOMAIN>` |
+| 69 | `LANGFUSE_PUBLIC_URL` is not `https://<host>[:port][/]` — a `:` with no port, a path, credentials, a bracketed IPv6 literal are refused, and the host must be a DNS name (two or more labels) or a valid IPv4 address; or, under `nginx`, it names a host other than `langfuse.<GATEWAY_DOMAIN>` |
 
 Any other non-zero exit is `nginx -t` rejecting the rendered config; its own
 message is in the same log. Facts that surprise operators:

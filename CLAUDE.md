@@ -58,7 +58,8 @@ helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
 compose/                 production compose stack for non-k8s hosts (data plane + Langfuse + Vector audit);
                          compose/nginx/ is the opt-in HTTPS front door (COMPOSE_PROFILES=nginx|nginx-ports):
-                         entrypoint.sh validates NGINX_* (exit 64-69) and renders one listener;
+                         entrypoint.sh validates the NGINX_*, GATEWAY_DOMAIN and LANGFUSE_PUBLIC_URL keys
+                         (exit 64-69) and renders one listener config (TLS mode × routing);
                          templates/snippets/gateway-locations.inc.template is the exact-path allow-list, the
                          only copy; certs/ is server-only, gitignored; pinned by
                          tests/compose/test_nginx_{profile,runtime,allowlist_routes}.py
@@ -131,10 +132,10 @@ Two caches:
 
 ```
 # Full unit suite. Local .venv is Python 3.14 with no extras and no litellm (graceful
-# NER degradation): last known 4139 passed + 382 skipped, ~8.5min. The authoritative
+# NER degradation): measured 4139 passed + 382 skipped, ~8.5min. The authoritative
 # local run is .venv-bench = Python 3.14.7 with every extra (`ner` incl. pymorphy3,
-# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: 4829 passed + 16 skipped
-# with Postgres, ~8.5min — the entrypoint, route-guard, served-stack, container and
+# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: measured 4829 passed + 16 skipped
+# with Postgres and CI=true, ~13min — the entrypoint, route-guard, served-stack, container and
 # nginx route cross-check suites only RUN there. CI runs the same suite on Python
 # 3.14 only — the same interpreter line as .venv-bench; nothing exercises 3.12 any
 # more. Always run both before committing.

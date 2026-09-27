@@ -530,7 +530,7 @@ wait_for_healthcheck() {
                     # nginx always declares a healthcheck. Between two restarts
                     # of a crash loop it shows `running` with no health for an
                     # instant, so "running" alone never counts here.
-                    if [[ "$health" == "healthy" ]]; then
+                    if [[ "$state" == "running" && "$health" == "healthy" ]]; then
                         continue
                     fi
                 elif [[ "$state" == "exited" && -n "$exit_code" && "$exit_code" != "0" ]]; then
