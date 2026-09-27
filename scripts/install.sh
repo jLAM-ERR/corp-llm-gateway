@@ -11,16 +11,21 @@
 # What it does:
 #   1. Detects shell (bash / zsh / fish) and writes ANTHROPIC_BASE_URL,
 #      OPENAI_BASE_URL, CORP_GATEWAY_TOKEN_FILE to your rc file.
-#   2. Runs Keycloak device-flow OAuth (or stub if KEYCLOAK_DEVICE_URL is
-#      unset) and writes a 30-day corp token to ~/.corp-llm-gateway/token.
-#   3. Smokes the gateway with a redactable string and verifies round-trip.
+#   2. Signs you in to Keycloak (RFC 8628 device flow, KEYCLOAK_ISSUER +
+#      KEYCLOAK_CLIENT_ID), trades the access token at the gateway's
+#      /internal/issue-token for a 30-day corp token and writes it 0600 to
+#      ~/.corp-llm-gateway/token. With KEYCLOAK_ISSUER unset it skips this step.
+#   3. Smokes the gateway with your subscription token (ANTHROPIC_AUTH_TOKEN);
+#      skipped when that is unset.
 #
 # Idempotent: re-running rotates the token and replaces the rc lines.
 
 set -euo pipefail
 
 GATEWAY_URL="${CORP_GATEWAY_URL:-https://gateway.corp.lan}"
-KEYCLOAK_DEVICE_URL="${KEYCLOAK_DEVICE_URL:-}"
+KEYCLOAK_ISSUER="${KEYCLOAK_ISSUER:-}"
+KEYCLOAK_ISSUER="${KEYCLOAK_ISSUER%/}"
+KEYCLOAK_CLIENT_ID="${KEYCLOAK_CLIENT_ID:-}"
 INSTALL_DIR="${HOME}/.corp-llm-gateway"
 TOKEN_FILE="${INSTALL_DIR}/token"
 VERSION_FILE="${INSTALL_DIR}/VERSION"
@@ -42,6 +47,11 @@ require_cmd() {
 
 require_cmd curl
 require_cmd jq
+
+if [[ -n "$KEYCLOAK_ISSUER" && -z "$KEYCLOAK_CLIENT_ID" ]]; then
+    err "KEYCLOAK_CLIENT_ID is required when KEYCLOAK_ISSUER is set"
+    exit 1
+fi
 
 mkdir -p "$INSTALL_DIR"
 chmod 700 "$INSTALL_DIR"
@@ -107,80 +117,210 @@ write_rc_block() {
     rm -f "$tmp"
 }
 
-# 2. Keycloak device flow (stub if URL unset) --------------------------------
+# HTTP helpers -----------------------------------------------------------------
+# Secrets travel to curl through a config file on stdin, never through argv.
+curl_cfg_quote() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "$v"
+}
+
+# http_post <url> <curl config lines>: prints the body, then the HTTP status on
+# its own last line. Non-zero only when the request never got an answer.
+http_post() {
+    printf 'url = %s\n%s\n' "$(curl_cfg_quote "$1")" "$2" \
+        | curl -sS -X POST -w '\n%{http_code}' -K -
+}
+
+json_get() {
+    printf '%s' "$1" | jq -r "$2 // empty" 2>/dev/null || true
+}
+
+# The error code of an OAuth / gateway error body, only when it looks like one.
+error_code() {
+    local code pattern='^[A-Za-z0-9_.:-]{1,64}$'
+    code="$(json_get "$1" '.error // .code')"
+    if [[ "$code" =~ $pattern ]]; then
+        printf '%s' "$code"
+    fi
+}
+
+positive_int_or() {
+    local pattern='^[0-9]+$'
+    if [[ "$1" =~ $pattern ]] && [[ "$1" -ge 1 ]]; then
+        printf '%s' "$1"
+    else
+        printf '%s' "$2"
+    fi
+}
+
+# 2. Keycloak device flow + corp-token exchange ---------------------------------
+OIDC_ACCESS_TOKEN=""
+
+keycloak_device_login() {
+    local device_url="$KEYCLOAK_ISSUER/protocol/openid-connect/auth/device"
+    local token_url="$KEYCLOAK_ISSUER/protocol/openid-connect/token"
+    local resp status body code
+
+    log "signing in with Keycloak at $KEYCLOAK_ISSUER"
+    if ! resp="$(http_post "$device_url" \
+        "data-urlencode = $(curl_cfg_quote "client_id=$KEYCLOAK_CLIENT_ID")")"; then
+        err "cannot reach Keycloak at $KEYCLOAK_ISSUER"
+        exit 1
+    fi
+    status="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    if [[ "$status" != "200" ]]; then
+        code="$(error_code "$body")"
+        err "Keycloak refused the device login (HTTP $status${code:+, $code})"
+        exit 1
+    fi
+
+    local device_code user_code uri uri_complete interval expires_in
+    device_code="$(json_get "$body" '.device_code')"
+    user_code="$(json_get "$body" '.user_code')"
+    uri="$(json_get "$body" '.verification_uri')"
+    uri_complete="$(json_get "$body" '.verification_uri_complete')"
+    interval="$(positive_int_or "$(json_get "$body" '.interval')" 5)"
+    expires_in="$(positive_int_or "$(json_get "$body" '.expires_in')" 600)"
+    if [[ -z "$device_code" || ( -z "$uri_complete" && ( -z "$uri" || -z "$user_code" ) ) ]]; then
+        err "Keycloak's device login response is incomplete"
+        exit 1
+    fi
+
+    if [[ -n "$uri_complete" ]]; then
+        printf '\nOpen this URL in a browser and approve the sign-in:\n  \033[1;36m%s\033[0m\n' \
+            "$uri_complete"
+        if [[ -n "$user_code" ]]; then
+            printf 'The page should show the code: %s\n' "$user_code"
+        fi
+    else
+        printf '\nOpen this URL in a browser:\n  \033[1;36m%s\033[0m\nand enter the code: %s\n' \
+            "$uri" "$user_code"
+    fi
+    printf '\nWaiting for you to approve...\n\n'
+
+    local poll_cfg deadline=$(( SECONDS + expires_in ))
+    poll_cfg="data-urlencode = $(curl_cfg_quote "grant_type=urn:ietf:params:oauth:grant-type:device_code")
+data-urlencode = $(curl_cfg_quote "device_code=$device_code")
+data-urlencode = $(curl_cfg_quote "client_id=$KEYCLOAK_CLIENT_ID")"
+
+    while [[ "$SECONDS" -lt "$deadline" ]]; do
+        sleep "$interval"
+        if ! resp="$(http_post "$token_url" "$poll_cfg")"; then
+            err "lost the connection to Keycloak while waiting for sign-in"
+            exit 1
+        fi
+        status="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+        if [[ "$status" == "200" ]]; then
+            OIDC_ACCESS_TOKEN="$(json_get "$body" '.access_token')"
+            if [[ -z "$OIDC_ACCESS_TOKEN" ]]; then
+                err "Keycloak answered without an access token"
+                exit 1
+            fi
+            return
+        fi
+        code="$(error_code "$body")"
+        case "$code" in
+            authorization_pending) ;;
+            slow_down) interval=$(( interval + 5 )) ;;
+            expired_token)
+                err "the sign-in code expired before it was approved — re-run install.sh"
+                exit 1
+                ;;
+            access_denied)
+                err "the sign-in was denied in Keycloak — re-run install.sh to try again"
+                exit 1
+                ;;
+            *)
+                err "Keycloak token request failed (HTTP $status${code:+, $code})"
+                exit 1
+                ;;
+        esac
+    done
+    err "the sign-in code expired before it was approved — re-run install.sh"
+    exit 1
+}
+
+write_token_file() {
+    local tmp="$TOKEN_FILE.tmp.$$"
+    (
+        umask 077
+        printf '%s\n' "$1" > "$tmp"
+    )
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$TOKEN_FILE"
+}
+
 issue_corp_token() {
-    if [[ -z "$KEYCLOAK_DEVICE_URL" ]]; then
-        log "KEYCLOAK_DEVICE_URL unset — using local-stub token (NOT FOR PROD)"
-        echo "ct_local_stub_$(date +%s)" > "$TOKEN_FILE"
-        chmod 600 "$TOKEN_FILE"
+    if [[ -z "$KEYCLOAK_ISSUER" ]]; then
+        log "KEYCLOAK_ISSUER unset — skipping sign-in; no corp token was issued"
+        log "ask your gateway operator for one (gateway-admin token issue) and save it to $TOKEN_FILE (mode 0600)"
         return
     fi
 
-    log "starting Keycloak device flow at $KEYCLOAK_DEVICE_URL"
-    local resp device_code user_code verification_uri interval expires_in
-    resp="$(curl -fsSL -X POST "$KEYCLOAK_DEVICE_URL")"
-    device_code="$(echo "$resp" | jq -r '.device_code')"
-    user_code="$(echo "$resp" | jq -r '.user_code')"
-    verification_uri="$(echo "$resp" | jq -r '.verification_uri_complete // .verification_uri')"
-    interval="$(echo "$resp" | jq -r '.interval // 5')"
-    expires_in="$(echo "$resp" | jq -r '.expires_in // 600')"
+    keycloak_device_login
 
-    printf '\nOpen this URL to authenticate:\n  \033[1;36m%s\033[0m\nUser code: %s\n\n' \
-        "$verification_uri" "$user_code"
-
-    local elapsed=0 oidc_token=""
-    while (( elapsed < expires_in )); do
-        sleep "$interval"
-        elapsed=$(( elapsed + interval ))
-        local poll_resp
-        poll_resp="$(curl -fsSL -X POST "$KEYCLOAK_DEVICE_URL/poll" \
-            --data-urlencode "device_code=$device_code" || true)"
-        oidc_token="$(echo "$poll_resp" | jq -r '.access_token // empty')"
-        if [[ -n "$oidc_token" ]]; then break; fi
-    done
-
-    if [[ -z "$oidc_token" ]]; then
-        err "device-flow timed out"
+    log "exchanging the Keycloak sign-in for a corp token at $GATEWAY_URL"
+    local resp status body code corp_token expires_at pattern='^[A-Za-z0-9._~+/=-]+$'
+    if ! resp="$(http_post "$GATEWAY_URL/internal/issue-token" \
+        "header = $(curl_cfg_quote "Authorization: Bearer $OIDC_ACCESS_TOKEN")
+header = \"Content-Length: 0\"")"; then
+        OIDC_ACCESS_TOKEN=""
+        err "cannot reach the gateway at $GATEWAY_URL"
         exit 1
     fi
-
-    # NOTE: not served today — the gateway leaves /internal/issue-token unlisted (404
-    # route_gate_unlisted); mint tokens with `gateway-admin token issue` out-of-band.
-    log "exchanging OIDC token for 30-day corp token"
-    local issue_resp corp_token
-    issue_resp="$(curl -fsSL -X POST "$GATEWAY_URL/internal/issue-token" \
-        -H "Authorization: Bearer $oidc_token")"
-    corp_token="$(echo "$issue_resp" | jq -r '.corp_token')"
-    if [[ -z "$corp_token" || "$corp_token" == "null" ]]; then
-        err "failed to issue corp token"
+    OIDC_ACCESS_TOKEN=""
+    status="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    if [[ "$status" != "200" ]]; then
+        code="$(error_code "$body")"
+        err "the gateway refused to issue a corp token (HTTP $status${code:+, $code})"
         exit 1
     fi
-    echo "$corp_token" > "$TOKEN_FILE"
-    chmod 600 "$TOKEN_FILE"
+    corp_token="$(json_get "$body" '.corp_token')"
+    expires_at="$(json_get "$body" '.expires_at')"
+    if ! [[ "$corp_token" =~ $pattern ]]; then
+        err "the gateway answered without a usable corp token"
+        exit 1
+    fi
+    write_token_file "$corp_token"
+    log "corp token written to $TOKEN_FILE (expires ${expires_at:-in 30 days})"
 }
 
 # 3. Smoke test ---------------------------------------------------------------
 run_smoke_test() {
-    if [[ -z "$KEYCLOAK_DEVICE_URL" ]]; then
-        log "skipping smoke test (no real corp token)"
+    if [[ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+        log "skipping smoke test: ANTHROPIC_AUTH_TOKEN is unset (export your subscription token and re-run to smoke-test)"
+        return
+    fi
+    if [[ ! -s "$TOKEN_FILE" ]]; then
+        log "skipping smoke test: no corp token at $TOKEN_FILE"
         return
     fi
     log "running smoke test against $GATEWAY_URL"
-    local corp_token
+    local corp_token sample payload resp status body code
     corp_token="$(cat "$TOKEN_FILE")"
-    local sample
-    sample="Hello [SMOKE_TEST_TOKEN_alpha-$(date +%s%N)]."
-    local resp
-    resp="$(curl -fsSL -X POST "$GATEWAY_URL/v1/messages" \
-        -H "X-Corp-Auth: $corp_token" \
-        -H "Authorization: Bearer fake-byok-key" \
-        -H "Content-Type: application/json" \
-        -d "{\"model\":\"claude-3-5-sonnet\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"$sample\"}]}" \
-        || true)"
-    if echo "$resp" | grep -q '"content"'; then
+    sample="Hello [SMOKE_TEST_TOKEN_alpha-$(date +%s)]."
+    payload="{\"model\":\"claude-haiku-4-5\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"$sample\"}]}"
+    if ! resp="$(http_post "$GATEWAY_URL/v1/messages" \
+        "header = $(curl_cfg_quote "X-Corp-Auth: $corp_token")
+header = $(curl_cfg_quote "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN")
+header = \"Content-Type: application/json\"
+header = \"anthropic-version: 2023-06-01\"
+data-binary = $(curl_cfg_quote "$payload")")"; then
+        err "smoke test FAILED — cannot reach $GATEWAY_URL"
+        exit 1
+    fi
+    status="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    if [[ "$status" == "200" ]] && printf '%s' "$body" | grep -q '"content"'; then
         log "smoke test OK"
     else
-        err "smoke test FAILED — response: $resp"
+        code="$(error_code "$body")"
+        err "smoke test FAILED (HTTP $status${code:+, $code})"
         exit 1
     fi
 }

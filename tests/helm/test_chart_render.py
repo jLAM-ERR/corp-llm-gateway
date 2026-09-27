@@ -123,3 +123,61 @@ def test_callback_dotted_path_matches_items_projection_path(
     projected_paths = {item["path"] for item in volume["configMap"]["items"]}
 
     assert expected_shim_path in projected_paths
+
+
+def _render(*sets: str) -> subprocess.CompletedProcess[str]:
+    args = ["helm", "template", "gw", str(CHART_DIR)]
+    for item in sets:
+        args += ["--set", item]
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def _egress_rules(*sets: str) -> list[dict[str, Any]]:
+    result = _render("networkPolicy.enabled=true", *sets)
+    assert result.returncode == 0, result.stderr
+    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    return _first_of_kind(docs, "NetworkPolicy")["spec"]["egress"]
+
+
+def _ip_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [rule for rule in rules if "ipBlock" in rule["to"][0]]
+
+
+def test_keycloak_egress_is_off_by_default() -> None:
+    assert _ip_rules(_egress_rules()) == []
+
+
+def test_keycloak_egress_renders_one_rule_for_the_configured_cidr_and_port() -> None:
+    rules = _egress_rules(
+        "keycloak.egress.enabled=true",
+        "keycloak.egress.cidr=10.20.30.40/32",
+        "keycloak.egress.port=8443",
+    )
+
+    assert _ip_rules(rules) == [
+        {
+            "to": [{"ipBlock": {"cidr": "10.20.30.40/32"}}],
+            "ports": [{"protocol": "TCP", "port": 8443}],
+        }
+    ]
+
+
+def test_keycloak_egress_port_defaults_to_443() -> None:
+    rules = _egress_rules("keycloak.egress.enabled=true", "keycloak.egress.cidr=10.20.30.40/32")
+
+    assert _ip_rules(rules)[0]["ports"] == [{"protocol": "TCP", "port": 443}]
+
+
+def test_keycloak_egress_without_a_cidr_fails_the_render() -> None:
+    result = _render("networkPolicy.enabled=true", "keycloak.egress.enabled=true")
+
+    assert result.returncode != 0
+    assert "keycloak.egress.cidr is required" in result.stderr
+
+
+def test_keycloak_egress_needs_the_network_policy_enabled() -> None:
+    result = _render("keycloak.egress.enabled=true", "keycloak.egress.cidr=10.20.30.40/32")
+
+    assert result.returncode == 0, result.stderr
+    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    assert not any(doc.get("kind") == "NetworkPolicy" for doc in docs)

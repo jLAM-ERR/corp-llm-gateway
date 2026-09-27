@@ -89,6 +89,15 @@ networkPolicy:
   upstreamCidrs: []
   corpInternalCidrs: []
 
+# Egress from the gateway pods to Keycloak (JWKS fetch for developer token
+# issuance, POST /internal/issue-token). Rendered only when
+# networkPolicy.enabled is also true. cidr is required once enabled.
+keycloak:
+  egress:
+    enabled: false
+    cidr: ""   # the Keycloak endpoint, e.g. "10.20.30.40/32"
+    port: 443
+
 failPolicy:
   corpLlmDown: "fail-closed"
   prePassDown: "continue"

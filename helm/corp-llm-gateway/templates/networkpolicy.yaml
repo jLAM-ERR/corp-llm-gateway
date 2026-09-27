@@ -49,4 +49,13 @@ spec:
         - protocol: TCP
           port: 6379
     {{- end }}
+    {{- if .Values.keycloak.egress.enabled }}
+    # Keycloak (JWKS for developer token issuance)
+    - to:
+        - ipBlock:
+            cidr: {{ required "keycloak.egress.cidr is required when keycloak.egress.enabled is true" .Values.keycloak.egress.cidr | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.egress.port | int }}
+    {{- end }}
 {{- end }}
