@@ -280,7 +280,7 @@ def _token_schema_problem(dsn: str) -> str | None:
             return pool.submit(lambda: asyncio.run(_token_schema_state(dsn))).result()
     except Exception as exc:
         # The type only: a driver message can carry the DSN.
-        outcome = pg_session.boot_probe_outcome(exc)
+        outcome = pg_session.boot_probe_outcome(exc, dsn)
         if outcome != pg_session.BOOT_WARN:
             return _TOKEN_SCHEMA_REFUSED[outcome].format(type(exc).__name__)
         log.warning(

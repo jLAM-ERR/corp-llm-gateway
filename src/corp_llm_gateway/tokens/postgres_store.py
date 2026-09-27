@@ -47,6 +47,9 @@ _ACQUIRE_TIMEOUT_S = 5.0
 _CONNECT_TIMEOUT_S = 5.0
 # Returning an issuance connection to the pool; past it the connection is dropped.
 _RELEASE_BUDGET_S = RELEASE_BUDGET_S
+# The auth hot path's lookup statement, client-side: it also bounds a server that
+# stopped answering. Past it: TimeoutError, the connection is abandoned.
+LOOKUP_TIMEOUT_S = 5.0
 
 _asyncpg_mod: types.ModuleType | None = None
 _asyncpg_tried = False
@@ -158,8 +161,9 @@ class PostgresTokenStore(TokenStore):
 
     async def lookup(self, corp_token: str) -> TokenInfo | None:
         pool = await self._get_pool()
-        async with self._acquire(pool) as conn:
-            row: Any = await conn.fetchrow(
+        row: Any = await run_on_connection(
+            pool,
+            lambda conn: conn.fetchrow(
                 """
                 SELECT corp_token, user_id, team_id, scopes,
                        issued_at, expires_at, revoked_at
@@ -167,7 +171,11 @@ class PostgresTokenStore(TokenStore):
                 WHERE corp_token = $1
                 """,
                 corp_token,
-            )
+                timeout=LOOKUP_TIMEOUT_S,
+            ),
+            acquire_timeout=_ACQUIRE_TIMEOUT_S,
+            release_budget=_RELEASE_BUDGET_S,
+        )
         if row is None:
             return None
         return _row_to_token_info(row)

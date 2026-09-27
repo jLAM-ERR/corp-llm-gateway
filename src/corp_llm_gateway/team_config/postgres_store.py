@@ -35,6 +35,8 @@ _ACQUIRE_TIMEOUT_S = 5.0
 _CONNECT_TIMEOUT_S = 5.0
 # Returning a `get` connection to the pool; past it the connection is dropped.
 _RELEASE_BUDGET_S = RELEASE_BUDGET_S
+# The `get` statement, client-side: it also bounds a server that stopped answering.
+_GET_TIMEOUT_S = 5.0
 
 _COLUMNS = (
     "team_id, name, replace_md_path, profile_ids, "
@@ -139,7 +141,9 @@ class PostgresTeamConfigStore(TeamConfigStore):
         row: Any = await run_on_connection(
             pool,
             lambda conn: conn.fetchrow(
-                f"SELECT {_COLUMNS} FROM team_config WHERE team_id = $1", team_id
+                f"SELECT {_COLUMNS} FROM team_config WHERE team_id = $1",
+                team_id,
+                timeout=_GET_TIMEOUT_S,
             ),
             acquire_timeout=_ACQUIRE_TIMEOUT_S,
             release_budget=_RELEASE_BUDGET_S,

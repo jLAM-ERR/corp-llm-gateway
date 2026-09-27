@@ -63,8 +63,8 @@ class _Pool:
 
     async def release(self, conn: _Conn, *, timeout: float | None = None) -> None:
         self.released.append(timeout)
-        if self.release_hangs and not conn.terminated:
-            await asyncio.sleep(3600)
+        while self.release_hangs and not conn.terminated:
+            await asyncio.sleep(0.01)
 
 
 async def _elapsed(coro: object) -> tuple[object, float]:
@@ -87,7 +87,10 @@ async def test_the_work_runs_on_a_connection_acquired_within_the_bound() -> None
     assert pool.conn.terminated == 0
 
 
-async def test_a_release_past_its_budget_drops_the_connection_and_keeps_the_result() -> None:
+async def test_a_release_past_its_budget_drops_the_connection_and_keeps_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pg_session, "RELEASE_GRACE_S", 0.2)
     pool = _Pool(release_hangs=True)
 
     async def work(conn: _Conn) -> str:
@@ -120,6 +123,151 @@ async def test_a_cancelled_work_terminates_the_connection_without_waiting_on_it(
 
     assert loop.time() - start < 1.0
     assert pool.conn.terminated >= 1
+
+
+class _BudgetedPool(_Pool):
+    """Releases like asyncpg: runs to its own timeout, then drops the connection."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cut_short = False
+        self.terminated_under_it = False
+
+    async def release(self, conn: _Conn, *, timeout: float | None = None) -> None:
+        self.released.append(timeout)
+        try:
+            await asyncio.sleep(timeout or 0)
+        except asyncio.CancelledError:
+            self.cut_short = True
+            raise
+        self.terminated_under_it = conn.terminated > 0
+        conn.terminate()
+        raise TimeoutError
+
+
+async def test_asyncpg_gets_the_release_budget_and_is_not_cut_short_under_it() -> None:
+    pool = _BudgetedPool()
+
+    async def work(conn: _Conn) -> str:
+        return "committed"
+
+    result, elapsed = await _elapsed(
+        run_on_connection(pool, work, acquire_timeout=1, release_budget=0.2)
+    )
+
+    assert result == "committed"
+    assert pool.released == [0.2]
+    assert not pool.cut_short
+    assert not pool.terminated_under_it
+    assert elapsed < 0.2 + pg_session.RELEASE_GRACE_S
+
+
+async def test_a_cancel_during_the_release_leaves_it_bounded_in_the_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pg_session, "RELEASE_GRACE_S", 0.1)
+    pool = _Pool(release_hangs=True)
+    released = asyncio.Event()
+
+    class _SignallingPool(_Pool):
+        async def release(self, conn: _Conn, *, timeout: float | None = None) -> None:
+            released.set()
+            await pool.release(conn, timeout=timeout)
+
+    wrapper = _SignallingPool()
+    wrapper.conn = pool.conn
+
+    async def work(conn: _Conn) -> str:
+        return "committed"
+
+    task = asyncio.create_task(
+        run_on_connection(wrapper, work, acquire_timeout=1, release_budget=0.1)
+    )
+    await released.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert pool.conn.terminated == 0
+
+    await asyncio.sleep(0.4)
+    assert pool.conn.terminated == 1
+    assert not pg_session._BACKGROUND
+
+
+class _CancellableConn(_Conn):
+    """A Connection with asyncpg's cancel request; ``cancel_hangs`` models a server
+    that never answers it."""
+
+    def __init__(self, *, cancel_hangs: bool = False) -> None:
+        super().__init__()
+        self.cancel_hangs = cancel_hangs
+
+    def is_closed(self) -> bool:
+        return self.terminated > 0
+
+    def terminate(self) -> None:
+        self.events.append("terminate")
+        super().terminate()
+
+    async def _cancel(self, waiter: asyncio.Future[None]) -> None:
+        self.events.append("cancel")
+        if self.cancel_hangs:
+            await asyncio.sleep(3600)
+        waiter.set_result(None)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [asyncio.CancelledError, TimeoutError],
+    ids=["cancelled", "statement-timeout"],
+)
+async def test_an_abandoned_statement_is_cancelled_before_the_connection_is_dropped(
+    fault: type[BaseException],
+) -> None:
+    pool = _Pool()
+    pool.conn = _CancellableConn()
+
+    async def work(conn: _Conn) -> None:
+        raise fault
+
+    with pytest.raises(fault):
+        await run_on_connection(pool, work, acquire_timeout=1)
+
+    assert pool.conn.events[:2] == ["cancel", "terminate"]
+
+
+async def test_a_cancel_request_nobody_answers_is_given_up_within_its_budget() -> None:
+    pool = _Pool()
+    pool.conn = _CancellableConn(cancel_hangs=True)
+    entered = asyncio.Event()
+
+    async def work(conn: _Conn) -> None:
+        entered.set()
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(run_on_connection(pool, work, acquire_timeout=1))
+    await entered.wait()
+    task.cancel()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    assert loop.time() - start < pg_session.CANCEL_BUDGET_S + 0.5
+    assert pool.conn.events[:2] == ["cancel", "terminate"]
+
+
+async def test_a_query_error_is_not_an_abandoned_statement() -> None:
+    pool = _Pool()
+    pool.conn = _CancellableConn()
+
+    async def work(conn: _Conn) -> None:
+        raise LookupError("query fault")
+
+    with pytest.raises(LookupError):
+        await run_on_connection(pool, work, acquire_timeout=1)
+
+    assert pool.conn.events == []
 
 
 async def test_an_error_in_the_work_propagates_and_the_connection_goes_back() -> None:
@@ -185,6 +333,18 @@ async def test_a_cancelled_transaction_neither_commits_nor_waits_on_a_rollback()
     assert conn.events == ["tx {}", "start"]
 
 
+async def test_a_statement_timeout_in_a_transaction_does_not_wait_on_a_rollback() -> None:
+    conn = _Conn()
+
+    async def timed_out(c: _Conn) -> None:
+        raise TimeoutError
+
+    with pytest.raises(TimeoutError):
+        await in_transaction(conn, timed_out)
+
+    assert conn.events == ["tx {}", "start"]
+
+
 # ── store_unavailable ────────────────────────────────────────────────────────
 
 
@@ -222,6 +382,17 @@ def test_asyncpg_connection_classes_are_unavailable(name: str) -> None:
 def test_asyncpg_query_faults_are_not_unavailable(name: str) -> None:
     asyncpg = pytest.importorskip("asyncpg")
     assert not store_unavailable(getattr(asyncpg.exceptions, name)("x"))
+
+
+def test_a_client_configuration_fault_is_not_unavailable() -> None:
+    # An InterfaceError subclass, but a config fault: 500, as the boot refuses it.
+    asyncpg = pytest.importorskip("asyncpg")
+    assert not store_unavailable(asyncpg.exceptions.ClientConfigurationError("x"))
+    assert store_unavailable(
+        asyncpg.exceptions.InterfaceError(
+            "cannot perform operation: another operation is in progress"
+        )
+    )
 
 
 def test_a_plain_error_is_not_unavailable() -> None:
@@ -278,6 +449,30 @@ def test_a_network_failure_warns_and_boots(exc: BaseException) -> None:
 def test_each_asyncpg_class_has_its_boot_outcome(name: str, outcome: str) -> None:
     asyncpg = pytest.importorskip("asyncpg")
     assert boot_probe_outcome(getattr(asyncpg.exceptions, name)("x")) == outcome
+
+
+_SSL_REJECTED = ConnectionError('PostgreSQL server at "db:5432" rejected SSL upgrade')
+
+
+@pytest.mark.parametrize("mode", ["require", "verify-ca", "verify-full", "REQUIRE"])
+def test_a_server_declining_the_tls_the_dsn_demands_refuses_the_boot(mode: str) -> None:
+    dsn = f"postgresql://gw:pw@db:5432/gw?sslmode={mode}"
+    assert boot_probe_outcome(_SSL_REJECTED, dsn) == BOOT_REFUSE_TLS
+
+
+@pytest.mark.parametrize(
+    ("exc", "dsn"),
+    [
+        (_SSL_REJECTED, "postgresql://gw:pw@db:5432/gw"),
+        (_SSL_REJECTED, "postgresql://gw:pw@db:5432/gw?sslmode=prefer"),
+        (_SSL_REJECTED, ""),
+        (ConnectionRefusedError("connect call failed"), "postgresql://db/gw?sslmode=require"),
+        (ConnectionResetError(), "postgresql://db/gw?sslmode=verify-full"),
+    ],
+    ids=["no-sslmode", "prefer", "no-dsn", "refused-require", "reset-verify-full"],
+)
+def test_a_connection_failure_that_can_heal_still_warns(exc: BaseException, dsn: str) -> None:
+    assert boot_probe_outcome(exc, dsn) == BOOT_WARN
 
 
 def test_an_unlisted_failure_refuses_the_boot() -> None:

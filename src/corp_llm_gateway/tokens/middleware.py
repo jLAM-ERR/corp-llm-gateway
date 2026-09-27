@@ -93,11 +93,13 @@ class AuthMiddleware:
             return cached[0]
         task = self._inflight.get(corp_token)
         if task is None:
-            task = asyncio.ensure_future(self._fetch(corp_token))
+            task = asyncio.get_running_loop().create_task(self._fetch(corp_token))
             self._inflight[corp_token] = task
             task.add_done_callback(lambda done: self._forget(corp_token, done))
-        # Shielded: one caller giving up does not cancel the lookup the others share.
-        return await asyncio.shield(task)
+        # A caller giving up stops waiting; the lookup the others share runs on. Not
+        # shield: it hands the lookup's failure, text and all, to the loop's handler.
+        await asyncio.wait((task,))
+        return task.result()
 
     async def _fetch(self, corp_token: str) -> TokenInfo | None:
         info = await self._store.lookup(corp_token)

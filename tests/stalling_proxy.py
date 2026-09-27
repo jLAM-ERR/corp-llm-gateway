@@ -3,6 +3,7 @@
 While stalled, no byte moves either way and a new connection is accepted but
 never answered — what a client sees from a paused or partitioned server, including
 asyncpg's out-of-band cancel request. ``resume()`` lets everything flow again.
+While dropping, a new connection is closed unread: a cancel request that is lost.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ class StallingProxy:
         self._tasks: set[asyncio.Task[None]] = set()
         self._writers: set[asyncio.StreamWriter] = set()
         self.accepted = 0
+        self.dropping = False
 
     async def start(self) -> str:
         """Listen on a loopback port; the DSN that goes through the relay."""
@@ -38,23 +40,29 @@ class StallingProxy:
     def resume(self) -> None:
         self._flowing.set()
 
+    def drop_new(self, dropping: bool = True) -> None:
+        self.dropping = dropping
+
     async def close(self) -> None:
         self.resume()
         if self._server is not None:
             self._server.close()
         for writer in list(self._writers):
             writer.close()
-        for task in list(self._tasks):
+        tasks = list(self._tasks)
+        for task in tasks:
             task.cancel()
-        for task in list(self._tasks):
-            with contextlib.suppress(BaseException):
-                await task
+        # The relay tasks' own cancellations are results; a cancelled close propagates.
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self._server is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._server.wait_closed(), 2)
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.accepted += 1
+        if self.dropping:
+            writer.close()
+            return
         self._writers.add(writer)
         task = asyncio.current_task()
         assert task is not None

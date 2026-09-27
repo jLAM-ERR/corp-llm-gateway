@@ -318,3 +318,48 @@ async def test_no_lookup_bookkeeping_outlives_its_lookup() -> None:
         await mw.authenticate("tok-other")
 
     assert mw._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_with_a_cancelled_waiter_never_reaches_the_loop_handler() -> None:
+    from tests.loop_errors import describe, loop_errors
+
+    store = _GatedStore("tok-SECRET")
+    store.fail_with = ConnectionResetError("tok-SECRET")
+    mw = AuthMiddleware(store)
+
+    async with loop_errors(settle_s=0.05) as seen:
+        gone = asyncio.create_task(mw.authenticate("tok-SECRET"))
+        await asyncio.sleep(0)
+        survivor = asyncio.create_task(mw.authenticate("tok-SECRET"))
+        await asyncio.sleep(0)
+        gone.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await gone
+        store.release.set()
+        with pytest.raises(ConnectionResetError):
+            await asyncio.wait_for(survivor, timeout=1)
+
+    assert seen == [], describe(seen)
+    assert store.calls == ["tok-SECRET"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_every_waiter_abandoned_is_still_retrieved() -> None:
+    from tests.loop_errors import describe, loop_errors
+
+    store = _GatedStore("tok-SECRET")
+    store.fail_with = ConnectionResetError("tok-SECRET")
+    mw = AuthMiddleware(store)
+
+    async with loop_errors(settle_s=0.05) as seen:
+        waiters = [asyncio.create_task(mw.authenticate("tok-SECRET")) for _ in range(2)]
+        await asyncio.sleep(0)
+        for waiter in waiters:
+            waiter.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+        store.release.set()
+        await asyncio.sleep(0.01)
+
+    assert seen == [], describe(seen)
+    assert mw._inflight == {}

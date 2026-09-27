@@ -21,6 +21,7 @@ The class is duck-typed; LiteLLM doesn't require strict subclassing.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -104,6 +105,7 @@ from corp_llm_gateway.tokens import (
     AuthMiddleware,
     MissingTokenError,
 )
+from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
 
 # litellm v1.85's proxy dispatcher filters callbacks via
 # `isinstance(cb, CustomLogger)` before invoking any hook method.
@@ -139,6 +141,9 @@ _AUDIT_DEDUP_CAP = 4096
 
 # The error code of a request the route gate cancelled because its client left.
 E_CLIENT_DISCONNECTED = "E_CLIENT_DISCONNECTED"
+
+# The auth lookup's own bound on the request path; past it: 503 E_STORE_UNAVAILABLE.
+AUTH_LOOKUP_BOUND_S = LOOKUP_TIMEOUT_S + 1.0
 
 # `role` is echoed straight from the request body into a log line. Only these
 # known message roles are logged verbatim; anything else logs as "invalid" so a
@@ -449,7 +454,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         inbound_headers = _extract_auth_headers(data)
         try:
-            ctx = await self._auth.authenticate_headers(inbound_headers)
+            async with asyncio.timeout(AUTH_LOOKUP_BOUND_S):
+                ctx = await self._auth.authenticate_headers(inbound_headers)
         except MissingTokenError:
             logger.info(
                 "litellm_pre_call_auth_failed request_id=%s error_code=E_MISSING_TOKEN",

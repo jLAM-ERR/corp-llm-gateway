@@ -198,3 +198,28 @@ def test_a_server_sent_transient_failure_warns_and_boots(
         in (result["stdout"])
     )
     assert _SECRET not in result["stdout"]
+
+
+@pytest.mark.parametrize(
+    ("dsn_query", "refused"),
+    [("?sslmode=require", True), ("?sslmode=verify-full", True), ("", False)],
+    ids=["require", "verify-full", "no-sslmode"],
+)
+def test_a_server_declining_the_tls_the_dsn_demands_exits_78(
+    valid_config: Path, tmp_path: Path, dsn_query: str, refused: bool
+) -> None:
+    # asyncpg raises a plain ConnectionError, an OSError; with sslmode=require it
+    # never heals, so it must not warn and boot.
+    _require_issuance_extras()
+    env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=UNREACHABLE_PG + dsn_query)
+    expr = f"ConnectionError('PostgreSQL server at \"{_SECRET}\" rejected SSL upgrade')"
+
+    result = _run(_probe_raising(expr), valid_config, env=env)
+
+    if refused:
+        assert result["exit_code"] == 78
+        assert "TLS to CORP_LLM_PG_DSN failed (ConnectionError)" in result["stdout"]
+    else:
+        assert result["exit_code"] is None
+        assert "Postgres not reachable at boot (ConnectionError)" in result["stdout"]
+    assert _SECRET not in result["stdout"]
