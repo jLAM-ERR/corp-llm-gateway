@@ -241,6 +241,20 @@ def _start_postgres(name: str, network: str) -> None:
     pytest.fail(f"postgres never became ready:\n{docker('logs', name).stderr[-2000:]}")
 
 
+def _run_sql(name: str, sql: str) -> None:
+    psql = ["psql", "-U", "gw", "-d", "litellm", "-v", "ON_ERROR_STOP=1"]
+    result = subprocess.run(
+        ["docker", "exec", "-i", name, *psql],
+        input=sql,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"psql failed:\n{result.stderr}")
+
+
 @contextlib.contextmanager
 def running_stack(
     image: str,
@@ -248,8 +262,14 @@ def running_stack(
     env: Mapping[str, str],
     *,
     with_postgres: bool = False,
+    postgres_sql: str | None = None,
+    gateway_args: Sequence[str] = (),
 ) -> Iterator[Stack]:
-    """Stub + gateway on an egress-blocked network, reachable through a relay."""
+    """Stub + gateway on an egress-blocked network, reachable through a relay.
+
+    ``postgres_sql`` runs in the stack's Postgres before the gateway boots;
+    ``gateway_args`` are extra ``docker run`` arguments for the gateway (an alias,
+    a mount)."""
     suffix = uuid.uuid4().hex[:8]
     network = f"corp-rg-net-{suffix}"
     stub = f"corp-rg-stub-{suffix}"
@@ -280,6 +300,8 @@ def running_stack(
         if with_postgres:
             _start_postgres(postgres, network)
             extra = ["-e", f"DATABASE_URL={POSTGRES_DSN}"]
+            if postgres_sql is not None:
+                _run_sql(postgres, postgres_sql)
         _run_detached(
             gateway,
             [
@@ -291,6 +313,7 @@ def running_stack(
                 f"{config_path}:/etc/litellm/config.yaml:ro",
                 *_env_args(env),
                 *extra,
+                *gateway_args,
                 image,
             ],
         )

@@ -16,6 +16,13 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.compose.nginx_allowlist import (
+    GATEWAY_SNIPPET,
+    Location,
+    Snippet,
+    gateway_snippet,
+    parse_snippet,
+)
 from tests.compose.nginx_support import (
     COMPOSE,
     COMPOSE_DIR,
@@ -302,24 +309,61 @@ def test_the_rendering_design_layout_is_in_place() -> None:
     assert (NGINX_DIR / "entrypoint.sh").is_file()
 
 
-def _locations(snippet: Path) -> dict[str, list[str]]:
-    """location -> its directives. Every directive in a snippet sits in a location."""
-    body = _directives(snippet.read_text())
-    blocks = re.findall(r"location\s+([^{;]+?)\s*\{([^{}]*)\}", body)
-    rest = re.sub(r"location\s+[^{;]+?\s*\{[^{}]*\}", "", body)
-    assert rest.strip() == "", (snippet.name, rest)
+def _locations(snippet: Path) -> tuple[list[str], dict[str, list[str]]]:
+    """(server-context directives, location -> its directives), nested blocks
+    rendered inline (``limit_except POST { deny all }``)."""
+    parsed = parse_snippet(snippet.read_text())
     locations = {
-        name: [d.strip() for d in directives.split(";") if d.strip()] for name, directives in blocks
+        location.key: [str(d) for d in location.directives] for location in parsed.locations
     }
-    assert len(locations) == len(blocks), snippet.name
-    return locations
+    assert len(locations) == len(parsed.locations), snippet.name
+    return [str(d) for d in parsed.server], locations
 
 
-# What the front door admits today: nothing. Tasks 3 and 5 replace these with
-# the allow-lists; the assertion evolves with them.
+def _proxied(path: str) -> str:
+    return f"proxy_pass $gateway_upstream{path}$is_args$args"
+
+
+# The one copy of the proxy settings, inherited by every location below.
+GATEWAY_SERVER_DIRECTIVES = [
+    "set $gateway_upstream http://litellm:4000",
+    "proxy_http_version 1.1",
+    "proxy_buffering off",
+    "proxy_request_buffering off",
+    "proxy_read_timeout 3600s",
+    "chunked_transfer_encoding on",
+    "proxy_max_temp_file_size 0",
+    'proxy_set_header Upgrade ""',
+    'proxy_set_header Connection ""',
+    "proxy_set_header Host $proxy_host_header",
+    "proxy_set_header X-Forwarded-Proto https",
+    "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for",
+    "client_max_body_size 25m",
+]
+
+# What the front door admits: the gateway's allow-list ("The security
+# constraint"), and nothing on Langfuse yet — Task 5 replaces that pin.
 ADMITTED_LOCATIONS = {
-    "gateway-locations.inc.template": {"/": ["return 404"]},
-    "langfuse-locations.inc.template": {"/": ["return 404"]},
+    "gateway-locations.inc.template": (
+        GATEWAY_SERVER_DIRECTIVES,
+        {
+            "= /v1/messages": ["limit_except POST { deny all }", _proxied("/v1/messages")],
+            "= /v1/chat/completions": [
+                "limit_except POST { deny all }",
+                _proxied("/v1/chat/completions"),
+            ],
+            "= /v1/responses": ["limit_except POST { deny all }", _proxied("/v1/responses")],
+            "= /v1/models": ["limit_except GET { deny all }", _proxied("/v1/models")],
+            "= /healthz/live": ["limit_except GET { deny all }", _proxied("/healthz/live")],
+            "= /internal/issue-token": [
+                "limit_except POST { deny all }",
+                "client_max_body_size 1k",
+                _proxied("/internal/issue-token"),
+            ],
+            "/": ["return 404"],
+        },
+    ),
+    "langfuse-locations.inc.template": ([], {"/": ["return 404"]}),
 }
 
 
@@ -328,6 +372,96 @@ def test_each_snippet_admits_exactly_the_pinned_locations(snippet: str) -> None:
     path = NGINX_DIR / "templates" / "snippets" / snippet
 
     assert _locations(path) == ADMITTED_LOCATIONS[snippet]
+
+
+def test_the_parser_sees_a_nested_block_and_refuses_an_unbalanced_one() -> None:
+    parsed = parse_snippet("location = /a { limit_except POST { deny all; } return 204; }")
+    assert [str(d) for d in parsed.locations[0].directives] == [
+        "limit_except POST { deny all }",
+        "return 204",
+    ]
+    with pytest.raises(AssertionError):
+        parse_snippet("location = /a { limit_except POST { deny all; } ")
+
+
+# --------------------------------------------------------------------------- #
+# the gateway allow-list
+# --------------------------------------------------------------------------- #
+
+
+def test_the_gateway_snippet_never_forwards_a_websocket_upgrade() -> None:
+    text = GATEWAY_SNIPPET.read_text()
+
+    assert "$http_upgrade" not in text
+    assert "$connection_upgrade" not in text
+    exact = gateway_snippet().exact()
+    assert exact
+    for location in exact:
+        assert len(location.find("limit_except")) == 1, location.key
+
+
+def test_every_gateway_location_is_exact_except_the_404_catch_all() -> None:
+    snippet = gateway_snippet()
+    others = [location for location in snippet.locations if location.modifier != "="]
+
+    assert [(location.key, [str(d) for d in location.directives]) for location in others] == [
+        ("/", ["return 404"])
+    ]
+    for location in snippet.exact():
+        assert len(location.methods) == 1, location.key
+        (limit,) = location.find("limit_except")
+        assert [str(d) for d in limit.block or ()] == ["deny all"], location.key
+        # A literal path: nothing request-derived but the query string reaches litellm.
+        assert [str(d) for d in location.find("proxy_pass")] == [_proxied(location.path)]
+
+
+def _effective(snippet: Snippet, location: Location, name: str) -> list[str]:
+    own = location.find(name)
+    inherited = [d for d in snippet.server if d.name == name]
+    return [str(d) for d in (own or inherited)]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("proxy_request_buffering", "proxy_request_buffering off"),
+        ("proxy_max_temp_file_size", "proxy_max_temp_file_size 0"),
+        ("proxy_buffering", "proxy_buffering off"),
+        ("proxy_http_version", "proxy_http_version 1.1"),
+    ],
+)
+def test_no_proxied_location_can_write_a_temp_file_or_buffer(name: str, value: str) -> None:
+    # A temp-file fault is a [crit] entry, which carries the request line.
+    snippet = gateway_snippet()
+    proxied = [location for location in snippet.locations if location.find("proxy_pass")]
+
+    assert len(proxied) == 6
+    for location in proxied:
+        assert _effective(snippet, location, name) == [value], location.key
+
+
+def test_the_credentials_pass_through_untouched() -> None:
+    snippet = gateway_snippet()
+    every = [*snippet.server, *(d for loc in snippet.locations for d in loc.directives)]
+    headers = [d.args[0].lower() for d in every if d.name == "proxy_set_header"]
+
+    assert "authorization" not in headers
+    assert "x-corp-auth" not in headers
+    assert not [d for d in every if d.name in ("proxy_hide_header", "proxy_pass_request_headers")]
+    # A location-level proxy_set_header would drop every inherited one there.
+    for location in snippet.locations:
+        assert not location.find("proxy_set_header"), location.key
+
+
+def test_the_body_caps_are_25m_and_1k_on_issuance_alone() -> None:
+    snippet = gateway_snippet()
+    caps = {
+        location.key: _effective(snippet, location, "client_max_body_size")
+        for location in snippet.exact()
+    }
+
+    assert caps.pop("= /internal/issue-token") == ["client_max_body_size 1k"]
+    assert set(map(tuple, caps.values())) == {("client_max_body_size 25m",)}
 
 
 TRUSTED_PEER_GATE = "if ($from_trusted_proxy = 0) { return 444; }"
