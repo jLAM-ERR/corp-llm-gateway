@@ -70,13 +70,19 @@ class TokenIssuer:
         store: TokenStore,
         verifier: OidcVerifier,
         *,
-        ttl: timedelta = timedelta(days=DEFAULT_TOKEN_TTL_DAYS),
+        ttl: timedelta | None = None,
         token_factory: Callable[[], str] | None = None,
         policy: IssuancePolicy | None = None,
     ) -> None:
+        """With ``policy``, TTL and token minting come from the policy, so passing
+        ``ttl`` or ``token_factory`` as well raises ``ValueError``."""
+        if policy is not None and (ttl is not None or token_factory is not None):
+            raise ValueError(
+                "TokenIssuer: ttl and token_factory are the policy's; do not pass them with policy"
+            )
         self._store = store
         self._verifier = verifier
-        self._ttl = ttl
+        self._ttl = ttl if ttl is not None else timedelta(days=DEFAULT_TOKEN_TTL_DAYS)
         self._token_factory = token_factory or default_token_factory
         self._policy = policy
 

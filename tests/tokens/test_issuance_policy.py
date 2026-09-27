@@ -304,3 +304,19 @@ async def test_token_issuer_verifies_before_the_policy_runs() -> None:
         await issuer.issue("")
 
     assert await store.list_tokens() == ()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"ttl": timedelta(hours=1)},
+        {"ttl": timedelta(days=30)},
+        {"token_factory": lambda: "ct_fixed"},
+    ],
+    ids=["ttl", "default-valued-ttl", "token-factory"],
+)
+def test_token_issuer_refuses_settings_the_policy_would_ignore(overrides: dict) -> None:
+    policy, store, _ = _policy()
+
+    with pytest.raises(ValueError, match="policy"):
+        TokenIssuer(store, _verifier(_claims("jti-1")), policy=policy, **overrides)

@@ -10,6 +10,7 @@ Pattern mirrors tests/storage/test_mapping_store.py.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,7 +33,8 @@ from tests.postgres_support import (
 
 StoreFactory = Callable[[], Awaitable[TokenStore]]
 
-# Room for the 10-way race tests to hold 10 connections at once.
+_RACE_WIDTH = 10
+# Room for the race tests to hold _RACE_WIDTH connections at once.
 _RACE_POOL_SIZE = 12
 
 
@@ -167,7 +169,6 @@ _T0 = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 _TTL = timedelta(days=30)
 _INTERVAL = timedelta(minutes=10)
 _MAX_ACTIVE = 2
-_RACE_WIDTH = 10
 
 
 def _oidc_info(corp_token: str, now: datetime, *, ttl: timedelta = _TTL) -> TokenInfo:
@@ -211,6 +212,15 @@ async def _revoked(store: TokenStore, corp_token: str) -> bool:
 async def _stored(store: TokenStore, tokens: list[str]) -> list[TokenInfo]:
     found = [await store.lookup(t) for t in tokens]
     return [info for info in found if info is not None]
+
+
+def _assert_no_driver_detail(exc: BaseException, *values: str) -> None:
+    # The driver's message quotes the conflicting key; it must not ride along.
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    rendered = f"{exc!s} {exc!r}"
+    for value in values:
+        assert value not in rendered
 
 
 def _codes(results: list[Any]) -> list[str]:
@@ -267,6 +277,66 @@ async def test_issue_within_interval_is_rate_limited(store: TokenStore) -> None:
     # The interval boundary itself is allowed.
     await _issue(store, "ct-rate-c", now=_T0 + _INTERVAL, jti="jti-c")
     assert not await _revoked(store, "ct-rate-c")
+
+
+@pytest.mark.asyncio
+async def test_interval_counts_a_revoked_latest_token(store: TokenStore) -> None:
+    await _issue(store, "ct-rrev-a", now=_T0, jti="jti-a")
+    assert await store.revoke_user("alice") == 1
+
+    with pytest.raises(IssuancePolicyError) as exc_info:
+        await _issue(store, "ct-rrev-b", now=_T0 + timedelta(minutes=1), jti="jti-b")
+
+    assert exc_info.value.code == "E_ISSUE_RATE"
+    assert await store.lookup("ct-rrev-b") is None
+    await _issue(store, "ct-rrev-c", now=_T0 + _INTERVAL, jti="jti-c")
+    assert not await _revoked(store, "ct-rrev-c")
+
+
+@pytest.mark.asyncio
+async def test_interval_counts_an_expired_latest_token(store: TokenStore) -> None:
+    await _issue(store, "ct-rexp-a", now=_T0, jti="jti-a", ttl=timedelta(minutes=1))
+
+    with pytest.raises(IssuancePolicyError) as exc_info:
+        await _issue(store, "ct-rexp-b", now=_T0 + timedelta(minutes=5), jti="jti-b")
+
+    assert exc_info.value.code == "E_ISSUE_RATE"
+    assert await store.lookup("ct-rexp-b") is None
+    await _issue(store, "ct-rexp-c", now=_T0 + _INTERVAL, jti="jti-c")
+    assert not await _revoked(store, "ct-rexp-c")
+
+
+@pytest.mark.asyncio
+async def test_issued_row_is_stored_unrevoked(store: TokenStore) -> None:
+    info = dataclasses.replace(_oidc_info("ct-unrev", _T0), revoked_at=_T0)
+
+    got = await store.issue_for_subject(
+        info,
+        issuer=_ISS,
+        subject="sub-alice",
+        jti="jti-unrev",
+        max_active=_MAX_ACTIVE,
+        min_interval=_INTERVAL,
+    )
+
+    assert got.revoked_at is None
+    assert not await _revoked(store, "ct-unrev")
+
+
+@pytest.mark.asyncio
+async def test_corp_token_collision_is_an_opaque_runtime_error(store: TokenStore) -> None:
+    await _upsert(store, _info("ct-collide-7f3a", user_id="bob"))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await _issue(store, "ct-collide-7f3a", now=_T0, jti="jti-collide-9c1e")
+
+    _assert_no_driver_detail(
+        exc_info.value, "ct-collide-7f3a", "jti-collide-9c1e", "Key (", "duplicate key"
+    )
+    kept = await store.lookup("ct-collide-7f3a")
+    assert kept is not None and kept.user_id == "bob"
+    # The failed attempt consumed neither the jti nor the interval.
+    await _issue(store, "ct-collide-next", now=_T0, jti="jti-collide-9c1e")
 
 
 @pytest.mark.asyncio
@@ -367,7 +437,7 @@ async def test_parallel_same_jti_across_subjects_yields_exactly_one_token(
     for result in results:
         if isinstance(result, IssuancePolicyError):
             assert result.args == ("E_ISSUE_REPLAY",)
-            assert result.__cause__ is None
+            _assert_no_driver_detail(result, "jti-shared", *tokens)
     assert len(await _stored(store, tokens)) == 1
 
 
@@ -431,7 +501,7 @@ async def test_parallel_issuance_without_interval_never_exceeds_the_cap(store: T
 _CI_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
 
 
-def test_ci_test_job_runs_the_postgres_the_contract_tests_reach() -> None:
+def test_ci_test_job_runs_the_postgres_the_contract_tests_need() -> None:
     """Without the service the Postgres half of this file would fail on CI; this
     pins the wiring so the service cannot be dropped for a skip-shaped green."""
     job = yaml.safe_load(_CI_WORKFLOW.read_text())["jobs"]["test"]

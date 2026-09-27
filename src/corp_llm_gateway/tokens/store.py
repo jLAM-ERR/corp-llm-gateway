@@ -24,14 +24,18 @@ class TokenStore(ABC):
         max_active: int,
         min_interval: timedelta,
     ) -> TokenInfo:
-        """Atomically store ``info`` as a token for the OIDC ``(issuer, subject)``.
+        """Atomically store ``info`` (unrevoked) as a token for the OIDC ``(issuer, subject)``.
 
-        ``info.issued_at`` is "now". In order: a ``jti`` seen before raises
-        ``IssuancePolicyError(E_ISSUE_REPLAY)``; an active token for the subject
-        issued less than ``min_interval`` ago raises ``E_ISSUE_RATE``; otherwise the
-        oldest active tokens are revoked so that, with ``info``, exactly
-        ``max_active`` remain. Active means unrevoked and unexpired at "now"; rows
-        without OIDC identity (CLI-issued) never count.
+        ``info.issued_at`` is "now", from the caller's clock (replicas are assumed
+        NTP-synced). In order: a ``jti`` seen before raises
+        ``IssuancePolicyError(E_ISSUE_REPLAY)``; any token for the subject issued less
+        than ``min_interval`` ago, revoked or expired included, raises
+        ``E_ISSUE_RATE`` (the interval is an issuance rate, not a property of the
+        active set); otherwise the oldest active tokens are revoked so that, with
+        ``info``, exactly ``max_active`` remain. Active means unrevoked and unexpired
+        at "now"; rows without OIDC identity (CLI-issued) never count. A store that
+        bounds its lock waits raises ``E_ISSUE_BUSY`` when one times out; a
+        ``corp_token`` collision raises ``RuntimeError``. Returns the stored row.
         """
         raise NotImplementedError(
             f"TokenStore impl {type(self).__name__} lacks issue_for_subject; "

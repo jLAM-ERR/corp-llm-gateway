@@ -8,6 +8,7 @@ Demo credentials: gateway/gateway/gateway (from docker-compose.demo.yml).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 from collections.abc import AsyncIterator
@@ -16,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 
+from corp_llm_gateway.tokens.errors import IssuancePolicyError
 from corp_llm_gateway.tokens.models import TokenInfo
 from tests.postgres_support import PG_DSN_ENV_VAR, pg_dsn, require_asyncpg, skip_or_fail
 
@@ -154,6 +156,110 @@ async def test_pg_revoke_only_affects_target_user(pg_store: object) -> None:
     b = await pg_store.lookup(tok_bob)
     assert a is not None and a.revoked_at is not None
     assert b is not None and b.revoked_at is None
+
+
+_ISS = "https://kc.corp.test/realms/dev"
+
+
+async def _issue_for(store: object, corp_token: str, *, subject: str, jti: str) -> TokenInfo:
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    assert isinstance(store, PostgresTokenStore)
+    return await store.issue_for_subject(
+        _info(corp_token),
+        issuer=_ISS,
+        subject=subject,
+        jti=jti,
+        max_active=2,
+        min_interval=timedelta(minutes=10),
+    )
+
+
+async def _wait_for_lock_waiter(pool: object) -> None:
+    async with pool.acquire() as conn:  # type: ignore[attr-defined]
+        for _ in range(500):
+            waiting = await conn.fetchval(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+            )
+            if waiting:
+                return
+            await asyncio.sleep(0.01)
+    pytest.fail("issuance never blocked on the uncommitted jti row")
+
+
+@pytest.mark.asyncio
+async def test_pg_jti_unique_violation_is_a_replay_without_driver_detail(
+    pg_store: object,
+) -> None:
+    """The in-transaction jti check cannot see an uncommitted twin; the unique
+    index can. The mapped error must not chain the driver's error, whose detail
+    quotes the jti."""
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    assert isinstance(pg_store, PostgresTokenStore)
+    jti = f"jti-uv-{secrets.token_hex(4)}"
+    tok = _tok()
+    pool = await pg_store._get_pool()
+    async with pool.acquire() as other:
+        tx = other.transaction()
+        await tx.start()
+        try:
+            await other.execute(
+                "INSERT INTO corp_tokens (corp_token, user_id, team_id, expires_at, "
+                "oidc_issuer, oidc_subject, oidc_jti) "
+                "VALUES ($1, 'pg-test-bob', 't1', now() + interval '1 day', $2, $3, $4)",
+                _tok(),
+                _ISS,
+                f"sub-bob-{secrets.token_hex(4)}",
+                jti,
+            )
+            task = asyncio.create_task(
+                _issue_for(pg_store, tok, subject=f"sub-alice-{secrets.token_hex(4)}", jti=jti)
+            )
+            await _wait_for_lock_waiter(pool)
+        except BaseException:
+            await tx.rollback()
+            raise
+        await tx.commit()
+
+    with pytest.raises(IssuancePolicyError) as exc_info:
+        await task
+
+    exc = exc_info.value
+    assert exc.args == ("E_ISSUE_REPLAY",)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert jti not in f"{exc!s} {exc!r}"
+    assert await pg_store.lookup(tok) is None
+
+
+@pytest.mark.asyncio
+async def test_pg_subject_lock_wait_times_out_as_busy(
+    pg_store: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from corp_llm_gateway.tokens import postgres_store
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    assert isinstance(pg_store, PostgresTokenStore)
+    monkeypatch.setattr(postgres_store, "_ISSUE_LOCK_TIMEOUT", "50ms")
+    subject = f"sub-busy-{secrets.token_hex(4)}"
+    tok = _tok()
+    pool = await pg_store._get_pool()
+    async with pool.acquire() as holder, holder.transaction():
+        await holder.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"{_ISS}\x1f{subject}")
+        with pytest.raises(IssuancePolicyError) as exc_info:
+            await _issue_for(pg_store, tok, subject=subject, jti=f"jti-busy-{secrets.token_hex(4)}")
+
+    exc = exc_info.value
+    assert exc.code == IssuancePolicyError.BUSY == "E_ISSUE_BUSY"
+    assert exc.args == ("E_ISSUE_BUSY",)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert await pg_store.lookup(tok) is None
+    # The lock is per subject: once released, the same request goes through.
+    await _issue_for(pg_store, tok, subject=subject, jti=f"jti-busy-{secrets.token_hex(4)}")
+    assert await pg_store.lookup(tok) is not None
 
 
 _PRE_OIDC_CORP_TOKENS = """

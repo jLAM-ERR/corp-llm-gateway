@@ -58,22 +58,29 @@ class InMemoryTokenStore(TokenStore):
             if jti in self._jtis:
                 raise IssuancePolicyError(IssuancePolicyError.REPLAY)
             now = info.issued_at
+            held_by_subject = [
+                held
+                for token, owner in self._subjects.items()
+                if owner == key and (held := self._tokens.get(token)) is not None
+            ]
+            # The interval is an issuance rate: revoked and expired rows count.
+            latest = max((held.issued_at for held in held_by_subject), default=None)
+            if latest is not None and now - latest < min_interval:
+                raise IssuancePolicyError(IssuancePolicyError.RATE)
+            if info.corp_token in self._tokens:
+                raise RuntimeError("corp_tokens unique violation on issuance")
             active = sorted(
                 (
                     held
-                    for token, owner in self._subjects.items()
-                    if owner == key
-                    and (held := self._tokens.get(token)) is not None
-                    and held.revoked_at is None
-                    and held.expires_at > now
+                    for held in held_by_subject
+                    if held.revoked_at is None and held.expires_at > now
                 ),
                 key=lambda held: (held.issued_at, held.corp_token),
             )
-            if active and now - active[-1].issued_at < min_interval:
-                raise IssuancePolicyError(IssuancePolicyError.RATE)
             for held in active[: max(0, len(active) - max_active + 1)]:
                 self._tokens[held.corp_token] = dataclasses.replace(held, revoked_at=now)
-            self._tokens[info.corp_token] = info
-            self._subjects[info.corp_token] = key
+            stored = dataclasses.replace(info, revoked_at=None)
+            self._tokens[stored.corp_token] = stored
+            self._subjects[stored.corp_token] = key
             self._jtis.add(jti)
-            return info
+            return stored

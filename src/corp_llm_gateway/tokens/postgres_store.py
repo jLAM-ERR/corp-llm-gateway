@@ -10,6 +10,7 @@ raised at instantiation time when asyncpg is absent.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,7 +27,12 @@ _JTI_UNIQUE_INDEX = "corp_tokens_oidc_jti_key"
 # Serialises issuance per (issuer, subject) across replicas, including the very
 # first issuance when there are no rows to lock. A hash collision only
 # over-serialises two subjects; it never mixes their rows.
-_SUBJECT_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1::text || '\\0' || $2::text))"
+_SUBJECT_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
+_SUBJECT_KEY_SEPARATOR = "\x1f"
+
+# Bounds every lock wait inside the issuance transaction (the subject lock, and a
+# unique-index wait on a racing jti); a timeout surfaces as E_ISSUE_BUSY.
+_ISSUE_LOCK_TIMEOUT = "5s"
 
 _asyncpg_mod: types.ModuleType | None = None
 _asyncpg_tried = False
@@ -193,19 +199,37 @@ class PostgresTokenStore(TokenStore):
         asyncpg_mod = _get_asyncpg()
         assert asyncpg_mod is not None  # guarded in __init__
         pool = await self._get_pool()
+        stored = dataclasses.replace(info, revoked_at=None)
         now = info.issued_at
+        # Raised after the except block: chaining the driver error would carry its
+        # detail text, which quotes the conflicting jti or corp token.
+        refused: Exception | None = None
         async with pool.acquire() as conn:
             try:
                 # READ COMMITTED: each statement after the lock sees the previous
                 # holder's commit; a snapshot taken at the lock would not.
                 async with conn.transaction(isolation="read_committed"):
-                    await conn.execute(_SUBJECT_LOCK_SQL, issuer, subject)
+                    await conn.execute(
+                        "SELECT set_config('lock_timeout', $1, true)", _ISSUE_LOCK_TIMEOUT
+                    )
+                    await conn.execute(
+                        _SUBJECT_LOCK_SQL, f"{issuer}{_SUBJECT_KEY_SEPARATOR}{subject}"
+                    )
                     seen = await conn.fetchval("SELECT 1 FROM corp_tokens WHERE oidc_jti = $1", jti)
                     if seen is not None:
                         raise IssuancePolicyError(IssuancePolicyError.REPLAY)
+                    # The interval is an issuance rate: revoked and expired rows count.
+                    latest = await conn.fetchval(
+                        "SELECT max(issued_at) FROM corp_tokens "
+                        "WHERE oidc_issuer = $1 AND oidc_subject = $2",
+                        issuer,
+                        subject,
+                    )
+                    if latest is not None and now - _ensure_utc(latest) < min_interval:
+                        raise IssuancePolicyError(IssuancePolicyError.RATE)
                     active: Any = await conn.fetch(
                         """
-                        SELECT corp_token, issued_at
+                        SELECT corp_token
                         FROM corp_tokens
                         WHERE oidc_issuer = $1 AND oidc_subject = $2
                           AND revoked_at IS NULL AND expires_at > $3
@@ -215,8 +239,6 @@ class PostgresTokenStore(TokenStore):
                         subject,
                         now,
                     )
-                    if active and now - _ensure_utc(active[-1]["issued_at"]) < min_interval:
-                        raise IssuancePolicyError(IssuancePolicyError.RATE)
                     excess = len(active) - max_active + 1
                     if excess > 0:
                         await conn.execute(
@@ -243,11 +265,15 @@ class PostgresTokenStore(TokenStore):
                         jti,
                     )
             except asyncpg_mod.exceptions.UniqueViolationError as exc:
-                # `from None`: the driver's detail text quotes the conflicting value.
                 if exc.constraint_name == _JTI_UNIQUE_INDEX:
-                    raise IssuancePolicyError(IssuancePolicyError.REPLAY) from None
-                raise RuntimeError("corp_tokens unique violation on issuance") from None
-        return info
+                    refused = IssuancePolicyError(IssuancePolicyError.REPLAY)
+                else:
+                    refused = RuntimeError("corp_tokens unique violation on issuance")
+            except asyncpg_mod.exceptions.LockNotAvailableError:
+                refused = IssuancePolicyError(IssuancePolicyError.BUSY)
+        if refused is not None:
+            raise refused
+        return stored
 
     async def close(self) -> None:
         """Close the connection pool; no-op if pool was never created."""
