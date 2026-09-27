@@ -25,6 +25,10 @@ _SCHEMA_SQL = Path(__file__).parent / "schema.sql"
 _asyncpg_mod: types.ModuleType | None = None
 _asyncpg_tried = False
 
+# Waiting for a pooled connection, and opening one; asyncio.TimeoutError past it.
+_ACQUIRE_TIMEOUT_S = 5.0
+_CONNECT_TIMEOUT_S = 5.0
+
 _COLUMNS = (
     "team_id, name, replace_md_path, profile_ids, "
     "retention_hot_days, retention_cold_years, fail_policy"
@@ -107,19 +111,23 @@ class PostgresTeamConfigStore(TeamConfigStore):
                     self._dsn,
                     min_size=1,
                     max_size=5,
+                    timeout=_CONNECT_TIMEOUT_S,
                 )
         return self._pool
+
+    def _acquire(self, pool: Any) -> Any:
+        return pool.acquire(timeout=_ACQUIRE_TIMEOUT_S)
 
     async def init_schema(self) -> None:
         """Apply schema.sql idempotently; safe on an already-initialised DB."""
         pool = await self._get_pool()
         sql = _SCHEMA_SQL.read_text()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             await conn.execute(sql)
 
     async def get(self, team_id: str) -> TeamConfig:
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             row: Any = await conn.fetchrow(
                 f"SELECT {_COLUMNS} FROM team_config WHERE team_id = $1",
                 team_id,
@@ -130,7 +138,7 @@ class PostgresTeamConfigStore(TeamConfigStore):
 
     async def upsert(self, config: TeamConfig) -> None:
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             await conn.execute(
                 """
                 INSERT INTO team_config
@@ -156,7 +164,7 @@ class PostgresTeamConfigStore(TeamConfigStore):
 
     async def list_all(self) -> tuple[TeamConfig, ...]:
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             rows: Any = await conn.fetch(f"SELECT {_COLUMNS} FROM team_config ORDER BY team_id")
         return tuple(_row_to_team_config(r) for r in rows)
 

@@ -21,8 +21,10 @@ from corp_llm_gateway.healthz.checks import (
     SanitizationCheck,
 )
 from corp_llm_gateway.healthz.server import HealthRouter, Scope
+from corp_llm_gateway.settings import IssuanceSettings
 from corp_llm_gateway.tokens import (
     InMemoryTokenStore,
+    IssuancePolicy,
     IssuancePolicyError,
     JwksUnavailableError,
     OidcClaims,
@@ -30,6 +32,7 @@ from corp_llm_gateway.tokens import (
     OidcVerificationError,
     TokenIssuer,
 )
+from corp_llm_gateway.tokens.models import TokenInfo
 
 PATH = "/internal/issue-token"
 BEARER = "eyJ.issuance-bearer-9f3c.sig"
@@ -735,3 +738,262 @@ async def test_the_gate_refuses_every_variant_of_the_path_before_the_router(
     assert status in (403, 404)
     assert seen == []
     assert reached == []
+
+
+# ── the bound on the issuer's work, and the store's 503s ─────────────────────
+
+
+class _HangingStore(InMemoryTokenStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+
+    async def issue_for_subject(self, info: TokenInfo, **kwargs: object) -> TokenInfo:
+        self.entered.set()
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+
+class _FailingStore(InMemoryTokenStore):
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def issue_for_subject(self, info: TokenInfo, **kwargs: object) -> TokenInfo:
+        raise self._exc
+
+
+def _settings() -> IssuanceSettings:
+    return IssuanceSettings(
+        issuer="https://kc.corp.test/realms/dev",
+        audience="corp-gateway-issuance",
+        client_id="corp-gateway-cli",
+        jwks_url="https://kc.corp.test/realms/dev/protocol/openid-connect/certs",
+        team_claim="groups",
+        team_map=(("/devs", "t1"),),
+        user_claim="preferred_username",
+        operator_audience="",
+        ca_bundle=None,
+        token_ttl_days=30,
+        max_active=2,
+        min_interval_seconds=600,
+        max_inflight=4,
+        rate_per_minute=30,
+    )
+
+
+async def _claims(token: str) -> OidcClaims:
+    return OidcClaims(
+        "alice", "t1", issuer="https://kc.corp.test/realms/dev", subject="s", jti=token
+    )
+
+
+def _policy_router(store: InMemoryTokenStore, **bounds: object) -> HealthRouter:
+    issuer = TokenIssuer(store, _claims, policy=IssuancePolicy(store, _settings()))
+    return build_health_router(
+        live_check=LiveCheck(),
+        ready_check=ReadyCheck(check_redis=_ok, check_postgres=_ok),
+        sanitization_check=SanitizationCheck(run_round_trip=_ok),
+        extensions_check=ExtensionsCheck(health_all=_ext),
+        token_issuer=issuer,
+        **bounds,  # type: ignore[arg-type]
+    )
+
+
+async def test_a_hung_store_answers_503_at_the_bound_and_frees_its_slot() -> None:
+    store = _HangingStore()
+    router = _policy_router(store, issue_timeout_s=0.2, issue_max_inflight=1)
+
+    start = asyncio.get_running_loop().time()
+    resp = await asyncio.wait_for(_post(router), timeout=5)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    assert (resp.status_code, resp.json()) == (503, {"error": "E_ISSUE_STORE_TIMEOUT"})
+    assert resp.headers["cache-control"] == "no-store"
+    assert 0.2 <= elapsed < 2.0
+    assert store.entered.is_set()
+    assert router._issue_inflight == 0
+
+
+async def test_a_hung_verifier_or_team_lookup_is_bounded_too() -> None:
+    async def hang(token: str) -> OidcClaims:
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    resp = await asyncio.wait_for(_post(_router(hang, issue_timeout_s=0.1)), timeout=5)
+
+    assert (resp.status_code, resp.json()) == (503, {"error": "E_ISSUE_STORE_TIMEOUT"})
+
+
+async def test_a_disconnect_while_the_store_hangs_still_frees_the_slot_at_the_bound() -> None:
+    store = _HangingStore()
+    router = _policy_router(store, issue_timeout_s=0.2, issue_max_inflight=1)
+    messages = iter(
+        [{"type": "http.request", "body": b"", "more_body": False}, {"type": "http.disconnect"}]
+    )
+
+    async def receive() -> dict:
+        return next(messages, {"type": "http.disconnect"})
+
+    stuck = asyncio.create_task(_drive(router, receive))
+    await asyncio.wait_for(store.entered.wait(), timeout=2)
+    held = router._issue_inflight
+    status, body = await asyncio.wait_for(stuck, timeout=5)
+
+    assert held == 1
+    assert (status, body) == (503, {"error": "E_ISSUE_STORE_TIMEOUT"})
+    assert router._issue_inflight == 0
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ConnectionRefusedError(111, f"connect to {BEARER} refused"),
+        ConnectionResetError(),
+        TimeoutError(),  # asyncpg's pool acquire past its timeout
+        OSError(f"no route to {BEARER}"),
+    ],
+    ids=["refused", "reset", "acquire-timeout", "oserror"],
+)
+async def test_a_connection_class_store_failure_is_503_not_500(
+    exc: BaseException, caplog: pytest.LogCaptureFixture
+) -> None:
+    router = _policy_router(_FailingStore(exc), issue_max_inflight=1)
+
+    with caplog.at_level(logging.DEBUG):
+        resp = await _post(router)
+
+    assert (resp.status_code, resp.json()) == (503, {"error": "E_ISSUE_STORE_UNAVAILABLE"})
+    assert type(exc).__name__ in caplog.text
+    assert BEARER not in caplog.text
+    assert router._issue_inflight == 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PostgresConnectionError",
+        "InterfaceError",
+        "ConnectionDoesNotExistError",
+        "CannotConnectNowError",
+        "TooManyConnectionsError",
+    ],
+)
+async def test_an_asyncpg_connection_failure_is_503(name: str) -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+    exc = getattr(asyncpg.exceptions, name)("connection gone")
+
+    resp = await _post(_policy_router(_FailingStore(exc)))
+
+    assert (resp.status_code, resp.json()) == (503, {"error": "E_ISSUE_STORE_UNAVAILABLE"})
+
+
+async def test_an_asyncpg_query_failure_stays_500() -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+    exc = asyncpg.exceptions.UndefinedColumnError("column oidc_jti does not exist")
+
+    resp = await _post(_policy_router(_FailingStore(exc)))
+
+    assert (resp.status_code, resp.json()) == (500, {"error": "E_ISSUE_INTERNAL"})
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        {"issue_body_timeout_s": 0},
+        {"issue_body_timeout_s": -1.0},
+        {"issue_body_timeout_s": float("nan")},
+        {"issue_timeout_s": 0},
+        {"issue_timeout_s": -0.5},
+        {"issue_timeout_s": float("nan")},
+    ],
+)
+def test_non_positive_timeouts_are_refused(bounds: dict) -> None:
+    with pytest.raises(ValueError):
+        _router(**bounds)
+
+
+# ── HEAD carries no body; every issuance answer is no-store ──────────────────
+
+
+async def _drive_raw(router: HealthRouter, method: str) -> tuple[int, dict, bytes]:
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await router({**_scope(), "method": method}, _empty_body, send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return start["status"], dict(start["headers"]), body
+
+
+@pytest.mark.parametrize(("issuer", "status"), [(None, 404), (_accept, 405)])
+async def test_a_head_to_the_issuance_path_gets_no_body(
+    issuer: Verifier | None, status: int
+) -> None:
+    got, headers, body = await _drive_raw(_router(issuer), "HEAD")
+
+    assert got == status
+    assert body == b""
+    assert headers[b"cache-control"] == b"no-store"
+
+
+async def test_a_head_is_served_over_a_real_socket_without_a_protocol_error() -> None:
+    uvicorn = pytest.importorskip("uvicorn")
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(_router(None), lifespan="off", log_level="warning", access_log=False)
+    )
+    task = asyncio.create_task(server.serve(sockets=[sock]))
+    try:
+        while not server.started:
+            await asyncio.sleep(0.01)
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+            head = await client.head(PATH)
+            post = await client.post(PATH)
+    finally:
+        server.should_exit = True
+        await task
+        sock.close()
+
+    assert (head.status_code, head.content) == (404, b"")
+    assert post.json() == {"error": "E_ISSUE_DISABLED"}
+
+
+@pytest.mark.parametrize(
+    ("router", "kwargs", "status"),
+    [
+        (lambda: _router(None), {}, 404),
+        (lambda: _router(), {"headers": {}}, 401),
+        (lambda: _router(), {"content": b"x"}, 400),
+        (lambda: _router(_raising(RuntimeError("x"))), {}, 500),
+        (lambda: _router(_raising(IssuancePolicyError(IssuancePolicyError.RATE))), {}, 403),
+        (lambda: _router(_raising(JwksUnavailableError())), {}, 503),
+        (lambda: _router(), {}, 200),
+    ],
+    ids=["404", "401", "400", "500", "403", "503", "200"],
+)
+async def test_every_issuance_response_is_no_store(
+    router: Callable[[], HealthRouter], kwargs: dict, status: int
+) -> None:
+    resp = await _post(router(), **kwargs)
+
+    assert resp.status_code == status
+    assert resp.headers["cache-control"] == "no-store"
+
+
+async def test_the_405_and_429_answers_are_no_store() -> None:
+    router = _router(issue_rate_per_minute=1)
+    async with _client(router) as client:
+        wrong_method = await client.get(PATH)
+    await _post(router)
+    throttled = await _post(router)
+
+    assert (wrong_method.status_code, throttled.status_code) == (405, 429)
+    assert wrong_method.headers["cache-control"] == "no-store"
+    assert throttled.headers["cache-control"] == "no-store"

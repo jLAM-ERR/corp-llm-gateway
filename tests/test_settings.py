@@ -975,3 +975,153 @@ async def test_issuance_bounds_of_one_resolve_and_are_usable(
     assert second.expires_at == t0 + timedelta(days=1, seconds=1)
     old = await store.lookup(first.corp_token)
     assert old is not None and old.revoked_at is not None
+
+
+# ── issuance: upper bounds, the store bound, runtime needs ───────────────────
+
+
+def test_the_store_timeout_key_is_registered_with_its_default(hermetic: Path) -> None:
+    assert "CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS" in settings.all_keys()
+
+
+def test_issuance_store_timeout_defaults_to_ten_seconds(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    result = settings.issuance()
+    assert result is not None
+    assert result.store_timeout_seconds == 10
+
+
+@pytest.mark.parametrize(
+    ("key", "highest"),
+    [
+        ("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", 3650),
+        ("CORP_GATEWAY_ISSUE_MAX_ACTIVE", 100),
+        ("CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS", 30 * 86400),
+        ("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", 1000),
+        ("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", 100_000),
+        ("CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS", 300),
+    ],
+)
+def test_issuance_bounds_accept_their_ceiling_and_refuse_one_past_it(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, key: str, highest: int
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv(key, str(highest))
+    assert settings.issuance() is not None
+
+    monkeypatch.setenv(key, str(highest + 1))
+    with pytest.raises(ConfigError) as exc:
+        settings.issuance()
+    assert [p for p in exc.value.problems if p.startswith(key) and str(highest) in p]
+
+
+@pytest.mark.parametrize(("value", "ok"), [("4", False), ("5", True), ("0", False)])
+def test_the_store_timeout_is_never_below_the_stores_lock_wait(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str, ok: bool
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS", value)
+    if ok:
+        assert settings.issuance() is not None
+        return
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS"):
+        settings.issuance()
+
+
+def test_validate_refuses_an_issuance_bound_past_its_ceiling(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `config check` runs validate(): it must refuse what the boot refuses.
+    _write(hermetic, _TEAM_MAP_TOML)
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", "3000000")
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS"):
+        config.validate()
+
+
+@pytest.fixture
+def serving(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """Issuance fully configured, with both extras present as far as imports go."""
+    import sys
+    import types
+
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    for name in ("cryptography", "jwt", "asyncpg"):
+        if name not in sys.modules:
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    return monkeypatch
+
+
+def test_runtime_problems_are_empty_when_issuance_is_off(hermetic: Path) -> None:
+    assert settings.issuance_runtime_problems() == []
+
+
+def test_runtime_problems_are_empty_when_the_config_is_refused(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # validate() and the boot report the config itself; this adds nothing twice.
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER)
+    assert settings.issuance_runtime_problems() == []
+
+
+def test_runtime_problems_are_empty_when_everything_is_there(
+    serving: pytest.MonkeyPatch,
+) -> None:
+    assert settings.issuance_runtime_problems() == []
+
+
+@pytest.mark.parametrize(
+    ("module", "problem"),
+    [
+        ("cryptography", settings.ISSUANCE_NEEDS_OIDC_EXTRA),
+        ("jwt", settings.ISSUANCE_NEEDS_OIDC_EXTRA),
+        ("asyncpg", settings.ISSUANCE_NEEDS_POSTGRES_EXTRA),
+    ],
+)
+def test_runtime_problems_name_the_missing_extra(
+    serving: pytest.MonkeyPatch, module: str, problem: str
+) -> None:
+    import sys
+
+    serving.setitem(sys.modules, module, None)
+
+    assert settings.issuance_runtime_problems() == [problem]
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "not-pem"])
+def test_runtime_problems_refuse_a_ca_bundle_that_cannot_be_used(
+    serving: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    bundle = tmp_path / "bundle-path-91c4"
+    if kind == "directory":
+        bundle.mkdir()
+    elif kind == "not-pem":
+        bundle.write_text("not a certificate\n")
+    serving.setenv("CORP_LLM_CA_BUNDLE", str(bundle))
+
+    problems = settings.issuance_runtime_problems()
+
+    expected = (
+        settings.ISSUANCE_CA_BUNDLE_INVALID
+        if kind == "not-pem"
+        else settings.ISSUANCE_CA_BUNDLE_UNREADABLE
+    )
+    assert problems == [expected]
+    assert "bundle-path-91c4" not in problems[0]
+
+
+def test_runtime_problems_accept_a_loadable_ca_bundle(serving: pytest.MonkeyPatch) -> None:
+    import certifi  # httpx's own dependency
+
+    serving.setenv("CORP_LLM_CA_BUNDLE", certifi.where())
+
+    assert settings.issuance_runtime_problems() == []

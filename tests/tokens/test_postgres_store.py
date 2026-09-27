@@ -426,3 +426,64 @@ async def test_pg_issuance_waits_for_a_pool_connection_instead_of_failing() -> N
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM corp_tokens WHERE user_id LIKE 'pg-test-%'")
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout_not_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_asyncpg()
+    from corp_llm_gateway.tokens import postgres_store
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    monkeypatch.setattr(postgres_store, "_ACQUIRE_TIMEOUT_S", 0.2)
+    store = PostgresTokenStore(_dsn(), pool_max_size=1)
+    try:
+        await store.init_schema()
+    except Exception as exc:
+        await store.close()
+        skip_or_fail(f"Postgres unreachable: {exc}")
+    try:
+        pool = await store._get_pool()
+        async with pool.acquire():
+            start = asyncio.get_running_loop().time()
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(
+                    _issue_for(store, _tok(), subject="sub-acq", jti=f"jti-{secrets.token_hex(4)}"),
+                    timeout=5,
+                )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(store.lookup(_tok()), timeout=5)
+            elapsed = asyncio.get_running_loop().time() - start
+        assert elapsed < 2.0
+        # Released: the store works again.
+        assert await store.lookup(_tok("pg-missing")) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_pg_a_statement_past_its_timeout_is_busy(
+    pg_store: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from corp_llm_gateway.tokens import postgres_store
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    assert isinstance(pg_store, PostgresTokenStore)
+    # The lock wait outlasts the statement bound, so the statement bound fires.
+    monkeypatch.setattr(postgres_store, "_ISSUE_LOCK_TIMEOUT", "30s")
+    monkeypatch.setattr(postgres_store, "_ISSUE_STATEMENT_TIMEOUT", "200ms")
+    subject = f"sub-stmt-{secrets.token_hex(4)}"
+    tok = _tok()
+    pool = await pg_store._get_pool()
+    async with pool.acquire() as holder, holder.transaction():
+        await holder.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"{_ISS}\x1f{subject}")
+        with pytest.raises(IssuancePolicyError) as exc_info:
+            await asyncio.wait_for(
+                _issue_for(pg_store, tok, subject=subject, jti=f"jti-{secrets.token_hex(4)}"),
+                timeout=5,
+            )
+
+    assert exc_info.value.code == IssuancePolicyError.BUSY
+    assert exc_info.value.__context__ is None
+    assert await pg_store.lookup(tok) is None

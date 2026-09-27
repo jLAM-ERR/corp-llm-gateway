@@ -309,7 +309,7 @@ class _FlakyTeams(InMemoryTeamConfigStore):
         return await super().get(team_id)
 
 
-async def test_a_team_store_outage_is_a_500_that_stores_nothing_and_burns_nothing(
+async def test_a_team_store_outage_is_a_503_that_stores_nothing_and_burns_nothing(
     shared: None,
     jwks_url: str,
     tmp_path: Path,
@@ -330,7 +330,7 @@ async def test_a_team_store_outage_is_a_500_that_stores_nothing_and_burns_nothin
     teams.down = False
     recovered = await _issue(router, bearer)
 
-    assert (outage.status_code, outage.json()) == (500, {"error": "E_ISSUE_INTERNAL"})
+    assert (outage.status_code, outage.json()) == (503, {"error": "E_ISSUE_STORE_UNAVAILABLE"})
     assert "payments" not in outage.text
     assert "team store unreachable" not in caplog.text
     assert bearer not in caplog.text
@@ -357,3 +357,48 @@ async def test_the_config_file_map_order_decides_between_overlapping_groups(
     assert resp.status_code == 200, resp.text
     (info,) = await tokens.list_tokens()
     assert info.team_id == "zeta"
+
+
+async def test_the_router_takes_its_store_bound_from_settings(
+    shared: None, jwks_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_issuance(monkeypatch, tmp_path, jwks_url)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS", "7")
+    config.reset_cache()
+    await _seed_stores("payments")
+
+    router = bootstrap.build_health_router()
+    try:
+        assert router._issue_timeout_s == 7.0
+    finally:
+        await router.aclose()
+
+
+async def test_the_default_store_bound_is_ten_seconds(
+    shared: None, jwks_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_issuance(monkeypatch, tmp_path, jwks_url)
+    await _seed_stores("payments")
+
+    router = bootstrap.build_health_router()
+    try:
+        assert router._issue_timeout_s == 10.0
+    finally:
+        await router.aclose()
+
+
+async def test_closing_the_router_closes_the_verifiers_jwks_client(
+    shared: None, jwks_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_issuance(monkeypatch, tmp_path, jwks_url)
+    await _seed_stores("payments")
+    router = bootstrap.build_health_router()
+    verifier = router._on_close.__self__  # type: ignore[union-attr]
+    http = verifier._jwks._http
+
+    ok = await _issue(router, _token(jwks_url, groups=["/devs/payments"]))
+    assert not http.is_closed
+    await router.aclose()
+
+    assert ok.status_code == 200
+    assert http.is_closed

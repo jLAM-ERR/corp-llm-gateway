@@ -394,10 +394,117 @@ def test_a_boot_refusal_never_prints_the_dsn(valid_config: Path, tmp_path: Path)
     assert "dsn-password-7f1e" not in result["stdout"]
 
 
+def _boot_record(stdout: str, needle: str) -> dict:
+    carrying = _lines_carrying(stdout, needle)
+    assert len(carrying) == 1, stdout
+    return json.loads(carrying[0])
+
+
 def test_issuance_boots_when_postgres_is_unreachable(valid_config: Path, tmp_path: Path) -> None:
     # Readiness reports an unreachable database; the boot does not refuse on it.
+    from datetime import datetime
+
     _require_issuance_extras()
     env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=UNREACHABLE_PG)
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] is None
+    assert result["proxy_imported"] is True
+    warning = _boot_record(result["stdout"], "issuance schema check skipped")
+    assert warning["level"] == "WARNING"
+    assert "(ConnectionRefusedError)" in warning["message"]
+    assert "127.0.0.1" not in warning["message"]
+    assert "gateway:gateway" not in result["stdout"]
+    accepted = _boot_record(result["stdout"], STEP_1_LINE)
+    elapsed = datetime.fromisoformat(warning["timestamp"]) - datetime.fromisoformat(
+        accepted["timestamp"]
+    )
+    assert elapsed.total_seconds() < 10
+
+
+_NOT_A_DSN = "not-a-dsn-secret-5b1f"
+
+
+def test_a_dsn_postgres_cannot_parse_exits_78_and_never_prints_it(
+    valid_config: Path, tmp_path: Path
+) -> None:
+    _require_issuance_extras()
+    env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=_NOT_A_DSN)
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert "Postgres refused CORP_LLM_PG_DSN (ClientConfigurationError)" in result["stdout"]
+    assert _NOT_A_DSN not in result["stdout"]
+
+
+def _blocking(module: str, script: str) -> str:
+    """``script``, run with ``module`` unimportable (a None entry in sys.modules)."""
+    return f"import sys\nsys.modules[{module!r}] = None\n" + textwrap.dedent(script)
+
+
+@pytest.mark.parametrize(
+    ("module", "extra"),
+    [
+        ("cryptography", "corp-llm-gateway[oidc]"),
+        ("jwt", "corp-llm-gateway[oidc]"),
+        ("asyncpg", "corp-llm-gateway[postgres]"),
+    ],
+)
+def test_issuance_without_its_extra_exits_78_naming_it(
+    valid_config: Path, tmp_path: Path, module: str, extra: str
+) -> None:
+    _require_issuance_extras()
+    env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=UNREACHABLE_PG)
+
+    result = _run(_blocking(module, _REFUSAL_SCRIPT), valid_config, env=env)
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert extra in result["stdout"]
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory"])
+def test_an_unreadable_ca_bundle_exits_78_without_printing_its_path(
+    valid_config: Path, tmp_path: Path, kind: str
+) -> None:
+    _require_issuance_extras()
+    bundle = tmp_path / "ca-bundle-path-3e9a"
+    if kind == "directory":
+        bundle.mkdir()
+    env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=UNREACHABLE_PG, CORP_LLM_CA_BUNDLE=str(bundle))
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] == 78
+    assert "CORP_LLM_CA_BUNDLE is not readable" in result["stdout"]
+    assert "ca-bundle-path-3e9a" not in result["stdout"]
+
+
+def test_a_ca_bundle_that_is_not_pem_exits_78_not_a_traceback(
+    valid_config: Path, tmp_path: Path
+) -> None:
+    _require_issuance_extras()
+    bundle = tmp_path / "ca-bundle-path-3e9a.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\nnot base64\n")
+    env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=UNREACHABLE_PG, CORP_LLM_CA_BUNDLE=str(bundle))
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] == 78
+    assert "CORP_LLM_CA_BUNDLE does not load as a PEM CA bundle" in result["stdout"]
+    assert "ca-bundle-path-3e9a" not in result["stdout"]
+
+
+def test_a_loadable_ca_bundle_passes_the_boot_check(valid_config: Path, tmp_path: Path) -> None:
+    import certifi
+
+    _require_issuance_extras()
+    env = _issuance_env(
+        tmp_path, CORP_LLM_PG_DSN=UNREACHABLE_PG, CORP_LLM_CA_BUNDLE=certifi.where()
+    )
 
     result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
 
@@ -534,9 +641,11 @@ def test_a_jti_unique_index_under_another_name_exits_78(
     assert "tokens/schema.sql" in result["stdout"]
 
 
-def test_a_postgres_that_refuses_the_password_boots_and_never_prints_it(
+def test_a_postgres_that_refuses_the_password_exits_78_and_never_prints_it(
     valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
 ) -> None:
+    # A credential fault does not heal on a restart: refusing beats serving a route
+    # whose every request would fail.
     from urllib.parse import urlsplit, urlunsplit
 
     _require_issuance_extras()
@@ -549,10 +658,217 @@ def test_a_postgres_that_refuses_the_password_boots_and_never_prints_it(
         _REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=bad_dsn)
     )
 
-    assert result["exit_code"] is None
-    assert result["proxy_imported"] is True
-    assert "issuance schema check skipped" in result["stdout"]
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert "Postgres refused CORP_LLM_PG_DSN (InvalidPasswordError)" in result["stdout"]
+    assert "issuance schema check skipped" not in result["stdout"]
     assert "wrong-pass-4c2d9e" not in result["stdout"]
+
+
+def test_a_database_that_does_not_exist_exits_78(
+    valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
+) -> None:
+    from urllib.parse import urlsplit, urlunsplit
+
+    _require_issuance_extras()
+    dsn, _ = pg_schema
+    bad_dsn = urlunsplit(urlsplit(dsn)._replace(path="/no_such_db_7a2c"))
+
+    result = _run(
+        _REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=bad_dsn)
+    )
+
+    assert result["exit_code"] == 78
+    assert "Postgres refused CORP_LLM_PG_DSN (InvalidCatalogNameError)" in result["stdout"]
+    assert "no_such_db_7a2c" not in result["stdout"]
+
+
+def test_a_token_table_with_the_columns_but_no_jti_index_exits_78(
+    valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
+) -> None:
+    dsn, in_schema = pg_schema
+    in_schema(_TOKEN_BASE_TABLE.replace("corp_tokens_base", "corp_tokens"))
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=dsn))
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert "tokens/schema.sql" in result["stdout"]
+
+
+# ── issuance served end to end through the real entrypoint ───────────────────
+
+_ISSUE_SCRIPT = f"""
+    import asyncio, json, os
+    import corp_llm_gateway.asgi as asgi
+
+    async def lifespan_step(queue, sent, message, expect):
+        await queue.put({{"type": message}})
+        while not [m for m in sent if m["type"].startswith(expect)]:
+            await asyncio.sleep(0.01)
+
+    async def main():
+        verifier = asgi._GATEWAY_ROUTES._on_close.__self__
+        queue, sent = asyncio.Queue(), []
+
+        async def lifespan_send(message):
+            sent.append(message)
+
+        # Through the served app, as uvicorn drives it: gate -> HealthRouter -> litellm.
+        lifespan = asyncio.create_task(
+            asgi.app({{"type": "lifespan", "asgi": {{"version": "3.0"}}}}, queue.get, lifespan_send)
+        )
+        await lifespan_step(queue, sent, "lifespan.startup", "lifespan.startup.")
+        messages = []
+
+        async def receive():
+            return {{"type": "http.request", "body": b"", "more_body": False}}
+
+        async def send(message):
+            messages.append(message)
+
+        bearer = os.environ["ISSUE_TEST_BEARER"].encode()
+        await asgi.app(
+            {{
+                "type": "http",
+                "method": "POST",
+                "path": "/internal/issue-token",
+                "raw_path": b"/internal/issue-token",
+                "headers": [(b"authorization", b"Bearer " + bearer)],
+            }},
+            receive,
+            send,
+        )
+        await lifespan_step(queue, sent, "lifespan.shutdown", "lifespan.shutdown.")
+        await lifespan
+        start = next(m for m in messages if m["type"] == "http.response.start")
+        body = json.loads(
+            b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+        )
+        print("{SENTINEL}" + json.dumps({{
+            "status": start["status"],
+            "keys": sorted(body),
+            "error": body.get("error"),
+            "armed": asgi.gate.armed,
+            "lifespan": [m["type"] for m in sent],
+            "jwks_client_closed": verifier._jwks._http.is_closed,
+        }}))
+
+    asyncio.run(main())
+"""
+
+
+@pytest.fixture
+def jwks_server() -> Iterator[tuple[str, object]]:
+    """A loopback JWKS endpoint and the RSA key it publishes."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    pytest.importorskip("cryptography")
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    document = json.dumps(
+        {
+            "keys": [
+                {
+                    **jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True),
+                    "kid": "kid-entrypoint",
+                    "use": "sig",
+                    "alg": "RS256",
+                }
+            ]
+        }
+    ).encode()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(document)))
+            self.end_headers()
+            self.wfile.write(document)
+
+        def log_message(self, *args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/realms/dev", key
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_issuance_serves_a_200_through_the_real_entrypoint(
+    valid_config: Path,
+    tmp_path: Path,
+    pg_schema: tuple[str, Callable[[str], None]],
+    jwks_server: tuple[str, object],
+) -> None:
+    import asyncio
+    import time
+
+    import jwt
+
+    _require_issuance_extras()
+    dsn, in_schema = pg_schema
+    in_schema((ROOT / "src/corp_llm_gateway/tokens/schema.sql").read_text())
+    in_schema((ROOT / "src/corp_llm_gateway/team_config/schema.sql").read_text())
+    in_schema("INSERT INTO team_config (team_id, name) VALUES ('t1', 't1')")
+    issuer, key = jwks_server
+    now = int(time.time())
+    bearer = jwt.encode(
+        {
+            "iss": issuer,
+            "aud": "corp-gateway-issuance",
+            "azp": "corp-gateway-cli",
+            "sub": "sub-entrypoint",
+            "jti": "jti-entrypoint",
+            "iat": now,
+            "exp": now + 300,
+            "preferred_username": "alice.entrypoint",
+            "groups": ["/devs"],
+        },
+        key,
+        "RS256",
+        headers={"kid": "kid-entrypoint", "typ": "JWT"},
+    )
+    env = _issuance_env(
+        tmp_path,
+        CORP_LLM_PG_DSN=dsn,
+        CORP_GATEWAY_ISSUE_OIDC_ISSUER=issuer,
+        CORP_GATEWAY_ISSUE_OIDC_JWKS_URL=f"{issuer}/certs",
+        ISSUE_TEST_BEARER=bearer,
+    )
+
+    result = _run(_ISSUE_SCRIPT, valid_config, env=env)
+
+    assert (result["status"], result["error"]) == (200, None), result["stdout"]
+    assert result["keys"] == ["corp_token", "expires_at"]
+    assert result["armed"] is True
+    assert result["lifespan"] == ["lifespan.startup.complete", "lifespan.shutdown.complete"]
+    assert result["jwks_client_closed"] is True
+    assert bearer not in result["stdout"]
+    assert _boot_record(result["stdout"], "gateway routes served ahead of litellm")[
+        "message"
+    ].endswith("POST /internal/issue-token")
+
+    async def issued_rows() -> int:
+        import asyncpg
+
+        conn = await asyncpg.connect(dsn, timeout=5.0)
+        try:
+            return await conn.fetchval(
+                "SELECT count(*) FROM corp_tokens WHERE oidc_jti = 'jti-entrypoint'"
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(issued_rows()) == 1
 
 
 # ── steps 3-5: what a successful import leaves behind ────────────────────────
@@ -623,6 +939,13 @@ def test_the_import_does_not_build_the_guardrail(imported: dict) -> None:
 
 def test_the_gate_starts_unarmed(imported: dict) -> None:
     assert imported["armed"] is False
+
+
+def test_the_boot_log_names_issuance_as_disabled_when_it_is(imported: dict) -> None:
+    record = _boot_record(imported["stdout"], "gateway routes served ahead of litellm")
+
+    assert record["message"].endswith("/internal/issue-token (issuance disabled, 404)")
+    assert "POST /internal/issue-token" not in record["message"]
 
 
 def test_the_gateway_owned_routes_are_served_ahead_of_litellm(imported: dict) -> None:

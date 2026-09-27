@@ -17,10 +17,13 @@ new dependency. A pure-ASGI app mounts unchanged in front of LiteLLM's app.
 The issue-token route is a public endpoint and is bounded like one: the Keycloak
 access token comes from the `Authorization: Bearer` header only, any request
 body byte is refused (the read stops at 1 KiB and at 2 s), and the route has its
-own in-flight cap and token bucket, answered with 429 without queueing. With no
-issuer the path is a local 404 for every method — it never falls through. Error
-bodies carry a code only, and the one log line per request carries the status
-and the code: never the bearer, the minted token or a claim (M1-14).
+own in-flight cap and token bucket, answered with 429 without queueing. The
+issuer's work after the body (verification, team lookup, token store) is bounded
+too: past the bound the request answers 503 and frees its slot. With no issuer
+the path is a local 404 for every method — it never falls through. Error bodies
+carry a code only, every issuance response is ``cache-control: no-store``, and
+the one log line per request carries the status and the code: never the bearer,
+the minted token or a claim (M1-14).
 
 Production wiring lives in `corp_llm_gateway.bootstrap.build_health_router`;
 this module imports no composition root.
@@ -32,6 +35,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
@@ -57,6 +61,7 @@ ISSUE_MAX_BODY_BYTES = 1024
 ISSUE_BODY_TIMEOUT_S = 2.0
 DEFAULT_ISSUE_MAX_INFLIGHT = 4
 DEFAULT_ISSUE_RATE_PER_MINUTE = 30
+DEFAULT_ISSUE_TIMEOUT_S = 10.0
 
 _CODE = re.compile(r"E_[A-Z0-9_]{1,64}")
 _DISCONNECTED = "disconnected"
@@ -99,9 +104,13 @@ class HealthRouter:
         issue_max_inflight: int = DEFAULT_ISSUE_MAX_INFLIGHT,
         issue_rate_per_minute: int = DEFAULT_ISSUE_RATE_PER_MINUTE,
         issue_body_timeout_s: float = ISSUE_BODY_TIMEOUT_S,
+        issue_timeout_s: float = DEFAULT_ISSUE_TIMEOUT_S,
         issue_clock: Callable[[], float] = time.monotonic,
+        on_close: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        if issue_max_inflight <= 0 or issue_rate_per_minute <= 0:
+        bounds = (issue_max_inflight, issue_rate_per_minute, issue_body_timeout_s, issue_timeout_s)
+        # `not x > 0` also refuses NaN.
+        if any(not bound > 0 for bound in bounds):
             raise ValueError("issuance bounds must be positive")
         self._checks: dict[str, HealthCheck] = {
             "/healthz/live": live_check,
@@ -115,6 +124,8 @@ class HealthRouter:
         self._issue_inflight = 0
         self._issue_bucket = _TokenBucket(issue_rate_per_minute, issue_clock)
         self._issue_body_timeout_s = issue_body_timeout_s
+        self._issue_timeout_s = issue_timeout_s
+        self._on_close = on_close
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         scope_type = scope["type"]
@@ -141,10 +152,11 @@ class HealthRouter:
             return
 
         if path == _ISSUE_TOKEN_PATH:
+            # A response to HEAD carries no body (h11 refuses to send one).
             if self._issuer is None:
-                await _issue_respond(send, 404, "E_ISSUE_DISABLED")
+                await _issue_respond(send, 404, "E_ISSUE_DISABLED", body=method != "HEAD")
             elif method != "POST":
-                await _issue_respond(send, 405, "E_METHOD_NOT_ALLOWED")
+                await _issue_respond(send, 405, "E_METHOD_NOT_ALLOWED", body=method != "HEAD")
             else:
                 await self._handle_issue_token(self._issuer, scope, receive, send)
             return
@@ -195,8 +207,10 @@ class HealthRouter:
         bearer = _bearer_token(scope)
         if not bearer:
             return 401, "E_OIDC_MISSING", None
+        bound = asyncio.timeout(self._issue_timeout_s)
         try:
-            result = await issuer.issue(bearer)
+            async with bound:
+                result = await issuer.issue(bearer)
         except OidcVerificationError as exc:
             return 401, _code_of(exc, "E_OIDC_INVALID"), None
         except OidcTeamMappingError as exc:
@@ -208,6 +222,12 @@ class HealthRouter:
             return 503, "E_JWKS_UNAVAILABLE", None
         except Exception as exc:
             # The class name only: a driver message can quote a token or a claim.
+            if bound.expired():
+                _log.warning("issue_token store work past its bound: %s", type(exc).__name__)
+                return 503, "E_ISSUE_STORE_TIMEOUT", None
+            if _store_unavailable(exc):
+                _log.warning("issue_token store unavailable: %s", type(exc).__name__)
+                return 503, "E_ISSUE_STORE_UNAVAILABLE", None
             _log.error("issue_token internal failure: %s", type(exc).__name__)
             return 500, "E_ISSUE_INTERNAL", None
         payload = {"corp_token": result.corp_token, "expires_at": result.expires_at.isoformat()}
@@ -233,15 +253,33 @@ class HealthRouter:
             return "E_ISSUE_BODY_TIMEOUT"
         return "E_ISSUE_BODY" if size else None
 
+    async def aclose(self) -> None:
+        """Release what the issuance route holds open (the JWKS HTTP client).
+        Idempotent; a failure is logged by class name and never raised."""
+        on_close, self._on_close = self._on_close, None
+        if on_close is None:
+            return
+        try:
+            await on_close()
+        except Exception as exc:
+            _log.warning("issuance resources not closed cleanly: %s", type(exc).__name__)
+
     async def _handle_lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self._fallthrough is not None:
-            await self._fallthrough(scope, receive, send)
+
+            async def send_after_closing(message: Message) -> None:
+                if message["type"] in ("lifespan.shutdown.complete", "lifespan.shutdown.failed"):
+                    await self.aclose()
+                await send(message)
+
+            await self._fallthrough(scope, receive, send_after_closing)
             return
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
+                await self.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -257,11 +295,14 @@ def build_health_router(
     issue_max_inflight: int = DEFAULT_ISSUE_MAX_INFLIGHT,
     issue_rate_per_minute: int = DEFAULT_ISSUE_RATE_PER_MINUTE,
     issue_body_timeout_s: float = ISSUE_BODY_TIMEOUT_S,
+    issue_timeout_s: float = DEFAULT_ISSUE_TIMEOUT_S,
     issue_clock: Callable[[], float] = time.monotonic,
+    on_close: Callable[[], Awaitable[None]] | None = None,
 ) -> HealthRouter:
     """Build the ASGI router with all dependencies injected as parameters.
 
     ``token_issuer=None`` disables issuance: the path answers 404 locally.
+    ``on_close`` runs once, at lifespan shutdown or on ``aclose()``.
     """
     return HealthRouter(
         live_check=live_check,
@@ -273,7 +314,9 @@ def build_health_router(
         issue_max_inflight=issue_max_inflight,
         issue_rate_per_minute=issue_rate_per_minute,
         issue_body_timeout_s=issue_body_timeout_s,
+        issue_timeout_s=issue_timeout_s,
         issue_clock=issue_clock,
+        on_close=on_close,
     )
 
 
@@ -289,19 +332,44 @@ def _bearer_token(scope: Scope) -> str:
     return token.strip()
 
 
+def _store_unavailable(exc: BaseException) -> bool:
+    """A connection-class store failure. asyncpg is only consulted when something
+    already imported it: without it loaded, none of its errors can be in flight."""
+    if isinstance(exc, OSError):  # ConnectionRefusedError, TimeoutError (pool acquire), …
+        return True
+    asyncpg = sys.modules.get("asyncpg")
+    return asyncpg is not None and isinstance(
+        exc,
+        (
+            asyncpg.PostgresConnectionError,
+            asyncpg.InterfaceError,
+            asyncpg.CannotConnectNowError,
+            asyncpg.TooManyConnectionsError,
+        ),
+    )
+
+
 def _code_of(exc: BaseException, default: str) -> str:
     arg = exc.args[0] if exc.args else None
     return arg if isinstance(arg, str) and _CODE.fullmatch(arg) else default
 
 
 async def _issue_respond(
-    send: Send, status: int, code: str, payload: dict[str, Any] | None = None
+    send: Send,
+    status: int,
+    code: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    body: bool = True,
 ) -> None:
     _log.info("issue_token status=%d code=%s", status, code)
-    if payload is None:
-        await _send_json(send, status, {"error": code})
-        return
-    await _send_json(send, status, payload, extra_headers=[(b"cache-control", b"no-store")])
+    await _send_json(
+        send,
+        status,
+        payload if payload is not None else {"error": code},
+        body=body,
+        extra_headers=[(b"cache-control", b"no-store")],
+    )
 
 
 async def _send_json(

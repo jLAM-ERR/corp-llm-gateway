@@ -192,3 +192,26 @@ async def test_init_schema_adds_profile_ids_to_preexisting_table() -> None:
         async with pool.acquire() as conn:
             await conn.execute("DROP TABLE IF EXISTS team_config CASCADE")
         await store.close()
+
+
+async def test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from contextlib import AsyncExitStack
+
+    from corp_llm_gateway.team_config import postgres_store
+
+    store = await _try_make_postgres()
+    monkeypatch.setattr(postgres_store, "_ACQUIRE_TIMEOUT_S", 0.2)
+    try:
+        pool = await store._get_pool()  # type: ignore[attr-defined]
+        async with AsyncExitStack() as held:
+            for _ in range(pool.get_max_size()):
+                await held.enter_async_context(pool.acquire())
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(store.get("t1"), timeout=5)
+        with pytest.raises(TeamNotFoundError):
+            await store.get("t1")
+    finally:
+        await store.close()  # type: ignore[attr-defined]

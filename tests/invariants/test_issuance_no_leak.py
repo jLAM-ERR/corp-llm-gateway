@@ -8,6 +8,7 @@ same chain the entrypoint serves (route gate -> HealthRouter).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -100,6 +101,7 @@ CASES: list[tuple[str, Callable[[str], Awaitable[OidcClaims]], dict[str, Any], i
     ("busy", _leaky(IssuancePolicyError(IssuancePolicyError.BUSY)), {}, 503),
     ("jwks-down", _leaky(JwksUnavailableError(_DETAIL)), {}, 503),
     ("internal", _leaky(RuntimeError(_DETAIL)), {}, 500),
+    ("store-down", _leaky(ConnectionRefusedError(111, _DETAIL)), {}, 503),
 ]
 
 
@@ -199,6 +201,94 @@ async def test_the_429_bounds_leak_nothing(
     captured = capsys.readouterr()
     _assert_clean(
         body=resp.text,
+        log_text=caplog.text,
+        stdout=captured.out + captured.err,
+        sink=sink,
+        metrics=metrics,
+    )
+
+
+async def _drive(app: Any, receive: Any, *, method: str = "POST") -> tuple[int, str]:
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": PATH,
+        "raw_path": PATH.encode(),
+        "headers": [(b"authorization", f"Bearer {BEARER}".encode())],
+    }
+    await app(scope, receive, send)
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return status, body.decode()
+
+
+async def _stalled_body() -> dict[str, Any]:
+    await asyncio.sleep(3600)
+    raise AssertionError("unreachable")
+
+
+async def _empty_body() -> dict[str, Any]:
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+
+async def _hang(token: str) -> OidcClaims:
+    await asyncio.sleep(3600)
+    raise AssertionError(_DETAIL)
+
+
+def _gated() -> tuple[asyncio.Event, asyncio.Event, Callable[[str], Awaitable[OidcClaims]]]:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def verify(token: str) -> OidcClaims:
+        entered.set()
+        await release.wait()
+        return await _accept(token)
+
+    return entered, release, verify
+
+
+@pytest.mark.parametrize("case", ["408", "405", "429-inflight", "503-store-timeout"])
+async def test_the_bounded_refusals_leak_nothing(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    held: asyncio.Task[Any] | None = None
+    release: asyncio.Event | None = None
+    with caplog.at_level(logging.DEBUG):
+        if case == "408":
+            gate, sink, metrics = _stack(_accept, issue_body_timeout_s=0.05)
+            status, body = await _drive(gate, _stalled_body)
+        elif case == "405":
+            # The gate has no row for GET, so the router's own 405 is driven directly.
+            gate, sink, metrics = _stack(_accept)
+            status, body = await _drive(gate.app, _empty_body, method="GET")
+        elif case == "429-inflight":
+            entered, release, verify = _gated()
+            gate, sink, metrics = _stack(verify, issue_max_inflight=1)
+            held = asyncio.create_task(_drive(gate, _empty_body))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            status, body = await _drive(gate, _empty_body)
+        else:
+            gate, sink, metrics = _stack(_hang, issue_timeout_s=0.05)
+            status, body = await asyncio.wait_for(_drive(gate, _empty_body), timeout=5)
+    if release is not None and held is not None:
+        release.set()
+        await held
+
+    expected = {
+        "408": (408, "E_ISSUE_BODY_TIMEOUT"),
+        "405": (405, "E_METHOD_NOT_ALLOWED"),
+        "429-inflight": (429, "E_ISSUE_INFLIGHT"),
+        "503-store-timeout": (503, "E_ISSUE_STORE_TIMEOUT"),
+    }[case]
+    assert (status, json.loads(body)) == (expected[0], {"error": expected[1]})
+    captured = capsys.readouterr()
+    _assert_clean(
+        body=body,
         log_text=caplog.text,
         stdout=captured.out + captured.err,
         sink=sink,

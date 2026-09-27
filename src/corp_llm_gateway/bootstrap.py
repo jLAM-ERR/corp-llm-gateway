@@ -25,6 +25,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -432,14 +433,18 @@ def _known_team_only(verifier: OidcVerifier, teams: TeamConfigStore) -> OidcVeri
     return verify
 
 
-def _build_token_issuer(configured: IssuanceSettings) -> TokenIssuer:
+def _build_token_issuer(
+    configured: IssuanceSettings,
+) -> tuple[TokenIssuer, Callable[[], Awaitable[None]]]:
+    """The issuer, and the closer for the JWKS HTTP client its verifier owns."""
     store = get_token_store()
     verifier = KeycloakOidcVerifier.from_settings(configured)
-    return TokenIssuer(
+    issuer = TokenIssuer(
         store,
         _known_team_only(verifier, get_team_config_store()),
         policy=IssuancePolicy(store, configured),
     )
+    return issuer, verifier.aclose
 
 
 def build_health_router(fallthrough: object | None = None) -> HealthRouter:
@@ -457,14 +462,16 @@ def build_health_router(fallthrough: object | None = None) -> HealthRouter:
     built here.
     """
     configured = serving_issuance()
-    bounds = (
-        {
+    issuance: dict[str, Any] = {}
+    if configured is not None:
+        issuer, close_issuer = _build_token_issuer(configured)
+        issuance = {
+            "token_issuer": issuer,
+            "on_close": close_issuer,
             "issue_max_inflight": configured.max_inflight,
             "issue_rate_per_minute": configured.rate_per_minute,
+            "issue_timeout_s": float(configured.store_timeout_seconds),
         }
-        if configured is not None
-        else {}
-    )
     return make_health_router(
         live_check=LiveCheck(),
         ready_check=ReadyCheck(
@@ -472,9 +479,8 @@ def build_health_router(fallthrough: object | None = None) -> HealthRouter:
         ),
         sanitization_check=SanitizationCheck(run_round_trip=_sanitization_probe()),
         extensions_check=ExtensionsCheck(health_all=REGISTRY.health_all),
-        token_issuer=_build_token_issuer(configured) if configured is not None else None,
         fallthrough=fallthrough,  # type: ignore[arg-type]
-        **bounds,
+        **issuance,
     )
 
 

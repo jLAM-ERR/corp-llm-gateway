@@ -865,7 +865,9 @@ code — never the bearer, the minted token, `sub`, groups or username
 (`tests/invariants/test_issuance_no_leak.py`). Issuance needs Postgres: set
 without `CORP_LLM_PG_DSN`, partially configured, or against a `corp_tokens`
 table that predates `tokens/schema.sql`'s issuance columns, the entrypoint exits
-78 at boot.
+78 at boot. The issuer's work after the body is bounded by
+`CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS` (503 `E_ISSUE_STORE_TIMEOUT`; a
+connection-class store failure is 503 `E_ISSUE_STORE_UNAVAILABLE`).
 
 ### Consequences to know
 

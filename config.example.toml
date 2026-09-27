@@ -240,6 +240,7 @@
 # CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS = "600"   # one issuance per (iss, sub) per interval
 # CORP_GATEWAY_ISSUE_MAX_INFLIGHT         = "4"     # concurrent issuance requests (429 beyond)
 # CORP_GATEWAY_ISSUE_RATE_PER_MINUTE      = "30"    # issuance requests per minute (429 beyond)
+# CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS = "10"   # team lookup + token store bound (503 beyond; 5-300)
 
 # ── Providers guard (providers/registry.py) ──────────────────────────────────
 #

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import statistics
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -214,7 +215,17 @@ async def test_disabled_issuance_is_a_local_404_with_a_fallthrough_configured() 
     assert reached == []
 
 
-async def test_liveness_answers_within_100ms_while_the_jwks_endpoint_hangs() -> None:
+async def _probe_latencies(probe: httpx.AsyncClient, count: int = 10) -> list[float]:
+    latencies = []
+    for _ in range(count):
+        start = time.monotonic()
+        live = await probe.get("/healthz/live")
+        latencies.append(time.monotonic() - start)
+        assert live.status_code == 200
+    return latencies
+
+
+async def test_liveness_stays_as_fast_as_its_baseline_while_the_jwks_endpoint_hangs() -> None:
     pytest.importorskip("cryptography")
     import jwt
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -254,6 +265,7 @@ async def test_liveness_answers_within_100ms_while_the_jwks_endpoint_hangs() -> 
             httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10) as issuing,
             httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as probe,
         ):
+            baseline = statistics.median(await _probe_latencies(probe))
             stuck = [
                 asyncio.create_task(
                     issuing.post(PATH, headers={"Authorization": f"Bearer {token}"})
@@ -262,12 +274,7 @@ async def test_liveness_answers_within_100ms_while_the_jwks_endpoint_hangs() -> 
             ]
             while not hung:
                 await asyncio.sleep(0.01)
-            latencies = []
-            for _ in range(10):
-                start = time.monotonic()
-                live = await probe.get("/healthz/live")
-                latencies.append(time.monotonic() - start)
-                assert live.status_code == 200
+            latencies = await _probe_latencies(probe)
             outcomes = await asyncio.gather(*stuck)
     finally:
         for writer in hung:
@@ -275,7 +282,59 @@ async def test_liveness_answers_within_100ms_while_the_jwks_endpoint_hangs() -> 
         jwks_server.close()
         await verifier.aclose()
 
-    assert max(latencies) < 0.1, latencies
+    # A probe queued behind the hung fetch would take its full 3 s timeout. The
+    # ceilings are relative to this machine's own idle probe, plus an absolute cap.
+    assert statistics.median(latencies) < max(10 * baseline, 0.1), (baseline, latencies)
+    assert max(latencies) < 1.0, latencies
     # The JWKS fetch is bounded too: the stuck requests end, as 503s.
     assert [r.status_code for r in outcomes] == [503] * 4
     assert {r.json()["error"] for r in outcomes} == {"E_JWKS_UNAVAILABLE"}
+
+
+async def test_a_client_that_hangs_up_on_a_hung_store_frees_its_slot_at_the_bound() -> None:
+    entered = asyncio.Event()
+
+    class _HangingStore(InMemoryTokenStore):
+        async def upsert(self, info: Any) -> None:  # type: ignore[override]
+            entered.set()
+            await asyncio.sleep(3600)
+
+    issuer = TokenIssuer(_HangingStore(), _gated_issuer(asyncio.Semaphore(0), _released()))
+    router = build_health_router(
+        live_check=LiveCheck(),
+        ready_check=ReadyCheck(check_redis=_ok, check_postgres=_ok),
+        sanitization_check=SanitizationCheck(run_round_trip=_ok),
+        extensions_check=ExtensionsCheck(health_all=_ext),
+        token_issuer=issuer,
+        issue_max_inflight=1,
+        issue_timeout_s=0.3,
+    )
+    gate = RouteGateMiddleware(
+        router, metrics=NoopExporter(), audit_logger=AuditLogger(ListSink(), gateway_version="0")
+    )
+
+    async with _served(gate) as port:
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(_head("Content-Length: 0\r\n").encode("latin-1"))
+        await writer.drain()
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        held = router._issue_inflight
+        writer.close()
+        deadline = time.monotonic() + 5
+        while router._issue_inflight and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        entered.clear()
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10) as client:
+            after = await client.post(PATH, headers={"Authorization": "Bearer after"})
+
+    assert held == 1
+    assert router._issue_inflight == 0
+    # The slot is free again: the next request reaches the (still hung) store,
+    # not the 429 of a leaked slot.
+    assert (after.status_code, after.json()) == (503, {"error": "E_ISSUE_STORE_TIMEOUT"})
+
+
+def _released() -> asyncio.Event:
+    event = asyncio.Event()
+    event.set()
+    return event

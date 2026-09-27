@@ -33,6 +33,12 @@ _SUBJECT_KEY_SEPARATOR = "\x1f"
 # Bounds every lock wait inside the issuance transaction (the subject lock, and a
 # unique-index wait on a racing jti); a timeout surfaces as E_ISSUE_BUSY.
 _ISSUE_LOCK_TIMEOUT = "5s"
+# Bounds each statement of that transaction; also E_ISSUE_BUSY. Under the route's
+# own bound (CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS, default 10 s).
+_ISSUE_STATEMENT_TIMEOUT = "8s"
+# Waiting for a pooled connection, and opening one; asyncio.TimeoutError past it.
+_ACQUIRE_TIMEOUT_S = 5.0
+_CONNECT_TIMEOUT_S = 5.0
 
 _asyncpg_mod: types.ModuleType | None = None
 _asyncpg_tried = False
@@ -100,20 +106,24 @@ class PostgresTokenStore(TokenStore):
                     self._dsn,
                     min_size=1,
                     max_size=self._pool_max_size,
+                    timeout=_CONNECT_TIMEOUT_S,
                 )
         return self._pool
+
+    def _acquire(self, pool: Any) -> Any:
+        return pool.acquire(timeout=_ACQUIRE_TIMEOUT_S)
 
     async def init_schema(self) -> None:
         """Apply schema.sql idempotently; safe on an already-initialised DB."""
         pool = await self._get_pool()
         sql = _SCHEMA_SQL.read_text()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             await conn.execute(sql)
 
     async def upsert(self, info: TokenInfo) -> None:
         """Insert or replace a token record."""
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             await conn.execute(
                 """
                 INSERT INTO corp_tokens
@@ -139,7 +149,7 @@ class PostgresTokenStore(TokenStore):
 
     async def lookup(self, corp_token: str) -> TokenInfo | None:
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             row: Any = await conn.fetchrow(
                 """
                 SELECT corp_token, user_id, team_id, scopes,
@@ -156,7 +166,7 @@ class PostgresTokenStore(TokenStore):
     async def revoke_user(self, user_id: str) -> int:
         pool = await self._get_pool()
         now = datetime.now(UTC)
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             # asyncpg execute returns "UPDATE N" for DML
             status: str = await conn.execute(
                 """
@@ -175,7 +185,7 @@ class PostgresTokenStore(TokenStore):
             "SELECT corp_token, user_id, team_id, scopes, "
             "issued_at, expires_at, revoked_at FROM corp_tokens"
         )
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             rows: Any
             if user_id is None:
                 rows = await conn.fetch(f"{select} ORDER BY issued_at DESC")
@@ -204,13 +214,16 @@ class PostgresTokenStore(TokenStore):
         # Raised after the except block: chaining the driver error would carry its
         # detail text, which quotes the conflicting jti or corp token.
         refused: Exception | None = None
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             try:
                 # READ COMMITTED: each statement after the lock sees the previous
                 # holder's commit; a snapshot taken at the lock would not.
                 async with conn.transaction(isolation="read_committed"):
                     await conn.execute(
-                        "SELECT set_config('lock_timeout', $1, true)", _ISSUE_LOCK_TIMEOUT
+                        "SELECT set_config('lock_timeout', $1, true), "
+                        "set_config('statement_timeout', $2, true)",
+                        _ISSUE_LOCK_TIMEOUT,
+                        _ISSUE_STATEMENT_TIMEOUT,
                     )
                     await conn.execute(
                         _SUBJECT_LOCK_SQL, f"{issuer}{_SUBJECT_KEY_SEPARATOR}{subject}"
@@ -269,7 +282,10 @@ class PostgresTokenStore(TokenStore):
                     refused = IssuancePolicyError(IssuancePolicyError.REPLAY)
                 else:
                     refused = RuntimeError("corp_tokens unique violation on issuance")
-            except asyncpg_mod.exceptions.LockNotAvailableError:
+            except (
+                asyncpg_mod.exceptions.LockNotAvailableError,
+                asyncpg_mod.exceptions.QueryCanceledError,
+            ):
                 refused = IssuancePolicyError(IssuancePolicyError.BUSY)
         if refused is not None:
             raise refused

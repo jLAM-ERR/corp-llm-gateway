@@ -27,6 +27,9 @@ oversize cases.
 
 from __future__ import annotations
 
+import importlib
+import os
+import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -284,6 +287,11 @@ KEYS: tuple[Key, ...] = (
     ),
     Key("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", default="4", help="concurrent issuance requests"),
     Key("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", default="30", help="issuance requests per minute"),
+    Key(
+        "CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS",
+        default="10",
+        help="bound on one issuance's team lookup + token store work; 503 past it (5-300)",
+    ),
     # ── Providers (providers/registry.py) ────────────────────────────────────
     Key("CORP_ALLOW_V2_PROVIDERS", flag=True, default="0", help="allow non-v1 providers"),
     # ── Profiles (profiles/) ─────────────────────────────────────────────────
@@ -613,12 +621,16 @@ def _check_no_op_sanitizer(values: Mapping[str, str | None], problems: list[str]
 
 ISSUANCE_TEAM_MAP_KEY = "CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"
 
-_ISSUANCE_BOUNDS: tuple[tuple[str, str], ...] = (
-    ("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", "token_ttl_days"),
-    ("CORP_GATEWAY_ISSUE_MAX_ACTIVE", "max_active"),
-    ("CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS", "min_interval_seconds"),
-    ("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", "max_inflight"),
-    ("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", "rate_per_minute"),
+# (key, field, lowest, highest). The ceilings keep every accepted value one the
+# gateway can serve with: a TTL or interval past them overflows datetime maths at
+# issuance. The store timeout's floor is the store's own 5 s lock wait.
+_ISSUANCE_BOUNDS: tuple[tuple[str, str, int, int], ...] = (
+    ("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", "token_ttl_days", 1, 3650),
+    ("CORP_GATEWAY_ISSUE_MAX_ACTIVE", "max_active", 1, 100),
+    ("CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS", "min_interval_seconds", 1, 30 * 86400),
+    ("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", "max_inflight", 1, 1000),
+    ("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", "rate_per_minute", 1, 100_000),
+    ("CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS", "store_timeout_seconds", 5, 300),
 )
 
 
@@ -641,6 +653,7 @@ class IssuanceSettings:
     max_inflight: int
     rate_per_minute: int
     allow_insecure_http: bool = False
+    store_timeout_seconds: int = 10
 
 
 def _stripped(values: Mapping[str, str | None], name: str) -> str:
@@ -717,15 +730,15 @@ def _build_issuance(
             problems.append(problem)
     team_map = _issuance_team_map(table, problems)
     bounds: dict[str, int] = {}
-    for name, field_name in _ISSUANCE_BOUNDS:
+    for name, field_name, lowest, highest in _ISSUANCE_BOUNDS:
         raw = _stripped(values, name) or (_BY_NAME[name].default or "")
         try:
             bounds[field_name] = int(raw)
         except ValueError:
             problems.append(f"{name}={raw!r} is not an integer")
             continue
-        if bounds[field_name] <= 0:
-            problems.append(f"{name}: must be a positive integer")
+        if not lowest <= bounds[field_name] <= highest:
+            problems.append(f"{name}: must be an integer from {lowest} to {highest}")
     if len(problems) > start:
         return None
     return IssuanceSettings(
@@ -783,6 +796,65 @@ def serving_issuance() -> IssuanceSettings | None:
     if problems:
         raise ConfigError(problems)
     return result
+
+
+ISSUANCE_NEEDS_OIDC_EXTRA = (
+    "CORP_GATEWAY_ISSUE_OIDC_ISSUER is set but PyJWT + cryptography are not installed — "
+    "pip install 'corp-llm-gateway[oidc]'"
+)
+ISSUANCE_NEEDS_POSTGRES_EXTRA = (
+    "CORP_GATEWAY_ISSUE_OIDC_ISSUER is set but asyncpg is not installed — "
+    "pip install 'corp-llm-gateway[postgres]'"
+)
+ISSUANCE_CA_BUNDLE_UNREADABLE = (
+    "CORP_LLM_CA_BUNDLE is not readable — it must name a readable PEM file; the issuance "
+    "JWKS fetch verifies Keycloak's TLS against it"
+)
+ISSUANCE_CA_BUNDLE_INVALID = (
+    "CORP_LLM_CA_BUNDLE does not load as a PEM CA bundle; the issuance JWKS fetch "
+    "verifies Keycloak's TLS against it"
+)
+
+
+def _importable(*modules: str) -> bool:
+    try:
+        for module in modules:
+            importlib.import_module(module)
+    except ImportError:
+        return False
+    return True
+
+
+def _ca_bundle_problem(path: str) -> str | None:
+    if not (os.path.isfile(path) and os.access(path, os.R_OK)):
+        return ISSUANCE_CA_BUNDLE_UNREADABLE
+    try:
+        ssl.create_default_context(cafile=path)
+    except (OSError, ValueError):  # ssl.SSLError is an OSError
+        return ISSUANCE_CA_BUNDLE_INVALID
+    return None
+
+
+def issuance_runtime_problems() -> list[str]:
+    """What serving issuance needs from this machine rather than from the config:
+    the 'oidc' and 'postgres' extras, and a loadable CA bundle when one is named.
+    Empty when issuance is off or its config is refused (reported elsewhere)."""
+    try:
+        configured = serving_issuance()
+    except ConfigError:
+        return []
+    if configured is None:
+        return []
+    problems: list[str] = []
+    if not _importable("cryptography", "jwt"):
+        problems.append(ISSUANCE_NEEDS_OIDC_EXTRA)
+    if not _importable("asyncpg"):
+        problems.append(ISSUANCE_NEEDS_POSTGRES_EXTRA)
+    if configured.ca_bundle is not None:
+        problem = _ca_bundle_problem(configured.ca_bundle)
+        if problem is not None:
+            problems.append(problem)
+    return problems
 
 
 def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) -> bool:
