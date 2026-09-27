@@ -2,8 +2,9 @@
 
 Satisfies the ``OidcVerifier`` contract in ``tokens/issuance.py``. The JWKS is
 fetched by our own async client (not ``PyJWKClient``, which blocks the loop):
-HTTPS only, no redirects, a hard total timeout, one shared in-flight refresh,
-and a cooldown so unknown ``kid`` values cannot drive refetches.
+HTTPS only, no redirects, a hard total timeout, a capped body, one shared
+in-flight refresh, a cooldown so unknown ``kid`` values cannot drive refetches,
+and a short backoff after a failed fetch.
 
 Failures raise with an error code only; the token, ``sub``, groups and other
 claim values never reach exception args, tracebacks or logs (M1-14).
@@ -12,6 +13,7 @@ claim values never reach exception args, tracebacks or logs (M1-14).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -34,11 +36,29 @@ _log = logging.getLogger(__name__)
 
 JWKS_TIMEOUT_S = 3.0
 UNKNOWN_KID_COOLDOWN_S = 60.0
+FAILURE_BACKOFF_S = 5.0
 LEEWAY_S = 60
+MAX_JWKS_BYTES = 64 * 1024
+MAX_TOKEN_LENGTH = 8 * 1024
 
 _ALGORITHM = "RS256"
 _REQUIRED_CLAIMS = ("exp", "iat", "iss", "aud", "sub", "jti", "azp")
 _ALLOWED_TYP = frozenset({"jwt", "at+jwt"})
+
+
+def _require_oidc_extra() -> None:
+    try:
+        import cryptography  # noqa: F401
+        import jwt  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "Keycloak token verification (RS256) requires PyJWT + 'cryptography'; "
+            "install the 'oidc' extra"
+        ) from exc
+
+
+class _JwksFetchError(Exception):
+    """Internal: a JWKS response we refuse. Args carry a safe reason only."""
 
 
 def _require_https(url: str, allow_insecure_http: bool) -> None:
@@ -59,13 +79,16 @@ class JwksClient:
         verify: bool | str = True,
         timeout_s: float = JWKS_TIMEOUT_S,
         cooldown_s: float = UNKNOWN_KID_COOLDOWN_S,
+        failure_backoff_s: float = FAILURE_BACKOFF_S,
         clock: Callable[[], float] = time.monotonic,
         allow_insecure_http: bool = False,
     ) -> None:
+        _require_oidc_extra()
         _require_https(url, allow_insecure_http)
         self._url = url
         self._timeout_s = timeout_s
         self._cooldown_s = cooldown_s
+        self._failure_backoff_s = failure_backoff_s
         self._clock = clock
         self._owns_http = http is None
         self._http = http or httpx.AsyncClient(
@@ -73,14 +96,18 @@ class JwksClient:
         )
         self._keys: dict[str, Any] = {}
         self._refreshed_at: float | None = None
+        self._failed_at: float | None = None
         self._inflight: asyncio.Task[None] | None = None
 
     async def key_for(self, kid: str) -> Any:
         key = self._keys.get(kid)
         if key is not None:
             return key
-        if self._inflight is None and self._in_cooldown():
-            raise OidcVerificationError("E_OIDC_UNKNOWN_KID")
+        if self._inflight is None:
+            if self._in_failure_backoff():
+                raise JwksUnavailableError("E_JWKS_UNAVAILABLE")
+            if self._in_cooldown():
+                raise OidcVerificationError("E_OIDC_UNKNOWN_KID")
         await self._refresh()
         key = self._keys.get(kid)
         if key is None:
@@ -96,14 +123,22 @@ class JwksClient:
             self._refreshed_at is not None and self._clock() - self._refreshed_at < self._cooldown_s
         )
 
+    def _in_failure_backoff(self) -> bool:
+        return (
+            self._failed_at is not None
+            and self._clock() - self._failed_at < self._failure_backoff_s
+        )
+
     async def _refresh(self) -> None:
         task = self._inflight
         if task is None:
             task = asyncio.get_running_loop().create_task(self._fetch())
             task.add_done_callback(self._clear_inflight)
             self._inflight = task
-        # shield: one caller's cancellation must not cancel the fetch others await.
-        await asyncio.shield(task)
+        # A cancelled waiter must not cancel the fetch others await. asyncio.wait, not
+        # shield: shield reports the fetch's failure to the loop's exception handler.
+        await asyncio.wait((task,))
+        task.result()
 
     def _clear_inflight(self, task: asyncio.Task[None]) -> None:
         if self._inflight is task:
@@ -114,26 +149,36 @@ class JwksClient:
     async def _fetch(self) -> None:
         try:
             async with asyncio.timeout(self._timeout_s):
-                resp = await self._http.get(self._url, follow_redirects=False)
-        except (httpx.HTTPError, TimeoutError) as exc:
-            _log.warning("issuance JWKS fetch failed: %s", type(exc).__name__)
+                body = await self._download()
+            keys = _parse_jwks(body)
+            if not keys:
+                raise _JwksFetchError("no usable RS256 signing key")
+        except Exception as exc:
+            self._failed_at = self._clock()
+            reason = exc.args[0] if isinstance(exc, _JwksFetchError) else type(exc).__name__
+            _log.warning("issuance JWKS fetch failed: %s", reason)
             raise JwksUnavailableError("E_JWKS_UNAVAILABLE") from None
-        if resp.status_code != 200:
-            _log.warning("issuance JWKS fetch failed: HTTP %d", resp.status_code)
-            raise JwksUnavailableError("E_JWKS_UNAVAILABLE")
-        keys = _parse_jwks(resp)
-        if not keys:
-            _log.warning("issuance JWKS has no usable RS256 signing key")
-            raise JwksUnavailableError("E_JWKS_UNAVAILABLE")
         self._keys = keys
         self._refreshed_at = self._clock()
+        self._failed_at = None
+
+    async def _download(self) -> bytes:
+        async with self._http.stream("GET", self._url, follow_redirects=False) as resp:
+            if resp.status_code != 200:
+                raise _JwksFetchError(f"HTTP {resp.status_code}")
+            body = bytearray()
+            async for chunk in resp.aiter_bytes():
+                body += chunk
+                if len(body) > MAX_JWKS_BYTES:
+                    raise _JwksFetchError(f"body over {MAX_JWKS_BYTES} bytes")
+            return bytes(body)
 
 
-def _parse_jwks(resp: httpx.Response) -> dict[str, Any]:
+def _parse_jwks(body: bytes) -> dict[str, Any]:
     import jwt
 
     try:
-        document = resp.json()
+        document = json.loads(body)
     except ValueError:
         return {}
     entries = document.get("keys") if isinstance(document, dict) else None
@@ -171,7 +216,8 @@ class KeycloakOidcVerifier:
         operator_audience: str = "",
         leeway_s: int = LEEWAY_S,
     ) -> None:
-        self._issuer = issuer
+        _require_oidc_extra()
+        self._issuer = issuer.rstrip("/")
         self._audience = audience
         self._client_id = client_id
         self._team_map = tuple(team_map)
@@ -187,13 +233,12 @@ class KeycloakOidcVerifier:
         settings: IssuanceSettings,
         *,
         http: httpx.AsyncClient | None = None,
-        allow_insecure_http: bool = False,
     ) -> KeycloakOidcVerifier:
         jwks = JwksClient(
             settings.jwks_url,
             http=http,
             verify=settings.ca_bundle or True,
-            allow_insecure_http=allow_insecure_http,
+            allow_insecure_http=settings.allow_insecure_http,
         )
         return cls(
             issuer=settings.issuer,
@@ -219,6 +264,8 @@ class KeycloakOidcVerifier:
     async def _verify(self, token: str) -> OidcClaims:
         import jwt
 
+        if len(token) > MAX_TOKEN_LENGTH:
+            raise OidcVerificationError("E_OIDC_MALFORMED")
         try:
             header = jwt.get_unverified_header(token)
         except jwt.PyJWTError:
@@ -236,7 +283,7 @@ class KeycloakOidcVerifier:
             token,
             key,
             audience=self._audience,
-            issuer=self._issuer,
+            issuers=[self._issuer, self._issuer + "/"],
             leeway=self._leeway_s,
         )
         if claims.get("azp") != self._client_id:
@@ -252,7 +299,7 @@ class KeycloakOidcVerifier:
         return OidcClaims(
             user_id=user if isinstance(user, str) and user else subject,
             team_id=self._team_for(claims.get(self._team_claim)),
-            issuer=claims["iss"],
+            issuer=self._issuer,
             subject=subject,
             jti=jti,
         )
@@ -269,7 +316,9 @@ class KeycloakOidcVerifier:
         raise OidcTeamMappingError("E_ISSUE_NO_TEAM")
 
 
-def _decode(token: str, key: Any, *, audience: str, issuer: str, leeway: int) -> dict[str, Any]:
+def _decode(
+    token: str, key: Any, *, audience: str, issuers: list[str], leeway: int
+) -> dict[str, Any]:
     import jwt
 
     try:
@@ -278,7 +327,7 @@ def _decode(token: str, key: Any, *, audience: str, issuer: str, leeway: int) ->
             key,
             algorithms=[_ALGORITHM],
             audience=audience,
-            issuer=issuer,
+            issuer=issuers,
             options={"require": list(_REQUIRED_CLAIMS)},
             leeway=leeway,
         )

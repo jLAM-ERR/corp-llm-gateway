@@ -627,7 +627,7 @@ def test_issuance_accepts_an_inline_team_map_table(
     assert result.team_map == (("devs", "t1"),)
 
 
-def test_issuance_default_jwks_url_strips_a_trailing_slash(
+def test_issuance_strips_a_trailing_slash_from_the_issuer_and_default_jwks_url(
     hermetic: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write(hermetic, _TEAM_MAP_TOML)
@@ -635,6 +635,7 @@ def test_issuance_default_jwks_url_strips_a_trailing_slash(
     monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER + "/")
     result = settings.issuance()
     assert result is not None
+    assert result.issuer == _ISSUER
     assert result.jwks_url == f"{_ISSUER}/protocol/openid-connect/certs"
 
 
@@ -715,8 +716,8 @@ def test_issuance_refuses_a_missing_team_map(
 def test_issuance_refuses_a_team_map_given_as_a_scalar(
     hermetic: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _write(hermetic, 'CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP = "devs=t1"\n')
     _issuance_env(monkeypatch)
-    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP", "devs=t1")
     with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"):
         settings.issuance()
 
@@ -799,6 +800,19 @@ def test_issuance_allows_http_outside_prod(hermetic: Path, monkeypatch: pytest.M
     result = settings.issuance()
     assert result is not None
     assert result.jwks_url == "http://keycloak:8080/realms/dev/protocol/openid-connect/certs"
+    assert result.allow_insecure_http is True
+
+
+@pytest.mark.parametrize(("env", "allowed"), [("", True), ("dev", True), ("production", False)])
+def test_issuance_allows_insecure_http_exactly_outside_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, env: str, allowed: bool
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", env)
+    result = settings.issuance()
+    assert result is not None
+    assert result.allow_insecure_http is allowed
 
 
 @pytest.mark.parametrize("url", ["ftp://jwks.corp.lan/certs", "not-a-url", "https://"])

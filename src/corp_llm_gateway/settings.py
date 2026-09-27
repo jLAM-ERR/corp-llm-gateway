@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 from corp_llm_gateway import config
 
@@ -639,6 +640,7 @@ class IssuanceSettings:
     min_interval_seconds: int
     max_inflight: int
     rate_per_minute: int
+    allow_insecure_http: bool = False
 
 
 def _stripped(values: Mapping[str, str | None], name: str) -> str:
@@ -646,8 +648,6 @@ def _stripped(values: Mapping[str, str | None], name: str) -> str:
 
 
 def _url_problem(name: str, url: str, *, prod: bool) -> str | None:
-    from urllib.parse import urlsplit
-
     parts = urlsplit(url)
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https") or not parts.netloc:
@@ -682,7 +682,7 @@ def _issuance_team_map(
 def _build_issuance(
     values: Mapping[str, str | None], table: Mapping[str, object], problems: list[str]
 ) -> IssuanceSettings | None:
-    issuer = _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_ISSUER")
+    issuer = _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_ISSUER").rstrip("/")
     if not issuer:
         return None
     start = len(problems)
@@ -706,7 +706,7 @@ def _build_issuance(
         )
     jwks_url = (
         _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_JWKS_URL")
-        or f"{issuer.rstrip('/')}/protocol/openid-connect/certs"
+        or f"{issuer}/protocol/openid-connect/certs"
     )
     for name, url in (
         ("CORP_GATEWAY_ISSUE_OIDC_ISSUER", issuer),
@@ -738,6 +738,7 @@ def _build_issuance(
         user_claim=_stripped(values, "CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM") or "preferred_username",
         operator_audience=operator_audience,
         ca_bundle=_stripped(values, "CORP_LLM_CA_BUNDLE") or None,
+        allow_insecure_http=not prod,
         **bounds,
     )
 

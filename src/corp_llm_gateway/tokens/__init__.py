@@ -19,6 +19,7 @@ from corp_llm_gateway.tokens.issuance import (
 from corp_llm_gateway.tokens.issuance_policy import IssuancePolicy
 from corp_llm_gateway.tokens.middleware import AuthContext, AuthMiddleware
 from corp_llm_gateway.tokens.models import TokenInfo
+from corp_llm_gateway.tokens.oidc_verifier import JwksClient, KeycloakOidcVerifier
 from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
 from corp_llm_gateway.tokens.store import TokenStore
 
@@ -33,7 +34,9 @@ __all__ = [
     "IssuancePolicy",
     "IssuancePolicyError",
     "IssueResult",
+    "JwksClient",
     "JwksUnavailableError",
+    "KeycloakOidcVerifier",
     "MissingTokenError",
     "OidcClaims",
     "OidcTeamMappingError",
