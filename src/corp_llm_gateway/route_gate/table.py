@@ -1234,29 +1234,32 @@ def parse_extras(raw: str | Iterable[str] | None) -> dict[tuple[str, str], Entry
         return {}
     items = re.split(r"[,\n]", raw) if isinstance(raw, str) else list(raw)
     extras: dict[tuple[str, str], Entry] = {}
-    for item in items:
+    # Messages never echo the item: the env value reaches stdout at boot.
+    for index, item in enumerate(items, start=1):
         text = item.strip()
         if not text:
             continue
+        malformed = f"route gate extra item {index}: malformed (expected 'METHOD /path')"
         fields = text.split()
         if len(fields) != 2:
-            raise ValueError(f"route gate extra must be 'METHOD /path', got {item!r}")
+            raise ValueError(malformed)
         method, path = fields[0].upper(), fields[1]
         if method not in HTTP_METHODS:
-            raise ValueError(f"route gate extra has unknown method {fields[0]!r} in {item!r}")
+            raise ValueError(f"{malformed}: unknown HTTP method")
         if not path.startswith("/"):
-            raise ValueError(f"route gate extra path must start with '/', got {item!r}")
+            raise ValueError(f"{malformed}: the path must start with '/'")
         bad = [token for token in _BAD_EXTRA_PATH_TOKENS if token in path]
         if bad or any(char.isspace() for char in path):
-            offending = ", ".join(bad) or "whitespace"
+            offending = ", ".join(repr(token) for token in bad) or "whitespace"
             raise ValueError(
-                f"route gate extra path must be a plain absolute path — {offending} "
-                f"in {item!r} matches nothing; the gate matches the decoded path as received"
+                f"{malformed}: the path carries {offending} and would match nothing; "
+                "the gate matches the decoded path as received"
             )
         if _refused(method, path):
             raise ValueError(
-                f"route gate extra {method} {path} names a route the table refused; the key "
-                "adds PASSTHROUGH rows only and can never re-open a refusal (docs/security.md §14)"
+                f"route gate extra item {index} ({method} {path}) names a route the table "
+                "refused; the key adds PASSTHROUGH rows only and can never re-open a refusal "
+                "(docs/security.md §14)"
             )
         extras[(method, path)] = _passthrough(
             f"operator extra: CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH lists {method} {path}"

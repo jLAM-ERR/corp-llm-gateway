@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from corp_llm_gateway.route_gate import (
@@ -195,6 +197,54 @@ def test_issue_token_is_unlisted_for_any_other_method() -> None:
 def test_a_malformed_extra_raises_at_load(raw: str) -> None:
     with pytest.raises(ValueError):
         parse_extras(raw)
+
+
+SECRET = "sk-live-9f3a2c-extra-canary"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        SECRET,
+        f"POST /a {SECRET}",
+        f"{SECRET} /internal/ops",
+        f"POST {SECRET}",
+        f"POST /internal/ops?key={SECRET}",
+        f"POST /internal/../{SECRET}",
+    ],
+)
+def test_a_malformed_extra_never_echoes_its_value(hostile: str) -> None:
+    # The message reaches stdout at boot; the env value may hold anything.
+    with pytest.raises(ValueError) as caught:
+        parse_extras(f"GET /internal/ok, {hostile}")
+    message = str(caught.value)
+    assert SECRET.lower() not in message.lower()
+    assert "item 2" in message
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("/internal/ops", "item 1: malformed (expected 'METHOD /path')"),
+        ("POST /a /b", "item 1: malformed (expected 'METHOD /path')"),
+        ("GET /x,,TRACE /internal/ops", "item 3: malformed (expected 'METHOD /path')"),
+        ("POST internal/ops", "item 1: malformed (expected 'METHOD /path')"),
+        ("POST /internal/ops?x=1", "item 1: malformed (expected 'METHOD /path')"),
+    ],
+)
+def test_a_malformed_extra_names_its_position(raw: str, expected: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(expected)):
+        parse_extras(raw)
+
+
+def test_a_path_extra_names_the_offending_token_not_the_path() -> None:
+    with pytest.raises(ValueError, match=re.escape("'?'")):
+        parse_extras("POST /internal/ops?x=1")
+
+
+def test_a_refused_extra_names_its_position_and_route() -> None:
+    with pytest.raises(ValueError, match=re.escape("item 2 (GET /key/list)")):
+        parse_extras("GET /internal/ok, get /key/list")
 
 
 def test_empty_extras_are_accepted() -> None:

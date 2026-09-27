@@ -964,7 +964,8 @@ entries only: it can never admit a route as rewritten, never override a REFUSE,
 and never disable the gate. Both are enforced twice. At load, an item that is
 malformed or names a refused route — including a `HEAD` on a path whose `GET`
 is refused — is a config problem: `config check` reports it and the entrypoint
-exits 78. At runtime, the tables answer before any extra, for `HEAD` too, so an
+exits 78. The error names the item's position and, when it parses, only
+`METHOD path` — the env value itself never reaches stdout. At runtime, the tables answer before any extra, for `HEAD` too, so an
 extra only ever reaches a pair no table lists. Use it for an operator route that
 provably sends no user text anywhere.
 
