@@ -24,7 +24,8 @@ In order —
    Postgres the network cannot reach does not refuse the boot — readiness reports it.
    Then the in-flight cap through ``settings.capacity()`` (also ``config check``'s):
    a non-integer, negative or oversized ``CORP_LLM_MAX_INFLIGHT``, ``0`` under
-   ``CORP_ENV=prod|production``, or a bad ``CORP_LLM_CANCEL_GRACE_SECONDS`` exits 78.
+   ``CORP_ENV=prod|production``, or a bad ``CORP_LLM_CANCEL_GRACE_SECONDS``,
+   ``CORP_LLM_BODY_READ_SECONDS`` or ``CORP_LLM_MAX_DRAINING`` exits 78.
    Last, ``CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH``: a malformed item, or one naming
    a route the table refused, exits 78;
 2. run litellm's Prisma schema sequence when ``DATABASE_URL`` is set, with the
@@ -318,7 +319,12 @@ def _check_capacity() -> settings.CapacitySettings:
     except settings.ConfigError as exc:
         _fail_gateway_config(exc.problems)
     if capacity.max_inflight:
-        log.info("in-flight cap: %d rewritten requests per pod", capacity.max_inflight)
+        log.info(
+            "in-flight cap: %d rewritten requests per pod, %d reading a body (%gs deadline)",
+            capacity.max_inflight,
+            capacity.max_draining,
+            capacity.body_read_seconds,
+        )
     else:
         log.warning("in-flight cap off (CORP_LLM_MAX_INFLIGHT=0); not allowed in prod")
     return capacity
@@ -398,9 +404,10 @@ def _nothing() -> None:
 def _start_litellm_logging_worker() -> None:
     """Start litellm's logging worker outside any request.
 
-    It starts lazily on the first callback, inside that request's task tree, and
-    the task factory would tag it to the request: a cancelled request would then
-    take every later success/failure callback (and our audit events) with it.
+    It starts lazily on the first callback, inside that request's task tree; a
+    worker tagged to that request would be cancelled with it, taking every later
+    success/failure callback (and our audit events) along. The task factory also
+    refuses to tag the worker's tasks, so a restart from inside a request is safe.
     """
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
@@ -500,6 +507,8 @@ limiter = InflightLimiter(
     CAPACITY.max_inflight,
     metrics=_exporter,
     cancel_grace_s=CAPACITY.cancel_grace_seconds,
+    body_read_s=CAPACITY.body_read_seconds,
+    max_draining=CAPACITY.max_draining,
 )
 gate = RouteGateMiddleware(
     _GATEWAY_ROUTES,

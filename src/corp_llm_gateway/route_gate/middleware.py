@@ -8,9 +8,10 @@ through the in-flight limiter (``inflight.py``), whose ``send`` wrapper observes
 each message and forwards it unbuffered.
 
 Fail-closed: a REFUSE, an unarmed REWRITTEN route and any classifier exception
-all end here, never at litellm. The request body is never read on a refusal and
-no request byte is echoed (M1-14); the refusal names only the route the caller
-itself sent.
+all end here, never at litellm. A route refusal never reads the body; the
+limiter's oversize and body-timeout refusals have read (part of) it, and a
+capacity refusal may have. No request byte is ever echoed or logged (M1-14); the
+refusal names only the route the caller itself sent.
 """
 
 from __future__ import annotations
@@ -35,8 +36,10 @@ from corp_llm_gateway.route_gate.classify import (
     classify,
 )
 from corp_llm_gateway.route_gate.inflight import (
+    E_BODY_TIMEOUT,
     E_CAPACITY,
     OVERSIZE_BLOCKED,
+    ROUTE_GATE_BODY_TIMEOUT,
     ROUTE_GATE_CAPACITY,
     InflightLimiter,
 )
@@ -63,6 +66,7 @@ _STATUS: dict[str, int] = {
     ROUTE_GATE_UNARMED: 503,
     ROUTE_GATE_ERROR: 500,
     ROUTE_GATE_CAPACITY: 429,
+    ROUTE_GATE_BODY_TIMEOUT: 408,
     OVERSIZE_BLOCKED: 422,
 }
 
@@ -74,6 +78,7 @@ _ERROR_CODE: dict[str, str] = {
     ROUTE_GATE_UNARMED: "E_ROUTE_GATE_UNARMED",
     ROUTE_GATE_ERROR: "E_ROUTE_GATE_ERROR",
     ROUTE_GATE_CAPACITY: E_CAPACITY,
+    ROUTE_GATE_BODY_TIMEOUT: E_BODY_TIMEOUT,
     OVERSIZE_BLOCKED: "E_OVERSIZE_BLOCKED",
 }
 
@@ -85,6 +90,7 @@ _ERROR_TYPE: dict[str, str] = {
     ROUTE_GATE_UNARMED: "route_gate_unarmed",
     ROUTE_GATE_ERROR: "route_gate_error",
     ROUTE_GATE_CAPACITY: "capacity",
+    ROUTE_GATE_BODY_TIMEOUT: "body_timeout",
     OVERSIZE_BLOCKED: "oversize",
 }
 
@@ -97,7 +103,16 @@ _FAILURE_COMPONENT: dict[str, str] = {
 }
 _CAPACITY_WHY = "the gateway's in-flight cap is reached; retry later"
 _OVERSIZE_WHY = "the request body is over the gateway's body cap"
-_WHY: dict[str, str] = {ROUTE_GATE_CAPACITY: _CAPACITY_WHY, OVERSIZE_BLOCKED: _OVERSIZE_WHY}
+_BODY_TIMEOUT_WHY = "the request body did not arrive within the gateway's body-read deadline"
+_WHY: dict[str, str] = {
+    ROUTE_GATE_CAPACITY: _CAPACITY_WHY,
+    ROUTE_GATE_BODY_TIMEOUT: _BODY_TIMEOUT_WHY,
+    OVERSIZE_BLOCKED: _OVERSIZE_WHY,
+}
+# Extra response headers per refusal.
+_EXTRA_HEADERS: dict[str, list[tuple[bytes, bytes]]] = {
+    ROUTE_GATE_CAPACITY: [(b"retry-after", b"1")],
+}
 
 _UNARMED_WHY = (
     "the guardrail callback is not registered, so a rewritten route cannot be proven sanitized"
@@ -181,12 +196,6 @@ class RouteGateMiddleware:
         method: str,
         path: str,
     ) -> None:
-        if not limiter.try_acquire():
-            await self._refuse(
-                scope, receive, send, method, path, ROUTE_GATE_CAPACITY, _CAPACITY_WHY
-            )
-            return
-
         async def refuse(reason: str) -> None:
             await self._refuse(scope, receive, send, method, path, reason, _WHY[reason])
 
@@ -223,7 +232,9 @@ class RouteGateMiddleware:
         if scope_type == "websocket":
             await self._refuse_handshake(scope, receive, send, method, path, reason)
         elif scope_type == "http":
-            await _send_json(send, _STATUS[reason], _payload(method, path, reason))
+            await _send_json(
+                send, _STATUS[reason], _payload(method, path, reason), _EXTRA_HEADERS.get(reason)
+            )
         # Any other scope type has no response protocol; not forwarding is the refusal.
 
     async def _refuse_handshake(
@@ -303,9 +314,15 @@ def _headers(body: bytes) -> list[tuple[bytes, bytes]]:
     ]
 
 
-async def _send_json(send: Send, status: int, payload: dict[str, Any]) -> None:
+async def _send_json(
+    send: Send,
+    status: int,
+    payload: dict[str, Any],
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
     body = _encode(payload)
-    await send({"type": "http.response.start", "status": status, "headers": _headers(body)})
+    headers = _headers(body) + list(extra_headers or ())
+    await send({"type": "http.response.start", "status": status, "headers": headers})
     await send({"type": "http.response.body", "body": body})
 
 

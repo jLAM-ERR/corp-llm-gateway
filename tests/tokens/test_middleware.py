@@ -363,3 +363,39 @@ async def test_a_failed_lookup_every_waiter_abandoned_is_still_retrieved() -> No
 
     assert seen == [], describe(seen)
     assert mw._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_the_shared_lookup_belongs_to_no_request() -> None:
+    # Started inside one request, awaited by others: that request's disconnect
+    # sweep must not be able to cancel it.
+    from corp_llm_gateway.route_gate.inflight import (
+        _TICKET,
+        RequestTicket,
+        _tag,
+        install_task_factory,
+        pending_request_tasks,
+    )
+
+    store = _GatedStore("tok-1")
+    store.upsert(_info("tok-1"))
+    mw = AuthMiddleware(store)
+    restore = install_task_factory(asyncio.get_running_loop())
+    try:
+        ticket = RequestTicket("gateway-id")
+        token = _TICKET.set(ticket)
+        try:
+            waiter = asyncio.create_task(mw.authenticate("tok-1"))
+        finally:
+            _TICKET.reset(token)
+        _tag(waiter, ticket)
+        await asyncio.sleep(0)
+        (shared,) = mw._inflight.values()
+
+        assert waiter in ticket.pending()
+        assert shared not in ticket.pending()
+        assert shared not in pending_request_tasks()
+        store.release.set()
+        assert (await waiter).user_id == "alice"
+    finally:
+        restore()

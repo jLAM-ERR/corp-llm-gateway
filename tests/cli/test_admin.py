@@ -799,6 +799,33 @@ def test_config_check_refuses_the_capacity_the_boot_refuses(
     assert any(problem.startswith("CORP_LLM_MAX_INFLIGHT") for problem in problems)
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("CORP_LLM_BODY_READ_SECONDS", "0"),
+        ("CORP_LLM_BODY_READ_SECONDS", "301"),
+        ("CORP_LLM_MAX_DRAINING", "3"),
+    ],
+    ids=["body-deadline-zero", "body-deadline-past-the-ceiling", "draining-below-the-cap"],
+)
+def test_config_check_refuses_the_body_limits_the_boot_refuses(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv(name, value)
+    config.reset_cache()
+
+    rc = main(["config", "check", "--no-probe", "--json"])
+
+    assert rc == 1
+    problems = json.loads(capsys.readouterr().out)["problems"]
+    assert any(problem.startswith(name) for problem in problems)
+
+
 def test_config_check_accepts_a_zero_cap_outside_prod(
     hermetic_gateway_config: None,
     monkeypatch: pytest.MonkeyPatch,

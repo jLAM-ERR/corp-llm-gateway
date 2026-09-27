@@ -14,11 +14,22 @@ the rest of the request. On a disconnect before the response completed it
 cancels the downstream, waits a bounded grace, cancels any task the request
 spawned that is still pending, tells the guardrail, and frees the slot.
 
+The body is read BEFORE a slot is taken, under a deadline
+(``CORP_LLM_BODY_READ_SECONDS``, 408 past it), and the number of requests
+reading a body at once has its own, larger cap (``CORP_LLM_MAX_DRAINING``, 429
+past it without reading): a client that never finishes its body holds no slot.
+
 Tasks belong to a request through :class:`RequestTicket`, carried in a
 contextvar. The task factory (:func:`install_task_factory`) tags a new task only
 when the task creating it already belongs to the request, so a long-lived task
 that merely runs in a copy of the request's context (litellm's logging worker
 runs callbacks that way) is never cancelled with it.
+
+A task whose result more than one request awaits (a single-flight lookup, a
+shared key fetch) MUST be started with :func:`spawn_shared`. Started from inside
+a request, it would belong to that request, and that request's disconnect would
+cancel it under every other waiter. litellm's logging worker is recognised by
+its module and never tagged either, wherever it is (re)started.
 """
 
 from __future__ import annotations
@@ -31,7 +42,7 @@ import uuid
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from typing import Any, Protocol
 
 from corp_llm_gateway.metrics import MetricsExporter
@@ -48,15 +59,23 @@ Refuse = Callable[[str], Awaitable[None]]
 # block_reason / error code of the capacity refusal.
 ROUTE_GATE_CAPACITY = "capacity"
 E_CAPACITY = "E_CAPACITY"
+# block_reason / error code of a body not complete within the body-read deadline.
+ROUTE_GATE_BODY_TIMEOUT = "body_timeout"
+E_BODY_TIMEOUT = "E_BODY_TIMEOUT"
 # The oversize outcome the hook already gives a leaf past its threshold.
 OVERSIZE_BLOCKED = "oversize:blocked"
 # Every block_reason the gate answers with on the limiter's behalf.
-LIMITER_BLOCK_REASONS: frozenset[str] = frozenset({ROUTE_GATE_CAPACITY, OVERSIZE_BLOCKED})
+LIMITER_BLOCK_REASONS: frozenset[str] = frozenset(
+    {ROUTE_GATE_CAPACITY, ROUTE_GATE_BODY_TIMEOUT, OVERSIZE_BLOCKED}
+)
 
 # nginx's client_max_body_size. The 100 KiB payload threshold is per text leaf,
 # not a body cap: a real Claude Code body is routinely larger.
 MAX_BODY_BYTES = 25 * 1024 * 1024
 DEFAULT_CANCEL_GRACE_S = 5.0
+DEFAULT_BODY_READ_S = 30.0
+# Concurrent body reads per admitted slot, when no draining cap is given.
+DRAINING_PER_SLOT = 4
 
 _COMPONENT = "route_gate"
 
@@ -90,6 +109,11 @@ class RequestTicket:
 
 _TICKET: ContextVar[RequestTicket | None] = ContextVar("corp_llm_gateway_request", default=None)
 _TAGGED: weakref.WeakKeyDictionary[asyncio.Task[Any], RequestTicket] = weakref.WeakKeyDictionary()
+# Tasks no request owns: a request's straggler sweep never cancels one.
+_SHARED: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
+# Modules whose tasks serve every request (litellm's logging worker and its
+# queue-overflow helpers), even when a request's task starts them.
+_UNOWNED_MODULES = frozenset({"litellm.litellm_core_utils.logging_worker"})
 
 
 def current_ticket() -> RequestTicket | None:
@@ -108,6 +132,20 @@ def pending_request_tasks() -> list[asyncio.Task[Any]]:
     return [task for task in list(_TAGGED.keys()) if not task.done()]
 
 
+def spawn_shared[T](coro: Coroutine[Any, Any, T], *, name: str | None = None) -> asyncio.Task[T]:
+    """Start a task that no request owns, for a result several requests await."""
+    context = copy_context()
+    context.run(_TICKET.set, None)
+    task = asyncio.get_running_loop().create_task(coro, name=name, context=context)
+    _SHARED.add(task)
+    return task
+
+
+def _unowned(coro: Any) -> bool:
+    frame = getattr(coro, "cr_frame", None)
+    return frame is not None and frame.f_globals.get("__name__") in _UNOWNED_MODULES
+
+
 def _tag(task: asyncio.Task[Any], ticket: RequestTicket) -> None:
     ticket.tasks.add(task)
     _TAGGED[task] = ticket
@@ -122,6 +160,9 @@ def install_task_factory(loop: asyncio.AbstractEventLoop) -> Callable[[], None]:
             task = previous(loop_, coro, **kwargs)
         else:
             task = asyncio.Task(coro, loop=loop_, **kwargs)
+        if _unowned(coro):
+            _SHARED.add(task)
+            return task
         context = kwargs.get("context")
         ticket = context.get(_TICKET) if context is not None else _TICKET.get()
         if ticket is not None:
@@ -166,6 +207,7 @@ class _Replay:
 
 _DISCONNECTED = object()
 _OVERSIZE = object()
+_BODY_TIMEOUT = object()
 
 
 class InflightLimiter:
@@ -178,16 +220,29 @@ class InflightLimiter:
         metrics: MetricsExporter,
         cancel_grace_s: float = DEFAULT_CANCEL_GRACE_S,
         max_body_bytes: int = MAX_BODY_BYTES,
+        body_read_s: float = DEFAULT_BODY_READ_S,
+        max_draining: int | None = None,
     ) -> None:
-        if isinstance(max_inflight, bool) or not isinstance(max_inflight, int) or max_inflight < 0:
+        if not _count(max_inflight):
             raise ValueError("max_inflight must be a non-negative integer")
         if not (math.isfinite(cancel_grace_s) and cancel_grace_s > 0):
             raise ValueError("cancel_grace_s must be a positive finite number")
+        if not (math.isfinite(body_read_s) and body_read_s > 0):
+            raise ValueError("body_read_s must be a positive finite number")
+        if max_draining is None:
+            max_draining = DRAINING_PER_SLOT * max_inflight
+        if not _count(max_draining) or max_draining < max_inflight:
+            raise ValueError("max_draining must be an integer no smaller than max_inflight")
+        if max_inflight and not max_draining:
+            raise ValueError("max_draining cannot be 0 while the in-flight cap is on")
         self._max = max_inflight
         self._metrics = metrics
         self._grace = float(cancel_grace_s)
         self._max_body = max_body_bytes
+        self._body_read_s = float(body_read_s)
+        self._max_draining = max_draining
         self._inflight = 0
+        self._draining = 0
         self._cancel_hook: CancelHook | None = None
 
     @property
@@ -201,6 +256,18 @@ class InflightLimiter:
     @property
     def inflight(self) -> int:
         return self._inflight
+
+    @property
+    def max_draining(self) -> int:
+        return self._max_draining
+
+    @property
+    def body_read_s(self) -> float:
+        return self._body_read_s
+
+    @property
+    def draining(self) -> int:
+        return self._draining
 
     def bind_cancel_hook(self, hook: CancelHook | None) -> None:
         self._cancel_hook = hook
@@ -219,18 +286,37 @@ class InflightLimiter:
     async def run(
         self, scope: Scope, receive: Receive, send: Send, app: ASGIApp, *, refuse: Refuse
     ) -> None:
-        """Serve one request that already holds a slot; frees it exactly once."""
+        """Admit one request: read its body, then take a slot and free it exactly once."""
+        full = bool(self._max) and self._inflight >= self._max
+        if full or (self._max_draining and self._draining >= self._max_draining):
+            await refuse(ROUTE_GATE_CAPACITY)
+            return
         started = time.monotonic()
         ticket = RequestTicket(uuid.uuid4().hex)
+        self._draining += 1
         try:
-            drained = await self._drain(receive)
-            if drained is _OVERSIZE:
-                await refuse(OVERSIZE_BLOCKED)
-                return
-            if drained is _DISCONNECTED:
-                await self._cancelled(ticket, started, downstream=None)
-                return
-            assert isinstance(drained, list)
+            try:
+                async with asyncio.timeout(self._body_read_s):
+                    drained = await self._drain(receive)
+            except TimeoutError:
+                drained = _BODY_TIMEOUT
+        finally:
+            self._draining -= 1
+        if drained is _OVERSIZE:
+            await refuse(OVERSIZE_BLOCKED)
+            return
+        if drained is _BODY_TIMEOUT:
+            await refuse(ROUTE_GATE_BODY_TIMEOUT)
+            return
+        if drained is _DISCONNECTED:
+            await self._cancelled(ticket, started, downstream=None)
+            return
+        assert isinstance(drained, list)
+        if not self.try_acquire():
+            drained.clear()
+            await refuse(ROUTE_GATE_CAPACITY)
+            return
+        try:
             await self._serve(ticket, started, scope, receive, send, app, drained)
         finally:
             self._release()
@@ -291,7 +377,9 @@ class InflightLimiter:
         except asyncio.CancelledError:
             watcher.cancel()
             downstream.cancel()
-            await asyncio.wait({downstream}, timeout=self._grace)
+            await asyncio.wait({downstream, watcher}, timeout=self._grace)
+            _retrieve_when_done(downstream)
+            _retrieve_when_done(watcher)
             raise
         if replay.disconnected and not response_complete:
             await self._cancelled(ticket, started, downstream=downstream)
@@ -332,6 +420,7 @@ class InflightLimiter:
         self, ticket: RequestTicket, started: float, *, downstream: asyncio.Task[None] | None
     ) -> None:
         ticket.cancelled = True
+        loop = asyncio.get_running_loop()
         unwound = True
         if downstream is not None:
             downstream.cancel()
@@ -345,12 +434,21 @@ class InflightLimiter:
                     logger.info(
                         "route_gate_cancelled_downstream_error error=%s", type(exc).__name__
                     )
-        stragglers = [task for task in ticket.pending() if task is not downstream]
+            elif not unwound:
+                downstream.add_done_callback(_retrieve)
+        # One budget for the stragglers AND the guardrail: a slot is held at most
+        # 2 x grace after a disconnect.
+        deadline = loop.time() + self._grace
+        stragglers = [
+            task for task in ticket.pending() if task is not downstream and task not in _SHARED
+        ]
         for task in stragglers:
             task.cancel()
         if stragglers:
             await asyncio.wait(stragglers, timeout=self._grace)
-        left = [task for task in ticket.pending() if task is not downstream]
+        left = [task for task in ticket.pending() if task is not downstream and task not in _SHARED]
+        for task in left:
+            task.add_done_callback(_retrieve)
         if not unwound or left:
             self._metrics.record_failure(_COMPONENT)
             logger.error(
@@ -368,23 +466,54 @@ class InflightLimiter:
             len(stragglers),
             latency_ms,
         )
-        await self._notify(ticket, latency_ms)
+        await self._notify(ticket, latency_ms, deadline)
 
-    async def _notify(self, ticket: RequestTicket, latency_ms: int) -> None:
+    async def _notify(self, ticket: RequestTicket, latency_ms: int, deadline: float) -> None:
         hook = self._cancel_hook
         if hook is None:
             return
-        for request_id in ticket.request_ids():
-            try:
-                await asyncio.wait_for(hook(request_id, latency_ms=latency_ms), self._grace)
-            except Exception as exc:
-                # Type only: an exception message can quote request content.
-                self._metrics.record_failure(_COMPONENT)
-                logger.error(
-                    "route_gate_cancel_hook_failed request_id=%s error=%s",
-                    ticket.gateway_id,
-                    type(exc).__name__,
-                )
+        loop = asyncio.get_running_loop()
+        calls = [
+            loop.create_task(_call_hook(hook, request_id, latency_ms))
+            for request_id in ticket.request_ids()
+        ]
+        # Started even with no budget left: each runs up to its first suspension.
+        _, pending = await asyncio.wait(calls, timeout=max(0.0, deadline - loop.time()))
+        for call in calls:
+            if call in pending:
+                call.cancel()
+                call.add_done_callback(_retrieve)
+                error = "TimeoutError"
+            else:
+                exc = call.exception()
+                if exc is None:
+                    continue
+                error = type(exc).__name__
+            # Type only: an exception message can quote request content.
+            self._metrics.record_failure(_COMPONENT)
+            logger.error(
+                "route_gate_cancel_hook_failed request_id=%s error=%s", ticket.gateway_id, error
+            )
+
+
+async def _call_hook(hook: CancelHook, request_id: str, latency_ms: int) -> None:
+    await hook(request_id, latency_ms=latency_ms)
+
+
+def _count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _retrieve(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+def _retrieve_when_done(task: asyncio.Task[Any]) -> None:
+    if task.done():
+        _retrieve(task)
+    else:
+        task.add_done_callback(_retrieve)
 
 
 async def _settle(task: asyncio.Task[Any]) -> None:

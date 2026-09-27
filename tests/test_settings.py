@@ -1142,7 +1142,12 @@ def test_runtime_problems_accept_a_loadable_ca_bundle(serving: pytest.MonkeyPatc
 
 def test_capacity_keys_are_registered() -> None:
     keys = set(settings.all_keys())
-    assert {"CORP_LLM_MAX_INFLIGHT", "CORP_LLM_CANCEL_GRACE_SECONDS"} <= keys
+    assert {
+        "CORP_LLM_MAX_INFLIGHT",
+        "CORP_LLM_CANCEL_GRACE_SECONDS",
+        "CORP_LLM_BODY_READ_SECONDS",
+        "CORP_LLM_MAX_DRAINING",
+    } <= keys
 
 
 def test_capacity_defaults(hermetic: Path) -> None:
@@ -1150,6 +1155,65 @@ def test_capacity_defaults(hermetic: Path) -> None:
 
     assert capacity.max_inflight == 64
     assert capacity.cancel_grace_seconds == 5.0
+    assert capacity.body_read_seconds == 30.0
+    assert capacity.max_draining == 256
+
+
+def test_the_draining_default_follows_the_inflight_cap(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from corp_llm_gateway.route_gate.inflight import DRAINING_PER_SLOT
+
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "10")
+
+    assert settings.capacity().max_draining == 40
+    assert settings.DRAINING_PER_SLOT == DRAINING_PER_SLOT
+
+
+@pytest.mark.parametrize(
+    ("inflight", "draining"), [("10", "10"), ("10", "40000"), ("0", "0"), ("0", "5")]
+)
+def test_capacity_accepts_a_draining_cap_in_range(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, inflight: str, draining: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", inflight)
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING", draining)
+
+    assert settings.capacity().max_draining == int(draining)
+
+
+@pytest.mark.parametrize("value", ["9", "0", "-1", "40001", "1.5", "lots"])
+def test_capacity_refuses_a_bad_draining_cap(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "10")
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_MAX_DRAINING" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["0.5", "30", "300"])
+def test_capacity_accepts_a_body_deadline_in_range(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_BODY_READ_SECONDS", value)
+
+    assert settings.capacity().body_read_seconds == float(value)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "300.5", "nan", "inf", "soon"])
+def test_capacity_refuses_a_bad_body_deadline(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_BODY_READ_SECONDS", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_BODY_READ_SECONDS" in str(exc.value)
 
 
 def test_capacity_resolves_through_the_config_file(hermetic: Path) -> None:
@@ -1216,6 +1280,8 @@ def test_validate_reports_the_capacity_problems(
     monkeypatch.setenv("CORP_ENV", "production")
     monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "0")
     monkeypatch.setenv("CORP_LLM_CANCEL_GRACE_SECONDS", "-2")
+    monkeypatch.setenv("CORP_LLM_BODY_READ_SECONDS", "0")
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING", "many")
 
     with pytest.raises(ConfigError) as exc:
         settings.validate()
@@ -1223,6 +1289,8 @@ def test_validate_reports_the_capacity_problems(
     joined = "\n".join(exc.value.problems)
     assert "CORP_LLM_MAX_INFLIGHT" in joined
     assert "CORP_LLM_CANCEL_GRACE_SECONDS" in joined
+    assert "CORP_LLM_BODY_READ_SECONDS" in joined
+    assert "CORP_LLM_MAX_DRAINING" in joined
 
 
 def test_validate_passes_the_default_capacity(

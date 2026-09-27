@@ -78,8 +78,10 @@ The route gate caps concurrent LLM requests per pod. The cap is
 - **How long.** A slot is held for the **whole request**, SSE stream included.
   A Claude Code session that streams for two minutes holds its slot for two
   minutes, so size the cap by concurrent streams, not by requests per second.
-- **When it is full.** The next request gets **429** before its body is read,
-  before litellm and before the sanitizer:
+- **When it is full.** A request that arrives with every slot taken gets **429**
+  before its body is read, before litellm and before the sanitizer; one that
+  loses the last slot while its body was still arriving gets the same 429 after
+  it. The response carries `Retry-After: 1`:
 
   ```json
   {"error": {"type": "capacity", "code": "E_CAPACITY", "route": "POST /v1/messages", "reason": "capacity"}}
@@ -92,6 +94,19 @@ The route gate caps concurrent LLM requests per pod. The cap is
   local-first cascade runs in-process) and memory (each admitted body, up to
   25 MiB, is buffered once). More concurrent sessions means more pods: 200
   concurrent sessions at the default cap is 4 pods with headroom.
+- **The body comes first, under a deadline.** A slot is taken only once the
+  whole body has arrived, so a client that announces a body and never sends it
+  holds no slot. The body must arrive within `CORP_LLM_BODY_READ_SECONDS`
+  (default **30**, above 0 and at most 300); past it the gate answers **408**
+  `E_BODY_TIMEOUT` (`block_reason` `body_timeout`). At most
+  `CORP_LLM_MAX_DRAINING` requests per pod read a body at once (default **4 ×
+  `CORP_LLM_MAX_INFLIGHT`**, never below it, at most 40000); the next gets 429
+  `E_CAPACITY` without a byte read. Each body being read is buffered, up to
+  25 MiB, so the worst-case body memory per pod is `CORP_LLM_MAX_DRAINING` ×
+  25 MiB; lower the draining cap if pod memory cannot hold that. Measured on a real socket (loopback, default
+  cap 64, a 2 s deadline): 65 unauthenticated clients announcing a 10-byte body
+  and sending nothing kept `gateway_inflight_requests` at 0 while a normal
+  request was served (200 in about 20 ms); all 65 got 408 at 2.04 s.
 - **Off.** `0` turns the cap off. The entrypoint refuses it (exit 78) when
   `CORP_ENV` is `prod`/`production`, and so does `gateway-admin config check`;
   so do a negative value, a non-integer and anything above 10000.
@@ -111,11 +126,16 @@ mid-stream — the gateway:
 
 1. cancels the request and gives it `CORP_LLM_CANCEL_GRACE_SECONDS` (default 5)
    to unwind, which closes the upstream connection;
-2. cancels any task the request started that is still running, with the same
-   grace again;
+2. cancels any task the request started that is still running — never a task
+   other requests share, such as a token lookup or a JWKS fetch several requests
+   wait on — and
 3. writes one audit record with `status` `cancelled` and `error_code`
    `E_CLIENT_DISCONNECTED` (counts only), counted in
-   `gateway_cancelled_requests_total`;
+   `gateway_cancelled_requests_total`; steps 2 and 3 share one more grace, so a
+   slot is held **at most 2 × `CORP_LLM_CANCEL_GRACE_SECONDS`** after a
+   disconnect. If the audit sink fails or runs out of that budget, the
+   request's state is kept and the next litellm event for it writes the terminal
+   record instead;
 4. frees the slot — once, whatever happened above.
 
 Measured on a real socket (loopback, stalled upstream stub): the slot is back

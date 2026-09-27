@@ -1,10 +1,13 @@
 """Child process for ``tests/test_inflight_served_stack.py``: the real entrypoint
 (route gate + in-flight limiter + litellm + the guardrail) served by uvicorn on a
 real socket, in front of an upstream stub on another real socket. Runs every
-disconnect case, prints one ``@@RESULT@@`` JSON line.
+disconnect case (scenario ``disconnects``) or the isolation cases (scenario
+``isolation``: a shared auth lookup across a disconnect, idle bodies against the
+slots), prints one ``@@RESULT@@`` JSON line.
 
-Run as ``python tests/inflight_served_script.py <asyncio|uvloop>``; importing
-``corp_llm_gateway.asgi`` IS the boot, so this cannot share the test process.
+Run as ``python tests/inflight_served_script.py <asyncio|uvloop> [scenario]``;
+importing ``corp_llm_gateway.asgi`` IS the boot, so this cannot share the test
+process.
 """
 
 from __future__ import annotations
@@ -243,6 +246,11 @@ async def main() -> None:
 
     warm = await _complete(port, stub, stream=False)
     results: dict[str, Any] = {"warmup": warm[0], "cases": {}}
+    if SCENARIO == "isolation":
+        results["shared_lookup"] = await _shared_lookup(port, stub, guardrail, sink, limiter)
+        results["idle_bodies"] = await _idle_bodies(port, stub, limiter)
+        await _finish(results, port, limiter, server, serving, stub_server)
+        return
 
     async def case(
         name: str,
@@ -326,16 +334,148 @@ async def main() -> None:
     sink.stall_next = True
     await case("f_audit_emit_in_flight", stream=True, mode="ok", token=None, entered=sink.entered)
 
+    await _finish(results, port, limiter, server, serving, stub_server)
+
+
+async def _finish(
+    results: dict[str, Any], port: int, limiter: Any, server: Any, serving: Any, stub_server: Any
+) -> None:
     metrics_status, metrics_body = await _metrics(port)
     results["metrics"] = {"status": metrics_status, "text": metrics_body}
     results["cancel_grace_s"] = limiter.cancel_grace_s
     results["max_inflight"] = limiter.max_inflight
+    results["max_draining"] = limiter.max_draining
+    results["body_read_s"] = limiter.body_read_s
     results["loop"] = type(asyncio.get_running_loop()).__module__
 
     server.should_exit = True
     await serving
     stub_server.close()
     print(SENTINEL + json.dumps(results), flush=True)
+
+
+async def _shared_lookup(port: int, stub: Stub, guardrail: Any, sink: Any, limiter: Any) -> Any:
+    """A and B share one token lookup, started by A; A's client leaves mid-lookup."""
+    auth = guardrail._auth
+    store = auth._store
+    real_lookup = store.lookup
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_lookup(corp_token: str) -> Any:
+        entered.set()
+        await release.wait()
+        return await real_lookup(corp_token)
+
+    auth._cache.clear()
+    store.lookup = slow_lookup
+    base_records = len(sink.records)
+    base_state = len(guardrail._req_state)
+    stub.reset("ok")
+    _, a_writer = await _open(port, stream=False, token=TOKEN)
+    await asyncio.wait_for(entered.wait(), BOUND_S)
+    b_reader, b_writer = await _open(port, stream=False, token=TOKEN, close=True)
+    await _until(lambda: limiter.inflight >= 2)
+    await asyncio.sleep(0.2)  # B is parked on the lookup A started
+    lookups_in_flight = len(auth._inflight)
+    (shared,) = auth._inflight.values()
+    inflight_both = limiter.inflight
+
+    a_writer.close()
+    a_released_s = await _until(lambda: limiter.inflight <= 1)
+    await asyncio.sleep(0.2)
+    shared_cancelled = shared.cancelled()
+    b_answered_early = bool(b_reader._buffer)  # type: ignore[attr-defined]
+    release.set()
+    try:
+        b_status = await _status(b_reader)
+        b_rest = await asyncio.wait_for(b_reader.read(), BOUND_S)
+    finally:
+        b_writer.close()
+        del store.lookup
+    await _until(lambda: limiter.inflight <= 0)
+    await asyncio.sleep(0.5)
+    records = sink.records[base_records:]
+    return {
+        "lookups_in_flight": lookups_in_flight,
+        "inflight_both": inflight_both,
+        "a_released_s": a_released_s,
+        "shared_cancelled": shared_cancelled,
+        "b_answered_early": b_answered_early,
+        "b_status": b_status,
+        "b_completion": b"chat.completion" in b_rest,
+        "records": sorted([r["status"], r["user_id"]] for r in records),
+        "pending_request_tasks": len(inflight.pending_request_tasks()),
+        "req_state_delta": len(guardrail._req_state) - base_state,
+        "inflight_after": limiter.inflight,
+    }
+
+
+IDLE_SOCKETS = 65
+
+
+async def _idle_bodies(port: int, stub: Stub, limiter: Any) -> Any:
+    """65 unauthenticated clients announce a 10-byte body and never send it."""
+    head = (
+        b"POST /v1/chat/completions HTTP/1.1\r\nHost: gateway\r\n"
+        b"Content-Type: application/json\r\nContent-Length: 10\r\n\r\n"
+    )
+    idle = []
+    opened = time.monotonic()
+    for _ in range(IDLE_SOCKETS):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(head)
+        await writer.drain()
+        idle.append((reader, writer))
+    await _until(lambda: limiter.draining >= IDLE_SOCKETS)
+    samples: list[int] = []
+    sampling = True
+
+    async def sample() -> None:
+        while True:
+            if sampling:
+                samples.append(limiter.inflight)
+            await asyncio.sleep(0.005)
+
+    sampler = asyncio.create_task(sample())
+    await asyncio.sleep(0.3)
+    _, gauge_text = await _metrics(port)
+    sampling = False
+    normal_started = time.monotonic() - opened
+    normal = await _complete(port, stub, stream=False)
+    normal_done = time.monotonic() - opened
+    draining_after_normal = limiter.draining
+    await _until(lambda: limiter.inflight <= 0)
+    sampling = True
+    statuses = []
+    first_body = b""
+    for index, (reader, _) in enumerate(idle):
+        statuses.append(await _status(reader))
+        if index == 0:
+            first_body = await asyncio.wait_for(reader.read(65536), BOUND_S)
+    refused_s = time.monotonic() - opened
+    sampler.cancel()
+    for _, writer in idle:
+        writer.close()
+    await _until(lambda: limiter.draining <= 0)
+    gauge = [
+        line for line in gauge_text.splitlines() if line.startswith("gateway_inflight_requests ")
+    ]
+    return {
+        "draining_while_idle": IDLE_SOCKETS,
+        "inflight_samples_max": max(samples),
+        "inflight_samples": len(samples),
+        "gauge_while_idle": gauge,
+        "normal_status": normal[0],
+        "normal_started_s": normal_started,
+        "normal_done_s": normal_done,
+        "draining_after_normal": draining_after_normal,
+        "statuses": sorted(set(statuses)),
+        "count": len(statuses),
+        "refused_s": refused_s,
+        "body_timeout_code": b"E_BODY_TIMEOUT" in first_body,
+        "draining_after": limiter.draining,
+    }
 
 
 async def _metrics(port: int) -> tuple[int, str]:
@@ -348,8 +488,10 @@ async def _metrics(port: int) -> tuple[int, str]:
     return status, rest.decode("latin-1")
 
 
+SCENARIO = sys.argv[2] if len(sys.argv) > 2 else "disconnects"
+
 if __name__ == "__main__":
-    if sys.argv[1:] == ["uvloop"]:
+    if sys.argv[1] == "uvloop":
         import uvloop
 
         asyncio.run(main(), loop_factory=uvloop.new_event_loop)

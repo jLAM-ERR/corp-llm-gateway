@@ -298,9 +298,17 @@
 # boot (exit 78) when CORP_ENV is prod/production. litellm's own
 # general_settings.global_max_parallel_requests does nothing in this deployment.
 # When a client disconnects, the request is cancelled and gets the grace to
-# unwind; its leftover tasks then get the same grace again.
+# unwind; its leftover tasks and the cancel audit record then share one more
+# grace. A slot is held at most 2 x the grace after a disconnect.
+# The body is read before a slot is taken: it must arrive whole within
+# CORP_LLM_BODY_READ_SECONDS (0 < value <= 300; 408 E_BODY_TIMEOUT past it), and
+# at most CORP_LLM_MAX_DRAINING requests read a body at once (default 4 x the
+# in-flight cap, at least the cap; the next gets 429 E_CAPACITY unread). A client
+# that never finishes its body holds no slot.
 # CORP_LLM_MAX_INFLIGHT         = "64"
 # CORP_LLM_CANCEL_GRACE_SECONDS = "5"
+# CORP_LLM_BODY_READ_SECONDS    = "30"
+# CORP_LLM_MAX_DRAINING         = "256"
 
 # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────────
 #

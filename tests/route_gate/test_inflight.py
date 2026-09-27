@@ -17,8 +17,10 @@ from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware
 from corp_llm_gateway.route_gate.inflight import (
+    E_BODY_TIMEOUT,
     E_CAPACITY,
     MAX_BODY_BYTES,
+    ROUTE_GATE_BODY_TIMEOUT,
     ROUTE_GATE_CAPACITY,
     InflightLimiter,
     bind_call_id,
@@ -140,11 +142,16 @@ def _stack(
     metrics: _Metrics | None = None,
     sink: ListSink | None = None,
     max_body_bytes: int = MAX_BODY_BYTES,
+    **limits: Any,
 ) -> tuple[RouteGateMiddleware, InflightLimiter, _Metrics, ListSink]:
     metrics = metrics if metrics is not None else _Metrics()
     sink = sink if sink is not None else ListSink()
     limiter = InflightLimiter(
-        max_inflight, metrics=metrics, cancel_grace_s=grace, max_body_bytes=max_body_bytes
+        max_inflight,
+        metrics=metrics,
+        cancel_grace_s=grace,
+        max_body_bytes=max_body_bytes,
+        **limits,
     )
     gate = RouteGateMiddleware(
         app, metrics=metrics, audit_logger=AuditLogger(sink, "test"), limiter=limiter
@@ -885,3 +892,403 @@ async def test_a_disconnect_after_the_response_leaves_the_request_uncancelled() 
 
     assert flags == [False]
     assert metrics.cancelled == 0
+
+
+# ── shared tasks survive a request's straggler sweep ─────────────────────────
+
+
+async def test_a_shared_auth_lookup_survives_the_disconnect_of_the_request_that_started_it(
+    task_factory: None,
+) -> None:
+    from datetime import UTC, datetime
+
+    from tests.test_litellm_hook import _build_guardrail, _data_with_token
+
+    guardrail, sink = _build_guardrail()
+    store = guardrail._auth._store
+    real_lookup = store.lookup
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_lookup(corp_token: str) -> Any:
+        entered.set()
+        await release.wait()
+        return await real_lookup(corp_token)
+
+    store.lookup = slow_lookup  # type: ignore[method-assign]
+
+    async def litellm_like(scope: Any, receive: Any, send: Any) -> None:
+        call_id = json.loads(await _read_body(receive))["id"]
+        data = _data_with_token("tok-1")
+        data["litellm_call_id"] = call_id
+        await guardrail.pre_call(data)
+        now = datetime.now(UTC)
+        await guardrail.async_log_success_event({"litellm_call_id": call_id}, None, now, now)
+        await _respond(send)
+
+    gate, limiter, metrics, _ = _stack(litellm_like, max_inflight=2)
+    limiter.bind_cancel_hook(guardrail.on_request_cancelled)
+    first, second = _Client((b'{"id": "call-a"}',)), _Client((b'{"id": "call-b"}',))
+    first_task = asyncio.create_task(gate(_scope(), first.receive, first.send))
+    await asyncio.wait_for(entered.wait(), 2)
+    second_task = asyncio.create_task(gate(_scope(), second.receive, second.send))
+    await asyncio.sleep(0.05)
+    (shared,) = guardrail._auth._inflight.values()
+    assert limiter.inflight == 2
+
+    first.disconnect()
+    await asyncio.wait_for(first_task, 2)
+
+    assert not shared.cancelled()
+    assert shared not in pending_request_tasks()
+    assert limiter.inflight == 1
+    release.set()
+    await asyncio.wait_for(second_task, 2)
+    assert second.status == 200
+    assert {r["request_id"]: r["status"] for r in sink.records} == {
+        "call-a": "cancelled",
+        "call-b": "ok",
+    }
+    assert COMPONENT not in metrics.failures
+    assert limiter.inflight == 0
+
+
+async def test_a_shared_task_is_never_tagged_and_outlives_the_sweep(task_factory: None) -> None:
+    from corp_llm_gateway.route_gate.inflight import spawn_shared
+
+    shared_box: list[asyncio.Task[Any]] = []
+    entered = asyncio.Event()
+
+    async def forever() -> None:
+        await asyncio.sleep(3600)
+
+    async def sharing(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        shared = spawn_shared(forever(), name="shared-fetch")
+        shared_box.append(shared)
+        entered.set()
+        await asyncio.wait({shared})
+
+    gate, limiter, _, _ = _stack(sharing)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+    (shared,) = shared_box
+    assert shared not in pending_request_tasks()
+    assert shared.get_name() == "shared-fetch"
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert not shared.done()
+    assert limiter.inflight == 0
+    shared.cancel()
+
+
+async def test_the_sweep_skips_a_shared_task_even_if_it_was_tagged(task_factory: None) -> None:
+    from corp_llm_gateway.route_gate import inflight
+
+    shared_box: list[asyncio.Task[Any]] = []
+    entered = asyncio.Event()
+
+    async def forever() -> None:
+        await asyncio.sleep(3600)
+
+    async def sharing(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        shared = inflight.spawn_shared(forever())
+        ticket = current_ticket()
+        assert ticket is not None
+        inflight._tag(shared, ticket)  # a path that tags it anyway
+        shared_box.append(shared)
+        entered.set()
+        await asyncio.wait({shared})
+
+    gate, _, metrics, _ = _stack(sharing)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert not shared_box[0].done()
+    assert COMPONENT not in metrics.failures
+    shared_box[0].cancel()
+
+
+async def test_litellms_logging_worker_never_belongs_to_a_request(task_factory: None) -> None:
+    pytest.importorskip("litellm")
+    from litellm.litellm_core_utils.logging_worker import LoggingWorker
+
+    worker = LoggingWorker()
+    entered = asyncio.Event()
+
+    async def restarting(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        # The worker (re)starts lazily on the first callback, inside a request.
+        worker.start()
+        entered.set()
+        await asyncio.sleep(3600)
+
+    gate, _, _, _ = _stack(restarting)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+    worker_task = worker._worker_task
+    assert worker_task is not None
+    assert worker_task not in pending_request_tasks()
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert not worker_task.done()
+    await worker.stop()
+
+
+# ── the body: read under a deadline, before any slot is taken ────────────────
+
+
+def _stalled_client(first: bytes = b"{") -> _Client:
+    client = _Client()
+    client.incoming = asyncio.Queue()
+    client.incoming.put_nowait({"type": "http.request", "body": first, "more_body": True})
+    return client
+
+
+def _headers(client: _Client) -> dict[bytes, bytes]:
+    start = next(m for m in client.sent if m["type"] == "http.response.start")
+    return dict(start["headers"])
+
+
+async def test_no_slot_is_held_while_a_body_is_still_arriving() -> None:
+    app = _Holding()
+    app.release.set()
+    gate, limiter, metrics, _ = _stack(app, max_inflight=1, body_read_s=5.0)
+    stalled = _stalled_client()
+    stalling = asyncio.create_task(gate(_scope(), stalled.receive, stalled.send))
+    await asyncio.sleep(0.05)
+
+    assert limiter.inflight == 0
+    assert limiter.draining == 1
+    assert metrics.inflight == []
+    normal = _Client()
+    await asyncio.wait_for(gate(_scope(), normal.receive, normal.send), 2)
+    assert normal.status == 200
+
+    stalled.incoming.put_nowait({"type": "http.request", "body": b"}", "more_body": False})
+    await asyncio.wait_for(stalling, 2)
+    assert stalled.status == 200
+    assert limiter.inflight == limiter.draining == 0
+
+
+async def test_a_body_not_complete_within_the_deadline_gets_408_and_never_a_slot() -> None:
+    app = _Holding()
+    gate, limiter, metrics, sink = _stack(app, max_inflight=1, body_read_s=0.1)
+    client = _stalled_client(CANARY.encode())
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+
+    await asyncio.wait_for(gate(_scope(), client.receive, client.send), 2)
+
+    assert 0.1 <= loop.time() - start < 1.0
+    assert client.status == 408
+    assert client.json() == {
+        "error": {
+            "type": "body_timeout",
+            "code": E_BODY_TIMEOUT,
+            "route": "POST /v1/messages",
+            "reason": ROUTE_GATE_BODY_TIMEOUT,
+        }
+    }
+    assert app.calls == 0
+    assert metrics.inflight == []
+    assert (limiter.inflight, limiter.draining) == (0, 0)
+    assert metrics.blocks == [ROUTE_GATE_BODY_TIMEOUT]
+    assert metrics.failures == []
+    assert metrics.cancelled == 0
+    assert [r["block_reason"] for r in sink.records] == [ROUTE_GATE_BODY_TIMEOUT]
+    assert sink.records[0]["error_code"] == E_BODY_TIMEOUT
+    assert CANARY not in json.dumps(sink.records)
+
+
+async def test_over_the_draining_cap_the_next_request_gets_429_unread() -> None:
+    app = _Holding()
+    app.release.set()
+    gate, limiter, metrics, _ = _stack(app, max_inflight=1, max_draining=1, body_read_s=5.0)
+    stalled = _stalled_client()
+    stalling = asyncio.create_task(gate(_scope(), stalled.receive, stalled.send))
+    await asyncio.sleep(0.05)
+    assert limiter.draining == 1
+
+    refused = _Client()
+    await gate(_scope(), refused.receive, refused.send)
+
+    assert refused.status == 429
+    assert refused.json()["error"]["code"] == E_CAPACITY
+    assert refused.receive_calls == 0
+    assert _headers(refused)[b"retry-after"] == b"1"
+    assert metrics.blocks == [ROUTE_GATE_CAPACITY]
+    stalled.incoming.put_nowait({"type": "http.request", "body": b"}", "more_body": False})
+    await asyncio.wait_for(stalling, 2)
+    admitted = _Client()
+    await gate(_scope(), admitted.receive, admitted.send)
+    assert admitted.status == 200
+
+
+async def test_the_capacity_refusal_asks_the_client_to_retry_after_a_second() -> None:
+    app = _Holding()
+    gate, _, _, _ = _stack(app, max_inflight=1)
+    held = _Client()
+    running = asyncio.create_task(gate(_scope(), held.receive, held.send))
+    await asyncio.wait_for(app.entered.acquire(), 2)
+
+    refused = _Client()
+    await gate(_scope(), refused.receive, refused.send)
+
+    assert refused.status == 429
+    assert _headers(refused)[b"retry-after"] == b"1"
+    app.release.set()
+    await running
+    assert b"retry-after" not in _headers(held)
+
+
+async def test_a_request_that_loses_the_slot_after_its_body_arrived_gets_429() -> None:
+    app = _Holding()
+    gate, limiter, metrics, _ = _stack(app, max_inflight=1, body_read_s=5.0)
+    slow = _stalled_client()
+    slow_task = asyncio.create_task(gate(_scope(), slow.receive, slow.send))
+    await asyncio.sleep(0.05)
+    fast = _Client()
+    fast_task = asyncio.create_task(gate(_scope(), fast.receive, fast.send))
+    await asyncio.wait_for(app.entered.acquire(), 2)
+
+    slow.incoming.put_nowait({"type": "http.request", "body": b"}", "more_body": False})
+    await asyncio.wait_for(slow_task, 2)
+
+    assert slow.status == 429
+    assert app.calls == 1
+    assert metrics.blocks == [ROUTE_GATE_CAPACITY]
+    app.release.set()
+    await fast_task
+    assert fast.status == 200
+    assert (limiter.inflight, limiter.draining) == (0, 0)
+
+
+async def test_a_server_cancel_while_the_body_is_read_frees_the_draining_count() -> None:
+    gate, limiter, metrics, _ = _stack(_Holding(), body_read_s=5.0)
+    stalled = _stalled_client()
+    task = asyncio.create_task(gate(_scope(), stalled.receive, stalled.send))
+    await asyncio.sleep(0.05)
+    assert limiter.draining == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert (limiter.inflight, limiter.draining) == (0, 0)
+    assert metrics.inflight == []
+
+
+def test_the_draining_cap_defaults_to_four_times_the_inflight_cap() -> None:
+    assert InflightLimiter(16, metrics=_Metrics()).max_draining == 64
+    assert InflightLimiter(0, metrics=_Metrics()).max_draining == 0
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_draining": 3},
+        {"max_draining": 0},
+        {"max_draining": -1},
+        {"max_draining": True},
+        {"body_read_s": 0},
+        {"body_read_s": -1.0},
+        {"body_read_s": float("nan")},
+        {"body_read_s": float("inf")},
+    ],
+)
+def test_the_limiter_refuses_bad_drain_settings(limits: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        InflightLimiter(4, metrics=_Metrics(), **limits)
+
+
+# ── the cancel path's bound ──────────────────────────────────────────────────
+
+
+async def test_a_cancelled_request_holds_its_slot_at_most_twice_the_grace(
+    task_factory: None,
+) -> None:
+    stop = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def ignore_cancel() -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    async def stubborn(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        bind_call_id("call-1")
+        bind_call_id("call-2")
+        stragglers.append(asyncio.ensure_future(ignore_cancel()))  # tagged
+        entered.set()
+        await ignore_cancel()
+
+    grace = 0.2
+    gate, limiter, metrics, _ = _stack(stubborn, grace=grace)
+    hook_calls: list[str] = []
+    stragglers: list[asyncio.Task[None]] = []
+
+    async def stalled_hook(request_id: str, *, latency_ms: int = 0) -> None:
+        hook_calls.append(request_id)
+        await asyncio.sleep(3600)
+
+    limiter.bind_cancel_hook(stalled_hook)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+
+    client.disconnect()
+    await asyncio.wait_for(task, 5)
+
+    assert loop.time() - start < 2 * grace + 0.1
+    assert sorted(hook_calls) == ["call-1", "call-2"]
+    assert limiter.inflight == 0
+    assert COMPONENT in metrics.failures
+    stop.set()
+    await asyncio.wait(stragglers, timeout=1)
+
+
+# ── a server cancel leaves nothing for the loop's exception handler ──────────
+
+
+async def test_a_server_cancel_leaves_no_unretrieved_exception() -> None:
+    from tests.loop_errors import describe, loop_errors
+
+    entered = asyncio.Event()
+
+    async def failing_on_cancel(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        entered.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise RuntimeError(CANARY) from None
+
+    gate, limiter, _, _ = _stack(failing_on_cancel)
+    client = _Client()
+    async with loop_errors(settle_s=0.05) as seen:
+        task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        del task
+
+    assert seen == [], describe(seen)
+    assert limiter.inflight == 0

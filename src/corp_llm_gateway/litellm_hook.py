@@ -278,6 +278,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # via audit() — a failed emit + safety-net retry call audit() twice
         # for one request; the histogram must only see it once.
         self._latency_observed_ids: OrderedDict[str, None] = OrderedDict()
+        # Bounded set of cancelled request_ids whose `cancelled` record never
+        # landed: a later audit() for one of them writes instead of standing down.
+        self._cancel_unrecorded: OrderedDict[str, None] = OrderedDict()
 
     @property
     def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
@@ -426,6 +429,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         `async_pre_call_hook` wiring supplies a call_type.
         """
         request_id = self._ensure_request_id(data)
+        ticket = current_ticket()
+        if ticket is not None and ticket.cancelled:
+            # The route gate already wrote this request's `cancelled` record; a
+            # call id bound now would never be audited and its state never freed.
+            self._metrics.record_failure("route_gate")
+            logger.error(
+                "route_gate_cancel_incomplete request_id=%s late_pre_call=true", request_id
+            )
+            raise GuardrailHttpException(499, E_CLIENT_DISCONNECTED, "client disconnected")
         # The route gate's ticket for this HTTP request learns litellm's call id,
         # so a client disconnect can find this request's state.
         bind_call_id(request_id)
@@ -1568,7 +1580,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
             return
         ticket = current_ticket()
-        if ticket is not None and ticket.cancelled:
+        if ticket is not None and ticket.cancelled and request_id not in self._cancel_unrecorded:
             # The route gate is cancelling this request; its terminal record is
             # the `cancelled` one `on_request_cancelled` writes.
             logger.debug("litellm_audit_deferred_to_cancel request_id=%s", request_id)
@@ -1627,10 +1639,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             # out) — treat it as delivered so a safety-net retry for the same
             # request_id doesn't write a second record for one logical write.
             logger.error("litellm_audit_emit_ambiguous request_id=%s status=%s", request_id, status)
-            self._req_state.pop(request_id, None)
-            self._audited_ids[request_id] = None
-            if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
-                self._audited_ids.popitem(last=False)
+            self._mark_audited(request_id)
             raise
         except Exception:
             # Do NOT mark dedup on a confirmed failed emit: a request whose
@@ -1642,10 +1651,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             raise
         # Pop only after a confirmed-successful emit, so `_req_state` never
         # grows unbounded past this point either.
-        self._req_state.pop(request_id, None)
-        self._audited_ids[request_id] = None
-        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
-            self._audited_ids.popitem(last=False)
+        self._mark_audited(request_id)
         logger.info(
             "litellm_audit_emitted request_id=%s status=%s latency_ms=%d "
             "redaction_count=%d cache_a_hit=%s prompt_tokens=%d completion_tokens=%d",
@@ -1661,18 +1667,17 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     async def on_request_cancelled(self, request_id: str, *, latency_ms: int = 0) -> None:
         """The terminal record of a request the route gate cancelled (client gone).
 
-        Pops the request's state (Cache B expires on its own TTL) and emits one
-        ``cancelled`` record with counts only — no placeholder list, nothing of
-        the content. The id is marked audited BEFORE the emit, so a failure event
-        litellm fires later for the same call dedups instead of adding a second
-        record. A request whose terminal record already went out gets nothing.
+        Emits one ``cancelled`` record with counts only — no placeholder list,
+        nothing of the content. Like :meth:`audit`, the id is marked audited and
+        its state popped only once the emit is confirmed (or ambiguous); after a
+        failed or cut-short emit the state stays, and a later litellm event for
+        the call writes the terminal record instead. A request whose terminal
+        record already went out gets nothing.
         """
-        state = self._req_state.pop(request_id, None)
         if request_id in self._audited_ids:
+            self._req_state.pop(request_id, None)
             return
-        self._audited_ids[request_id] = None
-        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
-            self._audited_ids.popitem(last=False)
+        state = self._req_state.get(request_id)
         event = AuditEvent(
             timestamp=datetime.now(UTC),
             request_id=request_id,
@@ -1693,15 +1698,35 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         )
         try:
             await self._audit.emit(event)
-        except Exception:
-            logger.error("litellm_audit_cancelled_emit_failed request_id=%s", request_id)
+        except AuditWriteAmbiguousError:
+            logger.error("litellm_audit_cancelled_emit_ambiguous request_id=%s", request_id)
+            self._mark_audited(request_id)
             raise
+        except BaseException as exc:
+            # The class name only: a sink's message can quote what it was writing.
+            self._cancel_unrecorded[request_id] = None
+            if len(self._cancel_unrecorded) > _AUDIT_DEDUP_CAP:
+                self._cancel_unrecorded.popitem(last=False)
+            logger.error(
+                "litellm_audit_cancelled_emit_failed request_id=%s error=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            raise
+        self._mark_audited(request_id)
         logger.info(
             "litellm_audit_emitted request_id=%s status=cancelled latency_ms=%d redaction_count=%d",
             request_id,
             event.latency_ms,
             event.redaction_count,
         )
+
+    def _mark_audited(self, request_id: str) -> None:
+        self._req_state.pop(request_id, None)
+        self._cancel_unrecorded.pop(request_id, None)
+        self._audited_ids[request_id] = None
+        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+            self._audited_ids.popitem(last=False)
 
     # ---- internals --------------------------------------------------------
 

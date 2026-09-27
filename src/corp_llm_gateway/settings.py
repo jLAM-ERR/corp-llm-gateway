@@ -353,8 +353,22 @@ KEYS: tuple[Key, ...] = (
     Key(
         "CORP_LLM_CANCEL_GRACE_SECONDS",
         default="5",
-        help="seconds a request cancelled by a client disconnect gets to unwind, then its "
-        "leftover tasks get the same again (0 < value <= 60)",
+        help="seconds a request cancelled by a client disconnect gets to unwind; its leftover "
+        "tasks and the cancel audit record then share one more such budget, so a slot is "
+        "held at most 2 x this after a disconnect (0 < value <= 60)",
+    ),
+    Key(
+        "CORP_LLM_BODY_READ_SECONDS",
+        default="30",
+        help="seconds a rewritten request gets to deliver its whole body, before any slot "
+        "is taken; past it the gate answers 408 E_BODY_TIMEOUT (0 < value <= 300)",
+    ),
+    Key(
+        "CORP_LLM_MAX_DRAINING",
+        default="",
+        help="rewritten requests reading their body at once per pod (before a slot is "
+        "taken); the next gets 429 E_CAPACITY unread; default 4 x CORP_LLM_MAX_INFLIGHT, "
+        "at least CORP_LLM_MAX_INFLIGHT, at most 40000",
     ),
     # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────
     Key("CORP_LLM_TESTDATA_ALLOWLIST", default="", help="inline never-redact test values"),
@@ -872,6 +886,9 @@ def issuance_runtime_problems() -> list[str]:
 
 MAX_INFLIGHT_CEILING = 10_000
 CANCEL_GRACE_CEILING_S = 60.0
+BODY_READ_CEILING_S = 300.0
+DRAINING_PER_SLOT = 4
+MAX_DRAINING_CEILING = DRAINING_PER_SLOT * MAX_INFLIGHT_CEILING
 
 
 @dataclass(frozen=True)
@@ -880,6 +897,8 @@ class CapacitySettings:
 
     max_inflight: int
     cancel_grace_seconds: float
+    body_read_seconds: float
+    max_draining: int
 
 
 def _prod(values: Mapping[str, str | None]) -> bool:
@@ -904,19 +923,42 @@ def _build_capacity(
                 f"{name}=0 turns the in-flight cap off; refused when CORP_ENV is "
                 "prod/production — set a positive cap per pod and scale replicas"
             )
-    name = "CORP_LLM_CANCEL_GRACE_SECONDS"
-    raw = _stripped(values, name) or (_BY_NAME[name].default or "")
-    grace = 0.0
-    try:
-        grace = float(raw)
-    except ValueError:
-        problems.append(f"{name}={raw!r} is not a number")
-    else:
-        if not 0 < grace <= CANCEL_GRACE_CEILING_S:
-            problems.append(f"{name}: must be a number above 0 and at most 60")
+    grace = _seconds(values, "CORP_LLM_CANCEL_GRACE_SECONDS", CANCEL_GRACE_CEILING_S, problems)
+    body_read = _seconds(values, "CORP_LLM_BODY_READ_SECONDS", BODY_READ_CEILING_S, problems)
+    name = "CORP_LLM_MAX_DRAINING"
+    raw = _stripped(values, name)
+    max_draining = DRAINING_PER_SLOT * max_inflight
+    if raw:
+        if not raw.isdigit():
+            problems.append(f"{name}={raw!r} is not a non-negative integer")
+        else:
+            max_draining = int(raw)
+            if max_draining > MAX_DRAINING_CEILING:
+                problems.append(f"{name}: must be at most {MAX_DRAINING_CEILING}")
+            elif max_draining < max_inflight or (max_inflight and not max_draining):
+                problems.append(f"{name}: must be at least CORP_LLM_MAX_INFLIGHT ({max_inflight})")
     if len(problems) > start:
         return None
-    return CapacitySettings(max_inflight=max_inflight, cancel_grace_seconds=grace)
+    return CapacitySettings(
+        max_inflight=max_inflight,
+        cancel_grace_seconds=grace,
+        body_read_seconds=body_read,
+        max_draining=max_draining,
+    )
+
+
+def _seconds(
+    values: Mapping[str, str | None], name: str, ceiling: float, problems: list[str]
+) -> float:
+    raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+    try:
+        seconds = float(raw)
+    except ValueError:
+        problems.append(f"{name}={raw!r} is not a number")
+        return 0.0
+    if not 0 < seconds <= ceiling:
+        problems.append(f"{name}: must be a number above 0 and at most {ceiling:g}")
+    return seconds
 
 
 def _check_capacity(values: Mapping[str, str | None], problems: list[str]) -> None:

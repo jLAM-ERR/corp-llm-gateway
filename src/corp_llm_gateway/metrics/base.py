@@ -50,8 +50,9 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
         "route_gate_unarmed",
         "route_gate_error",
     ),
-    # The route gate's in-flight cap, after the verdict (route_gate/inflight.py).
-    "capacity": ("capacity",),
+    # The route gate's in-flight cap, after the verdict (route_gate/inflight.py):
+    # every slot (or body-read place) taken, or a body past its read deadline.
+    "capacity": ("capacity", "body_timeout"),
 }
 
 # Every ``gateway_failure{component}`` label value. The hook maps an error code

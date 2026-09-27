@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from corp_llm_gateway.route_gate.inflight import spawn_shared
 from corp_llm_gateway.tokens.errors import (
     ExpiredTokenError,
     InvalidTokenError,
@@ -93,7 +94,8 @@ class AuthMiddleware:
             return cached[0]
         task = self._inflight.get(corp_token)
         if task is None:
-            task = asyncio.get_running_loop().create_task(self._fetch(corp_token))
+            # Shared by every caller of this token: no request may own it.
+            task = spawn_shared(self._fetch(corp_token), name="corp-auth-lookup")
             self._inflight[corp_token] = task
             task.add_done_callback(lambda done: self._forget(corp_token, done))
         # A caller giving up stops waiting; the lookup the others share runs on. Not

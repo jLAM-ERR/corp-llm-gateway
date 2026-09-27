@@ -943,8 +943,16 @@ no shipped config sets either. The limiter is the single reader of the request's
 replays it to litellm, and watches the socket, so a client that disconnects —
 during our pre-call hook, before the first byte or mid-stream — gets its request
 cancelled, its leftover tasks cancelled, one `cancelled` audit record with counts
-only, and its slot back (`docs/ops/capacity.md`). The cap is capacity, not
-authorization: it decides how many requests run, never which.
+only, and its slot back within 2 × `CORP_LLM_CANCEL_GRACE_SECONDS`
+(`docs/ops/capacity.md`). The body is read BEFORE a slot is taken and before any
+authentication, so it is bounded twice: it must arrive within
+`CORP_LLM_BODY_READ_SECONDS` (408 `E_BODY_TIMEOUT`), and at most
+`CORP_LLM_MAX_DRAINING` requests read one at once (429 unread) — an
+unauthenticated client that never finishes its body holds no slot. A task that
+several requests await (the per-token auth lookup, the JWKS fetch) is started
+outside every request (`inflight.spawn_shared`), so one caller's disconnect never
+cancels it under the others. The cap is capacity, not authorization: it decides
+how many requests run, never which.
 
 ### Consequences to know
 

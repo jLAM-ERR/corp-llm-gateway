@@ -9,6 +9,12 @@ response headers while litellm awaits the stalled upstream, (b) mid-SSE, (c)
 during a non-streaming call, (d) inside our pre-call hook, (e) on a zero-chunk
 stream, (f) while an audit emit is in flight.
 
+A second run (scenario ``isolation``, the default cap of 64) proves two things
+the disconnect cases cannot: a token lookup shared by two requests survives the
+disconnect of the one that started it, and 64+1 clients that announce a body and
+never send it hold no slot — a normal request is served while they idle, and each
+of them gets 408 once the body-read deadline passes.
+
 Skips only where uvicorn or litellm is absent (the graceful-degradation venv).
 """
 
@@ -47,7 +53,7 @@ REACHES_UPSTREAM = frozenset(
 LOOPS = ["asyncio"] + (["uvloop"] if find_spec("uvloop") is not None else [])
 
 
-def _served(loop: str) -> dict[str, Any]:
+def _served(loop: str, scenario: str = "disconnects", **extra_env: str) -> dict[str, Any]:
     env = {name: os.environ[name] for name in _INHERITED if name in os.environ}
     env.update(
         {
@@ -64,10 +70,11 @@ def _served(loop: str) -> dict[str, Any]:
             "CORP_LLM_DEV_TEAM_TOKEN": "served-dev-token",
             "CORP_LLM_MAX_INFLIGHT": "1",
             "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+            **extra_env,
         }
     )
     completed = subprocess.run(
-        [sys.executable, str(SCRIPT), loop],
+        [sys.executable, str(SCRIPT), loop, scenario],
         capture_output=True,
         text=True,
         env=env,
@@ -182,4 +189,71 @@ def test_the_metrics_count_every_cancellation_and_no_gate_failure(served: dict[s
 
     assert f"gateway_cancelled_requests_total {float(len(CASES))}" in text
     assert "gateway_inflight_requests 0.0" in text
+    assert 'gateway_failure{component="route_gate"}' not in text
+
+
+# ── isolation: shared tasks and idle bodies ──────────────────────────────────
+
+BODY_READ_S = 2.0
+
+
+@pytest.fixture(scope="module", params=LOOPS)
+def isolated(request: pytest.FixtureRequest) -> dict[str, Any]:
+    return _served(
+        request.param,
+        "isolation",
+        CORP_LLM_MAX_INFLIGHT="64",
+        CORP_LLM_BODY_READ_SECONDS=str(BODY_READ_S),
+    )
+
+
+def test_the_isolation_stack_runs_the_default_limits(isolated: dict[str, Any]) -> None:
+    assert isolated["warmup"] == 200
+    assert (isolated["max_inflight"], isolated["max_draining"]) == (64, 256)
+    assert isolated["body_read_s"] == BODY_READ_S
+
+
+def test_a_shared_lookup_survives_the_disconnect_of_the_request_that_started_it(
+    isolated: dict[str, Any],
+) -> None:
+    result = isolated["shared_lookup"]
+
+    # Both requests were parked on one lookup, started by A.
+    assert (result["lookups_in_flight"], result["inflight_both"]) == (1, 2)
+    assert result["a_released_s"] < isolated["cancel_grace_s"]
+    assert result["shared_cancelled"] is False
+    assert result["b_answered_early"] is False
+    assert result["b_status"] == 200
+    assert result["b_completion"] is True
+    # A was cancelled inside its auth lookup, before it had an identity.
+    assert result["records"] == [["cancelled", "unknown"], ["ok", "local-dev"]]
+    assert result["pending_request_tasks"] == 0
+    assert result["req_state_delta"] == 0
+    assert result["inflight_after"] == 0
+
+
+def test_idle_bodies_hold_no_slot_and_a_normal_request_is_served(
+    isolated: dict[str, Any],
+) -> None:
+    result = isolated["idle_bodies"]
+
+    assert result["inflight_samples"] > 0
+    assert result["inflight_samples_max"] == 0
+    assert result["gauge_while_idle"] == ["gateway_inflight_requests 0.0"]
+    assert result["normal_status"] == 200
+    assert result["normal_done_s"] < BODY_READ_S
+    # The stall was still on when the normal request finished.
+    assert result["draining_after_normal"] == 65
+
+
+def test_idle_bodies_get_408_once_the_deadline_passes(isolated: dict[str, Any]) -> None:
+    result = isolated["idle_bodies"]
+
+    assert result["count"] == 65
+    assert result["statuses"] == [408]
+    assert result["body_timeout_code"] is True
+    assert BODY_READ_S <= result["refused_s"] < BODY_READ_S + 5
+    assert result["draining_after"] == 0
+    text = isolated["metrics"]["text"]
+    assert 'corp_llm_gateway_blocked_requests_total{block_reason="body_timeout"} 65.0' in text
     assert 'gateway_failure{component="route_gate"}' not in text

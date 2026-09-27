@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from corp_llm_gateway.route_gate.inflight import spawn_shared
 from corp_llm_gateway.tokens.issuance import (
     JwksUnavailableError,
     OidcClaims,
@@ -132,7 +133,7 @@ class JwksClient:
     async def _refresh(self) -> None:
         task = self._inflight
         if task is None:
-            task = asyncio.get_running_loop().create_task(self._fetch())
+            task = spawn_shared(self._fetch(), name="jwks-fetch")
             task.add_done_callback(self._clear_inflight)
             self._inflight = task
         # A cancelled waiter must not cancel the fetch others await. asyncio.wait, not

@@ -552,10 +552,11 @@ def test_the_limiter_reasons_are_enumerated() -> None:
     from corp_llm_gateway.route_gate.inflight import (
         LIMITER_BLOCK_REASONS,
         OVERSIZE_BLOCKED,
+        ROUTE_GATE_BODY_TIMEOUT,
         ROUTE_GATE_CAPACITY,
     )
 
-    assert BLOCK_REASONS["capacity"] == (ROUTE_GATE_CAPACITY,)
+    assert BLOCK_REASONS["capacity"] == (ROUTE_GATE_CAPACITY, ROUTE_GATE_BODY_TIMEOUT)
     assert OVERSIZE_BLOCKED in BLOCK_REASONS["policy"]
     assert set(ALL_BLOCK_REASONS) >= LIMITER_BLOCK_REASONS
 

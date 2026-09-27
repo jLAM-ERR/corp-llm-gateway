@@ -1179,3 +1179,42 @@ async def test_a_cancelled_waiter_on_a_hung_fetch_leaves_the_client_usable_after
     clock.now += oidc_verifier.FAILURE_BACKOFF_S
     assert (await verifier(_sign())).subject == _SUB
     assert jwks.calls == 2
+
+
+async def test_the_shared_jwks_fetch_survives_the_sweep_of_the_request_that_started_it() -> None:
+    # issue-token is a PASSTHROUGH route and carries no request ticket today; the
+    # fetch must still belong to no request if a ticketed caller ever starts it.
+    from corp_llm_gateway.route_gate.inflight import (
+        _TICKET,
+        RequestTicket,
+        _tag,
+        install_task_factory,
+        pending_request_tasks,
+    )
+
+    jwks = _Jwks()
+    jwks.delay = 0.05
+    verifier = _verifier(jwks)
+    restore = install_task_factory(asyncio.get_running_loop())
+    try:
+        ticket = RequestTicket("gateway-id")
+        token = _TICKET.set(ticket)
+        try:
+            first = asyncio.create_task(verifier(_sign()))
+        finally:
+            _TICKET.reset(token)
+        _tag(first, ticket)
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(verifier(_sign(_claims(jti="j2"))))
+        await asyncio.sleep(0)
+        assert pending_request_tasks() == [first]
+
+        for task in ticket.pending():  # the disconnect sweep
+            task.cancel()
+
+        assert (await second).jti == "j2"
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert jwks.calls == 1
+    finally:
+        restore()
