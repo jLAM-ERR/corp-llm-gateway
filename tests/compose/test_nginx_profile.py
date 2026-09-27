@@ -357,8 +357,26 @@ RATE_LIMITED_BODY = [
     """return 429 '{"error":{"code":"E_RATE_LIMITED"}}'""",
 ]
 
+LANGFUSE_SNIPPET = NGINX_DIR / "templates" / "snippets" / "langfuse-locations.inc.template"
+
+# The Langfuse origin's proxy settings: the only snippet that forwards an
+# upgrade, and the only consumer of $proxy_host_header (NextAuth needs the port).
+LANGFUSE_SERVER_DIRECTIVES = [
+    "set $langfuse_upstream http://langfuse-web:3000",
+    "proxy_http_version 1.1",
+    "proxy_buffering off",
+    "proxy_request_buffering off",
+    "proxy_read_timeout 3600s",
+    "chunked_transfer_encoding on",
+    "proxy_max_temp_file_size 0",
+    "proxy_set_header Upgrade $http_upgrade",
+    "proxy_set_header Connection $connection_upgrade",
+    "proxy_set_header Host $proxy_host_header",
+    "proxy_set_header X-Forwarded-Proto https",
+]
+
 # What the front door admits: the gateway's allow-list ("The security
-# constraint"), and nothing on Langfuse yet — Task 5 replaces that pin.
+# constraint"), and the whole Langfuse origin — its own server, at its root.
 ADMITTED_LOCATIONS = {
     "gateway-locations.inc.template": (
         GATEWAY_SERVER_DIRECTIVES,
@@ -394,7 +412,10 @@ ADMITTED_LOCATIONS = {
             RATE_LIMITED: RATE_LIMITED_BODY,
         },
     ),
-    "langfuse-locations.inc.template": ([], {"/": ["return 404"]}),
+    "langfuse-locations.inc.template": (
+        LANGFUSE_SERVER_DIRECTIVES,
+        {"/": ["proxy_pass $langfuse_upstream$request_uri"]},
+    ),
 }
 
 
@@ -478,6 +499,18 @@ def _effective(snippet: Snippet, location: Location, name: str) -> list[str]:
     return [str(d) for d in (own or inherited)]
 
 
+def _langfuse_snippet() -> Snippet:
+    return parse_snippet(LANGFUSE_SNIPPET.read_text())
+
+
+# snippet -> (its parse, how many locations it proxies)
+PROXYING_SNIPPETS = {
+    "gateway": (gateway_snippet, 6),
+    "langfuse": (_langfuse_snippet, 1),
+}
+
+
+@pytest.mark.parametrize("which", sorted(PROXYING_SNIPPETS))
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -485,20 +518,26 @@ def _effective(snippet: Snippet, location: Location, name: str) -> list[str]:
         ("proxy_max_temp_file_size", "proxy_max_temp_file_size 0"),
         ("proxy_buffering", "proxy_buffering off"),
         ("proxy_http_version", "proxy_http_version 1.1"),
+        ("proxy_read_timeout", "proxy_read_timeout 3600s"),
+        ("chunked_transfer_encoding", "chunked_transfer_encoding on"),
     ],
 )
-def test_no_proxied_location_can_write_a_temp_file_or_buffer(name: str, value: str) -> None:
+def test_no_proxied_location_can_write_a_temp_file_or_buffer(
+    which: str, name: str, value: str
+) -> None:
     # A temp-file fault is a [crit] entry, which carries the request line.
-    snippet = gateway_snippet()
+    parse, count = PROXYING_SNIPPETS[which]
+    snippet = parse()
     proxied = [location for location in snippet.locations if location.find("proxy_pass")]
 
-    assert len(proxied) == 6
+    assert len(proxied) == count
     for location in proxied:
         assert _effective(snippet, location, name) == [value], location.key
 
 
-def test_the_credentials_pass_through_untouched() -> None:
-    snippet = gateway_snippet()
+@pytest.mark.parametrize("which", sorted(PROXYING_SNIPPETS))
+def test_the_credentials_pass_through_untouched(which: str) -> None:
+    snippet = PROXYING_SNIPPETS[which][0]()
     every = [*snippet.server, *(d for loc in snippet.locations for d in loc.directives)]
     headers = [d.args[0].lower() for d in every if d.name == "proxy_set_header"]
 
@@ -566,6 +605,99 @@ def test_both_limits_refuse_with_the_edges_json_429() -> None:
     assert [d for d in server if d.startswith("error_page")] == ["error_page 429 = @rate_limited"]
     (named,) = snippet.named()
     assert [str(d) for d in named.directives] == RATE_LIMITED_BODY
+
+
+# --------------------------------------------------------------------------- #
+# the Langfuse origin
+# --------------------------------------------------------------------------- #
+
+# Where each upgrade / ported-Host variable may appear: defined once in the
+# http context, consumed by the Langfuse snippet alone. The gateway snippet
+# clears Upgrade and Connection and forwards $host.
+UPGRADE_AND_HOST_USES = {
+    "00-http.conf.template": [
+        "map $http_upgrade $connection_upgrade {",
+        "map $http_host $proxy_host_header {",
+    ],
+    "langfuse-locations.inc.template": [
+        "proxy_set_header Upgrade $http_upgrade;",
+        "proxy_set_header Connection $connection_upgrade;",
+        "proxy_set_header Host $proxy_host_header;",
+    ],
+}
+
+
+def test_only_the_langfuse_snippet_forwards_an_upgrade_or_a_ported_host() -> None:
+    uses: dict[str, list[str]] = {}
+    for path in _every_config_file():
+        for line in _directives(path.read_text()).splitlines():
+            if re.search(r"\$(http_upgrade|connection_upgrade|proxy_host_header)\b", line):
+                uses.setdefault(path.name, []).append(line.strip())
+
+    assert uses == UPGRADE_AND_HOST_USES
+
+
+@pytest.mark.parametrize("which", sorted(PROXYING_SNIPPETS))
+def test_no_snippet_forwards_the_scheme_nginx_spoke(which: str) -> None:
+    # $scheme is http in behind-proxy; the public side is always https.
+    snippet = PROXYING_SNIPPETS[which][0]()
+    every = [*snippet.server, *(d for loc in snippet.locations for d in loc.directives)]
+
+    assert [str(d) for d in every if d.name == "proxy_set_header" and "Proto" in d.args[0]] == [
+        "proxy_set_header X-Forwarded-Proto https"
+    ]
+    assert not [str(d) for d in every if "$scheme" in str(d)]
+
+
+PRODUCTION_FILES = (COMPOSE, OAUTH, ISSUANCE)
+STACKS = pytest.mark.parametrize(
+    "files", [(COMPOSE,), (COMPOSE, OAUTH), PRODUCTION_FILES], ids=["base", "oauth", "production"]
+)
+
+
+@STACKS
+@pytest.mark.parametrize("profile", [None, *PROFILES])
+def test_langfuse_web_is_never_published(
+    tmp_path: Path, files: tuple[Path, ...], profile: str | None
+) -> None:
+    # Reachable only through nginx or a tunnel.
+    service = render(tmp_path, *files, profiles=profile).services["langfuse-web"]
+
+    assert "ports" not in service
+    assert "network_mode" not in service
+
+
+PUBLIC_LANGFUSE = "https://langfuse.example.test"
+
+
+def _nextauth_url(service: dict[str, Any]) -> str:
+    environment = service["environment"]
+    assert isinstance(environment, dict), environment
+    return environment["NEXTAUTH_URL"]
+
+
+@STACKS
+@pytest.mark.parametrize("profile", PROFILES)
+def test_nextauth_url_is_the_langfuse_public_url_with_a_profile_on(
+    tmp_path: Path, files: tuple[Path, ...], profile: str
+) -> None:
+    services = render(
+        tmp_path, *files, profiles=profile, env_extra=f"LANGFUSE_PUBLIC_URL={PUBLIC_LANGFUSE}\n"
+    ).services
+
+    assert _nextauth_url(services["langfuse-web"]) == PUBLIC_LANGFUSE
+    # The value the entrypoint checks is the one NextAuth is given.
+    assert services[profile]["environment"]["LANGFUSE_PUBLIC_URL"] == PUBLIC_LANGFUSE
+
+
+@STACKS
+@pytest.mark.parametrize("profile", [None, *PROFILES])
+def test_nextauth_url_keeps_the_tunnel_default_when_nothing_is_set(
+    tmp_path: Path, files: tuple[Path, ...], profile: str | None
+) -> None:
+    services = render(tmp_path, *files, profiles=profile).services
+
+    assert _nextauth_url(services["langfuse-web"]) == "http://localhost:3000"
 
 
 TRUSTED_PEER_GATE = "if ($from_trusted_proxy = 0) { return 444; }"
@@ -907,6 +1039,32 @@ def test_the_env_example_block_sits_beside_the_compose_file_line() -> None:
     profiles = lines.index("# COMPOSE_PROFILES=nginx")
 
     assert 0 < profiles - compose_file < 15
+
+
+def _langfuse_public_url_block() -> list[str]:
+    """The comment above the shipped LANGFUSE_PUBLIC_URL line, and that line."""
+    lines = ENV_EXAMPLE.read_text().splitlines()
+    (index,) = [i for i, line in enumerate(lines) if line.startswith("LANGFUSE_PUBLIC_URL=")]
+    start = index
+    while lines[start - 1].startswith("#"):
+        start -= 1
+    return lines[start : index + 1]
+
+
+def test_the_env_example_ships_the_tunnel_default_for_langfuse() -> None:
+    # Right for a tunnel; nginx's entrypoint refuses it, so a profile forces a change.
+    assert _langfuse_public_url_block()[-1] == "LANGFUSE_PUBLIC_URL=http://localhost:3000"
+
+
+def test_the_env_example_says_what_langfuse_public_url_must_be_under_each_profile() -> None:
+    comment = " ".join(line.removeprefix("#").strip() for line in _langfuse_public_url_block()[:-1])
+
+    assert "COMPOSE_PROFILES" in comment
+    assert "https://langfuse.<GATEWAY_DOMAIN> under `nginx`" in comment
+    assert "https://<address>:<NGINX_LANGFUSE_PORT> under `nginx-ports`" in comment
+    assert "cannot both be correct" in comment
+    assert 'compose/README.md, "Reaching the UI"' in comment
+    assert "### Reaching the UI" in (COMPOSE_DIR / "README.md").read_text()
 
 
 # The entrypoint's step-7a defaults.

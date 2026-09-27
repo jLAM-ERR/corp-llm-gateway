@@ -5,9 +5,12 @@
 ``big=1`` query parameter makes the answer 8 MiB instead of ``ok``, and
 ``delay=<seconds>`` holds the answer that long after the request is recorded,
 and ``status=429`` answers the gateway's own capacity refusal instead.
-Prints one ``stub-hit`` line per request that reaches it; a :4000 line carries
-``stub-hit <json>`` with the method, the request target exactly as sent, the
-headers, and the body's length and sha256."""
+:3000 stands in for Langfuse (aliased ``langfuse-web``) and answers the same
+way; a request there with ``Upgrade: websocket`` is answered 101, and the
+stand-in then echoes one line back as ``echo:<line>`` through the tunnel.
+Prints one ``stub-hit`` line per request that reaches it; a :4000 or :3000 line
+carries ``stub-hit <json>`` with the port, the method, the request target
+exactly as sent, the headers, and the body's length and sha256."""
 
 import hashlib
 import http.server
@@ -64,6 +67,7 @@ class Recording(http.server.BaseHTTPRequestHandler):
     def _record(self) -> None:
         body = self._body()
         record = {
+            "port": self.server.server_address[1],
             "method": self.command,
             "target": self.path,
             "headers": [[name.lower(), value] for name, value in self.headers.items()],
@@ -71,6 +75,9 @@ class Recording(http.server.BaseHTTPRequestHandler):
             "body_sha256": hashlib.sha256(body).hexdigest(),
         }
         hit("stub-hit " + json.dumps(record))
+        if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            self._tunnel()
+            return
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if "delay" in query:
             time.sleep(float(query["delay"][0]))
@@ -83,6 +90,14 @@ class Recording(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(answer)
+
+    def _tunnel(self) -> None:
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.end_headers()
+        self.wfile.write(b"echo:" + self.rfile.readline())
+        self.close_connection = True
 
     def _capacity_refusal(self) -> None:
         answer = b'{"error":"E_CAPACITY"}'
@@ -111,8 +126,9 @@ def hold(listener: socket.socket) -> None:
 
 
 threading.Thread(target=hold, args=(socket.create_server(("", 8002)),), daemon=True).start()
-recording = http.server.ThreadingHTTPServer(("", 4000), Recording)
-threading.Thread(target=recording.serve_forever, daemon=True).start()
+for port in (4000, 3000):
+    recording = http.server.ThreadingHTTPServer(("", port), Recording)
+    threading.Thread(target=recording.serve_forever, daemon=True).start()
 server = http.server.ThreadingHTTPServer(("", 8000), Ok)
 print("stub-ready", flush=True)
 server.serve_forever()

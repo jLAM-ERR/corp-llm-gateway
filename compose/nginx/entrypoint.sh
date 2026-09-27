@@ -241,12 +241,13 @@ case $LANGFUSE_PUBLIC_URL in
     https://?*) ;;
     *) fail 69 "LANGFUSE_PUBLIC_URL must be Langfuse's public https:// origin whenever nginx is on, got '$langfuse_origin'" ;;
 esac
+authority=${LANGFUSE_PUBLIC_URL#https://}
+authority=${authority%%[/?#]*}
+# Under either routing: a credential in this value has no legitimate use.
+case $authority in
+    *@*) fail 69 "LANGFUSE_PUBLIC_URL must not carry credentials (userinfo), got '$langfuse_origin'" ;;
+esac
 if [ "$routing" = host ]; then
-    authority=${LANGFUSE_PUBLIC_URL#https://}
-    authority=${authority%%[/?#]*}
-    case $authority in
-        *@*) fail 69 "LANGFUSE_PUBLIC_URL must not carry credentials (userinfo), got '$langfuse_origin'" ;;
-    esac
     langfuse_host=$(lowercase "${authority%%:*}")
     if [ "$langfuse_host" != "langfuse.$GATEWAY_DOMAIN" ]; then
         fail 69 "LANGFUSE_PUBLIC_URL must name langfuse.$GATEWAY_DOMAIN under host routing, got '$langfuse_origin'"

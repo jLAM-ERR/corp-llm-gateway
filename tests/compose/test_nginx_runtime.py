@@ -6,8 +6,9 @@ per-test copy of ``compose/nginx/`` (``nginx_container.py``). So a wrong mount p
 in compose fails here, not just a wrong template: a static test reads host files
 and cannot see what the container renders.
 
-The tracked gateway snippet proxies to ``http://litellm:4000``; here the stub
-upstream answers as ``litellm`` on the per-test network.
+The tracked gateway snippet proxies to ``http://litellm:4000`` and the Langfuse
+snippet to ``http://langfuse-web:3000``; here the stub upstream answers as both
+on the per-test network.
 
 Skips without Docker on a laptop and FAILS on CI (``nginx_support.skip_or_fail``).
 """
@@ -54,8 +55,12 @@ TEST_ONLY_PROXY_SNIPPET = FIXTURES / "test-only-proxy-locations.inc.template"
 STUB_UPSTREAM_SCRIPT = FIXTURES / "stub_upstream.py"
 STUB_IMAGE = "python:3.12-slim"
 STUB_ALIAS = "stub-upstream"
-# What the tracked gateway snippet proxies to: http://litellm:4000.
+# What the tracked snippets proxy to: http://litellm:4000 and
+# http://langfuse-web:3000.
 GATEWAY_ALIAS = "litellm"
+LANGFUSE_ALIAS = "langfuse-web"
+GATEWAY_STAND_IN_PORT = 4000
+LANGFUSE_STAND_IN_PORT = 3000
 
 BOOT_TIMEOUT_SECONDS = 30
 EXIT_TIMEOUT_SECONDS = 60
@@ -113,24 +118,33 @@ class Stub:
         result = docker("logs", self.name)
         return (result.stdout + result.stderr).count("stub-hit")
 
-    def requests(self) -> list[dict[str, Any]]:
-        """What reached the ``litellm`` stand-in (:4000), oldest first."""
+    def _recorded(self, port: int) -> list[dict[str, Any]]:
         result = docker("logs", self.name)
-        return [
+        records = [
             json.loads(line.removeprefix("stub-hit "))
             for line in result.stdout.splitlines()
             if line.startswith("stub-hit {")
         ]
+        return [record for record in records if record["port"] == port]
+
+    def requests(self) -> list[dict[str, Any]]:
+        """What reached the ``litellm`` stand-in (:4000), oldest first."""
+        return self._recorded(GATEWAY_STAND_IN_PORT)
 
     def requests_since(self, seen: int) -> list[dict[str, Any]]:
         return self.requests()[seen:]
+
+    def langfuse_requests(self) -> list[dict[str, Any]]:
+        """What reached the ``langfuse-web`` stand-in (:3000), oldest first."""
+        return self._recorded(LANGFUSE_STAND_IN_PORT)
 
 
 @contextlib.contextmanager
 def launched_stub(network: Network) -> Iterator[Stub]:
     """200 on :8000, refused on :8001, never answers on :8002 — reachable as
-    ``stub-upstream`` from nginx on the same network — and the ``litellm``
-    stand-in on :4000, where the tracked gateway snippet proxies."""
+    ``stub-upstream`` from nginx on the same network — the ``litellm``
+    stand-in on :4000, where the tracked gateway snippet proxies, and the
+    ``langfuse-web`` stand-in on :3000, where the Langfuse snippet proxies."""
     pull_if_missing(STUB_IMAGE)
     stub = Stub(f"corp-nginx-stub-{uuid.uuid4().hex[:8]}")
     launched = docker(
@@ -144,6 +158,8 @@ def launched_stub(network: Network) -> Iterator[Stub]:
         STUB_ALIAS,
         "--network-alias",
         GATEWAY_ALIAS,
+        "--network-alias",
+        LANGFUSE_ALIAS,
         "-v",
         f"{STUB_UPSTREAM_SCRIPT}:/stub/stub_upstream.py:ro",
         STUB_IMAGE,
@@ -371,6 +387,10 @@ REFUSALS = [
     pytest.param(_langfuse(f"https://user@{LANGFUSE_HOST}"), id="langfuse-userinfo"),
     pytest.param(_langfuse(f"https://{LANGFUSE_HOST}.evil.test"), id="langfuse-suffix"),
     pytest.param(_langfuse("http://10.1.2.3:8443", routing="port"), id="langfuse-http-port"),
+    # A credential in this value has no legitimate use under either routing.
+    pytest.param(
+        _langfuse("https://user@10.1.2.3:8443", routing="port"), id="langfuse-userinfo-port"
+    ),
     # Rendered into limit_req_zone / limit_req / limit_conn: a bare positive integer.
     *(
         pytest.param(_limit("NGINX_TOKEN_RATE", value), id=f"token-rate-{name}")
@@ -415,15 +435,16 @@ LEAK_CANARY = "LEAK-CANARY-9c1e"
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("routing", "value"),
     [
-        f"https://u:{LEAK_CANARY}@{LANGFUSE_HOST}",
-        f"http://u:{LEAK_CANARY}@{LANGFUSE_HOST}",
-        f"https://langfuse.other.test/cb?token={LEAK_CANARY}",
-        f"https://u:{LEAK_CANARY}/x@{LANGFUSE_HOST}",
-        f"https://langfuse.other.test/cb?email=alice@{LEAK_CANARY}.example",
-        f"https://langfuse.other.test#x@{LEAK_CANARY}",
-        f"sk-ant-api03-{LEAK_CANARY}",
+        ("host", f"https://u:{LEAK_CANARY}@{LANGFUSE_HOST}"),
+        ("host", f"http://u:{LEAK_CANARY}@{LANGFUSE_HOST}"),
+        ("host", f"https://langfuse.other.test/cb?token={LEAK_CANARY}"),
+        ("host", f"https://u:{LEAK_CANARY}/x@{LANGFUSE_HOST}"),
+        ("host", f"https://langfuse.other.test/cb?email=alice@{LEAK_CANARY}.example"),
+        ("host", f"https://langfuse.other.test#x@{LEAK_CANARY}"),
+        ("host", f"sk-ant-api03-{LEAK_CANARY}"),
+        ("port", f"https://u:{LEAK_CANARY}@10.1.2.3:8443"),
     ],
     ids=[
         "https-userinfo",
@@ -433,13 +454,14 @@ LEAK_CANARY = "LEAK-CANARY-9c1e"
         "at-in-query",
         "at-in-fragment",
         "no-scheme",
+        "port-routing-userinfo",
     ],
 )
 def test_the_langfuse_refusal_does_not_echo_a_credential(
-    specs: dict[str, Spec], project: Path, value: str
+    specs: dict[str, Spec], project: Path, routing: str, value: str
 ) -> None:
     result = run_to_exit(
-        specs["host"], project, {**VALID_BEHIND_PROXY, "LANGFUSE_PUBLIC_URL": value}
+        specs[routing], project, {**VALID_BEHIND_PROXY, "LANGFUSE_PUBLIC_URL": value}
     )
 
     assert result.returncode == 69, result.stderr
@@ -633,7 +655,7 @@ def test_envsubst_substitutes_only_the_listed_names(
 
 
 # --------------------------------------------------------------------------- #
-# routing: the gateway name serves the allow-list, Langfuse still 404s
+# routing: the gateway name serves the allow-list, Langfuse gets its own origin
 # --------------------------------------------------------------------------- #
 
 PATHS = (
@@ -667,19 +689,29 @@ def _gateway_status(method: str, path: str) -> int:
     return 200 if (method, bare) in passing else 403
 
 
+def _langfuse_targets(stub: Stub, seen: int) -> list[tuple[str, str]]:
+    return [(r["method"], r["target"]) for r in stub.langfuse_requests()[seen:]]
+
+
 def test_host_routing_serves_the_allow_list_on_its_gateway_name_and_444s_any_other(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
 ) -> None:
+    seen = len(stub_upstream.langfuse_requests())
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         for path in PATHS:
             for method in ("GET", "POST"):
                 assert nginx.status(8080, path, GATEWAY_HOST, method) == _gateway_status(
                     method, path
                 ), (method, path)
-                assert nginx.status(8080, path, LANGFUSE_HOST, method) == 404, (method, path)
+                # The whole Langfuse origin, every path: it is not an allow-list.
+                assert nginx.status(8080, path, LANGFUSE_HOST, method) == 200, (method, path)
         for host in UNMATCHED_HOSTS:
             for path in ("/", "/v1/messages"):
                 assert nginx.status(8080, path, host, "POST") == 444, (host, path)
+
+    assert _langfuse_targets(stub_upstream, seen) == [
+        (method, path) for path in PATHS for method in ("GET", "POST")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -716,18 +748,26 @@ LIMITS_OUT_OF_THE_WAY = {
 }
 
 
-def test_port_routing_serves_the_allow_list_on_8080_and_404s_8081_whatever_the_host(
+PORT_ROUTING_HOSTS = (GATEWAY_HOST, "other.example.test", "10.1.2.3")
+
+
+def test_port_routing_serves_the_allow_list_on_8080_and_langfuse_on_8081_whatever_the_host(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
 ) -> None:
     env = {**VALID_BEHIND_PROXY, **LIMITS_OUT_OF_THE_WAY}
+    seen = len(stub_upstream.langfuse_requests())
     with started(specs["port"], project, network, env) as nginx:
-        for host in (GATEWAY_HOST, "other.example.test", "10.1.2.3"):
+        for host in PORT_ROUTING_HOSTS:
             for path in PATHS:
                 for method in ("GET", "POST"):
                     assert nginx.status(8080, path, host, method) == _gateway_status(
                         method, path
                     ), (host, method, path)
-                    assert nginx.status(8081, path, host, method) == 404, (host, method, path)
+                    assert nginx.status(8081, path, host, method) == 200, (host, method, path)
+
+    assert _langfuse_targets(stub_upstream, seen) == [
+        (method, path) for _ in PORT_ROUTING_HOSTS for path in PATHS for method in ("GET", "POST")
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -850,7 +890,7 @@ def test_a_failed_upstream_logs_its_status_and_no_secret(
 
 UNTRUSTED_ONLY = "192.0.2.1"
 # (port, path, host) per routing: an admitted (proxied) path, a denied path,
-# and a Host that names neither origin.
+# the Langfuse origin, and a Host that names neither origin.
 PEER_PROBES = {
     "host": [
         (8080, "/stub/ok", GATEWAY_HOST),
@@ -866,7 +906,7 @@ PEER_PROBES = {
         (8081, "/", "other.example.test"),
     ],
 }
-TRUSTED_STATUS = {"/stub/ok": 200, "/v1/models": 404, "/": 404}
+TRUSTED_STATUS = {"/stub/ok": 200, "/v1/models": 404, "/": 200}
 
 # HTTP/1.1 without a Host header: nginx refuses it while reading the headers.
 NO_HOST_REQUEST = (
@@ -996,8 +1036,10 @@ def _raw_status(port: int, request: bytes) -> int:
     return int(received.split(b" ", 2)[1])
 
 
-def _raw_request(method: str, target: str, *headers: str, body: bytes = b"") -> bytes:
-    lines = [f"{method} {target} HTTP/1.1", f"Host: {GATEWAY_HOST}", *headers]
+def _raw_request(
+    method: str, target: str, *headers: str, body: bytes = b"", host: str = GATEWAY_HOST
+) -> bytes:
+    lines = [f"{method} {target} HTTP/1.1", f"Host: {host}", *headers]
     if body:
         lines.append(f"Content-Length: {len(body)}")
     return ("\r\n".join([*lines, "Connection: close"]) + "\r\n\r\n").encode() + body
@@ -1339,10 +1381,12 @@ BIG_RESPONSE_BYTES = 8 * 1024 * 1024
 BIG_TARGET = f"/v1/models?big=1&code={PROXY_CANARY}"
 
 
-def _read_slowly(port: int, target: str, stalled: Callable[[], None]) -> bytes:
+def _read_slowly(
+    port: int, target: str, stalled: Callable[[], None], host: str = GATEWAY_HOST
+) -> bytes:
     """GET ``target`` and run ``stalled`` before reading, so nginx is left holding
     far more response than its memory buffers take."""
-    request = _raw_request("GET", target, *(f"{k}: {v}" for k, v in CREDENTIALS.items()))
+    request = _raw_request("GET", target, *(f"{k}: {v}" for k, v in CREDENTIALS.items()), host=host)
     with socket.socket() as conn:
         # Before connect(), so the SYN already advertises the small window.
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
@@ -1406,6 +1450,136 @@ def test_the_response_temp_file_fault_is_real_on_a_buffering_location(
     assert "[crit]" in stderr
     assert "proxy_temp" in stderr
     assert PROXY_CANARY in stderr
+
+
+# --------------------------------------------------------------------------- #
+# the Langfuse origin, against the langfuse-web stand-in
+# --------------------------------------------------------------------------- #
+
+# (routing, the container port the Langfuse origin listens on)
+LANGFUSE_LISTENERS = [pytest.param("host", 8080, id="host"), pytest.param("port", 8081, id="port")]
+COOKIE_SECRET = "LEAK-COOKIE-3b7d"
+COOKIE = f"next-auth.session-token={COOKIE_SECRET}"
+
+
+def _langfuse_origin_host(routing: str, published: int) -> str:
+    """The Host a browser sends for the Langfuse origin on a published port."""
+    name = LANGFUSE_HOST if routing == "host" else "10.1.2.3"
+    return f"{name}:{published}"
+
+
+@pytest.mark.parametrize(("routing", "listener"), LANGFUSE_LISTENERS)
+def test_langfuse_sees_the_host_with_its_port_on_a_non_default_port(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    stub_upstream: Stub,
+    routing: str,
+    listener: int,
+) -> None:
+    # NextAuth checks the Host against NEXTAUTH_URL; $host would drop the port.
+    seen = len(stub_upstream.langfuse_requests())
+    target = f"/api/auth/session?code={PROXY_CANARY}"
+    with started(specs[routing], project, network, VALID_BEHIND_PROXY) as nginx:
+        published = nginx.ports[listener]
+        host = _langfuse_origin_host(routing, published)
+        status = nginx.status(listener, target, host, headers={**CREDENTIALS, "Cookie": COOKIE})
+        entries = nginx.access_log(expected=1)
+        _assert_no_secret_in(nginx)
+        logs = nginx.logs()
+
+    assert published not in (80, 443)
+    assert status == 200
+    (record,) = stub_upstream.langfuse_requests()[seen:]
+    assert (record["method"], record["target"]) == ("GET", target)
+    headers = _headers(record)
+    assert headers["host"] == [host]
+    assert headers["x-forwarded-proto"] == ["https"]
+    # Langfuse's own credentials (API key, session cookie) arrive untouched.
+    assert headers["authorization"] == [AUTHORIZATION]
+    assert headers["cookie"] == [COOKIE]
+    # No upgrade asked for, none forwarded.
+    assert "upgrade" not in headers
+    assert headers["connection"] == ["close"]
+    assert COOKIE_SECRET not in logs
+    assert [(e["uri"], e["status"], e["server_port"]) for e in entries] == [
+        ("/api/auth/session", "200", str(listener))
+    ]
+
+
+def _upgrade(port: int, request: bytes) -> tuple[bytes, bytes]:
+    """The response head, then what comes back through the tunnel for ``ping``."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+        conn.sendall(request)
+        received = b""
+        while b"\r\n\r\n" not in received and (chunk := conn.recv(65536)):
+            received += chunk
+        head, _, rest = received.partition(b"\r\n\r\n")
+        if head.startswith(b"HTTP/1.1 101 "):
+            conn.sendall(b"ping\n")
+            while b"\n" not in rest and (chunk := conn.recv(65536)):
+                rest += chunk
+    return head, rest
+
+
+@pytest.mark.parametrize(("routing", "listener"), LANGFUSE_LISTENERS)
+def test_a_websocket_upgrade_reaches_langfuse_and_is_tunnelled(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    stub_upstream: Stub,
+    routing: str,
+    listener: int,
+) -> None:
+    handshake = _raw_request(
+        "GET",
+        "/ws",
+        "Upgrade: websocket",
+        "Sec-WebSocket-Version: 13",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        host=LANGFUSE_HOST,
+    ).replace(b"Connection: close", b"Connection: Upgrade")
+    seen = len(stub_upstream.langfuse_requests())
+    with started(specs[routing], project, network, VALID_BEHIND_PROXY) as nginx:
+        head, tunnelled = _upgrade(nginx.ports[listener], handshake)
+
+    assert head.startswith(b"HTTP/1.1 101 "), head
+    assert tunnelled == b"echo:ping\n"
+    (record,) = stub_upstream.langfuse_requests()[seen:]
+    assert (record["method"], record["target"]) == ("GET", "/ws")
+    headers = _headers(record)
+    assert headers["upgrade"] == ["websocket"]
+    assert headers["connection"] == ["upgrade"]
+    assert headers["host"] == [LANGFUSE_HOST]
+
+
+def test_a_temp_file_fault_cannot_write_the_request_line_on_the_langfuse_origin(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    # The gateway's buffered-location controls above prove the fault is real.
+    body = b"x" * TWO_HUNDRED_KB
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        _fault_temp_files(nginx)
+        status = nginx.status(
+            8080, f"/api/public/ingestion?code={PROXY_CANARY}", LANGFUSE_HOST, "POST", content=body
+        )
+        response = _read_slowly(
+            nginx.ports[8080],
+            f"/export?big=1&code={PROXY_CANARY}",
+            lambda: time.sleep(3),
+            host=LANGFUSE_HOST,
+        )
+        nginx.access_log(expected=2)
+        _assert_no_secret_in(nginx)
+        stdout, stderr = nginx.log_streams()
+
+    assert status == 200
+    head, _, received = response.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 200 "), head
+    assert len(received) == BIG_RESPONSE_BYTES
+    for stream in (stdout, stderr):
+        for leaked in ("POST /api/public/ingestion", "GET /export", "client_temp", "proxy_temp"):
+            assert leaked not in stream, leaked
 
 
 # --------------------------------------------------------------------------- #
