@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -184,10 +184,12 @@ def started(
     env: Mapping[str, str | None],
     *,
     trust_client: bool = True,
+    aliases: Sequence[str] = (),
 ) -> Iterator[Running]:
     """nginx as compose would start it. In behind-proxy every peer outside
     NGINX_TRUSTED_PROXIES gets a 444, so this test process's peer address is
-    added to the list unless ``trust_client`` is False."""
+    added to the list unless ``trust_client`` is False. ``aliases`` are extra
+    names for it on ``network``."""
     running = Running(f"corp-nginx-up-{uuid.uuid4().hex[:8]}")
     if trust_client and env.get("NGINX_TLS_MODE") == "behind-proxy":
         listed = env.get("NGINX_TRUSTED_PROXIES") or ""
@@ -200,6 +202,7 @@ def started(
         running.name,
         "--network",
         network.name,
+        *(arg for alias in aliases for arg in ("--network-alias", alias)),
         *publish,
         *run_args(spec, project_dir, env, None),
     ]

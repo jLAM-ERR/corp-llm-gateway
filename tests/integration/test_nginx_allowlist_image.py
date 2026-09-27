@@ -50,8 +50,9 @@ from tests.compose.nginx_container import (
     started,
     user_network,
 )
-from tests.compose.nginx_support import COMPOSE, OAUTH
+from tests.compose.nginx_support import COMPOSE, OAUTH, run_status_cli
 from tests.integration.conftest import ROOT, Stack, running_stack, skip_or_fail
+from tests.integration.route_gate_stub_provider import SSE_DELAY_SECONDS
 
 HERE = Path(__file__).resolve().parent
 DUMP_SCRIPT = HERE / "nginx_route_dump.py"
@@ -367,6 +368,90 @@ def test_count_tokens_is_nginxs_404_and_reaches_nothing(oauth_front_door: FrontD
     assert counted, f"no /v1/messages/count_tokens entry within 10 s: {entries}"
     assert [e["status"] for e in counted] == ["404"]
     assert counted[0]["upstream_status"] in ("", "-")
+
+
+def _stream(url: str, **headers: str) -> tuple[int, list[float], bytes]:
+    """The status, each non-empty chunk's arrival (seconds after sending), and
+    the bytes, for one streamed ``/v1/messages`` call."""
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 64,
+        "stream": True,
+        "messages": [{"role": "user", "content": f"escalate to {CANARY}"}],
+    }
+    arrivals: list[float] = []
+    received = b""
+    with httpx.Client(trust_env=False, timeout=120) as client:
+        sent_at = time.monotonic()
+        with client.stream(
+            "POST",
+            url,
+            content=json.dumps(payload).encode(),
+            headers={
+                "content-type": "application/json",
+                "Authorization": f"Bearer {OAUTH_TOKEN}",
+                "X-Corp-Auth": CORP_TOKEN,
+                **headers,
+            },
+        ) as response:
+            for chunk in response.iter_raw():
+                if chunk.strip():
+                    arrivals.append(time.monotonic() - sent_at)
+                    received += chunk
+    return response.status_code, arrivals, received
+
+
+def test_a_stream_through_nginx_arrives_as_spread_out_as_from_the_gateway(
+    oauth_front_door: FrontDoor,
+) -> None:
+    """The stub provider spaces its events. The gateway holds a little back
+    (a placeholder can straddle two events), so the baseline is the same stream
+    read from the gateway directly: nginx must not bunch it up any further."""
+    stack = oauth_front_door.stack
+    stack.mark()
+
+    direct = _stream(f"{stack.base_url}/v1/messages")
+    through = _stream(
+        f"http://127.0.0.1:{oauth_front_door.nginx.ports[8080]}/v1/messages", Host=GATEWAY_HOST
+    )
+
+    for status, arrivals, received in (direct, through):
+        assert status == 200, received[:400]
+        assert b"message_stop" in received
+        assert len(arrivals) >= 2, arrivals
+    captured = stack.new_captures()
+    assert len(captured) == 2, captured
+    assert all(CANARY not in json.dumps(c["body"]) for c in captured)
+    direct_spread = direct[1][-1] - direct[1][0]
+    through_spread = through[1][-1] - through[1][0]
+    # Several of the stub's gaps survive the gateway, so bunching would show.
+    assert direct_spread >= 2 * SSE_DELAY_SECONDS, direct[1]
+    assert through_spread >= direct_spread - SSE_DELAY_SECONDS / 2, (direct[1], through[1])
+
+
+def test_the_status_cli_is_healthy_through_nginx_and_readiness_stays_inside(
+    oauth_front_door: FrontDoor, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    (home / ".corp-llm-gateway").mkdir(parents=True)
+    (home / ".corp-llm-gateway" / "token").write_text(CORP_TOKEN + "\n")
+    url = f"http://{GATEWAY_HOST}:{oauth_front_door.nginx.ports[8080]}"
+
+    code, report = run_status_cli(url, home, resolve=GATEWAY_HOST)
+    outside = oauth_front_door.request("GET", "/healthz/ready")
+    with httpx.Client(trust_env=False, timeout=60) as client:
+        inside = client.get(f"{oauth_front_door.stack.base_url}/healthz/ready")
+
+    assert (code, report["live"], report["token_present"], report["healthy"]) == (
+        0,
+        True,
+        True,
+        True,
+    )
+    # The gateway serves readiness; nginx does not admit it from outside.
+    assert inside.status_code == 200, inside.text
+    assert outside.status_code == 404
+    assert "E_ROUTE_BLOCKED" not in outside.text
 
 
 def _error_code(response: httpx.Response) -> str:

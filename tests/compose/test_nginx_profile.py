@@ -708,6 +708,43 @@ def test_nextauth_url_keeps_the_tunnel_default_when_nothing_is_set(
     assert _nextauth_url(services["langfuse-web"]) == "http://localhost:3000"
 
 
+# Every key the service reads, set, so an overlay that re-interpolated one would show.
+EVERY_NGINX_KEY = (
+    "NGINX_TLS_MODE=terminate\nGATEWAY_DOMAIN=corp.example\nNGINX_TLS_CERT=gateway.crt\n"
+    "NGINX_TLS_KEY=gateway.key\nNGINX_TRUSTED_PROXIES=10.0.0.0/8\nNGINX_BIND_ADDR=10.1.2.3\n"
+    "NGINX_PORT=9443\nNGINX_LANGFUSE_PORT=9444\nLANGFUSE_PUBLIC_URL=https://langfuse.corp.example\n"
+    "NGINX_TOKEN_RATE=7\nNGINX_TOKEN_BURST=11\nNGINX_TOKEN_CONN=3\nNGINX_ISSUE_RATE=4\n"
+)
+
+
+def _portable_service(tmp_path: Path, files: tuple[Path, ...], profile: str) -> str:
+    """The service as rendered, with its bind-mount sources relative to the project."""
+    rendered = render(tmp_path, *files, profiles=profile, env_extra=EVERY_NGINX_KEY)
+    service = rendered.services[profile]
+    for volume in service["volumes"]:
+        source = Path(volume["source"]).resolve()
+        volume["source"] = source.relative_to(rendered.project_dir).as_posix()
+    return yaml.safe_dump(service, sort_keys=True)
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_no_auth_overlay_touches_the_nginx_service(tmp_path: Path, profile: str) -> None:
+    # Mode A (base) and Mode B (OAuth, with and without issuance) must start the
+    # same front door: the auth modes differ behind nginx, never in it.
+    base, oauth, production = (
+        _portable_service(tmp_path / stack, files, profile)
+        for stack, files in (
+            ("base", (COMPOSE,)),
+            ("oauth", (COMPOSE, OAUTH)),
+            ("production", PRODUCTION_FILES),
+        )
+    )
+
+    assert "corp.example" in base and "9443" in base
+    assert oauth == base
+    assert production == base
+
+
 TRUSTED_PEER_GATE = "if ($from_trusted_proxy = 0) { return 444; }"
 GATE_MARKER = "corp_trusted_peer_gate"
 

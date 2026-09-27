@@ -8,10 +8,12 @@ process environment every name any compose file interpolates
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
@@ -155,3 +157,59 @@ def render(
     if check and result.returncode != 0:
         pytest.fail(f"docker compose config failed (exit {result.returncode}):\n{result.stderr}")
     return Render(project_dir.resolve(), result.returncode, result.stdout, result.stderr)
+
+
+# `corp-llm-gateway status` as a developer runs it, one process per probe, with
+# one name resolved to loopback in place of DNS.
+STATUS_CLI = """
+import socket
+import sys
+
+real_getaddrinfo = socket.getaddrinfo
+
+
+def resolving(host, *args, **kwargs):
+    return real_getaddrinfo("127.0.0.1" if host == sys.argv[1] else host, *args, **kwargs)
+
+
+socket.getaddrinfo = resolving
+from corp_llm_gateway.cli.status import main
+
+sys.exit(main(sys.argv[2:]))
+"""
+
+
+def run_status_cli(
+    gateway_url: str, home: Path, *, resolve: str, ca: Path | None = None
+) -> tuple[int, dict[str, Any]]:
+    """The CLI's exit code and ``--json`` report for the install under ``home``.
+    ``ca`` is trusted through ``SSL_CERT_FILE``; no proxy is used."""
+    install_dir = home / ".corp-llm-gateway"
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "PYTHONPATH": str(ROOT / "src"),
+        "NO_PROXY": "*",
+        "no_proxy": "*",
+    }
+    if ca is not None:
+        env["SSL_CERT_FILE"] = str(ca)
+    argv = [
+        "--gateway-url",
+        gateway_url,
+        "--token-file",
+        str(install_dir / "token"),
+        "--version-file",
+        str(install_dir / "VERSION"),
+        "--json",
+    ]
+    ran = subprocess.run(
+        [sys.executable, "-c", STATUS_CLI, resolve, *argv],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert ran.stdout, ran.stderr
+    return ran.returncode, json.loads(ran.stdout)

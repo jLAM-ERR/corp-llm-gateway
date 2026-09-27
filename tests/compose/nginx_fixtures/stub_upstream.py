@@ -4,7 +4,11 @@
 ``litellm``): it answers 200 to any method and records what arrived; a
 ``big=1`` query parameter makes the answer 8 MiB instead of ``ok``, and
 ``delay=<seconds>`` holds the answer that long after the request is recorded,
-and ``status=429`` answers the gateway's own capacity refusal instead.
+and ``status=429`` answers the gateway's own capacity refusal instead;
+``sse=<n>`` streams n ``text/event-stream`` events 200 ms apart, printing
+``stub-sse-sent <i>`` as each one leaves; ``POST
+/internal/issue-token`` on :4000 answers the gateway's issuance shape
+(``ISSUED_TOKEN``, ``ISSUED_EXPIRES_AT``), the one install.sh parses.
 :3000 stands in for Langfuse (aliased ``langfuse-web``) and answers the same
 way; a request there with ``Upgrade: websocket`` is answered 101, and the
 stand-in then echoes one line back as ``echo:<line>`` through the tunnel.
@@ -22,6 +26,9 @@ import time
 import urllib.parse
 
 BIG_RESPONSE = b"x" * (8 * 1024 * 1024)
+SSE_GAP_SECONDS = 0.2
+ISSUED_TOKEN = "ct_" + "S" * 43
+ISSUED_EXPIRES_AT = "2026-10-27T00:00:00Z"
 _OUTPUT = threading.Lock()
 
 
@@ -84,6 +91,13 @@ class Recording(http.server.BaseHTTPRequestHandler):
         if query.get("status") == ["429"]:
             self._capacity_refusal()
             return
+        if "sse" in query:
+            self._stream(int(query["sse"][0]))
+            return
+        port = self.server.server_address[1]
+        if (port, self.command, self.path) == (4000, "POST", "/internal/issue-token"):
+            self._issued()
+            return
         answer = BIG_RESPONSE if query.get("big") == ["1"] else b"ok"
         self.send_response(200)
         self.send_header("Content-Length", str(len(answer)))
@@ -98,6 +112,29 @@ class Recording(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"echo:" + self.rfile.readline())
         self.close_connection = True
+
+    def _stream(self, events: int) -> None:
+        # No Content-Length: the stream ends when the connection closes, so
+        # nothing here holds an event back; only a buffering proxy can.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        for index in range(events):
+            if index:
+                time.sleep(SSE_GAP_SECONDS)
+            self.wfile.write(f"data: event-{index}\n\n".encode())
+            self.wfile.flush()
+            hit(f"stub-sse-sent {index}")
+        self.close_connection = True
+
+    def _issued(self) -> None:
+        answer = json.dumps({"corp_token": ISSUED_TOKEN, "expires_at": ISSUED_EXPIRES_AT})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(answer)))
+        self.end_headers()
+        self.wfile.write(answer.encode())
 
     def _capacity_refusal(self) -> None:
         answer = b'{"error":"E_CAPACITY"}'

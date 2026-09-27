@@ -18,15 +18,19 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import re
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -49,8 +53,20 @@ from tests.compose.nginx_container import (
     started,
     user_network,
 )
-from tests.compose.nginx_support import COMPOSE, NGINX_DIR, OAUTH, ROOT, skip_or_fail
+from tests.compose.nginx_support import (
+    COMPOSE,
+    NGINX_DIR,
+    OAUTH,
+    ROOT,
+    run_status_cli,
+    skip_or_fail,
+)
 from tests.compose.test_nginx_profile import TLS_CIPHERS, TLS_SESSION
+from tests.deploy.test_install_device_flow import CLIENT_ID as KEYCLOAK_CLIENT_ID
+from tests.deploy.test_install_device_flow import REALM_PATH as KEYCLOAK_REALM_PATH
+from tests.deploy.test_install_device_flow import SCRIPT as INSTALL_SCRIPT
+from tests.deploy.test_install_device_flow import StubState
+from tests.deploy.test_install_device_flow import _make_handler as make_keycloak_handler
 
 FIXTURES = Path(__file__).resolve().parent / "nginx_fixtures"
 TEST_ONLY_PROXY_SNIPPET = FIXTURES / "test-only-proxy-locations.inc.template"
@@ -2341,3 +2357,396 @@ def test_terminate_negotiates_tls_1_2_or_later_with_a_forward_secret_aead_suite(
     assert "HANDSHAKE_FAILURE" in str(refused.value), refused.value
     # Alert 70: nginx speaks neither TLS 1.0 nor 1.1.
     assert "TLSV1_ALERT_PROTOCOL_VERSION" in str(too_old.value), too_old.value
+
+
+# --------------------------------------------------------------------------- #
+# behind-proxy behind the admins' TLS terminator
+# --------------------------------------------------------------------------- #
+
+FRONT_DOOR_ALIAS = "corp-front-door"
+# terminator listen port -> the front door listener it forwards to
+TERMINATOR_ROUTES = {"host": {8443: 8080}, "port": {8443: 8080, 9443: 8081}}
+TERMINATOR_SERVER = """
+    server {{
+        listen {listen} ssl;
+        ssl_certificate /certs/gateway.crt;
+        ssl_certificate_key /certs/gateway.key;
+        location / {{
+            set $front_door http://{front}:{port};
+            proxy_pass $front_door;
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+        }}
+    }}
+"""
+LANGFUSE_CALLBACK = "/api/auth/callback/keycloak?code=kc-callback-code"
+
+
+@dataclass(frozen=True)
+class Terminator:
+    name: str
+    # Its address on the per-test network: the peer the front door sees.
+    address: str
+    ports: dict[int, int]
+
+
+@contextlib.contextmanager
+def tls_terminator(
+    image: str, network: Network, material: Path, tmp_path: Path, routing: str
+) -> Iterator[Terminator]:
+    """A plain nginx that terminates TLS with the helper's certificate and
+    forwards HTTP to the front door by its alias, setting the X-Forwarded-*
+    headers an admins' terminator sets. It resolves the alias per request, so it
+    starts first and its address can go into NGINX_TRUSTED_PROXIES."""
+    servers = "".join(
+        TERMINATOR_SERVER.format(listen=listen, front=FRONT_DOOR_ALIAS, port=port)
+        for listen, port in TERMINATOR_ROUTES[routing].items()
+    )
+    conf = tmp_path / "terminator.conf"
+    conf.write_text(
+        "error_log /dev/stderr notice;\nevents {}\nhttp {\n"
+        "    resolver 127.0.0.11 valid=5s ipv6=off;\n"
+        f"    access_log off;\n{servers}}}\n"
+    )
+    name = f"corp-nginx-term-{uuid.uuid4().hex[:8]}"
+    listens = TERMINATOR_ROUTES[routing]
+    publish = [arg for listen in listens for arg in ("-p", f"127.0.0.1::{listen}")]
+    launched = docker(
+        "run",
+        "-d",
+        "--name",
+        name,
+        "--network",
+        network.name,
+        *publish,
+        "-v",
+        f"{conf}:/etc/nginx/nginx.conf:ro",
+        "-v",
+        f"{material / 'gateway.crt'}:/certs/gateway.crt:ro",
+        "-v",
+        f"{material / 'gateway.key'}:/certs/gateway.key:ro",
+        image,
+    )
+    try:
+        assert launched.returncode == 0, launched.stderr
+        deadline = time.monotonic() + BOOT_TIMEOUT_SECONDS
+        while "start worker process" not in (logs := docker("logs", name)).stderr:
+            state = docker("inspect", "-f", "{{.State.Running}}", name).stdout.strip()
+            assert state == "true", f"the terminator exited:\n{logs.stdout}{logs.stderr}"
+            assert time.monotonic() < deadline, f"the terminator never started:\n{logs.stderr}"
+            time.sleep(0.2)
+        networks = "{{(index .NetworkSettings.Networks " + json.dumps(network.name) + ")"
+        address = docker("inspect", "-f", networks + ".IPAddress}}", name).stdout.strip()
+        assert address, f"no address for the terminator on {network.name}"
+        ports = {
+            listen: int(docker("port", name, f"{listen}/tcp").stdout.split()[0].rsplit(":", 1)[1])
+            for listen in listens
+        }
+        yield Terminator(name, address, ports)
+    finally:
+        docker("rm", "-f", name)
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_behind_proxy_serves_through_a_tls_terminator_and_444s_a_client_going_around_it(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    tls_material: Path,
+    stub_upstream: Stub,
+    tmp_path: Path,
+    routing: str,
+) -> None:
+    """The trusted list names the terminator and nothing else: the test process
+    is served through it and refused when it dials the front door itself."""
+    spec = specs[routing]
+    context = _tls_context(tls_material)
+    gateway_name = GATEWAY_HOST if routing == "host" else TLS_IP_SAN
+    langfuse_name = LANGFUSE_HOST if routing == "host" else TLS_IP_SAN
+    seen = len(stub_upstream.recorded())
+    with tls_terminator(spec.image, network, tls_material, tmp_path, routing) as terminator:
+        assert terminator.address != network.client_peer
+        env = {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": terminator.address}
+        with started(
+            spec, project, network, env, trust_client=False, aliases=(FRONT_DOOR_ALIAS,)
+        ) as nginx:
+            gateway_port = terminator.ports[8443]
+            langfuse_port = terminator.ports[9443 if routing == "port" else 8443]
+            langfuse_authority = f"{langfuse_name}:{langfuse_port}"
+            gateway = _tls_request(
+                gateway_port, gateway_name, context, "/v1/models", f"{gateway_name}:{gateway_port}"
+            )
+            callback = _tls_request(
+                langfuse_port, langfuse_name, context, LANGFUSE_CALLBACK, langfuse_authority
+            )
+            through = stub_upstream.recorded_since(seen)
+            spoofed = {"X-Forwarded-For": terminator.address, "X-Forwarded-Proto": "https"}
+            langfuse_listener = 8081 if routing == "port" else 8080
+            around = [
+                nginx.status(8080, "/v1/models", GATEWAY_HOST),
+                nginx.status(langfuse_listener, LANGFUSE_CALLBACK, LANGFUSE_HOST),
+                nginx.status(8080, "/v1/models", GATEWAY_HOST, headers=spoofed),
+                nginx.status(langfuse_listener, LANGFUSE_CALLBACK, LANGFUSE_HOST, headers=spoofed),
+            ]
+            entries = nginx.access_log(expected=2 + len(around))
+
+    assert (gateway.status, callback.status) == (200, 200)
+    # No redirect, let alone a loop: the stand-in's own answer, reached once.
+    assert callback.body == b"ok"
+    assert "location" not in callback.headers
+    assert [(r["port"], r["method"], r["target"]) for r in through] == [
+        (GATEWAY_STAND_IN_PORT, "GET", "/v1/models"),
+        (LANGFUSE_STAND_IN_PORT, "GET", LANGFUSE_CALLBACK),
+    ]
+    # What NextAuth builds its callback URLs from: https, and the public origin
+    # with its port.
+    langfuse_headers = _headers(through[1])
+    assert langfuse_headers["x-forwarded-proto"] == ["https"]
+    assert langfuse_headers["host"] == [langfuse_authority]
+    assert _headers(through[0])["x-forwarded-proto"] == ["https"]
+    assert around == [444] * len(around)
+    assert stub_upstream.recorded_since(seen) == through
+    assert [
+        (e["status"], e["from_trusted_proxy"], e["realip_remote_addr"], e["remote_addr"])
+        for e in entries
+    ] == [
+        *[("200", "1", terminator.address, network.client_peer)] * 2,
+        *[("444", "0", network.client_peer, network.client_peer)] * len(around),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# streaming: an event stream is never held back
+# --------------------------------------------------------------------------- #
+
+SSE_EVENTS = 10
+SSE_GAP_SECONDS = 0.2  # the stub's gap between events
+SSE_ORIGINS = [
+    pytest.param("POST", f"/v1/messages?sse={SSE_EVENTS}", GATEWAY_HOST, id="gateway"),
+    pytest.param("GET", f"/api/public/stream?sse={SSE_EVENTS}", LANGFUSE_HOST, id="langfuse"),
+]
+
+
+@dataclass(frozen=True)
+class Streamed:
+    status: int
+    content_type: str
+    events: list[str]
+    # Seconds after the request was sent, per event.
+    arrivals: list[float]
+    # How many events the stub had sent when the first one reached the client.
+    sent_at_first: int
+
+
+def _sse_sent(stub: Stub) -> int:
+    return docker("logs", stub.name).stdout.count("stub-sse-sent ")
+
+
+def _stream(port: int, method: str, target: str, host: str, stub: Stub) -> Streamed:
+    before = _sse_sent(stub)
+    events: list[str] = []
+    arrivals: list[float] = []
+    sent_at_first = -1
+    pending = b""
+    with httpx.Client(trust_env=False, timeout=30) as client:
+        sent_at = time.monotonic()
+        with client.stream(
+            method,
+            f"http://127.0.0.1:{port}{target}",
+            headers={"Host": host},
+            content=b"{}" if method == "POST" else None,
+        ) as response:
+            for chunk in response.iter_raw():
+                pending += chunk
+                while b"\n\n" in pending:
+                    event, pending = pending.split(b"\n\n", 1)
+                    arrivals.append(time.monotonic() - sent_at)
+                    events.append(event.decode())
+                    if len(events) == 1:
+                        sent_at_first = _sse_sent(stub) - before
+    return Streamed(
+        response.status_code,
+        response.headers.get("content-type", ""),
+        events,
+        arrivals,
+        sent_at_first,
+    )
+
+
+EXPECTED_EVENTS = [f"data: event-{index}" for index in range(SSE_EVENTS)]
+
+
+@pytest.mark.parametrize(("method", "target", "host"), SSE_ORIGINS)
+def test_an_event_stream_reaches_the_client_as_the_upstream_sends_it(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    stub_upstream: Stub,
+    method: str,
+    target: str,
+    host: str,
+) -> None:
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        streamed = _stream(nginx.ports[8080], method, target, host, stub_upstream)
+
+    assert streamed.status == 200
+    assert streamed.content_type == "text/event-stream"
+    assert streamed.events == EXPECTED_EVENTS
+    # Causal, not timed: the first event was at the client before the stub had
+    # written the last one.
+    assert 1 <= streamed.sent_at_first < SSE_EVENTS, streamed
+    first, last = streamed.arrivals[0], streamed.arrivals[-1]
+    assert first < 0.5 * last, streamed.arrivals
+    assert last - first >= 0.8 * (SSE_EVENTS - 1) * SSE_GAP_SECONDS, streamed.arrivals
+
+
+def test_a_buffering_location_holds_the_same_stream_back(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    # The control: with response buffering on, the same measurement sees every
+    # event land at once after the stub has sent them all.
+    snippet = project / "nginx" / "templates" / "snippets" / "gateway-locations.inc.template"
+    text = snippet.read_text()
+    assert text.count("proxy_buffering off;\n") == 1
+    snippet.write_text(text.replace("proxy_buffering off;\n", "proxy_buffering on;\n"))
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        method, target, host = SSE_ORIGINS[0].values
+        streamed = _stream(nginx.ports[8080], method, target, host, stub_upstream)
+
+    assert streamed.events == EXPECTED_EVENTS
+    assert streamed.sent_at_first == SSE_EVENTS
+    assert streamed.arrivals[-1] - streamed.arrivals[0] < SSE_GAP_SECONDS, streamed.arrivals
+
+
+# --------------------------------------------------------------------------- #
+# the laptop path: scripts/install.sh and `corp-llm-gateway status`
+# --------------------------------------------------------------------------- #
+
+# The gateway stand-in's issuance answer (nginx_fixtures/stub_upstream.py).
+ISSUED_TOKEN = "ct_" + "S" * 43
+ISSUED_EXPIRES_AT = "2026-10-27T00:00:00Z"
+INSTALL_COMMANDS = ("bash", "curl", "jq")
+
+
+@contextlib.contextmanager
+def stub_keycloak() -> Iterator[StubState]:
+    """The RFC 8628 stub tests/deploy/test_install_device_flow.py runs install.sh
+    against, on loopback (plain http is allowed there)."""
+    state = StubState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_keycloak_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    state.base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _install(
+    home: Path, gateway_url: str, keycloak: StubState, ca: Path | None, resolve: str | None
+) -> subprocess.CompletedProcess[str]:
+    """install.sh as a developer runs it: the CA through curl's own
+    CURL_CA_BUNDLE, and the gateway name through ~/.curlrc in place of DNS."""
+    home.mkdir()
+    if resolve is not None:
+        (home / ".curlrc").write_text(f'resolve = "{resolve}"\n')
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "SHELL": "/bin/bash",
+        "NO_PROXY": "127.0.0.1",
+        "no_proxy": "127.0.0.1",
+        "CORP_GATEWAY_URL": gateway_url,
+        "KEYCLOAK_ISSUER": keycloak.base_url + KEYCLOAK_REALM_PATH,
+        "KEYCLOAK_CLIENT_ID": KEYCLOAK_CLIENT_ID,
+    }
+    if ca is not None:
+        env["CURL_CA_BUNDLE"] = str(ca)
+    return subprocess.run(
+        ["bash", str(INSTALL_SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_the_laptop_path_installs_and_reports_healthy_through_the_front_door(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    tls_material: Path,
+    stub_upstream: Stub,
+    tmp_path: Path,
+    routing: str,
+) -> None:
+    """terminate, the helper's CA: install.sh's device flow ends in an issuance
+    call through nginx, and the status CLI's /healthz/live probe goes the same
+    way. Host routing dials the gateway name, port routing the IP SAN."""
+    missing = [command for command in INSTALL_COMMANDS if shutil.which(command) is None]
+    if missing:
+        skip_or_fail(f"install.sh needs {', '.join(missing)} on PATH")
+    install_certs(project, tls_material)
+    ca = tls_material / "selfsigned-ca.crt"
+    name = GATEWAY_HOST if routing == "host" else TLS_IP_SAN
+    seen = len(stub_upstream.requests())
+    with stub_keycloak() as keycloak, started(specs[routing], project, network, TERMINATE) as nginx:
+        port = nginx.ports[8080]
+        url = f"https://{name}:{port}"
+        resolve = f"{GATEWAY_HOST}:{port}:127.0.0.1" if routing == "host" else None
+        untrusted = _install(tmp_path / "untrusted", url, keycloak, None, resolve)
+        installed = _install(tmp_path / "home", url, keycloak, ca, resolve)
+        code, report = run_status_cli(url, tmp_path / "home", resolve=GATEWAY_HOST, ca=ca)
+        unverified_code, unverified = run_status_cli(url, tmp_path / "home", resolve=GATEWAY_HOST)
+        ready = _tls_request(port, name, _tls_context(tls_material), "/healthz/ready")
+        entries = nginx.access_log(expected=3)
+        stdout, stderr = nginx.log_streams()
+
+    # Without the CA the installer does not talk to the gateway at all.
+    assert untrusted.returncode != 0
+    assert "cannot reach the gateway" in untrusted.stderr, untrusted.stderr
+    assert not (tmp_path / "untrusted" / ".corp-llm-gateway" / "token").exists()
+
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    token_file = tmp_path / "home" / ".corp-llm-gateway" / "token"
+    assert token_file.read_text().strip() == ISSUED_TOKEN
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    assert f"expires_at: {ISSUED_EXPIRES_AT}" in installed.stdout + installed.stderr
+
+    records = stub_upstream.requests_since(seen)
+    assert [(r["method"], r["target"]) for r in records] == [
+        ("POST", "/internal/issue-token"),
+        ("GET", "/healthz/live"),
+    ]
+    issuance = _headers(records[0])
+    assert issuance["authorization"] == [f"Bearer {keycloak.access_token}"]
+    assert issuance["host"] == [name]
+    assert records[0]["body_length"] == 0
+
+    assert (code, report["live"], report["token_present"], report["healthy"]) == (
+        0,
+        True,
+        True,
+        True,
+    )
+    # The probe verifies: without the CA the same front door is not live.
+    assert (unverified_code, unverified["live"], unverified["healthy"]) == (1, False, False)
+
+    # nginx's own 404: the stand-in answers 200 to anything it is sent.
+    assert ready.status == 404
+    assert [(e["uri"], e["status"]) for e in entries] == [
+        ("/internal/issue-token", "200"),
+        ("/healthz/live", "200"),
+        ("/healthz/ready", "404"),
+    ]
+    for secret in (keycloak.access_token, ISSUED_TOKEN):
+        assert secret not in stdout
+        assert secret not in stderr
