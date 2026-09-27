@@ -5,6 +5,11 @@
 # nginx starts before they exist and follows a restarted container's new IP.
 resolver 127.0.0.11 valid=30s ipv6=off;
 
+# Off until a scrubbed format exists. With no access_log at all, nginx logs its
+# compiled-in `combined` (request line, query string, Basic-auth user) to the
+# image's /var/log/nginx/access.log, a symlink to stdout.
+access_log off;
+
 # Loopback only and never published: the compose healthcheck probes this, so
 # health does not depend on an upstream being up.
 server {

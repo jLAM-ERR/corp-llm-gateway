@@ -158,7 +158,7 @@ is_unspecified_address() {
                 *[!0:]*) return 1 ;;
             esac
             case $tail in
-                *[!0.]*) return 1 ;;
+                *[!0:.]*) return 1 ;;
             esac
             return 0
             ;;
@@ -188,20 +188,33 @@ else
 fi
 
 # ---- 7. Langfuse public origin ------------------------------------------------
+# Scheme and host only, for messages: userinfo, path and query can hold secrets.
+url_origin() {
+    scheme=
+    case $1 in
+        https://*) scheme=https:// ;;
+        http://*) scheme=http:// ;;
+    esac
+    rest=${1#*://}
+    rest=${rest##*@}
+    printf '%s%s' "$scheme" "${rest%%[/?#]*}"
+}
+
 LANGFUSE_PUBLIC_URL=${LANGFUSE_PUBLIC_URL:-}
+langfuse_origin=$(url_origin "$LANGFUSE_PUBLIC_URL")
 case $LANGFUSE_PUBLIC_URL in
     https://?*) ;;
-    *) fail 69 "LANGFUSE_PUBLIC_URL must be Langfuse's public https:// origin whenever nginx is on, got '$LANGFUSE_PUBLIC_URL'" ;;
+    *) fail 69 "LANGFUSE_PUBLIC_URL must be Langfuse's public https:// origin whenever nginx is on, got '$langfuse_origin'" ;;
 esac
 if [ "$routing" = host ]; then
     authority=${LANGFUSE_PUBLIC_URL#https://}
     authority=${authority%%[/?#]*}
     case $authority in
-        *@*) fail 69 "LANGFUSE_PUBLIC_URL must not carry credentials, got '$LANGFUSE_PUBLIC_URL'" ;;
+        *@*) fail 69 "LANGFUSE_PUBLIC_URL must not carry credentials, got '$langfuse_origin' with userinfo (not shown)" ;;
     esac
     langfuse_host=$(lowercase "${authority%%:*}")
     if [ "$langfuse_host" != "langfuse.$GATEWAY_DOMAIN" ]; then
-        fail 69 "LANGFUSE_PUBLIC_URL must name langfuse.$GATEWAY_DOMAIN under host routing, got '$LANGFUSE_PUBLIC_URL'"
+        fail 69 "LANGFUSE_PUBLIC_URL must name langfuse.$GATEWAY_DOMAIN under host routing, got '$langfuse_origin'"
     fi
 fi
 

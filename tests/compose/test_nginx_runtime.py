@@ -359,6 +359,11 @@ REFUSALS = [
             "0:0:0:0:0:0:0:0",
             "::ffff:0.0.0.0",
             "[::FFFF:0.0.0.0]",
+            "::ffff:0:0",
+            "[::ffff:0:0]",
+            "0:0:0:0:0:ffff:0:0",
+            "::ffff:0000:0000",
+            "[::FFFF:0:0]",
             "",
         )
     ),
@@ -395,6 +400,31 @@ def test_the_entrypoint_refuses(specs: dict[str, Spec], project: Path, refusal: 
 
     assert result.returncode == refusal.code, result.stderr
     _assert_one_line_naming(result, refusal.names)
+
+
+LEAK_CANARY = "LEAK-CANARY-9c1e"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        f"https://u:{LEAK_CANARY}@{LANGFUSE_HOST}",
+        f"http://u:{LEAK_CANARY}@{LANGFUSE_HOST}",
+        f"https://langfuse.other.test/cb?token={LEAK_CANARY}",
+        f"https://u:{LEAK_CANARY}/x@{LANGFUSE_HOST}",
+    ],
+    ids=["https-userinfo", "http-userinfo", "query-string", "slash-in-userinfo"],
+)
+def test_the_langfuse_refusal_does_not_echo_a_credential(
+    specs: dict[str, Spec], project: Path, value: str
+) -> None:
+    result = run_to_exit(
+        specs["host"], project, {**VALID_BEHIND_PROXY, "LANGFUSE_PUBLIC_URL": value}
+    )
+
+    assert result.returncode == 69, result.stderr
+    _assert_one_line_naming(result, ("LANGFUSE_PUBLIC_URL",))
+    assert LEAK_CANARY not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("routing", ["hosts", "", "both"])
@@ -438,6 +468,7 @@ def test_a_missing_template_is_refused(specs: dict[str, Spec], project: Path, ro
 STARTS = [
     pytest.param("host", {"NGINX_BIND_ADDR": "10.1.2.3"}, id="bind-v4-nic"),
     pytest.param("host", {"NGINX_BIND_ADDR": "[fd00::1]"}, id="bind-v6-nic"),
+    pytest.param("host", {"NGINX_BIND_ADDR": "[::ffff:1:0]"}, id="bind-v4-mapped-nonzero"),
     pytest.param(
         "host", {"NGINX_TRUSTED_PROXIES": "10.0.0.0/8 192.168.0.0/16"}, id="trusted-two-cidrs"
     ),
@@ -527,6 +558,10 @@ def test_a_valid_behind_proxy_config_renders_only_the_design(
         # The stock default.conf server: its docroot and its server_name.
         assert "/usr/share/nginx/html" not in dump.stdout
         assert not re.search(r"server_name\s+localhost", dump.stdout)
+        # Without one, nginx's compiled-in `combined` log goes to the image's
+        # /var/log/nginx/access.log -> /dev/stdout, request line and all.
+        directives = re.sub(r"#[^\n]*", "", dump.stdout)
+        assert re.findall(r"^\s*access_log\s+([^;]+);", directives, re.MULTILINE) == ["off"]
 
 
 def test_envsubst_substitutes_only_the_listed_names(
@@ -575,6 +610,23 @@ def test_host_routing_answers_404_for_its_names_and_444_for_any_other(
         for host in UNMATCHED_HOSTS:
             for path in ("/", "/v1/messages"):
                 assert nginx.status(8080, path, host, "POST") == 444, (host, path)
+
+
+def test_a_denied_request_writes_nothing_of_itself_to_the_container_log(
+    specs: dict[str, Spec], project: Path, network: str
+) -> None:
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        url = f"http://127.0.0.1:{nginx.ports[8080]}/v1/messages?code={LEAK_CANARY}"
+        with httpx.Client(trust_env=False, timeout=10) as client:
+            response = client.get(
+                url, headers={"Host": GATEWAY_HOST}, auth=("leak-user", LEAK_CANARY)
+            )
+        assert response.status_code == 404
+        logs = nginx.logs()
+
+    assert LEAK_CANARY not in logs
+    assert "leak-user" not in logs
+    assert "/v1/messages" not in logs
 
 
 def test_port_routing_answers_404_on_both_ports_whatever_the_host(

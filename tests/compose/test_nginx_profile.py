@@ -9,6 +9,7 @@ YAML layer. What the container renders is asserted in ``test_nginx_runtime.py``.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from tests.compose.nginx_support import (
     NGINX_DIR,
     OAUTH,
     PROFILES,
+    ROOT,
     ROUTING,
     render,
     require_compose_cli,
@@ -122,7 +124,7 @@ def test_nginx_publishes_on_loopback_unless_told_otherwise(tmp_path: Path, profi
     else:
         assert published == [(443, 8080), (8443, 8081)]
     for name, port in _all_ports(services):
-        assert port.get("host_ip") not in (None, "", "0.0.0.0", "::"), (name, port)
+        assert port.get("host_ip") == "127.0.0.1", (name, port)
 
 
 @pytest.mark.parametrize("profile", PROFILES)
@@ -139,6 +141,15 @@ def test_nginx_publishes_where_the_env_says(tmp_path: Path, profile: str) -> Non
     # The bind address moves nginx only, never the gateway's own port.
     litellm_ports = services["litellm"]["ports"]
     assert [p["host_ip"] for p in litellm_ports] == ["127.0.0.1"]
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_a_bracketed_ipv6_bind_address_renders(tmp_path: Path, profile: str) -> None:
+    ports = render(tmp_path, profiles=profile, env_extra="NGINX_BIND_ADDR=[fd00::1]\n").services[
+        profile
+    ]["ports"]
+
+    assert {p["host_ip"] for p in ports} == {"fd00::1"}
 
 
 @pytest.mark.parametrize("profile", PROFILES)
@@ -291,9 +302,17 @@ def test_the_rendering_design_layout_is_in_place() -> None:
 
 
 def test_every_listener_server_block_is_one_include_of_a_snippet() -> None:
-    for template in (NGINX_DIR / "templates" / "listeners").glob("*.template"):
+    templates = sorted((NGINX_DIR / "templates" / "listeners").glob("*.template"))
+    assert templates
+    for template in templates:
         body = re.sub(r"#[^\n]*", "", template.read_text())
-        for block in re.findall(r"server\s*\{([^{}]*)\}", body):
+        # An envsubst placeholder's braces are not nginx blocks.
+        body = re.sub(r"\$\{([A-Z_]+)\}", r"\1", body)
+        blocks = re.findall(r"server\s*\{([^{}]*)\}", body)
+        # A nested brace hides its server block from the pattern above.
+        assert blocks, template.name
+        assert len(re.findall(r"server\s*\{", body)) == len(blocks), template.name
+        for block in blocks:
             directives = [d.strip() for d in block.split(";") if d.strip()]
             payload = [
                 d for d in directives if not d.startswith(("listen ", "server_name ", "ssl_"))
@@ -303,6 +322,29 @@ def test_every_listener_server_block_is_one_include_of_a_snippet() -> None:
                 ["include /etc/nginx/rendered/snippets/gateway-locations.inc"],
                 ["include /etc/nginx/rendered/snippets/langfuse-locations.inc"],
             ), (template.name, directives)
+
+
+def _git_ignores(path: str) -> bool:
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--no-index", path],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode in (0, 1), result.stderr
+    return result.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "name", ["privkey", "server.cer", "gateway.pem", "gateway.crt", "gateway.key", "a.p12", "a.pfx"]
+)
+def test_every_file_under_the_nginx_certs_dir_is_ignored(name: str) -> None:
+    assert _git_ignores(f"compose/nginx/certs/{name}")
+
+
+def test_the_nginx_certs_readme_is_not_ignored() -> None:
+    assert not _git_ignores("compose/nginx/certs/README.md")
 
 
 # --------------------------------------------------------------------------- #
