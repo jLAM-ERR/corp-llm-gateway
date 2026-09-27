@@ -772,3 +772,40 @@ def test_config_check_refuses_an_issuance_bound_past_its_ceiling(
 
     assert rc == 1
     assert "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("env", "cap"),
+    [("production", "0"), ("prod", "0"), ("", "-5"), ("production", "10001")],
+    ids=["zero-in-production", "zero-in-prod", "negative", "past-the-ceiling"],
+)
+def test_config_check_refuses_the_capacity_the_boot_refuses(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    env: str,
+    cap: str,
+) -> None:
+    # The same resolver as the entrypoint's boot step: settings.capacity().
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_ENV", env)
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", cap)
+    config.reset_cache()
+
+    rc = main(["config", "check", "--no-probe", "--json"])
+
+    assert rc == 1
+    problems = json.loads(capsys.readouterr().out)["problems"]
+    assert any(problem.startswith("CORP_LLM_MAX_INFLIGHT") for problem in problems)
+
+
+def test_config_check_accepts_a_zero_cap_outside_prod(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "0")
+    config.reset_cache()
+
+    assert main(["config", "check", "--no-probe"]) == 0

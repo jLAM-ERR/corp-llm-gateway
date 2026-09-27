@@ -2,8 +2,10 @@
 
 Pure ASGI, not ``BaseHTTPMiddleware``: it must see ``lifespan`` and ``websocket``
 scopes (Starlette's HTTP middleware never does) and it must never buffer a
-response, or SSE streaming would stall behind it. Forwarding is therefore a bare
-``await self.app(scope, receive, send)`` — no wrapping of ``send``.
+response, or SSE streaming would stall behind it. PASSTHROUGH forwarding is a
+bare ``await self.app(scope, receive, send)``; an armed REWRITTEN request goes
+through the in-flight limiter (``inflight.py``), whose ``send`` wrapper observes
+each message and forwards it unbuffered.
 
 Fail-closed: a REFUSE, an unarmed REWRITTEN route and any classifier exception
 all end here, never at litellm. The request body is never read on a refusal and
@@ -32,6 +34,12 @@ from corp_llm_gateway.route_gate.classify import (
     ROUTE_GATE_WEBSOCKET,
     classify,
 )
+from corp_llm_gateway.route_gate.inflight import (
+    E_CAPACITY,
+    OVERSIZE_BLOCKED,
+    ROUTE_GATE_CAPACITY,
+    InflightLimiter,
+)
 from corp_llm_gateway.route_gate.table import HTTP_METHODS, Entry, Verdict
 
 logger = logging.getLogger(__name__)
@@ -54,6 +62,8 @@ _STATUS: dict[str, int] = {
     ROUTE_GATE_MALFORMED: 403,
     ROUTE_GATE_UNARMED: 503,
     ROUTE_GATE_ERROR: 500,
+    ROUTE_GATE_CAPACITY: 429,
+    OVERSIZE_BLOCKED: 422,
 }
 
 _ERROR_CODE: dict[str, str] = {
@@ -63,6 +73,8 @@ _ERROR_CODE: dict[str, str] = {
     ROUTE_GATE_MALFORMED: _BLOCKED,
     ROUTE_GATE_UNARMED: "E_ROUTE_GATE_UNARMED",
     ROUTE_GATE_ERROR: "E_ROUTE_GATE_ERROR",
+    ROUTE_GATE_CAPACITY: E_CAPACITY,
+    OVERSIZE_BLOCKED: "E_OVERSIZE_BLOCKED",
 }
 
 _ERROR_TYPE: dict[str, str] = {
@@ -72,10 +84,20 @@ _ERROR_TYPE: dict[str, str] = {
     ROUTE_GATE_MALFORMED: "route_blocked",
     ROUTE_GATE_UNARMED: "route_gate_unarmed",
     ROUTE_GATE_ERROR: "route_gate_error",
+    ROUTE_GATE_CAPACITY: "capacity",
+    OVERSIZE_BLOCKED: "oversize",
 }
 
-# Refusals that mean the gateway itself is wrong, not the caller.
-_FAILURES = frozenset({ROUTE_GATE_UNARMED, ROUTE_GATE_ERROR})
+# gateway_failure{component} per refusal that records one: the gate itself is
+# wrong, or (oversize) the same component the hook records for that block.
+_FAILURE_COMPONENT: dict[str, str] = {
+    ROUTE_GATE_UNARMED: COMPONENT,
+    ROUTE_GATE_ERROR: COMPONENT,
+    OVERSIZE_BLOCKED: "oversize",
+}
+_CAPACITY_WHY = "the gateway's in-flight cap is reached; retry later"
+_OVERSIZE_WHY = "the request body is over the gateway's body cap"
+_WHY: dict[str, str] = {ROUTE_GATE_CAPACITY: _CAPACITY_WHY, OVERSIZE_BLOCKED: _OVERSIZE_WHY}
 
 _UNARMED_WHY = (
     "the guardrail callback is not registered, so a rewritten route cannot be proven sanitized"
@@ -93,11 +115,13 @@ class RouteGateMiddleware:
         metrics: MetricsExporter,
         audit_logger: AuditLogger,
         extras: Mapping[tuple[str, str], Entry] | None = None,
+        limiter: InflightLimiter | None = None,
     ) -> None:
         self.app = app
         self._metrics = metrics
         self._audit = audit_logger
         self._extras = dict(extras) if extras else {}
+        self.limiter = limiter
         self.armed = False
 
     def arm(self) -> None:
@@ -138,12 +162,35 @@ class RouteGateMiddleware:
         if decision.verdict is Verdict.REWRITTEN and not self.armed:
             await self._refuse(scope, receive, send, method, path, ROUTE_GATE_UNARMED, _UNARMED_WHY)
             return
+        if decision.verdict is Verdict.REWRITTEN and self.limiter is not None:
+            await self._admit(self.limiter, scope, receive, send, method, path)
+            return
         if decision.verdict is Verdict.PASSTHROUGH or decision.verdict is Verdict.REWRITTEN:
             await self.app(scope, receive, send)
             return
         # A verdict this middleware does not know is a gate defect, not a pass.
         logger.error("route_gate_unknown_verdict method=%s", _safe_method(method))
         await self._refuse(scope, receive, send, method, path, ROUTE_GATE_ERROR, _ERROR_WHY)
+
+    async def _admit(
+        self,
+        limiter: InflightLimiter,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        method: str,
+        path: str,
+    ) -> None:
+        if not limiter.try_acquire():
+            await self._refuse(
+                scope, receive, send, method, path, ROUTE_GATE_CAPACITY, _CAPACITY_WHY
+            )
+            return
+
+        async def refuse(reason: str) -> None:
+            await self._refuse(scope, receive, send, method, path, reason, _WHY[reason])
+
+        await limiter.run(scope, receive, send, self.app, refuse=refuse)
 
     async def _refuse(
         self,
@@ -156,8 +203,9 @@ class RouteGateMiddleware:
         why: str,
     ) -> None:
         self._metrics.record_block(reason)
-        if reason in _FAILURES:
-            self._metrics.record_failure(COMPONENT)
+        component = _FAILURE_COMPONENT.get(reason)
+        if component is not None:
+            self._metrics.record_failure(component)
         scope_type = str(scope["type"])
         # No path, no header and no request byte: gateway stdout is an audited
         # surface (M1-14) and a path can carry caller content. The method is

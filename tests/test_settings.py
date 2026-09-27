@@ -1135,3 +1135,100 @@ def test_runtime_problems_accept_a_loadable_ca_bundle(serving: pytest.MonkeyPatc
     serving.setenv("CORP_LLM_CA_BUNDLE", certifi.where())
 
     assert settings.issuance_runtime_problems() == []
+
+
+# ── in-flight cap (route_gate/inflight.py) ───────────────────────────────────
+
+
+def test_capacity_keys_are_registered() -> None:
+    keys = set(settings.all_keys())
+    assert {"CORP_LLM_MAX_INFLIGHT", "CORP_LLM_CANCEL_GRACE_SECONDS"} <= keys
+
+
+def test_capacity_defaults(hermetic: Path) -> None:
+    capacity = settings.capacity()
+
+    assert capacity.max_inflight == 64
+    assert capacity.cancel_grace_seconds == 5.0
+
+
+def test_capacity_resolves_through_the_config_file(hermetic: Path) -> None:
+    _write(hermetic, 'CORP_LLM_MAX_INFLIGHT = "12"\nCORP_LLM_CANCEL_GRACE_SECONDS = "0.5"\n')
+
+    capacity = settings.capacity()
+
+    assert (capacity.max_inflight, capacity.cancel_grace_seconds) == (12, 0.5)
+
+
+@pytest.mark.parametrize("value", ["0", "1", "10000", " 64 "])
+def test_capacity_accepts_a_cap_in_range_outside_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", value)
+
+    assert settings.capacity().max_inflight == int(value)
+
+
+@pytest.mark.parametrize("env", ["prod", "production", "PROD", " Production "])
+def test_capacity_refuses_zero_in_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    monkeypatch.setenv("CORP_ENV", env)
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "0")
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_MAX_INFLIGHT" in str(exc.value)
+    assert "prod" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["-1", "10001", "1.5", "sixty-four", "0x10", "1e3"])
+@pytest.mark.parametrize("env", ["", "prod"])
+def test_capacity_refuses_a_bad_cap_everywhere(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str, env: str
+) -> None:
+    monkeypatch.setenv("CORP_ENV", env)
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_MAX_INFLIGHT" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "60.5", "nan", "inf", "soon"])
+def test_capacity_refuses_a_bad_cancel_grace(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_CANCEL_GRACE_SECONDS", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_CANCEL_GRACE_SECONDS" in str(exc.value)
+
+
+def test_validate_reports_the_capacity_problems(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_ENV", "production")
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "0")
+    monkeypatch.setenv("CORP_LLM_CANCEL_GRACE_SECONDS", "-2")
+
+    with pytest.raises(ConfigError) as exc:
+        settings.validate()
+
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_LLM_MAX_INFLIGHT" in joined
+    assert "CORP_LLM_CANCEL_GRACE_SECONDS" in joined
+
+
+def test_validate_passes_the_default_capacity(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_ENV", "production")
+
+    settings.validate()

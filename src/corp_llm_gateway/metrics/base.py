@@ -11,6 +11,8 @@ without updating them together:
     (helm/corp-llm-gateway/templates/siem-alerts.yaml)
   * ``gateway_failure{component}`` (docs/ops/runbook.md)
   * ``corp_llm_gateway_request_latency_seconds`` (histogram)
+  * ``gateway_inflight_requests`` (gauge) and ``gateway_cancelled_requests_total``
+    (counter) — the route gate's in-flight cap (docs/ops/capacity.md)
 
 ``BLOCK_REASONS`` and ``FAILURE_COMPONENTS`` below enumerate the label values
 those first two series can carry.
@@ -48,6 +50,8 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
         "route_gate_unarmed",
         "route_gate_error",
     ),
+    # The route gate's in-flight cap, after the verdict (route_gate/inflight.py).
+    "capacity": ("capacity",),
 }
 
 # Every ``gateway_failure{component}`` label value. The hook maps an error code
@@ -94,6 +98,16 @@ class MetricsExporter(ABC):
     @abstractmethod
     def observe_request_latency(self, seconds: float, *, status: str) -> None:
         """Observe one end-to-end request latency, labelled ok|failed."""
+
+    # Not abstract: an exporter written before the in-flight cap existed still
+    # instantiates, it just does not export these two series.
+    def set_inflight(self, count: int) -> None:
+        """Set the number of requests holding an in-flight slot right now."""
+        return None
+
+    def record_cancelled(self) -> None:
+        """Count one admitted request the gateway cancelled because its client left."""
+        return None
 
     def render(self) -> bytes:
         """Prometheus exposition for a ``/metrics`` route. Non-scraping exporters return empty."""

@@ -343,6 +343,19 @@ KEYS: tuple[Key, ...] = (
         "comma- or newline-separated (e.g. 'GET /internal/ops-status'); "
         "PASSTHROUGH only — it can never admit a route as rewritten",
     ),
+    # ── In-flight cap (route_gate/inflight.py) ───────────────────────────────
+    Key(
+        "CORP_LLM_MAX_INFLIGHT",
+        default="64",
+        help="concurrent rewritten (LLM) requests per pod, 0-10000; the next one gets 429 "
+        "E_CAPACITY; 0 turns the cap off and is refused when CORP_ENV is prod/production",
+    ),
+    Key(
+        "CORP_LLM_CANCEL_GRACE_SECONDS",
+        default="5",
+        help="seconds a request cancelled by a client disconnect gets to unwind, then its "
+        "leftover tasks get the same again (0 < value <= 60)",
+    ),
     # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────
     Key("CORP_LLM_TESTDATA_ALLOWLIST", default="", help="inline never-redact test values"),
     Key("CORP_LLM_TESTDATA_ALLOWLIST_FILE", default="", help="never-redact test values file"),
@@ -857,6 +870,68 @@ def issuance_runtime_problems() -> list[str]:
     return problems
 
 
+MAX_INFLIGHT_CEILING = 10_000
+CANCEL_GRACE_CEILING_S = 60.0
+
+
+@dataclass(frozen=True)
+class CapacitySettings:
+    """The route gate's in-flight cap. Built by :func:`capacity`."""
+
+    max_inflight: int
+    cancel_grace_seconds: float
+
+
+def _prod(values: Mapping[str, str | None]) -> bool:
+    return _stripped(values, "CORP_ENV").lower() in ("prod", "production")
+
+
+def _build_capacity(
+    values: Mapping[str, str | None], problems: list[str]
+) -> CapacitySettings | None:
+    start = len(problems)
+    name = "CORP_LLM_MAX_INFLIGHT"
+    raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+    max_inflight = 0
+    if not raw.isdigit() and not (raw.startswith("-") and raw[1:].isdigit()):
+        problems.append(f"{name}={raw!r} is not an integer")
+    else:
+        max_inflight = int(raw)
+        if not 0 <= max_inflight <= MAX_INFLIGHT_CEILING:
+            problems.append(f"{name}: must be an integer from 0 to {MAX_INFLIGHT_CEILING}")
+        elif max_inflight == 0 and _prod(values):
+            problems.append(
+                f"{name}=0 turns the in-flight cap off; refused when CORP_ENV is "
+                "prod/production — set a positive cap per pod and scale replicas"
+            )
+    name = "CORP_LLM_CANCEL_GRACE_SECONDS"
+    raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+    grace = 0.0
+    try:
+        grace = float(raw)
+    except ValueError:
+        problems.append(f"{name}={raw!r} is not a number")
+    else:
+        if not 0 < grace <= CANCEL_GRACE_CEILING_S:
+            problems.append(f"{name}: must be a number above 0 and at most 60")
+    if len(problems) > start:
+        return None
+    return CapacitySettings(max_inflight=max_inflight, cancel_grace_seconds=grace)
+
+
+def _check_capacity(values: Mapping[str, str | None], problems: list[str]) -> None:
+    _build_capacity(values, problems)
+
+
+def capacity() -> CapacitySettings:
+    """The in-flight cap; the one resolver ``config check`` and the entrypoint share."""
+    problems: list[str] = []
+    result = _build_capacity(_resolve(), problems)
+    if result is None:
+        raise ConfigError(problems)
+    return result
+
+
 def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) -> bool:
     """Validate required-endpoint + choices with pydantic. Returns False if absent.
 
@@ -929,6 +1004,7 @@ def validate() -> Settings:
     _check_forward_auth_exclusive(values, problems)
     _check_master_key_conflict(values, problems)
     _check_issuance(values, problems)
+    _check_capacity(values, problems)
     if problems:
         raise ConfigError(list(dict.fromkeys(problems)))
     return Settings(values=values)

@@ -22,6 +22,9 @@ In order —
    refuses the DSN (credentials, database name, DSN syntax) or whose
    ``corp_tokens`` lacks the issuance columns or the unique ``oidc_jti`` index. A
    Postgres the network cannot reach does not refuse the boot — readiness reports it.
+   Then the in-flight cap through ``settings.capacity()`` (also ``config check``'s):
+   a non-integer, negative or oversized ``CORP_LLM_MAX_INFLIGHT``, ``0`` under
+   ``CORP_ENV=prod|production``, or a bad ``CORP_LLM_CANCEL_GRACE_SECONDS`` exits 78.
    Last, ``CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH``: a malformed item, or one naming
    a route the table refused, exits 78;
 2. run litellm's Prisma schema sequence when ``DATABASE_URL`` is set, with the
@@ -39,7 +42,10 @@ In order —
    rather than serve unsanitized;
 5. wrap the whole chain in ``RouteGateMiddleware`` — by wrapping, not
    ``add_middleware``, so the gate is outermost. Every middleware litellm adds
-   sits inside it and none can answer ahead of the gate.
+   sits inside it and none can answer ahead of the gate. The gate carries the
+   in-flight limiter (``route_gate/inflight.py``); once armed, the lifespan
+   hands it the guardrail's ``on_request_cancelled`` and installs the task
+   factory that tags each request's tasks on uvicorn's own loop.
 
 What moved here from the ``litellm`` CLI: the config-load check, the Prisma
 sequence, ``WORKER_CONFIG``, and (in ``serve.py``) uvicorn's arguments.
@@ -74,16 +80,17 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, NoReturn
 
 from corp_llm_gateway import config, litellm_cli, litellm_config, pg_session, settings
 from corp_llm_gateway.audit import AuditLogger, get_sink
 from corp_llm_gateway.metrics import get_exporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware
+from corp_llm_gateway.route_gate.inflight import InflightLimiter, install_task_factory
 
 # `corp_llm_gateway.bootstrap` is NOT imported here: it reaches
 # `litellm_hook`, which imports litellm itself (the guardrail has to subclass
@@ -180,7 +187,7 @@ def _fail_config(problems: list[str]) -> None:
     raise SystemExit(EXIT_CONFIG)
 
 
-def _fail_gateway_config(problems: list[str]) -> None:
+def _fail_gateway_config(problems: list[str]) -> NoReturn:
     for problem in problems:
         log.error("gateway config refused: %s", problem)
     raise SystemExit(EXIT_CONFIG)
@@ -304,6 +311,19 @@ def _check_issuance() -> bool:
     return True
 
 
+def _check_capacity() -> settings.CapacitySettings:
+    """Refuse (exit 78) an in-flight cap the gateway must not serve with."""
+    try:
+        capacity = settings.capacity()
+    except settings.ConfigError as exc:
+        _fail_gateway_config(exc.problems)
+    if capacity.max_inflight:
+        log.info("in-flight cap: %d rewritten requests per pod", capacity.max_inflight)
+    else:
+        log.warning("in-flight cap off (CORP_LLM_MAX_INFLIGHT=0); not allowed in prod")
+    return capacity
+
+
 def _route_gate_extras() -> dict[Any, Any]:
     """Refuse (exit 78) a malformed extra, or one naming a route the table refused."""
     try:
@@ -359,12 +379,32 @@ def _setup_prisma(config_path: Any) -> None:
     )
 
 
-def _guardrail_registered() -> bool:
+def _registered_guardrail() -> Any:
     import litellm
 
     from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 
-    return any(isinstance(cb, CorpLlmGuardrail) for cb in (litellm.callbacks or ()))
+    return next((cb for cb in (litellm.callbacks or ()) if isinstance(cb, CorpLlmGuardrail)), None)
+
+
+def _guardrail_registered() -> bool:
+    return _registered_guardrail() is not None
+
+
+def _nothing() -> None:
+    return None
+
+
+def _start_litellm_logging_worker() -> None:
+    """Start litellm's logging worker outside any request.
+
+    It starts lazily on the first callback, inside that request's task tree, and
+    the task factory would tag it to the request: a cancelled request would then
+    take every later success/failure callback (and our audit events) with it.
+    """
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    GLOBAL_LOGGING_WORKER.start()
 
 
 # ── 1. litellm's config ──────────────────────────────────────────────────────
@@ -380,6 +420,7 @@ if _problems:
     _fail_config(_problems)
 log.info("litellm config accepted: %s", CONFIG_PATH)
 ISSUANCE_ENABLED = _check_issuance()
+CAPACITY = _check_capacity()
 ROUTE_GATE_EXTRAS = _route_gate_extras()
 
 # ── 2. Prisma schema setup ───────────────────────────────────────────────────
@@ -455,11 +496,17 @@ log.info(
     f"POST {_ISSUE_TOKEN}" if ISSUANCE_ENABLED else f"{_ISSUE_TOKEN} (issuance disabled, 404)",
 )
 
+limiter = InflightLimiter(
+    CAPACITY.max_inflight,
+    metrics=_exporter,
+    cancel_grace_s=CAPACITY.cancel_grace_seconds,
+)
 gate = RouteGateMiddleware(
     _GATEWAY_ROUTES,
     metrics=_exporter,
     audit_logger=AuditLogger(get_sink(), gateway_version=gateway_version()),
     extras=ROUTE_GATE_EXTRAS,
+    limiter=limiter,
 )
 
 _litellm_lifespan = _app.router.lifespan_context
@@ -477,7 +524,12 @@ async def _armed_lifespan(scoped_app: Any) -> AsyncIterator[None]:
     is a different list and would pass while the hook was absent.
     """
     async with _litellm_lifespan(scoped_app):
-        if _guardrail_registered():
+        guardrail = _registered_guardrail()
+        restore_task_factory: Callable[[], None] = _nothing
+        if guardrail is not None:
+            _start_litellm_logging_worker()
+            restore_task_factory = install_task_factory(asyncio.get_running_loop())
+            limiter.bind_cancel_hook(guardrail.on_request_cancelled)
             gate.arm()
             log.info("CorpLlmGuardrail found in litellm.callbacks; route gate armed")
         else:
@@ -489,7 +541,10 @@ async def _armed_lifespan(scoped_app: Any) -> AsyncIterator[None]:
             # _exit, not sys.exit: this runs inside uvicorn's lifespan task,
             # where an exception is caught and logged and the server keeps going.
             os._exit(EXIT_NO_CALLBACK)
-        yield
+        try:
+            yield
+        finally:
+            restore_task_factory()
 
 
 _app.router.lifespan_context = _armed_lifespan

@@ -475,10 +475,13 @@ async def test_a_refusal_writes_one_audit_record_with_the_block_reason() -> None
 
 def test_every_block_reason_has_a_status_a_code_and_a_type() -> None:
     from corp_llm_gateway.route_gate import middleware
+    from corp_llm_gateway.route_gate.inflight import LIMITER_BLOCK_REASONS
 
-    assert set(middleware._STATUS) == BLOCK_REASONS
-    assert set(middleware._ERROR_CODE) == BLOCK_REASONS
-    assert set(middleware._ERROR_TYPE) == BLOCK_REASONS
+    # The classifier's reasons plus the two the in-flight limiter refuses with.
+    answered = BLOCK_REASONS | LIMITER_BLOCK_REASONS
+    assert set(middleware._STATUS) == answered
+    assert set(middleware._ERROR_CODE) == answered
+    assert set(middleware._ERROR_TYPE) == answered
 
 
 async def test_a_passthrough_writes_no_audit_record() -> None:

@@ -7,7 +7,7 @@ from typing import Literal
 # not require editing this leaf module. Values reaching an AuditEvent are
 # produced by _detect_provider, which resolves through the provider registry.
 Provider = str
-Status = Literal["ok", "failed", "degraded"]
+Status = Literal["ok", "failed", "degraded", "cancelled"]
 
 
 @dataclass(frozen=True)

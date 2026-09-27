@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 BLOCKED_REQUESTS_METRIC = "corp_llm_gateway_blocked_requests_total"
 GATEWAY_FAILURE_METRIC = "gateway_failure"
 REQUEST_LATENCY_METRIC = "corp_llm_gateway_request_latency_seconds"
+INFLIGHT_METRIC = "gateway_inflight_requests"
+CANCELLED_METRIC = "gateway_cancelled_requests_total"
 
 _MISSING_DEP_HINT = (
     "the prometheus metrics exporter requires the [metrics] extra: "
@@ -61,6 +63,16 @@ class PrometheusExporter(MetricsExporter):
             ["status"],
             registry=self._registry,
         )
+        self._inflight = Gauge(
+            INFLIGHT_METRIC,
+            "Rewritten requests holding an in-flight slot (route gate cap).",
+            registry=self._registry,
+        )
+        self._cancelled = Counter(
+            CANCELLED_METRIC,
+            "Admitted requests cancelled because the client disconnected.",
+            registry=self._registry,
+        )
 
     def record_block(self, block_reason: str) -> None:
         self._blocked.labels(block_reason=block_reason).inc()
@@ -70,6 +82,12 @@ class PrometheusExporter(MetricsExporter):
 
     def observe_request_latency(self, seconds: float, *, status: str) -> None:
         self._latency.labels(status=status).observe(seconds)
+
+    def set_inflight(self, count: int) -> None:
+        self._inflight.set(count)
+
+    def record_cancelled(self) -> None:
+        self._cancelled.inc()
 
     def render(self) -> bytes:
         from prometheus_client import generate_latest

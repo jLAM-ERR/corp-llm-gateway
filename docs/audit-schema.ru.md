@@ -29,7 +29,7 @@ Vector (M3-3) парсит каждую запись и проверяет пр�
 | `finding_label_counts` | object\<string, int\> | Формат `{"EMAIL": 2, "PERSON": 1}`; только гистограмма меток — без текста; всегда заполнено; `sum(values) == redaction_count` |
 | `cache_a_hit` | bool | Попал ли запрос в кэш дедупликации |
 | `gateway_version` | string | Версия приложения, обработавшего запрос |
-| `status` | string | `ok` / `failed` / `degraded` |
+| `status` | string | `ok` / `failed` / `degraded` / `cancelled` (клиент отключился до конца ответа, шлюз отменил запрос; `error_code` `E_CLIENT_DISCONNECTED`, только счётчики) |
 
 ## Поля NEVER
 

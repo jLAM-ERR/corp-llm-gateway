@@ -410,6 +410,130 @@ def test_a_bad_route_gate_extra_exits_78_before_litellm_is_imported(
     assert needle in result["stdout"]
 
 
+@pytest.mark.parametrize(
+    ("env", "needle"),
+    [
+        ({"CORP_ENV": "production", "CORP_LLM_MAX_INFLIGHT": "0"}, "turns the in-flight cap off"),
+        ({"CORP_ENV": "prod", "CORP_LLM_MAX_INFLIGHT": "0"}, "turns the in-flight cap off"),
+        ({"CORP_LLM_MAX_INFLIGHT": "-3"}, "from 0 to 10000"),
+        ({"CORP_ENV": "production", "CORP_LLM_MAX_INFLIGHT": "-3"}, "from 0 to 10000"),
+        ({"CORP_LLM_MAX_INFLIGHT": "lots"}, "is not an integer"),
+        ({"CORP_LLM_CANCEL_GRACE_SECONDS": "0"}, "CORP_LLM_CANCEL_GRACE_SECONDS"),
+    ],
+    ids=["zero-production", "zero-prod", "negative", "negative-prod", "not-int", "grace"],
+)
+def test_a_bad_capacity_exits_78_before_litellm_is_imported(
+    valid_config: Path, env: dict[str, str], needle: str
+) -> None:
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert needle in result["stdout"]
+
+
+def _serve(config_path: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """`python -m corp_llm_gateway.serve`, exactly as the image runs it."""
+    _require_fastapi()
+    pytest.importorskip("uvicorn")
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    child_env = {name: os.environ[name] for name in _INHERITED if name in os.environ}
+    child_env.update(
+        {
+            "PYTHONPATH": str(ROOT / "src"),
+            "CORP_LLM_LITELLM_CONFIG": str(config_path),
+            "CORP_LLM_ORACLE_ENABLED": "0",
+            "CORP_LLM_LOCAL_FIRST": "1",
+            "CORP_AUDIT_SINK": "stdout",
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+            "CORP_LLM_SERVE_HOST": "127.0.0.1",
+            "CORP_LLM_SERVE_PORT": str(port),
+            **env,
+        }
+    )
+    return subprocess.run(
+        [sys.executable, "-m", "corp_llm_gateway.serve"],
+        capture_output=True,
+        text=True,
+        env=child_env,
+        timeout=120,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"CORP_ENV": "production", "CORP_LLM_MAX_INFLIGHT": "0"},
+        {"CORP_ENV": "prod", "CORP_LLM_MAX_INFLIGHT": "-1"},
+    ],
+    ids=["zero-production", "negative-prod"],
+)
+def test_the_served_entrypoint_exits_78_on_a_bad_capacity(
+    valid_config: Path, env: dict[str, str]
+) -> None:
+    completed = _serve(valid_config, env)
+
+    assert completed.returncode == 78, completed.stdout + completed.stderr
+    assert "CORP_LLM_MAX_INFLIGHT" in completed.stdout + completed.stderr
+
+
+_CAPACITY_WIRING_SCRIPT = f"""
+    import asyncio, json
+    import corp_llm_gateway.asgi as asgi
+    from corp_llm_gateway.route_gate import inflight
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        before = loop.get_task_factory()
+        async with asgi._app.router.lifespan_context(asgi._app):
+            from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+            hook = asgi.limiter._cancel_hook
+            inside = loop.get_task_factory()
+            worker = GLOBAL_LOGGING_WORKER._worker_task
+            state = {{
+                "armed": asgi.gate.armed,
+                "gate_limiter": asgi.gate.limiter is asgi.limiter,
+                "max": asgi.limiter.max_inflight,
+                "grace": asgi.limiter.cancel_grace_s,
+                "hook_bound": getattr(hook, "__name__", None) == "on_request_cancelled"
+                and type(getattr(hook, "__self__", None)).__name__ == "CorpLlmGuardrail",
+                "factory_installed": inside is not None and inside is not before,
+                "worker_running": worker is not None and not worker.done(),
+                "worker_untagged": worker not in inflight.pending_request_tasks(),
+            }}
+        state["factory_restored"] = loop.get_task_factory() is before
+        print("{SENTINEL}" + json.dumps(state))
+
+    asyncio.run(main())
+"""
+
+
+def test_the_lifespan_wires_the_limiter(valid_config: Path) -> None:
+    result = _run(
+        _CAPACITY_WIRING_SCRIPT,
+        valid_config,
+        env={"CORP_LLM_MAX_INFLIGHT": "7", "CORP_LLM_CANCEL_GRACE_SECONDS": "2.5"},
+    )
+
+    assert result["armed"] is True
+    assert result["gate_limiter"] is True
+    assert (result["max"], result["grace"]) == (7, 2.5)
+    assert result["hook_bound"] is True
+    assert result["factory_installed"] is True
+    assert result["factory_restored"] is True
+    assert result["worker_running"] is True
+    assert result["worker_untagged"] is True
+    assert _boot_record(result["stdout"], "in-flight cap")["message"].endswith(
+        "7 rewritten requests per pod"
+    )
+
+
 def _boot_record(stdout: str, needle: str) -> dict:
     carrying = _lines_carrying(stdout, needle)
     assert len(carrying) == 1, stdout

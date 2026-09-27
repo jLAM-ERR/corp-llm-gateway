@@ -290,6 +290,18 @@
 # off switch. A malformed entry fails `gateway-admin config check` at boot.
 # CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH = "GET /internal/ops-status"
 
+# ── In-flight cap (route_gate/inflight.py) ───────────────────────────────────
+#
+# Concurrent rewritten (LLM) requests per pod. A slot is held for the whole
+# request, SSE stream included; the next request gets 429 E_CAPACITY. Scale
+# with replicas, not with this number. 0 turns the cap off and is refused at
+# boot (exit 78) when CORP_ENV is prod/production. litellm's own
+# general_settings.global_max_parallel_requests does nothing in this deployment.
+# When a client disconnects, the request is cancelled and gets the grace to
+# unwind; its leftover tasks then get the same grace again.
+# CORP_LLM_MAX_INFLIGHT         = "64"
+# CORP_LLM_CANCEL_GRACE_SECONDS = "5"
+
 # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────────
 #
 # Never-redact fixture values (so obvious test tokens survive sanitization).

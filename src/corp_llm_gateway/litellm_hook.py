@@ -46,6 +46,7 @@ from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.payload.size_threshold import OversizeContentError, should_skip_sanitization
 from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.providers import detect_provider
+from corp_llm_gateway.route_gate.inflight import bind_call_id, current_ticket
 from corp_llm_gateway.sanitizer import (
     OpenAiToolCallDesanitizer,
     ResponsesStreamDesanitizer,
@@ -135,6 +136,9 @@ logger = logging.getLogger(__name__)
 # for one request (inline block-audit + any litellm event) happen ms apart, so a
 # small window suffices; this just prevents unbounded growth over process life.
 _AUDIT_DEDUP_CAP = 4096
+
+# The error code of a request the route gate cancelled because its client left.
+E_CLIENT_DISCONNECTED = "E_CLIENT_DISCONNECTED"
 
 # `role` is echoed straight from the request body into a log line. Only these
 # known message roles are logged verbatim; anything else logs as "invalid" so a
@@ -417,6 +421,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         `async_pre_call_hook` wiring supplies a call_type.
         """
         request_id = self._ensure_request_id(data)
+        # The route gate's ticket for this HTTP request learns litellm's call id,
+        # so a client disconnect can find this request's state.
+        bind_call_id(request_id)
         model = str(data.get("model") or "unknown")
         raw_messages, request_shape = _request_items(data, call_type)
         message_count = len(raw_messages) if isinstance(raw_messages, list) else 0
@@ -1554,6 +1561,12 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         if request_id in self._audited_ids:
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
             return
+        ticket = current_ticket()
+        if ticket is not None and ticket.cancelled:
+            # The route gate is cancelling this request; its terminal record is
+            # the `cancelled` one `on_request_cancelled` writes.
+            logger.debug("litellm_audit_deferred_to_cancel request_id=%s", request_id)
+            return
         # Do NOT pop yet: a failed emit below must leave `state` in place for
         # a genuine retry (the F8 safety net's own guarded audit() call) to
         # find the real user_id/redaction_count/block_reason instead of
@@ -1637,6 +1650,51 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             event.cache_a_hit,
             prompt_tokens,
             completion_tokens,
+        )
+
+    async def on_request_cancelled(self, request_id: str, *, latency_ms: int = 0) -> None:
+        """The terminal record of a request the route gate cancelled (client gone).
+
+        Pops the request's state (Cache B expires on its own TTL) and emits one
+        ``cancelled`` record with counts only — no placeholder list, nothing of
+        the content. The id is marked audited BEFORE the emit, so a failure event
+        litellm fires later for the same call dedups instead of adding a second
+        record. A request whose terminal record already went out gets nothing.
+        """
+        state = self._req_state.pop(request_id, None)
+        if request_id in self._audited_ids:
+            return
+        self._audited_ids[request_id] = None
+        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+            self._audited_ids.popitem(last=False)
+        event = AuditEvent(
+            timestamp=datetime.now(UTC),
+            request_id=request_id,
+            user_id=state.user_id if state else "unknown",
+            team_id=state.team_id if state else "unknown",
+            provider=state.provider if state else "unknown",
+            model=state.model if state else "unknown",
+            latency_ms=max(0, latency_ms),
+            prompt_token_count=0,
+            completion_token_count=0,
+            redaction_count=state.redaction_count if state else 0,
+            finding_label_counts=_label_counts(state.placeholders) if state else {},
+            cache_a_hit=state.cache_a_hit if state else False,
+            status="cancelled",
+            error_code=E_CLIENT_DISCONNECTED,
+            block_reason=state.block_reason if state else None,
+            profile_ids=state.profile_ids if state else (),
+        )
+        try:
+            await self._audit.emit(event)
+        except Exception:
+            logger.error("litellm_audit_cancelled_emit_failed request_id=%s", request_id)
+            raise
+        logger.info(
+            "litellm_audit_emitted request_id=%s status=cancelled latency_ms=%d redaction_count=%d",
+            request_id,
+            event.latency_ms,
+            event.redaction_count,
         )
 
     # ---- internals --------------------------------------------------------
