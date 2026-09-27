@@ -58,7 +58,7 @@ helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto (~3530 passed / ~360 skipped on .venv; ~4200 / 16 on .venv-bench with
+tests/                   pytest, pytest-asyncio mode=auto (3626 passed / 367 skipped on .venv; 4301 / 16 on .venv-bench with
                          Postgres, where NER, RS256 crypto, the Postgres contracts and the entrypoint/route-gate suites run)
 ```
 
@@ -125,12 +125,13 @@ Two caches:
 
 ```
 # Full unit suite. Local .venv is Python 3.14 with no extras and no litellm (graceful
-# NER degradation): last known ~3530 passed + ~360 skipped, ~4min. The authoritative
+# NER degradation): last known 3626 passed + 367 skipped, ~4.5min. The authoritative
 # local run is .venv-bench = Python 3.14.7 with every extra (`ner` incl. pymorphy3,
-# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: ~4200 passed + 16 skipped
-# with Postgres, ~8min — the entrypoint, route-guard, served-stack and container suites
-# only RUN there. CI runs the same suite on Python 3.14 only — the same interpreter line as
-# .venv-bench; nothing exercises 3.12 any more. Always run both before committing.
+# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: 4301 passed + 16 skipped
+# with Postgres, ~8.5min (4219 + 98 without) — the entrypoint, route-guard,
+# served-stack and container suites only RUN there. CI runs the same suite on Python
+# 3.14 only — the same interpreter line as .venv-bench; nothing exercises 3.12 any
+# more. Always run both before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
 NO_PROXY=127.0.0.1,localhost PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs
 
