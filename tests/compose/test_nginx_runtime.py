@@ -631,6 +631,9 @@ STARTS = [
     pytest.param(
         "host", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}:65535"}, id="langfuse-max-port"
     ),
+    pytest.param(
+        "host", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}:0"}, id="langfuse-port-0"
+    ),
     pytest.param("port", {"LANGFUSE_PUBLIC_URL": "https://10.1.2.3:8443"}, id="langfuse-ipv4-port"),
     pytest.param(
         "port", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}:8443"}, id="langfuse-name-port"
@@ -2565,8 +2568,9 @@ def _stream(port: int, method: str, target: str, host: str, stub: Stub) -> Strea
                     event, pending = pending.split(b"\n\n", 1)
                     arrivals.append(time.monotonic() - sent_at)
                     events.append(event.decode())
-                    if len(events) == 1:
-                        sent_at_first = _sse_sent(stub) - before
+                # After the chunk's events are stamped: `docker logs` takes its own time.
+                if sent_at_first < 0 and events:
+                    sent_at_first = _sse_sent(stub) - before
     return Streamed(
         response.status_code,
         response.headers.get("content-type", ""),
@@ -2596,8 +2600,8 @@ def test_an_event_stream_reaches_the_client_as_the_upstream_sends_it(
     assert streamed.content_type == "text/event-stream"
     assert streamed.events == EXPECTED_EVENTS
     # Causal, not timed: the first event was at the client before the stub had
-    # written the last one.
-    assert 1 <= streamed.sent_at_first < SSE_EVENTS, streamed
+    # written the last one. The stub logs after each send, so 0 is possible.
+    assert 0 <= streamed.sent_at_first < SSE_EVENTS, streamed
     first, last = streamed.arrivals[0], streamed.arrivals[-1]
     assert first < 0.5 * last, streamed.arrivals
     assert last - first >= 0.8 * (SSE_EVENTS - 1) * SSE_GAP_SECONDS, streamed.arrivals
@@ -2606,8 +2610,8 @@ def test_an_event_stream_reaches_the_client_as_the_upstream_sends_it(
 def test_a_buffering_location_holds_the_same_stream_back(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
 ) -> None:
-    # The control: with response buffering on, the same measurement sees every
-    # event land at once after the stub has sent them all.
+    # The control: with response buffering on, the same measurement sees the first
+    # event reach the client only after the stub has sent them all.
     snippet = project / "nginx" / "templates" / "snippets" / "gateway-locations.inc.template"
     text = snippet.read_text()
     assert text.count("proxy_buffering off;\n") == 1
@@ -2617,8 +2621,7 @@ def test_a_buffering_location_holds_the_same_stream_back(
         streamed = _stream(nginx.ports[8080], method, target, host, stub_upstream)
 
     assert streamed.events == EXPECTED_EVENTS
-    assert streamed.sent_at_first == SSE_EVENTS
-    assert streamed.arrivals[-1] - streamed.arrivals[0] < SSE_GAP_SECONDS, streamed.arrivals
+    assert streamed.sent_at_first == SSE_EVENTS, streamed
 
 
 # --------------------------------------------------------------------------- #

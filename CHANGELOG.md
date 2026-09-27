@@ -141,8 +141,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Known limitations of the compose target
 
-- **No TLS in front of the stack yet** — the only published port is `127.0.0.1:4000`. (Resolved
-  before release: the opt-in HTTPS front door, "Added — HTTPS front door" above.)
+- **No TLS without a profile** — with `COMPOSE_PROFILES` unset the only published port is
+  `127.0.0.1:4000` (the front door above).
 - **In Mode B litellm's management endpoints are unauthenticated** (`/key/*`, `/model/*`,
   `/user/*`, the UI) — its proxy auth is skipped without a master key, which is what the mode
   requires. The LLM routes stay gated by `X-Corp-Auth`. Must be closed at nginx before the port

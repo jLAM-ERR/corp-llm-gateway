@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "deploy" / "deploy.sh"
@@ -253,10 +254,19 @@ def test_unknown_option_and_unknown_subcommand_are_refused() -> None:
 
 
 def test_remote_dir_default_matches_bootstrap_server(script_text: str) -> None:
-    mine = re.search(r'^REMOTE_DIR="\$\{[A-Z_]+:-(?P<dir>[^}]+)\}"', script_text, re.M)
+    mine = re.search(
+        r'^REMOTE_DIR="\$\{[A-Z_]+:-(?:(?P<dir>[^$}]+)|\$(?P<var>[A-Z_]+))\}"', script_text, re.M
+    )
     theirs = re.search(r'^TARGET_DIR="\$\{[A-Z_]+:-(?P<dir>[^}]+)\}"', BOOTSTRAP.read_text(), re.M)
     assert mine is not None and theirs is not None
-    assert mine.group("dir") == theirs.group("dir") == "/opt/corp-llm-gateway"
+    default = mine.group("dir")
+    if default is None:
+        named = re.search(rf'^{mine.group("var")}="(?P<dir>[^"]+)"', script_text, re.M)
+        assert named is not None
+        default = named.group("dir")
+    assert default == theirs.group("dir") == "/opt/corp-llm-gateway"
+    assignments = re.findall(r'^[A-Z_]+="[^"\n]*/opt/corp-llm-gateway', script_text, re.M)
+    assert len(assignments) == 1, assignments
 
 
 def test_only_the_production_compose_entrypoint_is_used(script_text: str) -> None:
@@ -597,7 +607,7 @@ def test_a_failed_one_shot_fails_at_once_and_names_it(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 1
-    assert "minio-init exited with code 1" in result.stderr
+    assert "minio-init exited with code 1; the services that wait for it" in result.stderr
     assert f"scripts/deploy/deploy.sh --host {HOST} logs minio-init\n" in result.stderr
     # One poll plus the status table.
     assert _log(tmp_path, "ssh.log").count("ps --all") == 2
@@ -616,6 +626,91 @@ def test_a_one_shot_without_an_exit_code_is_not_mistaken_for_done(tmp_path: Path
 
     assert result.returncode == 1
     assert "within 1s — stuck: minio-init" in result.stderr
+
+
+def _shell_array(text: str, name: str) -> list[str]:
+    match = re.search(rf"^{re.escape(name)}=\((?P<items>[^)]*)\)$", text, re.M)
+    assert match is not None, f"no shell array named {name!r}"
+    return match.group("items").split()
+
+
+def test_the_one_shot_list_is_every_restart_no_service(script_text: str) -> None:
+    # Only a listed service counts as done once it exits 0, so a new `restart: "no"`
+    # service must land here too, or every deploy times out waiting for it.
+    base = ROOT / "compose" / "docker-compose.yml"
+    overlays = sorted(path for path in base.parent.glob("docker-compose*.yml") if path != base)
+    restart: dict[str, object] = {}
+    for path in (base, *overlays):
+        services = (yaml.safe_load(path.read_text()) or {}).get("services") or {}
+        for name, spec in services.items():
+            if spec and "restart" in spec:
+                restart[name] = spec["restart"]
+    one_shots = {name for name, value in restart.items() if value in ("no", False)}
+
+    assert one_shots, "the stack has no one-shot any more; the list should go too"
+    assert set(_shell_array(script_text, "ONE_SHOT_SERVICES")) == one_shots
+
+
+@pytest.mark.parametrize(
+    ("service", "state", "health", "exit_code", "done"),
+    [
+        ("minio-init", "exited", "", 0, True),
+        # compose prints an empty Health for every exited container, one with a
+        # healthcheck included, so only the one-shot list tells them apart.
+        ("langfuse-web", "exited", "", 0, False),
+        ("langfuse-web", "exited", "healthy", 0, False),
+        ("langfuse-web", "exited", "unhealthy", 0, False),
+        ("langfuse-web", "restarting", "", None, False),
+        ("langfuse-web", "restarting", "healthy", None, False),
+        ("langfuse-web", "running", "healthy", None, True),
+    ],
+)
+def test_only_a_running_service_or_a_finished_one_shot_is_done(
+    service: str,
+    state: str,
+    health: str,
+    exit_code: int | None,
+    done: bool,
+    tmp_path: Path,
+) -> None:
+    row: dict[str, object] = {"Service": service, "State": state, "Health": health}
+    if exit_code is not None:
+        row["ExitCode"] = exit_code
+    others = [r for r in HEALTHY_PS if r["Service"] != service]
+
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=[*others, row],  # type: ignore[list-item]
+        extra="HEALTH_MAX_WAIT=1\nHEALTH_INTERVAL=1\n",
+    )
+
+    if done:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1
+        assert f"within 1s — stuck: {service} (state={state}" in result.stderr
+        assert "exited with code" not in result.stderr
+
+
+def test_a_failed_service_that_is_not_a_one_shot_fails_without_blaming_dependents(
+    tmp_path: Path,
+) -> None:
+    ps = [*HEALTHY_PS, {"Service": "langfuse-web", "State": "exited", "Health": "", "ExitCode": 2}]
+
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=ps,
+        extra="HEALTH_MAX_WAIT=10\nHEALTH_INTERVAL=1\n",
+    )
+
+    assert result.returncode == 1
+    assert "langfuse-web exited with code 2" in result.stderr
+    assert "the services that wait for it" not in result.stderr
+    assert f"scripts/deploy/deploy.sh --host {HOST} logs langfuse-web\n" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1205,7 +1300,8 @@ def test_the_script_never_sets_a_profile(script_text: str) -> None:
         r"\bCOMPOSE_PROFILES=",
         r"\bexport\s+[^\n]*\bCOMPOSE_PROFILES\b",
         r"\bunset\s+[^\n]*\bCOMPOSE_PROFILES\b",
-        r"\benv\s+-u\s+COMPOSE_PROFILES\b",
+        r"\benv\b[^\n]*(-u|--unset)[= ]*COMPOSE_PROFILES\b",
+        r"\benv\s+-i\b",
     ):
         assert not re.search(pattern, code), pattern
 

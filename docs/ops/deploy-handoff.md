@@ -210,7 +210,7 @@ reference: `compose/README.md`, "HTTPS front door (nginx)".
    `NGINX_TLS_MODE=behind-proxy`, plus `NGINX_TRUSTED_PROXIES` = the load
    balancer's address as nginx sees it. Every other peer gets no response at
    all, so a wrong value is an outage: the refused address is in
-   `docker compose logs nginx` (status `444`). Otherwise →
+   `docker compose logs nginx` (or `nginx-ports`; status `444`). Otherwise →
    `NGINX_TLS_MODE=terminate`, and nginx needs a certificate (point 4).
 3. **Fill in `.env` on the server** (the commented "nginx front door" block):
 
@@ -230,12 +230,12 @@ reference: `compose/README.md`, "HTTPS front door (nginx)".
    outside the host reaches nginx. `LANGFUSE_PUBLIC_URL` must be the public
    `https://` origin (`https://<address>:8443` under `nginx-ports`), in
    `behind-proxy` too.
-4. **Install the certificate on the server** (`terminate` only), the way the
-   egress CA is installed in step 6: directly in
-   `/opt/corp-llm-gateway/nginx/certs/`, never through the sync. One
-   certificate with both names as SANs (or the IP clients dial, under
-   `nginx-ports`), the full chain in PEM, the key unencrypted and `0600`. The
-   deploy script never uploads anything there. SANs, a CSR example and a
+4. **Install the certificate on the server** (`terminate` only): directly in
+   `/opt/corp-llm-gateway/nginx/certs/`, never through the sync (as
+   `compose/certs/corp-ca-bundle.pem` in step 6, which the sync also
+   excludes). One certificate with both names as SANs (or the IP clients dial,
+   under `nginx-ports`), the full chain in PEM, the key unencrypted and `0600`.
+   The deploy script never uploads anything there. SANs, a CSR example and a
    throwaway self-signed helper: `compose/nginx/certs/README.md`.
 5. **Rotating it:** replace both files in the same directory, then
    `docker compose restart nginx` (or `nginx-ports`) on the server. nginx reads

@@ -23,8 +23,8 @@
 
 set -euo pipefail
 
-REMOTE_DIR="${CORP_GATEWAY_DEPLOY_DIR:-/opt/corp-llm-gateway}"
 DEFAULT_REMOTE_DIR="/opt/corp-llm-gateway"
+REMOTE_DIR="${CORP_GATEWAY_DEPLOY_DIR:-$DEFAULT_REMOTE_DIR}"
 COMPOSE_FILE="docker-compose.yml"
 # The default mode is oauth (subscription, the production mode): it layers
 # docker-compose.oauth.yml on top. virtual-keys (the base file alone) is a test
@@ -51,6 +51,10 @@ NGINX_CERTS_README="${NGINX_CERTS_DIR}/README.md"
 # value here would override that file and diverge from what the boot-time
 # unit (a bare `docker compose up -d`) starts.
 NGINX_SERVICES=(nginx nginx-ports)
+# The `restart: "no"` services: the only ones that are done once they exit 0.
+# Compose prints an empty Health for every exited container, so the state alone
+# cannot tell a finished one-shot from a service that stopped.
+ONE_SHOT_SERVICES=(minio-init)
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/compose"
@@ -480,6 +484,16 @@ is_front_door() {
     return 1
 }
 
+is_one_shot() {
+    local name
+    for name in "${ONE_SHOT_SERVICES[@]}"; do
+        if [[ "$1" == "$name" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # The front door's entrypoint exits 64-69 on a bad NGINX_* key or a missing
 # certificate, and `restart: unless-stopped` then cycles it through
 # "restarting". Neither heals by waiting, so neither waits out the timeout.
@@ -525,8 +539,8 @@ wait_for_healthcheck() {
                     failed_service="$service"
                     stuck="${service} exited with code ${exit_code}"
                     break
-                elif [[ "$state" == "exited" && -z "$health" && "$exit_code" == "0" ]]; then
-                    # A `restart: "no"` one-shot that finished: `ps --all` lists it.
+                elif [[ "$state" == "exited" && "$exit_code" == "0" ]] && is_one_shot "$service"; then
+                    # A one-shot that finished: `ps --all` keeps listing it.
                     continue
                 # A service that DECLARES a healthcheck must actually report
                 # "healthy": "starting" is not healthy yet and can still flip to
@@ -534,7 +548,7 @@ wait_for_healthcheck() {
                 # Only a service with NO healthcheck (empty Health) falls back to
                 # "is it running".
                 elif [[ -n "$health" ]]; then
-                    if [[ "$health" == "healthy" ]]; then
+                    if [[ "$state" == "running" && "$health" == "healthy" ]]; then
                         continue
                     fi
                 elif [[ "$state" == "running" ]]; then
@@ -553,8 +567,12 @@ wait_for_healthcheck() {
         fi
 
         if [[ -n "$failed_service" ]]; then
+            local consequence=""
+            if is_one_shot "$failed_service"; then
+                consequence="; the services that wait for it will not start"
+            fi
             print_status
-            fatal "${stuck}; the services that wait for it will not start.
+            fatal "${stuck}${consequence}.
        Read its log with:
        scripts/deploy/deploy.sh --host ${HOST}${SELF_FLAGS} logs ${failed_service}"
         fi

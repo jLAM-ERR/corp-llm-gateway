@@ -56,9 +56,15 @@ src/corp_llm_gateway/
   litellm_hook.py  CorpLlmGuardrail — LiteLLM callback adapter (sanitize/desanitize incl. OpenAI tool_calls + streaming)
 helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret + HPA/PDB/SA + ServiceMonitor + config-check
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
+compose/                 production compose stack for non-k8s hosts (data plane + Langfuse + Vector audit);
+                         compose/nginx/ is the opt-in HTTPS front door (COMPOSE_PROFILES=nginx|nginx-ports):
+                         entrypoint.sh validates NGINX_* (exit 64-69) and renders one listener;
+                         templates/snippets/gateway-locations.inc.template is the exact-path allow-list, the
+                         only copy; certs/ is server-only, gitignored; pinned by
+                         tests/compose/test_nginx_{profile,runtime,allowlist_routes}.py
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto (3626 passed / 367 skipped on .venv; 4301 / 16 on .venv-bench with
+tests/                   pytest, pytest-asyncio mode=auto (4139 passed / 382 skipped on .venv; 4829 / 16 on .venv-bench with
                          Postgres, where NER, RS256 crypto, the Postgres contracts and the entrypoint/route-gate suites run)
 ```
 
@@ -125,11 +131,11 @@ Two caches:
 
 ```
 # Full unit suite. Local .venv is Python 3.14 with no extras and no litellm (graceful
-# NER degradation): last known 3626 passed + 367 skipped, ~4.5min. The authoritative
+# NER degradation): last known 4139 passed + 382 skipped, ~8.5min. The authoritative
 # local run is .venv-bench = Python 3.14.7 with every extra (`ner` incl. pymorphy3,
-# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: 4301 passed + 16 skipped
-# with Postgres, ~8.5min (4219 + 98 without) — the entrypoint, route-guard,
-# served-stack and container suites only RUN there. CI runs the same suite on Python
+# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: 4829 passed + 16 skipped
+# with Postgres, ~8.5min — the entrypoint, route-guard, served-stack, container and
+# nginx route cross-check suites only RUN there. CI runs the same suite on Python
 # 3.14 only — the same interpreter line as .venv-bench; nothing exercises 3.12 any
 # more. Always run both before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
@@ -230,7 +236,10 @@ When adding a new tunable, plumb it through this loader — don't read
    switch (`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` adds PASSTHROUGH rows
    only). Startup exits 78 without litellm's config and 70 without a
    `CorpLlmGuardrail` in `litellm.callbacks` — `docs/security.md` §14,
-   invariant row 7 in §9. Two rules under it (rows 7a/7b):
+   invariant row 7 in §9. The compose front door (`compose/nginx/`) mirrors
+   the gate at the edge — an exact-path allow-list, 404 before a body byte is
+   read — so adding a location there is the same security decision as adding
+   a table row. Two rules under it (rows 7a/7b):
    - **No slot before the body is complete.** The in-flight limiter drains
      the whole body under `CORP_LLM_BODY_READ_SECONDS`, `CORP_LLM_MAX_DRAINING`
      and `CORP_LLM_MAX_DRAINING_BYTES` before it takes a slot; never acquire

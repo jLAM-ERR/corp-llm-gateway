@@ -774,8 +774,8 @@ COMPOSE_PROFILES=nginx        # or nginx-ports; never both
 bare `docker compose up -d` that reads the same `.env`: a deploy and a reboot
 start the same services. `deploy.sh up` refuses a `.env` that enables both
 profiles before it pulls anything, and fails at once, naming the service, when
-the front door exits or restarts — `deploy.sh logs nginx` shows the
-entrypoint's one-line reason.
+the front door exits or restarts — `deploy.sh logs nginx` (or `nginx-ports`)
+shows the entrypoint's one-line reason.
 
 | Profile | Routing | Published (host → container) | Needs |
 |---|---|---|---|
@@ -852,7 +852,7 @@ modes, a corp-CA example). In short:
 - **SANs:** one certificate for `gateway.<GATEWAY_DOMAIN>` and
   `langfuse.<GATEWAY_DOMAIN>` under `nginx`; under `nginx-ports`, the IP address
   or local name clients dial (an IP SAN for an address).
-- **Files:** the full chain (leaf first) and an unencrypted key, mode `0600`,
+- **Files:** the full chain (leaf first), and the key unencrypted and `0600`,
   named by `NGINX_TLS_CERT` / `NGINX_TLS_KEY` as bare file names.
 - **Installed on the server**, in `nginx/certs/` of the deploy directory
   (`/opt/corp-llm-gateway/nginx/certs/` by default). `deploy.sh` never syncs
@@ -872,7 +872,7 @@ modes, a corp-CA example). In short:
 
 An exact-path allow-list, the same under both TLS modes, both routings and both
 auth modes (`nginx/templates/snippets/gateway-locations.inc.template` is the
-only copy). Each entry is one method on one exact path:
+only copy). Each entry is one exact path and the one method it admits:
 
 | Method + path | What |
 |---|---|
@@ -883,8 +883,10 @@ only copy). Each entry is one method on one exact path:
 | `GET /healthz/live` | the gateway's own liveness probe; never rate-limited |
 | `POST /internal/issue-token` | developer token issuance (`scripts/install.sh`); a body over 1 KiB is 413 — the gateway refuses any body anyway |
 
-**Everything else is 404 from nginx**, before a byte of the body is read and
-without reaching the gateway. The route gate refuses the same routes inside the
+**Every other path is 404 from nginx**, before a byte of the body is read and
+without reaching the gateway. Another method on an admitted path is 403
+(`limit_except`), and `HEAD` is admitted wherever `GET` is (`limit_except GET`
+cannot refuse it). The route gate refuses the same routes inside the
 image (`docs/security.md` §14), so this is defence in depth, and nginx never
 admits a route the gate refuses (`tests/compose/test_nginx_allowlist_routes.py`).
 Worth knowing by name:
@@ -916,12 +918,13 @@ through as the gateway sends it), and bodies up to 25 MiB pass: the gateway's
 ### Logs
 
 One JSON access-log line per request on nginx's stdout
-(`docker compose logs nginx`): the peer and client address, `from_trusted_proxy`,
-host, method, path (`$uri`), status, upstream status and time. It carries no
-`Authorization`, no `X-Corp-Auth`, no body and no query string. The error log is
-set to `crit`: at `error` and `warn` nginx appends the full request line, query
-string included, to its messages. Diagnose a 502/504 from the access log's
-`status` and `upstream_status`. The healthcheck's own requests are not logged.
+(`docker compose logs nginx`, or `nginx-ports`): the peer and client address,
+`from_trusted_proxy`, host, method, path (`$uri`), status, upstream status and
+time. It carries no `Authorization`, no `X-Corp-Auth`, no body and no query
+string. The error log is set to `crit`: at `error` and `warn` nginx appends the
+full request line, query string included, to its messages. Diagnose a 502/504
+from the access log's `status` and `upstream_status`. The healthcheck's own
+requests are not logged.
 
 ### Troubleshooting
 
@@ -929,12 +932,12 @@ The entrypoint writes one line naming the key it refused, then exits:
 
 | Exit | Cause |
 |---|---|
-| 64 | `NGINX_TLS_MODE` is not exactly `terminate` or `behind-proxy`; `GATEWAY_DOMAIN` is missing or not a lowercase DNS name with two labels (under `nginx`); an edge-limit key (`NGINX_TOKEN_RATE`, `NGINX_TOKEN_BURST`, `NGINX_TOKEN_CONN`, `NGINX_ISSUE_RATE`) is not a whole number from 1 to 999999; or the service's routing argument is not `host` / `port` (an edited compose file) |
-| 65 | `terminate`: `NGINX_TLS_CERT` or `NGINX_TLS_KEY` is not a bare file name (`A-Z a-z 0-9 . _ -`), or that file in `compose/nginx/certs/` is missing or empty |
+| 64 | `NGINX_TLS_MODE` is not exactly `terminate` or `behind-proxy`; `GATEWAY_DOMAIN` is missing or not a lowercase DNS name with at least two labels (under `nginx`); an edge-limit key (`NGINX_TOKEN_RATE`, `NGINX_TOKEN_BURST`, `NGINX_TOKEN_CONN`, `NGINX_ISSUE_RATE`) is not a whole number from 1 to 999999; or the service's routing argument is not `host` / `port` (an edited compose file) |
+| 65 | `terminate`: `NGINX_TLS_CERT` or `NGINX_TLS_KEY` is not a bare file name (`A-Z a-z 0-9 . _ -`), or that file in `compose/nginx/certs/` is missing, not a regular file, or empty |
 | 66 | an `NGINX_TRUSTED_PROXIES` entry is not an IP/CIDR with a prefix of at least `/8` (IPv4) or `/16` (IPv6); or, in `behind-proxy`, the list is empty or has no IPv4 entry |
 | 67 | a template is missing, or names a variable the entrypoint does not render — a damaged `nginx/templates/`, not a setting |
 | 68 | `behind-proxy` with `NGINX_BIND_ADDR` set to the unspecified address in any spelling |
-| 69 | `LANGFUSE_PUBLIC_URL` is not `https://<host>[:port]` (no path, no credentials, no bracketed IPv6), or under `nginx` names a host other than `langfuse.<GATEWAY_DOMAIN>` |
+| 69 | `LANGFUSE_PUBLIC_URL` is not `https://<host>[:port][/]` — a `:` with no port, a path, credentials, a bracketed IPv6 literal or a host that is neither a DNS name nor a valid IPv4 address is refused; or, under `nginx`, it names a host other than `langfuse.<GATEWAY_DOMAIN>` |
 
 Any other non-zero exit is `nginx -t` rejecting the rendered config; its own
 message is in the same log. Facts that surprise operators:
