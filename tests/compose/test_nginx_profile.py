@@ -297,8 +297,37 @@ def test_the_rendering_design_layout_is_in_place() -> None:
     }
     present = {p.relative_to(templates).as_posix() for p in templates.rglob("*") if p.is_file()}
 
-    assert expected <= present
+    # Exactly: a stray file here (the test-only proxy snippet, say) would ship.
+    assert present == expected
     assert (NGINX_DIR / "entrypoint.sh").is_file()
+
+
+def _locations(snippet: Path) -> dict[str, list[str]]:
+    """location -> its directives. Every directive in a snippet sits in a location."""
+    body = _directives(snippet.read_text())
+    blocks = re.findall(r"location\s+([^{;]+?)\s*\{([^{}]*)\}", body)
+    rest = re.sub(r"location\s+[^{;]+?\s*\{[^{}]*\}", "", body)
+    assert rest.strip() == "", (snippet.name, rest)
+    locations = {
+        name: [d.strip() for d in directives.split(";") if d.strip()] for name, directives in blocks
+    }
+    assert len(locations) == len(blocks), snippet.name
+    return locations
+
+
+# What the front door admits today: nothing. Tasks 3 and 5 replace these with
+# the allow-lists; the assertion evolves with them.
+ADMITTED_LOCATIONS = {
+    "gateway-locations.inc.template": {"/": ["return 404"]},
+    "langfuse-locations.inc.template": {"/": ["return 404"]},
+}
+
+
+@pytest.mark.parametrize("snippet", sorted(ADMITTED_LOCATIONS))
+def test_each_snippet_admits_exactly_the_pinned_locations(snippet: str) -> None:
+    path = NGINX_DIR / "templates" / "snippets" / snippet
+
+    assert _locations(path) == ADMITTED_LOCATIONS[snippet]
 
 
 TRUSTED_PEER_GATE = "if ($from_trusted_proxy = 0) { return 444; }"
@@ -444,6 +473,19 @@ def _depth_at(text: str, offset: int) -> int:
     return text.count("{", 0, offset) - text.count("}", 0, offset)
 
 
+# Conditional, so the loopback health probe (one request every few seconds) is
+# not logged — and still the one access_log directive.
+ACCESS_LOG = "access_log /dev/stdout corp_gate if=$corp_loggable;"
+
+
+def test_only_the_health_listener_is_kept_out_of_the_access_log() -> None:
+    body = re.sub(r"\s+", " ", _directives(HTTP_TEMPLATE.read_text()))
+
+    assert "map $server_port $corp_loggable { 8090 0; default 1; }" in body
+    assert body.count("$corp_loggable {") == 1
+    assert "listen 127.0.0.1:8090;" in body
+
+
 def test_there_is_exactly_one_access_log_and_it_names_the_format_beside_it() -> None:
     found = [
         (path, match)
@@ -451,12 +493,12 @@ def test_there_is_exactly_one_access_log_and_it_names_the_format_beside_it() -> 
         for match in re.finditer(r"\baccess_log\b[^;]*;", _directives(path.read_text()))
     ]
     assert [(path.name, match.group(0)) for path, match in found] == [
-        ("00-http.conf.template", "access_log /dev/stdout corp_gate;")
+        ("00-http.conf.template", ACCESS_LOG)
     ]
     body = re.sub(r"\$\{([A-Z_]+)\}", r"\1", _directives(HTTP_TEMPLATE.read_text()))
     # A quoted log_format string's braces are JSON, not blocks.
     body = re.sub(r"'[^']*'", "''", body)
-    access_log = body.index("access_log /dev/stdout corp_gate;")
+    access_log = body.index(ACCESS_LOG)
     # The http context: not inside a server, map or geo block of the template.
     assert _depth_at(body, access_log) == 0
     # Immediately after the log_format it names, never before it.

@@ -15,6 +15,7 @@ import contextlib
 import json
 import re
 import shutil
+import socket
 import subprocess
 import time
 import uuid
@@ -466,6 +467,23 @@ REFUSALS = [
     pytest.param(_trusted("10.0.0"), id="trusted-three-octets"),
     pytest.param(_trusted("10.0.0.0/8/8"), id="trusted-two-slashes"),
     pytest.param(_trusted("10.0.0.0/"), id="trusted-empty-prefix"),
+    # The listeners are IPv4: an IPv6-only list would 444 every peer.
+    pytest.param(
+        Refusal(
+            {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": "fd00::1"},
+            66,
+            ("NGINX_TRUSTED_PROXIES", "IPv4"),
+        ),
+        id="trusted-v6-only",
+    ),
+    pytest.param(
+        Refusal(
+            {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": "fd00::1 fd00::/16"},
+            66,
+            ("NGINX_TRUSTED_PROXIES", "IPv4"),
+        ),
+        id="trusted-v6-only-two",
+    ),
     pytest.param(
         Refusal(
             {**TERMINATE, "NGINX_TRUSTED_PROXIES": "0.0.0.0/0"},
@@ -540,8 +558,17 @@ LEAK_CANARY = "LEAK-CANARY-9c1e"
         f"http://u:{LEAK_CANARY}@{LANGFUSE_HOST}",
         f"https://langfuse.other.test/cb?token={LEAK_CANARY}",
         f"https://u:{LEAK_CANARY}/x@{LANGFUSE_HOST}",
+        f"https://langfuse.other.test/cb?email=alice@{LEAK_CANARY}.example",
+        f"https://langfuse.other.test#x@{LEAK_CANARY}",
     ],
-    ids=["https-userinfo", "http-userinfo", "query-string", "slash-in-userinfo"],
+    ids=[
+        "https-userinfo",
+        "http-userinfo",
+        "query-string",
+        "slash-in-userinfo",
+        "at-in-query",
+        "at-in-fragment",
+    ],
 )
 def test_the_langfuse_refusal_does_not_echo_a_credential(
     specs: dict[str, Spec], project: Path, value: str
@@ -635,6 +662,28 @@ def test_a_valid_config_starts(
         assert "not a domain" not in rendered.stdout
 
 
+@pytest.mark.parametrize(
+    "trusted",
+    ["fd00::1 10.0.0.0/8", "::ffff:10.1.2.3", "::FFFF:10.1.2.3"],
+    ids=["v6-beside-v4", "v4-mapped", "v4-mapped-upper"],
+)
+def test_a_trusted_list_with_an_ipv4_entry_starts(
+    specs: dict[str, Spec], project: Path, network: Network, trusted: str
+) -> None:
+    # trust_client=False: the test client's own IPv4 address must not be what
+    # satisfies the at-least-one-IPv4 rule.
+    env = {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": trusted}
+    with started(specs["host"], project, network, env, trust_client=False) as nginx:
+        dump = nginx.exec("nginx", "-T")
+
+    assert dump.returncode == 0, dump.stderr
+    directives = re.sub(r"#[^\n]*", "", dump.stdout)
+    assert _block(directives, "geo $realip_remote_addr $from_trusted_proxy") == [
+        "default 0;",
+        *(f"{entry} 1;" for entry in trusted.split()),
+    ]
+
+
 def _runtime_variables(text: str) -> set[str]:
     return set(re.findall(r"\$(?!\{)[a-z_][a-z0-9_]*", text))
 
@@ -690,7 +739,7 @@ def test_a_valid_behind_proxy_config_renders_only_the_design(
         # none nginx logs its compiled-in `combined`, request line and all.
         directives = re.sub(r"#[^\n]*", "", dump.stdout)
         assert re.findall(r"^\s*access_log\s+([^;]+);", directives, re.MULTILINE) == [
-            "/dev/stdout corp_gate"
+            "/dev/stdout corp_gate if=$corp_loggable"
         ]
         assert re.findall(r"^\s*error_log\s+([^;]+);", directives, re.MULTILINE) == [
             "/dev/stderr crit"
@@ -815,6 +864,24 @@ def test_the_trusted_list_renders_one_real_ip_line_and_one_geo_entry_per_entry(
     ]
 
 
+HEALTH_PROBES = 5
+
+
+def test_the_health_probe_writes_no_access_entry(
+    specs: dict[str, Spec], project: Path, network: Network
+) -> None:
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        for _ in range(HEALTH_PROBES):
+            assert nginx.exec(*HEALTH_PROBE).returncode == 0
+        assert nginx.status(8080, "/v1/models", GATEWAY_HOST) == 404
+        nginx.access_log(expected=1)
+        entries = _access_entries(nginx.log_streams()[0])
+
+    assert [(e["server_port"], e["uri"], e["status"]) for e in entries] == [
+        ("8080", "/v1/models", "404")
+    ]
+
+
 PROXY_CANARY = "LEAK-CANARY-7f3a"
 AUTHORIZATION = "Bearer sk-ant-api03-LEAK-AUTH-5d2b"
 CORP_AUTH = "corp-LEAK-TOKEN-8e4a"
@@ -903,6 +970,23 @@ PEER_PROBES = {
 }
 TRUSTED_STATUS = {"/stub/ok": 200, "/v1/models": 404, "/": 404}
 
+# HTTP/1.1 without a Host header: nginx refuses it while reading the headers.
+NO_HOST_REQUEST = (
+    f"GET /no-host-probe?code={PROXY_CANARY} HTTP/1.1\r\n"
+    f"X-Corp-Auth: {CORP_AUTH}\r\n"
+    "Connection: close\r\n\r\n"
+).encode()
+
+
+def _raw_exchange(port: int, request: bytes) -> bytes:
+    """Send bytes httpx would not (it always adds Host); read until nginx closes."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+        conn.sendall(request)
+        chunks = []
+        while chunk := conn.recv(65536):
+            chunks.append(chunk)
+    return b"".join(chunks)
+
 
 @pytest.mark.parametrize("routing", ["host", "port"])
 def test_an_untrusted_peer_gets_no_response_at_all(
@@ -912,6 +996,11 @@ def test_an_untrusted_peer_gets_no_response_at_all(
     stub_upstream: Stub,
     routing: str,
 ) -> None:
+    """Every request an untrusted peer gets past nginx's header parser is closed
+    with no response. nginx's own pre-phase errors — no ``Host``, ``Host: a..b``,
+    an oversized header — are answered 400 with ``Server: nginx`` before the
+    server-level ``if`` runs: a fingerprint, never request content, accepted by
+    the plan (Task 9 documents it)."""
     assert network.client_peer != UNTRUSTED_ONLY
     inject_test_only_proxy(project)
     env = {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": UNTRUSTED_ONLY}
@@ -920,19 +1009,26 @@ def test_an_untrusted_peer_gets_no_response_at_all(
     with started(specs[routing], project, network, env, trust_client=False) as nginx:
         for port, path, host in probes:
             assert nginx.status(port, path, host, "POST") == 444, (port, path, host)
-        # Naming a trusted address in X-Forwarded-For changes nothing: the gate
-        # reads the peer that connected, not what it claims.
+        # An untrusted peer cannot talk its way in by naming a trusted address in
+        # X-Forwarded-For. real_ip never rewrites for an untrusted peer, so this
+        # holds whether geo keys on $realip_remote_addr or $remote_addr; the
+        # trusted-peer test below is the one that tells the two apart.
         spoofed = nginx.status(
             8080, "/stub/ok", GATEWAY_HOST, headers={"X-Forwarded-For": UNTRUSTED_ONLY}
         )
         assert spoofed == 444
-        entries = nginx.access_log(expected=len(probes) + 1)
+        no_host = _raw_exchange(nginx.ports[8080], NO_HOST_REQUEST)
+        entries = nginx.access_log(expected=len(probes) + 2)
+        _assert_no_secret_in(nginx)
         assert nginx.exec(*HEALTH_PROBE).returncode == 0
 
+    assert no_host.startswith(b"HTTP/1.1 400 "), no_host
+    for sent in (b"no-host-probe", PROXY_CANARY.encode(), CORP_AUTH.encode()):
+        assert sent not in no_host, sent
     assert stub_upstream.hits() == hits
-    assert len(entries) == len(probes) + 1, entries
+    assert len(entries) == len(probes) + 2, entries
+    assert sorted(entry["status"] for entry in entries) == ["400"] + ["444"] * (len(probes) + 1)
     for entry in entries:
-        assert entry["status"] == "444", entry
         assert entry["realip_remote_addr"] == network.client_peer, entry
         assert entry["remote_addr"] == network.client_peer, entry
         assert entry["from_trusted_proxy"] == "0", entry
@@ -950,6 +1046,9 @@ def test_a_trusted_peer_is_served_and_its_forwarded_client_is_logged(
     inject_test_only_proxy(project)
     hits = stub_upstream.hits()
     probes = PEER_PROBES[routing]
+    # Not in NGINX_TRUSTED_PROXIES. real_ip rewrites $remote_addr to it, so a geo
+    # keyed on $remote_addr would 444 every probe here; being served (and
+    # from_trusted_proxy "1") is what pins the gate to $realip_remote_addr.
     client = "203.0.113.9"
     # Host routing still drops a Host that names neither origin.
     expected = [

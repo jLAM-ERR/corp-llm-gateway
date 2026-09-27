@@ -26,6 +26,13 @@ map $http_host $proxy_host_header {
     ''      $host;
 }
 
+# The loopback health listener is probed every few seconds; its requests are
+# not logged. A separate access_log there would break the one-directive rule.
+map $server_port $corp_loggable {
+    8090    0;
+    default 1;
+}
+
 # A leak surface (invariants 1 and 4): no credential header, no body, no query
 # string. $uri is the normalized path without its arguments.
 log_format corp_gate escape=json
@@ -45,7 +52,7 @@ log_format corp_gate escape=json
     '"upstream_response_time":"$upstream_response_time"}';
 # The only access_log anywhere: one at server or location level would replace
 # it for that scope, and without it nginx logs `combined`, query string and all.
-access_log /dev/stdout corp_gate;
+access_log /dev/stdout corp_gate if=$corp_loggable;
 
 # Loopback only and never published: the compose healthcheck probes this, so
 # health does not depend on an upstream being up.

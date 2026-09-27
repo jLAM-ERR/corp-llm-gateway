@@ -123,17 +123,32 @@ is_trusted_entry() {
     [ "$prefix" -ge "$floor" ] && [ "$prefix" -le "$ceiling" ]
 }
 
+# An IPv4-mapped IPv6 address (::ffff:a.b.c.d) is looked up in geo's IPv4 tree.
+is_ipv4_entry() {
+    address=$(lowercase "${1%%/*}")
+    is_ipv4 "${address#::ffff:}"
+}
+
 NGINX_TRUSTED_PROXIES=${NGINX_TRUSTED_PROXIES:-}
 trusted_count=0
+ipv4_count=0
 # shellcheck disable=SC2086 # a space-separated list; globbing is off
 for entry in $NGINX_TRUSTED_PROXIES; do
     if ! is_trusted_entry "$entry"; then
         fail 66 "NGINX_TRUSTED_PROXIES entry '$entry' is not an IPv4/IPv6 address or CIDR with a prefix of at least /8 (IPv4) or /16 (IPv6)"
     fi
     trusted_count=$((trusted_count + 1))
+    if is_ipv4_entry "$entry"; then
+        ipv4_count=$((ipv4_count + 1))
+    fi
 done
 if [ "$NGINX_TLS_MODE" = behind-proxy ] && [ "$trusted_count" -eq 0 ]; then
     fail 66 "NGINX_TRUSTED_PROXIES is required in behind-proxy: the space-separated addresses/CIDRs of the TLS terminator"
+fi
+# The listeners are IPv4 (listen 8080) and neither geo nor set_real_ip_from
+# matches across address families: an IPv6-only list would refuse every peer.
+if [ "$NGINX_TLS_MODE" = behind-proxy ] && [ "$ipv4_count" -eq 0 ]; then
+    fail 66 "NGINX_TRUSTED_PROXIES has no IPv4 entry: the behind-proxy listeners are IPv4, so at least one IPv4 address/CIDR is required"
 fi
 
 # ---- 5. bind address (behind-proxy) -------------------------------------------
@@ -188,16 +203,31 @@ else
 fi
 
 # ---- 7. Langfuse public origin ------------------------------------------------
-# Scheme and host only, for messages: userinfo, path and query can hold secrets.
+# Scheme and host only, for messages: userinfo, path, query and fragment can
+# hold secrets. The authority ends at the first / ? or #, so an @ after it is
+# never read; an authority with an @ or a host that is not a hostname is not shown.
 url_origin() {
     scheme=
     case $1 in
         https://*) scheme=https:// ;;
         http://*) scheme=http:// ;;
     esac
-    rest=${1#*://}
-    rest=${rest##*@}
-    printf '%s%s' "$scheme" "${rest%%[/?#]*}"
+    authority=${1#*://}
+    authority=${authority%%[/?#]*}
+    case $authority in
+        *@*)
+            printf '%s<userinfo not shown>' "$scheme"
+            return
+            ;;
+    esac
+    host=${authority%%:*}
+    case $host in
+        '' | *[!A-Za-z0-9.-]*)
+            printf '%s<not shown>' "$scheme"
+            return
+            ;;
+    esac
+    printf '%s%s' "$scheme" "$host"
 }
 
 LANGFUSE_PUBLIC_URL=${LANGFUSE_PUBLIC_URL:-}
@@ -210,7 +240,7 @@ if [ "$routing" = host ]; then
     authority=${LANGFUSE_PUBLIC_URL#https://}
     authority=${authority%%[/?#]*}
     case $authority in
-        *@*) fail 69 "LANGFUSE_PUBLIC_URL must not carry credentials, got '$langfuse_origin' with userinfo (not shown)" ;;
+        *@*) fail 69 "LANGFUSE_PUBLIC_URL must not carry credentials (userinfo), got '$langfuse_origin'" ;;
     esac
     langfuse_host=$(lowercase "${authority%%:*}")
     if [ "$langfuse_host" != "langfuse.$GATEWAY_DOMAIN" ]; then
