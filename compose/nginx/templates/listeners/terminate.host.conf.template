@@ -1,0 +1,40 @@
+# terminate, host routing: nginx is the public TLS endpoint, so every client
+# is a peer and there is no trusted-peer gate. A TLS handshake for a name that
+# is neither origin (or for no name) is rejected: no certificate, no response.
+# No plain listener and no :80 redirect; HSTS only on the TLS blocks here.
+# nginx negotiates the protocol before SNI selects a server, so the protocol
+# and cipher lines repeat in the default_server.
+
+server {
+    listen 8080 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    return 444;
+}
+
+server {
+    listen 8080 ssl;
+    server_name gateway.${GATEWAY_DOMAIN};
+    ssl_certificate /etc/nginx/certs/${NGINX_TLS_CERT};
+    ssl_certificate_key /etc/nginx/certs/${NGINX_TLS_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    include /etc/nginx/rendered/snippets/gateway-locations.inc;
+}
+
+server {
+    listen 8080 ssl;
+    server_name langfuse.${GATEWAY_DOMAIN};
+    ssl_certificate /etc/nginx/certs/${NGINX_TLS_CERT};
+    ssl_certificate_key /etc/nginx/certs/${NGINX_TLS_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    include /etc/nginx/rendered/snippets/langfuse-locations.inc;
+}

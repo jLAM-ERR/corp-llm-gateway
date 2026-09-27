@@ -90,8 +90,8 @@ location / {
 }
 
 # add_header here REPLACES every add_header of an enclosing level, it does not
-# merge with them: a server-level header (HSTS) must be repeated here or set at
-# the http level.
+# merge with them. So this 429 carries no HSTS in terminate: a known gap, since
+# this snippet also serves behind-proxy, where HSTS on plain HTTP is wrong.
 location @rate_limited {
     default_type application/json;
     add_header Retry-After 1 always;

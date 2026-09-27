@@ -301,6 +301,8 @@ def test_the_rendering_design_layout_is_in_place() -> None:
         "00-http.conf.template",
         "listeners/behind-proxy.host.conf.template",
         "listeners/behind-proxy.port.conf.template",
+        "listeners/terminate.host.conf.template",
+        "listeners/terminate.port.conf.template",
         "snippets/gateway-locations.inc.template",
         "snippets/langfuse-locations.inc.template",
     }
@@ -705,29 +707,61 @@ def test_nextauth_url_keeps_the_tunnel_default_when_nothing_is_set(
 TRUSTED_PEER_GATE = "if ($from_trusted_proxy = 0) { return 444; }"
 GATE_MARKER = "corp_trusted_peer_gate"
 
+# TLSv1.2+ with forward-secret AEAD suites only (Mozilla "intermediate", no DHE).
+TLS_CIPHERS = ":".join(
+    [
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+        "ECDHE-RSA-AES128-GCM-SHA256",
+        "ECDHE-ECDSA-AES256-GCM-SHA384",
+        "ECDHE-RSA-AES256-GCM-SHA384",
+        "ECDHE-ECDSA-CHACHA20-POLY1305",
+        "ECDHE-RSA-CHACHA20-POLY1305",
+    ]
+)
+HSTS = 'add_header Strict-Transport-Security "max-age=31536000" always'
+TLS_POLICY = [
+    "ssl_protocols TLSv1.2 TLSv1.3",
+    f"ssl_ciphers {TLS_CIPHERS}",
+    "ssl_prefer_server_ciphers off",
+]
+CERT_AND_KEY = [
+    "ssl_certificate /etc/nginx/certs/NGINX_TLS_CERT",
+    "ssl_certificate_key /etc/nginx/certs/NGINX_TLS_KEY",
+]
+# Beside listen and server_name, the only directives a listener block may hold
+# besides its payload. Named one by one: a directive that is not here (another
+# ssl_* or add_header) is payload, and payload is pinned below.
+TLS_DIRECTIVES = {*TLS_POLICY, *CERT_AND_KEY, "ssl_reject_handshake on", HSTS}
+
+
+def _listener_blocks(template: Path) -> list[list[str]]:
+    """Each server block's directives, placeholders unwrapped and the gate as a marker."""
+    body = re.sub(r"#[^\n]*", "", template.read_text())
+    # An envsubst placeholder's braces are not nginx blocks.
+    body = re.sub(r"\$\{([A-Z_]+)\}", r"\1", body)
+    # The trusted-peer gate is the one nested block allowed, and only verbatim.
+    body = body.replace(TRUSTED_PEER_GATE, f"{GATE_MARKER};")
+    blocks = re.findall(r"server\s*\{([^{}]*)\}", body)
+    # A nested brace hides its server block from the pattern above.
+    assert blocks, template.name
+    assert len(re.findall(r"server\s*\{", body)) == len(blocks), template.name
+    return [[d.strip() for d in block.split(";") if d.strip()] for block in blocks]
+
 
 def test_every_listener_server_block_is_one_include_of_a_snippet() -> None:
     templates = sorted((NGINX_DIR / "templates" / "listeners").glob("*.template"))
     assert templates
     for template in templates:
-        body = re.sub(r"#[^\n]*", "", template.read_text())
-        # An envsubst placeholder's braces are not nginx blocks.
-        body = re.sub(r"\$\{([A-Z_]+)\}", r"\1", body)
-        # The trusted-peer gate is the one nested block allowed, and only verbatim.
-        body = body.replace(TRUSTED_PEER_GATE, f"{GATE_MARKER};")
-        blocks = re.findall(r"server\s*\{([^{}]*)\}", body)
-        # A nested brace hides its server block from the pattern above.
-        assert blocks, template.name
-        assert len(re.findall(r"server\s*\{", body)) == len(blocks), template.name
         gated = template.name.startswith("behind-proxy.")
-        for block in blocks:
-            directives = [d.strip() for d in block.split(";") if d.strip()]
+        for directives in _listener_blocks(template):
             if gated:
                 # Before anything else in the block, so nothing runs for an untrusted peer.
                 assert directives[0] == GATE_MARKER, (template.name, directives)
                 directives = directives[1:]
             payload = [
-                d for d in directives if not d.startswith(("listen ", "server_name ", "ssl_"))
+                d
+                for d in directives
+                if not d.startswith(("listen ", "server_name ")) and d not in TLS_DIRECTIVES
             ]
             assert payload in (
                 ["return 444"],
@@ -748,8 +782,96 @@ def test_both_behind_proxy_listeners_exist_and_every_server_block_is_gated() -> 
 
 def test_the_terminate_listeners_do_not_carry_the_trusted_peer_gate() -> None:
     # The terminate listener is the public TLS endpoint: every client is a peer.
-    for template in (NGINX_DIR / "templates" / "listeners").glob("terminate.*.template"):
+    templates = sorted((NGINX_DIR / "templates" / "listeners").glob("terminate.*.template"))
+    assert [t.name for t in templates] == [
+        "terminate.host.conf.template",
+        "terminate.port.conf.template",
+    ]
+    for template in templates:
         assert "$from_trusted_proxy" not in template.read_text(), template.name
+
+
+def _listens(directives: list[str]) -> list[str]:
+    return [d.removeprefix("listen ") for d in directives if d.startswith("listen ")]
+
+
+# (listen, what the block serves) per server block, in order.
+TERMINATE_BLOCKS = {
+    "host": [
+        ("8080 ssl default_server", "return 444"),
+        ("8080 ssl", "include /etc/nginx/rendered/snippets/gateway-locations.inc"),
+        ("8080 ssl", "include /etc/nginx/rendered/snippets/langfuse-locations.inc"),
+    ],
+    "port": [
+        ("8080 ssl default_server", "include /etc/nginx/rendered/snippets/gateway-locations.inc"),
+        ("8081 ssl default_server", "include /etc/nginx/rendered/snippets/langfuse-locations.inc"),
+    ],
+}
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_every_terminate_listener_speaks_tls_and_only_tls(routing: str) -> None:
+    template = NGINX_DIR / "templates" / "listeners" / f"terminate.{routing}.conf.template"
+    blocks = _listener_blocks(template)
+
+    assert [(_listens(d), d[-1]) for d in blocks] == [
+        ([listen], served) for listen, served in TERMINATE_BLOCKS[routing]
+    ]
+    for directives in blocks:
+        # nginx negotiates the protocol before SNI picks a server: every block,
+        # the default_server included, carries the same policy.
+        assert [d for d in directives if d in TLS_POLICY] == TLS_POLICY, directives
+        if directives[-1] == "return 444":
+            # Host routing's catch-all: no certificate, so no handshake either.
+            assert "ssl_reject_handshake on" in directives
+            assert not any(d.startswith("ssl_certificate") for d in directives)
+            assert HSTS not in directives
+        else:
+            assert [d for d in directives if d.startswith("ssl_certificate")] == CERT_AND_KEY
+            assert directives.count(HSTS) == 1
+            assert "ssl_reject_handshake on" not in directives
+
+
+def test_only_the_host_routing_catch_all_rejects_the_handshake() -> None:
+    listeners = NGINX_DIR / "templates" / "listeners"
+    rejecting = [
+        (template.name, directives[-1])
+        for template in sorted(listeners.glob("*.template"))
+        for directives in _listener_blocks(template)
+        if "ssl_reject_handshake on" in directives
+    ]
+
+    assert rejecting == [("terminate.host.conf.template", "return 444")]
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_the_behind_proxy_listeners_carry_no_tls_and_no_hsts(routing: str) -> None:
+    template = NGINX_DIR / "templates" / "listeners" / f"behind-proxy.{routing}.conf.template"
+    for directives in _listener_blocks(template):
+        assert not any(d in TLS_DIRECTIVES or d.startswith("ssl_") for d in directives)
+        assert all(
+            re.fullmatch(r"80(80|81) default_server|80(80|81)", x) for x in _listens(directives)
+        )
+
+
+def test_hsts_is_set_in_the_terminate_listeners_alone() -> None:
+    # Strict-Transport-Security on a plain-HTTP (behind-proxy) response is wrong,
+    # and the snippets serve both modes.
+    carriers = {
+        path.name
+        for path in _every_config_file()
+        if "strict-transport-security" in _directives(path.read_text()).lower()
+    }
+
+    assert carriers == {"terminate.host.conf.template", "terminate.port.conf.template"}
+
+
+def test_no_listener_redirects_to_https_or_listens_on_another_port() -> None:
+    for template in (NGINX_DIR / "templates" / "listeners").glob("*.template"):
+        text = _directives(template.read_text())
+        assert not re.search(r"\breturn\s+30[1278]\b|\brewrite\b", text), template.name
+        for listen in re.findall(r"^\s*listen\s+([^;]+);", text, re.MULTILINE):
+            assert listen.split()[0] in ("8080", "8081"), (template.name, listen)
 
 
 # --------------------------------------------------------------------------- #
@@ -1003,7 +1125,19 @@ def _git_ignores(path: str) -> bool:
 
 
 @pytest.mark.parametrize(
-    "name", ["privkey", "server.cer", "gateway.pem", "gateway.crt", "gateway.key", "a.p12", "a.pfx"]
+    "name",
+    [
+        "privkey",
+        "server.cer",
+        "gateway.pem",
+        "gateway.crt",
+        "gateway.key",
+        "a.p12",
+        "a.pfx",
+        # What scripts/deploy/make-selfsigned-certs.sh writes, staged names included.
+        "selfsigned-ca.crt",
+        ".gateway.key.new",
+    ],
 )
 def test_every_file_under_the_nginx_certs_dir_is_ignored(name: str) -> None:
     assert _git_ignores(f"compose/nginx/certs/{name}")
@@ -1011,6 +1145,43 @@ def test_every_file_under_the_nginx_certs_dir_is_ignored(name: str) -> None:
 
 def test_the_nginx_certs_readme_is_not_ignored() -> None:
     assert not _git_ignores("compose/nginx/certs/README.md")
+
+
+def _tracked(*pathspecs: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--", *pathspecs],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [name for name in result.stdout.split("\0") if name]
+
+
+def test_no_certificate_or_key_is_tracked_under_compose() -> None:
+    assert _tracked("compose/nginx/certs") == ["compose/nginx/certs/README.md"]
+    tracked = _tracked("compose")
+    assert tracked
+    assert [n for n in tracked if re.search(r"\.(pem|crt|cer|key|csr|p12|pfx)$", n, re.I)] == []
+    assert [n for n in tracked if "-----BEGIN" in (ROOT / n).read_text(errors="replace")] == []
+
+
+def test_the_certs_readme_covers_what_an_operator_must_supply() -> None:
+    text = (NGINX_DIR / "certs" / "README.md").read_text()
+    for needle in (
+        "NGINX_TLS_CERT",
+        "NGINX_TLS_KEY",
+        "gateway.<GATEWAY_DOMAIN>",
+        "langfuse.<GATEWAY_DOMAIN>",
+        "IP SAN",
+        "0600",
+        "on the server",
+        "make-selfsigned-certs.sh",
+        "--cacert",
+        "ACME",
+        "port 80",
+    ):
+        assert needle in text, needle
 
 
 # --------------------------------------------------------------------------- #

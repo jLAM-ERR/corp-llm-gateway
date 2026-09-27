@@ -21,6 +21,7 @@ import json
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import time
 import uuid
@@ -48,7 +49,7 @@ from tests.compose.nginx_container import (
     started,
     user_network,
 )
-from tests.compose.nginx_support import COMPOSE, NGINX_DIR, OAUTH
+from tests.compose.nginx_support import COMPOSE, NGINX_DIR, OAUTH, ROOT, skip_or_fail
 
 FIXTURES = Path(__file__).resolve().parent / "nginx_fixtures"
 TEST_ONLY_PROXY_SNIPPET = FIXTURES / "test-only-proxy-locations.inc.template"
@@ -83,6 +84,11 @@ TERMINATE: dict[str, str | None] = {
     "NGINX_TLS_KEY": "gateway.key",
 }
 BOTH_CERTS = {"gateway.crt": b"cert", "gateway.key": b"key"}
+
+MAKE_SELFSIGNED_CERTS = ROOT / "scripts" / "deploy" / "make-selfsigned-certs.sh"
+# The IP SAN: what a client dials under port routing, since Docker publishes on
+# loopback here.
+TLS_IP_SAN = "127.0.0.1"
 
 UNSET = None
 
@@ -195,6 +201,37 @@ def stub_upstream(network: Network) -> Iterator[Stub]:
 def project(tmp_path: Path) -> Path:
     """A per-test copy of compose/nginx/ for the bind mounts to point at."""
     return copy_nginx_dir(tmp_path)
+
+
+@pytest.fixture(scope="module")
+def tls_material(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The CA, leaf and key scripts/deploy/make-selfsigned-certs.sh makes, run
+    once on the host: the nginx image has no openssl."""
+    if shutil.which("openssl") is None:
+        skip_or_fail("openssl not on PATH — the self-signed helper needs it")
+    out = tmp_path_factory.mktemp("tls")
+    made = subprocess.run(
+        [str(MAKE_SELFSIGNED_CERTS), "--domain", DOMAIN, "--out", str(out), TLS_IP_SAN],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert made.returncode == 0, made.stderr
+    assert Path(made.stdout.strip()).samefile(out / "selfsigned-ca.crt")
+    return out
+
+
+def install_certs(project_dir: Path, material: Path) -> None:
+    """The leaf and its key into the per-test copy's certs/, as an operator would."""
+    for name in ("gateway.crt", "gateway.key"):
+        shutil.copy2(material / name, project_dir / "nginx" / "certs" / name)
+
+
+def _mode_env(mode: str, project_dir: Path, material: Path) -> dict[str, str | None]:
+    if mode == "terminate":
+        install_certs(project_dir, material)
+        return TERMINATE
+    return VALID_BEHIND_PROXY
 
 
 def inject_test_only_proxy(project_dir: Path) -> None:
@@ -630,41 +667,49 @@ def _runtime_variables(text: str) -> set[str]:
     return set(re.findall(r"\$(?!\{)[a-z_][a-z0-9_]*", text))
 
 
-RENDERED_FILES = {
-    "host": {
+def _rendered_files(mode: str, routing: str) -> dict[str, str]:
+    """rendered file -> the template it came from: the one listener of this
+    mode and routing, beside the http context and both snippets."""
+    return {
         "00-http.conf": "00-http.conf.template",
-        "10-behind-proxy.host.conf": "listeners/behind-proxy.host.conf.template",
+        f"10-{mode}.{routing}.conf": f"listeners/{mode}.{routing}.conf.template",
         "snippets/gateway-locations.inc": "snippets/gateway-locations.inc.template",
         "snippets/langfuse-locations.inc": "snippets/langfuse-locations.inc.template",
-    },
-    "port": {
-        "00-http.conf": "00-http.conf.template",
-        "10-behind-proxy.port.conf": "listeners/behind-proxy.port.conf.template",
-        "snippets/gateway-locations.inc": "snippets/gateway-locations.inc.template",
-        "snippets/langfuse-locations.inc": "snippets/langfuse-locations.inc.template",
-    },
-}
+    }
 
 
-@pytest.mark.parametrize("routing", ["host", "port"])
-def test_a_valid_behind_proxy_config_renders_only_the_design(
-    specs: dict[str, Spec], project: Path, network: Network, routing: str
+MODES_AND_ROUTINGS = [
+    pytest.param(mode, routing, id=f"{mode}-{routing}")
+    for mode in ("behind-proxy", "terminate")
+    for routing in ("host", "port")
+]
+
+
+@pytest.mark.parametrize(("mode", "routing"), MODES_AND_ROUTINGS)
+def test_a_valid_config_renders_only_the_design(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    tls_material: Path,
+    mode: str,
+    routing: str,
 ) -> None:
     spec = specs[routing]
-    with started(spec, project, network, VALID_BEHIND_PROXY) as nginx:
+    env = _mode_env(mode, project, tls_material)
+    with started(spec, project, network, env) as nginx:
         assert nginx.exec("nginx", "-t").returncode == 0
         # The compose healthcheck itself, as declared.
         assert nginx.exec(*spec.healthcheck).returncode == 0
 
         listing = nginx.exec("find", RENDERED, "-type", "f").stdout.split()
         assert {path.removeprefix(f"{RENDERED}/") for path in listing} == set(
-            RENDERED_FILES[routing]
+            _rendered_files(mode, routing)
         )
 
         leftover = nginx.exec("grep", "-R", "-n", "[$][{]", RENDERED)
         assert leftover.returncode == 1, leftover.stdout
 
-        for rendered_name, template_name in RENDERED_FILES[routing].items():
+        for rendered_name, template_name in _rendered_files(mode, routing).items():
             template = (NGINX_DIR / "templates" / template_name).read_text()
             rendered = nginx.exec("cat", f"{RENDERED}/{rendered_name}").stdout
             assert _runtime_variables(template) <= _runtime_variables(rendered), rendered_name
@@ -1961,3 +2006,249 @@ def test_a_gateway_429_passes_through_the_edge_untouched(
     assert b"E_RATE_LIMITED" not in answer.body
     assert len(stub_upstream.requests_since(seen)) == 1
     assert [(e["status"], e["upstream_status"]) for e in entries] == [("429", "429")]
+
+
+# --------------------------------------------------------------------------- #
+# TLS: terminate speaks it on every published listener, behind-proxy never
+# --------------------------------------------------------------------------- #
+
+HSTS_VALUE = "max-age=31536000"
+PUBLISHED_PORTS = ("8080", "8081")
+HEALTH_LISTEN = "127.0.0.1:8090"
+
+
+@dataclass(frozen=True)
+class TlsAnswer:
+    status: int
+    headers: dict[str, str]
+    version: str | None
+    cipher: str | None
+
+
+def _tls_context(material: Path) -> ssl.SSLContext:
+    """Verifies the chain against the helper's CA and the name or IP dialled —
+    never switched off: that would hide exactly the SAN mismatch it is about."""
+    return ssl.create_default_context(cafile=str(material / "selfsigned-ca.crt"))
+
+
+def _tls_request(
+    port: int,
+    server_hostname: str,
+    context: ssl.SSLContext,
+    path: str = "/v1/models",
+    host: str | None = None,
+) -> TlsAnswer:
+    """One HTTP/1.1 GET over TLS to 127.0.0.1:port, with ``server_hostname`` as
+    the SNI (none for an IP literal) and the name the certificate must carry.
+    A connection closed with no response is status 444."""
+    request = f"GET {path} HTTP/1.1\r\nHost: {host or server_hostname}\r\nConnection: close\r\n\r\n"
+    with (
+        socket.create_connection(("127.0.0.1", port), timeout=10) as raw,
+        context.wrap_socket(raw, server_hostname=server_hostname) as conn,
+    ):
+        version, cipher = conn.version(), conn.cipher()[0]
+        conn.sendall(request.encode())
+        chunks = []
+        while chunk := conn.recv(65536):
+            chunks.append(chunk)
+    received = b"".join(chunks)
+    if not received:
+        return TlsAnswer(444, {}, version, cipher)
+    head = received.split(b"\r\n\r\n", 1)[0].decode("latin-1").split("\r\n")
+    headers = {}
+    for line in head[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return TlsAnswer(int(head[0].split(" ", 2)[1]), headers, version, cipher)
+
+
+def _plain_headers(port: int, path: str, host: str) -> tuple[int, httpx.Headers]:
+    with httpx.Client(trust_env=False, timeout=10) as client:
+        response = client.get(f"http://127.0.0.1:{port}{path}", headers={"Host": host})
+    return response.status_code, response.headers
+
+
+@pytest.mark.parametrize(("mode", "routing"), MODES_AND_ROUTINGS)
+def test_tls_and_hsts_are_on_every_published_listener_in_terminate_alone(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    tls_material: Path,
+    stub_upstream: Stub,
+    mode: str,
+    routing: str,
+) -> None:
+    env = _mode_env(mode, project, tls_material)
+    context = _tls_context(tls_material)
+    # (port, name dialled, path, status): a proxied 200 and nginx's own 404 per origin.
+    if routing == "host":
+        probes = [
+            (8080, GATEWAY_HOST, "/v1/models", 200),
+            (8080, GATEWAY_HOST, "/ui", 404),
+            (8080, LANGFUSE_HOST, "/", 200),
+        ]
+    else:
+        probes = [
+            (8080, TLS_IP_SAN, "/v1/models", 200),
+            (8080, TLS_IP_SAN, "/ui", 404),
+            (8081, TLS_IP_SAN, "/", 200),
+        ]
+    with started(specs[routing], project, network, env) as nginx:
+        dump = nginx.exec("nginx", "-T")
+        if mode == "terminate":
+            answers = [
+                _tls_request(nginx.ports[port], name, context, path)
+                for port, name, path, _ in probes
+            ]
+            statuses = [a.status for a in answers]
+            hsts = [a.headers.get("strict-transport-security") for a in answers]
+        else:
+            plain = [
+                _plain_headers(nginx.ports[port], path, name) for port, name, path, _ in probes
+            ]
+            statuses = [status for status, _ in plain]
+            hsts = [headers.get("strict-transport-security") for _, headers in plain]
+        assert nginx.exec(*HEALTH_PROBE).returncode == 0
+
+    assert dump.returncode == 0, dump.stderr
+    directives = re.sub(r"#[^\n]*", "", dump.stdout)
+    listens = [
+        listen.split() for listen in re.findall(r"^\s*listen\s+([^;]+);", directives, re.MULTILINE)
+    ]
+    published = [listen for listen in listens if listen[0] in PUBLISHED_PORTS]
+    assert published
+    # Nothing else: no :80 redirect listener, no second scheme on another port.
+    assert sorted(" ".join(listen) for listen in listens if listen not in published) == [
+        HEALTH_LISTEN
+    ]
+    assert statuses == [status for *_, status in probes]
+    if mode == "terminate":
+        assert all("ssl" in listen[1:] for listen in published), published
+        assert hsts == [HSTS_VALUE] * len(probes)
+        assert re.search(r"^\s*ssl_protocols\s+TLSv1\.2 TLSv1\.3;", directives, re.MULTILINE)
+    else:
+        assert not any("ssl" in listen for listen in published), published
+        assert hsts == [None] * len(probes)
+        assert not re.search(r"^\s*ssl_", directives, re.MULTILINE)
+        assert "strict-transport-security" not in directives.lower()
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_terminate_serves_a_peer_outside_the_trusted_list(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    tls_material: Path,
+    stub_upstream: Stub,
+    routing: str,
+) -> None:
+    """The terminate listener is the public TLS endpoint: no 444 gate, so a peer
+    NGINX_TRUSTED_PROXIES does not name is served like any other client."""
+    assert network.client_peer != UNTRUSTED_ONLY
+    install_certs(project, tls_material)
+    env = {**TERMINATE, "NGINX_TRUSTED_PROXIES": UNTRUSTED_ONLY}
+    name = GATEWAY_HOST if routing == "host" else TLS_IP_SAN
+    seen = len(stub_upstream.requests())
+    with started(specs[routing], project, network, env, trust_client=False) as nginx:
+        answer = _tls_request(nginx.ports[8080], name, _tls_context(tls_material))
+        entries = nginx.access_log(expected=1)
+
+    assert answer.status == 200
+    assert [(r["method"], r["target"]) for r in stub_upstream.requests_since(seen)] == [
+        ("GET", "/v1/models")
+    ]
+    assert [(e["status"], e["from_trusted_proxy"], e["realip_remote_addr"]) for e in entries] == [
+        ("200", "0", network.client_peer)
+    ]
+
+
+# SNI values host routing has no certificate for; an IP literal sends no SNI.
+UNMATCHED_SNI = ("other.example.test", f"{GATEWAY_HOST}.evil.test", DOMAIN, TLS_IP_SAN)
+
+
+def test_terminate_host_routing_rejects_the_handshake_for_an_unmatched_name(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    tls_material: Path,
+    stub_upstream: Stub,
+) -> None:
+    install_certs(project, tls_material)
+    context = _tls_context(tls_material)
+    hits = stub_upstream.hits()
+    with started(specs["host"], project, network, TERMINATE) as nginx:
+        port = nginx.ports[8080]
+        rejected = {}
+        for name in UNMATCHED_SNI:
+            with pytest.raises(ssl.SSLError) as refused:
+                _tls_request(port, name, context)
+            rejected[name] = refused.value
+        # A name the certificate carries, then a Host that names neither origin:
+        # the handshake succeeds and the catch-all closes with no response.
+        foreign_host = _tls_request(port, GATEWAY_HOST, context, "/", host="other.example.test")
+        served = _tls_request(port, GATEWAY_HOST, context)
+
+    for name, error in rejected.items():
+        # nginx's alert, not this client's verification: no certificate was sent.
+        assert not isinstance(error, ssl.SSLCertVerificationError), (name, error)
+        assert "UNRECOGNIZED_NAME" in str(error).upper(), (name, error)
+    assert foreign_host.status == 444
+    assert served.status == 200
+    assert stub_upstream.hits() == hits + 1
+
+
+def test_the_helpers_certificate_verifies_by_name_and_ip_san_and_by_nothing_else(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    tls_material: Path,
+    stub_upstream: Stub,
+) -> None:
+    """Port routing presents the certificate whatever the name, so the client's
+    check against the helper's CA is what decides — the ⛔8 SAN rule."""
+    install_certs(project, tls_material)
+    context = _tls_context(tls_material)
+    with started(specs["port"], project, network, TERMINATE) as nginx:
+        verified = [
+            _tls_request(nginx.ports[port], name, context, path).status
+            for port, path in ((8080, "/v1/models"), (8081, "/"))
+            for name in (GATEWAY_HOST, LANGFUSE_HOST, TLS_IP_SAN)
+        ]
+        refused = {}
+        # Dials 127.0.0.1 either way; the certificate carries neither.
+        for name in ("localhost", "10.9.9.9"):
+            with pytest.raises(ssl.SSLCertVerificationError) as mismatch:
+                _tls_request(nginx.ports[8080], name, context)
+            refused[name] = mismatch.value
+
+    assert verified == [200] * 6
+    for name, error in refused.items():
+        assert "mismatch" in error.verify_message.lower(), (name, error.verify_message)
+
+
+def test_terminate_negotiates_tls_1_2_or_later_with_a_forward_secret_aead_suite(
+    specs: dict[str, Spec], project: Path, network: Network, tls_material: Path
+) -> None:
+    install_certs(project, tls_material)
+    newest = _tls_context(tls_material)
+    tls12 = _tls_context(tls_material)
+    tls12.maximum_version = ssl.TLSVersion.TLSv1_2
+    # A CBC suite this client supports and nginx's OpenSSL would accept by
+    # default; ssl_ciphers is what refuses it.
+    cbc_only = _tls_context(tls_material)
+    cbc_only.maximum_version = ssl.TLSVersion.TLSv1_2
+    cbc_only.set_ciphers("ECDHE-ECDSA-AES128-SHA256")
+    with started(specs["port"], project, network, TERMINATE) as nginx:
+        port = nginx.ports[8080]
+        latest = _tls_request(port, TLS_IP_SAN, newest, "/ui")
+        pinned = _tls_request(port, TLS_IP_SAN, tls12, "/ui")
+        with pytest.raises(ssl.SSLError) as refused:
+            _tls_request(port, TLS_IP_SAN, cbc_only, "/ui")
+
+    assert (latest.status, latest.version) == (404, "TLSv1.3")
+    assert (pinned.status, pinned.version) == (404, "TLSv1.2")
+    assert pinned.cipher is not None
+    assert re.fullmatch(
+        r"ECDHE-(ECDSA|RSA)-(AES(128|256)-GCM-SHA(256|384)|CHACHA20-POLY1305)", pinned.cipher
+    )
+    assert not isinstance(refused.value, ssl.SSLCertVerificationError)
