@@ -149,9 +149,9 @@ def test_keycloak_egress_is_off_by_default() -> None:
 
 def test_keycloak_egress_renders_one_rule_for_the_configured_cidr_and_port() -> None:
     rules = _egress_rules(
-        "keycloak.egress.enabled=true",
-        "keycloak.egress.cidr=10.20.30.40/32",
-        "keycloak.egress.port=8443",
+        "networkPolicy.keycloak.enabled=true",
+        "networkPolicy.keycloak.cidr=10.20.30.40/32",
+        "networkPolicy.keycloak.port=8443",
     )
 
     assert _ip_rules(rules) == [
@@ -163,21 +163,32 @@ def test_keycloak_egress_renders_one_rule_for_the_configured_cidr_and_port() -> 
 
 
 def test_keycloak_egress_port_defaults_to_443() -> None:
-    rules = _egress_rules("keycloak.egress.enabled=true", "keycloak.egress.cidr=10.20.30.40/32")
+    rules = _egress_rules(
+        "networkPolicy.keycloak.enabled=true", "networkPolicy.keycloak.cidr=10.20.30.40/32"
+    )
 
     assert _ip_rules(rules)[0]["ports"] == [{"protocol": "TCP", "port": 443}]
 
 
 def test_keycloak_egress_without_a_cidr_fails_the_render() -> None:
-    result = _render("networkPolicy.enabled=true", "keycloak.egress.enabled=true")
+    result = _render("networkPolicy.enabled=true", "networkPolicy.keycloak.enabled=true")
 
     assert result.returncode != 0
-    assert "keycloak.egress.cidr is required" in result.stderr
+    assert "networkPolicy.keycloak.cidr is required" in result.stderr
 
 
 def test_keycloak_egress_needs_the_network_policy_enabled() -> None:
-    result = _render("keycloak.egress.enabled=true", "keycloak.egress.cidr=10.20.30.40/32")
+    result = _render(
+        "networkPolicy.keycloak.enabled=true", "networkPolicy.keycloak.cidr=10.20.30.40/32"
+    )
 
     assert result.returncode == 0, result.stderr
     docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
     assert not any(doc.get("kind") == "NetworkPolicy" for doc in docs)
+
+
+def test_keycloak_egress_knobs_sit_under_network_policy() -> None:
+    values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
+
+    assert "keycloak" not in values
+    assert values["networkPolicy"]["keycloak"] == {"enabled": False, "cidr": "", "port": 443}

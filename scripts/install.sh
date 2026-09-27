@@ -14,7 +14,8 @@
 #   2. Signs you in to Keycloak (RFC 8628 device flow, KEYCLOAK_ISSUER +
 #      KEYCLOAK_CLIENT_ID), trades the access token at the gateway's
 #      /internal/issue-token for a 30-day corp token and writes it 0600 to
-#      ~/.corp-llm-gateway/token. With KEYCLOAK_ISSUER unset it skips this step.
+#      $CORP_GATEWAY_TOKEN_FILE (default ~/.corp-llm-gateway/token). With
+#      KEYCLOAK_ISSUER unset it skips this step.
 #   3. Smokes the gateway with your subscription token (ANTHROPIC_AUTH_TOKEN);
 #      skipped when that is unset.
 #
@@ -27,13 +28,17 @@ KEYCLOAK_ISSUER="${KEYCLOAK_ISSUER:-}"
 KEYCLOAK_ISSUER="${KEYCLOAK_ISSUER%/}"
 KEYCLOAK_CLIENT_ID="${KEYCLOAK_CLIENT_ID:-}"
 INSTALL_DIR="${HOME}/.corp-llm-gateway"
-TOKEN_FILE="${INSTALL_DIR}/token"
+TOKEN_FILE="${CORP_GATEWAY_TOKEN_FILE:-${INSTALL_DIR}/token}"
 VERSION_FILE="${INSTALL_DIR}/VERSION"
 INSTALLED_VERSION="${CORP_GATEWAY_VERSION:-dev}"
 
 # Marker lines for rc updates — install rewrites between these markers.
 RC_MARK_BEGIN="# >>> corp-llm-gateway >>>"
 RC_MARK_END="# <<< corp-llm-gateway <<<"
+
+TOKEN_SHAPE='^[A-Za-z0-9._~+/=-]+$'
+STATUS_SHAPE='^[0-9]{3}$'
+TRANSIENT_POLL_LIMIT=5
 
 log() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[install:error]\033[0m %s\n' "$*" >&2; }
@@ -53,8 +58,31 @@ if [[ -n "$KEYCLOAK_ISSUER" && -z "$KEYCLOAK_CLIENT_ID" ]]; then
     exit 1
 fi
 
+LOOPBACK_HTTP='^http://(localhost|127\.0\.0\.1)(:[0-9]+)?(/|$)'
+if [[ -n "$KEYCLOAK_ISSUER" && "$KEYCLOAK_ISSUER" != https://* ]] \
+    && ! [[ "$KEYCLOAK_ISSUER" =~ $LOOPBACK_HTTP ]]; then
+    err "KEYCLOAK_ISSUER must be an https:// URL (plain http only for localhost / 127.0.0.1)"
+    exit 1
+fi
+
+# The path is written into the rc file inside single quotes.
+case "$TOKEN_FILE" in
+    /*) ;;
+    *)
+        err "CORP_GATEWAY_TOKEN_FILE must be an absolute path"
+        exit 1
+        ;;
+esac
+case "$TOKEN_FILE" in
+    *"'"* | *$'\n'*)
+        err "CORP_GATEWAY_TOKEN_FILE must not contain a quote or a newline"
+        exit 1
+        ;;
+esac
+
 mkdir -p "$INSTALL_DIR"
 chmod 700 "$INSTALL_DIR"
+mkdir -p "$(dirname "$TOKEN_FILE")"
 
 # 1. Detect shell + rc file ---------------------------------------------------
 detect_rc_file() {
@@ -146,6 +174,20 @@ error_code() {
     fi
 }
 
+is_json_object() {
+    printf '%s' "$1" | jq -e 'type == "object"' >/dev/null 2>&1
+}
+
+# A poll answer worth retrying: 5xx, or anything but a 4xx that is not JSON
+# (an ingress error page, a truncated body).
+poll_is_transient() {
+    case "$1" in
+        4??) return 1 ;;
+        5??) return 0 ;;
+    esac
+    ! is_json_object "$2"
+}
+
 positive_int_or() {
     local pattern='^[0-9]+$'
     if [[ "$1" =~ $pattern ]] && [[ "$1" -ge 1 ]]; then
@@ -206,18 +248,39 @@ keycloak_device_login() {
 data-urlencode = $(curl_cfg_quote "device_code=$device_code")
 data-urlencode = $(curl_cfg_quote "client_id=$KEYCLOAK_CLIENT_ID")"
 
+    local transient=0 last
     while [[ "$SECONDS" -lt "$deadline" ]]; do
         sleep "$interval"
-        if ! resp="$(http_post "$token_url" "$poll_cfg")"; then
-            err "lost the connection to Keycloak while waiting for sign-in"
-            exit 1
+        status=""
+        body=""
+        if resp="$(http_post "$token_url" "$poll_cfg" 2>/dev/null)"; then
+            status="${resp##*$'\n'}"
+            body="${resp%$'\n'*}"
         fi
-        status="${resp##*$'\n'}"
-        body="${resp%$'\n'*}"
+        if ! [[ "$status" =~ $STATUS_SHAPE ]] || poll_is_transient "$status" "$body"; then
+            transient=$(( transient + 1 ))
+            if [[ "$status" =~ $STATUS_SHAPE ]]; then
+                last="HTTP $status"
+            else
+                last="no answer"
+            fi
+            if [[ "$transient" -gt "$TRANSIENT_POLL_LIMIT" ]]; then
+                err "Keycloak token request failed $transient times in a row (last: $last)"
+                exit 1
+            fi
+            log "Keycloak token request failed ($last); retrying ($transient/$TRANSIENT_POLL_LIMIT)"
+            continue
+        fi
+        transient=0
         if [[ "$status" == "200" ]]; then
             OIDC_ACCESS_TOKEN="$(json_get "$body" '.access_token')"
             if [[ -z "$OIDC_ACCESS_TOKEN" ]]; then
                 err "Keycloak answered without an access token"
+                exit 1
+            fi
+            if ! [[ "$OIDC_ACCESS_TOKEN" =~ $TOKEN_SHAPE ]]; then
+                OIDC_ACCESS_TOKEN=""
+                err "Keycloak's access token has an unexpected shape"
                 exit 1
             fi
             return
@@ -244,14 +307,38 @@ data-urlencode = $(curl_cfg_quote "client_id=$KEYCLOAK_CLIENT_ID")"
     exit 1
 }
 
+# Follows a symlinked token file to its target (no `readlink -f` on macOS).
+resolve_symlinks() {
+    local path="$1" target hops=0
+    while [[ -L "$path" ]]; do
+        hops=$(( hops + 1 ))
+        if [[ "$hops" -gt 16 ]]; then
+            err "too many symlinks at $1"
+            exit 1
+        fi
+        target="$(readlink "$path")"
+        case "$target" in
+            /*) path="$target" ;;
+            *) path="$(dirname "$path")/$target" ;;
+        esac
+    done
+    printf '%s' "$path"
+}
+
 write_token_file() {
-    local tmp="$TOKEN_FILE.tmp.$$"
+    local dest tmp
+    dest="$(resolve_symlinks "$TOKEN_FILE")" || exit 1
+    if [[ -d "$dest" ]]; then
+        err "$TOKEN_FILE is a directory"
+        exit 1
+    fi
+    tmp="$dest.tmp.$$"
     (
         umask 077
         printf '%s\n' "$1" > "$tmp"
     )
     chmod 600 "$tmp"
-    mv -f "$tmp" "$TOKEN_FILE"
+    mv -f "$tmp" "$dest"
 }
 
 issue_corp_token() {
@@ -264,7 +351,7 @@ issue_corp_token() {
     keycloak_device_login
 
     log "exchanging the Keycloak sign-in for a corp token at $GATEWAY_URL"
-    local resp status body code corp_token expires_at pattern='^[A-Za-z0-9._~+/=-]+$'
+    local resp status body code corp_token expires_at expires_shape='^[0-9T:+.Z-]{1,40}$'
     if ! resp="$(http_post "$GATEWAY_URL/internal/issue-token" \
         "header = $(curl_cfg_quote "Authorization: Bearer $OIDC_ACCESS_TOKEN")
 header = \"Content-Length: 0\"")"; then
@@ -282,12 +369,17 @@ header = \"Content-Length: 0\"")"; then
     fi
     corp_token="$(json_get "$body" '.corp_token')"
     expires_at="$(json_get "$body" '.expires_at')"
-    if ! [[ "$corp_token" =~ $pattern ]]; then
+    if ! [[ "$corp_token" =~ $TOKEN_SHAPE ]]; then
         err "the gateway answered without a usable corp token"
         exit 1
     fi
     write_token_file "$corp_token"
-    log "corp token written to $TOKEN_FILE (expires ${expires_at:-in 30 days})"
+    log "corp token written to $TOKEN_FILE"
+    if [[ "$expires_at" =~ $expires_shape ]]; then
+        log "expires_at: $expires_at"
+    else
+        log "expires_at: (unparseable)"
+    fi
 }
 
 # 3. Smoke test ---------------------------------------------------------------

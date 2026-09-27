@@ -131,14 +131,17 @@ tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipp
 ### Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh \
+  | KEYCLOAK_ISSUER='https://keycloak.corp.lan/realms/corp' KEYCLOAK_CLIENT_ID='corp-gateway-cli' bash
 ```
 
 What it does ([`scripts/install.sh`](scripts/install.sh)):
 
 1. Detects shell (bash / zsh / fish), writes `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `CORP_GATEWAY_TOKEN_FILE`, and (for Claude Code) `ANTHROPIC_CUSTOM_HEADERS` into your rc file between `# >>> corp-llm-gateway >>>` markers.
-2. Runs Keycloak device-flow OAuth and writes a 30-day corp token to `~/.corp-llm-gateway/token` (`0600`).
-3. Smokes the gateway with a redactable string and verifies round-trip.
+2. Signs you in to Keycloak (device flow: open the printed URL and approve), trades that sign-in at the gateway for a 30-day corp token, and writes it to `~/.corp-llm-gateway/token` (`0600`; set `CORP_GATEWAY_TOKEN_FILE` to use another path).
+3. Smoke-tests the gateway with your subscription token, if `ANTHROPIC_AUTH_TOKEN` is exported; otherwise it says it skipped the test.
+
+Without `KEYCLOAK_ISSUER` the installer writes the rc block only: it issues no token, prints how to get one (ask your gateway operator), and exits 0. `CORP_GATEWAY_URL` overrides the default gateway URL (`https://gateway.corp.lan`).
 
 Re-running the installer is idempotent — it rotates the token and rewrites the rc block.
 

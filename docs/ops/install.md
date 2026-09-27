@@ -143,10 +143,28 @@ The gateway image mounts these onto LiteLLM's ASGI app (probes target them):
 - `GET  /metrics` — Prometheus scrape (the series ship with the metrics module; see `configuration.md`)
 
 `POST /internal/issue-token` is **not served today**, although `scripts/install.sh`
-still calls it: the health router is mounted without a `TokenIssuer`, and the route
-gate leaves the path unlisted, so it answers 404 `route_gate_unlisted`. Until it is
-wired, mint tokens with `gateway-admin token issue` (see `admin-cli.md`) and hand
-them to developers out-of-band.
+calls it after the Keycloak sign-in: the health router is mounted without a
+`TokenIssuer`, and the route gate leaves the path unlisted, so it answers 404
+`route_gate_unlisted`. Until it is wired, mint tokens with `gateway-admin token issue`
+(see `admin-cli.md`) and hand them to developers out-of-band.
+
+The developer installer reads these variables:
+
+- `KEYCLOAK_ISSUER` + `KEYCLOAK_CLIENT_ID` — the realm URL (`https://` only) and the
+  public client for the device flow. Export both:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh \
+    | KEYCLOAK_ISSUER='https://keycloak.corp.lan/realms/corp' KEYCLOAK_CLIENT_ID='corp-gateway-cli' bash
+  ```
+
+  Without `KEYCLOAK_ISSUER` the installer writes the rc block only, issues no
+  token, prints how to get one and exits 0 — the path to use until the route is
+  served.
+- `ANTHROPIC_AUTH_TOKEN` — the developer's subscription token; it drives the smoke
+  test, which is skipped with a message when it is unset.
+- `CORP_GATEWAY_URL` (default `https://gateway.corp.lan`) and
+  `CORP_GATEWAY_TOKEN_FILE` (default `~/.corp-llm-gateway/token`).
 
 ## Rollback
 

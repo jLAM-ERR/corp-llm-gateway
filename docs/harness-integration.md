@@ -96,6 +96,21 @@ user-service so it's always running. Example launchd plist in
 
 ## What `install.sh` does today
 
+Run it with the Keycloak realm and client exported:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh \
+  | KEYCLOAK_ISSUER='https://keycloak.corp.lan/realms/corp' KEYCLOAK_CLIENT_ID='corp-gateway-cli' bash
+```
+
+It signs you in to Keycloak (device flow), trades that sign-in at the gateway
+for a 30-day corp token, and writes it to `CORP_GATEWAY_TOKEN_FILE` (default
+`~/.corp-llm-gateway/token`, `0600`). If `ANTHROPIC_AUTH_TOKEN` is exported it
+also smoke-tests the gateway with it. Without `KEYCLOAK_ISSUER` it writes the
+rc block only, issues no token, prints how to get one and exits 0.
+
+The rc block it writes:
+
 ```bash
 ANTHROPIC_BASE_URL='https://gateway.corp.lan'
 OPENAI_BASE_URL='https://gateway.corp.lan/v1'

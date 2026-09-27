@@ -131,14 +131,17 @@ tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipp
 ### Установка
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh \
+  | KEYCLOAK_ISSUER='https://keycloak.corp.lan/realms/corp' KEYCLOAK_CLIENT_ID='corp-gateway-cli' bash
 ```
 
 Что он делает ([`scripts/install.sh`](scripts/install.sh)):
 
 1. Определяет shell (bash / zsh / fish), пишет `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `CORP_GATEWAY_TOKEN_FILE` и (для Claude Code) `ANTHROPIC_CUSTOM_HEADERS` в ваш rc-файл между маркерами `# >>> corp-llm-gateway >>>`.
-2. Выполняет OAuth device-flow через Keycloak и пишет 30-дневный корп-токен в `~/.corp-llm-gateway/token` (`0600`).
-3. Прогоняет smoke-тест шлюза строкой, подлежащей маскированию, и проверяет round-trip.
+2. Выполняет вход в Keycloak (device flow: откройте напечатанный URL и подтвердите вход), обменивает этот вход на шлюзе на 30-дневный корп-токен и пишет его в `~/.corp-llm-gateway/token` (`0600`; другой путь задаёт `CORP_GATEWAY_TOKEN_FILE`).
+3. Прогоняет smoke-тест шлюза с вашим токеном подписки, если экспортирован `ANTHROPIC_AUTH_TOKEN`; иначе сообщает, что тест пропущен.
+
+Без `KEYCLOAK_ISSUER` установщик пишет только rc-блок: токен не выпускается, установщик печатает, как его получить (у оператора шлюза), и завершается с кодом 0. `CORP_GATEWAY_URL` переопределяет URL шлюза по умолчанию (`https://gateway.corp.lan`).
 
 Повторный запуск установщика идемпотентен — он ротирует токен и перезаписывает rc-блок.
 
