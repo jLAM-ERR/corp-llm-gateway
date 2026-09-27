@@ -490,7 +490,8 @@ def build_health_router(
     Readiness probes Redis and Postgres (through the stores' connection path) only,
     plus, with issuance on, the token schema until it has been seen current: the
     entrypoint passes ``issuance_schema_verified`` from its boot check. Until then
-    issuance answers 503 ``E_ISSUE_SCHEMA``. NER readiness
+    issuance answers 503 ``E_ISSUE_SCHEMA``; readiness and the route share one
+    rate-limited re-check. NER readiness
     (`CORP_LLM_REQUIRE_NER`) and corp-NER readiness (`CORP_NER_ENABLED`) are NOT
     wired here: both need a detector built at import, and the entrypoint's
     contract is that nothing on the request path is constructed before litellm's

@@ -21,8 +21,9 @@ own in-flight cap and token bucket, answered with 429 without queueing. The
 issuer's work after the body (verifier and its JWKS fetch, team lookup, token
 store) is bounded too, by one bound: past it the request answers 503
 ``E_ISSUE_STORE_TIMEOUT`` and frees its slot. Until the token schema has been
-seen current (``IssuanceSchemaGate``) the route answers 503 ``E_ISSUE_SCHEMA``
-without touching the store. With no issuer
+seen current (``IssuanceSchemaGate``, re-checked at most once per interval
+across the route and readiness) the route answers 503 ``E_ISSUE_SCHEMA``. With
+no issuer
 the path is a local 404 for every method — it never falls through. Error bodies
 carry a code only, every issuance response is ``cache-control: no-store``, and
 the one log line per request carries the status and the code: never the bearer,
@@ -162,7 +163,10 @@ class HealthRouter:
                 await _issue_respond(send, 404, "E_ISSUE_DISABLED", body=method != "HEAD")
             elif method != "POST":
                 await _issue_respond(send, 405, "E_METHOD_NOT_ALLOWED", body=method != "HEAD")
-            elif self._issuance_schema is not None and not self._issuance_schema.verified:
+            elif (
+                self._issuance_schema is not None
+                and await self._issuance_schema.problem() is not None
+            ):
                 await _issue_respond(send, 503, "E_ISSUE_SCHEMA")
             else:
                 await self._handle_issue_token(self._issuer, scope, receive, send)
@@ -314,7 +318,7 @@ def build_health_router(
 
     ``token_issuer=None`` disables issuance: the path answers 404 locally.
     ``on_close`` runs once, at lifespan shutdown or on ``aclose()``.
-    ``issuance_schema`` unverified refuses issuance with 503 ``E_ISSUE_SCHEMA``.
+    ``issuance_schema`` not yet passing refuses issuance with 503 ``E_ISSUE_SCHEMA``.
     """
     return HealthRouter(
         live_check=live_check,

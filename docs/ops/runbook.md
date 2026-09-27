@@ -252,7 +252,7 @@ Symptom: `scripts/install.sh` prints an HTTP status and an error code from
 | `E_ISSUE_BUSY` | 503 | the subject's lock or statement timed out (5 s / 8 s); retry |
 | `E_JWKS_UNAVAILABLE` | 503 | the pod cannot fetch Keycloak's JWKS — NetworkPolicy (`networkPolicy.keycloak`), CA bundle, Keycloak itself |
 | `E_ISSUE_STORE_TIMEOUT` / `E_ISSUE_STORE_UNAVAILABLE` | 503 | Postgres slow or unreachable (see above) |
-| `E_ISSUE_SCHEMA` | 503 | the pod booted while Postgres was unreachable and has not yet seen `corp_tokens` current; `/healthz/ready` names the problem — apply `tokens/schema.sql` (`upgrade.md`); readiness re-checks every 15 s |
+| `E_ISSUE_SCHEMA` | 503 | the pod booted while Postgres was unreachable and has not yet seen `corp_tokens` current; `/healthz/ready` names the problem — apply `tokens/schema.sql` (`upgrade.md`); readiness and the route re-check at most every 15 s, so retry after that |
 
 ### Token revocation didn't take effect immediately
 

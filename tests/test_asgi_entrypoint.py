@@ -1169,16 +1169,21 @@ _SCHEMA_READINESS_SCRIPT = f"""
             gate._clock = lambda: now[0]
             steps["unmigrated_ready"] = await call("GET", "/healthz/ready")
             steps["unmigrated_issue"] = await call("POST", "/internal/issue-token")
+            steps["hammered"] = []
+            for _ in range(3):
+                steps["hammered"].append(await call("GET", "/healthz/ready"))
+                steps["hammered"].append(await call("POST", "/internal/issue-token"))
             conn = await asyncpg.connect(os.environ["UPSTREAM_PG_DSN"], timeout=5.0)
             try:
                 with open(os.environ["TOKENS_SCHEMA_SQL"]) as sql:
                     await conn.execute(sql.read())
             finally:
                 await conn.close()
-            steps["within_interval_ready"] = await call("GET", "/healthz/ready")
+            # No readiness call from here: the issuance attempt re-checks by itself.
+            steps["within_interval_issue"] = await call("POST", "/internal/issue-token")
             now[0] += gate._recheck_s
-            steps["migrated_ready"] = await call("GET", "/healthz/ready")
             steps["migrated_issue"] = await call("POST", "/internal/issue-token")
+            steps["migrated_ready"] = await call("GET", "/healthz/ready")
         else:
             steps["ready"] = [await call("GET", "/healthz/ready") for _ in range(3)]
         steps["queries"] = schema_queries[0]
@@ -1214,7 +1219,7 @@ def _issuance_bearer(issuer: str, key: object, jti: str) -> str:
     )
 
 
-def test_a_late_postgres_recovery_gates_readiness_and_issuance_on_the_token_schema(
+def test_a_late_postgres_recovery_gates_issuance_until_an_attempt_sees_the_schema(
     valid_config: Path,
     tmp_path: Path,
     pg_schema: tuple[str, Callable[[str], None]],
@@ -1259,10 +1264,11 @@ def test_a_late_postgres_recovery_gates_readiness_and_issuance_on_the_token_sche
     assert detail.startswith("issuance_schema: corp_tokens lacks the issuance columns")
     assert "tokens/schema.sql" in detail
     assert result["unmigrated_issue"] == [503, "E_ISSUE_SCHEMA"]
-    # Re-checked at most once per interval: still the cached answer.
-    assert result["within_interval_ready"] == result["unmigrated_ready"]
-    assert result["migrated_ready"] == [200, "ready"], result["stdout"]
+    # Re-checked at most once per interval across readiness and the route.
+    assert result["hammered"] == [result["unmigrated_ready"], [503, "E_ISSUE_SCHEMA"]] * 3
+    assert result["within_interval_issue"] == [503, "E_ISSUE_SCHEMA"]
     assert result["migrated_issue"] == [200, None], result["stdout"]
+    assert result["migrated_ready"] == [200, "ready"], result["stdout"]
     assert result["queries"] == 2
     assert "issuance schema check skipped" in result["stdout"]
     assert gateway_dsn not in result["stdout"]

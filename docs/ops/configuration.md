@@ -477,10 +477,13 @@ Exit 70 (`EX_SOFTWARE`): litellm started without a `CorpLlmGuardrail` callback.
 
 - issuance on and Postgres unreachable at boot (08xxx connection errors, 57P0x
   shutdown/starting up, 53300 too many connections, a socket error): the schema
-  check is skipped with a warning. Until readiness sees the schema current,
+  check is skipped with a warning. Until a re-check sees the schema current,
   `/healthz/ready` answers 503 (the store, then `issuance_schema: …` naming the
   remedy) and `POST /internal/issue-token` answers **503 `E_ISSUE_SCHEMA`**.
-  Readiness re-checks at most every 15 s and stops once the schema passes;
+  Readiness and issuance attempts both re-check, at most one query per 15 s
+  between them, and stop once the schema passes — so after applying
+  `tokens/schema.sql` the next issuance past the interval succeeds even where
+  nothing polls `/healthz/ready` (compose);
 - `CORP_LLM_MAX_INFLIGHT=0` outside prod: the cap is off, with a warning;
 - `CORP_LLM_DEV_TEAM_TOKEN` set with a DSN or in prod: ignored, with a warning.
 

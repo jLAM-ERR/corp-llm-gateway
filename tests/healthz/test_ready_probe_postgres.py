@@ -162,6 +162,7 @@ def test_the_probe_never_dials_a_bare_connect() -> None:
 
 ROOT = Path(__file__).resolve().parents[2]
 TOKENS_SCHEMA = ROOT / "src/corp_llm_gateway/tokens/schema.sql"
+TEAM_SCHEMA = ROOT / "src/corp_llm_gateway/team_config/schema.sql"
 
 
 @pytest.fixture
@@ -195,12 +196,78 @@ async def schema_dsn() -> AsyncIterator[tuple[str, Callable[[str], Awaitable[Non
         await execute(f"DROP SCHEMA {schema} CASCADE")
 
 
-def _enable_issuance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dsn: str) -> None:
+@pytest.fixture
+def jwks() -> Iterator[tuple[str, object]]:
+    """A loopback Keycloak realm URL serving a JWKS, and the RSA key it publishes."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    pytest.importorskip("cryptography")
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
+    document = json.dumps({"keys": [{**jwk, "kid": "kid-ready", "use": "sig", "alg": "RS256"}]})
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = document.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/realms/dev", key
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _bearer(issuer: str, key: object) -> str:
+    import time
+
+    import jwt
+
+    now = int(time.time())
+    return jwt.encode(
+        {
+            "iss": issuer,
+            "aud": "corp-gateway-issuance",
+            "azp": "corp-gateway-cli",
+            "sub": "sub-ready",
+            "jti": "jti-ready",
+            "iat": now,
+            "exp": now + 300,
+            "preferred_username": "alice.ready",
+            "groups": ["/devs"],
+        },
+        key,  # type: ignore[arg-type]
+        "RS256",
+        headers={"kid": "kid-ready", "typ": "JWT"},
+    )
+
+
+def _enable_issuance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dsn: str,
+    issuer: str = "https://kc.corp.lan/realms/dev",
+) -> None:
     pytest.importorskip("cryptography")
     cfg = tmp_path / "issuance.toml"
     cfg.write_text('[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]\n"/devs" = "t1"\n')
     monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
-    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", "https://kc.corp.lan/realms/dev")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", issuer)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_JWKS_URL", f"{issuer}/certs")
     monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_AUDIENCE", "corp-gateway-issuance")
     monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID", "corp-gateway-cli")
     monkeypatch.setenv("CORP_LLM_PG_DSN", dsn)
@@ -214,44 +281,71 @@ class _Clock:
         return self.now
 
 
-async def test_readiness_waits_for_the_token_schema_then_turns_ready(
-    schema_dsn: tuple, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+async def test_issuance_alone_recovers_once_the_token_schema_is_applied(
+    schema_dsn: tuple,
+    jwks: tuple[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    # No readiness call after the migration: an issuance attempt re-checks the
+    # schema itself, through the same throttle readiness uses.
     from corp_llm_gateway.healthz.checks import ISSUANCE_SCHEMA_RECHECK_S
 
     dsn, in_schema = schema_dsn
-    _enable_issuance(monkeypatch, tmp_path, dsn)
+    await in_schema(TEAM_SCHEMA.read_text())
+    await in_schema("INSERT INTO team_config (team_id, name) VALUES ('t1', 't1')")
+    issuer, key = jwks
+    _enable_issuance(monkeypatch, tmp_path, dsn, issuer)
+    queries = 0
+    real = pg_session.token_schema_problem
+
+    async def counting(conn: object, **kwargs: object) -> str | None:
+        nonlocal queries
+        queries += 1
+        return await real(conn, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pg_session, "token_schema_problem", counting)
     router = bootstrap.build_health_router(issuance_schema_verified=False)
     clock = _Clock()
     router._issuance_schema._clock = clock  # type: ignore[union-attr]
+    bearer = _bearer(issuer, key)
 
     async def call(method: str, path: str) -> httpx.Response:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=router), base_url="http://gw"
         ) as client:
-            return await client.request(
-                method, path, headers={"Authorization": "Bearer eyJ.not-a-jwt.sig"}
-            )
+            return await client.request(method, path, headers={"Authorization": f"Bearer {bearer}"})
 
     try:
         missing = await call("GET", "/healthz/ready")
-        refused = await call("POST", "/internal/issue-token")
+        hammered = []
+        for _ in range(3):
+            hammered.append(await call("POST", "/internal/issue-token"))
+            hammered.append(await call("GET", "/healthz/ready"))
         await in_schema(TOKENS_SCHEMA.read_text())
-        cached = await call("GET", "/healthz/ready")
+        within_interval = await call("POST", "/internal/issue-token")
+        queries_within_interval = queries
         clock.now += ISSUANCE_SCHEMA_RECHECK_S
+        issued = await call("POST", "/internal/issue-token")
         ready = await call("GET", "/healthz/ready")
-        past_the_gate = await call("POST", "/internal/issue-token")
     finally:
         await router.aclose()
         await _close_store()
 
     assert missing.status_code == 503
     assert missing.json()["detail"] == f"issuance_schema: {pg_session.TOKEN_SCHEMA_MISSING}"
-    assert (refused.status_code, refused.json()) == (503, {"error": "E_ISSUE_SCHEMA"})
-    assert cached.status_code == 503
+    assert [r.status_code for r in hammered] == [503] * 6
+    assert hammered[0].json() == {"error": "E_ISSUE_SCHEMA"}
+    assert (within_interval.status_code, within_interval.json()) == (
+        503,
+        {"error": "E_ISSUE_SCHEMA"},
+    )
+    assert queries_within_interval == 1
+    assert issued.status_code == 200, issued.text
+    assert sorted(issued.json()) == ["corp_token", "expires_at"]
     assert ready.status_code == 200, ready.text
-    # The route now verifies the bearer: the schema gate no longer answers.
-    assert past_the_gate.status_code == 401
+    # The miss, and the one re-check the route ran; the pass is cached for good.
+    assert queries == 2
 
 
 async def test_a_schema_verified_at_boot_is_not_queried_by_readiness(

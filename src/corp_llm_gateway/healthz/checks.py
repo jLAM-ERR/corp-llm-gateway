@@ -111,9 +111,10 @@ class IssuanceSchemaGate:
     """Whether the token schema issuance needs has been seen current.
 
     The boot's check passes it in as ``verified``; a boot that could not reach
-    Postgres leaves it unverified. Then ``problem()`` (readiness) runs ``check``
-    at most once per ``recheck_s``; once it passes it is never run again. The
-    issuance route reads ``verified`` only, so it never runs the query.
+    Postgres leaves it unverified. Then ``problem()`` runs ``check`` at most once
+    per ``recheck_s`` across all its callers (readiness and the issuance route,
+    so a deployment without a readiness poller still recovers); once it passes it
+    is never run again.
     """
 
     def __init__(

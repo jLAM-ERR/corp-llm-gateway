@@ -1,6 +1,6 @@
 """Readiness and the issuance route when the boot could not prove the token schema
-current (Postgres was unreachable then): readiness re-checks it, rate-limited, and
-the route refuses 503 `E_ISSUE_SCHEMA` from the cached result until it passes."""
+current (Postgres was unreachable then): readiness and the route both re-check it
+through one throttle, and the route refuses 503 `E_ISSUE_SCHEMA` until it passes."""
 
 from __future__ import annotations
 
@@ -109,17 +109,64 @@ async def test_an_unverified_schema_keeps_the_pod_unready_and_refuses_issuance()
     assert "tokens/schema.sql" in ready.json()["detail"]
     assert (issue.status_code, issue.json()) == (503, {"error": "E_ISSUE_SCHEMA"})
     assert issue.headers["cache-control"] == "no-store"
-    # The route reads the cached result; only readiness runs the query.
+    # Inside one interval the route answers from the cached result.
     assert check.calls == 1
 
 
-async def test_the_route_never_runs_the_schema_query() -> None:
-    check = _SchemaCheck(pg_session.TOKEN_SCHEMA_MISSING)
-    router = _router(IssuanceSchemaGate(check, verified=False, clock=_Clock()))
+async def test_the_route_rechecks_through_the_same_throttle_as_readiness() -> None:
+    clock = _Clock()
+    check = _SchemaCheck(pg_session.TOKEN_SCHEMA_MISSING, None)
+    router = _router(IssuanceSchemaGate(check, verified=False, clock=clock))
 
-    for _ in range(5):
+    for _ in range(3):
         assert (await _issue(router)).json() == {"error": "E_ISSUE_SCHEMA"}
-    assert check.calls == 0
+        assert (await _ready(router)).status_code == 503
+    assert check.calls == 1
+
+    clock.now += ISSUANCE_SCHEMA_RECHECK_S - 0.1
+    assert (await _issue(router)).json() == {"error": "E_ISSUE_SCHEMA"}
+    assert (await _ready(router)).status_code == 503
+    assert check.calls == 1
+
+
+async def test_an_issuance_attempt_alone_flips_the_gate_after_the_interval() -> None:
+    # No readiness poller (compose checks /healthz/live only): the route recovers by itself.
+    clock = _Clock()
+    check = _SchemaCheck(pg_session.TOKEN_SCHEMA_MISSING, None)
+    router = _router(IssuanceSchemaGate(check, verified=False, clock=clock))
+
+    assert (await _issue(router)).json() == {"error": "E_ISSUE_SCHEMA"}
+    clock.now += ISSUANCE_SCHEMA_RECHECK_S
+    issued = await _issue(router)
+    clock.now += 10 * ISSUANCE_SCHEMA_RECHECK_S
+    assert (await _issue(router)).status_code == 200
+    assert (await _ready(router)).status_code == 200
+
+    assert issued.status_code == 200
+    assert check.calls == 2
+
+
+async def test_concurrent_callers_share_one_check_per_interval() -> None:
+    import asyncio
+
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_check() -> str | None:
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return pg_session.TOKEN_SCHEMA_MISSING
+
+    router = _router(IssuanceSchemaGate(slow_check, verified=False, clock=_Clock()))
+    first = asyncio.create_task(_ready(router))
+    await asyncio.sleep(0.05)
+    others = await asyncio.gather(*(_issue(router) for _ in range(5)), _ready(router))
+    release.set()
+    await first
+
+    assert calls == 1
+    assert [r.status_code for r in others] == [503] * 6
 
 
 async def test_an_invalid_jti_index_names_its_remedy() -> None:

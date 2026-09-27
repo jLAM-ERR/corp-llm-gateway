@@ -22,8 +22,8 @@ In order —
    refuses the DSN (credentials, database name, DSN syntax) or whose
    ``corp_tokens`` lacks the issuance columns or the unique ``oidc_jti`` index. A
    Postgres the network cannot reach does not refuse the boot: readiness stays 503
-   and the issuance route answers 503 ``E_ISSUE_SCHEMA`` until readiness sees the
-   schema current.
+   and the issuance route answers 503 ``E_ISSUE_SCHEMA`` until a re-check (readiness
+   or an issuance attempt, at most one per 15 s) sees the schema current.
    Then the in-flight cap through ``settings.capacity()`` (also ``config check``'s):
    a non-integer, negative or oversized ``CORP_LLM_MAX_INFLIGHT``, ``0`` under
    ``CORP_ENV=prod|production``, or a bad ``CORP_LLM_CANCEL_GRACE_SECONDS``,

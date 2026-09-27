@@ -911,12 +911,14 @@ naming an unreadable `CORP_LLM_CA_BUNDLE`, or when Postgres refuses the DSN
 `corp_tokens`, and when `corp_tokens` lacks the issuance columns or a valid
 unique index `corp_tokens_oidc_jti_key` on `oidc_jti` alone. A Postgres the
 network cannot reach (08xxx, 57P0x, 53300, a socket error) warns and boots
-(`pg_session.BOOT_PROBE_OUTCOMES`), with the schema unchecked: until readiness
+(`pg_session.BOOT_PROBE_OUTCOMES`), with the schema unchecked: until a re-check
 sees it current, `/healthz/ready` is 503 and the route answers 503
-`E_ISSUE_SCHEMA` without touching the store. Readiness re-runs the same schema
-check at most every 15 s, over the token store's own pool, and stops once it
-passes (`healthz/checks.py` `IssuanceSchemaGate`); its detail names the problem
-and the remedy, never the DSN. Readiness reaches Postgres the way the stores do —
+`E_ISSUE_SCHEMA`. Readiness and the route itself both re-run the same schema
+check, sharing one throttle — at most one query per 15 s across both, over the
+token store's own pool — and stop once it passes (`healthz/checks.py`
+`IssuanceSchemaGate`), so a deployment whose healthcheck polls only
+`/healthz/live` (compose) still recovers on the next issuance attempt. The
+readiness detail names the problem and the remedy, never the DSN. Readiness reaches Postgres the way the stores do —
 the token store's pool, or before it exists one connection with the same
 keepalive startup parameters — so a PgBouncer that rejects them turns the pod
 unready (`postgres_error:StartupParameterRejectedError`).
