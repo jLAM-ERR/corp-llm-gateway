@@ -242,6 +242,47 @@ KEYS: tuple[Key, ...] = (
     Key("CORP_GATEWAY_OIDC_AUDIENCE", default="", help="expected RBAC JWT audience (aud); F11"),
     Key("CORP_GATEWAY_OIDC_ISSUER", default="", help="expected RBAC JWT issuer (iss); F11"),
     Key("CORP_GATEWAY_ADMIN_TOKEN", secret=True, default="", help="operator JWT for gateway-admin"),
+    # ── Developer token issuance (tokens/oidc_verifier.py, healthz/server.py) ─
+    # Unset issuer ⇒ issuance disabled; the rest is validated only when it is set.
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_ISSUER",
+        default="",
+        help="Keycloak realm issuer URL for /internal/issue-token; unset disables issuance",
+    ),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE",
+        default="",
+        help="expected issuance JWT aud; must differ from CORP_GATEWAY_OIDC_AUDIENCE",
+    ),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID",
+        default="",
+        help="Keycloak client id install.sh uses; the JWT azp must equal it",
+    ),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_JWKS_URL",
+        default="",
+        help="JWKS URL; unset → {issuer}/protocol/openid-connect/certs; HTTPS in prod",
+    ),
+    Key("CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM", default="groups", help="claim holding groups"),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP",
+        help="ordered group → team_id TOML table (config file only); first mapped group wins",
+    ),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM",
+        default="preferred_username",
+        help="claim used as user_id (falls back to sub)",
+    ),
+    Key("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", default="30", help="issued corp token lifetime"),
+    Key("CORP_GATEWAY_ISSUE_MAX_ACTIVE", default="2", help="live corp tokens per (iss, sub)"),
+    Key(
+        "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS",
+        default="600",
+        help="min seconds between issuances per (iss, sub)",
+    ),
+    Key("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", default="4", help="concurrent issuance requests"),
+    Key("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", default="30", help="issuance requests per minute"),
     # ── Providers (providers/registry.py) ────────────────────────────────────
     Key("CORP_ALLOW_V2_PROVIDERS", flag=True, default="0", help="allow non-v1 providers"),
     # ── Profiles (profiles/) ─────────────────────────────────────────────────
@@ -569,6 +610,151 @@ def _check_no_op_sanitizer(values: Mapping[str, str | None], problems: list[str]
     problems.append(NO_OP_SANITIZER_MESSAGE)
 
 
+ISSUANCE_TEAM_MAP_KEY = "CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"
+
+_ISSUANCE_BOUNDS: tuple[tuple[str, str], ...] = (
+    ("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", "token_ttl_days"),
+    ("CORP_GATEWAY_ISSUE_MAX_ACTIVE", "max_active"),
+    ("CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS", "min_interval_seconds"),
+    ("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", "max_inflight"),
+    ("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", "rate_per_minute"),
+)
+
+
+@dataclass(frozen=True)
+class IssuanceSettings:
+    """Resolved developer-token issuance config. Built by :func:`issuance`."""
+
+    issuer: str
+    audience: str
+    client_id: str
+    jwks_url: str
+    team_claim: str
+    team_map: tuple[tuple[str, str], ...]
+    user_claim: str
+    operator_audience: str
+    ca_bundle: str | None
+    token_ttl_days: int
+    max_active: int
+    min_interval_seconds: int
+    max_inflight: int
+    rate_per_minute: int
+
+
+def _stripped(values: Mapping[str, str | None], name: str) -> str:
+    return (values.get(name) or "").strip()
+
+
+def _url_problem(name: str, url: str, *, prod: bool) -> str | None:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.netloc:
+        return f"{name}: must be an absolute http(s) URL"
+    if prod and scheme != "https":
+        return f"{name}: must be HTTPS when CORP_ENV is prod/production"
+    return None
+
+
+def _issuance_team_map(
+    table: Mapping[str, object], problems: list[str]
+) -> tuple[tuple[str, str], ...]:
+    if not table:
+        problems.append(
+            f"{ISSUANCE_TEAM_MAP_KEY}: required when CORP_GATEWAY_ISSUE_OIDC_ISSUER is set — "
+            "a non-empty group → team_id TOML table in the config file (env vars cannot "
+            "carry tables)"
+        )
+        return ()
+    pairs: list[tuple[str, str]] = []
+    for group, team in table.items():
+        if not group.strip() or not isinstance(team, str) or not team.strip():
+            problems.append(
+                f"{ISSUANCE_TEAM_MAP_KEY}: every entry must map a group to a non-empty "
+                "team_id string"
+            )
+            return ()
+        pairs.append((group, team.strip()))
+    return tuple(pairs)
+
+
+def _build_issuance(
+    values: Mapping[str, str | None], table: Mapping[str, object], problems: list[str]
+) -> IssuanceSettings | None:
+    issuer = _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_ISSUER")
+    if not issuer:
+        return None
+    start = len(problems)
+    prod = _stripped(values, "CORP_ENV").lower() in ("prod", "production")
+    required = {
+        name: _stripped(values, name)
+        for name in ("CORP_GATEWAY_ISSUE_OIDC_AUDIENCE", "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID")
+    }
+    for name, value in required.items():
+        if not value:
+            problems.append(
+                f"{name}: required when CORP_GATEWAY_ISSUE_OIDC_ISSUER is set. "
+                f"{_BY_NAME[name].help}"
+            )
+    audience = required["CORP_GATEWAY_ISSUE_OIDC_AUDIENCE"]
+    operator_audience = _stripped(values, "CORP_GATEWAY_OIDC_AUDIENCE")
+    if audience and audience == operator_audience:
+        problems.append(
+            "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE must differ from CORP_GATEWAY_OIDC_AUDIENCE — "
+            "an operator RBAC token must never mint developer tokens"
+        )
+    jwks_url = (
+        _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_JWKS_URL")
+        or f"{issuer.rstrip('/')}/protocol/openid-connect/certs"
+    )
+    for name, url in (
+        ("CORP_GATEWAY_ISSUE_OIDC_ISSUER", issuer),
+        ("CORP_GATEWAY_ISSUE_OIDC_JWKS_URL", jwks_url),
+    ):
+        problem = _url_problem(name, url, prod=prod)
+        if problem is not None:
+            problems.append(problem)
+    team_map = _issuance_team_map(table, problems)
+    bounds: dict[str, int] = {}
+    for name, field_name in _ISSUANCE_BOUNDS:
+        raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+        try:
+            bounds[field_name] = int(raw)
+        except ValueError:
+            problems.append(f"{name}={raw!r} is not an integer")
+            continue
+        if bounds[field_name] <= 0:
+            problems.append(f"{name}: must be a positive integer")
+    if len(problems) > start:
+        return None
+    return IssuanceSettings(
+        issuer=issuer,
+        audience=audience,
+        client_id=required["CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID"],
+        jwks_url=jwks_url,
+        team_claim=_stripped(values, "CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM") or "groups",
+        team_map=team_map,
+        user_claim=_stripped(values, "CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM") or "preferred_username",
+        operator_audience=operator_audience,
+        ca_bundle=_stripped(values, "CORP_LLM_CA_BUNDLE") or None,
+        **bounds,
+    )
+
+
+def _check_issuance(values: Mapping[str, str | None], problems: list[str]) -> None:
+    _build_issuance(values, config.get_table(ISSUANCE_TEAM_MAP_KEY), problems)
+
+
+def issuance() -> IssuanceSettings | None:
+    """Resolve issuance config: ``None`` when disabled, :class:`ConfigError` when unsafe."""
+    problems: list[str] = []
+    result = _build_issuance(_resolve(), config.get_table(ISSUANCE_TEAM_MAP_KEY), problems)
+    if problems:
+        raise ConfigError(problems)
+    return result
+
+
 def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) -> bool:
     """Validate required-endpoint + choices with pydantic. Returns False if absent.
 
@@ -640,6 +826,7 @@ def validate() -> Settings:
     _check_no_op_sanitizer(values, problems)
     _check_forward_auth_exclusive(values, problems)
     _check_master_key_conflict(values, problems)
+    _check_issuance(values, problems)
     if problems:
         raise ConfigError(list(dict.fromkeys(problems)))
     return Settings(values=values)

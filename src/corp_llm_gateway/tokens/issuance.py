@@ -31,13 +31,25 @@ class OidcClaims:
     user_id: str
     team_id: str
     scopes: tuple[str, ...] = field(default_factory=tuple)
+    issuer: str = ""
+    subject: str = ""
+    jti: str = ""
 
 
 OidcVerifier = Callable[[str], Awaitable[OidcClaims]]
 
 
+# Exception args carry an error code only — never the token or a claim value (M1-14).
 class OidcVerificationError(Exception):
-    pass
+    """The bearer is not a valid issuance token (401)."""
+
+
+class OidcTeamMappingError(Exception):
+    """The token is valid but none of its groups maps to a team (403)."""
+
+
+class JwksUnavailableError(Exception):
+    """The issuer's signing keys could not be fetched (503)."""
 
 
 @dataclass(frozen=True)

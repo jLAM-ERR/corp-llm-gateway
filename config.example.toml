@@ -210,6 +210,37 @@
 # CORP_GATEWAY_OIDC_ISSUER    = "https://keycloak.corp.lan/realms/corp"
 # CORP_GATEWAY_ADMIN_TOKEN    = "eyJ..."
 
+# ── Developer token issuance (POST /internal/issue-token) ────────────────────
+#
+# install.sh runs the Keycloak device flow and trades the access JWT for a corp
+# token here. Unset ISSUER disables issuance. With ISSUER set, AUDIENCE,
+# CLIENT_ID and TEAM_MAP are required, or `config check` fails. The JWT is RS256
+# only; its azp must equal CLIENT_ID, and its aud must include AUDIENCE and must
+# NOT include CORP_GATEWAY_OIDC_AUDIENCE (so AUDIENCE must differ from it). The
+# issuer and JWKS URLs must be HTTPS when CORP_ENV is prod/production. The JWKS
+# is fetched without redirects, with a 3 s timeout, and verified against
+# CORP_LLM_CA_BUNDLE when that is set.
+# CORP_GATEWAY_ISSUE_OIDC_ISSUER     = "https://keycloak.corp.lan/realms/dev"
+# CORP_GATEWAY_ISSUE_OIDC_AUDIENCE   = "corp-gateway-issuance"
+# CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID  = "corp-gateway-cli"
+# CORP_GATEWAY_ISSUE_OIDC_JWKS_URL   = "https://keycloak.corp.lan/realms/dev/protocol/openid-connect/certs"
+# CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM = "groups"
+# CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM = "preferred_username"   # falls back to sub
+#
+# TEAM_MAP maps Keycloak groups to existing team_ids. It is a TOML table, so it
+# lives in this file only (env vars carry scalars). Order matters: the first
+# group in THIS order that the user belongs to wins. Unmapped users get 403.
+# Either inline (one line) or as a [CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP] section at
+# the END of the file (every key after a section header belongs to it).
+# CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP   = { "/devs/payments" = "payments", "/devs/core" = "core" }
+#
+# Minting policy and route bounds (all must be positive integers).
+# CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS       = "30"
+# CORP_GATEWAY_ISSUE_MAX_ACTIVE           = "2"     # live tokens per (iss, sub); oldest revoked
+# CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS = "600"   # one issuance per (iss, sub) per interval
+# CORP_GATEWAY_ISSUE_MAX_INFLIGHT         = "4"     # concurrent issuance requests (429 beyond)
+# CORP_GATEWAY_ISSUE_RATE_PER_MINUTE      = "30"    # issuance requests per minute (429 beyond)
+
 # ── Providers guard (providers/registry.py) ──────────────────────────────────
 #
 # CORP_ALLOW_V2_PROVIDERS = "1" unlocks non-v1 providers (Bedrock/Gemini/Azure);

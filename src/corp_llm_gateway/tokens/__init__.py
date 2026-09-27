@@ -9,7 +9,9 @@ from corp_llm_gateway.tokens.in_memory import InMemoryTokenStore
 from corp_llm_gateway.tokens.issuance import (
     DEFAULT_TOKEN_TTL_DAYS,
     IssueResult,
+    JwksUnavailableError,
     OidcClaims,
+    OidcTeamMappingError,
     OidcVerificationError,
     TokenIssuer,
 )
@@ -27,8 +29,10 @@ __all__ = [
     "InMemoryTokenStore",
     "InvalidTokenError",
     "IssueResult",
+    "JwksUnavailableError",
     "MissingTokenError",
     "OidcClaims",
+    "OidcTeamMappingError",
     "OidcVerificationError",
     "PostgresTokenStore",
     "RevokedTokenError",
