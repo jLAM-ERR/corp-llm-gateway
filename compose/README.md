@@ -28,9 +28,8 @@ off. Both run **this** stack. Short version:
   developer's own Anthropic subscription token upstream. `scripts/deploy/deploy.sh`
   deploys this mode by default. Developers get their `X-Corp-Auth` token from
   `scripts/install.sh` (Keycloak login → `POST /internal/issue-token`) once
-  issuance is configured — which this stack does not do yet: it passes no
-  `CORP_GATEWAY_ISSUE_*` key and mounts no `config.toml` for the team map (see
-  "Developer token issuance" below). Until then, `gateway-admin token issue`.
+  issuance is on: add the `docker-compose.issuance.yml` overlay (see "Developer
+  token issuance" below). `gateway-admin token issue` stays as break-glass.
 - **API-key mode (the compose default) — a test posture only.** `docker compose
   up -d`. `LITELLM_MASTER_KEY` is required and requests carry a LiteLLM virtual
   key, but there is **no way to issue one**: the route gate refuses `/key/*`, the
@@ -818,16 +817,34 @@ A bad value is a boot refusal (exit 78) with the key named in the log.
 
 ## Developer token issuance
 
-`POST /internal/issue-token` is off on this stack: the `litellm` service passes
-no `CORP_GATEWAY_ISSUE_*` key, and the team map
-(`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`) is a TOML table that only a mounted
-`config.toml` can carry. To turn it on, add the scalar keys to the service's
-`environment:` and mount a `config.toml` with the map at
-`/etc/corp-llm-gateway/config.toml` — `docs/ops/install.md`, "Developer
-onboarding", and `docs/ops/configuration.md`, "Developer token issuance". The
-`corp_tokens` schema staged by `deploy.sh` carries the issuance columns, but
-init scripts run only on an empty volume: on an existing one, re-run
-`tokens/schema.sql` first (`docs/ops/upgrade.md`).
+`POST /internal/issue-token` is off unless you add the optional
+`docker-compose.issuance.yml` overlay. The base stack passes no
+`CORP_GATEWAY_ISSUE_*` key and mounts no config file, so a subscription deploy
+without Keycloak is unaffected. To turn issuance on:
+
+1. `cp gateway/config.toml.example gateway/config.toml` and edit the team map
+   (`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`). It is a TOML table, so it can only live
+   in this file. Order matters: the first listed group the user belongs to wins.
+   `gateway/config.toml` is gitignored.
+2. Set the scalar keys — at least `CORP_GATEWAY_ISSUE_OIDC_ISSUER`, `_AUDIENCE`
+   and `_CLIENT_ID` — in `.env` (the commented block in `.env.example`) or in
+   `gateway/config.toml`. The overlay passes them by bare name, so an unset key
+   in `.env` does not shadow the file; set each key in one place only.
+3. Start with the overlay:
+   `docker compose -f docker-compose.yml -f docker-compose.oauth.yml -f docker-compose.issuance.yml up -d`
+   (or uncomment the three-file `COMPOSE_FILE` line in `.env` for the autostart
+   unit).
+
+The overlay mounts `./gateway/config.toml` read-only at
+`/etc/corp-llm-gateway/config.toml` and sets `CORP_LLM_GATEWAY_CONFIG_FILE` to
+that path. A missing `gateway/config.toml` fails `up` rather than booting with
+issuance off. `scripts/deploy/deploy.sh` does not add this overlay yet: run the
+command above on the server. Keys, defaults and ranges:
+`docs/ops/configuration.md`, "Developer token issuance"; Keycloak setup:
+`docs/ops/install.md`, "Developer onboarding". The `corp_tokens` schema staged
+by `deploy.sh` carries the issuance columns, but init scripts run only on an
+empty volume: on an existing one, re-run `tokens/schema.sql` first
+(`docs/ops/upgrade.md`). `gateway-admin token issue` stays as break-glass.
 
 ## Operator CLI (gateway-admin)
 

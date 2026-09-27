@@ -278,3 +278,382 @@ def test_the_render_never_sets_litellms_dead_concurrency_knobs() -> None:
 
     assert "global_max_parallel_requests" not in result.stdout
     assert "LEGACY_MULTI_INSTANCE_RATE_LIMITING" not in result.stdout
+
+
+# ── developer token issuance: issuance.* → /etc/corp-llm-gateway/config.toml ──
+
+CONFIG_TOML_PATH = "/etc/corp-llm-gateway/config.toml"
+
+_ISSUANCE_ON: dict[str, Any] = {
+    "enabled": True,
+    "issuer": "https://keycloak.corp.lan/realms/dev",
+    "audience": "corp-gateway-issuance",
+    "clientId": "corp-gateway-cli",
+    # Not sorted on purpose: the rendered table must keep this order.
+    "teamMap": [
+        {"group": "/devs/payments", "team": "payments"},
+        {"group": "/devs/core", "team": "core"},
+        {"group": "/devs/alpha", "team": "alpha"},
+    ],
+}
+
+_EXPECTED_TOML = """\
+# Rendered by the corp-llm-gateway chart from the issuance.* values.
+CORP_GATEWAY_ISSUE_OIDC_ISSUER = "https://keycloak.corp.lan/realms/dev"
+CORP_GATEWAY_ISSUE_OIDC_AUDIENCE = "corp-gateway-issuance"
+CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID = "corp-gateway-cli"
+CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM = "groups"
+CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM = "preferred_username"
+CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS = "30"
+CORP_GATEWAY_ISSUE_MAX_ACTIVE = "2"
+CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS = "600"
+CORP_GATEWAY_ISSUE_MAX_INFLIGHT = "4"
+CORP_GATEWAY_ISSUE_RATE_PER_MINUTE = "30"
+CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS = "10"
+
+# Ordered: the first group in this list that the user belongs to wins.
+[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]
+"/devs/payments" = "payments"
+"/devs/core" = "core"
+"/devs/alpha" = "alpha"
+"""
+
+
+def _render_values(
+    tmp_path: Path, values: dict[str, Any], *files: Path
+) -> subprocess.CompletedProcess[str]:
+    values_file = tmp_path / "values-test.yaml"
+    values_file.write_text(yaml.safe_dump(values))
+    args = ["helm", "template", "gw", str(CHART_DIR)]
+    for path in (*files, values_file):
+        args += ["-f", str(path)]
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def _docs_of(result: subprocess.CompletedProcess[str]) -> list[dict[str, Any]]:
+    assert result.returncode == 0, result.stderr
+    return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+
+def _issuance(**overrides: Any) -> dict[str, Any]:
+    return {"issuance": {**_ISSUANCE_ON, **overrides}}
+
+
+def _gateway_configmap(docs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for doc in docs:
+        if doc.get("kind") == "ConfigMap" and doc["metadata"]["name"].endswith("-gateway-config"):
+            return doc
+    return None
+
+
+def _pod_spec(docs: list[dict[str, Any]]) -> dict[str, Any]:
+    return _first_of_kind(docs, "Deployment")["spec"]["template"]["spec"]
+
+
+def _gateway_and_check(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    spec = _pod_spec(docs)
+    litellm = next(c for c in spec["containers"] if c["name"] == "litellm")
+    check = next(c for c in spec["initContainers"] if c["name"] == "config-check")
+    return [litellm, check]
+
+
+def _names(entries: list[dict[str, Any]] | None) -> list[str]:
+    return [entry["name"] for entry in entries or []]
+
+
+def test_issuance_is_off_by_default_and_renders_no_config_file(
+    rendered_docs: list[dict[str, Any]],
+) -> None:
+    assert _gateway_configmap(rendered_docs) is None
+    assert "gateway-config" not in _names(_pod_spec(rendered_docs)["volumes"])
+    for container in _gateway_and_check(rendered_docs):
+        assert "gateway-config" not in _names(container.get("volumeMounts"))
+        assert "CORP_LLM_GATEWAY_CONFIG_FILE" not in _names(container["env"])
+
+
+def test_issuance_values_default_to_off_with_the_settings_defaults() -> None:
+    values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
+
+    assert values["issuance"] == {
+        "enabled": False,
+        "issuer": "",
+        "audience": "",
+        "clientId": "",
+        "jwksUrl": "",
+        "teamClaim": "groups",
+        "userClaim": "preferred_username",
+        "ttlDays": 30,
+        "maxActive": 2,
+        "minIntervalSeconds": 600,
+        "maxInflight": 4,
+        "ratePerMinute": 30,
+        "storeTimeoutSeconds": 10,
+        "teamMap": [],
+    }
+
+
+def test_issuance_renders_the_config_toml_with_the_team_map_in_list_order(
+    tmp_path: Path,
+) -> None:
+    configmap = _gateway_configmap(_docs_of(_render_values(tmp_path, _issuance())))
+
+    assert configmap is not None
+    assert configmap["data"] == {"config.toml": _EXPECTED_TOML}
+
+
+def test_issuance_renders_the_jwks_url_only_when_set(tmp_path: Path) -> None:
+    url = "https://keycloak.corp.lan/realms/dev/protocol/openid-connect/certs"
+    configmap = _gateway_configmap(_docs_of(_render_values(tmp_path, _issuance(jwksUrl=url))))
+
+    assert configmap is not None
+    assert f'CORP_GATEWAY_ISSUE_OIDC_JWKS_URL = "{url}"\n' in configmap["data"]["config.toml"]
+    assert "JWKS_URL" not in _EXPECTED_TOML
+
+
+def test_issuance_renders_large_integers_without_an_exponent(tmp_path: Path) -> None:
+    # Helm reads YAML numbers as float64; 2592000 would print as 2.592e+06.
+    configmap = _gateway_configmap(
+        _docs_of(_render_values(tmp_path, _issuance(minIntervalSeconds=2592000)))
+    )
+
+    assert configmap is not None
+    assert (
+        'CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS = "2592000"\n'
+        in (configmap["data"]["config.toml"])
+    )
+
+
+def test_issuance_mounts_the_file_read_only_on_the_gateway_and_the_config_check(
+    tmp_path: Path,
+) -> None:
+    docs = _docs_of(_render_values(tmp_path, _issuance()))
+    volume = next(v for v in _pod_spec(docs)["volumes"] if v["name"] == "gateway-config")
+
+    assert volume["configMap"]["name"] == "gw-corp-llm-gateway-gateway-config"
+    for container in _gateway_and_check(docs):
+        mounts = [m for m in container["volumeMounts"] if m["name"] == "gateway-config"]
+        assert mounts == [
+            {
+                "name": "gateway-config",
+                "mountPath": CONFIG_TOML_PATH,
+                "subPath": "config.toml",
+                "readOnly": True,
+            }
+        ], container["name"]
+
+
+def test_issuance_points_both_containers_at_the_config_file(tmp_path: Path) -> None:
+    for container in _gateway_and_check(_docs_of(_render_values(tmp_path, _issuance()))):
+        env = {e["name"]: e.get("value") for e in container["env"]}
+        assert env["CORP_LLM_GATEWAY_CONFIG_FILE"] == CONFIG_TOML_PATH, container["name"]
+
+
+def test_issuance_rolls_the_pods_when_the_config_file_changes(tmp_path: Path) -> None:
+    # A subPath mount never sees a ConfigMap update; the checksum restarts the pods.
+    def checksum(team: str) -> str:
+        values = _issuance(teamMap=[{"group": "/devs/core", "team": team}])
+        docs = _docs_of(_render_values(tmp_path, values))
+        annotations = _first_of_kind(docs, "Deployment")["spec"]["template"]["metadata"]
+        return annotations["annotations"]["checksum/gateway-config"]
+
+    assert checksum("core") != checksum("payments")
+
+
+@pytest.mark.parametrize("field", ["issuer", "audience", "clientId"])
+def test_issuance_refuses_to_render_without_a_required_scalar(tmp_path: Path, field: str) -> None:
+    result = _render_values(tmp_path, _issuance(**{field: ""}))
+
+    assert result.returncode != 0
+    assert f"issuance.{field} is required when issuance.enabled is true" in result.stderr
+
+
+def test_issuance_refuses_to_render_without_a_team_map(tmp_path: Path) -> None:
+    result = _render_values(tmp_path, _issuance(teamMap=[]))
+
+    assert result.returncode != 0
+    assert "issuance.teamMap is required when issuance.enabled is true" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "entry", [{"group": "/devs/core"}, {"team": "core"}, {"group": "", "team": "core"}]
+)
+def test_issuance_refuses_a_team_map_entry_without_a_group_or_team(
+    tmp_path: Path, entry: dict[str, str]
+) -> None:
+    result = _render_values(tmp_path, _issuance(teamMap=[entry]))
+
+    assert result.returncode != 0
+    assert "issuance.teamMap entries need a non-empty group and team" in result.stderr
+
+
+def test_issuance_refuses_a_group_listed_twice(tmp_path: Path) -> None:
+    # A duplicate key is a TOML parse error, i.e. a gateway that cannot boot.
+    result = _render_values(
+        tmp_path,
+        _issuance(
+            teamMap=[
+                {"group": "/devs/core", "team": "core"},
+                {"group": "/devs/core", "team": "payments"},
+            ]
+        ),
+    )
+
+    assert result.returncode != 0
+    assert 'issuance.teamMap lists group "/devs/core" twice' in result.stderr
+
+
+@pytest.mark.parametrize("key", ["CORP_GATEWAY_ISSUE_OIDC_ISSUER", "CORP_GATEWAY_ISSUE_MAX_ACTIVE"])
+def test_issuance_keys_in_the_config_passthrough_are_refused(tmp_path: Path, key: str) -> None:
+    # An env var wins over the file, so a config: copy would silently shadow issuance.*.
+    result = _render_values(tmp_path, {**_issuance(), "config": {key: "x"}})
+
+    assert result.returncode != 0
+    assert f"config.{key}: set developer token issuance through issuance.*" in result.stderr
+
+
+def test_issuance_keys_in_the_config_passthrough_are_refused_with_issuance_off() -> None:
+    # Set alone, the issuer turns issuance on with no team map: a pod that never starts.
+    result = _render("config.CORP_GATEWAY_ISSUE_OIDC_ISSUER=https://k/realms/dev")
+
+    assert result.returncode != 0
+    assert "config.CORP_GATEWAY_ISSUE_OIDC_ISSUER: set developer token issuance" in result.stderr
+
+
+def test_issuance_refuses_a_config_file_override_in_the_passthrough(tmp_path: Path) -> None:
+    result = _render_values(
+        tmp_path, {**_issuance(), "config": {"CORP_LLM_GATEWAY_CONFIG_FILE": "/tmp/x.toml"}}
+    )
+
+    assert result.returncode != 0
+    assert "config.CORP_LLM_GATEWAY_CONFIG_FILE: the chart sets it" in result.stderr
+
+
+def test_issuance_under_a_network_policy_needs_the_keycloak_egress_rule(
+    tmp_path: Path,
+) -> None:
+    # Without it the JWKS fetch never leaves the pod and every issuance is a 503.
+    result = _render_values(tmp_path, {**_issuance(), "networkPolicy": {"enabled": True}})
+
+    assert result.returncode != 0
+    assert "issuance.enabled with networkPolicy.enabled needs networkPolicy.keycloak" in (
+        result.stderr
+    )
+
+
+def test_issuance_under_a_network_policy_renders_with_the_keycloak_egress_rule(
+    tmp_path: Path,
+) -> None:
+    values = {
+        **_issuance(),
+        "networkPolicy": {
+            "enabled": True,
+            "keycloak": {"enabled": True, "cidr": "10.20.30.40/32"},
+        },
+    }
+
+    assert _gateway_configmap(_docs_of(_render_values(tmp_path, values))) is not None
+
+
+def test_issuance_group_names_survive_quoting_and_parse_back(tmp_path: Path) -> None:
+    import tomllib
+
+    groups = ['/devs/"quoted"', "/devs/back\\slash", "/разработка/платежи", "a = b"]
+    values = _issuance(teamMap=[{"group": g, "team": f"t{i}"} for i, g in enumerate(groups)])
+    configmap = _gateway_configmap(_docs_of(_render_values(tmp_path, values)))
+
+    assert configmap is not None
+    parsed = tomllib.loads(configmap["data"]["config.toml"])
+    assert list(parsed["CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"].items()) == [
+        (g, f"t{i}") for i, g in enumerate(groups)
+    ]
+
+
+_ISSUANCE_ENV_KEYS = (
+    "CORP_ENV",
+    "CORP_GATEWAY_OIDC_AUDIENCE",
+    *(
+        name
+        for name in (
+            "CORP_GATEWAY_ISSUE_OIDC_ISSUER",
+            "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE",
+            "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID",
+            "CORP_GATEWAY_ISSUE_OIDC_JWKS_URL",
+            "CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM",
+            "CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM",
+            "CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS",
+            "CORP_GATEWAY_ISSUE_MAX_ACTIVE",
+            "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS",
+            "CORP_GATEWAY_ISSUE_MAX_INFLIGHT",
+            "CORP_GATEWAY_ISSUE_RATE_PER_MINUTE",
+            "CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS",
+        )
+    ),
+)
+
+
+@pytest.mark.usefixtures("hermetic_gateway_config")
+def test_the_rendered_config_file_resolves_through_the_gateway_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from corp_llm_gateway import config, settings
+
+    values = {
+        **_issuance(minIntervalSeconds=2592000),
+        "networkPolicy": {"keycloak": {"enabled": True, "cidr": "10.20.30.40/32"}},
+    }
+    docs = _docs_of(_render_values(tmp_path, values, CHART_DIR / "values-prod.yaml"))
+    configmap = _gateway_configmap(docs)
+    assert configmap is not None
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text(configmap["data"]["config.toml"])
+    for name in _ISSUANCE_ENV_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    # The pod's own env: CORP_ENV and the operator audience come from values-prod.
+    env = {e["name"]: e.get("value") for e in _gateway_and_check(docs)[0]["env"]}
+    monkeypatch.setenv("CORP_ENV", env["CORP_ENV"])
+    monkeypatch.setenv("CORP_GATEWAY_OIDC_AUDIENCE", env["CORP_GATEWAY_OIDC_AUDIENCE"])
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(toml_file))
+    config.reset_cache()
+
+    resolved = settings.issuance()
+
+    assert resolved is not None
+    assert resolved.issuer == "https://keycloak.corp.lan/realms/dev"
+    assert resolved.jwks_url == "https://keycloak.corp.lan/realms/dev/protocol/openid-connect/certs"
+    assert resolved.team_map == (
+        ("/devs/payments", "payments"),
+        ("/devs/core", "core"),
+        ("/devs/alpha", "alpha"),
+    )
+    assert resolved.min_interval_seconds == 2592000
+    assert resolved.token_ttl_days == 30
+    assert resolved.allow_insecure_http is False
+
+
+def _lint(*files: Path) -> subprocess.CompletedProcess[str]:
+    args = ["helm", "lint", str(CHART_DIR)]
+    for path in files:
+        args += ["-f", str(path)]
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def test_the_chart_lints_with_the_default_and_the_prod_values() -> None:
+    for files in ((), (CHART_DIR / "values-prod.yaml",)):
+        result = _lint(*files)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_chart_lints_with_issuance_enabled_on_the_prod_values(tmp_path: Path) -> None:
+    values_file = tmp_path / "values-issuance.yaml"
+    values_file.write_text(
+        yaml.safe_dump(
+            {
+                **_issuance(),
+                "networkPolicy": {"keycloak": {"enabled": True, "cidr": "10.20.30.40/32"}},
+            }
+        )
+    )
+
+    result = _lint(CHART_DIR / "values-prod.yaml", values_file)
+
+    assert result.returncode == 0, result.stdout + result.stderr

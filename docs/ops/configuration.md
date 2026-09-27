@@ -288,14 +288,19 @@ table carrying the issuance columns — re-run `tokens/schema.sql` first
 (`upgrade.md`). `CORP_LLM_CA_BUNDLE`, when set, is also the CA the JWKS fetch
 verifies Keycloak against, so it must be a readable PEM bundle.
 
-`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP` has no env form. Neither the Helm chart nor
-the compose stack mounts a `config.toml` today, so enabling issuance there means
-mounting one at `/etc/corp-llm-gateway/config.toml` (or pointing
-`CORP_LLM_GATEWAY_CONFIG_FILE` at it) that carries the map, for example:
+`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP` has no env form: it lives in the config file,
+for example:
 
 ```toml
 CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP = { "/devs/payments" = "payments", "/devs/core" = "core" }
 ```
+
+Both deploy targets mount that file at `/etc/corp-llm-gateway/config.toml` and
+set `CORP_LLM_GATEWAY_CONFIG_FILE` to it. Helm renders it from the `issuance.*`
+values (`teamMap` is an ordered list of `{group, team}`; `install.md`,
+"Developer onboarding"). Compose mounts `compose/gateway/config.toml` through
+the `docker-compose.issuance.yml` overlay (`compose/README.md`, "Developer token
+issuance"). `gateway-admin token issue` stays as break-glass.
 
 Every mapped `team_id` must already exist (`gateway-admin team create`); an
 unknown one answers 403 `E_ISSUE_UNKNOWN_TEAM`.

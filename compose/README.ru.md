@@ -29,10 +29,9 @@
   собственный токен подписки Anthropic разработчика. `scripts/deploy/deploy.sh`
   разворачивает этот режим по умолчанию. Токен `X-Corp-Auth` разработчик
   получает через `scripts/install.sh` (вход в Keycloak →
-  `POST /internal/issue-token`), когда выдача настроена, — а этот стек её пока
-  не настраивает: он не передаёт ни одного ключа `CORP_GATEWAY_ISSUE_*` и не
-  монтирует `config.toml` для карты команд (см. «Выдача токенов разработчикам»
-  ниже). До тех пор — `gateway-admin token issue`.
+  `POST /internal/issue-token`), когда выдача включена: добавьте оверлей
+  `docker-compose.issuance.yml` (см. «Выдача токенов разработчикам» ниже).
+  `gateway-admin token issue` остаётся аварийным путём.
 - **Режим API-ключей (дефолт compose) — только тестовая поза.** `docker compose
   up -d`. `LITELLM_MASTER_KEY` обязателен, запросы несут виртуальный ключ
   LiteLLM, но **выдать его нечем**: route gate отклоняет `/key/*`, админ-UI и
@@ -834,16 +833,36 @@ deployment».
 
 ## Выдача токенов разработчикам
 
-`POST /internal/issue-token` на этом стеке выключен: сервис `litellm` не
-передаёт ни одного ключа `CORP_GATEWAY_ISSUE_*`, а карта команд
-(`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`) — TOML-таблица, которую может нести только
-смонтированный `config.toml`. Чтобы включить выдачу, добавьте скалярные ключи в
-`environment:` сервиса и смонтируйте `config.toml` с картой в
-`/etc/corp-llm-gateway/config.toml` — `docs/ops/install.md`, «Developer
-onboarding», и `docs/ops/configuration.md`, «Developer token issuance». Схема
-`corp_tokens`, которую подкладывает `deploy.sh`, содержит issuance-колонки, но
-init-скрипты отрабатывают только на пустом томе: на существующем сначала
-повторно примените `tokens/schema.sql` (`docs/ops/upgrade.md`).
+`POST /internal/issue-token` выключен, пока вы не добавите необязательный
+оверлей `docker-compose.issuance.yml`. Базовый стек не передаёт ни одного ключа
+`CORP_GATEWAY_ISSUE_*` и не монтирует файл конфигурации, так что развёртывание
+в режиме подписки без Keycloak это не затрагивает. Чтобы включить выдачу:
+
+1. `cp gateway/config.toml.example gateway/config.toml` и поправьте карту
+   команд (`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`). Это TOML-таблица, поэтому она
+   может жить только в этом файле. Порядок важен: побеждает первая группа из
+   списка, в которой состоит пользователь. `gateway/config.toml` в `.gitignore`.
+2. Задайте скалярные ключи — как минимум `CORP_GATEWAY_ISSUE_OIDC_ISSUER`,
+   `_AUDIENCE` и `_CLIENT_ID` — в `.env` (закомментированный блок в
+   `.env.example`) или в `gateway/config.toml`. Оверлей передаёт их голыми
+   именами, поэтому не заданный в `.env` ключ не перекрывает файл; задавайте
+   каждый ключ в одном месте.
+3. Запустите с оверлеем:
+   `docker compose -f docker-compose.yml -f docker-compose.oauth.yml -f docker-compose.issuance.yml up -d`
+   (или раскомментируйте строку `COMPOSE_FILE` с тремя файлами в `.env` для
+   юнита автозапуска).
+
+Оверлей монтирует `./gateway/config.toml` только для чтения в
+`/etc/corp-llm-gateway/config.toml` и выставляет `CORP_LLM_GATEWAY_CONFIG_FILE`
+на этот путь. Без `gateway/config.toml` падает `up`, а не старт с выключенной
+выдачей. `scripts/deploy/deploy.sh` этот оверлей пока не добавляет: выполните
+команду выше на сервере. Ключи, значения по умолчанию и диапазоны —
+`docs/ops/configuration.md`, «Developer token issuance»; настройка Keycloak —
+`docs/ops/install.md`, «Developer onboarding». Схема `corp_tokens`, которую
+подкладывает `deploy.sh`, содержит issuance-колонки, но init-скрипты
+отрабатывают только на пустом томе: на существующем сначала повторно примените
+`tokens/schema.sql` (`docs/ops/upgrade.md`). `gateway-admin token issue`
+остаётся аварийным путём.
 
 ## Операторский CLI (gateway-admin)
 

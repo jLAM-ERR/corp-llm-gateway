@@ -80,6 +80,40 @@ token:
   ttlDays: 30
   revocationCacheSeconds: 60
 
+# Developer token issuance (POST /internal/issue-token; docs/ops/install.md,
+# docs/ops/configuration.md). Enabled renders these values into
+# /etc/corp-llm-gateway/config.toml, mounted read-only on the gateway and the
+# config-check initContainer, and points CORP_LLM_GATEWAY_CONFIG_FILE at it. Set
+# the CORP_GATEWAY_ISSUE_* keys here only — the chart refuses them under
+# `config:`, where an env var would shadow the file. Also needed: CORP_LLM_PG_DSN
+# in the Secret and tokens/schema.sql applied (docs/ops/upgrade.md). With
+# networkPolicy.enabled, networkPolicy.keycloak must be enabled too (the gateway
+# fetches the realm JWKS; without the egress rule every issuance is a 503) — the
+# chart refuses to render otherwise.
+issuance:
+  enabled: false
+  issuer: ""          # Keycloak realm URL; required when enabled
+  audience: ""        # required; must differ from CORP_GATEWAY_OIDC_AUDIENCE
+  clientId: ""        # required; the device-flow client (the token's azp)
+  jwksUrl: ""         # empty -> {issuer}/protocol/openid-connect/certs
+  teamClaim: "groups"
+  userClaim: "preferred_username"
+  ttlDays: 30
+  maxActive: 2
+  minIntervalSeconds: 600
+  maxInflight: 4
+  ratePerMinute: 30
+  storeTimeoutSeconds: 10
+  # Keycloak group -> existing team_id, as a LIST so the order survives (a YAML
+  # map has none). First group in this order that the user belongs to wins;
+  # an unmapped user gets 403. Required when enabled. Example:
+  #   teamMap:
+  #     - group: "/devs/payments"
+  #       team: payments
+  #     - group: "/devs/core"
+  #       team: core
+  teamMap: []
+
 ingress:
   host: gateway.corp.lan
   tls: true

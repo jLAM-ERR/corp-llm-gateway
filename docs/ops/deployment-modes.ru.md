@@ -154,10 +154,12 @@ litellm всё равно никого не аутентифицирует, и �
 токена отклоняется (`MissingTokenError` / `InvalidTokenError`). Corp-токен —
 личный: `scripts/install.sh` выпускает его через Keycloak на
 `POST /internal/issue-token`, когда выдача настроена (`install.md`, «Developer
-onboarding»), а `gateway-admin token revoke --user` отзывает. Этот compose-стек
-пока не передаёт ключи `CORP_GATEWAY_ISSUE_*` и не монтирует `config.toml`, в
-котором нужна карта команд, поэтому до тех пор corp-токены здесь выдаёт
-`gateway-admin token issue` (аварийный путь).
+onboarding»), а `gateway-admin token revoke --user` отзывает. На этом
+compose-стеке выдача — необязательный оверлей `docker-compose.issuance.yml`
+поверх `docker-compose.oauth.yml`; он монтирует `gateway/config.toml` с картой
+команд (`compose/README.ru.md`, «Выдача токенов разработчикам»). В Helm это
+значения `issuance.*` (`install.md`, «Developer onboarding»). Без неё
+corp-токены выдаёт `gateway-admin token issue` (аварийный путь).
 
 **Postgres за PgBouncer.** Пулы шлюза передают параметры TCP keepalive при
 старте соединения; PgBouncer их отвергает, если они не перечислены в

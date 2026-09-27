@@ -75,8 +75,70 @@ both see identical config. Templated CORP_* keys first, then the operator-set
 - name: SSL_CERT_FILE
   value: {{ printf "%s/ca-bundle.pem" .Values.caBundle.mountPath | quote }}
 {{- end }}
+{{- if .Values.issuance.enabled }}
+- name: CORP_LLM_GATEWAY_CONFIG_FILE
+  value: {{ include "corp-llm-gateway.configTomlPath" . | quote }}
+{{- end }}
 {{- range $k, $v := .Values.config }}
+{{- if hasPrefix "CORP_GATEWAY_ISSUE_" $k }}
+{{- fail (printf "config.%s: set developer token issuance through issuance.*, not config: (an env var would shadow the rendered config file)" $k) }}
+{{- end }}
+{{- if and $.Values.issuance.enabled (eq $k "CORP_LLM_GATEWAY_CONFIG_FILE") }}
+{{- fail "config.CORP_LLM_GATEWAY_CONFIG_FILE: the chart sets it when issuance.enabled is true" }}
+{{- end }}
 - name: {{ $k }}
   value: {{ $v | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "corp-llm-gateway.configTomlPath" -}}
+/etc/corp-llm-gateway/config.toml
+{{- end -}}
+
+{{/*
+The gateway config file rendered from issuance.*. Strings go through toJson: a
+JSON string is a valid TOML basic string, so group names with `/`, quotes or
+Cyrillic survive. teamMap is a list because the table's order is significant.
+*/}}
+{{- define "corp-llm-gateway.issuanceToml" -}}
+{{- $i := .Values.issuance -}}
+{{- range $field := list "issuer" "audience" "clientId" }}
+{{- $_ := required (printf "issuance.%s is required when issuance.enabled is true" $field) (get $i $field) }}
+{{- end }}
+{{- if not $i.teamMap }}
+{{- fail "issuance.teamMap is required when issuance.enabled is true" }}
+{{- end }}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.keycloak.enabled) }}
+{{- fail "issuance.enabled with networkPolicy.enabled needs networkPolicy.keycloak.{enabled,cidr}: the gateway fetches the realm JWKS, and without the egress rule every issuance answers 503" }}
+{{- end -}}
+# Rendered by the corp-llm-gateway chart from the issuance.* values.
+CORP_GATEWAY_ISSUE_OIDC_ISSUER = {{ $i.issuer | toString | toJson }}
+CORP_GATEWAY_ISSUE_OIDC_AUDIENCE = {{ $i.audience | toString | toJson }}
+CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID = {{ $i.clientId | toString | toJson }}
+{{- with $i.jwksUrl }}
+CORP_GATEWAY_ISSUE_OIDC_JWKS_URL = {{ . | toString | toJson }}
+{{- end }}
+CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM = {{ $i.teamClaim | toString | toJson }}
+CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM = {{ $i.userClaim | toString | toJson }}
+CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS = {{ $i.ttlDays | int64 | quote }}
+CORP_GATEWAY_ISSUE_MAX_ACTIVE = {{ $i.maxActive | int64 | quote }}
+CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS = {{ $i.minIntervalSeconds | int64 | quote }}
+CORP_GATEWAY_ISSUE_MAX_INFLIGHT = {{ $i.maxInflight | int64 | quote }}
+CORP_GATEWAY_ISSUE_RATE_PER_MINUTE = {{ $i.ratePerMinute | int64 | quote }}
+CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS = {{ $i.storeTimeoutSeconds | int64 | quote }}
+
+# Ordered: the first group in this list that the user belongs to wins.
+[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]
+{{- $seen := dict }}
+{{- range $i.teamMap }}
+{{- if not (and .group .team) }}
+{{- fail "issuance.teamMap entries need a non-empty group and team" }}
+{{- end }}
+{{- $group := .group | toString }}
+{{- if hasKey $seen $group }}
+{{- fail (printf "issuance.teamMap lists group %s twice" ($group | toJson)) }}
+{{- end }}
+{{- $_ := set $seen $group true }}
+{{ $group | toJson }} = {{ .team | toString | toJson }}
 {{- end }}
 {{- end -}}

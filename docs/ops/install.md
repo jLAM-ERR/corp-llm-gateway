@@ -189,11 +189,38 @@ operator audience, and refuses to boot when the two audiences are equal.
 
 ### Gateway side
 
-Set the issuance keys (`configuration.md`, "Developer token issuance"): the
-scalars through the chart's `config:` map (Helm) or the environment, and
-`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP` in a mounted `config.toml` — it is a TOML
-table with no env form, and neither the chart nor the compose stack mounts one
-yet. Before the first issuance:
+Set the issuance keys (`configuration.md`, "Developer token issuance").
+`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP` is a TOML table with no env form, so both
+deploy targets carry the keys in a config file mounted read-only at
+`/etc/corp-llm-gateway/config.toml`:
+
+- **Helm:** the `issuance.*` values. `enabled: true` renders them into that
+  file, mounts it on the gateway and the `config-check` initContainer, and sets
+  `CORP_LLM_GATEWAY_CONFIG_FILE`. `issuer`, `audience`, `clientId` and `teamMap`
+  are required. `teamMap` is a list, so its order survives — the first listed
+  group the user belongs to wins:
+
+  ```yaml
+  issuance:
+    enabled: true
+    issuer: https://keycloak.corp.lan/realms/dev
+    audience: corp-gateway-issuance
+    clientId: corp-gateway-cli
+    teamMap:
+      - group: "/devs/payments"
+        team: payments
+      - group: "/devs/core"
+        team: core
+  ```
+
+  The chart refuses to render with a `CORP_GATEWAY_ISSUE_*` key under `config:`
+  (an env var would shadow the file), and with `networkPolicy.enabled` but not
+  `networkPolicy.keycloak.enabled`. A changed `issuance.*` rolls the pods.
+- **Compose:** the `docker-compose.issuance.yml` overlay with
+  `compose/gateway/config.toml` (`compose/README.md`, "Developer token
+  issuance").
+
+Before the first issuance:
 
 - Postgres is required (`CORP_LLM_PG_DSN`), and `tokens/schema.sql` must have
   been re-run on it (`upgrade.md`); the boot exits 78 otherwise;

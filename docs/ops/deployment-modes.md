@@ -153,10 +153,12 @@ the Postgres token store, and a request without a valid one is refused
 (`MissingTokenError` / `InvalidTokenError`). The corp token is per developer:
 `scripts/install.sh` mints it through Keycloak at `POST /internal/issue-token`
 once issuance is configured (`install.md`, "Developer onboarding"), and
-`gateway-admin token revoke --user` revokes it. This compose stack does not pass
-the `CORP_GATEWAY_ISSUE_*` keys or mount the `config.toml` the team map needs
-yet, so until it does, corp tokens here come from `gateway-admin token issue`
-(break-glass).
+`gateway-admin token revoke --user` revokes it. On this compose stack issuance
+is the optional `docker-compose.issuance.yml` overlay, layered on top of
+`docker-compose.oauth.yml`; it mounts `gateway/config.toml` with the team map
+(`compose/README.md`, "Developer token issuance"). On Helm it is the
+`issuance.*` values (`install.md`, "Developer onboarding"). Without it, corp
+tokens come from `gateway-admin token issue` (break-glass).
 
 **Postgres behind PgBouncer.** The gateway's pools send TCP keepalive startup
 parameters; PgBouncer refuses them unless `ignore_startup_parameters` lists them
