@@ -163,7 +163,9 @@ tokens come from `gateway-admin token issue` (break-glass).
 **Postgres behind PgBouncer.** The gateway's pools send TCP keepalive startup
 parameters; PgBouncer refuses them unless `ignore_startup_parameters` lists them
 (`configuration.md`, "Backends"). Without that, every store call fails and
-every LLM request answers 503.
+every LLM request answers 503. With issuance on, the gateway does not start: it
+exits 78, and the log line names `ignore_startup_parameters` and the three
+parameters to list.
 
 **Litellm's own management endpoints are refused, in both modes.** Without a
 master key litellm accepts any caller as an internal user

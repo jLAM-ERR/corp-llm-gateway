@@ -120,6 +120,24 @@ def test_each_capacity_key_reaches_both_deploy_targets(key: str) -> None:
     assert key in (ROOT / "compose/.env.example").read_text(), key
 
 
+def test_the_pgbouncer_boot_refusal_is_quoted_verbatim() -> None:
+    from corp_llm_gateway import pg_session
+
+    assert pg_session.STARTUP_PARAMETER_REJECTED in CONFIGURATION.read_text()
+    assert (
+        "ignore_startup_parameters = " + ",".join(pg_session.KEEPALIVE_SERVER_SETTINGS)
+        in CONFIGURATION.read_text()
+    )
+
+
+def test_the_keys_outside_the_registry_section_lists_only_unregistered_keys() -> None:
+    section = _section(CONFIGURATION.read_text(), "## Keys read outside `settings.py`")
+    bullets = re.findall(r"^- `(CORP_[A-Z0-9_]+)`", section, re.MULTILINE)
+
+    assert bullets == ["CORP_LLM_GATEWAY_CONFIG_FILE"]
+    assert not set(bullets) & set(settings.all_keys())
+
+
 # ── error codes and block reasons ────────────────────────────────────────────
 
 

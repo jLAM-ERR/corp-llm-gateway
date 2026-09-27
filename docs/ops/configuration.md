@@ -208,8 +208,18 @@ lost behind a partition — and the subject lock its transaction holds — in ab
 ignore_startup_parameters = tcp_keepalives_idle,tcp_keepalives_interval,tcp_keepalives_count
 ```
 
-to `pgbouncer.ini`. Without it every store connection fails, so every LLM request
-answers 503 (`E_STORE_UNAVAILABLE` / `E_PROFILE_UNAVAILABLE`) and issuance answers
+to the `[pgbouncer]` section of `pgbouncer.ini`, then reload PgBouncer. Without
+it every store connection fails, so every LLM request answers 503
+(`E_STORE_UNAVAILABLE` / `E_PROFILE_UNAVAILABLE`).
+
+With issuance on, the boot's schema probe connects with the same parameters, so
+the gateway does not start at all: it exits 78 and logs
+
+```
+gateway config refused: issuance schema check: Postgres/PgBouncer rejected a startup parameter; add tcp_keepalives_idle,tcp_keepalives_interval,tcp_keepalives_count to ignore_startup_parameters (StartupParameterRejectedError)
+```
+
+A gateway that booted before PgBouncer began refusing them answers issuance with
 503 `E_ISSUE_STORE_UNAVAILABLE`.
 
 ### TLS to corp-LLM
@@ -454,6 +464,8 @@ boot does).
   or `SELECT` on `corp_tokens`; `corp_tokens` without the issuance columns, or
   `corp_tokens_oidc_jti_key` missing, not UNIQUE on `oidc_jti` alone, or INVALID
   (`upgrade.md` has the remedy);
+- issuance on and PgBouncer (or Postgres) rejecting the keepalive startup
+  parameters: set `ignore_startup_parameters` ("Backends");
 - any in-flight key out of range, or `CORP_LLM_MAX_INFLIGHT=0` in prod;
 - `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` malformed or naming a refused route.
 
@@ -496,13 +508,15 @@ Read by the test suite, never by the gateway:
 
 ## Keys read outside `settings.py`
 
-These are read directly at call sites and are **not** in the `KEYS` registry
-(a tracked follow-up to register them). They are real and honored — document and
-set them, but note they are not covered by `config check`'s required/choice
-validation yet:
+Every `CORP_*` key the gateway reads is in the `KEYS` registry, so
+`config check` validates it — `CORP_ENV`, `CORP_GATEWAY_OIDC_AUDIENCE`,
+`CORP_GATEWAY_OIDC_ISSUER` and `CORP_PROFILE_REQUIRE_SIGNATURE` included. One
+key is deliberately outside it:
 
-- `CORP_ENV` — `config.py` (prod marker; F9 SSL guard)
-- `CORP_GATEWAY_OIDC_AUDIENCE`, `CORP_GATEWAY_OIDC_ISSUER` — `auth/rbac.py`
-- `CORP_PROFILE_REQUIRE_SIGNATURE` — `profiles/manifest.py` (gated no-op)
-- `CORP_LLM_GATEWAY_CONFIG_FILE` — `config.py` (selects the config file; env-only
-  by design, so it is not itself a config-file key)
+- `CORP_LLM_GATEWAY_CONFIG_FILE` — `config.py`. It selects the config file, so
+  it is read from the environment only and is not itself a config-file key. The
+  Helm chart (`issuance.enabled`) and the compose issuance overlay set it.
+
+`DATABASE_URL`, `DIRECT_URL` and `JSON_LOGS` are litellm's own variables. The
+entrypoint reads them from the environment the way litellm does ("Server
+entrypoint" above; `litellm_config.py`), not through the config file.

@@ -343,6 +343,23 @@ only and never contains `authorization`, so BYOK passthrough is untouched, and
 `X-Corp-Auth` was already stripped unconditionally one step earlier. Set it to
 `0` only to reproduce the old behaviour. Recorded as `../security.md` §11 (h).
 
+## The `ner` extra now carries pymorphy3: RU gazetteer terms are lemmatised
+
+The `ner` extra now installs `pymorphy3` and `pymorphy3-dicts-ru`, and the
+production image is built with it (`Dockerfile.gateway`). The gazetteer uses it
+to lemmatise Russian terms and text; before, it matched Russian surface forms
+only. No config change is needed.
+
+- **Detection widens.** Inflected forms of a gazetteer term (other cases,
+  numbers) now match, so more Russian text is redacted. With the oracle on and
+  the default `gazetteer_hit` trigger, more hits also mean more oracle calls.
+- **Cache A entries from the old build do not match.** The gazetteer's
+  lemmatiser identity, pymorphy3 version included, is part of the policy
+  fingerprint in the Cache-A key. Entries written without pymorphy3 (or with
+  another version) are never served to the new pods; expect fewer cache hits
+  until the new keys fill.
+- An image built without the `ner` extra keeps surface matching.
+
 ## Cache A is invalidated by this release (no action required *for the cache*)
 
 This release widens detector coverage: the Luhn-validated `BANK_CARD` label is
