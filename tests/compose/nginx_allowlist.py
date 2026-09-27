@@ -122,8 +122,10 @@ class Location:
 
     @property
     def methods(self) -> tuple[str, ...]:
-        (limit,) = self.find("limit_except")
-        return limit.args
+        limits = self.find("limit_except")
+        if len(limits) != 1:
+            raise AssertionError(f"{self.key}: expected one limit_except, found {len(limits)}")
+        return limits[0].args
 
 
 @dataclass(frozen=True)

@@ -60,7 +60,7 @@ def test_the_snippet_declares_exactly_the_admitted_set() -> None:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(("method", "path"), sorted(ADMITTED))
+@pytest.mark.parametrize(("method", "path"), sorted(declared_pairs(gateway_snippet())))
 def test_the_gateway_table_admits_every_pair_nginx_admits(method: str, path: str) -> None:
     entry = lookup(method, path)
 

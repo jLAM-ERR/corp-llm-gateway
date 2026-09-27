@@ -1,7 +1,8 @@
 """Stub upstream for the nginx runtime tests: 200 on :8000, nothing on :8001
 (connection refused), and :8002 accepts and never answers (a read timeout).
 :4000 stands in for the gateway (the harness aliases this container as
-``litellm``): it answers 200 to any method and records what arrived.
+``litellm``): it answers 200 to any method and records what arrived; a
+``big=1`` query parameter makes the answer 8 MiB instead of ``ok``.
 Prints one ``stub-hit`` line per request that reaches it; a :4000 line carries
 ``stub-hit <json>`` with the method, the request target exactly as sent, the
 headers, and the body's length and sha256."""
@@ -11,6 +12,9 @@ import http.server
 import json
 import socket
 import threading
+import urllib.parse
+
+BIG_RESPONSE = b"x" * (8 * 1024 * 1024)
 
 
 class Ok(http.server.BaseHTTPRequestHandler):
@@ -54,11 +58,13 @@ class Recording(http.server.BaseHTTPRequestHandler):
             "body_sha256": hashlib.sha256(body).hexdigest(),
         }
         print("stub-hit " + json.dumps(record), flush=True)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        answer = BIG_RESPONSE if query.get("big") == ["1"] else b"ok"
         self.send_response(200)
-        self.send_header("Content-Length", "2")
+        self.send_header("Content-Length", str(len(answer)))
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(b"ok")
+            self.wfile.write(answer)
 
     def __getattr__(self, name: str):
         # BaseHTTPRequestHandler dispatches to do_<METHOD>: record every method.

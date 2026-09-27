@@ -309,6 +309,22 @@ REFUSALS = [
         ),
         id="trusted-v6-only-two",
     ),
+    # geo and set_real_ip_from never match an IPv4 socket against a mapped entry.
+    *(
+        pytest.param(
+            Refusal(
+                {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": value},
+                66,
+                ("NGINX_TRUSTED_PROXIES", "IPv4"),
+            ),
+            id=f"trusted-v4-mapped-only{suffix}",
+        )
+        for value, suffix in (
+            ("::ffff:10.1.2.3", ""),
+            ("::FFFF:10.1.2.3", "-upper"),
+            ("::ffff:10.1.2.3/128", "-128"),
+        )
+    ),
     pytest.param(
         Refusal(
             {**TERMINATE, "NGINX_TRUSTED_PROXIES": "0.0.0.0/0"},
@@ -385,6 +401,7 @@ LEAK_CANARY = "LEAK-CANARY-9c1e"
         f"https://u:{LEAK_CANARY}/x@{LANGFUSE_HOST}",
         f"https://langfuse.other.test/cb?email=alice@{LEAK_CANARY}.example",
         f"https://langfuse.other.test#x@{LEAK_CANARY}",
+        f"sk-ant-api03-{LEAK_CANARY}",
     ],
     ids=[
         "https-userinfo",
@@ -393,6 +410,7 @@ LEAK_CANARY = "LEAK-CANARY-9c1e"
         "slash-in-userinfo",
         "at-in-query",
         "at-in-fragment",
+        "no-scheme",
     ],
 )
 def test_the_langfuse_refusal_does_not_echo_a_credential(
@@ -487,19 +505,19 @@ def test_a_valid_config_starts(
         assert "not a domain" not in rendered.stdout
 
 
-@pytest.mark.parametrize(
-    "trusted",
-    ["fd00::1 10.0.0.0/8", "::ffff:10.1.2.3", "::FFFF:10.1.2.3"],
-    ids=["v6-beside-v4", "v4-mapped", "v4-mapped-upper"],
-)
+@pytest.mark.parametrize("trusted", ["fd00::1 {peer}"], ids=["v6-beside-v4"])
 def test_a_trusted_list_with_an_ipv4_entry_starts(
-    specs: dict[str, Spec], project: Path, network: Network, trusted: str
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub, trusted: str
 ) -> None:
-    # trust_client=False: the test client's own IPv4 address must not be what
-    # satisfies the at-least-one-IPv4 rule.
+    # trust_client=False: the list is exactly this one, and the IPv4 entry in it
+    # is what admits the client — served, not just started.
+    trusted = trusted.format(peer=network.client_peer)
     env = {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": trusted}
+    seen = len(stub_upstream.requests())
     with started(specs["host"], project, network, env, trust_client=False) as nginx:
         dump = nginx.exec("nginx", "-T")
+        status = nginx.status(8080, "/v1/models", GATEWAY_HOST)
+        entries = nginx.access_log(expected=1)
 
     assert dump.returncode == 0, dump.stderr
     directives = re.sub(r"#[^\n]*", "", dump.stdout)
@@ -507,6 +525,11 @@ def test_a_trusted_list_with_an_ipv4_entry_starts(
         "default 0;",
         *(f"{entry} 1;" for entry in trusted.split()),
     ]
+    assert status == 200
+    assert [(r["method"], r["target"]) for r in stub_upstream.requests_since(seen)] == [
+        ("GET", "/v1/models")
+    ]
+    assert [(e["status"], e["from_trusted_proxy"]) for e in entries] == [("200", "1")]
 
 
 def _runtime_variables(text: str) -> set[str]:
@@ -1082,6 +1105,27 @@ def test_each_admitted_pair_arrives_with_its_credentials_and_query_untouched(
         assert headers.get("connection", ["close"]) != ["upgrade"], record
 
 
+def test_an_absolute_form_request_forwards_the_host_nginx_selected_on(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    # nginx picks the server by the request-line authority, not the Host header;
+    # the gateway must see that authority, never the foreign Host.
+    request = (
+        f"POST http://{GATEWAY_HOST}/v1/messages HTTP/1.1\r\n"
+        "Host: other.example.test\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n\r\n{}"
+    ).encode()
+    seen = len(stub_upstream.requests())
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        status = _raw_status(nginx.ports[8080], request)
+
+    assert status == 200
+    (record,) = stub_upstream.requests_since(seen)
+    assert (record["method"], record["target"]) == ("POST", "/v1/messages")
+    assert _headers(record)["host"] == [GATEWAY_HOST]
+
+
 def test_an_issuance_body_over_1k_is_refused_by_nginx(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
 ) -> None:
@@ -1174,7 +1218,7 @@ def test_the_gateway_never_sees_a_path_nginx_did_not_admit(
     else:
         assert status == 200, (target, status)
         assert len(records) == 1, (target, records)
-        assert records[0]["target"] in ADMITTED_PATHS, (target, records[0]["target"])
+        assert (records[0]["method"], records[0]["target"]) in DECLARED, (target, records[0])
 
 
 @pytest.mark.parametrize("overlay", ["base", "oauth"])
@@ -1254,4 +1298,68 @@ def test_the_temp_file_fault_is_real_on_a_buffered_location(
 
     assert "[crit]" in stderr
     assert "client_temp" in stderr
+    assert PROXY_CANARY in stderr
+
+
+BIG_RESPONSE_BYTES = 8 * 1024 * 1024
+BIG_TARGET = f"/v1/models?big=1&code={PROXY_CANARY}"
+
+
+def _read_slowly(port: int, target: str) -> bytes:
+    """GET ``target`` and stall before reading, so nginx is left holding far more
+    response than its memory buffers take."""
+    request = _raw_request("GET", target, *(f"{k}: {v}" for k, v in CREDENTIALS.items()))
+    with socket.create_connection(("127.0.0.1", port), timeout=30) as conn:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        conn.sendall(request)
+        time.sleep(3)
+        chunks = []
+        with contextlib.suppress(ConnectionResetError):
+            while chunk := conn.recv(65536):
+                chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def test_a_temp_file_fault_cannot_write_the_request_line_for_a_large_response(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    """The response side of the same fault: a slow reader of a large answer is
+    where a buffering proxy spills to proxy_temp."""
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        _fault_temp_files(nginx)
+        response = _read_slowly(nginx.ports[8080], BIG_TARGET)
+        nginx.access_log(expected=1)
+        _assert_no_secret_in(nginx)
+        stdout, stderr = nginx.log_streams()
+
+    head, _, body = response.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 200 "), head
+    assert len(body) == BIG_RESPONSE_BYTES
+    for stream in (stdout, stderr):
+        assert "GET /v1/models" not in stream
+        assert "proxy_temp" not in stream
+
+
+def test_the_response_temp_file_fault_is_real_on_a_buffering_location(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    # The control: the tracked snippet with response buffering on and the temp
+    # file allowed does write the request line at crit on the same fault.
+    snippet = project / "nginx" / "templates" / "snippets" / "gateway-locations.inc.template"
+    text = snippet.read_text()
+    assert text.count("proxy_buffering off;\n") == 1
+    assert text.count("proxy_max_temp_file_size 0;\n") == 1
+    snippet.write_text(
+        text.replace("proxy_buffering off;\n", "proxy_buffering on;\n").replace(
+            "proxy_max_temp_file_size 0;\n", ""
+        )
+    )
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        _fault_temp_files(nginx)
+        _read_slowly(nginx.ports[8080], BIG_TARGET)
+        nginx.access_log(expected=1)
+        stderr = nginx.log_streams()[1]
+
+    assert "[crit]" in stderr
+    assert "proxy_temp" in stderr
     assert PROXY_CANARY in stderr

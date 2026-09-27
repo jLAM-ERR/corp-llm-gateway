@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import subprocess
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -355,8 +356,14 @@ def test_count_tokens_is_nginxs_404_and_reaches_nothing(oauth_front_door: FrontD
     # nginx's page, not the gateway's JSON refusal: the request never left nginx.
     assert "E_ROUTE_BLOCKED" not in response.text
     assert stack.new_captures() == []
-    entries = oauth_front_door.nginx.access_log(expected=1)
-    counted = [e for e in entries if e["uri"] == "/v1/messages/count_tokens"]
+    # The container is module-scoped and already holds entries: wait for this one.
+    deadline = time.monotonic() + 10
+    while True:
+        entries = oauth_front_door.nginx.access_log(expected=0)
+        counted = [e for e in entries if e["uri"] == "/v1/messages/count_tokens"]
+        if counted or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
     assert [e["status"] for e in counted] == ["404"]
     assert counted[0]["upstream_status"] in ("", "-")
 

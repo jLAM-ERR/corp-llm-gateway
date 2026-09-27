@@ -123,11 +123,7 @@ is_trusted_entry() {
     [ "$prefix" -ge "$floor" ] && [ "$prefix" -le "$ceiling" ]
 }
 
-# An IPv4-mapped IPv6 address (::ffff:a.b.c.d) is looked up in geo's IPv4 tree.
-is_ipv4_entry() {
-    address=$(lowercase "${1%%/*}")
-    is_ipv4 "${address#::ffff:}"
-}
+is_ipv4_entry() { is_ipv4 "${1%%/*}"; }
 
 NGINX_TRUSTED_PROXIES=${NGINX_TRUSTED_PROXIES:-}
 trusted_count=0
@@ -148,7 +144,7 @@ fi
 # The listeners are IPv4 (listen 8080) and neither geo nor set_real_ip_from
 # matches across address families: an IPv6-only list would refuse every peer.
 if [ "$NGINX_TLS_MODE" = behind-proxy ] && [ "$ipv4_count" -eq 0 ]; then
-    fail 66 "NGINX_TRUSTED_PROXIES has no IPv4 entry: the behind-proxy listeners are IPv4, so at least one IPv4 address/CIDR is required"
+    fail 66 "NGINX_TRUSTED_PROXIES has no IPv4 entry: the behind-proxy listeners are IPv4, so at least one dotted-quad IPv4 address/CIDR is required (::ffff:a.b.c.d never matches an IPv4 peer)"
 fi
 
 # ---- 5. bind address (behind-proxy) -------------------------------------------
@@ -207,6 +203,13 @@ fi
 # hold secrets. The authority ends at the first / ? or #, so an @ after it is
 # never read; an authority with an @ or a host that is not a hostname is not shown.
 url_origin() {
+    case $1 in
+        *://*) ;;
+        *)
+            printf '<not shown>'
+            return
+            ;;
+    esac
     scheme=
     case $1 in
         https://*) scheme=https:// ;;

@@ -21,7 +21,9 @@ proxy_max_temp_file_size 0;
 # guardrail. The upgrade maps in 00-http are for the Langfuse snippet only.
 proxy_set_header Upgrade "";
 proxy_set_header Connection "";
-proxy_set_header Host $proxy_host_header;
+# $host, not the Host header: an absolute-form request line selects the server
+# by its authority, and litellm must see that name, never a foreign Host.
+proxy_set_header Host $host;
 proxy_set_header X-Forwarded-Proto https;
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 

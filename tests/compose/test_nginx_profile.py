@@ -335,7 +335,7 @@ GATEWAY_SERVER_DIRECTIVES = [
     "proxy_max_temp_file_size 0",
     'proxy_set_header Upgrade ""',
     'proxy_set_header Connection ""',
-    "proxy_set_header Host $proxy_host_header",
+    "proxy_set_header Host $host",
     "proxy_set_header X-Forwarded-Proto https",
     "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for",
     "client_max_body_size 25m",
@@ -382,6 +382,18 @@ def test_the_parser_sees_a_nested_block_and_refuses_an_unbalanced_one() -> None:
     ]
     with pytest.raises(AssertionError):
         parse_snippet("location = /a { limit_except POST { deny all; } ")
+
+
+@pytest.mark.parametrize(
+    ("body", "found"),
+    [("return 204;", 0), ("limit_except POST { deny all; } limit_except GET { deny all; }", 2)],
+    ids=["none", "two"],
+)
+def test_a_location_without_exactly_one_limit_except_names_itself(body: str, found: int) -> None:
+    (location,) = parse_snippet(f"location = /a {{ {body} }}").locations
+
+    with pytest.raises(AssertionError, match=f"= /a: expected one limit_except, found {found}"):
+        _ = location.methods
 
 
 # --------------------------------------------------------------------------- #
