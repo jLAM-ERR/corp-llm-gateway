@@ -14,12 +14,9 @@ from __future__ import annotations
 import ast
 import json
 import os
-import socket
-import struct
 import subprocess
 import sys
 import textwrap
-import threading
 from collections.abc import Callable, Iterator
 from importlib.util import find_spec
 from pathlib import Path
@@ -608,65 +605,14 @@ def test_a_dsn_postgres_cannot_parse_exits_78_and_never_prints_it(
     assert _NOT_A_DSN not in result["stdout"]
 
 
-_SSL_REQUEST = 80877103
-
-
-class _RejectingPgBouncer:
-    """Answers every startup message the way PgBouncer answers one carrying a
-    parameter it does not know: ErrorResponse 08P01, then close."""
-
-    def __init__(self) -> None:
-        self.startups: list[bytes] = []
-        self._sock = socket.create_server(("127.0.0.1", 0))
-        self.port = self._sock.getsockname()[1]
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                conn, _ = self._sock.accept()
-            except OSError:
-                return
-            with conn:
-                self._answer(conn)
-
-    def _answer(self, conn: socket.socket) -> None:
-        def read_message() -> bytes:
-            (length,) = struct.unpack("!I", _read_exactly(conn, 4))
-            return _read_exactly(conn, length - 4)
-
-        try:
-            message = read_message()
-            if struct.unpack("!I", message[:4])[0] == _SSL_REQUEST:
-                conn.sendall(b"N")
-                message = read_message()
-        except (OSError, EOFError):
-            return
-        self.startups.append(message)
-        fields = b"SFATAL\0VFATAL\0C08P01\0Munsupported startup parameter: tcp_keepalives_idle\0\0"
-        conn.sendall(b"E" + struct.pack("!I", len(fields) + 4) + fields)
-
-    def close(self) -> None:
-        self._sock.close()
-
-
-def _read_exactly(conn: socket.socket, size: int) -> bytes:
-    data = b""
-    while len(data) < size:
-        chunk = conn.recv(size - len(data))
-        if not chunk:
-            raise EOFError
-        data += chunk
-    return data
-
-
 def test_a_pgbouncer_that_rejects_the_keepalive_parameters_exits_78(
     valid_config: Path, tmp_path: Path
 ) -> None:
     # Booting would answer 503 on every request until an operator changed PgBouncer.
     _require_issuance_extras()
-    bouncer = _RejectingPgBouncer()
+    from tests.postgres_support import RejectingPgBouncer
+
+    bouncer = RejectingPgBouncer()
     dsn = f"postgresql://gateway:pgb-pass-81d0@127.0.0.1:{bouncer.port}/gateway"
     try:
         result = _run(
@@ -1116,6 +1062,238 @@ def test_issuance_serves_a_200_through_the_real_entrypoint(
             await conn.close()
 
     assert asyncio.run(issued_rows()) == 1
+
+
+# ── a boot that could not check the token schema ─────────────────────────────
+
+_SCHEMA_READINESS_SCRIPT = f"""
+    import asyncio, json, os, socket, threading
+    from corp_llm_gateway import pg_session
+
+    schema_queries = [0]
+    _real_schema_problem = pg_session.token_schema_problem
+
+    async def _counting(conn, **kwargs):
+        schema_queries[0] += 1
+        return await _real_schema_problem(conn, **kwargs)
+
+    pg_session.token_schema_problem = _counting
+
+    import asyncpg
+    import corp_llm_gateway.asgi as asgi
+
+    boot_queries = schema_queries[0]
+
+    def start_relay(port, host, upstream_port):
+        server = socket.create_server(("127.0.0.1", port))
+
+        def pipe(src, dst):
+            try:
+                while data := src.recv(65536):
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for end in (src, dst):
+                    try:
+                        end.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        def accept():
+            while True:
+                try:
+                    client, _ = server.accept()
+                except OSError:
+                    return
+                upstream = socket.create_connection((host, upstream_port))
+                threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+                threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+
+    async def lifespan_step(queue, sent, message, expect):
+        await queue.put({{"type": message}})
+        while not [m for m in sent if m["type"].startswith(expect)]:
+            await asyncio.sleep(0.01)
+
+    async def call(method, path):
+        messages = []
+
+        async def receive():
+            return {{"type": "http.request", "body": b"", "more_body": False}}
+
+        async def send(message):
+            messages.append(message)
+
+        headers = []
+        if method == "POST":
+            headers = [(b"authorization", b"Bearer " + os.environ["ISSUE_TEST_BEARER"].encode())]
+        await asgi.app(
+            {{
+                "type": "http",
+                "method": method,
+                "path": path,
+                "raw_path": path.encode(),
+                "headers": headers,
+            }},
+            receive,
+            send,
+        )
+        start = next(m for m in messages if m["type"] == "http.response.start")
+        body = json.loads(
+            b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+        )
+        return [start["status"], body.get("detail") or body.get("error")]
+
+    async def main():
+        queue, sent = asyncio.Queue(), []
+
+        async def lifespan_send(message):
+            sent.append(message)
+
+        lifespan = asyncio.create_task(
+            asgi.app({{"type": "lifespan", "asgi": {{"version": "3.0"}}}}, queue.get, lifespan_send)
+        )
+        await lifespan_step(queue, sent, "lifespan.startup", "lifespan.startup.")
+        steps = {{"boot_verified": asgi.ISSUANCE_SCHEMA_VERIFIED, "boot_queries": boot_queries}}
+        if os.environ["SCHEMA_TEST_MODE"] == "late":
+            steps["down"] = await call("GET", "/healthz/ready")
+            start_relay(
+                int(os.environ["RELAY_PORT"]),
+                os.environ["UPSTREAM_HOST"],
+                int(os.environ["UPSTREAM_PORT"]),
+            )
+            gate = asgi._GATEWAY_ROUTES._issuance_schema
+            now = [0.0]
+            gate._clock = lambda: now[0]
+            steps["unmigrated_ready"] = await call("GET", "/healthz/ready")
+            steps["unmigrated_issue"] = await call("POST", "/internal/issue-token")
+            conn = await asyncpg.connect(os.environ["UPSTREAM_PG_DSN"], timeout=5.0)
+            try:
+                with open(os.environ["TOKENS_SCHEMA_SQL"]) as sql:
+                    await conn.execute(sql.read())
+            finally:
+                await conn.close()
+            steps["within_interval_ready"] = await call("GET", "/healthz/ready")
+            now[0] += gate._recheck_s
+            steps["migrated_ready"] = await call("GET", "/healthz/ready")
+            steps["migrated_issue"] = await call("POST", "/internal/issue-token")
+        else:
+            steps["ready"] = [await call("GET", "/healthz/ready") for _ in range(3)]
+        steps["queries"] = schema_queries[0]
+        await lifespan_step(queue, sent, "lifespan.shutdown", "lifespan.shutdown.")
+        await lifespan
+        print("{SENTINEL}" + json.dumps(steps))
+
+    asyncio.run(main())
+"""
+
+
+def _issuance_bearer(issuer: str, key: object, jti: str) -> str:
+    import time
+
+    import jwt
+
+    now = int(time.time())
+    return jwt.encode(
+        {
+            "iss": issuer,
+            "aud": "corp-gateway-issuance",
+            "azp": "corp-gateway-cli",
+            "sub": f"sub-{jti}",
+            "jti": jti,
+            "iat": now,
+            "exp": now + 300,
+            "preferred_username": "alice.schema",
+            "groups": ["/devs"],
+        },
+        key,  # type: ignore[arg-type]
+        "RS256",
+        headers={"kid": "kid-entrypoint", "typ": "JWT"},
+    )
+
+
+def test_a_late_postgres_recovery_gates_readiness_and_issuance_on_the_token_schema(
+    valid_config: Path,
+    tmp_path: Path,
+    pg_schema: tuple[str, Callable[[str], None]],
+    jwks_server: tuple[str, object],
+) -> None:
+    import socket
+    from urllib.parse import urlsplit, urlunsplit
+
+    _require_issuance_extras()
+    dsn, in_schema = pg_schema
+    in_schema((ROOT / "src/corp_llm_gateway/team_config/schema.sql").read_text())
+    in_schema("INSERT INTO team_config (team_id, name) VALUES ('t1', 't1')")
+    upstream = urlsplit(dsn)
+    # Nothing listens here at boot; the child relays it to Postgres afterwards.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        relay_port = probe.getsockname()[1]
+    netloc = f"{upstream.username}:{upstream.password}@127.0.0.1:{relay_port}"
+    gateway_dsn = urlunsplit(upstream._replace(netloc=netloc))
+    issuer, key = jwks_server
+    env = _issuance_env(
+        tmp_path,
+        CORP_LLM_PG_DSN=gateway_dsn,
+        CORP_GATEWAY_ISSUE_OIDC_ISSUER=issuer,
+        CORP_GATEWAY_ISSUE_OIDC_JWKS_URL=f"{issuer}/certs",
+        ISSUE_TEST_BEARER=_issuance_bearer(issuer, key, "jti-late-schema"),
+        SCHEMA_TEST_MODE="late",
+        RELAY_PORT=str(relay_port),
+        UPSTREAM_HOST=upstream.hostname or "localhost",
+        UPSTREAM_PORT=str(upstream.port or 5432),
+        UPSTREAM_PG_DSN=dsn,
+        TOKENS_SCHEMA_SQL=str(ROOT / "src/corp_llm_gateway/tokens/schema.sql"),
+    )
+
+    result = _run(_SCHEMA_READINESS_SCRIPT, valid_config, env=env)
+
+    assert result["boot_verified"] is False, result["stdout"]
+    assert result["boot_queries"] == 0
+    assert result["down"] == [503, "postgres_error:ConnectionRefusedError"]
+    status, detail = result["unmigrated_ready"]
+    assert status == 503
+    assert detail.startswith("issuance_schema: corp_tokens lacks the issuance columns")
+    assert "tokens/schema.sql" in detail
+    assert result["unmigrated_issue"] == [503, "E_ISSUE_SCHEMA"]
+    # Re-checked at most once per interval: still the cached answer.
+    assert result["within_interval_ready"] == result["unmigrated_ready"]
+    assert result["migrated_ready"] == [200, "ready"], result["stdout"]
+    assert result["migrated_issue"] == [200, None], result["stdout"]
+    assert result["queries"] == 2
+    assert "issuance schema check skipped" in result["stdout"]
+    assert gateway_dsn not in result["stdout"]
+    assert f"127.0.0.1:{relay_port}" not in result["stdout"]
+
+
+def test_a_schema_current_at_boot_is_never_queried_by_readiness(
+    valid_config: Path,
+    tmp_path: Path,
+    pg_schema: tuple[str, Callable[[str], None]],
+    jwks_server: tuple[str, object],
+) -> None:
+    _require_issuance_extras()
+    dsn, in_schema = pg_schema
+    in_schema((ROOT / "src/corp_llm_gateway/tokens/schema.sql").read_text())
+    issuer, key = jwks_server
+    env = _issuance_env(
+        tmp_path,
+        CORP_LLM_PG_DSN=dsn,
+        CORP_GATEWAY_ISSUE_OIDC_ISSUER=issuer,
+        CORP_GATEWAY_ISSUE_OIDC_JWKS_URL=f"{issuer}/certs",
+        ISSUE_TEST_BEARER=_issuance_bearer(issuer, key, "jti-current-schema"),
+        SCHEMA_TEST_MODE="current",
+    )
+
+    result = _run(_SCHEMA_READINESS_SCRIPT, valid_config, env=env)
+
+    assert result["boot_verified"] is True, result["stdout"]
+    assert result["boot_queries"] == 1
+    assert result["ready"] == [[200, "ready"]] * 3
+    assert result["queries"] == 1
 
 
 # ── steps 3-5: what a successful import leaves behind ────────────────────────

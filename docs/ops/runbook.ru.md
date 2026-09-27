@@ -203,6 +203,7 @@ staging-гейта апгрейда (согласно задаче M0-7 в пл�
 | `E_ISSUE_BUSY` | 503 | блокировка субъекта или запрос к базе не уложились (5 с / 8 с); повторите |
 | `E_JWKS_UNAVAILABLE` | 503 | pod не может загрузить JWKS Keycloak — NetworkPolicy (`networkPolicy.keycloak`), CA bundle, сам Keycloak |
 | `E_ISSUE_STORE_TIMEOUT` / `E_ISSUE_STORE_UNAVAILABLE` | 503 | Postgres медленный или недоступен (см. выше) |
+| `E_ISSUE_SCHEMA` | 503 | pod стартовал при недоступном Postgres и ещё не увидел `corp_tokens` актуальной; `/healthz/ready` называет проблему — примените `tokens/schema.sql` (`upgrade.md`); readiness перепроверяет каждые 15 с |
 
 ### Отзыв токена не подействовал сразу
 

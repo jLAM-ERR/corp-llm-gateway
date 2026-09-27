@@ -1,6 +1,7 @@
 """Issuance through the real composition root: a token minted by
-`bootstrap.build_health_router()` is accepted by the real guardrail's
-`AuthMiddleware`, because both hold the same lazily built store.
+`bootstrap.build_health_router(issuance_schema_verified=True)` is accepted by the real guardrail's
+`AuthMiddleware`, because both hold the same lazily built store. The router is
+built as the entrypoint builds it after a boot whose schema check passed.
 
 Signs real RS256 tokens and serves the JWKS from a local HTTP server, so it needs
 `cryptography` (the 'oidc' extra) and skips on the venv that lacks it.
@@ -153,7 +154,7 @@ async def test_a_token_issued_by_the_router_authenticates_through_the_guardrail(
     _enable_issuance(monkeypatch, tmp_path, jwks_url)
     tokens, _ = await _seed_stores("payments")
 
-    router = bootstrap.build_health_router()
+    router = bootstrap.build_health_router(issuance_schema_verified=True)
     # Building the routes must not build the guardrail (the entrypoint contract).
     assert bootstrap._guardrail is None
 
@@ -174,7 +175,7 @@ async def test_the_guardrail_and_the_router_share_the_team_config_store(
     _enable_issuance(monkeypatch, tmp_path, jwks_url)
     _, teams = await _seed_stores("payments")
 
-    bootstrap.build_health_router()
+    bootstrap.build_health_router(issuance_schema_verified=True)
 
     assert bootstrap.get_team_config_store() is teams
     assert bootstrap.guardrail.orchestrator._team_store is teams  # type: ignore[attr-defined]
@@ -189,7 +190,8 @@ async def test_a_group_mapped_to_an_unknown_team_is_refused_403(
     tokens, _ = await _seed_stores()
 
     resp = await _issue(
-        bootstrap.build_health_router(), _token(jwks_url, groups=["/devs/payments"])
+        bootstrap.build_health_router(issuance_schema_verified=True),
+        _token(jwks_url, groups=["/devs/payments"]),
     )
 
     assert resp.status_code == 403
@@ -203,7 +205,10 @@ async def test_an_unmapped_group_is_refused_403(
     _enable_issuance(monkeypatch, tmp_path, jwks_url)
     await _seed_stores("payments")
 
-    resp = await _issue(bootstrap.build_health_router(), _token(jwks_url, groups=["/other"]))
+    resp = await _issue(
+        bootstrap.build_health_router(issuance_schema_verified=True),
+        _token(jwks_url, groups=["/other"]),
+    )
 
     assert resp.status_code == 403
     assert resp.json() == {"error": "E_ISSUE_NO_TEAM"}
@@ -214,7 +219,7 @@ async def test_the_router_applies_the_per_subject_policy(
 ) -> None:
     _enable_issuance(monkeypatch, tmp_path, jwks_url)
     await _seed_stores("payments")
-    router = bootstrap.build_health_router()
+    router = bootstrap.build_health_router(issuance_schema_verified=True)
     bearer = _token(jwks_url, groups=["/devs/payments"])
 
     first = await _issue(router, bearer)
@@ -229,7 +234,7 @@ async def test_the_router_applies_the_per_subject_policy(
 async def test_with_issuance_off_the_router_has_no_issuer_and_builds_no_store(
     shared: None,
 ) -> None:
-    router = bootstrap.build_health_router()
+    router = bootstrap.build_health_router(issuance_schema_verified=True)
 
     resp = await _issue(router, "anything")
 
@@ -248,7 +253,7 @@ def test_issuance_without_postgres_is_refused_by_the_router_build(
     config.reset_cache()
 
     with pytest.raises(ConfigError, match="CORP_LLM_PG_DSN"):
-        bootstrap.build_health_router()
+        bootstrap.build_health_router(issuance_schema_verified=True)
 
 
 def test_the_token_store_pool_is_sized_for_issuance_plus_auth(
@@ -286,7 +291,7 @@ async def test_an_unknown_team_refusal_does_not_burn_the_jti(
 ) -> None:
     _enable_issuance(monkeypatch, tmp_path, jwks_url)
     tokens, teams = await _seed_stores()
-    router = bootstrap.build_health_router()
+    router = bootstrap.build_health_router(issuance_schema_verified=True)
     bearer = _token(jwks_url, groups=["/devs/payments"])
 
     refused = await _issue(router, bearer)
@@ -322,7 +327,7 @@ async def test_a_team_store_outage_is_a_503_that_stores_nothing_and_burns_nothin
     await teams.upsert(TeamConfig(team_id="payments", name="payments"))
     bootstrap._token_store = tokens
     bootstrap._team_config_store = teams
-    router = bootstrap.build_health_router()
+    router = bootstrap.build_health_router(issuance_schema_verified=True)
     bearer = _token(jwks_url, groups=["/devs/payments"])
 
     with caplog.at_level("DEBUG"):
@@ -350,7 +355,7 @@ async def test_the_config_file_map_order_decides_between_overlapping_groups(
     tokens, _ = await _seed_stores("zeta", "alpha")
 
     resp = await _issue(
-        bootstrap.build_health_router(),
+        bootstrap.build_health_router(issuance_schema_verified=True),
         _token(jwks_url, groups=["/devs/alpha", "/devs/zeta"]),
     )
 
@@ -367,7 +372,7 @@ async def test_the_router_takes_its_store_bound_from_settings(
     config.reset_cache()
     await _seed_stores("payments")
 
-    router = bootstrap.build_health_router()
+    router = bootstrap.build_health_router(issuance_schema_verified=True)
     try:
         assert router._issue_timeout_s == 7.0
     finally:
@@ -380,7 +385,7 @@ async def test_the_default_store_bound_is_ten_seconds(
     _enable_issuance(monkeypatch, tmp_path, jwks_url)
     await _seed_stores("payments")
 
-    router = bootstrap.build_health_router()
+    router = bootstrap.build_health_router(issuance_schema_verified=True)
     try:
         assert router._issue_timeout_s == 10.0
     finally:
@@ -392,7 +397,7 @@ async def test_closing_the_router_closes_the_verifiers_jwks_client(
 ) -> None:
     _enable_issuance(monkeypatch, tmp_path, jwks_url)
     await _seed_stores("payments")
-    router = bootstrap.build_health_router()
+    router = bootstrap.build_health_router(issuance_schema_verified=True)
     verifier = router._on_close.__self__  # type: ignore[union-attr]
     http = verifier._jwks._http
 

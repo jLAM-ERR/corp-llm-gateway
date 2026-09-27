@@ -8,6 +8,9 @@ fault FAILS: the issuance race tests must never go green by skipping.
 from __future__ import annotations
 
 import os
+import socket
+import struct
+import threading
 from typing import NoReturn
 
 import pytest
@@ -38,3 +41,56 @@ def require_asyncpg() -> None:
         import asyncpg  # noqa: F401
     except ImportError:
         skip_or_fail("asyncpg not installed")
+
+
+_SSL_REQUEST = 80877103
+
+
+class RejectingPgBouncer:
+    """Answers every startup message the way PgBouncer answers one carrying a
+    parameter it does not know: ErrorResponse 08P01, then close."""
+
+    def __init__(self) -> None:
+        self.startups: list[bytes] = []
+        self._sock = socket.create_server(("127.0.0.1", 0))
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            with conn:
+                self._answer(conn)
+
+    def _answer(self, conn: socket.socket) -> None:
+        def read_message() -> bytes:
+            (length,) = struct.unpack("!I", _read_exactly(conn, 4))
+            return _read_exactly(conn, length - 4)
+
+        try:
+            message = read_message()
+            if struct.unpack("!I", message[:4])[0] == _SSL_REQUEST:
+                conn.sendall(b"N")
+                message = read_message()
+        except (OSError, EOFError):
+            return
+        self.startups.append(message)
+        fields = b"SFATAL\0VFATAL\0C08P01\0Munsupported startup parameter: tcp_keepalives_idle\0\0"
+        conn.sendall(b"E" + struct.pack("!I", len(fields) + 4) + fields)
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def _read_exactly(conn: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            raise EOFError
+        data += chunk
+    return data

@@ -1,7 +1,7 @@
 """Bounded use of an asyncpg pool, and what each Postgres failure means.
 
-Shared by the Postgres stores, the issuance route, the auth hot path and the boot's
-issuance schema check. asyncpg
+Shared by the Postgres stores, the issuance route, the auth hot path, readiness and
+the issuance schema check (the boot's, and readiness's after a late recovery). asyncpg
 is optional: nothing here imports it, and an asyncpg class is only consulted when
 something already imported the driver — without it, none of its errors can be in
 flight.
@@ -65,10 +65,86 @@ async def connect_with_keepalives[T](
     try:
         return await connect(dsn, timeout=timeout, server_settings=KEEPALIVE_SERVER_SETTINGS)
     except Exception as exc:
-        asyncpg = sys.modules.get("asyncpg")
-        if asyncpg is not None and isinstance(exc, asyncpg.ProtocolViolationError):
+        if startup_parameter_rejected(exc):
             raise StartupParameterRejectedError from None
         raise
+
+
+def startup_parameter_rejected(exc: BaseException) -> bool:
+    """Whether ``exc`` is the protocol violation a rejected startup parameter raises
+    while a connection is being opened."""
+    asyncpg = sys.modules.get("asyncpg")
+    return asyncpg is not None and isinstance(exc, asyncpg.ProtocolViolationError)
+
+
+# Each statement of the token schema check, client-side; opening its connection too.
+TOKEN_SCHEMA_TIMEOUT_S = 5.0
+TOKEN_SCHEMA_MISSING = (
+    "corp_tokens lacks the issuance columns or the oidc_jti unique index — apply "
+    "src/corp_llm_gateway/tokens/schema.sql (idempotent) before enabling "
+    "CORP_GATEWAY_ISSUE_OIDC_ISSUER"
+)
+# CREATE UNIQUE INDEX IF NOT EXISTS skips an index that already carries the name,
+# so for these two re-applying schema.sql alone changes nothing.
+JTI_INDEX_INVALID = (
+    "corp_tokens_oidc_jti_key exists but is INVALID (an interrupted CREATE INDEX "
+    "CONCURRENTLY, or a failed REINDEX) — DROP INDEX corp_tokens_oidc_jti_key (or "
+    "REINDEX INDEX corp_tokens_oidc_jti_key), then re-apply "
+    "src/corp_llm_gateway/tokens/schema.sql"
+)
+JTI_INDEX_MISSHAPEN = (
+    "corp_tokens_oidc_jti_key is not a UNIQUE index on corp_tokens (oidc_jti) alone — "
+    "DROP INDEX corp_tokens_oidc_jti_key, then re-apply "
+    "src/corp_llm_gateway/tokens/schema.sql"
+)
+
+# The index the store's replay mapping names, proven to be what the name claims:
+# valid, UNIQUE, not partial, not on an expression, keyed on exactly oidc_jti of
+# the corp_tokens the store's unqualified queries resolve to. No row: no such index.
+_JTI_INDEX_SQL = """
+SELECT i.indisvalid AS valid,
+       coalesce(i.indisunique
+                AND i.indnatts = 1
+                AND i.indpred IS NULL
+                AND i.indexprs IS NULL
+                AND a.attname = 'oidc_jti', false) AS keyed_on_jti
+FROM pg_index i
+JOIN pg_class ic ON ic.oid = i.indexrelid
+LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+WHERE i.indrelid = to_regclass('corp_tokens')
+  AND ic.relname = 'corp_tokens_oidc_jti_key'
+"""
+
+
+async def token_schema_problem(conn: Any, *, timeout: float = TOKEN_SCHEMA_TIMEOUT_S) -> str | None:
+    """What keeps issuance from running on ``conn``'s database; ``None`` when
+    ``corp_tokens`` is current. Any other failure is raised."""
+    try:
+        # Resolved the way the store's own unqualified queries resolve it.
+        await conn.execute(
+            "SELECT oidc_issuer, oidc_subject, oidc_jti FROM corp_tokens LIMIT 0",
+            timeout=timeout,
+        )
+    except Exception as exc:
+        if _asyncpg_error(exc, "UndefinedTableError", "UndefinedColumnError"):
+            return TOKEN_SCHEMA_MISSING
+        raise
+    index = await conn.fetchrow(_JTI_INDEX_SQL, timeout=timeout)
+    if index is None:
+        return TOKEN_SCHEMA_MISSING
+    if not index["keyed_on_jti"]:
+        return JTI_INDEX_MISSHAPEN
+    if not index["valid"]:
+        return JTI_INDEX_INVALID
+    return None
+
+
+def _asyncpg_error(exc: BaseException, *names: str) -> bool:
+    asyncpg = sys.modules.get("asyncpg")
+    if asyncpg is None:
+        return False
+    classes = tuple(getattr(asyncpg, name) for name in names)
+    return isinstance(exc, classes)
 
 
 async def run_on_connection[T](

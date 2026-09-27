@@ -220,7 +220,9 @@ gateway config refused: issuance schema check: Postgres/PgBouncer rejected a sta
 ```
 
 A gateway that booted before PgBouncer began refusing them answers issuance with
-503 `E_ISSUE_STORE_UNAVAILABLE`.
+503 `E_ISSUE_STORE_UNAVAILABLE`, and its readiness turns 503 with
+`postgres_error:StartupParameterRejectedError`: readiness connects the way the
+stores do, with the same startup parameters.
 
 ### TLS to corp-LLM
 
@@ -475,7 +477,10 @@ Exit 70 (`EX_SOFTWARE`): litellm started without a `CorpLlmGuardrail` callback.
 
 - issuance on and Postgres unreachable at boot (08xxx connection errors, 57P0x
   shutdown/starting up, 53300 too many connections, a socket error): the schema
-  check is skipped with a warning and readiness reports the store;
+  check is skipped with a warning. Until readiness sees the schema current,
+  `/healthz/ready` answers 503 (the store, then `issuance_schema: …` naming the
+  remedy) and `POST /internal/issue-token` answers **503 `E_ISSUE_SCHEMA`**.
+  Readiness re-checks at most every 15 s and stops once the schema passes;
 - `CORP_LLM_MAX_INFLIGHT=0` outside prod: the cap is off, with a warning;
 - `CORP_LLM_DEV_TEAM_TOKEN` set with a DSN or in prod: ignored, with a warning.
 

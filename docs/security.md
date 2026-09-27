@@ -890,8 +890,9 @@ any public endpoint, in this order:
    revoked. The transaction runs with `lock_timeout` 5 s and
    `statement_timeout` 8 s; either firing is 503 `E_ISSUE_BUSY`.
 6. **One bound over steps 3-5**: `CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS`
-   (default 10, 5-300). Past it the request answers 503 `E_ISSUE_STORE_TIMEOUT`
-   and frees its slot; a connection-class store failure is 503
+   (default 10, 5-300). Before step 3, a token schema not yet seen current
+   (Boot, below) is 503 `E_ISSUE_SCHEMA`. Past the bound the request answers
+   503 `E_ISSUE_STORE_TIMEOUT` and frees its slot; a connection-class store failure is 503
    `E_ISSUE_STORE_UNAVAILABLE`; anything else is 500 `E_ISSUE_INTERNAL`. A
    cancelled statement gets a server-side cancel request within 0.5 s, then its
    connection is terminated (`pg_session.py`).
@@ -909,8 +910,16 @@ naming an unreadable `CORP_LLM_CA_BUNDLE`, or when Postgres refuses the DSN
 `sslmode=require|verify-*` the server declines), or the privilege to read
 `corp_tokens`, and when `corp_tokens` lacks the issuance columns or a valid
 unique index `corp_tokens_oidc_jti_key` on `oidc_jti` alone. A Postgres the
-network cannot reach (08xxx, 57P0x, 53300, a socket error) warns and boots;
-readiness reports it (`pg_session.BOOT_PROBE_OUTCOMES`).
+network cannot reach (08xxx, 57P0x, 53300, a socket error) warns and boots
+(`pg_session.BOOT_PROBE_OUTCOMES`), with the schema unchecked: until readiness
+sees it current, `/healthz/ready` is 503 and the route answers 503
+`E_ISSUE_SCHEMA` without touching the store. Readiness re-runs the same schema
+check at most every 15 s, over the token store's own pool, and stops once it
+passes (`healthz/checks.py` `IssuanceSchemaGate`); its detail names the problem
+and the remedy, never the DSN. Readiness reaches Postgres the way the stores do —
+the token store's pool, or before it exists one connection with the same
+keepalive startup parameters — so a PgBouncer that rejects them turns the pod
+unready (`postgres_error:StartupParameterRejectedError`).
 
 **The runtime auth path is bounded too.** Every rewritten request looks its
 `X-Corp-Auth` token up in the same store: one lookup per token at a time

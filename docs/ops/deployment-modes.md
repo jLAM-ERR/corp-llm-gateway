@@ -163,7 +163,8 @@ tokens come from `gateway-admin token issue` (break-glass).
 **Postgres behind PgBouncer.** The gateway's pools send TCP keepalive startup
 parameters; PgBouncer refuses them unless `ignore_startup_parameters` lists them
 (`configuration.md`, "Backends"). Without that, every store call fails and
-every LLM request answers 503. With issuance on, the gateway does not start: it
+every LLM request answers 503; readiness connects the same way, so the pod
+leaves rotation. With issuance on, the gateway does not start: it
 exits 78, and the log line names `ignore_startup_parameters` and the three
 parameters to list.
 

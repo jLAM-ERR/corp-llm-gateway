@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import types
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,14 @@ class PostgresTokenStore(TokenStore):
 
     def _acquire(self, pool: Any) -> Any:
         return pool.acquire(timeout=_ACQUIRE_TIMEOUT_S)
+
+    async def on_connection[T](self, work: Callable[[Any], Awaitable[T]]) -> T:
+        """``work(conn)`` on one of the store's pooled connections, bounded as the
+        lookups are: the connect, the acquire and the release."""
+        pool = await self._get_pool()
+        return await run_on_connection(
+            pool, work, acquire_timeout=_ACQUIRE_TIMEOUT_S, release_budget=_RELEASE_BUDGET_S
+        )
 
     async def init_schema(self) -> None:
         """Apply schema.sql idempotently; safe on an already-initialised DB."""

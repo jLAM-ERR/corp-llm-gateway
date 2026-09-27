@@ -20,7 +20,9 @@ body byte is refused (the read stops at 1 KiB and at 2 s), and the route has its
 own in-flight cap and token bucket, answered with 429 without queueing. The
 issuer's work after the body (verifier and its JWKS fetch, team lookup, token
 store) is bounded too, by one bound: past it the request answers 503
-``E_ISSUE_STORE_TIMEOUT`` and frees its slot. With no issuer
+``E_ISSUE_STORE_TIMEOUT`` and frees its slot. Until the token schema has been
+seen current (``IssuanceSchemaGate``) the route answers 503 ``E_ISSUE_SCHEMA``
+without touching the store. With no issuer
 the path is a local 404 for every method — it never falls through. Error bodies
 carry a code only, every issuance response is ``cache-control: no-store``, and
 the one log line per request carries the status and the code: never the bearer,
@@ -40,7 +42,7 @@ import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
-from corp_llm_gateway.healthz.checks import HealthCheck
+from corp_llm_gateway.healthz.checks import HealthCheck, IssuanceSchemaGate
 from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.tokens.errors import IssuancePolicyError
 from corp_llm_gateway.tokens.issuance import (
@@ -108,6 +110,7 @@ class HealthRouter:
         issue_timeout_s: float = DEFAULT_ISSUE_TIMEOUT_S,
         issue_clock: Callable[[], float] = time.monotonic,
         on_close: Callable[[], Awaitable[None]] | None = None,
+        issuance_schema: IssuanceSchemaGate | None = None,
     ) -> None:
         bounds = (issue_max_inflight, issue_rate_per_minute, issue_body_timeout_s, issue_timeout_s)
         # `not x > 0` also refuses NaN.
@@ -127,6 +130,7 @@ class HealthRouter:
         self._issue_body_timeout_s = issue_body_timeout_s
         self._issue_timeout_s = issue_timeout_s
         self._on_close = on_close
+        self._issuance_schema = issuance_schema
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         scope_type = scope["type"]
@@ -158,6 +162,8 @@ class HealthRouter:
                 await _issue_respond(send, 404, "E_ISSUE_DISABLED", body=method != "HEAD")
             elif method != "POST":
                 await _issue_respond(send, 405, "E_METHOD_NOT_ALLOWED", body=method != "HEAD")
+            elif self._issuance_schema is not None and not self._issuance_schema.verified:
+                await _issue_respond(send, 503, "E_ISSUE_SCHEMA")
             else:
                 await self._handle_issue_token(self._issuer, scope, receive, send)
             return
@@ -302,11 +308,13 @@ def build_health_router(
     issue_timeout_s: float = DEFAULT_ISSUE_TIMEOUT_S,
     issue_clock: Callable[[], float] = time.monotonic,
     on_close: Callable[[], Awaitable[None]] | None = None,
+    issuance_schema: IssuanceSchemaGate | None = None,
 ) -> HealthRouter:
     """Build the ASGI router with all dependencies injected as parameters.
 
     ``token_issuer=None`` disables issuance: the path answers 404 locally.
     ``on_close`` runs once, at lifespan shutdown or on ``aclose()``.
+    ``issuance_schema`` unverified refuses issuance with 503 ``E_ISSUE_SCHEMA``.
     """
     return HealthRouter(
         live_check=live_check,
@@ -321,6 +329,7 @@ def build_health_router(
         issue_timeout_s=issue_timeout_s,
         issue_clock=issue_clock,
         on_close=on_close,
+        issuance_schema=issuance_schema,
     )
 
 

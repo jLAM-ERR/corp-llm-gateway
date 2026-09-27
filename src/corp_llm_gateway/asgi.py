@@ -21,7 +21,9 @@ In order —
    naming an unreadable ``CORP_LLM_CA_BUNDLE``, exits 78; so does a Postgres that
    refuses the DSN (credentials, database name, DSN syntax) or whose
    ``corp_tokens`` lacks the issuance columns or the unique ``oidc_jti`` index. A
-   Postgres the network cannot reach does not refuse the boot — readiness reports it.
+   Postgres the network cannot reach does not refuse the boot: readiness stays 503
+   and the issuance route answers 503 ``E_ISSUE_SCHEMA`` until readiness sees the
+   schema current.
    Then the in-flight cap through ``settings.capacity()`` (also ``config check``'s):
    a non-integer, negative or oversized ``CORP_LLM_MAX_INFLIGHT``, ``0`` under
    ``CORP_ENV=prod|production``, or a bad ``CORP_LLM_CANCEL_GRACE_SECONDS``,
@@ -195,25 +197,6 @@ def _fail_gateway_config(problems: list[str]) -> NoReturn:
     raise SystemExit(EXIT_CONFIG)
 
 
-_TOKEN_SCHEMA_TIMEOUT_S = 5.0
-_TOKEN_SCHEMA_PROBLEM = (
-    "corp_tokens lacks the issuance columns or the oidc_jti unique index — apply "
-    "src/corp_llm_gateway/tokens/schema.sql (idempotent) before enabling "
-    "CORP_GATEWAY_ISSUE_OIDC_ISSUER"
-)
-# CREATE UNIQUE INDEX IF NOT EXISTS skips an index that already carries the name,
-# so for these two re-applying schema.sql alone changes nothing.
-_JTI_INDEX_INVALID = (
-    "corp_tokens_oidc_jti_key exists but is INVALID (an interrupted CREATE INDEX "
-    "CONCURRENTLY, or a failed REINDEX) — DROP INDEX corp_tokens_oidc_jti_key (or "
-    "REINDEX INDEX corp_tokens_oidc_jti_key), then re-apply "
-    "src/corp_llm_gateway/tokens/schema.sql"
-)
-_JTI_INDEX_MISSHAPEN = (
-    "corp_tokens_oidc_jti_key is not a UNIQUE index on corp_tokens (oidc_jti) alone — "
-    "DROP INDEX corp_tokens_oidc_jti_key, then re-apply "
-    "src/corp_llm_gateway/tokens/schema.sql"
-)
 _TOKEN_SCHEMA_REFUSED = {
     pg_session.BOOT_REFUSE: (
         "issuance schema check: Postgres refused CORP_LLM_PG_DSN ({}) — check the DSN "
@@ -232,23 +215,6 @@ _TOKEN_SCHEMA_REFUSED = {
     ),
 }
 
-# The index the store's replay mapping names, proven to be what the name claims:
-# valid, UNIQUE, not partial, not on an expression, keyed on exactly oidc_jti of
-# the corp_tokens the store's unqualified queries resolve to. No row: no such index.
-_JTI_INDEX_SQL = """
-SELECT i.indisvalid AS valid,
-       coalesce(i.indisunique
-                AND i.indnatts = 1
-                AND i.indpred IS NULL
-                AND i.indexprs IS NULL
-                AND a.attname = 'oidc_jti', false) AS keyed_on_jti
-FROM pg_index i
-JOIN pg_class ic ON ic.oid = i.indexrelid
-LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
-WHERE i.indrelid = to_regclass('corp_tokens')
-  AND ic.relname = 'corp_tokens_oidc_jti_key'
-"""
-
 
 async def _token_schema_state(dsn: str) -> str | None:
     """The schema problem to refuse on; ``None`` when the table is current."""
@@ -256,67 +222,57 @@ async def _token_schema_state(dsn: str) -> str | None:
 
     # The pools' own startup parameters: a PgBouncer that rejects them refuses here.
     conn = await pg_session.connect_with_keepalives(
-        asyncpg.connect, dsn, timeout=_TOKEN_SCHEMA_TIMEOUT_S
+        asyncpg.connect, dsn, timeout=pg_session.TOKEN_SCHEMA_TIMEOUT_S
     )
     try:
-        try:
-            # Resolved the way the store's own unqualified queries resolve it.
-            await conn.execute(
-                "SELECT oidc_issuer, oidc_subject, oidc_jti FROM corp_tokens LIMIT 0",
-                timeout=_TOKEN_SCHEMA_TIMEOUT_S,
-            )
-        except (asyncpg.exceptions.UndefinedTableError, asyncpg.exceptions.UndefinedColumnError):
-            return _TOKEN_SCHEMA_PROBLEM
-        index = await conn.fetchrow(_JTI_INDEX_SQL, timeout=_TOKEN_SCHEMA_TIMEOUT_S)
+        return await pg_session.token_schema_problem(conn)
     finally:
         await conn.close()
-    if index is None:
-        return _TOKEN_SCHEMA_PROBLEM
-    if not index["keyed_on_jti"]:
-        return _JTI_INDEX_MISSHAPEN
-    if not index["valid"]:
-        return _JTI_INDEX_INVALID
-    return None
 
 
-def _token_schema_problem(dsn: str) -> str | None:
-    """The issuance schema check; ``None`` when current or when Postgres cannot be reached."""
+def _token_schema_problem(dsn: str) -> tuple[str | None, bool]:
+    """The issuance schema check: the problem to refuse on, and whether the schema
+    was seen current. ``(None, False)`` when Postgres cannot be reached."""
     # uvicorn imports this module inside its running loop, so the probe gets a
     # loop of its own on a worker thread.
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(lambda: asyncio.run(_token_schema_state(dsn))).result()
+            problem = pool.submit(lambda: asyncio.run(_token_schema_state(dsn))).result()
     except Exception as exc:
         # The type only: a driver message can carry the DSN.
         outcome = pg_session.boot_probe_outcome(exc, dsn)
         if outcome != pg_session.BOOT_WARN:
-            return _TOKEN_SCHEMA_REFUSED[outcome].format(type(exc).__name__)
+            return _TOKEN_SCHEMA_REFUSED[outcome].format(type(exc).__name__), False
         log.warning(
-            "issuance schema check skipped, Postgres not reachable at boot (%s); "
-            "readiness reports it",
+            "issuance schema check skipped, Postgres not reachable at boot (%s); readiness "
+            "stays 503 and %s answers 503 E_ISSUE_SCHEMA until the schema is seen current",
             type(exc).__name__,
+            _ISSUE_TOKEN,
         )
-        return None
+        return None, False
+    return problem, problem is None
 
 
-def _check_issuance() -> bool:
-    """Refuse (exit 78) a gateway that cannot serve its issuance config; True when on."""
+def _check_issuance() -> tuple[bool, bool]:
+    """Refuse (exit 78) a gateway that cannot serve its issuance config.
+
+    Returns (issuance on, token schema seen current at boot).
+    """
     try:
         issuance = settings.serving_issuance()
     except settings.ConfigError as exc:
         _fail_gateway_config(exc.problems)
-        return False
     if issuance is None:
         log.info("developer token issuance disabled (CORP_GATEWAY_ISSUE_OIDC_ISSUER unset)")
-        return False
+        return False, False
     runtime = settings.issuance_runtime_problems()
     if runtime:
         _fail_gateway_config(runtime)
-    problem = _token_schema_problem(config.get("CORP_LLM_PG_DSN") or "")
+    problem, verified = _token_schema_problem(config.get("CORP_LLM_PG_DSN") or "")
     if problem is not None:
         _fail_gateway_config([problem])
     log.info("developer token issuance enabled: POST /internal/issue-token")
-    return True
+    return True, verified
 
 
 def _check_capacity() -> settings.CapacitySettings:
@@ -435,7 +391,7 @@ _problems = litellm_config.problems(CONFIG_PATH, require_file=True)
 if _problems:
     _fail_config(_problems)
 log.info("litellm config accepted: %s", CONFIG_PATH)
-ISSUANCE_ENABLED = _check_issuance()
+ISSUANCE_ENABLED, ISSUANCE_SCHEMA_VERIFIED = _check_issuance()
 CAPACITY = _check_capacity()
 ROUTE_GATE_EXTRAS = _route_gate_extras()
 
@@ -504,7 +460,10 @@ class _MetricsRoute:
 # gateway-owned route mounted inside litellm's router would be unscrapable in
 # Mode A. `HealthRouter` already takes a `fallthrough`, so the chain is:
 # /healthz/* -> /metrics -> litellm.
-_GATEWAY_ROUTES = build_health_router(fallthrough=_MetricsRoute(_exporter.asgi_app(), _app))
+_GATEWAY_ROUTES = build_health_router(
+    fallthrough=_MetricsRoute(_exporter.asgi_app(), _app),
+    issuance_schema_verified=ISSUANCE_SCHEMA_VERIFIED,
+)
 log.info(
     "gateway routes served ahead of litellm: %s/*, %s, %s",
     _MOUNT_HEALTHZ,

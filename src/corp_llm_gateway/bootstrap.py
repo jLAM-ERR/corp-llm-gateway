@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 
-from corp_llm_gateway import config
+from corp_llm_gateway import config, pg_session
 from corp_llm_gateway.audit import AuditLogger, Sink, get_sink, register_sink, sink_name_for
 from corp_llm_gateway.auth import get_auth_provider
 from corp_llm_gateway.corp_llm import CorpLlmClient
@@ -46,6 +46,7 @@ from corp_llm_gateway.extensions.corp_ner import CorpNerExtension, register_corp
 from corp_llm_gateway.healthz import (
     ExtensionsCheck,
     HealthRouter,
+    IssuanceSchemaGate,
     LiveCheck,
     ReadyCheck,
     SanitizationCheck,
@@ -92,6 +93,7 @@ from corp_llm_gateway.tokens import (
     KeycloakOidcVerifier,
     OidcClaims,
     OidcTeamMappingError,
+    PostgresTokenStore,
     TokenIssuer,
     TokenStore,
 )
@@ -376,6 +378,33 @@ def _redis_ready_probe() -> Callable[[], Awaitable[bool]]:
     return _ping
 
 
+# Opening a probe's own connection, each of its statements, and closing it.
+_PG_PROBE_TIMEOUT_S = 5.0
+
+
+async def _on_postgres[T](dsn: str, work: Callable[[Any], Awaitable[T]]) -> T:
+    """``work(conn)`` over the stores' own connection path: the shared token store's
+    pool once it is built, else one connection asking for the same startup
+    parameters. A rejected startup parameter raises ``StartupParameterRejectedError``."""
+    try:
+        store = _token_store
+        if isinstance(store, PostgresTokenStore):
+            return await store.on_connection(work)
+        import asyncpg
+
+        conn = await pg_session.connect_with_keepalives(
+            asyncpg.connect, dsn, timeout=_PG_PROBE_TIMEOUT_S
+        )
+        try:
+            return await work(conn)
+        finally:
+            await conn.close(timeout=_PG_PROBE_TIMEOUT_S)
+    except Exception as exc:
+        if pg_session.startup_parameter_rejected(exc):
+            raise pg_session.StartupParameterRejectedError from None
+        raise
+
+
 def _postgres_ready_probe() -> Callable[[], Awaitable[bool]]:
     dsn = config.get("CORP_LLM_PG_DSN")
     if not dsn:
@@ -385,16 +414,22 @@ def _postgres_ready_probe() -> Callable[[], Awaitable[bool]]:
 
         return _in_memory
 
-    async def _connect() -> bool:
-        import asyncpg
+    async def _select_one(conn: Any) -> Any:
+        return await conn.fetchval("SELECT 1", timeout=_PG_PROBE_TIMEOUT_S)
 
-        conn = await asyncpg.connect(dsn, timeout=5.0)
-        try:
-            return True
-        finally:
-            await conn.close()
+    async def _probe() -> bool:
+        return await _on_postgres(dsn, _select_one) == 1
 
-    return _connect
+    return _probe
+
+
+def _issuance_schema_gate(*, verified: bool) -> IssuanceSchemaGate:
+    dsn = config.get("CORP_LLM_PG_DSN") or ""
+
+    async def _check() -> str | None:
+        return await _on_postgres(dsn, pg_session.token_schema_problem)
+
+    return IssuanceSchemaGate(_check, verified=verified)
 
 
 def _sanitization_probe() -> Callable[[], Awaitable[bool]]:
@@ -447,10 +482,15 @@ def _build_token_issuer(
     return issuer, verifier.aclose
 
 
-def build_health_router(fallthrough: object | None = None) -> HealthRouter:
+def build_health_router(
+    fallthrough: object | None = None, *, issuance_schema_verified: bool = False
+) -> HealthRouter:
     """The gateway-owned routes the entrypoint serves ahead of litellm, wired from config.
 
-    Readiness probes Redis and Postgres only. NER readiness
+    Readiness probes Redis and Postgres (through the stores' connection path) only,
+    plus, with issuance on, the token schema until it has been seen current: the
+    entrypoint passes ``issuance_schema_verified`` from its boot check. Until then
+    issuance answers 503 ``E_ISSUE_SCHEMA``. NER readiness
     (`CORP_LLM_REQUIRE_NER`) and corp-NER readiness (`CORP_NER_ENABLED`) are NOT
     wired here: both need a detector built at import, and the entrypoint's
     contract is that nothing on the request path is constructed before litellm's
@@ -463,19 +503,24 @@ def build_health_router(fallthrough: object | None = None) -> HealthRouter:
     """
     configured = serving_issuance()
     issuance: dict[str, Any] = {}
+    schema_gate: IssuanceSchemaGate | None = None
     if configured is not None:
         issuer, close_issuer = _build_token_issuer(configured)
+        schema_gate = _issuance_schema_gate(verified=issuance_schema_verified)
         issuance = {
             "token_issuer": issuer,
             "on_close": close_issuer,
             "issue_max_inflight": configured.max_inflight,
             "issue_rate_per_minute": configured.rate_per_minute,
             "issue_timeout_s": float(configured.store_timeout_seconds),
+            "issuance_schema": schema_gate,
         }
     return make_health_router(
         live_check=LiveCheck(),
         ready_check=ReadyCheck(
-            check_redis=_redis_ready_probe(), check_postgres=_postgres_ready_probe()
+            check_redis=_redis_ready_probe(),
+            check_postgres=_postgres_ready_probe(),
+            check_issuance_schema=schema_gate.problem if schema_gate is not None else None,
         ),
         sanitization_check=SanitizationCheck(run_round_trip=_sanitization_probe()),
         extensions_check=ExtensionsCheck(health_all=REGISTRY.health_all),
