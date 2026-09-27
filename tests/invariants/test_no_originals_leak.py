@@ -2694,6 +2694,40 @@ async def test_a_capacity_refusal_after_its_body_was_read_leaks_no_body_byte(
 
 
 @pytest.mark.asyncio
+async def test_a_byte_budget_refusal_mid_body_leaks_no_body_byte(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+
+    size = len(_LIMITER_BODY)
+    gate, limiter, sink, metrics = _limited(
+        _never_forwarded,
+        max_inflight=4,
+        max_body_bytes=2 * size,
+        max_draining_bytes=2 * size,
+        body_read_s=5.0,
+    )
+    stalled = _BodyClient(_chunk(_LIMITER_BODY, more=True))
+    refused = _BodyClient(_chunk(_LIMITER_BODY, more=True), _chunk(_LIMITER_BODY, more=False))
+
+    with caplog.at_level(logging.DEBUG):
+        stalling = asyncio.create_task(gate(_limited_scope(), stalled.receive, stalled.send))  # type: ignore[operator]
+        await asyncio.sleep(0.02)
+        await gate(_limited_scope(), refused.receive, refused.send)  # type: ignore[operator]
+
+    status, body = refused.response()
+    assert status == 429
+    _assert_gate_surfaces_are_clean(
+        body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason="capacity"
+    )
+    assert limiter.buffered_bytes == size  # type: ignore[attr-defined]
+    stalling.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await stalling
+    assert limiter.buffered_bytes == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_a_capacity_refusal_before_the_body_leaks_no_body_byte(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

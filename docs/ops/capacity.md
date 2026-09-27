@@ -101,12 +101,32 @@ The route gate caps concurrent LLM requests per pod. The cap is
   `E_BODY_TIMEOUT` (`block_reason` `body_timeout`). At most
   `CORP_LLM_MAX_DRAINING` requests per pod read a body at once (default **4 ×
   `CORP_LLM_MAX_INFLIGHT`**, never below it, at most 40000); the next gets 429
-  `E_CAPACITY` without a byte read. Each body being read is buffered, up to
-  25 MiB, so the worst-case body memory per pod is `CORP_LLM_MAX_DRAINING` ×
-  25 MiB; lower the draining cap if pod memory cannot hold that. Measured on a real socket (loopback, default
+  `E_CAPACITY` without a byte read. Measured on a real socket (loopback, default
   cap 64, a 2 s deadline): 65 unauthenticated clients announcing a 10-byte body
   and sending nothing kept `gateway_inflight_requests` at 0 while a normal
   request was served (200 in about 20 ms); all 65 got 408 at 2.04 s.
+- **Body memory has its own budget.** Each body is buffered, up to 25 MiB, while
+  it is read and then until its request ends (litellm replays it from that
+  buffer). All of these bytes together, bodies being read and bodies of admitted
+  requests, share `CORP_LLM_MAX_DRAINING_BYTES` (bytes, default **536870912** =
+  512 MiB, from 25 MiB to 16 GiB). A body whose declared `Content-Length` would
+  take the sum past it gets 429 `E_CAPACITY` (`block_reason` `capacity`,
+  `Retry-After: 1`) without a byte read; a body sent without a length is
+  counted chunk by chunk and refused the same way at the chunk that passes the
+  budget, and what it had buffered is freed at once. The 25 MiB per-body cap
+  and its 422 stay as they are. `gateway_draining_bytes` is the number of
+  bytes held right now.
+
+  Worst-case body memory per pod = min(`CORP_LLM_MAX_DRAINING` × 25 MiB,
+  `CORP_LLM_MAX_DRAINING_BYTES`). With the defaults that is min(256 × 25 MiB ≈
+  6.4 GB, 512 MiB) = 512 MiB. Size the pod against the byte budget, not the
+  draining count: set `CORP_LLM_MAX_DRAINING_BYTES` to what the pod's memory
+  limit can spare for request bodies (leave room for the NER models, the
+  sanitizer's copies of each body and litellm). Measured on a real socket
+  (loopback, budget 25 MiB): two admitted 10 MiB bodies held 20971520 bytes
+  (`gateway_draining_bytes` read the same); a third declaring 10 MiB got 429
+  unread; once the two finished (200 each) the same request got 200, and the
+  gauge read 0.
 - **Off.** `0` turns the cap off. The entrypoint refuses it (exit 78) when
   `CORP_ENV` is `prod`/`production`, and so does `gateway-admin config check`;
   so do a negative value, a non-integer and anything above 10000.

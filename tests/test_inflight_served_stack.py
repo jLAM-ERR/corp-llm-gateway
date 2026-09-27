@@ -15,6 +15,10 @@ disconnect of the one that started it, and 64+1 clients that announce a body and
 never send it hold no slot — a normal request is served while they idle, and each
 of them gets 408 once the body-read deadline passes.
 
+A third run (scenario ``budget``) sets the body byte budget to its floor, 25 MiB:
+two admitted 10 MiB bodies hold it, a third that declares 10 MiB gets 429 unread,
+and the same request is served once the two have finished.
+
 Skips only where uvicorn or litellm is absent (the graceful-degradation venv).
 """
 
@@ -256,4 +260,62 @@ def test_idle_bodies_get_408_once_the_deadline_passes(isolated: dict[str, Any]) 
     assert result["draining_after"] == 0
     text = isolated["metrics"]["text"]
     assert 'corp_llm_gateway_blocked_requests_total{block_reason="body_timeout"} 65.0' in text
+    assert 'gateway_failure{component="route_gate"}' not in text
+
+
+# ── the body byte budget ─────────────────────────────────────────────────────
+
+BUDGET_BYTES = 25 * 1024 * 1024
+BUDGET_BODY_BYTES = 10 * 1024 * 1024
+
+
+@pytest.fixture(scope="module", params=LOOPS)
+def budgeted(request: pytest.FixtureRequest) -> dict[str, Any]:
+    return _served(
+        request.param,
+        "budget",
+        CORP_LLM_MAX_INFLIGHT="64",
+        CORP_LLM_MAX_DRAINING_BYTES=str(BUDGET_BYTES),
+    )
+
+
+def test_the_budget_stack_reads_the_byte_budget_from_the_environment(
+    budgeted: dict[str, Any],
+) -> None:
+    assert budgeted["warmup"] == 200
+    assert budgeted["max_draining_bytes"] == BUDGET_BYTES
+    assert budgeted["byte_budget"]["body_bytes"] == BUDGET_BODY_BYTES
+
+
+def test_admitted_bodies_hold_the_budget_until_they_finish(budgeted: dict[str, Any]) -> None:
+    result = budgeted["byte_budget"]
+
+    assert result["inflight_while_held"] == 2
+    assert result["buffered_while_held"] == 2 * BUDGET_BODY_BYTES
+    assert result["gauge_while_held"] == 2 * BUDGET_BODY_BYTES
+    assert result["held_statuses"] == [200, 200]
+    assert result["held_completions"] == [True, True]
+
+
+def test_a_body_that_would_pass_the_budget_gets_429_then_200_once_it_is_free(
+    budgeted: dict[str, Any],
+) -> None:
+    result = budgeted["byte_budget"]
+
+    assert result["third_status"] == 429
+    assert result["third_capacity"] is True
+    assert result["third_retry_after"] is True
+    assert result["buffered_after_refusal"] == 2 * BUDGET_BODY_BYTES
+    assert result["retry_status"] == 200
+    assert result["retry_completion"] is True
+
+
+def test_the_budget_is_all_given_back(budgeted: dict[str, Any]) -> None:
+    result = budgeted["byte_budget"]
+
+    assert (result["buffered_after"], result["inflight_after"]) == (0, 0)
+    assert budgeted["buffered_bytes"] == 0
+    text = budgeted["metrics"]["text"]
+    assert "gateway_draining_bytes 0.0" in text
+    assert 'corp_llm_gateway_blocked_requests_total{block_reason="capacity"} 1.0' in text
     assert 'gateway_failure{component="route_gate"}' not in text

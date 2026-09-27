@@ -576,11 +576,23 @@ def test_prometheus_exports_the_inflight_gauge_and_the_cancelled_counter() -> No
     assert "gateway_cancelled_requests_total 2.0" in text
 
 
+def test_prometheus_exports_the_draining_bytes_gauge() -> None:
+    exporter = _prom()
+
+    exporter.set_draining_bytes(4096)
+    exporter.set_draining_bytes(1024)
+
+    text = exporter.render().decode()
+    assert "# TYPE gateway_draining_bytes gauge" in text
+    assert "gateway_draining_bytes 1024.0" in text
+
+
 def test_the_noop_exporter_ignores_the_inflight_series() -> None:
     exporter = NoopExporter()
 
     assert exporter.set_inflight(5) is None
     assert exporter.record_cancelled() is None
+    assert exporter.set_draining_bytes(7) is None
     assert exporter.render() == b""
 
 
@@ -600,6 +612,7 @@ def test_an_exporter_written_before_the_inflight_series_still_instantiates() -> 
 
     assert legacy.set_inflight(1) is None
     assert legacy.record_cancelled() is None
+    assert legacy.set_draining_bytes(1) is None
 
 
 async def test_the_capacity_refusal_is_counted_on_the_real_series() -> None:

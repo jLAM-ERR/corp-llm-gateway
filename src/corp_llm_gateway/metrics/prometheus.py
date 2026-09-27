@@ -26,6 +26,7 @@ GATEWAY_FAILURE_METRIC = "gateway_failure"
 REQUEST_LATENCY_METRIC = "corp_llm_gateway_request_latency_seconds"
 INFLIGHT_METRIC = "gateway_inflight_requests"
 CANCELLED_METRIC = "gateway_cancelled_requests_total"
+DRAINING_BYTES_METRIC = "gateway_draining_bytes"
 
 _MISSING_DEP_HINT = (
     "the prometheus metrics exporter requires the [metrics] extra: "
@@ -73,6 +74,11 @@ class PrometheusExporter(MetricsExporter):
             "Admitted requests cancelled because the client disconnected.",
             registry=self._registry,
         )
+        self._draining_bytes = Gauge(
+            DRAINING_BYTES_METRIC,
+            "Request body bytes buffered by the route gate (read or held for replay).",
+            registry=self._registry,
+        )
 
     def record_block(self, block_reason: str) -> None:
         self._blocked.labels(block_reason=block_reason).inc()
@@ -88,6 +94,9 @@ class PrometheusExporter(MetricsExporter):
 
     def record_cancelled(self) -> None:
         self._cancelled.inc()
+
+    def set_draining_bytes(self, count: int) -> None:
+        self._draining_bytes.set(count)
 
     def render(self) -> bytes:
         from prometheus_client import generate_latest

@@ -25,7 +25,8 @@ In order —
    Then the in-flight cap through ``settings.capacity()`` (also ``config check``'s):
    a non-integer, negative or oversized ``CORP_LLM_MAX_INFLIGHT``, ``0`` under
    ``CORP_ENV=prod|production``, or a bad ``CORP_LLM_CANCEL_GRACE_SECONDS``,
-   ``CORP_LLM_BODY_READ_SECONDS`` or ``CORP_LLM_MAX_DRAINING`` exits 78.
+   ``CORP_LLM_BODY_READ_SECONDS``, ``CORP_LLM_MAX_DRAINING`` or
+   ``CORP_LLM_MAX_DRAINING_BYTES`` exits 78.
    Last, ``CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH``: a malformed item, or one naming
    a route the table refused, exits 78;
 2. run litellm's Prisma schema sequence when ``DATABASE_URL`` is set, with the
@@ -320,10 +321,12 @@ def _check_capacity() -> settings.CapacitySettings:
         _fail_gateway_config(exc.problems)
     if capacity.max_inflight:
         log.info(
-            "in-flight cap: %d rewritten requests per pod, %d reading a body (%gs deadline)",
+            "in-flight cap: %d rewritten requests per pod, %d reading a body (%gs deadline), "
+            "%d body bytes buffered at most",
             capacity.max_inflight,
             capacity.max_draining,
             capacity.body_read_seconds,
+            capacity.max_draining_bytes,
         )
     else:
         log.warning("in-flight cap off (CORP_LLM_MAX_INFLIGHT=0); not allowed in prod")
@@ -509,6 +512,7 @@ limiter = InflightLimiter(
     cancel_grace_s=CAPACITY.cancel_grace_seconds,
     body_read_s=CAPACITY.body_read_seconds,
     max_draining=CAPACITY.max_draining,
+    max_draining_bytes=CAPACITY.max_draining_bytes,
 )
 gate = RouteGateMiddleware(
     _GATEWAY_ROUTES,

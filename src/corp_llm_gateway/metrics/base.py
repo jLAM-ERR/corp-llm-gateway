@@ -11,8 +11,9 @@ without updating them together:
     (helm/corp-llm-gateway/templates/siem-alerts.yaml)
   * ``gateway_failure{component}`` (docs/ops/runbook.md)
   * ``corp_llm_gateway_request_latency_seconds`` (histogram)
-  * ``gateway_inflight_requests`` (gauge) and ``gateway_cancelled_requests_total``
-    (counter) — the route gate's in-flight cap (docs/ops/capacity.md)
+  * ``gateway_inflight_requests`` (gauge), ``gateway_cancelled_requests_total``
+    (counter) and ``gateway_draining_bytes`` (gauge) — the route gate's in-flight
+    cap and body byte budget (docs/ops/capacity.md)
 
 ``BLOCK_REASONS`` and ``FAILURE_COMPONENTS`` below enumerate the label values
 those first two series can carry.
@@ -101,13 +102,17 @@ class MetricsExporter(ABC):
         """Observe one end-to-end request latency, labelled ok|failed."""
 
     # Not abstract: an exporter written before the in-flight cap existed still
-    # instantiates, it just does not export these two series.
+    # instantiates, it just does not export these series.
     def set_inflight(self, count: int) -> None:
         """Set the number of requests holding an in-flight slot right now."""
         return None
 
     def record_cancelled(self) -> None:
         """Count one admitted request the gateway cancelled because its client left."""
+        return None
+
+    def set_draining_bytes(self, count: int) -> None:
+        """Set the body bytes buffered right now, being read or replayed to an admitted request."""
         return None
 
     def render(self) -> bytes:

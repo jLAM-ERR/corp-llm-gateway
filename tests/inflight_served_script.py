@@ -1,9 +1,10 @@
 """Child process for ``tests/test_inflight_served_stack.py``: the real entrypoint
 (route gate + in-flight limiter + litellm + the guardrail) served by uvicorn on a
 real socket, in front of an upstream stub on another real socket. Runs every
-disconnect case (scenario ``disconnects``) or the isolation cases (scenario
+disconnect case (scenario ``disconnects``), the isolation cases (scenario
 ``isolation``: a shared auth lookup across a disconnect, idle bodies against the
-slots), prints one ``@@RESULT@@`` JSON line.
+slots) or the body byte budget (scenario ``budget``), prints one ``@@RESULT@@``
+JSON line.
 
 Run as ``python tests/inflight_served_script.py <asyncio|uvloop> [scenario]``;
 importing ``corp_llm_gateway.asgi`` IS the boot, so this cannot share the test
@@ -96,6 +97,7 @@ class Stub:
 
     def __init__(self) -> None:
         self.requests = 0
+        self.hold_release = asyncio.Event()
         self.reset("ok")
 
     def reset(self, mode: str) -> None:
@@ -116,7 +118,9 @@ class Stub:
             body = json.loads(await reader.readexactly(length))
             self.requests += 1
             connected.set()
-            if mode == "ok":
+            if mode == "hold":
+                await self.hold_release.wait()
+            if mode in ("ok", "hold"):
                 if body.get("stream"):
                     writer.write(_SSE_HEAD + _sse(_CHUNK) + _sse(_DONE_CHUNK) + b"data: [DONE]\n\n")
                 else:
@@ -246,6 +250,10 @@ async def main() -> None:
 
     warm = await _complete(port, stub, stream=False)
     results: dict[str, Any] = {"warmup": warm[0], "cases": {}}
+    if SCENARIO == "budget":
+        results["byte_budget"] = await _byte_budget(port, stub, limiter)
+        await _finish(results, port, limiter, server, serving, stub_server)
+        return
     if SCENARIO == "isolation":
         results["shared_lookup"] = await _shared_lookup(port, stub, guardrail, sink, limiter)
         results["idle_bodies"] = await _idle_bodies(port, stub, limiter)
@@ -346,6 +354,8 @@ async def _finish(
     results["max_inflight"] = limiter.max_inflight
     results["max_draining"] = limiter.max_draining
     results["body_read_s"] = limiter.body_read_s
+    results["max_draining_bytes"] = limiter.max_draining_bytes
+    results["buffered_bytes"] = limiter.buffered_bytes
     results["loop"] = type(asyncio.get_running_loop()).__module__
 
     server.should_exit = True
@@ -475,6 +485,88 @@ async def _idle_bodies(port: int, stub: Stub, limiter: Any) -> Any:
         "refused_s": refused_s,
         "body_timeout_code": b"E_BODY_TIMEOUT" in first_body,
         "draining_after": limiter.draining,
+    }
+
+
+BUDGET_BODY_BYTES = 10 * 1024 * 1024
+
+
+def _padded_request(size: int, *, close: bool) -> tuple[bytes, bytes]:
+    """A request whose body is exactly ``size`` bytes: JSON, then whitespace."""
+    body = json.dumps(
+        {"model": "corp-probe", "messages": [{"role": "user", "content": "hello there"}]}
+    ).encode()
+    body += b" " * (size - len(body))
+    head = (
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {size}\r\n"
+        f"X-Corp-Auth: {TOKEN}\r\n" + ("Connection: close\r\n" if close else "") + "\r\n"
+    )
+    return head.encode(), body
+
+
+async def _send_padded(port: int, size: int) -> tuple[int, bytes]:
+    head, body = _padded_request(size, close=True)
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(head + body)
+        await writer.drain()
+        status = await _status(reader)
+        return status, await asyncio.wait_for(reader.read(), BOUND_S)
+    finally:
+        writer.close()
+
+
+def _gauge(text: str, name: str) -> float | None:
+    for line in text.splitlines():
+        if line.startswith(name + " "):
+            return float(line.split()[1])
+    return None
+
+
+async def _byte_budget(port: int, stub: Stub, limiter: Any) -> Any:
+    """Two admitted bodies hold the budget; a third that would pass it gets 429."""
+    size = BUDGET_BODY_BYTES
+    stub.hold_release = asyncio.Event()
+    stub.reset("hold")
+    base_requests = stub.requests
+    held = [asyncio.create_task(_send_padded(port, size)) for _ in range(2)]
+    await _until(lambda: stub.requests >= base_requests + 2)
+    buffered_while_held = limiter.buffered_bytes
+    inflight_while_held = limiter.inflight
+    _, held_text = await _metrics(port)
+
+    # Headers only: the declared length alone must be refused, with no body read.
+    head, _ = _padded_request(size, close=True)
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(head)
+    await writer.drain()
+    third_status = await _status(reader)
+    third_rest = await asyncio.wait_for(reader.read(), BOUND_S)
+    writer.close()
+    buffered_after_refusal = limiter.buffered_bytes
+
+    stub.hold_release.set()
+    held_results = await asyncio.gather(*held)
+    await _until(lambda: limiter.inflight <= 0 and limiter.buffered_bytes <= 0)
+    stub.reset("ok")
+    retry_status, retry_rest = await _send_padded(port, size)
+    await _until(lambda: limiter.inflight <= 0 and limiter.buffered_bytes <= 0)
+    return {
+        "body_bytes": size,
+        "buffered_while_held": buffered_while_held,
+        "inflight_while_held": inflight_while_held,
+        "gauge_while_held": _gauge(held_text, "gateway_draining_bytes"),
+        "third_status": third_status,
+        "third_capacity": b"E_CAPACITY" in third_rest,
+        "third_retry_after": b"retry-after: 1" in third_rest.lower(),
+        "buffered_after_refusal": buffered_after_refusal,
+        "held_statuses": [status for status, _ in held_results],
+        "held_completions": [b"chat.completion" in rest for _, rest in held_results],
+        "retry_status": retry_status,
+        "retry_completion": b"chat.completion" in retry_rest,
+        "buffered_after": limiter.buffered_bytes,
+        "inflight_after": limiter.inflight,
     }
 
 

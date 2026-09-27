@@ -1147,6 +1147,7 @@ def test_capacity_keys_are_registered() -> None:
         "CORP_LLM_CANCEL_GRACE_SECONDS",
         "CORP_LLM_BODY_READ_SECONDS",
         "CORP_LLM_MAX_DRAINING",
+        "CORP_LLM_MAX_DRAINING_BYTES",
     } <= keys
 
 
@@ -1157,6 +1158,38 @@ def test_capacity_defaults(hermetic: Path) -> None:
     assert capacity.cancel_grace_seconds == 5.0
     assert capacity.body_read_seconds == 30.0
     assert capacity.max_draining == 256
+    assert capacity.max_draining_bytes == 512 * 1024 * 1024
+
+
+def test_the_byte_budget_bounds_match_the_limiter() -> None:
+    from corp_llm_gateway.route_gate.inflight import DEFAULT_MAX_DRAINING_BYTES, MAX_BODY_BYTES
+
+    assert settings.MAX_DRAINING_BYTES_FLOOR == MAX_BODY_BYTES
+    (key,) = [k for k in settings.KEYS if k.name == "CORP_LLM_MAX_DRAINING_BYTES"]
+    assert int(key.default or "") == DEFAULT_MAX_DRAINING_BYTES
+
+
+@pytest.mark.parametrize("value", ["26214400", "536870912", "17179869184", " 1073741824 "])
+def test_capacity_accepts_a_byte_budget_in_range(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING_BYTES", value)
+
+    assert settings.capacity().max_draining_bytes == int(value)
+
+
+@pytest.mark.parametrize(
+    "value", ["26214399", "0", "-1", "17179869185", "1.5", "512MiB", "1e9", "0x100000", "²"]
+)
+def test_capacity_refuses_a_bad_byte_budget(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING_BYTES", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_MAX_DRAINING_BYTES" in str(exc.value)
 
 
 def test_the_draining_default_follows_the_inflight_cap(
@@ -1282,6 +1315,7 @@ def test_validate_reports_the_capacity_problems(
     monkeypatch.setenv("CORP_LLM_CANCEL_GRACE_SECONDS", "-2")
     monkeypatch.setenv("CORP_LLM_BODY_READ_SECONDS", "0")
     monkeypatch.setenv("CORP_LLM_MAX_DRAINING", "many")
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING_BYTES", "1024")
 
     with pytest.raises(ConfigError) as exc:
         settings.validate()
@@ -1290,7 +1324,8 @@ def test_validate_reports_the_capacity_problems(
     assert "CORP_LLM_MAX_INFLIGHT" in joined
     assert "CORP_LLM_CANCEL_GRACE_SECONDS" in joined
     assert "CORP_LLM_BODY_READ_SECONDS" in joined
-    assert "CORP_LLM_MAX_DRAINING" in joined
+    assert "CORP_LLM_MAX_DRAINING=" in joined
+    assert "CORP_LLM_MAX_DRAINING_BYTES" in joined
 
 
 def test_validate_passes_the_default_capacity(

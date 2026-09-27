@@ -22,3 +22,6 @@ class NoopExporter(MetricsExporter):
 
     def record_cancelled(self) -> None:
         return None
+
+    def set_draining_bytes(self, count: int) -> None:
+        return None

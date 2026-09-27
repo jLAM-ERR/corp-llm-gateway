@@ -305,10 +305,17 @@
 # at most CORP_LLM_MAX_DRAINING requests read a body at once (default 4 x the
 # in-flight cap, at least the cap; the next gets 429 E_CAPACITY unread). A client
 # that never finishes its body holds no slot.
+# Body bytes buffered per pod, being read or held for an admitted request until
+# it ends, share one budget: CORP_LLM_MAX_DRAINING_BYTES (bytes, 25 MiB to 16 GiB,
+# default 512 MiB). A body whose Content-Length, or next chunk, would pass it gets
+# 429 E_CAPACITY. Worst-case body memory per pod is
+# min(CORP_LLM_MAX_DRAINING x 25 MiB, CORP_LLM_MAX_DRAINING_BYTES): size this one
+# against the pod's memory limit.
 # CORP_LLM_MAX_INFLIGHT         = "64"
 # CORP_LLM_CANCEL_GRACE_SECONDS = "5"
 # CORP_LLM_BODY_READ_SECONDS    = "30"
 # CORP_LLM_MAX_DRAINING         = "256"
+# CORP_LLM_MAX_DRAINING_BYTES   = "536870912"
 
 # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────────
 #

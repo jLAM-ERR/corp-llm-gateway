@@ -18,6 +18,10 @@ The body is read BEFORE a slot is taken, under a deadline
 (``CORP_LLM_BODY_READ_SECONDS``, 408 past it), and the number of requests
 reading a body at once has its own, larger cap (``CORP_LLM_MAX_DRAINING``, 429
 past it without reading): a client that never finishes its body holds no slot.
+The bytes buffered for bodies, being read or replayed to an admitted request
+until it is released, share one budget (``CORP_LLM_MAX_DRAINING_BYTES``): a
+declared ``Content-Length``, or a chunk as it arrives, that would take the sum
+past it gets 429 and gives back what the request held.
 
 Tasks belong to a request through :class:`RequestTicket`, carried in a
 contextvar. The task factory (:func:`install_task_factory`) tags a new task only
@@ -76,6 +80,7 @@ DEFAULT_CANCEL_GRACE_S = 5.0
 DEFAULT_BODY_READ_S = 30.0
 # Concurrent body reads per admitted slot, when no draining cap is given.
 DRAINING_PER_SLOT = 4
+DEFAULT_MAX_DRAINING_BYTES = 512 * 1024 * 1024
 
 _COMPONENT = "route_gate"
 
@@ -208,6 +213,16 @@ class _Replay:
 _DISCONNECTED = object()
 _OVERSIZE = object()
 _BODY_TIMEOUT = object()
+_OVER_BUDGET = object()
+
+
+class _Held:
+    """The body bytes one request holds of the limiter's byte budget."""
+
+    __slots__ = ("bytes",)
+
+    def __init__(self) -> None:
+        self.bytes = 0
 
 
 class InflightLimiter:
@@ -222,6 +237,7 @@ class InflightLimiter:
         max_body_bytes: int = MAX_BODY_BYTES,
         body_read_s: float = DEFAULT_BODY_READ_S,
         max_draining: int | None = None,
+        max_draining_bytes: int = DEFAULT_MAX_DRAINING_BYTES,
     ) -> None:
         if not _count(max_inflight):
             raise ValueError("max_inflight must be a non-negative integer")
@@ -235,6 +251,8 @@ class InflightLimiter:
             raise ValueError("max_draining must be an integer no smaller than max_inflight")
         if max_inflight and not max_draining:
             raise ValueError("max_draining cannot be 0 while the in-flight cap is on")
+        if not _count(max_draining_bytes) or max_draining_bytes < max(max_body_bytes, 1):
+            raise ValueError("max_draining_bytes must be an integer no smaller than the body cap")
         self._max = max_inflight
         self._metrics = metrics
         self._grace = float(cancel_grace_s)
@@ -243,6 +261,8 @@ class InflightLimiter:
         self._max_draining = max_draining
         self._inflight = 0
         self._draining = 0
+        self._max_bytes = max_draining_bytes
+        self._buffered = 0
         self._cancel_hook: CancelHook | None = None
 
     @property
@@ -269,6 +289,14 @@ class InflightLimiter:
     def draining(self) -> int:
         return self._draining
 
+    @property
+    def max_draining_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def buffered_bytes(self) -> int:
+        return self._buffered
+
     def bind_cancel_hook(self, hook: CancelHook | None) -> None:
         self._cancel_hook = hook
 
@@ -283,6 +311,24 @@ class InflightLimiter:
         self._inflight -= 1
         self._metrics.set_inflight(self._inflight)
 
+    def _hold(self, held: _Held, size: int) -> bool:
+        """Grow what ``held`` holds to ``size`` bytes, if the budget has room."""
+        more = size - held.bytes
+        if more <= 0:
+            return True
+        if self._buffered + more > self._max_bytes:
+            return False
+        self._buffered += more
+        held.bytes = size
+        self._metrics.set_draining_bytes(self._buffered)
+        return True
+
+    def _give_back(self, held: _Held) -> None:
+        if held.bytes:
+            self._buffered -= held.bytes
+            held.bytes = 0
+            self._metrics.set_draining_bytes(self._buffered)
+
     async def run(
         self, scope: Scope, receive: Receive, send: Send, app: ASGIApp, *, refuse: Refuse
     ) -> None:
@@ -291,19 +337,38 @@ class InflightLimiter:
         if full or (self._max_draining and self._draining >= self._max_draining):
             await refuse(ROUTE_GATE_CAPACITY)
             return
+        held = _Held()
+        try:
+            await self._admit(held, scope, receive, send, app, refuse)
+        finally:
+            self._give_back(held)
+
+    async def _admit(
+        self, held: _Held, scope: Scope, receive: Receive, send: Send, app: ASGIApp, refuse: Refuse
+    ) -> None:
+        declared = _declared_length(scope)
+        if declared is not None and not self._hold(held, min(declared, self._max_body)):
+            await refuse(ROUTE_GATE_CAPACITY)
+            return
         started = time.monotonic()
         ticket = RequestTicket(uuid.uuid4().hex)
         self._draining += 1
         try:
             try:
                 async with asyncio.timeout(self._body_read_s):
-                    drained = await self._drain(receive)
+                    drained = await self._drain(receive, held)
             except TimeoutError:
                 drained = _BODY_TIMEOUT
         finally:
             self._draining -= 1
+        if not isinstance(drained, list):
+            # Nothing buffered is kept past a refusal: give it back before answering.
+            self._give_back(held)
         if drained is _OVERSIZE:
             await refuse(OVERSIZE_BLOCKED)
+            return
+        if drained is _OVER_BUDGET:
+            await refuse(ROUTE_GATE_CAPACITY)
             return
         if drained is _BODY_TIMEOUT:
             await refuse(ROUTE_GATE_BODY_TIMEOUT)
@@ -314,6 +379,7 @@ class InflightLimiter:
         assert isinstance(drained, list)
         if not self.try_acquire():
             drained.clear()
+            self._give_back(held)
             await refuse(ROUTE_GATE_CAPACITY)
             return
         try:
@@ -321,7 +387,7 @@ class InflightLimiter:
         finally:
             self._release()
 
-    async def _drain(self, receive: Receive) -> object:
+    async def _drain(self, receive: Receive, held: _Held) -> object:
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -334,6 +400,8 @@ class InflightLimiter:
             total += len(body)
             if total > self._max_body:
                 return _OVERSIZE
+            if not self._hold(held, total):
+                return _OVER_BUDGET
             if body:
                 chunks.append(bytes(body))
             if not message.get("more_body", False):
@@ -498,6 +566,18 @@ class InflightLimiter:
 
 async def _call_hook(hook: CancelHook, request_id: str, latency_ms: int) -> None:
     await hook(request_id, latency_ms=latency_ms)
+
+
+def _declared_length(scope: Scope) -> int | None:
+    """The request's ``Content-Length``, when it names exactly one byte count."""
+    headers = scope.get("headers") or ()
+    values = [value for name, value in headers if bytes(name).lower() == b"content-length"]
+    if len(values) != 1:
+        return None
+    raw = bytes(values[0]).strip()
+    if not raw or not raw.isdigit():
+        return None
+    return int(raw)
 
 
 def _count(value: object) -> bool:

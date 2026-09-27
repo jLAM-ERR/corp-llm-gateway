@@ -17,6 +17,7 @@ from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware
 from corp_llm_gateway.route_gate.inflight import (
+    DEFAULT_MAX_DRAINING_BYTES,
     E_BODY_TIMEOUT,
     E_CAPACITY,
     MAX_BODY_BYTES,
@@ -40,6 +41,7 @@ class _Metrics(MetricsExporter):
         self.failures: list[str] = []
         self.inflight: list[int] = []
         self.cancelled = 0
+        self.draining_bytes: list[int] = []
 
     def record_block(self, block_reason: str) -> None:
         self.blocks.append(block_reason)
@@ -55,6 +57,9 @@ class _Metrics(MetricsExporter):
 
     def record_cancelled(self) -> None:
         self.cancelled += 1
+
+    def set_draining_bytes(self, count: int) -> None:
+        self.draining_bytes.append(count)
 
 
 class _Client:
@@ -1206,11 +1211,267 @@ def test_the_draining_cap_defaults_to_four_times_the_inflight_cap() -> None:
         {"body_read_s": -1.0},
         {"body_read_s": float("nan")},
         {"body_read_s": float("inf")},
+        {"max_draining_bytes": MAX_BODY_BYTES - 1},
+        {"max_draining_bytes": 0},
+        {"max_draining_bytes": -1},
+        {"max_draining_bytes": True},
+        {"max_draining_bytes": 1.5e9},
     ],
 )
 def test_the_limiter_refuses_bad_drain_settings(limits: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         InflightLimiter(4, metrics=_Metrics(), **limits)
+
+
+# ── the byte budget: body bytes read or held for replay ──────────────────────
+
+
+def _sized_scope(length: int | bytes) -> dict[str, Any]:
+    scope = _scope()
+    value = length if isinstance(length, bytes) else str(length).encode()
+    scope["headers"] = [*scope["headers"], (b"content-length", value)]
+    return scope
+
+
+def _budget_stack(app: Any, **limits: Any) -> tuple[RouteGateMiddleware, InflightLimiter, _Metrics]:
+    limits.setdefault("max_inflight", 8)
+    limits.setdefault("max_body_bytes", 10)
+    limits.setdefault("max_draining_bytes", 16)
+    limits.setdefault("body_read_s", 5.0)
+    gate, limiter, metrics, _ = _stack(app, **limits)
+    return gate, limiter, metrics
+
+
+async def _hold(gate: Any, app: _Holding, chunks: tuple[bytes, ...], scope: Any = None) -> Any:
+    client = _Client(chunks)
+    task = asyncio.create_task(gate(scope or _scope(), client.receive, client.send))
+    await asyncio.wait_for(app.entered.acquire(), 2)
+    return client, task
+
+
+async def test_the_budget_counts_admitted_bodies_until_they_are_released() -> None:
+    app = _Holding()
+    gate, limiter, metrics = _budget_stack(app, max_draining_bytes=20)
+
+    first, first_task = await _hold(gate, app, (b"12345",))
+    assert limiter.buffered_bytes == 5
+    second, second_task = await _hold(gate, app, (b"123", b"4567"))
+    # The replay has handed the body over; it still counts until release.
+    assert limiter.buffered_bytes == 12
+
+    app.release.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert (first.status, second.status) == (200, 200)
+    assert limiter.buffered_bytes == 0
+    assert metrics.draining_bytes[-1] == 0
+    assert max(metrics.draining_bytes) == 12
+
+
+async def test_a_declared_length_over_the_budget_gets_429_unread() -> None:
+    app = _Holding()
+    gate, limiter, metrics = _budget_stack(app)
+    _, held_task = await _hold(gate, app, (b"1234567890",), _sized_scope(10))
+    assert limiter.buffered_bytes == 10
+
+    refused = _Client((CANARY.encode()[:10],))
+    await gate(_sized_scope(10), refused.receive, refused.send)
+
+    assert refused.status == 429
+    assert refused.json()["error"]["code"] == E_CAPACITY
+    assert _headers(refused)[b"retry-after"] == b"1"
+    assert refused.receive_calls == 0
+    assert app.calls == 1
+    assert metrics.blocks == [ROUTE_GATE_CAPACITY]
+    assert limiter.buffered_bytes == 10
+    assert limiter.draining == 0
+
+    app.release.set()
+    await held_task
+    admitted = _Client((b"1234567890",))
+    await gate(_sized_scope(10), admitted.receive, admitted.send)
+    assert admitted.status == 200
+    assert limiter.buffered_bytes == 0
+
+
+async def test_a_chunked_body_that_overruns_the_budget_mid_read_gets_429() -> None:
+    app = _Holding()
+    gate, limiter, metrics = _budget_stack(app)
+    _, held_task = await _hold(gate, app, (b"1234567890",))
+
+    refused = _Client((b"1234", CANARY.encode()[:4]))
+    await gate(_scope(), refused.receive, refused.send)
+
+    assert refused.status == 429
+    assert refused.json()["error"]["reason"] == ROUTE_GATE_CAPACITY
+    assert CANARY[:4] not in json.dumps(refused.json())
+    assert refused.receive_calls == 2
+    assert app.calls == 1
+    assert metrics.blocks == [ROUTE_GATE_CAPACITY]
+    # What the refused body held so far went back; the admitted one still counts.
+    assert limiter.buffered_bytes == 10
+    assert (limiter.inflight, limiter.draining) == (1, 0)
+
+    app.release.set()
+    await held_task
+    assert limiter.buffered_bytes == 0
+
+
+async def test_a_body_that_fills_the_budget_exactly_is_admitted() -> None:
+    app = _Holding()
+    gate, limiter, metrics = _budget_stack(app, max_draining_bytes=20)
+    _, first_task = await _hold(gate, app, (b"1234567890",), _sized_scope(10))
+    second, second_task = await _hold(gate, app, (b"12345", b"67890"))
+
+    assert limiter.buffered_bytes == 20
+    assert metrics.blocks == []
+    app.release.set()
+    await asyncio.gather(first_task, second_task)
+    assert second.status == 200
+    assert limiter.buffered_bytes == 0
+
+
+async def test_a_declared_length_past_the_body_cap_still_gets_the_oversize_refusal() -> None:
+    app = _Holding()
+    gate, limiter, metrics = _budget_stack(app, max_draining_bytes=10)
+    client = _Client((b"1234567890", b"1"))
+
+    await gate(_sized_scope(4096), client.receive, client.send)
+
+    assert client.status == 422
+    assert metrics.blocks == ["oversize:blocked"]
+    assert limiter.buffered_bytes == 0
+
+
+@pytest.mark.parametrize("length", [b"ten", b"-4", b"", b"1e3"])
+async def test_an_unreadable_declared_length_is_accounted_chunk_by_chunk(length: bytes) -> None:
+    app = _Holding()
+    gate, limiter, _ = _budget_stack(app)
+    client, task = await _hold(gate, app, (b"12345",), _sized_scope(length))
+
+    assert limiter.buffered_bytes == 5
+    app.release.set()
+    await task
+    assert client.status == 200
+    assert limiter.buffered_bytes == 0
+
+
+async def test_two_declared_lengths_are_accounted_chunk_by_chunk() -> None:
+    app = _Holding()
+    gate, limiter, _ = _budget_stack(app)
+    scope = _sized_scope(10)
+    scope["headers"].append((b"content-length", b"10"))
+    _, task = await _hold(gate, app, (b"123",), scope)
+
+    assert limiter.buffered_bytes == 3
+    app.release.set()
+    await task
+    assert limiter.buffered_bytes == 0
+
+
+async def test_the_budget_is_given_back_when_the_downstream_raises() -> None:
+    async def failing(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        raise RuntimeError("upstream exploded")
+
+    gate, limiter, metrics = _budget_stack(failing)
+    client = _Client((b"12345",))
+
+    with pytest.raises(RuntimeError):
+        await gate(_sized_scope(5), client.receive, client.send)
+
+    assert limiter.buffered_bytes == 0
+    assert metrics.draining_bytes == [5, 0]
+
+
+async def test_the_budget_is_given_back_on_a_disconnect_while_the_body_is_read() -> None:
+    gate, limiter, metrics = _budget_stack(_Holding())
+    client = _stalled_client(b"1234")
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.sleep(0.05)
+    assert limiter.buffered_bytes == 4
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert limiter.buffered_bytes == 0
+    assert metrics.cancelled == 1
+
+
+async def test_the_budget_is_given_back_on_a_disconnect_while_the_downstream_runs() -> None:
+    app = _Holding()
+    gate, limiter, metrics = _budget_stack(app)
+    client, task = await _hold(gate, app, (b"12345",))
+    assert limiter.buffered_bytes == 5
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert app.cancelled == 1
+    assert (limiter.inflight, limiter.buffered_bytes) == (0, 0)
+    assert metrics.draining_bytes[-1] == 0
+
+
+async def test_the_budget_is_given_back_when_the_server_cancels_the_request() -> None:
+    app = _Holding()
+    gate, limiter, _ = _budget_stack(app)
+    _, draining_task = await _hold(gate, app, (b"123",))
+    stalled = _stalled_client(b"12")
+    stalling = asyncio.create_task(gate(_sized_scope(9), stalled.receive, stalled.send))
+    await asyncio.sleep(0.05)
+    assert limiter.buffered_bytes == 12
+
+    for task in (draining_task, stalling):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert (limiter.inflight, limiter.draining, limiter.buffered_bytes) == (0, 0, 0)
+
+
+async def test_the_budget_is_given_back_on_a_body_timeout_and_a_lost_slot() -> None:
+    app = _Holding()
+    gate, limiter, metrics = _budget_stack(app, max_inflight=1, body_read_s=0.1)
+    timed_out = _stalled_client(b"123")
+    await asyncio.wait_for(gate(_scope(), timed_out.receive, timed_out.send), 2)
+    assert timed_out.status == 408
+    assert limiter.buffered_bytes == 0
+
+    _, held_task = await _hold(gate, app, (b"12345",))
+    lost = _Client((b"1234",))
+    await gate(_scope(), lost.receive, lost.send)
+    assert lost.status == 429
+    assert lost.receive_calls == 0
+    assert limiter.buffered_bytes == 5
+
+    app.release.set()
+    await held_task
+    assert limiter.buffered_bytes == 0
+    assert metrics.draining_bytes[-1] == 0
+
+
+async def test_a_body_that_loses_the_slot_after_it_was_read_gives_its_bytes_back() -> None:
+    app = _Holding()
+    gate, limiter, _ = _budget_stack(app, max_inflight=1, max_draining_bytes=20)
+    slow = _stalled_client(b"123")
+    slow_task = asyncio.create_task(gate(_scope(), slow.receive, slow.send))
+    await asyncio.sleep(0.05)
+    _, held_task = await _hold(gate, app, (b"12345",))
+    assert limiter.buffered_bytes == 8
+
+    slow.incoming.put_nowait({"type": "http.request", "body": b"4", "more_body": False})
+    await asyncio.wait_for(slow_task, 2)
+
+    assert slow.status == 429
+    assert limiter.buffered_bytes == 5
+    app.release.set()
+    await held_task
+    assert limiter.buffered_bytes == 0
+
+
+def test_the_byte_budget_defaults_to_512_mib() -> None:
+    assert DEFAULT_MAX_DRAINING_BYTES == 512 * 1024 * 1024
+    assert InflightLimiter(16, metrics=_Metrics()).max_draining_bytes == DEFAULT_MAX_DRAINING_BYTES
 
 
 # ── the cancel path's bound ──────────────────────────────────────────────────

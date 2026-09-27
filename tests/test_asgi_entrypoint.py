@@ -421,6 +421,7 @@ def test_a_bad_route_gate_extra_exits_78_before_litellm_is_imported(
         ({"CORP_LLM_CANCEL_GRACE_SECONDS": "0"}, "CORP_LLM_CANCEL_GRACE_SECONDS"),
         ({"CORP_LLM_BODY_READ_SECONDS": "301"}, "CORP_LLM_BODY_READ_SECONDS"),
         ({"CORP_LLM_MAX_INFLIGHT": "8", "CORP_LLM_MAX_DRAINING": "7"}, "CORP_LLM_MAX_DRAINING"),
+        ({"CORP_LLM_MAX_DRAINING_BYTES": "1048576"}, "CORP_LLM_MAX_DRAINING_BYTES"),
     ],
     ids=[
         "zero-production",
@@ -431,6 +432,7 @@ def test_a_bad_route_gate_extra_exits_78_before_litellm_is_imported(
         "grace",
         "body-deadline",
         "draining-below-cap",
+        "byte-budget-below-body-cap",
     ],
 )
 def test_a_bad_capacity_exits_78_before_litellm_is_imported(
@@ -514,6 +516,7 @@ _CAPACITY_WIRING_SCRIPT = f"""
                 "grace": asgi.limiter.cancel_grace_s,
                 "body_read": asgi.limiter.body_read_s,
                 "draining": asgi.limiter.max_draining,
+                "draining_bytes": asgi.limiter.max_draining_bytes,
                 "hook_bound": getattr(hook, "__name__", None) == "on_request_cancelled"
                 and type(getattr(hook, "__self__", None)).__name__ == "CorpLlmGuardrail",
                 "factory_installed": inside is not None and inside is not before,
@@ -536,6 +539,7 @@ def test_the_lifespan_wires_the_limiter(valid_config: Path) -> None:
             "CORP_LLM_CANCEL_GRACE_SECONDS": "2.5",
             "CORP_LLM_BODY_READ_SECONDS": "12",
             "CORP_LLM_MAX_DRAINING": "20",
+            "CORP_LLM_MAX_DRAINING_BYTES": "33554432",
         },
     )
 
@@ -543,13 +547,15 @@ def test_the_lifespan_wires_the_limiter(valid_config: Path) -> None:
     assert result["gate_limiter"] is True
     assert (result["max"], result["grace"]) == (7, 2.5)
     assert (result["body_read"], result["draining"]) == (12.0, 20)
+    assert result["draining_bytes"] == 33554432
     assert result["hook_bound"] is True
     assert result["factory_installed"] is True
     assert result["factory_restored"] is True
     assert result["worker_running"] is True
     assert result["worker_untagged"] is True
     assert _boot_record(result["stdout"], "in-flight cap")["message"].endswith(
-        "7 rewritten requests per pod, 20 reading a body (12s deadline)"
+        "7 rewritten requests per pod, 20 reading a body (12s deadline), "
+        "33554432 body bytes buffered at most"
     )
 
 

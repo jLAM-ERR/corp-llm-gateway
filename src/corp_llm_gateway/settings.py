@@ -370,6 +370,14 @@ KEYS: tuple[Key, ...] = (
         "taken); the next gets 429 E_CAPACITY unread; default 4 x CORP_LLM_MAX_INFLIGHT, "
         "at least CORP_LLM_MAX_INFLIGHT, at most 40000",
     ),
+    Key(
+        "CORP_LLM_MAX_DRAINING_BYTES",
+        default="536870912",
+        help="request body bytes buffered at once per pod, being read or held for an "
+        "admitted request until it ends; a body whose Content-Length (or next chunk) would "
+        "pass it gets 429 E_CAPACITY; size it against pod memory; bytes, 26214400 (25 MiB) "
+        "to 17179869184 (16 GiB), default 536870912 (512 MiB)",
+    ),
     # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────
     Key("CORP_LLM_TESTDATA_ALLOWLIST", default="", help="inline never-redact test values"),
     Key("CORP_LLM_TESTDATA_ALLOWLIST_FILE", default="", help="never-redact test values file"),
@@ -889,6 +897,9 @@ CANCEL_GRACE_CEILING_S = 60.0
 BODY_READ_CEILING_S = 300.0
 DRAINING_PER_SLOT = 4
 MAX_DRAINING_CEILING = DRAINING_PER_SLOT * MAX_INFLIGHT_CEILING
+# The floor is the per-request body cap: one largest body always fits the budget.
+MAX_DRAINING_BYTES_FLOOR = 25 * 1024 * 1024
+MAX_DRAINING_BYTES_CEILING = 16 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -899,6 +910,7 @@ class CapacitySettings:
     cancel_grace_seconds: float
     body_read_seconds: float
     max_draining: int
+    max_draining_bytes: int
 
 
 def _prod(values: Mapping[str, str | None]) -> bool:
@@ -937,6 +949,18 @@ def _build_capacity(
                 problems.append(f"{name}: must be at most {MAX_DRAINING_CEILING}")
             elif max_draining < max_inflight or (max_inflight and not max_draining):
                 problems.append(f"{name}: must be at least CORP_LLM_MAX_INFLIGHT ({max_inflight})")
+    name = "CORP_LLM_MAX_DRAINING_BYTES"
+    raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+    max_draining_bytes = 0
+    if not (raw.isascii() and raw.isdigit()):
+        problems.append(f"{name}={raw!r} is not a whole number of bytes")
+    else:
+        max_draining_bytes = int(raw)
+        if not MAX_DRAINING_BYTES_FLOOR <= max_draining_bytes <= MAX_DRAINING_BYTES_CEILING:
+            problems.append(
+                f"{name}: must be from {MAX_DRAINING_BYTES_FLOOR} (25 MiB) "
+                f"to {MAX_DRAINING_BYTES_CEILING} (16 GiB) bytes"
+            )
     if len(problems) > start:
         return None
     return CapacitySettings(
@@ -944,6 +968,7 @@ def _build_capacity(
         cancel_grace_seconds=grace,
         body_read_seconds=body_read,
         max_draining=max_draining,
+        max_draining_bytes=max_draining_bytes,
     )
 
 

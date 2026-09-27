@@ -5814,11 +5814,13 @@ async def test_a_token_store_stalled_mid_query_is_503_and_its_connection_is_drop
     proxy = StallingProxy(pg_dsn())
     store = postgres_store.PostgresTokenStore(await proxy.start(), pool_max_size=1)
     corp_token = f"pg-itest-stall-{time.monotonic_ns()}"
+    reached = False
     try:
         try:
             await store.init_schema()
         except Exception as exc:
             skip_or_fail(f"Postgres unreachable: {type(exc).__name__}")
+        reached = True
         await store.upsert(_token(corp_token, "pg-test-stall"))
         pool = await store._get_pool()
         assert pool.get_size() == 1
@@ -5847,9 +5849,10 @@ async def test_a_token_store_stalled_mid_query_is_503_and_its_connection_is_drop
     finally:
         proxy.resume()
         try:
-            pool = await store._get_pool()
-            async with pool.acquire() as conn:
-                await conn.execute("DELETE FROM corp_tokens WHERE corp_token = $1", corp_token)
+            if reached:
+                pool = await store._get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute("DELETE FROM corp_tokens WHERE corp_token = $1", corp_token)
         finally:
             await store.close()
             await proxy.close()

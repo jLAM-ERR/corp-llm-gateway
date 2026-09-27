@@ -805,8 +805,16 @@ def test_config_check_refuses_the_capacity_the_boot_refuses(
         ("CORP_LLM_BODY_READ_SECONDS", "0"),
         ("CORP_LLM_BODY_READ_SECONDS", "301"),
         ("CORP_LLM_MAX_DRAINING", "3"),
+        ("CORP_LLM_MAX_DRAINING_BYTES", "1048576"),
+        ("CORP_LLM_MAX_DRAINING_BYTES", "17179869185"),
     ],
-    ids=["body-deadline-zero", "body-deadline-past-the-ceiling", "draining-below-the-cap"],
+    ids=[
+        "body-deadline-zero",
+        "body-deadline-past-the-ceiling",
+        "draining-below-the-cap",
+        "byte-budget-below-the-body-cap",
+        "byte-budget-past-the-ceiling",
+    ],
 )
 def test_config_check_refuses_the_body_limits_the_boot_refuses(
     hermetic_gateway_config: None,
