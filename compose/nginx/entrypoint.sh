@@ -251,6 +251,32 @@ if [ "$routing" = host ]; then
     fi
 fi
 
+# ---- 7a. edge limits ------------------------------------------------------------
+# Rendered into limit_req_zone / limit_req / limit_conn: a bare positive
+# integer, ^[1-9][0-9]{0,5}$, and nothing else.
+check_limit() {
+    key=$1
+    value=$2
+    unit=$3
+    valid=1
+    case $value in
+        '' | 0* | *[!0-9]*) valid=0 ;;
+    esac
+    [ ${#value} -le 6 ] || valid=0
+    if [ "$valid" -eq 0 ]; then
+        fail 64 "$key must be a whole number from 1 to 999999 ($unit), got '$value'"
+    fi
+}
+
+NGINX_TOKEN_RATE=${NGINX_TOKEN_RATE:-10}
+NGINX_TOKEN_BURST=${NGINX_TOKEN_BURST:-20}
+NGINX_TOKEN_CONN=${NGINX_TOKEN_CONN:-8}
+NGINX_ISSUE_RATE=${NGINX_ISSUE_RATE:-5}
+check_limit NGINX_TOKEN_RATE "$NGINX_TOKEN_RATE" "requests per second per corp token"
+check_limit NGINX_TOKEN_BURST "$NGINX_TOKEN_BURST" "requests over the rate per corp token"
+check_limit NGINX_TOKEN_CONN "$NGINX_TOKEN_CONN" "concurrent requests per corp token"
+check_limit NGINX_ISSUE_RATE "$NGINX_ISSUE_RATE" "issuance requests per minute per client address"
+
 # ---- 8. expand the trusted list -------------------------------------------------
 newline='
 '
@@ -263,9 +289,10 @@ for entry in $NGINX_TRUSTED_PROXIES; do
 done
 
 # ---- 9. render ----------------------------------------------------------------
-export GATEWAY_DOMAIN NGINX_TLS_CERT NGINX_TLS_KEY TRUSTED_SET_REAL_IP_LINES TRUSTED_GEO_LINES
+export GATEWAY_DOMAIN NGINX_TLS_CERT NGINX_TLS_KEY TRUSTED_SET_REAL_IP_LINES TRUSTED_GEO_LINES \
+    NGINX_TOKEN_RATE NGINX_TOKEN_BURST NGINX_TOKEN_CONN NGINX_ISSUE_RATE
 # shellcheck disable=SC2016 # the names envsubst may substitute, not expansions
-substitutions='${GATEWAY_DOMAIN} ${NGINX_TLS_CERT} ${NGINX_TLS_KEY} ${TRUSTED_SET_REAL_IP_LINES} ${TRUSTED_GEO_LINES}'
+substitutions='${GATEWAY_DOMAIN} ${NGINX_TLS_CERT} ${NGINX_TLS_KEY} ${TRUSTED_SET_REAL_IP_LINES} ${TRUSTED_GEO_LINES} ${NGINX_TOKEN_RATE} ${NGINX_TOKEN_BURST} ${NGINX_TOKEN_CONN} ${NGINX_ISSUE_RATE}'
 
 render() {
     template=$1

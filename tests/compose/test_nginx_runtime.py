@@ -238,6 +238,10 @@ def _domain(value: str | None) -> Refusal:
     return Refusal({**VALID_BEHIND_PROXY, "GATEWAY_DOMAIN": value}, 64, ("GATEWAY_DOMAIN",))
 
 
+def _limit(key: str, value: str) -> Refusal:
+    return Refusal({**VALID_BEHIND_PROXY, key: value}, 64, (key,))
+
+
 def _langfuse(value: str | None, routing: str = "host") -> Refusal:
     return Refusal(
         {**VALID_BEHIND_PROXY, "LANGFUSE_PUBLIC_URL": value},
@@ -367,6 +371,24 @@ REFUSALS = [
     pytest.param(_langfuse(f"https://user@{LANGFUSE_HOST}"), id="langfuse-userinfo"),
     pytest.param(_langfuse(f"https://{LANGFUSE_HOST}.evil.test"), id="langfuse-suffix"),
     pytest.param(_langfuse("http://10.1.2.3:8443", routing="port"), id="langfuse-http-port"),
+    # Rendered into limit_req_zone / limit_req / limit_conn: a bare positive integer.
+    *(
+        pytest.param(_limit("NGINX_TOKEN_RATE", value), id=f"token-rate-{name}")
+        for value, name in (
+            ("0", "zero"),
+            ("10r/s", "unit"),
+            ("-1", "negative"),
+            ("1000000", "seven-digits"),
+            (" 10", "leading-space"),
+            ("1e3", "exponent"),
+        )
+    ),
+    pytest.param(_limit("NGINX_TOKEN_BURST", "08"), id="token-burst-leading-zero"),
+    pytest.param(_limit("NGINX_TOKEN_BURST", "20 nodelay"), id="token-burst-syntax"),
+    pytest.param(_limit("NGINX_TOKEN_CONN", "8;"), id="token-conn-semicolon"),
+    pytest.param(_limit("NGINX_TOKEN_CONN", "0"), id="token-conn-zero"),
+    pytest.param(_limit("NGINX_ISSUE_RATE", "5r/m"), id="issue-rate-unit"),
+    pytest.param(_limit("NGINX_ISSUE_RATE", "5\ninclude /etc/passwd"), id="issue-rate-newline"),
 ]
 
 
@@ -683,10 +705,20 @@ def test_a_denied_request_writes_nothing_of_itself_to_the_container_log(
     assert logs.count(path) == 1
 
 
+# For a test that sends more requests from one address than the edge limits
+# admit; the limits have tests of their own below.
+LIMITS_OUT_OF_THE_WAY = {
+    "NGINX_TOKEN_RATE": "999999",
+    "NGINX_TOKEN_BURST": "999999",
+    "NGINX_ISSUE_RATE": "999999",
+}
+
+
 def test_port_routing_serves_the_allow_list_on_8080_and_404s_8081_whatever_the_host(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
 ) -> None:
-    with started(specs["port"], project, network, VALID_BEHIND_PROXY) as nginx:
+    env = {**VALID_BEHIND_PROXY, **LIMITS_OUT_OF_THE_WAY}
+    with started(specs["port"], project, network, env) as nginx:
         for host in (GATEWAY_HOST, "other.example.test", "10.1.2.3"):
             for path in PATHS:
                 for method in ("GET", "POST"):
@@ -1363,3 +1395,225 @@ def test_the_response_temp_file_fault_is_real_on_a_buffering_location(
     assert "[crit]" in stderr
     assert "proxy_temp" in stderr
     assert PROXY_CANARY in stderr
+
+
+# --------------------------------------------------------------------------- #
+# the per-token edge limits
+# --------------------------------------------------------------------------- #
+
+
+def _edge_limits(dump: str) -> list[str]:
+    directives = re.sub(r"#[^\n]*", "", dump)
+    return re.findall(r"^\s*(limit_(?:req|conn)(?:_zone)?\s[^;]*);", directives, re.MULTILINE)
+
+
+def _expected_limits(rate: str, burst: str, conn: str, issue: str) -> list[str]:
+    token = [f"limit_req zone=corp_token burst={burst} nodelay", f"limit_conn corp_conn {conn}"]
+    return [
+        f"limit_req_zone $corp_token_key zone=corp_token:10m rate={rate}r/s",
+        "limit_conn_zone $corp_token_key zone=corp_conn:10m",
+        f"limit_req_zone $binary_remote_addr zone=corp_issue:1m rate={issue}r/m",
+        # /v1/messages, /v1/chat/completions, /v1/responses, /v1/models
+        *token * 4,
+        "limit_req zone=corp_issue burst=2 nodelay",
+    ]
+
+
+EDGE_KEYS = ("NGINX_TOKEN_RATE", "NGINX_TOKEN_BURST", "NGINX_TOKEN_CONN", "NGINX_ISSUE_RATE")
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        dict.fromkeys(EDGE_KEYS, UNSET),
+        dict.fromkeys(EDGE_KEYS, ""),
+        {"NGINX_ISSUE_RATE": "5"},
+    ],
+    ids=["unset", "empty", "issue-rate-5"],
+)
+def test_the_edge_limits_render_their_defaults(
+    specs: dict[str, Spec], project: Path, network: Network, env: dict[str, str | None]
+) -> None:
+    with started(specs["host"], project, network, {**VALID_BEHIND_PROXY, **env}) as nginx:
+        dump = nginx.exec("nginx", "-T")
+
+    assert dump.returncode == 0, dump.stderr
+    assert _edge_limits(dump.stdout) == _expected_limits("10", "20", "8", "5")
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_the_edge_limits_render_as_set_and_pass_nginx_t(
+    specs: dict[str, Spec], project: Path, network: Network, routing: str
+) -> None:
+    env = {
+        **VALID_BEHIND_PROXY,
+        "NGINX_TOKEN_RATE": "999999",
+        "NGINX_TOKEN_BURST": "7",
+        "NGINX_TOKEN_CONN": "3",
+        "NGINX_ISSUE_RATE": "12",
+    }
+    with started(specs[routing], project, network, env) as nginx:
+        checked = nginx.exec("nginx", "-t")
+        dump = nginx.exec("nginx", "-T")
+
+    assert checked.returncode == 0, checked.stderr
+    assert _edge_limits(dump.stdout) == _expected_limits("999999", "7", "3", "12")
+
+
+# A corp token is `ct_` + 43 url-safe characters.
+TOKEN_A = "ct_LEAK-TOKEN-A-" + "a" * 30
+TOKEN_B = "ct_LEAK-TOKEN-B-" + "b" * 30
+RATE_LIMITED_BODY = {"error": {"code": "E_RATE_LIMITED"}}
+
+
+@dataclass(frozen=True)
+class Answer:
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+
+def _send_post(port: int, target: str, token: str | None = None) -> socket.socket:
+    """Send a whole request and leave its answer unread."""
+    headers = [f"X-Corp-Auth: {token}"] if token else []
+    conn = socket.create_connection(("127.0.0.1", port), timeout=30)
+    conn.sendall(_raw_request("POST", target, *headers, body=b"{}"))
+    return conn
+
+
+def _answer(conn: socket.socket) -> Answer:
+    with conn:
+        chunks = []
+        while chunk := conn.recv(65536):
+            chunks.append(chunk)
+    head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+    status_line, *lines = head.decode("latin-1").split("\r\n")
+    headers = {}
+    for line in lines:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return Answer(int(status_line.split()[1]), headers, body)
+
+
+def _assert_rate_limited(answer: Answer) -> None:
+    assert answer.status == 429, answer
+    assert json.loads(answer.body) == RATE_LIMITED_BODY
+    assert answer.headers["retry-after"] == "1"
+    assert answer.headers["content-type"] == "application/json"
+
+
+def _by_token(records: list[dict[str, Any]]) -> dict[str | None, int]:
+    counts: dict[str | None, int] = {}
+    for record in records:
+        (token,) = _headers(record).get("x-corp-auth", [None])
+        counts[token] = counts.get(token, 0) + 1
+    return counts
+
+
+def test_a_burst_over_the_limit_is_refused_per_token_and_logs_no_token(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    """nginx admits 1 + burst at once, then one per 1/rate. At 1 r/s a burst of 3
+    admits four and refuses the fifth, as long as the five arrive within a
+    second; the admitted four are held a second at the stub, so all are open
+    before any completes."""
+    env = {**VALID_BEHIND_PROXY, "NGINX_TOKEN_RATE": "1", "NGINX_TOKEN_BURST": "3"}
+    seen = len(stub_upstream.requests())
+    with started(specs["host"], project, network, env) as nginx:
+        port = nginx.ports[8080]
+        boot_stderr = nginx.log_streams()[1]
+        token_a = [_send_post(port, "/v1/messages?delay=1", TOKEN_A) for _ in range(5)]
+        token_b = _send_post(port, "/v1/messages", TOKEN_B)
+        no_token = [_send_post(port, "/v1/messages?delay=1") for _ in range(5)]
+        answers_a = [_answer(conn) for conn in token_a]
+        answer_b = _answer(token_b)
+        answers_none = [_answer(conn) for conn in no_token]
+        entries = nginx.access_log(expected=11)
+        stdout, stderr = nginx.log_streams()
+
+    for answers in (answers_a, answers_none):
+        assert sorted(a.status for a in answers) == [200, 200, 200, 200, 429]
+        _assert_rate_limited(next(a for a in answers if a.status == 429))
+    # Token B has its own bucket, and the address bucket is neither A's nor B's.
+    assert answer_b.status == 200
+    assert _by_token(stub_upstream.requests_since(seen)) == {TOKEN_A: 4, TOKEN_B: 1, None: 4}
+    # nginx's "limiting requests" line is at `error`, below the crit pin: the
+    # refusals add no line to stderr, where only `nginx -t`'s two lines are.
+    assert stderr == boot_stderr
+    assert [line.split(":")[0] for line in boot_stderr.splitlines()] == ["nginx", "nginx"]
+    assert sorted(e["status"] for e in entries) == ["200"] * 9 + ["429"] * 2
+    for entry in entries:
+        assert entry["uri"] == "/v1/messages", entry
+    for secret in (TOKEN_A, TOKEN_B, "LEAK-TOKEN"):
+        assert secret not in stdout + stderr, secret
+
+
+def test_issuance_is_limited_per_address_per_minute(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    """``rate=5r/m burst=2``: three at once (1 + burst), then one every 12 s."""
+    env = {**VALID_BEHIND_PROXY, "NGINX_ISSUE_RATE": "5"}
+    seen = len(stub_upstream.requests())
+    with started(specs["host"], project, network, env) as nginx:
+        port = nginx.ports[8080]
+        answers = [_answer(_send_post(port, "/internal/issue-token")) for _ in range(8)]
+        # Per minute, not per second: 1.5 s later the bucket is still full.
+        time.sleep(1.5)
+        later = _answer(_send_post(port, "/internal/issue-token"))
+
+    assert [a.status for a in answers] == [200] * 3 + [429] * 5
+    for answer in (*answers[3:], later):
+        _assert_rate_limited(answer)
+    records = stub_upstream.requests_since(seen)
+    assert [(r["method"], r["target"]) for r in records] == [("POST", "/internal/issue-token")] * 3
+
+
+def _wait_for_requests(stub: Stub, seen: int, count: int) -> None:
+    deadline = time.monotonic() + 10
+    while len(stub.requests_since(seen)) < count:
+        assert time.monotonic() < deadline, stub.requests_since(seen)
+        time.sleep(0.1)
+
+
+def test_a_second_request_in_flight_on_one_token_is_429_not_503(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    env = {**VALID_BEHIND_PROXY, "NGINX_TOKEN_CONN": "1"}
+    seen = len(stub_upstream.requests())
+    with started(specs["host"], project, network, env) as nginx:
+        port = nginx.ports[8080]
+        held = _send_post(port, "/v1/messages?delay=3", TOKEN_A)
+        # It has reached the gateway: token A's one place is taken until it ends.
+        _wait_for_requests(stub_upstream, seen, 1)
+        second = _answer(_send_post(port, "/v1/messages", TOKEN_A))
+        other = _answer(_send_post(port, "/v1/messages", TOKEN_B))
+        first = _answer(held)
+        # The place comes back when the held request ends.
+        after = _answer(_send_post(port, "/v1/messages", TOKEN_A))
+
+    _assert_rate_limited(second)
+    assert (first.status, other.status, after.status) == (200, 200, 200)
+    records = stub_upstream.requests_since(seen)
+    assert [(r["target"], _headers(r)["x-corp-auth"]) for r in records] == [
+        ("/v1/messages?delay=3", [TOKEN_A]),
+        ("/v1/messages", [TOKEN_B]),
+        ("/v1/messages", [TOKEN_A]),
+    ]
+
+
+def test_an_upstream_failure_on_a_limited_route_logs_no_token(
+    specs: dict[str, Spec], project: Path
+) -> None:
+    # No litellm on this network: the name does not resolve, a 502 — the error
+    # path where nginx would write the request, at `error`, below the crit pin.
+    with (
+        user_network(specs["host"].image) as fresh,
+        started(specs["host"], project, fresh, VALID_BEHIND_PROXY) as nginx,
+    ):
+        answer = _answer(_send_post(nginx.ports[8080], "/v1/messages", TOKEN_A))
+        entries = nginx.access_log(expected=1)
+        stdout, stderr = nginx.log_streams()
+
+    assert answer.status == 502
+    assert [(e["uri"], e["status"]) for e in entries] == [("/v1/messages", "502")]
+    assert "LEAK-TOKEN" not in stdout + stderr

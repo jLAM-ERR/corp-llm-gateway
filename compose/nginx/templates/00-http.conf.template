@@ -26,6 +26,18 @@ map $http_host $proxy_host_header {
     ''      $host;
 }
 
+# Per-token fairness at the edge: keyed by the corp token itself, or by the
+# client address (the real client's, via real_ip) when there is none. The key
+# lives only in these shared zones; it is in no log_format.
+map $http_x_corp_auth $corp_token_key {
+    ""      $binary_remote_addr;
+    default $http_x_corp_auth;
+}
+limit_req_zone $corp_token_key zone=corp_token:10m rate=${NGINX_TOKEN_RATE}r/s;
+limit_conn_zone $corp_token_key zone=corp_conn:10m;
+# An issuance call carries no corp token yet.
+limit_req_zone $binary_remote_addr zone=corp_issue:1m rate=${NGINX_ISSUE_RATE}r/m;
+
 # The loopback health listener is probed every few seconds; its requests are
 # not logged. A separate access_log there would break the one-directive rule.
 map $server_port $corp_loggable {

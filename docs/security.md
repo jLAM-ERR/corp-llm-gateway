@@ -1024,6 +1024,17 @@ and one that finishes it after the last slot went gets 429 then. Every
 answers before litellm or the sanitizer runs, and none of its refusals reads,
 echoes or logs the body.
 
+**The edge answers `E_RATE_LIMITED`, the gateway `E_CAPACITY`.** With the nginx
+front door on (`compose/nginx/`), nginx limits each corp token before the
+gateway sees the request (`docs/ops/capacity.md`, "Edge limits"): past a
+per-token rate, burst or in-flight limit it answers 429
+`{"error":{"code":"E_RATE_LIMITED"}}` with `Retry-After: 1`, and the request
+never reaches the gateway, so it is neither audited nor counted here. The two
+codes say which layer answered: `E_RATE_LIMITED` is one token over its share,
+`E_CAPACITY` is this pod full. The token is the limiter's key only in nginx's
+shared memory; it is in no access-log field, and nginx's own "limiting requests"
+line is written at `error`, below the front door's `crit` log level.
+
 **Disconnects end the request.** The limiter replays the body to litellm and
 watches the socket. A client that disconnects — during our pre-call hook, before
 the first byte or mid-stream — gets its request cancelled, its leftover tasks

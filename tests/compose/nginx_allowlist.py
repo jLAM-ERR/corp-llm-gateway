@@ -25,6 +25,13 @@ GATEWAY_SNIPPET = NGINX_DIR / "templates" / "snippets" / "gateway-locations.inc.
 
 WEBSOCKET = "WEBSOCKET"
 
+# The one named location the gateway snippet may carry: the edge's 429 body.
+RATE_LIMITED = "@rate_limited"
+# The only placeholders the gateway snippet may carry: the edge limits, which
+# the entrypoint renders as bare positive integers (never a path or a method).
+SNIPPET_PLACEHOLDERS = frozenset({"NGINX_TOKEN_BURST", "NGINX_TOKEN_CONN"})
+LIMIT_DIRECTIVES = frozenset({"limit_req", "limit_conn"})
+
 # Every (method, path) litellm registers at an admitted path that nginx does not
 # admit, with what blocks it. Produced by the collector against litellm 1.101.0
 # — what that release shows, not a closed set: a bump that adds a pair at an
@@ -136,6 +143,9 @@ class Snippet:
     def exact(self) -> list[Location]:
         return [location for location in self.locations if location.modifier == "="]
 
+    def named(self) -> list[Location]:
+        return [location for location in self.locations if location.path.startswith("@")]
+
 
 def parse_snippet(text: str) -> Snippet:
     server: list[Directive] = []
@@ -148,15 +158,36 @@ def parse_snippet(text: str) -> Snippet:
         assert directive.block is not None, directive
         *modifier, path = directive.args
         assert len(modifier) <= 1, directive
+        if path.startswith("@"):
+            # A named location is reachable only by an internal redirect; one
+            # the tests do not know is a route nobody reviewed.
+            assert not modifier and path == RATE_LIMITED, f"unexpected named location {directive}"
         locations.append(Location("".join(modifier), path, directive.block))
     return Snippet(tuple(server), tuple(locations))
 
 
 def gateway_snippet() -> Snippet:
     text = GATEWAY_SNIPPET.read_text()
-    # No placeholder: the rendered snippet is the template byte for byte.
-    assert "${" not in text
+    # The rendered snippet is the template with the edge limits filled in.
+    assert set(re.findall(r"\$\{([^}]*)\}", text)) == SNIPPET_PLACEHOLDERS
     return parse_snippet(text)
+
+
+def limits_off_the_allow_list(snippet: Snippet, admitted: Iterable[tuple[str, str]]) -> list[str]:
+    """Every ``limit_req`` / ``limit_conn`` that is not a direct child of an exact
+    location for an admitted pair: at server level, on the catch-all, on a named
+    location, inside a nested block, or on a location nginx should not have. A
+    limit there says one thing and does another."""
+    admitted_paths = {path for _, path in admitted}
+    found = [f"server: {d}" for d in snippet.server if d.name in LIMIT_DIRECTIVES]
+    for location in snippet.locations:
+        on_allow_list = location.modifier == "=" and location.path in admitted_paths
+        for directive in location.directives:
+            if directive.name in LIMIT_DIRECTIVES and not on_allow_list:
+                found.append(f"{location.key}: {directive}")
+            nested = [d for d in directive.block or () if d.name in LIMIT_DIRECTIVES]
+            found += [f"{location.key}: {directive.name} {{ {d} }}" for d in nested]
+    return found
 
 
 def declared_pairs(snippet: Snippet) -> set[tuple[str, str]]:

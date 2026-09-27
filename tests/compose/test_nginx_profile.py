@@ -18,6 +18,7 @@ import yaml
 
 from tests.compose.nginx_allowlist import (
     GATEWAY_SNIPPET,
+    RATE_LIMITED,
     Location,
     Snippet,
     gateway_snippet,
@@ -339,6 +340,20 @@ GATEWAY_SERVER_DIRECTIVES = [
     "proxy_set_header X-Forwarded-Proto https",
     "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for",
     "client_max_body_size 25m",
+    "limit_req_status 429",
+    "limit_conn_status 429",
+    "error_page 429 = @rate_limited",
+]
+
+TOKEN_LIMITS = [
+    "limit_req zone=corp_token burst=${NGINX_TOKEN_BURST} nodelay",
+    "limit_conn corp_conn ${NGINX_TOKEN_CONN}",
+]
+ISSUE_LIMIT = "limit_req zone=corp_issue burst=2 nodelay"
+RATE_LIMITED_BODY = [
+    "default_type application/json",
+    "add_header Retry-After 1 always",
+    """return 429 '{"error":{"code":"E_RATE_LIMITED"}}'""",
 ]
 
 # What the front door admits: the gateway's allow-list ("The security
@@ -347,20 +362,35 @@ ADMITTED_LOCATIONS = {
     "gateway-locations.inc.template": (
         GATEWAY_SERVER_DIRECTIVES,
         {
-            "= /v1/messages": ["limit_except POST { deny all }", _proxied("/v1/messages")],
+            "= /v1/messages": [
+                "limit_except POST { deny all }",
+                *TOKEN_LIMITS,
+                _proxied("/v1/messages"),
+            ],
             "= /v1/chat/completions": [
                 "limit_except POST { deny all }",
+                *TOKEN_LIMITS,
                 _proxied("/v1/chat/completions"),
             ],
-            "= /v1/responses": ["limit_except POST { deny all }", _proxied("/v1/responses")],
-            "= /v1/models": ["limit_except GET { deny all }", _proxied("/v1/models")],
+            "= /v1/responses": [
+                "limit_except POST { deny all }",
+                *TOKEN_LIMITS,
+                _proxied("/v1/responses"),
+            ],
+            "= /v1/models": [
+                "limit_except GET { deny all }",
+                *TOKEN_LIMITS,
+                _proxied("/v1/models"),
+            ],
             "= /healthz/live": ["limit_except GET { deny all }", _proxied("/healthz/live")],
             "= /internal/issue-token": [
                 "limit_except POST { deny all }",
+                ISSUE_LIMIT,
                 "client_max_body_size 1k",
                 _proxied("/internal/issue-token"),
             ],
             "/": ["return 404"],
+            RATE_LIMITED: RATE_LIMITED_BODY,
         },
     ),
     "langfuse-locations.inc.template": ([], {"/": ["return 404"]}),
@@ -396,6 +426,19 @@ def test_a_location_without_exactly_one_limit_except_names_itself(body: str, fou
         _ = location.methods
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["location @other { return 204; }", "location = @rate_limited { return 204; }"],
+    ids=["another-name", "exact-modifier"],
+)
+def test_the_parser_admits_one_named_location_and_refuses_any_other(text: str) -> None:
+    (named,) = parse_snippet("location @rate_limited { return 429; }").named()
+    assert named.key == RATE_LIMITED
+
+    with pytest.raises(AssertionError, match="unexpected named location"):
+        parse_snippet(text)
+
+
 # --------------------------------------------------------------------------- #
 # the gateway allow-list
 # --------------------------------------------------------------------------- #
@@ -417,7 +460,8 @@ def test_every_gateway_location_is_exact_except_the_404_catch_all() -> None:
     others = [location for location in snippet.locations if location.modifier != "="]
 
     assert [(location.key, [str(d) for d in location.directives]) for location in others] == [
-        ("/", ["return 404"])
+        ("/", ["return 404"]),
+        (RATE_LIMITED, RATE_LIMITED_BODY),
     ]
     for location in snippet.exact():
         assert len(location.methods) == 1, location.key
@@ -474,6 +518,53 @@ def test_the_body_caps_are_25m_and_1k_on_issuance_alone() -> None:
 
     assert caps.pop("= /internal/issue-token") == ["client_max_body_size 1k"]
     assert set(map(tuple, caps.values())) == {("client_max_body_size 25m",)}
+
+
+# --------------------------------------------------------------------------- #
+# the per-token edge limits
+# --------------------------------------------------------------------------- #
+
+GATEWAY_OWNED_PATHS = {"/healthz/live", "/internal/issue-token"}
+
+
+def _limits(location: Location) -> list[str]:
+    return [str(d) for d in location.directives if d.name in ("limit_req", "limit_conn")]
+
+
+def test_every_admitted_litellm_location_is_limited_per_token() -> None:
+    litellm = [loc for loc in gateway_snippet().exact() if loc.path not in GATEWAY_OWNED_PATHS]
+
+    assert {loc.path for loc in litellm} == {
+        "/v1/messages",
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/models",
+    }
+    for location in litellm:
+        assert _limits(location) == TOKEN_LIMITS, location.key
+
+
+def test_issuance_is_limited_by_address_and_the_probe_not_at_all() -> None:
+    locations = {location.key: location for location in gateway_snippet().locations}
+
+    # An issuance call carries no corp token yet: the address zone instead.
+    assert _limits(locations["= /internal/issue-token"]) == [ISSUE_LIMIT]
+    # A load balancer's probe must never be told 429.
+    assert _limits(locations["= /healthz/live"]) == []
+    for key in ("/", RATE_LIMITED):
+        assert _limits(locations[key]) == [], key
+
+
+def test_both_limits_refuse_with_the_edges_json_429() -> None:
+    snippet = gateway_snippet()
+    server = [str(d) for d in snippet.server]
+
+    # limit_conn would answer 503 by default, indistinguishable from an outage.
+    assert "limit_req_status 429" in server
+    assert "limit_conn_status 429" in server
+    assert [d for d in server if d.startswith("error_page")] == ["error_page 429 = @rate_limited"]
+    (named,) = snippet.named()
+    assert [str(d) for d in named.directives] == RATE_LIMITED_BODY
 
 
 TRUSTED_PEER_GATE = "if ($from_trusted_proxy = 0) { return 444; }"
@@ -684,6 +775,61 @@ def test_the_two_shared_maps_are_defined_once() -> None:
     assert body.count("$proxy_host_header {") == 1
 
 
+EDGE_ZONES = [
+    "limit_req_zone $corp_token_key zone=corp_token:10m rate=${NGINX_TOKEN_RATE}r/s",
+    "limit_conn_zone $corp_token_key zone=corp_conn:10m",
+    "limit_req_zone $binary_remote_addr zone=corp_issue:1m rate=${NGINX_ISSUE_RATE}r/m",
+]
+TOKEN_KEY_MAP = (
+    'map $http_x_corp_auth $corp_token_key { "" $binary_remote_addr; default $http_x_corp_auth; }'
+)
+
+
+def test_the_http_context_defines_the_three_zones_and_the_token_key() -> None:
+    body = re.sub(r"\s+", " ", _directives(HTTP_TEMPLATE.read_text()))
+    flat = re.sub(r"'[^']*'", "''", body)
+
+    assert TOKEN_KEY_MAP in body
+    assert body.count("$corp_token_key {") == 1
+    zones = re.findall(r"\blimit_(?:req|conn)_zone\b[^;]*", body)
+    assert zones == EDGE_ZONES
+    for zone in zones:
+        # The http context: not inside the health server or a map.
+        assert _depth_at(flat, flat.index(zone)) == 0, zone
+    for path in _every_config_file():
+        if path != HTTP_TEMPLATE:
+            assert not re.search(r"\blimit_(req|conn)_zone\b", path.read_text()), path.name
+
+
+def test_the_token_is_in_no_log_format_and_the_key_only_in_the_zones() -> None:
+    for name, directive in _log_formats().items():
+        variables = _log_variables(directive)
+        assert "http_x_corp_auth" not in variables, name
+        assert "corp_token_key" not in variables, name
+    uses = [
+        line.strip()
+        for path in _every_config_file()
+        for line in _directives(path.read_text()).splitlines()
+        if "$corp_token_key" in line
+    ]
+    assert uses == [
+        "map $http_x_corp_auth $corp_token_key {",
+        f"{EDGE_ZONES[0]};",
+        f"{EDGE_ZONES[1]};",
+    ]
+
+
+def test_nginxs_limiting_line_is_below_the_error_log_level() -> None:
+    # nginx logs "limiting requests, excess: ... by zone" (request line
+    # appended) at limit_req_log_level's default `error`, below the `crit` pin.
+    for path in _every_config_file():
+        text = _directives(path.read_text())
+        assert not re.search(r"\blimit_(req|conn)_log_level\b", text), path.name
+    assert re.findall(
+        r"^\s*error_log\s+([^;]+);", _directives(NGINX_CONF.read_text()), re.MULTILINE
+    ) == ["/dev/stderr crit"]
+
+
 def test_no_config_reads_the_inbound_x_forwarded_proto() -> None:
     for path in _every_config_file():
         assert "$http_x_forwarded_proto" not in path.read_text().lower(), path.name
@@ -726,6 +872,10 @@ ENV_EXAMPLE_KEYS = (
     "NGINX_BIND_ADDR",
     "NGINX_PORT",
     "NGINX_LANGFUSE_PORT",
+    "NGINX_TOKEN_RATE",
+    "NGINX_TOKEN_BURST",
+    "NGINX_TOKEN_CONN",
+    "NGINX_ISSUE_RATE",
 )
 
 
@@ -744,3 +894,26 @@ def test_the_env_example_block_sits_beside_the_compose_file_line() -> None:
     profiles = lines.index("# COMPOSE_PROFILES=nginx")
 
     assert 0 < profiles - compose_file < 15
+
+
+# The entrypoint's step-7a defaults.
+EDGE_DEFAULTS = {
+    "NGINX_TOKEN_RATE": "10",
+    "NGINX_TOKEN_BURST": "20",
+    "NGINX_TOKEN_CONN": "8",
+    "NGINX_ISSUE_RATE": "5",
+}
+
+
+def test_the_env_example_shows_the_edge_defaults_beside_the_gateway_caps_they_front() -> None:
+    text = ENV_EXAMPLE.read_text()
+    start = text.index("# ---- nginx front door")
+    block = text[start : text.index("\n# ----", start + 1)]
+
+    entrypoint = (NGINX_DIR / "entrypoint.sh").read_text()
+    for key, default in EDGE_DEFAULTS.items():
+        assert f"\n# {key}={default}\n" in block, key
+        assert f"\n{key}=${{{key}:-{default}}}\n" in entrypoint, key
+    assert "CORP_LLM_MAX_INFLIGHT" in block
+    assert "CORP_GATEWAY_ISSUE_RATE_PER_MINUTE" in block
+    assert "E_RATE_LIMITED" in block and "E_CAPACITY" in block

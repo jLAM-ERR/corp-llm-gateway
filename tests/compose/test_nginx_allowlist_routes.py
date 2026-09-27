@@ -20,13 +20,16 @@ import pytest
 from corp_llm_gateway.route_gate import GATEWAY_ROUTE_TABLE, Verdict, classify, lookup
 from tests.compose.nginx_allowlist import (
     BLOCKED_AT_NGINX,
+    GATEWAY_SNIPPET,
     WEBSOCKET,
     declared_pairs,
     gateway_owned,
     gateway_paths_litellm_registers,
     gateway_snippet,
     installed_litellm_root,
+    limits_off_the_allow_list,
     missing_from_litellm,
+    parse_snippet,
     passing_pairs,
     stale_blocked_entries,
     unaccounted_at_admitted_paths,
@@ -53,6 +56,67 @@ def test_the_snippet_declares_exactly_the_admitted_set() -> None:
     assert declared == ADMITTED
     assert gateway_owned(declared) == GATEWAY_OWNED
     assert set(GATEWAY_ROUTE_TABLE) >= GATEWAY_OWNED
+
+
+# --------------------------------------------------------------------------- #
+# an edge limit sits only on an admitted location
+# --------------------------------------------------------------------------- #
+
+TOKEN_LIMIT = "limit_req zone=corp_token burst=${NGINX_TOKEN_BURST} nodelay"
+
+
+def test_every_edge_limit_sits_on_an_admitted_location() -> None:
+    assert limits_off_the_allow_list(gateway_snippet(), ADMITTED) == []
+
+
+def _drifted(old: str, new: str) -> str:
+    text = GATEWAY_SNIPPET.read_text()
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
+
+
+# A limit on a location nginx does not admit says one thing and does another.
+DRIFTS = [
+    pytest.param(
+        _drifted(
+            "location / {\n",
+            "location = /v1/embeddings {\n    limit_except POST { deny all; }\n"
+            f"    {TOKEN_LIMIT};\n    return 404;\n}}\n\nlocation / {{\n",
+        ),
+        f"= /v1/embeddings: {TOKEN_LIMIT}",
+        id="a-location-nginx-does-not-admit",
+    ),
+    pytest.param(
+        _drifted("location / {\n", f"location / {{\n    {TOKEN_LIMIT};\n"),
+        f"/: {TOKEN_LIMIT}",
+        id="the-catch-all",
+    ),
+    pytest.param(
+        _drifted(
+            "location @rate_limited {\n", "location @rate_limited {\n    limit_conn corp_conn 1;\n"
+        ),
+        "@rate_limited: limit_conn corp_conn 1",
+        id="the-named-location",
+    ),
+    pytest.param(
+        _drifted("limit_req_status 429;\n", f"limit_req_status 429;\n{TOKEN_LIMIT};\n"),
+        f"server: {TOKEN_LIMIT}",
+        id="server-level",
+    ),
+    pytest.param(
+        _drifted(
+            "location = /v1/messages {\n    limit_except POST { deny all; }\n",
+            f"location = /v1/messages {{\n    limit_except POST {{ deny all; {TOKEN_LIMIT}; }}\n",
+        ),
+        f"= /v1/messages: limit_except {{ {TOKEN_LIMIT} }}",
+        id="inside-limit-except",
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "found"), DRIFTS)
+def test_a_limit_off_the_allow_list_fails_the_guard(text: str, found: str) -> None:
+    assert limits_off_the_allow_list(parse_snippet(text), ADMITTED) == [found]
 
 
 # --------------------------------------------------------------------------- #
