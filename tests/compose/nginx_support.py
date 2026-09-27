@@ -1,10 +1,9 @@
 """Shared plumbing for the nginx front-door tests: the merged compose render and
 the skip-or-fail rule.
 
-The render reuses the env fixture of the existing render tests
-(``test_oauth_overlay.REQUIRED_ENV``) and strips from the process environment
-every name any compose file interpolates, so the render is the template's and
-not this laptop's.
+The render writes ``REQUIRED_ENV`` into the project ``.env`` and strips from the
+process environment every name any compose file interpolates
+(``bare_compose_env``), so the render is the template's and not this laptop's.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import pytest
 import yaml
 
 from corp_llm_gateway.settings import parse_flag
-from tests.compose.test_oauth_overlay import MODE_A_ONLY_KEYS, REQUIRED_ENV
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_DIR = ROOT / "compose"
@@ -49,6 +47,22 @@ ENTRYPOINT_KEYS = (
     "NGINX_ISSUE_RATE",
 )
 COMPOSE_ONLY_KEYS = ("NGINX_PORT", "NGINX_LANGFUSE_PORT")
+
+MODE_A_ONLY_KEYS = ("LITELLM_MASTER_KEY", "UI_USERNAME", "UI_PASSWORD")
+# Every `${X:?...}` in the base file, minus the Mode A keys the subscription mode
+# omits. Values are obvious non-credentials; only their presence in the render matters.
+REQUIRED_ENV = (
+    "POSTGRES_PASSWORD",
+    "GATEWAY_IMAGE_TAG",
+    "CORP_LANGFUSE_PUBLIC_KEY",
+    "CORP_LANGFUSE_SECRET_KEY",
+    "LANGFUSE_CLICKHOUSE_PASSWORD",
+    "LANGFUSE_ENCRYPTION_KEY",
+    "LANGFUSE_NEXTAUTH_SECRET",
+    "LANGFUSE_POSTGRES_PASSWORD",
+    "LANGFUSE_SALT",
+    "MINIO_ROOT_PASSWORD",
+)
 
 REQUIRE_ENV_VARS = ("CI", "CORP_REQUIRE_PROXY_CAPTURE")
 
@@ -86,6 +100,18 @@ def _interpolated_names() -> set[str]:
     return names
 
 
+def bare_compose_env() -> dict[str, str]:
+    """The process environment minus everything a compose file could read from it."""
+    stripped = _interpolated_names() | set(MODE_A_ONLY_KEYS) | set(ENTRYPOINT_KEYS)
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in stripped
+        and not key.startswith("COMPOSE_")
+        and not key.startswith("CORP_GATEWAY_ISSUE_")
+    }
+
+
 @dataclass
 class Render:
     project_dir: Path
@@ -119,20 +145,12 @@ def render(
     if profiles is not None:
         env_text += f"COMPOSE_PROFILES={profiles}\n"
     (project_dir / ".env").write_text(env_text + env_extra)
-    stripped = _interpolated_names() | set(MODE_A_ONLY_KEYS) | set(ENTRYPOINT_KEYS)
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in stripped
-        and not key.startswith("COMPOSE_")
-        and not key.startswith("CORP_GATEWAY_ISSUE_")
-    }
     argv = ["docker", "compose", "--project-name", "corp-nginx-render"]
     for path in files or (COMPOSE,):
         argv += ["-f", path.name]
     argv.append("config")
     result = subprocess.run(
-        argv, cwd=project_dir, capture_output=True, text=True, env=env, check=False
+        argv, cwd=project_dir, capture_output=True, text=True, env=bare_compose_env(), check=False
     )
     if check and result.returncode != 0:
         pytest.fail(f"docker compose config failed (exit {result.returncode}):\n{result.stderr}")

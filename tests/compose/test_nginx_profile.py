@@ -1243,7 +1243,11 @@ def test_the_env_example_block_sits_beside_the_compose_file_line() -> None:
     compose_file = max(i for i, line in enumerate(lines) if line.startswith("# COMPOSE_FILE="))
     profiles = lines.index("# COMPOSE_PROFILES=nginx")
 
-    assert 0 < profiles - compose_file < 15
+    assert compose_file < profiles
+    between = lines[compose_file + 1 : profiles]
+    assert not [line for line in between if re.match(r"[A-Z_]+=", line)], between
+    first = next(line for line in lines[compose_file + 1 :] if line.strip())
+    assert first.startswith("# ---- nginx front door"), first
 
 
 def _langfuse_public_url_block() -> list[str]:

@@ -24,6 +24,7 @@
 set -euo pipefail
 
 REMOTE_DIR="${CORP_GATEWAY_DEPLOY_DIR:-/opt/corp-llm-gateway}"
+DEFAULT_REMOTE_DIR="/opt/corp-llm-gateway"
 COMPOSE_FILE="docker-compose.yml"
 # The default mode is oauth (subscription, the production mode): it layers
 # docker-compose.oauth.yml on top. virtual-keys (the base file alone) is a test
@@ -68,6 +69,9 @@ ASSUME_YES=0
 FORCE_UNLOCK=0
 LOCK_DIR=""
 LOCK_HELD=0
+# The non-default stack-selecting flags of this run, each with a leading space,
+# for the hints that tell the operator what to run next.
+SELF_FLAGS=""
 
 fatal() {
     echo "FATAL: $*" >&2
@@ -260,6 +264,11 @@ parse_args() {
     done
 
     LOCK_DIR="${REMOTE_DIR}/.deploy.lock"
+
+    SELF_FLAGS=""
+    [[ "$REMOTE_DIR" == "$DEFAULT_REMOTE_DIR" ]] || SELF_FLAGS+=" --dir ${REMOTE_DIR}"
+    [[ "$DEPLOY_MODE" == "oauth" ]] || SELF_FLAGS+=" --mode ${DEPLOY_MODE}"
+    (( DEPLOY_ISSUANCE == 0 )) || SELF_FLAGS+=" --issuance"
 }
 
 require_cmd() {
@@ -447,14 +456,18 @@ sync_compose() {
 # health + status
 # --------------------------------------------------------------------------- #
 
-# One TSV line per service: name, state, health. Compose v2 prints either a
-# JSON array or one object per line depending on the version; both are handled.
+# One line per service: name, state, health, exit code, separated by FIELD_SEP.
+# Not tabs: `read` collapses a run of whitespace separators, so an empty health
+# would shift the exit code into its place. Compose v2 prints either a JSON
+# array or one object per line depending on the version; both are handled.
+FIELD_SEP=$'\x1f'
 service_states() {
     ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} ps --all --format json" \
         | jq -s -r '[.[] | if type == "array" then .[] else . end]
                     | .[]
-                    | [(.Service // .Name // "?"), (.State // ""), (.Health // "")]
-                    | @tsv'
+                    | [(.Service // .Name // "?"), (.State // ""), (.Health // ""),
+                       (if .ExitCode == null then "" else (.ExitCode|tostring) end)]
+                    | join("\u001f")'
 }
 
 is_front_door() {
@@ -485,7 +498,7 @@ wait_for_healthcheck() {
 
     while (( elapsed < max_wait )); do
         local all_healthy=true
-        local states service state health down_service=""
+        local states service state health exit_code down_service="" failed_service=""
         stuck=""
         states="$(service_states || true)"
 
@@ -493,18 +506,34 @@ wait_for_healthcheck() {
             all_healthy=false
             stuck="none reported"
         else
-            while IFS=$'\t' read -r service state health; do
-                if is_front_door "$service" && front_door_is_down "$state" "$health"; then
-                    down_service="$service"
-                    stuck="${service} (state=${state:-?} health=${health:-none})"
+            while IFS="$FIELD_SEP" read -r service state health exit_code; do
+                if is_front_door "$service"; then
+                    if front_door_is_down "$state" "$health"; then
+                        down_service="$service"
+                        stuck="${service} (state=${state:-?} health=${health:-none})"
+                        break
+                    fi
+                    # nginx always declares a healthcheck. Between two restarts
+                    # of a crash loop it shows `running` with no health for an
+                    # instant, so "running" alone never counts here.
+                    if [[ "$health" == "healthy" ]]; then
+                        continue
+                    fi
+                elif [[ "$state" == "exited" && -n "$exit_code" && "$exit_code" != "0" ]]; then
+                    # A failed one-shot never recovers, and whatever waits for it
+                    # to complete stays `created` until the timeout.
+                    failed_service="$service"
+                    stuck="${service} exited with code ${exit_code}"
                     break
-                fi
+                elif [[ "$state" == "exited" && -z "$health" && "$exit_code" == "0" ]]; then
+                    # A `restart: "no"` one-shot that finished: `ps --all` lists it.
+                    continue
                 # A service that DECLARES a healthcheck must actually report
                 # "healthy": "starting" is not healthy yet and can still flip to
                 # "unhealthy", so accepting it ended the wait on the first poll.
                 # Only a service with NO healthcheck (empty Health) falls back to
                 # "is it running".
-                if [[ -n "$health" ]]; then
+                elif [[ -n "$health" ]]; then
                     if [[ "$health" == "healthy" ]]; then
                         continue
                     fi
@@ -520,7 +549,14 @@ wait_for_healthcheck() {
             print_status
             fatal "the nginx front door is down: ${stuck}.
        Its entrypoint names the setting it refused in one log line. Read it with:
-       scripts/deploy/deploy.sh --host ${HOST} logs ${down_service}"
+       scripts/deploy/deploy.sh --host ${HOST}${SELF_FLAGS} logs ${down_service}"
+        fi
+
+        if [[ -n "$failed_service" ]]; then
+            print_status
+            fatal "${stuck}; the services that wait for it will not start.
+       Read its log with:
+       scripts/deploy/deploy.sh --host ${HOST}${SELF_FLAGS} logs ${failed_service}"
         fi
 
         if [[ "$all_healthy" == "true" ]]; then
@@ -534,7 +570,7 @@ wait_for_healthcheck() {
 
     print_status
     fatal "services did not reach a healthy state within ${max_wait}s — stuck: ${stuck}.
-       Inspect with: scripts/deploy/deploy.sh --host ${HOST} logs"
+       Inspect with: scripts/deploy/deploy.sh --host ${HOST}${SELF_FLAGS} logs"
 }
 
 print_status() {
@@ -548,7 +584,7 @@ print_status() {
 
     {
         printf '\n%-24s %-12s %s\n' SERVICE STATE HEALTH
-        while IFS=$'\t' read -r service state health; do
+        while IFS="$FIELD_SEP" read -r service state health _; do
             printf '%-24s %-12s %s\n' "$service" "${state:-?}" "${health:--}"
         done <<< "$states"
         printf '\n'

@@ -22,6 +22,10 @@
 # stdout carries only the CA certificate's path; everything else is on stderr.
 
 set -euo pipefail
+# Byte semantics for tr and the regexes: under a UTF-8 locale BSD tr stops at an
+# invalid byte, and the SAN that reached openssl was the truncated prefix.
+LC_ALL=C
+export LC_ALL
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${SCRIPT_DIR}/../../compose/nginx/certs"
@@ -261,8 +265,9 @@ main() {
 
     umask 077
     WORK_DIR="$(mktemp -d)"
-    # The CA key lives only here.
-    trap 'rm -rf -- "$WORK_DIR"' EXIT
+    # The CA key lives only here. A failed rename must not leave a staged key.
+    trap 'rm -rf -- "$WORK_DIR"; rm -f -- "${OUT_DIR}/.${LEAF_KEY}.new" \
+        "${OUT_DIR}/.${LEAF_CERT}.new" "${OUT_DIR}/.${CA_CERT}.new"' EXIT
 
     generate "$WORK_DIR"
     install_outputs "$WORK_DIR"

@@ -30,7 +30,7 @@ def _openssl() -> None:
         skip_or_fail("openssl not on PATH")
 
 
-def _make(*args: str, script: Path = SCRIPT) -> subprocess.CompletedProcess[str]:
+def _make(*args: str | bytes, script: Path = SCRIPT) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(script), *args], capture_output=True, text=True, timeout=60, check=False
     )
@@ -210,13 +210,28 @@ def test_a_bad_argument_is_refused_before_anything_is_written(
     assert not out.exists()
 
 
-def test_the_refusal_is_one_printable_line_whatever_the_argument_held(tmp_path: Path) -> None:
-    result = _make("--out", str(tmp_path / "out"), "a\x1b[31m\nb")
+@pytest.mark.parametrize(
+    ("san", "shown"),
+    [
+        ("a\x1b[31m\nb", "a?[31m?b"),
+        # Not UTF-8: a multibyte-locale `tr` used to cut the name at this byte and
+        # certify what was left.
+        (b"a\xffb", "a?b"),
+    ],
+    ids=["control-chars", "invalid-utf8"],
+)
+def test_the_refusal_is_one_printable_line_whatever_the_argument_held(
+    tmp_path: Path, san: str | bytes, shown: str
+) -> None:
+    out = tmp_path / "out"
+
+    result = _make("--out", str(out), san)
 
     assert result.returncode == 1
     assert result.stderr == (
-        "FATAL: SAN 'a?[31m?b' is neither an IP address nor a DNS name (a-z 0-9 . - only)\n"
+        f"FATAL: SAN '{shown}' is neither an IP address nor a DNS name (a-z 0-9 . - only)\n"
     )
+    assert not out.exists()
 
 
 def test_the_key_is_installed_after_both_certificates(tmp_path: Path) -> None:
@@ -247,6 +262,8 @@ def test_the_key_is_installed_after_both_certificates(tmp_path: Path) -> None:
 
     assert failed.returncode != 0
     assert (out / "gateway.key").read_bytes() == before["gateway.key"]
+    # The staged key is a fresh private key: it must not outlive the run.
+    assert sorted(path.name for path in out.iterdir()) == sorted(OUTPUTS)
     for name in ("gateway.crt", "selfsigned-ca.crt"):
         assert (out / name).read_bytes() != before[name], name
 

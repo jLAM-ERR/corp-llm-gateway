@@ -256,11 +256,14 @@ case $authority in
 esac
 langfuse_host=${authority%%:*}
 langfuse_port=
-case $authority in
-    *:*) langfuse_port=${authority#*:} ;;
-esac
 langfuse_rest=${LANGFUSE_PUBLIC_URL#"https://$authority"}
 valid=1
+case $authority in
+    *:*)
+        langfuse_port=${authority#*:}
+        [ -n "$langfuse_port" ] || valid=0
+        ;;
+esac
 # Checked before lowercase(), whose $(...) would drop a trailing newline.
 case $langfuse_host in
     '' | *[!A-Za-z0-9.-]*) valid=0 ;;

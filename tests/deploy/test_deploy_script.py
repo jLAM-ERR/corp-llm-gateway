@@ -30,6 +30,8 @@ HEALTHY_PS = [
     {"Service": "litellm", "State": "running", "Health": "healthy"},
     {"Service": "postgres", "State": "running", "Health": "healthy"},
     {"Service": "vector", "State": "running", "Health": ""},
+    # A `restart: "no"` one-shot that finished: `ps --all` keeps listing it.
+    {"Service": "minio-init", "State": "exited", "Health": "", "ExitCode": 0},
 ]
 UNHEALTHY_PS = [
     {"Service": "litellm", "State": "restarting", "Health": "unhealthy"},
@@ -576,6 +578,81 @@ def test_a_service_without_a_healthcheck_is_healthy_when_running(tmp_path: Path)
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_a_failed_one_shot_fails_at_once_and_names_it(tmp_path: Path) -> None:
+    # Its `service_completed_successfully` dependents would sit `created` until the
+    # timeout.
+    ps = [
+        {"Service": "litellm", "State": "running", "Health": "starting"},
+        {"Service": "minio-init", "State": "exited", "Health": "", "ExitCode": 1},
+    ]
+
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=ps,
+        extra="HEALTH_MAX_WAIT=10\nHEALTH_INTERVAL=1\n",
+    )
+
+    assert result.returncode == 1
+    assert "minio-init exited with code 1" in result.stderr
+    assert f"scripts/deploy/deploy.sh --host {HOST} logs minio-init\n" in result.stderr
+    # One poll plus the status table.
+    assert _log(tmp_path, "ssh.log").count("ps --all") == 2
+
+
+def test_a_one_shot_without_an_exit_code_is_not_mistaken_for_done(tmp_path: Path) -> None:
+    ps = [{"Service": "minio-init", "State": "exited", "Health": ""}]
+
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=ps,
+        extra="HEALTH_MAX_WAIT=1\nHEALTH_INTERVAL=1\n",
+    )
+
+    assert result.returncode == 1
+    assert "within 1s — stuck: minio-init" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        (["--mode", "virtual-keys", "--dir", "/x"], "--dir /x --mode virtual-keys"),
+        (["--issuance", "--dir", "/x/"], "--dir /x --issuance"),
+        (["--mode", "oauth", "--dir", "/opt/corp-llm-gateway"], ""),
+    ],
+    ids=["virtual-keys", "issuance", "defaults"],
+)
+@pytest.mark.parametrize(
+    ("ps", "service"),
+    [
+        ([{"Service": "nginx", "State": "exited", "Health": ""}], "nginx"),
+        ([{"Service": "minio-init", "State": "exited", "Health": "", "ExitCode": 3}], "minio-init"),
+        ([{"Service": "litellm", "State": "running", "Health": "starting"}], ""),
+    ],
+    ids=["front-door", "one-shot", "timeout"],
+)
+def test_the_logs_hint_selects_the_same_stack(
+    flags: list[str], expected: str, ps: list[dict[str, object]], service: str, tmp_path: Path
+) -> None:
+    # A `logs` run with a different file list or directory reads a different stack.
+    argv = " ".join(["--host", HOST, *flags, "status"])
+
+    result = _call(
+        f"parse_args {argv}\nHEALTH_MAX_WAIT=1\nHEALTH_INTERVAL=1\nwait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=ps,  # type: ignore[arg-type]
+    )
+
+    assert result.returncode == 1
+    parts = ("scripts/deploy/deploy.sh --host", HOST, expected, "logs", service)
+    hint = " ".join(part for part in parts if part)
+    assert f"{hint}\n" in result.stderr, result.stderr
 
 
 def test_empty_ps_output_is_not_mistaken_for_healthy(tmp_path: Path) -> None:
@@ -1128,6 +1205,7 @@ def test_the_script_never_sets_a_profile(script_text: str) -> None:
         r"\bCOMPOSE_PROFILES=",
         r"\bexport\s+[^\n]*\bCOMPOSE_PROFILES\b",
         r"\bunset\s+[^\n]*\bCOMPOSE_PROFILES\b",
+        r"\benv\s+-u\s+COMPOSE_PROFILES\b",
     ):
         assert not re.search(pattern, code), pattern
 
@@ -1260,7 +1338,7 @@ def test_up_fails_at_once_on_a_dead_front_door_and_names_it(
     assert result.returncode == 1  # type: ignore[attr-defined]
     stderr = result.stderr  # type: ignore[attr-defined]
     assert f"the nginx front door is down: {service} (state={state}" in stderr
-    assert f"scripts/deploy/deploy.sh --host {HOST} logs {service}\n" in stderr
+    assert f"scripts/deploy/deploy.sh --host {HOST} --dir {remote} logs {service}\n" in stderr
     # One poll plus the status table: an entrypoint refusal never heals by waiting.
     assert _log(tmp_path, "docker.log").count("ps --all") == 2
     assert not (remote / ".deploy.lock").exists()
@@ -1268,11 +1346,14 @@ def test_up_fails_at_once_on_a_dead_front_door_and_names_it(
 
 @pytest.mark.parametrize(
     ("state", "health"),
-    [("running", "healthy"), ("running", "starting"), ("created", "")],
+    [("running", "healthy"), ("running", "starting"), ("created", ""), ("running", "")],
 )
 def test_a_live_front_door_is_polled_like_any_service(
     state: str, health: str, tmp_path: Path
 ) -> None:
+    # nginx declares a healthcheck, so only "healthy" counts. A crash-looping
+    # front door shows `running` with an empty Health for an instant between
+    # restarts; accepting that let one poll end the wait on a broken NGINX_* key.
     ps = [*HEALTHY_PS, {"Service": "nginx", "State": state, "Health": health}]
 
     result = _call(
@@ -1325,15 +1406,12 @@ def test_the_reboot_path_starts_what_the_env_file_selects(
     profiles: str | None, compose_file: str | None, tmp_path: Path
 ) -> None:
     # The unit's bare command, no -f and no --profile: only the .env decides.
-    import os
-
     from tests.compose.nginx_support import (
         CONFIG_EXAMPLE,
-        ENTRYPOINT_KEYS,
-        _interpolated_names,
+        REQUIRED_ENV,
+        bare_compose_env,
         require_compose_cli,
     )
-    from tests.compose.test_oauth_overlay import MODE_A_ONLY_KEYS, REQUIRED_ENV
 
     require_compose_cli()
     project = tmp_path / "compose"
@@ -1345,19 +1423,13 @@ def test_the_reboot_path_starts_what_the_env_file_selects(
     if profiles is not None:
         lines.append(f"COMPOSE_PROFILES={profiles}")
     (project / ".env").write_text("\n".join(lines) + "\n")
-    stripped = _interpolated_names() | set(MODE_A_ONLY_KEYS) | set(ENTRYPOINT_KEYS)
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in stripped and not key.startswith("COMPOSE_")
-    }
 
     result = subprocess.run(
         ["docker", "compose", "config", "--services"],
         cwd=project,
         capture_output=True,
         text=True,
-        env=env,
+        env=bare_compose_env(),
         check=False,
     )
 

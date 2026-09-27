@@ -449,6 +449,8 @@ REFUSALS = [
             (f"https://{LANGFUSE_HOST}:abc", "bad-port", ("host", "port")),
             (f"https://{LANGFUSE_HOST}:123456", "six-digit-port", ("host", "port")),
             (f"https://{LANGFUSE_HOST}:65536", "port-out-of-range", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}:", "empty-port", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}:/", "empty-port-slash", ("host", "port")),
             # All digits and dots is an IPv4 address, not a hostname.
             ("https://999.1.2.3", "ip-bad-octet", ("port",)),
             (f"https://{LANGFUSE_HOST}.", "trailing-dot", ("host", "port")),
