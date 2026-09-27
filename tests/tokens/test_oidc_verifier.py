@@ -905,3 +905,277 @@ async def test_from_settings_verifies_with_the_settings_values() -> None:
     claims = await verifier(_sign(_claims(groups=["/devs/core"])))
     assert claims.team_id == "core"
     await verifier.aclose()
+
+
+# ── claim-shape boundaries ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "azp",
+    [[_CLIENT_ID], {"id": _CLIENT_ID}, 1, None, "", _CLIENT_ID.upper(), f" {_CLIENT_ID}"],
+    ids=["list", "object", "int", "null", "empty", "case", "padded"],
+)
+async def test_azp_must_be_exactly_the_client_id_string(
+    azp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    exc = await _rejects(_verifier(_Jwks()), _sign(_claims(azp=azp)), caplog)
+    assert not isinstance(exc, OidcTeamMappingError)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"sub": ""}, {"jti": ""}, {"sub": 42}, {"jti": 42}, {"sub": ["x"]}, {"jti": None}],
+    ids=["empty-sub", "empty-jti", "int-sub", "int-jti", "list-sub", "null-jti"],
+)
+async def test_sub_and_jti_must_be_non_empty_strings(
+    overrides: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    await _rejects(_verifier(_Jwks()), _sign(_claims(**overrides)), caplog)
+
+
+@pytest.mark.parametrize(
+    "aud",
+    [[_AUDIENCE, 7], [_AUDIENCE, None], [], [_AUDIENCE.upper()], f"{_AUDIENCE} "],
+    ids=["with-int", "with-null", "empty-list", "case", "padded"],
+)
+async def test_an_audience_that_is_not_exactly_ours_is_rejected(
+    aud: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    await _rejects(_verifier(_Jwks()), _sign(_claims(aud=aud)), caplog)
+
+
+async def test_an_unrelated_extra_audience_does_not_trip_the_operator_check() -> None:
+    token = _sign(_claims(aud=["account", _AUDIENCE, "broker", "realm-management"]))
+    assert (await _verifier(_Jwks())(token)).team_id == "payments"
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [[_GROUP, 1], [_GROUP, None], [_GROUP, [_GROUP]], [None, _GROUP]],
+    ids=["int", "null", "nested", "null-first"],
+)
+async def test_a_mapped_group_does_not_excuse_a_non_string_sibling(
+    groups: list[Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    exc = await _rejects(_verifier(_Jwks()), _sign(_claims(groups=groups)), caplog)
+    assert not isinstance(exc, OidcTeamMappingError)
+
+
+def _verifier_with_map(team_map: tuple[tuple[str, str], ...]) -> KeycloakOidcVerifier:
+    return KeycloakOidcVerifier(
+        issuer=_ISSUER,
+        audience=_AUDIENCE,
+        client_id=_CLIENT_ID,
+        team_map=team_map,
+        operator_audience=_OPERATOR_AUDIENCE,
+        jwks=JwksClient(_JWKS_URL, http=_Jwks().client(), clock=_Clock()),
+    )
+
+
+async def test_overlapping_groups_resolve_by_map_order_not_claim_order() -> None:
+    verifier = _verifier_with_map(
+        (("/devs/core", "core"), ("/devs/payments", "payments"), ("/devs", "devs"))
+    )
+    for groups in (
+        ["/devs", "/devs/payments", "/devs/core"],
+        ["/devs/core", "/devs"],
+        ["/devs/payments", "/devs/core", "/devs/payments"],
+    ):
+        assert (await verifier(_sign(_claims(groups=groups)))).team_id == "core"
+    assert (await verifier(_sign(_claims(groups=["/devs", "/devs/payments"])))).team_id == (
+        "payments"
+    )
+
+
+async def test_group_matching_is_exact() -> None:
+    verifier = _verifier(_Jwks())
+    for near_miss in ("/devs/payments/", "/DEVS/PAYMENTS", "devs/payments", " /devs/payments"):
+        with pytest.raises(OidcTeamMappingError):
+            await verifier(_sign(_claims(groups=[near_miss])))
+
+
+async def test_unicode_identity_and_groups_pass_through_verbatim() -> None:
+    subject = "f3a1-пользователь-用户-🔑"
+    username = "алиса.тест"
+    group = "/разработка/платежи"
+    verifier = _verifier_with_map(((group, "платежи"),))
+
+    claims = await verifier(
+        _sign(_claims(sub=subject, preferred_username=username, groups=[group], jti="jti-ü"))
+    )
+
+    assert (claims.subject, claims.user_id, claims.team_id, claims.jti) == (
+        subject,
+        username,
+        "платежи",
+        "jti-ü",
+    )
+
+
+@pytest.mark.parametrize(
+    "iss",
+    [_ISSUER + "//", _ISSUER.upper(), _ISSUER + "/protocol", _ISSUER.replace("https", "http")],
+    ids=["double-slash", "case", "suffix", "scheme"],
+)
+async def test_only_a_single_trailing_slash_is_tolerated_on_the_token_issuer(
+    iss: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    exc = await _rejects(_verifier(_Jwks()), _sign(_claims(iss=iss)), caplog)
+    assert str(exc) == "E_OIDC_ISSUER"
+
+
+async def test_an_expiry_just_beyond_the_leeway_is_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = int(time.time())
+    token = _sign(_claims(iat=now - 900, exp=now - oidc_verifier.LEEWAY_S - 5))
+    exc = await _rejects(_verifier(_Jwks()), token, caplog)
+    assert str(exc) == "E_OIDC_EXPIRED"
+
+
+async def test_an_expiry_just_inside_the_leeway_is_accepted() -> None:
+    now = int(time.time())
+    token = _sign(_claims(iat=now - 900, exp=now - oidc_verifier.LEEWAY_S + 5))
+    assert (await _verifier(_Jwks())(token)).subject == _SUB
+
+
+# ── JWKS document edge cases ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("malformed_first", [True, False], ids=["before", "after"])
+async def test_a_malformed_duplicate_kid_does_not_evict_the_valid_key(
+    malformed_first: bool,
+) -> None:
+    broken = {"kty": "RSA", "kid": "kid-a", "use": "sig", "alg": "RS256", "n": "!!", "e": "AQAB"}
+    valid = _jwk(_KEY_A, "kid-a")
+    jwks = _Jwks([broken, valid] if malformed_first else [valid, broken])
+
+    assert (await _verifier(jwks)(_sign())).subject == _SUB
+
+
+@pytest.mark.parametrize(
+    "noise",
+    [
+        {"kty": "RSA", "kid": 7, "n": "AQAB", "e": "AQAB"},
+        {"kty": "RSA", "kid": "", "n": "AQAB", "e": "AQAB"},
+        {"kty": "RSA", "kid": "kid-x", "use": "sig", "alg": "RS256"},
+        {"kty": "EC", "kid": "kid-ec", "crv": "P-256", "x": "AA", "y": "AA"},
+        None,
+        [],
+    ],
+    ids=["int-kid", "empty-kid", "no-modulus", "ec", "null", "list"],
+)
+async def test_garbage_entries_beside_a_valid_key_are_skipped(noise: Any) -> None:
+    jwks = _Jwks([noise, _jwk(_KEY_A, "kid-a"), noise])
+
+    assert (await _verifier(jwks)(_sign())).subject == _SUB
+
+
+async def test_a_jwks_whose_every_entry_is_garbage_is_unavailable_not_unknown_kid(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    jwks = _Jwks([{"kty": "RSA", "kid": "kid-a", "n": "!!", "e": "AQAB"}, {"kty": "oct"}])
+    await _rejects(_verifier(jwks), _sign(), caplog, JwksUnavailableError)
+
+
+async def test_an_unknown_kid_of_any_shape_is_rejected_without_a_crash(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    verifier = _verifier(_Jwks())
+    for kid in ("ключ-🔑", "k" * 4000, "../../etc/passwd", "kid-a\x00"):
+        exc = await _rejects(verifier, _sign(kid=kid), caplog)
+        assert str(exc) == "E_OIDC_UNKNOWN_KID"
+
+
+# ── JWKS refresh timing boundaries ───────────────────────────────────────────
+
+
+async def test_the_unknown_kid_cooldown_ends_exactly_at_its_length() -> None:
+    jwks = _Jwks()
+    clock = _Clock()
+    verifier = _verifier(jwks, clock=clock)
+    await verifier(_sign())
+    jwks.keys = [_jwk(_KEY_A, "kid-a"), _jwk(_KEY_B, "kid-b")]
+
+    clock.now += oidc_verifier.UNKNOWN_KID_COOLDOWN_S - 0.001
+    with pytest.raises(OidcVerificationError):
+        await verifier(_sign(key=_KEY_B, kid="kid-b"))
+    assert jwks.calls == 1
+
+    clock.now += 0.001
+    assert (await verifier(_sign(key=_KEY_B, kid="kid-b"))).subject == _SUB
+    assert jwks.calls == 2
+
+
+async def test_the_cooldown_restarts_from_the_latest_successful_refresh() -> None:
+    jwks = _Jwks()
+    clock = _Clock()
+    verifier = _verifier(jwks, clock=clock)
+    await verifier(_sign())
+    clock.now += 61
+    with pytest.raises(OidcVerificationError):
+        await verifier(_sign(key=_KEY_B, kid="kid-b"))
+    assert jwks.calls == 2
+
+    clock.now += 59
+    jwks.keys = [_jwk(_KEY_B, "kid-b")]
+    with pytest.raises(OidcVerificationError):
+        await verifier(_sign(key=_KEY_B, kid="kid-b"))
+    assert jwks.calls == 2
+
+
+async def test_a_waiter_joining_an_inflight_fetch_is_not_refused_by_the_cooldown() -> None:
+    jwks = _Jwks()
+    clock = _Clock()
+    verifier = _verifier(jwks, clock=clock)
+    await verifier(_sign())
+    clock.now += 61
+    jwks.keys = [_jwk(_KEY_A, "kid-a"), _jwk(_KEY_B, "kid-b")]
+    jwks.delay = 0.05
+
+    first = asyncio.create_task(verifier(_sign(_claims(jti="j1"), key=_KEY_B, kid="kid-b")))
+    await asyncio.sleep(0.01)
+    # The cooldown window "restarts" only when the fetch lands; a second unknown
+    # kid arriving mid-fetch shares it instead of being turned away.
+    second = await verifier(_sign(_claims(jti="j2"), key=_KEY_B, kid="kid-b"))
+
+    assert (await first).jti == "j1"
+    assert second.jti == "j2"
+    assert jwks.calls == 2
+
+
+async def test_a_sole_cancelled_waiter_still_lets_the_keys_land() -> None:
+    jwks = _Jwks()
+    jwks.delay = 0.05
+    verifier = _verifier(jwks)
+
+    waiter = asyncio.create_task(verifier(_sign()))
+    await asyncio.sleep(0.01)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.sleep(0.1)
+
+    assert (await verifier(_sign(_claims(jti="j2")))).jti == "j2"
+    assert jwks.calls == 1
+
+
+async def test_a_cancelled_waiter_on_a_hung_fetch_leaves_the_client_usable_after_backoff() -> None:
+    jwks = _Jwks()
+    clock = _Clock()
+    jwks.delay = 5.0
+    verifier = _verifier(jwks, clock=clock, timeout_s=0.05)
+
+    waiter = asyncio.create_task(verifier(_sign()))
+    await asyncio.sleep(0.01)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.sleep(0.1)
+
+    jwks.delay = 0.0
+    with pytest.raises(JwksUnavailableError):
+        await verifier(_sign())
+    clock.now += oidc_verifier.FAILURE_BACKOFF_S
+    assert (await verifier(_sign())).subject == _SUB
+    assert jwks.calls == 2

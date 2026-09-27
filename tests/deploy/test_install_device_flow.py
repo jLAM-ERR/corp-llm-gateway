@@ -75,6 +75,7 @@ class StubState:
     expires_in: int = 120
     device_status: int = 200
     device_omit: tuple[str, ...] = ()
+    device_extra: dict[str, Any] = field(default_factory=dict)
     # Per poll: "ok", "drop" (close without a reply), "502" (HTML 502),
     # "html" (HTML 200), anything else is an RFC 8628 error code (JSON 400).
     token_script: list[str] = field(default_factory=lambda: ["ok"])
@@ -110,7 +111,7 @@ def _make_handler(state: StubState) -> type[BaseHTTPRequestHandler]:
             with state.lock:
                 state.requests.append(
                     Recorded(
-                        method="POST",
+                        method=self.command,
                         path=self.path,
                         headers={k.lower(): v for k, v in self.headers.items()},
                         body=body,
@@ -137,6 +138,7 @@ def _make_handler(state: StubState) -> type[BaseHTTPRequestHandler]:
                     payload["interval"] = state.interval
                 for key in state.device_omit:
                     payload.pop(key, None)
+                payload.update(state.device_extra)
                 self._reply(200, payload)
             elif self.path == TOKEN_PATH:
                 step = state.token_script[min(token_round, len(state.token_script) - 1)]
@@ -176,6 +178,9 @@ def _make_handler(state: StubState) -> type[BaseHTTPRequestHandler]:
                 self._reply(200, {"content": [{"type": "text", "text": "ok"}]})
             else:
                 self._reply(404, {"error": "not found", "detail": CANARY})
+
+        def do_PUT(self) -> None:
+            self.do_POST()
 
     return Handler
 
@@ -645,3 +650,142 @@ def test_without_an_issuer_no_login_runs_and_no_token_is_invented(
 
 def test_the_old_device_url_variable_is_gone() -> None:
     assert "KEYCLOAK_DEVICE_URL" not in SCRIPT.read_text()
+
+
+def _sleep_shim(tmp_path: Path, *, real_seconds: float = 0.0) -> Path:
+    """Replace `sleep` for install.sh: record each requested interval, sleep
+    ``real_seconds`` instead. Returns the log of requested intervals."""
+    real_sleep = shutil.which("sleep")
+    assert real_sleep is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "sleep.log"
+    shim = bin_dir / "sleep"
+    shim.write_text(
+        f'#!/bin/sh\nprintf \'%s\\n\' "$1" >> "{log}"\nexec "{real_sleep}" {real_seconds}\n'
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+    return log
+
+
+def _sleeps(log: Path) -> list[str]:
+    return log.read_text().split() if log.exists() else []
+
+
+def test_device_response_text_is_printed_never_evaluated(tmp_path: Path, stub: StubState) -> None:
+    marker = tmp_path / "evaluated"
+    hostile = f"$(touch {marker})`touch {marker}`;touch {marker}'\"%s%n\\x41"
+    uri = f"https://kc.example.test/device?user_code={hostile}"
+    code = f"WX%sYZ$(touch {marker})"
+    stub.device_extra = {"verification_uri_complete": uri, "user_code": code}
+    _sleep_shim(tmp_path)
+
+    run = _run(tmp_path, stub)
+
+    assert run.proc.returncode == 0, run.output
+    assert not marker.exists()
+    assert uri in run.proc.stdout
+    assert code in run.proc.stdout
+    assert run.token_file.read_text().strip() == stub.corp_token
+
+
+@pytest.mark.parametrize(
+    ("interval", "slept"),
+    [("3", "3"), ("abc", "5"), (0, "5"), (-3, "5"), (1.5, "5"), ("", "5"), ([2], "5")],
+    ids=["numeric-string", "word", "zero", "negative", "fraction", "empty", "list"],
+)
+def test_the_device_interval_is_used_only_when_it_is_a_positive_integer(
+    tmp_path: Path, stub: StubState, interval: Any, slept: str
+) -> None:
+    stub.device_extra = {"interval": interval}
+    log = _sleep_shim(tmp_path)
+
+    run = _run(tmp_path, stub)
+
+    assert run.proc.returncode == 0, run.output
+    assert _sleeps(log) == [slept]
+
+
+def test_repeated_slow_down_adds_five_seconds_each_time(tmp_path: Path, stub: StubState) -> None:
+    stub.token_script = ["slow_down", "authorization_pending", "slow_down", "slow_down", "ok"]
+    log = _sleep_shim(tmp_path)
+
+    run = _run(tmp_path, stub)
+
+    assert run.proc.returncode == 0, run.output
+    assert _sleeps(log) == ["1", "6", "6", "11", "16"]
+    assert run.token_file.read_text().strip() == stub.corp_token
+    _assert_no_secrets_leaked(run, stub)
+
+
+def test_slow_down_forever_still_ends_at_the_device_code_deadline(
+    tmp_path: Path, stub: StubState
+) -> None:
+    stub.expires_in = 2
+    stub.token_script = ["slow_down"]
+    log = _sleep_shim(tmp_path, real_seconds=0.7)
+
+    run = _run(tmp_path, stub)
+
+    assert "expired" in run.proc.stderr
+    _assert_aborted_without_a_token(run, stub)
+    polls = len(stub.of(TOKEN_PATH))
+    assert 1 <= polls <= 5
+    assert _sleeps(log) == [str(1 + 5 * i) for i in range(polls)]
+
+
+def test_a_device_code_carrying_curl_config_lines_injects_nothing(
+    tmp_path: Path, stub: StubState
+) -> None:
+    secret = tmp_path / "id_rsa"
+    secret.write_text("PRIVATE-KEY-CANARY-51d0\n")
+    stub.device_code = (
+        f"dc-x\nupload-file = {secret}\nurl = {stub.base_url}/exfil\n"
+        f'header = "X-Injected: yes"\noutput = {tmp_path / "written"}'
+    )
+    _sleep_shim(tmp_path)
+
+    run = _run(tmp_path, stub)
+
+    assert run.proc.returncode != 0
+    assert [r.path for r in stub.requests if not r.path.startswith(REALM_PATH)] == []
+    assert all("x-injected" not in r.headers for r in stub.requests)
+    assert all(b"PRIVATE-KEY-CANARY" not in r.body for r in stub.requests)
+    assert not (tmp_path / "written").exists()
+    assert not run.token_file.exists()
+
+
+def test_a_home_with_spaces_installs_and_the_rc_file_loads_the_token(
+    tmp_path: Path, stub: StubState
+) -> None:
+    home = tmp_path / "my home" / "dev user"
+    home.mkdir(parents=True)
+
+    run = _run(tmp_path, stub, extra_env={"HOME": str(home)})
+
+    assert run.proc.returncode == 0, run.output
+    token_file = home / ".corp-llm-gateway" / "token"
+    assert token_file.read_text().strip() == stub.corp_token
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    loaded = subprocess.run(
+        ["bash", "-c", 'source "$HOME/.bashrc"; printf %s "$ANTHROPIC_CUSTOM_HEADERS"'],
+        env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert loaded.returncode == 0, loaded.stderr
+    assert loaded.stdout == f"X-Corp-Auth: {stub.corp_token}"
+
+
+def test_a_preexisting_install_dir_is_made_private(tmp_path: Path, stub: StubState) -> None:
+    install_dir = tmp_path / "home" / ".corp-llm-gateway"
+    install_dir.mkdir(parents=True)
+    install_dir.chmod(0o755)
+
+    run = _run(tmp_path, stub)
+
+    assert run.proc.returncode == 0, run.output
+    assert stat.S_IMODE(install_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(run.token_file.stat().st_mode) == 0o600

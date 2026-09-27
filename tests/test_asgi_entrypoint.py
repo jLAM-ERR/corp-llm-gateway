@@ -491,6 +491,70 @@ def test_a_migrated_token_table_boots(
     assert result["proxy_imported"] is True
 
 
+_TOKEN_BASE_TABLE = """
+CREATE TABLE corp_tokens_base (
+    corp_token   TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    team_id      TEXT NOT NULL,
+    scopes       TEXT[] NOT NULL DEFAULT '{}',
+    issued_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    revoked_at   TIMESTAMPTZ,
+    oidc_issuer  TEXT,
+    oidc_subject TEXT,
+    oidc_jti     TEXT
+)
+"""
+
+
+def test_a_token_view_without_the_jti_index_exits_78(
+    valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
+) -> None:
+    dsn, in_schema = pg_schema
+    in_schema(_TOKEN_BASE_TABLE)
+    in_schema("CREATE VIEW corp_tokens AS SELECT * FROM corp_tokens_base")
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=dsn))
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+
+
+def test_a_jti_unique_index_under_another_name_exits_78(
+    valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
+) -> None:
+    # The store maps a unique violation to E_ISSUE_REPLAY by the index name.
+    dsn, in_schema = pg_schema
+    schema = (ROOT / "src/corp_llm_gateway/tokens/schema.sql").read_text()
+    in_schema(schema.replace("corp_tokens_oidc_jti_key", "corp_tokens_jti_uniq"))
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=dsn))
+
+    assert result["exit_code"] == 78
+    assert "tokens/schema.sql" in result["stdout"]
+
+
+def test_a_postgres_that_refuses_the_password_boots_and_never_prints_it(
+    valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
+) -> None:
+    from urllib.parse import urlsplit, urlunsplit
+
+    _require_issuance_extras()
+    dsn, _ = pg_schema
+    parts = urlsplit(dsn)
+    netloc = f"{parts.username}:wrong-pass-4c2d9e@{parts.hostname}:{parts.port or 5432}"
+    bad_dsn = urlunsplit(parts._replace(netloc=netloc))
+
+    result = _run(
+        _REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=bad_dsn)
+    )
+
+    assert result["exit_code"] is None
+    assert result["proxy_imported"] is True
+    assert "issuance schema check skipped" in result["stdout"]
+    assert "wrong-pass-4c2d9e" not in result["stdout"]
+
+
 # ── steps 3-5: what a successful import leaves behind ────────────────────────
 
 _IMPORT_SCRIPT = f"""

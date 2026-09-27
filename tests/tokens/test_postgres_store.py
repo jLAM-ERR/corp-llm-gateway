@@ -9,6 +9,7 @@ Demo credentials: gateway/gateway/gateway (from docker-compose.demo.yml).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import secrets
 from collections.abc import AsyncIterator
@@ -324,4 +325,104 @@ async def test_init_schema_adds_oidc_columns_to_preexisting_table() -> None:
         async with pool.acquire() as conn:
             await conn.execute("DROP TABLE IF EXISTS corp_tokens CASCADE")
         await store.init_schema()
+        await store.close()
+
+
+async def _issue_many(
+    store: object, subject: str, count: int, *, prefix: str
+) -> tuple[list[str], list[BaseException]]:
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    assert isinstance(store, PostgresTokenStore)
+    tokens = [_tok(f"{prefix}-{i}") for i in range(count)]
+    now = datetime.now(UTC)
+    results = await asyncio.gather(
+        *(
+            store.issue_for_subject(
+                dataclasses.replace(_info(tok), issued_at=now),
+                issuer=_ISS,
+                subject=subject,
+                jti=f"jti-{prefix}-{secrets.token_hex(6)}",
+                max_active=2,
+                min_interval=timedelta(0),
+            )
+            for tok in tokens
+        ),
+        return_exceptions=True,
+    )
+    return tokens, [r for r in results if isinstance(r, BaseException)]
+
+
+@pytest.mark.asyncio
+async def test_pg_colliding_subject_locks_serialise_but_never_mix_rows(
+    pg_store: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every subject hashes to one lock key here: a real hashtext collision."""
+    from corp_llm_gateway.tokens import postgres_store
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    assert isinstance(pg_store, PostgresTokenStore)
+    monkeypatch.setattr(
+        postgres_store, "_SUBJECT_LOCK_SQL", "SELECT pg_advisory_xact_lock(hashtext($1) * 0 + 4242)"
+    )
+    monkeypatch.setattr(postgres_store, "_ISSUE_LOCK_TIMEOUT", "50ms")
+    alice = f"sub-coll-a-{secrets.token_hex(4)}"
+    bob = f"sub-coll-b-{secrets.token_hex(4)}"
+
+    pool = await pg_store._get_pool()
+    async with pool.acquire() as holder, holder.transaction():
+        await holder.execute("SELECT pg_advisory_xact_lock(4242)")
+        with pytest.raises(IssuancePolicyError) as exc_info:
+            await _issue_for(pg_store, _tok(), subject=bob, jti=f"jti-{secrets.token_hex(4)}")
+    assert exc_info.value.code == IssuancePolicyError.BUSY
+
+    monkeypatch.setattr(postgres_store, "_ISSUE_LOCK_TIMEOUT", "5s")
+    (a_tokens, a_errors), (b_tokens, b_errors) = await asyncio.gather(
+        _issue_many(pg_store, alice, 5, prefix="pg-coll-a"),
+        _issue_many(pg_store, bob, 5, prefix="pg-coll-b"),
+    )
+
+    assert a_errors == [] and b_errors == []
+    for tokens in (a_tokens, b_tokens):
+        rows = [await pg_store.lookup(t) for t in tokens]
+        assert all(row is not None for row in rows)
+        assert sum(row.revoked_at is None for row in rows if row is not None) == 2
+
+
+@pytest.mark.asyncio
+async def test_pg_issuance_waits_for_a_pool_connection_instead_of_failing() -> None:
+    require_asyncpg()
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    store = PostgresTokenStore(_dsn(), pool_max_size=2)
+    try:
+        await store.init_schema()
+    except Exception as exc:
+        await store.close()
+        skip_or_fail(f"Postgres unreachable: {exc}")
+    tokens = [_tok("pg-pool") for _ in range(12)]
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    store.issue_for_subject(
+                        _info(tok),
+                        issuer=_ISS,
+                        subject=f"sub-pool-{secrets.token_hex(6)}",
+                        jti=f"jti-pool-{secrets.token_hex(6)}",
+                        max_active=2,
+                        min_interval=timedelta(minutes=10),
+                    )
+                    for tok in tokens
+                ),
+                return_exceptions=True,
+            ),
+            timeout=30,
+        )
+        assert [r for r in results if isinstance(r, BaseException)] == []
+        assert all([await store.lookup(tok) is not None for tok in tokens])
+    finally:
+        pool = await store._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM corp_tokens WHERE user_id LIKE 'pg-test-%'")
         await store.close()

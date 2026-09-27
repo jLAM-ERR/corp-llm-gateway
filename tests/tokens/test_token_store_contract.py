@@ -496,6 +496,166 @@ async def test_parallel_issuance_without_interval_never_exceeds_the_cap(store: T
     assert sum(info.revoked_at is None for info in rows) == _MAX_ACTIVE
 
 
+@pytest.mark.asyncio
+async def test_a_subject_at_cap_with_only_expired_and_revoked_rows_revokes_nothing(
+    store: TokenStore,
+) -> None:
+    expired = await _issue(store, "ct-dead-exp", now=_T0, jti="jti-a", ttl=timedelta(minutes=5))
+    gone = await _issue(store, "ct-dead-rev", now=_T0 + timedelta(minutes=11), jti="jti-b")
+    revoked_at = _T0 + timedelta(minutes=12)
+    await _upsert(store, dataclasses.replace(gone, revoked_at=revoked_at))
+
+    await _issue(store, "ct-dead-c", now=_T0 + timedelta(minutes=22), jti="jti-c")
+    await _issue(store, "ct-dead-d", now=_T0 + timedelta(minutes=33), jti="jti-d")
+
+    assert not await _revoked(store, expired.corp_token)
+    kept = await store.lookup(gone.corp_token)
+    assert kept is not None and kept.revoked_at == revoked_at
+    assert not await _revoked(store, "ct-dead-c")
+    assert not await _revoked(store, "ct-dead-d")
+
+    await _issue(store, "ct-dead-e", now=_T0 + timedelta(minutes=44), jti="jti-e")
+    assert await _revoked(store, "ct-dead-c")
+    assert not await _revoked(store, expired.corp_token)
+    kept = await store.lookup(gone.corp_token)
+    assert kept is not None and kept.revoked_at == revoked_at
+
+
+@pytest.mark.asyncio
+async def test_a_token_expiring_exactly_now_is_not_active(store: TokenStore) -> None:
+    await _issue(store, "ct-edge-a", now=_T0, jti="jti-a", ttl=_INTERVAL, max_active=1)
+
+    await _issue(store, "ct-edge-b", now=_T0 + _INTERVAL, jti="jti-b", max_active=1)
+
+    # expires_at == now is not active, so it is not "rotated out" either.
+    assert not await _revoked(store, "ct-edge-a")
+    assert not await _revoked(store, "ct-edge-b")
+
+
+@pytest.mark.asyncio
+async def test_a_clock_step_back_never_bypasses_the_interval(store: TokenStore) -> None:
+    await _issue(store, "ct-skew-a", now=_T0, jti="jti-a")
+
+    with pytest.raises(IssuancePolicyError) as exc_info:
+        await _issue(store, "ct-skew-b", now=_T0 - timedelta(hours=1), jti="jti-b")
+
+    assert exc_info.value.code == "E_ISSUE_RATE"
+    assert await store.lookup("ct-skew-b") is None
+
+
+@pytest.mark.asyncio
+async def test_a_refused_issuance_consumes_neither_the_jti_nor_the_interval(
+    store: TokenStore,
+) -> None:
+    await _issue(store, "ct-keep-a", now=_T0, jti="jti-a")
+    with pytest.raises(IssuancePolicyError):
+        await _issue(store, "ct-keep-b", now=_T0 + timedelta(minutes=1), jti="jti-b")
+
+    # jti-b was refused on RATE, so it is still unused once the interval passes.
+    await _issue(store, "ct-keep-c", now=_T0 + _INTERVAL, jti="jti-b")
+    assert not await _revoked(store, "ct-keep-c")
+
+
+@pytest.mark.asyncio
+async def test_jti_is_single_use_across_issuers(store: TokenStore) -> None:
+    await _issue(store, "ct-xiss-a", now=_T0, jti="jti-shared")
+
+    with pytest.raises(IssuancePolicyError) as exc_info:
+        await store.issue_for_subject(
+            _oidc_info("ct-xiss-b", _T0),
+            issuer="https://kc.other.test/realms/ops",
+            subject="sub-alice",
+            jti="jti-shared",
+            max_active=_MAX_ACTIVE,
+            min_interval=_INTERVAL,
+        )
+
+    assert exc_info.value.code == "E_ISSUE_REPLAY"
+    assert await store.lookup("ct-xiss-b") is None
+
+
+@pytest.mark.asyncio
+async def test_the_same_subject_under_two_issuers_is_two_identities(store: TokenStore) -> None:
+    other = "https://kc.other.test/realms/dev"
+    await _issue(store, "ct-2iss-a", now=_T0, jti="jti-a", max_active=1)
+    await store.issue_for_subject(
+        _oidc_info("ct-2iss-b", _T0),
+        issuer=other,
+        subject="sub-alice",
+        jti="jti-b",
+        max_active=1,
+        min_interval=_INTERVAL,
+    )
+
+    assert not await _revoked(store, "ct-2iss-a")
+    assert not await _revoked(store, "ct-2iss-b")
+
+
+@pytest.mark.asyncio
+async def test_identities_that_join_to_the_same_lock_key_never_share_rows(
+    store: TokenStore,
+) -> None:
+    # issuer + separator + subject is the same string for both, so on Postgres
+    # they take the same advisory lock; their rows must still stay apart.
+    first = ("https://kc.corp.test", "realm\x1fsub")
+    second = ("https://kc.corp.test\x1frealm", "sub")
+    for i, (issuer, subject) in enumerate((first, second)):
+        await store.issue_for_subject(
+            _oidc_info(f"ct-join-{i}", _T0),
+            issuer=issuer,
+            subject=subject,
+            jti=f"jti-join-{i}",
+            max_active=1,
+            min_interval=_INTERVAL,
+        )
+
+    assert not await _revoked(store, "ct-join-0")
+    assert not await _revoked(store, "ct-join-1")
+
+
+@pytest.mark.asyncio
+async def test_unicode_and_long_subjects_are_keyed_exactly(store: TokenStore) -> None:
+    subject = "пользователь-用户-🔑-" + "ж" * 500
+    near = subject[:-1] + "з"
+    await _issue(store, "ct-uni-a", now=_T0, jti="jti-uni-a", subject=subject, max_active=1)
+    await _issue(store, "ct-uni-near", now=_T0, jti="jti-uni-near", subject=near, max_active=1)
+
+    with pytest.raises(IssuancePolicyError) as exc_info:
+        await _issue(
+            store,
+            "ct-uni-b",
+            now=_T0 + timedelta(minutes=1),
+            jti="jti-uni-b",
+            subject=subject,
+            max_active=1,
+        )
+    assert exc_info.value.code == "E_ISSUE_RATE"
+
+    await _issue(
+        store, "ct-uni-c", now=_T0 + _INTERVAL, jti="jti-uni-c", subject=subject, max_active=1
+    )
+    assert await _revoked(store, "ct-uni-a")
+    assert not await _revoked(store, "ct-uni-near")
+    assert not await _revoked(store, "ct-uni-c")
+
+
+@pytest.mark.asyncio
+async def test_parallel_issuance_for_many_subjects_is_not_serialised_into_refusals(
+    store: TokenStore,
+) -> None:
+    tokens = [f"ct-many-{i}" for i in range(_RACE_WIDTH)]
+    results = await asyncio.gather(
+        *(
+            _issue(store, t, now=_T0, jti=f"jti-many-{i}", subject=f"sub-many-{i}")
+            for i, t in enumerate(tokens)
+        ),
+        return_exceptions=True,
+    )
+
+    assert [r for r in results if isinstance(r, BaseException)] == []
+    assert len(await _stored(store, tokens)) == _RACE_WIDTH
+
+
 # CI wiring -------------------------------------------------------------------
 
 _CI_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"

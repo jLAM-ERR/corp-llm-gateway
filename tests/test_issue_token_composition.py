@@ -279,3 +279,81 @@ def test_the_shared_stores_are_built_once_and_lazily(shared: None) -> None:
     assert bootstrap.get_team_config_store() is teams
     assert isinstance(tokens, InMemoryTokenStore)
     assert isinstance(teams, InMemoryTeamConfigStore)
+
+
+async def test_an_unknown_team_refusal_does_not_burn_the_jti(
+    shared: None, jwks_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_issuance(monkeypatch, tmp_path, jwks_url)
+    tokens, teams = await _seed_stores()
+    router = bootstrap.build_health_router()
+    bearer = _token(jwks_url, groups=["/devs/payments"])
+
+    refused = await _issue(router, bearer)
+    await teams.upsert(TeamConfig(team_id="payments", name="payments"))
+    accepted = await _issue(router, bearer)
+
+    assert refused.status_code == 403
+    assert accepted.status_code == 200, accepted.text
+    assert len(await tokens.list_tokens()) == 1
+
+
+class _FlakyTeams(InMemoryTeamConfigStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.down = True
+
+    async def get(self, team_id: str) -> TeamConfig:
+        if self.down:
+            raise ConnectionError(f"team store unreachable while looking up {team_id}")
+        return await super().get(team_id)
+
+
+async def test_a_team_store_outage_is_a_500_that_stores_nothing_and_burns_nothing(
+    shared: None,
+    jwks_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _enable_issuance(monkeypatch, tmp_path, jwks_url)
+    tokens = InMemoryTokenStore()
+    teams = _FlakyTeams()
+    await teams.upsert(TeamConfig(team_id="payments", name="payments"))
+    bootstrap._token_store = tokens
+    bootstrap._team_config_store = teams
+    router = bootstrap.build_health_router()
+    bearer = _token(jwks_url, groups=["/devs/payments"])
+
+    with caplog.at_level("DEBUG"):
+        outage = await _issue(router, bearer)
+    teams.down = False
+    recovered = await _issue(router, bearer)
+
+    assert (outage.status_code, outage.json()) == (500, {"error": "E_ISSUE_INTERNAL"})
+    assert "payments" not in outage.text
+    assert "team store unreachable" not in caplog.text
+    assert bearer not in caplog.text
+    assert recovered.status_code == 200, recovered.text
+    assert len(await tokens.list_tokens()) == 1
+
+
+async def test_the_config_file_map_order_decides_between_overlapping_groups(
+    shared: None, jwks_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_issuance(monkeypatch, tmp_path, jwks_url)
+    cfg = tmp_path / "issuance.toml"
+    cfg.write_text(
+        '[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]\n"/devs/zeta" = "zeta"\n"/devs/alpha" = "alpha"\n'
+    )
+    config.reset_cache()
+    tokens, _ = await _seed_stores("zeta", "alpha")
+
+    resp = await _issue(
+        bootstrap.build_health_router(),
+        _token(jwks_url, groups=["/devs/alpha", "/devs/zeta"]),
+    )
+
+    assert resp.status_code == 200, resp.text
+    (info,) = await tokens.list_tokens()
+    assert info.team_id == "zeta"

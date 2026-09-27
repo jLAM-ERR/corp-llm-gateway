@@ -931,3 +931,47 @@ def test_validate_ignores_issuance_keys_when_issuer_unset(
     monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
     monkeypatch.setenv("CORP_GATEWAY_ISSUE_MAX_ACTIVE", "0")
     assert isinstance(config.validate(), Settings)
+
+
+@pytest.mark.parametrize("operator", [" corp-gateway-issuance", "corp-gateway-issuance  "])
+def test_issuance_refuses_an_operator_audience_that_differs_only_by_whitespace(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, operator: str
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_OIDC_AUDIENCE", operator)
+    with pytest.raises(ConfigError, match="must differ"):
+        settings.issuance()
+
+
+async def test_issuance_bounds_of_one_resolve_and_are_usable(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from corp_llm_gateway.tokens import InMemoryTokenStore, IssuancePolicy, OidcClaims
+
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    for key in (
+        "CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS",
+        "CORP_GATEWAY_ISSUE_MAX_ACTIVE",
+        "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS",
+        "CORP_GATEWAY_ISSUE_MAX_INFLIGHT",
+        "CORP_GATEWAY_ISSUE_RATE_PER_MINUTE",
+    ):
+        monkeypatch.setenv(key, " 1 ")
+    resolved = settings.issuance()
+    assert resolved is not None
+    t0 = datetime(2026, 9, 1, tzinfo=UTC)
+    clock = [t0]
+    store = InMemoryTokenStore()
+    policy = IssuancePolicy(store, resolved, clock=lambda: clock[0])
+
+    first = await policy.issue(OidcClaims("u", "t1", issuer="i", subject="s", jti="j1"))
+    clock[0] = t0 + timedelta(seconds=1)
+    second = await policy.issue(OidcClaims("u", "t1", issuer="i", subject="s", jti="j2"))
+
+    assert second.expires_at == t0 + timedelta(days=1, seconds=1)
+    old = await store.lookup(first.corp_token)
+    assert old is not None and old.revoked_at is not None
