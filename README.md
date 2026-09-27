@@ -124,7 +124,7 @@ examples/compose/       lightweight local sanitizing proxy (one container, oracl
 docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
 scripts/deploy/         server bootstrap (bootstrap-server.sh + systemd unit) + deploy.sh (push/upgrade a host)
-tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipped on 3.12 + litellm; 3.14 = graceful NER)
+tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipped on 3.14 + every extra + litellm; no extras = graceful NER)
 ```
 
 ## Developer quickstart (laptop)
@@ -425,13 +425,13 @@ Full per-surface guide (sinks, providers, the extensions registry, safety rules,
 
 ## Development
 
-Requires Python 3.12+.
+Requires Python 3.12+. CI runs Python 3.14 only.
 
 ```bash
 pip install -e ".[dev]"     # dev pulls the asgi + metrics extras too
 pre-commit install
 PYTHONPATH=src .venv/bin/pytest tests/ -q     # 2558 passed / 201 skipped, ~2min (3.14, no litellm: graceful NER)
-PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs   # 2767 / 40 (3.12 + litellm: NER, RS256, entrypoint, route guard)
+PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs   # 2767 / 40 (3.14 + every extra + litellm: NER, RS256, entrypoint, route guard)
 PYTHONPATH=src .venv/bin/ruff check src tests
 PYTHONPATH=src .venv/bin/ruff format --check src tests
 ```

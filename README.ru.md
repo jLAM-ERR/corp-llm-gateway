@@ -124,7 +124,7 @@ examples/compose/       лёгкий локальный санитизирующ
 docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      установщик для ноутбука (bash/zsh/fish, macOS/Linux)
 scripts/deploy/         подготовка сервера (bootstrap-server.sh + systemd-юнит) + deploy.sh (развёртывание/обновление хоста)
-tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipped на 3.12 + litellm; на 3.14 — грациозный NER)
+tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipped на 3.14 + все extras + litellm; без extras — грациозный NER)
 ```
 
 ## Быстрый старт для разработчика (ноутбук)
@@ -426,13 +426,13 @@ CLI оператора, обычно запускается через `kubectl 
 
 ## Разработка
 
-Требует Python 3.12+.
+Требует Python 3.12+. CI гоняет только Python 3.14.
 
 ```bash
 pip install -e ".[dev]"     # dev тянет ещё и extras asgi + metrics
 pre-commit install
 PYTHONPATH=src .venv/bin/pytest tests/ -q     # 2558 passed / 201 skipped, ~2min (3.14, без litellm: грациозный NER)
-PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs   # 2767 / 40 (3.12 + litellm: NER, RS256, точка входа, route guard)
+PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs   # 2767 / 40 (3.14 + все extras + litellm: NER, RS256, точка входа, route guard)
 PYTHONPATH=src .venv/bin/ruff check src tests
 PYTHONPATH=src .venv/bin/ruff format --check src tests
 ```

@@ -129,7 +129,8 @@ Two caches:
 # local run is .venv-bench = Python 3.14.7 with every extra (`ner` incl. pymorphy3,
 # `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: ~4200 passed + 16 skipped
 # with Postgres, ~8min — the entrypoint, route-guard, served-stack and container suites
-# only RUN there. CI runs the same suite on 3.12 and 3.14. Always run both before committing.
+# only RUN there. CI runs the same suite on Python 3.14 only — the same interpreter line as
+# .venv-bench; nothing exercises 3.12 any more. Always run both before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
 NO_PROXY=127.0.0.1,localhost PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs
 
@@ -155,9 +156,12 @@ docker compose run --rm e2e pytest -q tests/e2e
 
 ## Tooling
 
-- Python 3.12+, ruff for lint and format (`ruff-pre-commit` v0.15.14 runs
+- Python 3.12+ (`requires-python = ">=3.12"`; the package still supports 3.12,
+  but CI runs only 3.14), ruff for lint and format (`ruff-pre-commit` v0.15.14 runs
   `ruff --fix` + `ruff-format` in pre-commit; CI's lint job runs `ruff check`
   AND `ruff format --check` on every PR). No type checker is configured.
+- `Dockerfile.gateway`'s `python:3.12-slim` build stage tracks the litellm runtime
+  image's interpreter, not CI — don't bump it with CI's Python.
 - Async-first (LiteLLM hooks are async); pytest-asyncio mode = "auto"
 - Default branch: `main`; the live release line is `release/1.0.x`
 - CI: GitHub Actions (`.github/workflows/`)
@@ -169,11 +173,11 @@ docker compose run --rm e2e pytest -q tests/e2e
   gazetteer's RU lemmatizer) — plus the `en_core_web_md` wheel CI installs
 - `.github/workflows/ci.yml` gates every PR: a lint job (`ruff check` AND
   `ruff format --check` — running only `ruff check` locally can still leave
-  you with a CI format failure) and a test job running the full pytest suite
-  on a Python **3.12 + 3.14 matrix** (both legs required, `fail-fast: false`)
-  with the `ner`/`postgres`/`oidc`/`asgi`/`metrics` extras, a Postgres 16
-  service and `CORP_TEST_PG_DSN`, + helm
-  render tests
+  you with a CI format failure), a single `test` job running the full pytest
+  suite on Python **3.14** (no matrix) with the `ner`/`postgres`/`oidc`/`asgi`/`metrics`
+  extras, a Postgres 16 service and `CORP_TEST_PG_DSN`, + helm render tests, and
+  an `integration-container` job (route gate on the real image). All three run
+  Python 3.14; `tests/test_ci_workflow.py` pins that
 
 ## CLI entry points
 
