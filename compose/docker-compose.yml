@@ -130,6 +130,12 @@ services:
       # CORP_LLM_ORACLE_ENABLED=1 (default 0 below), so it does not fire on
       # this stack's default posture. Kept set for when the oracle is enabled.
       - CORP_ENV=${CORP_ENV:-production}
+      # The in-flight cap (route gate, docs/ops/capacity.md): concurrent
+      # rewritten requests on this host, a slot held for the whole stream; the
+      # next gets 429 E_CAPACITY. 0 = off, which the entrypoint refuses (exit
+      # 78) under the CORP_ENV=production default above.
+      - CORP_LLM_MAX_INFLIGHT=${CORP_LLM_MAX_INFLIGHT:-64}
+      - CORP_LLM_CANCEL_GRACE_SECONDS=${CORP_LLM_CANCEL_GRACE_SECONDS:-5}
       # F2: a self-disabled NER engine must fail closed, not silently return
       # no findings and let a PERSON/ORG egress. Load-bearing in production —
       # see helm/corp-llm-gateway/values-prod.yaml.

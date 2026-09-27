@@ -192,3 +192,33 @@ def test_keycloak_egress_knobs_sit_under_network_policy() -> None:
 
     assert "keycloak" not in values
     assert values["networkPolicy"]["keycloak"] == {"enabled": False, "cidr": "", "port": 443}
+
+
+# ── the in-flight cap and litellm's disconnect watch ─────────────────────────
+
+
+def test_litellm_watches_for_client_disconnects(rendered_docs: list[dict[str, Any]]) -> None:
+    config = yaml.safe_load(_litellm_configmap(rendered_docs)["data"]["config.yaml"])
+
+    assert config["general_settings"]["cancel_on_disconnect"] is True
+
+
+def test_the_in_flight_cap_reaches_the_gateway_and_the_config_check(
+    rendered_docs: list[dict[str, Any]],
+) -> None:
+    deployment = _first_of_kind(rendered_docs, "Deployment")
+    init = deployment["spec"]["template"]["spec"]["initContainers"]
+
+    assert _env_of(deployment, "litellm")["CORP_LLM_MAX_INFLIGHT"] == "64"
+    assert all(
+        {e["name"]: e.get("value") for e in c.get("env", [])}.get("CORP_LLM_MAX_INFLIGHT") == "64"
+        for c in init
+    )
+
+
+def test_the_render_never_sets_litellms_dead_concurrency_knobs() -> None:
+    result = _render()
+    assert result.returncode == 0, result.stderr
+
+    assert "global_max_parallel_requests" not in result.stdout
+    assert "LEGACY_MULTI_INSTANCE_RATE_LIMITING" not in result.stdout

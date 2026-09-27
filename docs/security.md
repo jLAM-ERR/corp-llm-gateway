@@ -929,6 +929,23 @@ a key up.
 `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` cannot re-open any of this (see
 "Widening it").
 
+### The in-flight cap: after the verdict, gateway-owned
+
+An armed REWRITTEN request also takes a slot in the gateway's in-flight limiter
+(`route_gate/inflight.py`, `CORP_LLM_MAX_INFLIGHT`, default 64 per pod) and holds
+it for the whole request, stream included; with every slot taken the gate answers
+429 `E_CAPACITY` (`block_reason` `capacity`) before litellm or the sanitizer runs.
+PASSTHROUGH routes never count. The cap is the gateway's because litellm's own is
+dead here: litellm 1.101.0 honours `general_settings.global_max_parallel_requests`
+only in its legacy limiter (selected by `LEGACY_MULTI_INSTANCE_RATE_LIMITING`), and
+no shipped config sets either. The limiter is the single reader of the request's
+`receive`: it drains the body (a body over 25 MiB is `oversize:blocked`, 422),
+replays it to litellm, and watches the socket, so a client that disconnects —
+during our pre-call hook, before the first byte or mid-stream — gets its request
+cancelled, its leftover tasks cancelled, one `cancelled` audit record with counts
+only, and its slot back (`docs/ops/capacity.md`). The cap is capacity, not
+authorization: it decides how many requests run, never which.
+
 ### Consequences to know
 
 - **Pre-flight token counting is gone.** The two token-count routes and
