@@ -743,14 +743,43 @@ def _build_issuance(
     )
 
 
+ISSUANCE_NEEDS_POSTGRES = (
+    "CORP_LLM_PG_DSN: required when CORP_GATEWAY_ISSUE_OIDC_ISSUER is set — developer token "
+    "issuance serialises per subject across replicas in Postgres; the in-memory token store "
+    "is for tests and the demo only"
+)
+
+
+def _serving_issuance(
+    values: Mapping[str, str | None], problems: list[str]
+) -> IssuanceSettings | None:
+    result = _build_issuance(values, config.get_table(ISSUANCE_TEAM_MAP_KEY), problems)
+    if _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_ISSUER") and not _stripped(
+        values, "CORP_LLM_PG_DSN"
+    ):
+        problems.append(ISSUANCE_NEEDS_POSTGRES)
+        return None
+    return result
+
+
 def _check_issuance(values: Mapping[str, str | None], problems: list[str]) -> None:
-    _build_issuance(values, config.get_table(ISSUANCE_TEAM_MAP_KEY), problems)
+    _serving_issuance(values, problems)
 
 
 def issuance() -> IssuanceSettings | None:
     """Resolve issuance config: ``None`` when disabled, :class:`ConfigError` when unsafe."""
     problems: list[str] = []
     result = _build_issuance(_resolve(), config.get_table(ISSUANCE_TEAM_MAP_KEY), problems)
+    if problems:
+        raise ConfigError(problems)
+    return result
+
+
+def serving_issuance() -> IssuanceSettings | None:
+    """:func:`issuance` plus what serving it needs (Postgres); the one resolver the
+    entrypoint's boot check, ``build_health_router`` and ``config check`` share."""
+    problems: list[str] = []
+    result = _serving_issuance(_resolve(), problems)
     if problems:
         raise ConfigError(problems)
     return result

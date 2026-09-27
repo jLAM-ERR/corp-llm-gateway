@@ -253,9 +253,38 @@ def test_the_gateway_owned_routes_are_listed_for_get() -> None:
     assert lookup("HEAD", "/healthz/live") is None
 
 
-def test_issue_token_is_not_in_the_gateway_table() -> None:
-    # Task 4 mounts /healthz/* and /metrics only; issuance stays unlisted.
-    assert lookup("POST", "/internal/issue-token") is None
+def test_issue_token_is_a_gateway_owned_passthrough_row() -> None:
+    # The HealthRouter answers it locally (404 when issuance is off); nothing is
+    # forwarded to litellm, so it is PASSTHROUGH and never REWRITTEN.
+    entry = GATEWAY_ROUTE_TABLE[("POST", "/internal/issue-token")]
+    assert entry.verdict is Verdict.PASSTHROUGH
+    assert entry.why == "gateway-owned issuance; terminates in the gateway, nothing forwarded"
+    assert (entry.justification or "").strip()
+    assert lookup("POST", "/internal/issue-token") is entry
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"])
+def test_issue_token_is_listed_for_post_only(method: str) -> None:
+    assert lookup(method, "/internal/issue-token") is None
+
+
+def test_the_gateway_table_is_exactly_the_gateway_owned_routes() -> None:
+    assert sorted(GATEWAY_ROUTE_TABLE) == [
+        ("GET", "/healthz/extensions"),
+        ("GET", "/healthz/live"),
+        ("GET", "/healthz/ready"),
+        ("GET", "/healthz/sanitization"),
+        ("GET", "/metrics"),
+        ("POST", "/internal/issue-token"),
+    ]
+
+
+def test_the_gateway_table_is_disjoint_from_litellms() -> None:
+    assert not set(GATEWAY_ROUTE_TABLE) & set(LITELLM_ROUTE_TABLE)
+    for method, path in GATEWAY_ROUTE_TABLE:
+        assert not [
+            row for row in LITELLM_REGEX_TABLE if row.method == method and row.pattern.match(path)
+        ], f"{method} {path}"
 
 
 def test_lookup_returns_none_for_an_unknown_pair() -> None:

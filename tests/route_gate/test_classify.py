@@ -160,9 +160,14 @@ def test_an_extra_can_never_promise_a_rewrite() -> None:
     assert decision.block_reason == ROUTE_GATE_UNLISTED
 
 
-def test_issue_token_is_unlisted_because_nothing_mounts_it() -> None:
-    # The health router is mounted for /healthz/* only; issuance stays refused.
+def test_issue_token_passes_to_the_gateway_owned_router() -> None:
+    # The HealthRouter terminates it (404 locally when issuance is off).
     decision = classify("POST", "/internal/issue-token", b"/internal/issue-token")
+    assert decision.verdict is Verdict.PASSTHROUGH
+
+
+def test_issue_token_is_unlisted_for_any_other_method() -> None:
+    decision = classify("GET", "/internal/issue-token", b"/internal/issue-token")
     assert decision.verdict is Verdict.REFUSE
     assert decision.block_reason == ROUTE_GATE_UNLISTED
 

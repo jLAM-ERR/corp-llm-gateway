@@ -849,6 +849,24 @@ completes without a `CorpLlmGuardrail` in `litellm.callbacks`. Until that check
 passes the gate is **unarmed**, and an unarmed gate answers 503 on every
 rewritten route rather than forward it.
 
+### The issuance route: gateway-owned, terminates locally, bounded
+
+`POST /internal/issue-token` is the one body-method row in `GATEWAY_ROUTE_TABLE`.
+It is PASSTHROUGH so the gate hands it to the gateway's own `HealthRouter`, which
+answers it and never forwards it to litellm — with issuance off
+(`CORP_GATEWAY_ISSUE_OIDC_ISSUER` unset) it is a local 404 for every method.
+When on, it is bounded like any public endpoint: the Keycloak access token comes
+from the `Authorization: Bearer` header only, any request body byte is refused
+(400; the read stops at 1 KiB and at 2 s, 408), the route has its own in-flight
+cap and token bucket (`CORP_GATEWAY_ISSUE_MAX_INFLIGHT` / `_RATE_PER_MINUTE`, 429
+without queueing), and the JWKS fetch has its own timeout (503). Error bodies
+carry a code only, and the one log line per request carries the status and the
+code — never the bearer, the minted token, `sub`, groups or username
+(`tests/invariants/test_issuance_no_leak.py`). Issuance needs Postgres: set
+without `CORP_LLM_PG_DSN`, partially configured, or against a `corp_tokens`
+table that predates `tokens/schema.sql`'s issuance columns, the entrypoint exits
+78 at boot.
+
 ### Consequences to know
 
 - **Pre-flight token counting is gone.** The two token-count routes and

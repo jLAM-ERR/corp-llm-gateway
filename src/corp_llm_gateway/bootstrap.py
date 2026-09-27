@@ -6,6 +6,8 @@ contract). Backend selection is config-driven:
 
 - token store   → Postgres when ``CORP_LLM_PG_DSN`` is set, else in-memory
 - team config   → Postgres when ``CORP_LLM_PG_DSN`` is set, else in-memory
+  (both are lazy process singletons — ``get_token_store()`` /
+  ``get_team_config_store()`` — shared by the guardrail and the issuance route)
 - mapping store → Redis when ``REDIS_URL`` is set, else in-memory
 - corp-LLM auth → `auth.factory.get_auth_provider` (never inline auth)
 
@@ -69,9 +71,12 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
 from corp_llm_gateway.settings import (
     NO_OP_SANITIZER_MESSAGE,
     ConfigError,
+    IssuanceSettings,
     forward_auth_conflict,
+    issuance,
     master_key_conflict,
     parse_flag,
+    serving_issuance,
 )
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import (
@@ -79,8 +84,18 @@ from corp_llm_gateway.team_config import (
     PostgresTeamConfigStore,
     TeamConfigStore,
 )
-from corp_llm_gateway.tokens import AuthMiddleware
-from corp_llm_gateway.tokens.middleware import make_auth_middleware
+from corp_llm_gateway.team_config.store import TeamNotFoundError
+from corp_llm_gateway.tokens import (
+    AuthMiddleware,
+    IssuancePolicy,
+    KeycloakOidcVerifier,
+    OidcClaims,
+    OidcTeamMappingError,
+    TokenIssuer,
+    TokenStore,
+)
+from corp_llm_gateway.tokens.issuance import OidcVerifier
+from corp_llm_gateway.tokens.middleware import build_token_store, make_auth_middleware
 
 _DIST_NAME = "corp-llm-gateway"
 _DEFAULT_ENDPOINT = "https://corp-llm.example/v1"
@@ -125,6 +140,41 @@ def build_team_config_store() -> TeamConfigStore:
     if dsn:
         return PostgresTeamConfigStore(dsn)
     return InMemoryTeamConfigStore()
+
+
+# Auth lookups (AuthMiddleware serialises them) plus headroom, as before issuance;
+# issuance adds one connection per in-flight request on top.
+TOKEN_POOL_BASE_SIZE = 5
+
+_token_store: TokenStore | None = None
+_team_config_store: TeamConfigStore | None = None
+
+
+def _token_pool_max_size() -> int:
+    try:
+        configured = issuance()
+    except ConfigError:
+        # Refused at boot and by `config check`; sizing is not the place to report it.
+        configured = None
+    extra = configured.max_inflight if configured is not None else 0
+    return TOKEN_POOL_BASE_SIZE + extra
+
+
+def get_token_store() -> TokenStore:
+    """The process's token store, built on first use: the guardrail's
+    AuthMiddleware and the issuance route must hold the same object."""
+    global _token_store
+    if _token_store is None:
+        _token_store = build_token_store(pool_max_size=_token_pool_max_size())
+    return _token_store
+
+
+def get_team_config_store() -> TeamConfigStore:
+    """The process's team-config store, built on first use (see get_token_store)."""
+    global _team_config_store
+    if _team_config_store is None:
+        _team_config_store = build_team_config_store()
+    return _team_config_store
 
 
 def build_mapping_store() -> MappingStore:
@@ -368,8 +418,32 @@ def _sanitization_probe() -> Callable[[], Awaitable[bool]]:
     return _round_trip
 
 
+def _known_team_only(verifier: OidcVerifier, teams: TeamConfigStore) -> OidcVerifier:
+    """A mapped team must already exist: the gateway never creates teams from claims."""
+
+    async def verify(token: str) -> OidcClaims:
+        claims = await verifier(token)
+        try:
+            await teams.get(claims.team_id)
+        except TeamNotFoundError:
+            raise OidcTeamMappingError("E_ISSUE_UNKNOWN_TEAM") from None
+        return claims
+
+    return verify
+
+
+def _build_token_issuer(configured: IssuanceSettings) -> TokenIssuer:
+    store = get_token_store()
+    verifier = KeycloakOidcVerifier.from_settings(configured)
+    return TokenIssuer(
+        store,
+        _known_team_only(verifier, get_team_config_store()),
+        policy=IssuancePolicy(store, configured),
+    )
+
+
 def build_health_router(fallthrough: object | None = None) -> HealthRouter:
-    """The `/healthz/*` router the gateway server mounts, wired from config.
+    """The gateway-owned routes the entrypoint serves ahead of litellm, wired from config.
 
     Readiness probes Redis and Postgres only. NER readiness
     (`CORP_LLM_REQUIRE_NER`) and corp-NER readiness (`CORP_NER_ENABLED`) are NOT
@@ -377,9 +451,20 @@ def build_health_router(fallthrough: object | None = None) -> HealthRouter:
     contract is that nothing on the request path is constructed before litellm's
     lifespan runs. They stay a follow-up.
 
-    `POST /internal/issue-token` is deliberately unserved — see
-    `healthz.build_health_router`.
+    `POST /internal/issue-token` is served when `settings.serving_issuance()`
+    resolves (issuer set, Postgres configured), over the shared token and
+    team-config stores; otherwise the path is a local 404. The guardrail is not
+    built here.
     """
+    configured = serving_issuance()
+    bounds = (
+        {
+            "issue_max_inflight": configured.max_inflight,
+            "issue_rate_per_minute": configured.rate_per_minute,
+        }
+        if configured is not None
+        else {}
+    )
     return make_health_router(
         live_check=LiveCheck(),
         ready_check=ReadyCheck(
@@ -387,7 +472,9 @@ def build_health_router(fallthrough: object | None = None) -> HealthRouter:
         ),
         sanitization_check=SanitizationCheck(run_round_trip=_sanitization_probe()),
         extensions_check=ExtensionsCheck(health_all=REGISTRY.health_all),
+        token_issuer=_build_token_issuer(configured) if configured is not None else None,
         fallthrough=fallthrough,  # type: ignore[arg-type]
+        **bounds,
     )
 
 
@@ -571,5 +658,8 @@ def __getattr__(name: str) -> CorpLlmGuardrail:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     global _guardrail
     if _guardrail is None:
-        _guardrail = build_guardrail()
+        _guardrail = build_guardrail(
+            auth_middleware=make_auth_middleware(store=get_token_store()),
+            team_config_store=get_team_config_store(),
+        )
     return _guardrail

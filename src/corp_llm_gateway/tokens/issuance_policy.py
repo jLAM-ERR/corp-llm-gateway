@@ -46,7 +46,8 @@ class IssuancePolicy:
         self._token_factory = token_factory
 
     async def issue(self, claims: OidcClaims) -> IssueResult:
-        """Mint a corp token for ``claims``; raises ``IssuancePolicyError`` on rate/replay."""
+        """Mint a corp token for ``claims``; raises ``IssuancePolicyError`` on rate/replay
+        (403) or ``E_ISSUE_BUSY`` when the store's per-subject lock wait timed out (503)."""
         if not (claims.issuer and claims.subject and claims.jti):
             raise OidcVerificationError("E_OIDC_CLAIMS")
         now = self._clock()

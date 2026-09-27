@@ -6,7 +6,8 @@ adds in a future bump cannot reach a provider until someone classifies it.
 
 ``LITELLM_ROUTE_TABLE`` / ``LITELLM_REGEX_TABLE`` describe routes litellm
 registers; ``GATEWAY_ROUTE_TABLE`` describes the routes the gateway itself
-mounts (``/healthz/*``, ``/metrics``) and is exempt from the source guard.
+serves (``/healthz/*``, ``/metrics``, ``POST /internal/issue-token``) and is exempt
+from the source guard.
 
 The litellm tables are generated from litellm 1.101.0's own source with the
 collector in ``tests/route_gate/litellm_routes.py`` and these rules, in order:
@@ -1174,17 +1175,22 @@ LITELLM_REGEX_TABLE: tuple[RegexEntry, ...] = (
     _regex("POST", "/{provider}/v1/files", _refuse(_WHY_PROVIDER)),
 )
 
-# Only what Task 4 mounts on litellm's app: `build_health_router()` at
-# /healthz/* and the metrics exposition at /metrics. HEAD needs no row — it
-# inherits the GET verdict in classify.py, and the router answers 405 to it.
-# POST /internal/issue-token is deliberately absent: the router is not mounted
-# for it, so the gate refuses it as unlisted.
+# Only what the entrypoint serves ahead of litellm's app: `build_health_router()`
+# (/healthz/* and the issuance route) and the metrics exposition at /metrics.
+# HEAD needs no row — it inherits the GET verdict in classify.py. Issuance is
+# POST only; the HealthRouter answers it (404 when issuance is off) and never
+# hands it to litellm.
 GATEWAY_ROUTE_TABLE: dict[tuple[str, str], Entry] = {
     ("GET", "/healthz/extensions"): _passthrough("gateway-owned health check; no user text"),
     ("GET", "/healthz/live"): _passthrough("gateway-owned liveness probe; Helm probes it"),
     ("GET", "/healthz/ready"): _passthrough("gateway-owned readiness probe; Helm probes it"),
     ("GET", "/healthz/sanitization"): _passthrough("gateway-owned health check; no user text"),
     ("GET", "/metrics"): _passthrough("gateway-owned Prometheus exposition; no user text"),
+    ("POST", "/internal/issue-token"): _passthrough(
+        "gateway-owned issuance; terminates in the gateway, nothing forwarded",
+        "answered by the HealthRouter, never litellm; body refused, bearer header only; "
+        "the only outbound call is the configured Keycloak JWKS fetch, carrying no request byte",
+    ),
 }
 
 

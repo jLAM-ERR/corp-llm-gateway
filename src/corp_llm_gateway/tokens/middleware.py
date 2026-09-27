@@ -115,7 +115,7 @@ def _seed_dev_team_token(store: InMemoryTokenStore, token: str) -> None:
 
     DEV-ONLY: the supported equivalent of the demo shim's seeding
     (``_demo_guardrail.py``), gated by the double guard in
-    :func:`make_auth_middleware` (no Postgres DSN, non-prod ``CORP_ENV``).
+    :func:`build_token_store` (no Postgres DSN, non-prod ``CORP_ENV``).
     """
     now = datetime.now(UTC)
     store.upsert(
@@ -131,41 +131,49 @@ def _seed_dev_team_token(store: InMemoryTokenStore, token: str) -> None:
     _log.info("seeded CORP_LLM_DEV_TEAM_TOKEN for team=%s (dev-only)", _DEV_TEAM_ID)
 
 
-def make_auth_middleware(*, revocation_cache_seconds: float = 60.0) -> AuthMiddleware:
-    """Build AuthMiddleware from config.
+def build_token_store(*, pool_max_size: int = 5) -> TokenStore:
+    """The token store selected by config.
 
-    Uses PostgresTokenStore when CORP_LLM_PG_DSN is configured; raises
-    RuntimeError if the DSN is set but asyncpg is absent (misconfiguration).
-    Falls back to InMemoryTokenStore when no DSN is configured (dev/demo) —
-    if CORP_LLM_DEV_TEAM_TOKEN is also set, it seeds a working X-Corp-Auth for
-    team "local-dev" unless CORP_ENV marks a production deployment (double
-    guard: never seeds against Postgres, never seeds in prod).
+    PostgresTokenStore when CORP_LLM_PG_DSN is configured; raises RuntimeError
+    if the DSN is set but asyncpg is absent (misconfiguration). Falls back to
+    InMemoryTokenStore when no DSN is configured (dev/demo) — if
+    CORP_LLM_DEV_TEAM_TOKEN is also set, it seeds a working X-Corp-Auth for team
+    "local-dev" unless CORP_ENV marks a production deployment (double guard:
+    never seeds against Postgres, never seeds in prod).
     """
     from corp_llm_gateway.config import get as _get_cfg
     from corp_llm_gateway.config import is_prod
 
     dsn = _get_cfg("CORP_LLM_PG_DSN")
     dev_token = _get_cfg("CORP_LLM_DEV_TEAM_TOKEN", "") or ""
-    store: TokenStore
     if dsn:
         from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
 
-        store = PostgresTokenStore(dsn)  # raises RuntimeError if asyncpg absent
+        store = PostgresTokenStore(dsn, pool_max_size=pool_max_size)
         if dev_token:
             _log.warning(
                 "CORP_LLM_DEV_TEAM_TOKEN is set but ignored: CORP_LLM_PG_DSN is "
                 "configured — the dev-only token seam only applies to the "
                 "in-memory token store"
             )
-    else:
-        mem_store = InMemoryTokenStore()
-        if dev_token:
-            if is_prod():
-                _log.warning(
-                    "CORP_LLM_DEV_TEAM_TOKEN is set but ignored: CORP_ENV marks a "
-                    "production deployment — the dev-only token seam is refused in prod"
-                )
-            else:
-                _seed_dev_team_token(mem_store, dev_token)
-        store = mem_store
-    return AuthMiddleware(store, revocation_cache_seconds=revocation_cache_seconds)
+        return store
+    mem_store = InMemoryTokenStore()
+    if dev_token:
+        if is_prod():
+            _log.warning(
+                "CORP_LLM_DEV_TEAM_TOKEN is set but ignored: CORP_ENV marks a "
+                "production deployment — the dev-only token seam is refused in prod"
+            )
+        else:
+            _seed_dev_team_token(mem_store, dev_token)
+    return mem_store
+
+
+def make_auth_middleware(
+    *, revocation_cache_seconds: float = 60.0, store: TokenStore | None = None
+) -> AuthMiddleware:
+    """AuthMiddleware over ``store``, or over :func:`build_token_store` when omitted."""
+    return AuthMiddleware(
+        store if store is not None else build_token_store(),
+        revocation_cache_seconds=revocation_cache_seconds,
+    )

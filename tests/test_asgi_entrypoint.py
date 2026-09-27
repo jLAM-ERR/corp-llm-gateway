@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable, Iterator
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -335,6 +336,161 @@ def test_disable_prisma_schema_update_checks_the_diff_instead(tmp_path: Path) ->
     assert result["booted"] is True
 
 
+# ── step 1, continued: the gateway's own serving config (issuance) ───────────
+
+ISSUER = "https://keycloak.corp.lan/realms/dev"
+ISSUANCE_TOML = '[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]\n"/devs" = "t1"\n'
+UNREACHABLE_PG = "postgresql://gateway:gateway@127.0.0.1:1/gateway"
+
+
+def _issuance_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    cfg = tmp_path / "gateway.toml"
+    cfg.write_text(ISSUANCE_TOML)
+    return {
+        "CORP_LLM_GATEWAY_CONFIG_FILE": str(cfg),
+        "CORP_GATEWAY_ISSUE_OIDC_ISSUER": ISSUER,
+        "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE": "corp-gateway-issuance",
+        "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID": "corp-gateway-cli",
+        **extra,
+    }
+
+
+def _require_issuance_extras() -> None:
+    # A boot that gets past the checks builds the verifier and the Postgres store.
+    for module in ("cryptography", "asyncpg"):
+        if find_spec(module) is None:
+            pytest.skip(f"{module} is not installed; the issuance boot needs it")
+
+
+def test_issuance_without_postgres_exits_78_before_litellm_is_imported(
+    valid_config: Path, tmp_path: Path
+) -> None:
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path))
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert "CORP_LLM_PG_DSN" in result["stdout"]
+
+
+def test_a_partial_issuance_config_exits_78(valid_config: Path, tmp_path: Path) -> None:
+    env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=UNREACHABLE_PG)
+    del env["CORP_GATEWAY_ISSUE_OIDC_AUDIENCE"]
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE" in result["stdout"]
+
+
+def test_a_boot_refusal_never_prints_the_dsn(valid_config: Path, tmp_path: Path) -> None:
+    secret_dsn = "postgresql://gateway:dsn-password-7f1e@127.0.0.1:1/gateway"
+    env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=secret_dsn)
+    del env["CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID"]
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] == 78
+    assert "dsn-password-7f1e" not in result["stdout"]
+
+
+def test_issuance_boots_when_postgres_is_unreachable(valid_config: Path, tmp_path: Path) -> None:
+    # Readiness reports an unreachable database; the boot does not refuse on it.
+    _require_issuance_extras()
+    env = _issuance_env(tmp_path, CORP_LLM_PG_DSN=UNREACHABLE_PG)
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] is None
+    assert result["proxy_imported"] is True
+
+
+_OLD_TOKEN_TABLE = """
+CREATE TABLE corp_tokens (
+    corp_token TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL,
+    team_id    TEXT NOT NULL,
+    scopes     TEXT[] NOT NULL DEFAULT '{}',
+    issued_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+)
+"""
+
+
+@pytest.fixture
+def pg_schema() -> Iterator[tuple[str, Callable[[str], None]]]:
+    """A throwaway schema on the test Postgres, and a DSN whose search_path is it."""
+    import asyncio
+    import secrets
+
+    from tests.postgres_support import pg_dsn, require_asyncpg, skip_or_fail
+
+    require_asyncpg()
+    import asyncpg
+
+    base = pg_dsn()
+    schema = f"boot_{secrets.token_hex(4)}"
+
+    async def execute(sql: str) -> None:
+        conn = await asyncpg.connect(base, timeout=5.0)
+        try:
+            await conn.execute(sql)
+        finally:
+            await conn.close()
+
+    try:
+        asyncio.run(execute(f"CREATE SCHEMA {schema}"))
+    except Exception as exc:
+        skip_or_fail(f"Postgres unreachable: {type(exc).__name__}")
+
+    def in_schema(sql: str) -> None:
+        asyncio.run(execute(f"SET search_path TO {schema}; {sql}"))
+
+    separator = "&" if "?" in base else "?"
+    try:
+        yield f"{base}{separator}search_path={schema}", in_schema
+    finally:
+        asyncio.run(execute(f"DROP SCHEMA {schema} CASCADE"))
+
+
+def test_a_token_table_without_the_oidc_columns_exits_78(
+    valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
+) -> None:
+    dsn, in_schema = pg_schema
+    in_schema(_OLD_TOKEN_TABLE)
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=dsn))
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert "tokens/schema.sql" in result["stdout"]
+
+
+def test_a_missing_token_table_exits_78(
+    valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
+) -> None:
+    dsn, _ = pg_schema
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=dsn))
+
+    assert result["exit_code"] == 78
+    assert "tokens/schema.sql" in result["stdout"]
+
+
+def test_a_migrated_token_table_boots(
+    valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
+) -> None:
+    _require_issuance_extras()
+    dsn, in_schema = pg_schema
+    in_schema((ROOT / "src/corp_llm_gateway/tokens/schema.sql").read_text())
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=_issuance_env(tmp_path, CORP_LLM_PG_DSN=dsn))
+
+    assert result["exit_code"] is None
+    assert result["proxy_imported"] is True
+
+
 # ── steps 3-5: what a successful import leaves behind ────────────────────────
 
 _IMPORT_SCRIPT = f"""
@@ -624,7 +780,7 @@ _REQUEST_SCRIPT = f"""
             issue = await call("POST", "/internal/issue-token")
             counts = await call("POST", "/v1/messages/count_tokens")
         print("{SENTINEL}" + json.dumps({{
-            "live": live, "metrics": metrics, "issue": issue[0], "count_tokens": counts[0],
+            "live": live, "metrics": metrics, "issue": issue, "count_tokens": counts[0],
         }}))
 
     asyncio.run(main())
@@ -649,9 +805,13 @@ def test_metrics_answers_through_the_gate(served: dict) -> None:
     assert status == 200
 
 
-def test_issue_token_stays_refused(served: dict) -> None:
-    # Not in GATEWAY_ROUTE_TABLE on purpose; issuance is `gateway-admin token issue`.
-    assert served["issue"] == 404
+def test_issue_token_is_a_local_404_when_issuance_is_off(served: dict) -> None:
+    # The gate admits it (a GATEWAY_ROUTE_TABLE row) and the HealthRouter answers
+    # it: disabled issuance never falls through to litellm.
+    status, body = served["issue"]
+
+    assert status == 404
+    assert json.loads(body) == {"error": "E_ISSUE_DISABLED"}
 
 
 def test_a_bypass_route_is_refused_on_the_real_app(served: dict) -> None:

@@ -189,20 +189,21 @@ async def test_issue_token_via_bearer_header_returns_valid_token() -> None:
 
 
 @pytest.mark.asyncio
-async def test_issue_token_via_json_body_returns_valid_token() -> None:
+async def test_issue_token_refuses_a_json_body_token() -> None:
+    # Header-only: the old `{"oidc_token": ...}` body fallback is gone, and any
+    # body byte is refused before the token is looked at.
     router = _router(issuer=_make_issuer())
     async with _client(router) as client:
         resp = await client.post("/internal/issue-token", json={"oidc_token": "valid-oidc"})
-    assert resp.status_code == 200
-    assert resp.json()["corp_token"].startswith("ct_")
+    assert resp.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_issue_token_missing_token_returns_400() -> None:
+async def test_issue_token_missing_token_returns_401() -> None:
     router = _router(issuer=_make_issuer())
     async with _client(router) as client:
         resp = await client.post("/internal/issue-token")
-    assert resp.status_code == 400
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -287,13 +288,11 @@ async def test_fallthrough_delegates_unknown_paths_but_serves_health() -> None:
     assert health.json()["status"] == "healthy"
 
 
-# ── issuance is optional (the gateway server does not serve it) ──────────────
+# ── issuance is optional (off unless CORP_GATEWAY_ISSUE_OIDC_ISSUER is set) ──
 
 
 async def test_without_an_issuer_the_issue_token_path_is_not_served() -> None:
-    # The gateway mounts this router at /healthz only and the route gate refuses
-    # POST /internal/issue-token; wiring an issuer there would be a second,
-    # unreachable copy of `gateway-admin token issue`.
+    # Disabled issuance answers 404 locally; it never falls through downstream.
     router = build_health_router(
         live_check=LiveCheck(),
         ready_check=ReadyCheck(check_redis=_ok, check_postgres=_ok),

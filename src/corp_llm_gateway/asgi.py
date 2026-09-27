@@ -15,7 +15,11 @@ In order —
    (``EX_CONFIG``) if it is missing, unreadable, not YAML or configures
    ``pass_through_endpoints`` or ``general_settings.database_url``. litellm's own
    lifespan skips a missing config in silence (``proxy_server.py:1088-1095``) and
-   would serve with NO guardrail;
+   would serve with NO guardrail. Then the gateway's own issuance config, through
+   ``settings.serving_issuance()`` (the resolver ``config check`` uses): partial,
+   or set without ``CORP_LLM_PG_DSN``, exits 78; so does a reachable Postgres
+   whose ``corp_tokens`` lacks the issuance columns (an unreachable one does not —
+   readiness reports it);
 2. run litellm's Prisma schema sequence when ``DATABASE_URL`` is set, with the
    same four guards and the same exit codes as ``proxy_cli.py:1326-1375``;
 3. ``save_worker_config(...)`` so litellm's lifespan takes the
@@ -60,17 +64,19 @@ Deliberately NOT carried over:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import subprocess
 import sys
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from corp_llm_gateway import config, litellm_cli, litellm_config
+from corp_llm_gateway import config, litellm_cli, litellm_config, settings
 from corp_llm_gateway.audit import AuditLogger, get_sink
 from corp_llm_gateway.metrics import get_exporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware
@@ -90,6 +96,7 @@ EXIT_NO_CALLBACK = 70
 
 _MOUNT_HEALTHZ = "/healthz"
 _MOUNT_METRICS = "/metrics"
+_ISSUE_TOKEN = "/internal/issue-token"
 
 
 class _BootJsonFormatter(logging.Formatter):
@@ -169,6 +176,80 @@ def _fail_config(problems: list[str]) -> None:
     raise SystemExit(EXIT_CONFIG)
 
 
+def _fail_gateway_config(problems: list[str]) -> None:
+    for problem in problems:
+        log.error("gateway config refused: %s", problem)
+    raise SystemExit(EXIT_CONFIG)
+
+
+_TOKEN_SCHEMA_TIMEOUT_S = 5.0
+_TOKEN_SCHEMA_PROBLEM = (
+    "corp_tokens lacks the issuance columns or the oidc_jti unique index — apply "
+    "src/corp_llm_gateway/tokens/schema.sql (idempotent) before enabling "
+    "CORP_GATEWAY_ISSUE_OIDC_ISSUER"
+)
+
+
+async def _token_schema_is_current(dsn: str) -> bool:
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn, timeout=_TOKEN_SCHEMA_TIMEOUT_S)
+    try:
+        try:
+            # Resolved the way the store's own unqualified queries resolve it.
+            await conn.execute(
+                "SELECT oidc_issuer, oidc_subject, oidc_jti FROM corp_tokens LIMIT 0",
+                timeout=_TOKEN_SCHEMA_TIMEOUT_S,
+            )
+        except (asyncpg.exceptions.UndefinedTableError, asyncpg.exceptions.UndefinedColumnError):
+            return False
+        return bool(
+            await conn.fetchval(
+                "SELECT to_regclass('corp_tokens_oidc_jti_key') IS NOT NULL",
+                timeout=_TOKEN_SCHEMA_TIMEOUT_S,
+            )
+        )
+    finally:
+        await conn.close()
+
+
+def _token_schema_problem(dsn: str) -> str | None:
+    """The issuance schema check; ``None`` when current or when Postgres cannot be asked."""
+    try:
+        import asyncpg  # noqa: F401
+    except ImportError:
+        return None  # PostgresTokenStore refuses at construction, naming the extra
+    # uvicorn imports this module inside its running loop, so the probe gets a
+    # loop of its own on a worker thread.
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            current = pool.submit(lambda: asyncio.run(_token_schema_is_current(dsn))).result()
+    except Exception as exc:
+        # The type only: a driver message can carry the DSN.
+        log.warning(
+            "issuance schema check skipped, Postgres not reachable at boot (%s); "
+            "readiness reports it",
+            type(exc).__name__,
+        )
+        return None
+    return None if current else _TOKEN_SCHEMA_PROBLEM
+
+
+def _check_issuance() -> None:
+    try:
+        issuance = settings.serving_issuance()
+    except settings.ConfigError as exc:
+        _fail_gateway_config(exc.problems)
+        return
+    if issuance is None:
+        log.info("developer token issuance disabled (CORP_GATEWAY_ISSUE_OIDC_ISSUER unset)")
+        return
+    problem = _token_schema_problem(config.get("CORP_LLM_PG_DSN") or "")
+    if problem is not None:
+        _fail_gateway_config([problem])
+    log.info("developer token issuance enabled: POST /internal/issue-token")
+
+
 def _setup_prisma(config_path: Any) -> None:
     """litellm's boot-time Prisma schema setup — ``proxy_cli.py:1326-1375``.
 
@@ -235,6 +316,7 @@ _problems = litellm_config.problems(CONFIG_PATH, require_file=True)
 if _problems:
     _fail_config(_problems)
 log.info("litellm config accepted: %s", CONFIG_PATH)
+_check_issuance()
 
 # ── 2. Prisma schema setup ───────────────────────────────────────────────────
 
@@ -302,7 +384,12 @@ class _MetricsRoute:
 # Mode A. `HealthRouter` already takes a `fallthrough`, so the chain is:
 # /healthz/* -> /metrics -> litellm.
 _GATEWAY_ROUTES = build_health_router(fallthrough=_MetricsRoute(_exporter.asgi_app(), _app))
-log.info("gateway routes served ahead of litellm: %s/*, %s", _MOUNT_HEALTHZ, _MOUNT_METRICS)
+log.info(
+    "gateway routes served ahead of litellm: %s/*, %s, POST %s",
+    _MOUNT_HEALTHZ,
+    _MOUNT_METRICS,
+    _ISSUE_TOKEN,
+)
 
 gate = RouteGateMiddleware(
     _GATEWAY_ROUTES,

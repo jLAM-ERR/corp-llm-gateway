@@ -874,8 +874,55 @@ def test_validate_accepts_a_complete_issuance_config(
 ) -> None:
     _write(hermetic, _TEAM_MAP_TOML)
     monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
     _issuance_env(monkeypatch)
     assert isinstance(config.validate(), Settings)
+
+
+def test_validate_refuses_issuance_without_postgres(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `config check` and the entrypoint's boot check share this resolver.
+    _write(hermetic, _TEAM_MAP_TOML)
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    _issuance_env(monkeypatch)
+    with pytest.raises(ConfigError, match="CORP_LLM_PG_DSN"):
+        config.validate()
+
+
+def test_serving_issuance_requires_postgres(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    with pytest.raises(ConfigError) as exc:
+        settings.serving_issuance()
+    assert [p for p in exc.value.problems if p.startswith("CORP_LLM_PG_DSN")]
+
+
+def test_serving_issuance_resolves_with_postgres(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    assert settings.serving_issuance() == settings.issuance()
+    assert settings.serving_issuance() is not None
+
+
+def test_serving_issuance_is_none_when_disabled(hermetic: Path) -> None:
+    assert settings.serving_issuance() is None
+
+
+def test_serving_issuance_reports_a_partial_config_and_the_missing_dsn_together(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER)
+    with pytest.raises(ConfigError) as exc:
+        settings.serving_issuance()
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE" in joined
+    assert "CORP_LLM_PG_DSN" in joined
 
 
 def test_validate_ignores_issuance_keys_when_issuer_unset(
