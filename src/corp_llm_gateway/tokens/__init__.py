@@ -2,6 +2,7 @@ from corp_llm_gateway.tokens.errors import (
     AuthError,
     ExpiredTokenError,
     InvalidTokenError,
+    IssuancePolicyError,
     MissingTokenError,
     RevokedTokenError,
 )
@@ -15,6 +16,7 @@ from corp_llm_gateway.tokens.issuance import (
     OidcVerificationError,
     TokenIssuer,
 )
+from corp_llm_gateway.tokens.issuance_policy import IssuancePolicy
 from corp_llm_gateway.tokens.middleware import AuthContext, AuthMiddleware
 from corp_llm_gateway.tokens.models import TokenInfo
 from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
@@ -28,6 +30,8 @@ __all__ = [
     "ExpiredTokenError",
     "InMemoryTokenStore",
     "InvalidTokenError",
+    "IssuancePolicy",
+    "IssuancePolicyError",
     "IssueResult",
     "JwksUnavailableError",
     "MissingTokenError",

@@ -14,14 +14,20 @@ wires up — this keeps the issuance code free of any specific OIDC SDK
 choice.
 """
 
+from __future__ import annotations
+
 import asyncio
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from corp_llm_gateway.tokens.models import TokenInfo
 from corp_llm_gateway.tokens.store import TokenStore
+
+if TYPE_CHECKING:
+    from corp_llm_gateway.tokens.issuance_policy import IssuancePolicy
 
 DEFAULT_TOKEN_TTL_DAYS = 30
 
@@ -66,16 +72,20 @@ class TokenIssuer:
         *,
         ttl: timedelta = timedelta(days=DEFAULT_TOKEN_TTL_DAYS),
         token_factory: Callable[[], str] | None = None,
+        policy: IssuancePolicy | None = None,
     ) -> None:
         self._store = store
         self._verifier = verifier
         self._ttl = ttl
-        self._token_factory = token_factory or _default_token_factory
+        self._token_factory = token_factory or default_token_factory
+        self._policy = policy
 
     async def issue(self, oidc_token: str) -> IssueResult:
         if not oidc_token:
             raise OidcVerificationError("missing OIDC token")
         claims = await self._verifier(oidc_token)
+        if self._policy is not None:
+            return await self._policy.issue(claims)
         now = datetime.now(UTC)
         corp_token = self._token_factory()
         info = TokenInfo(
@@ -90,7 +100,7 @@ class TokenIssuer:
         return IssueResult(corp_token=corp_token, expires_at=info.expires_at)
 
 
-def _default_token_factory() -> str:
+def default_token_factory() -> str:
     return f"ct_{secrets.token_urlsafe(32)}"
 
 

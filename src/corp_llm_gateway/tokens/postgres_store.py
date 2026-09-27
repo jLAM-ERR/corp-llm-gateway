@@ -11,14 +11,22 @@ from __future__ import annotations
 
 import asyncio
 import types
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from corp_llm_gateway.tokens.errors import IssuancePolicyError
 from corp_llm_gateway.tokens.models import TokenInfo
 from corp_llm_gateway.tokens.store import TokenStore
 
 _SCHEMA_SQL = Path(__file__).parent / "schema.sql"
+
+_JTI_UNIQUE_INDEX = "corp_tokens_oidc_jti_key"
+
+# Serialises issuance per (issuer, subject) across replicas, including the very
+# first issuance when there are no rows to lock. A hash collision only
+# over-serialises two subjects; it never mixes their rows.
+_SUBJECT_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1::text || '\\0' || $2::text))"
 
 _asyncpg_mod: types.ModuleType | None = None
 _asyncpg_tried = False
@@ -65,12 +73,13 @@ class PostgresTokenStore(TokenStore):
     DSN config key: CORP_LLM_PG_DSN.
     """
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, *, pool_max_size: int = 5) -> None:
         if _get_asyncpg() is None:
             raise RuntimeError(
                 "PostgresTokenStore requires asyncpg: pip install 'corp-llm-gateway[postgres]'"
             )
         self._dsn = dsn
+        self._pool_max_size = pool_max_size
         self._pool: Any = None
         self._lock = asyncio.Lock()
 
@@ -84,7 +93,7 @@ class PostgresTokenStore(TokenStore):
                 self._pool = await asyncpg_mod.create_pool(  # type: ignore[attr-defined]
                     self._dsn,
                     min_size=1,
-                    max_size=5,
+                    max_size=self._pool_max_size,
                 )
         return self._pool
 
@@ -170,6 +179,75 @@ class PostgresTokenStore(TokenStore):
                     user_id,
                 )
         return tuple(_row_to_token_info(r) for r in rows)
+
+    async def issue_for_subject(
+        self,
+        info: TokenInfo,
+        *,
+        issuer: str,
+        subject: str,
+        jti: str,
+        max_active: int,
+        min_interval: timedelta,
+    ) -> TokenInfo:
+        asyncpg_mod = _get_asyncpg()
+        assert asyncpg_mod is not None  # guarded in __init__
+        pool = await self._get_pool()
+        now = info.issued_at
+        async with pool.acquire() as conn:
+            try:
+                # READ COMMITTED: each statement after the lock sees the previous
+                # holder's commit; a snapshot taken at the lock would not.
+                async with conn.transaction(isolation="read_committed"):
+                    await conn.execute(_SUBJECT_LOCK_SQL, issuer, subject)
+                    seen = await conn.fetchval("SELECT 1 FROM corp_tokens WHERE oidc_jti = $1", jti)
+                    if seen is not None:
+                        raise IssuancePolicyError(IssuancePolicyError.REPLAY)
+                    active: Any = await conn.fetch(
+                        """
+                        SELECT corp_token, issued_at
+                        FROM corp_tokens
+                        WHERE oidc_issuer = $1 AND oidc_subject = $2
+                          AND revoked_at IS NULL AND expires_at > $3
+                        ORDER BY issued_at, corp_token
+                        """,
+                        issuer,
+                        subject,
+                        now,
+                    )
+                    if active and now - _ensure_utc(active[-1]["issued_at"]) < min_interval:
+                        raise IssuancePolicyError(IssuancePolicyError.RATE)
+                    excess = len(active) - max_active + 1
+                    if excess > 0:
+                        await conn.execute(
+                            "UPDATE corp_tokens SET revoked_at = $1 "
+                            "WHERE corp_token = ANY($2::text[])",
+                            now,
+                            [row["corp_token"] for row in active[:excess]],
+                        )
+                    await conn.execute(
+                        """
+                        INSERT INTO corp_tokens
+                            (corp_token, user_id, team_id, scopes, issued_at,
+                             expires_at, revoked_at, oidc_issuer, oidc_subject, oidc_jti)
+                        VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9)
+                        """,
+                        info.corp_token,
+                        info.user_id,
+                        info.team_id,
+                        list(info.scopes),
+                        info.issued_at,
+                        info.expires_at,
+                        issuer,
+                        subject,
+                        jti,
+                    )
+            except asyncpg_mod.exceptions.UniqueViolationError as exc:
+                # `from None`: the driver's detail text quotes the conflicting value.
+                if exc.constraint_name == _JTI_UNIQUE_INDEX:
+                    raise IssuancePolicyError(IssuancePolicyError.REPLAY) from None
+                raise RuntimeError("corp_tokens unique violation on issuance") from None
+        return info
 
     async def close(self) -> None:
         """Close the connection pool; no-op if pool was never created."""

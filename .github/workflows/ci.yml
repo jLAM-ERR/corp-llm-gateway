@@ -35,6 +35,24 @@ jobs:
     # 1.2 GB litellm image pull for tests/integration/test_anthropic_oauth_outbound.py
     # on top of the unit suite.
     timeout-minutes: 40
+    # The Postgres store contract tests (incl. the issuance race tests) run against
+    # this service. GitHub sets CI=true, which turns their "Postgres unreachable"
+    # skip into a failure (tests/postgres_support.py); the credentials mirror the
+    # demo stack's gateway/gateway/gateway, pinned by test_token_store_contract.py.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -57,3 +75,4 @@ jobs:
       - run: PYTHONPATH=src pytest tests/ -q
         env:
           CORP_REQUIRE_PROXY_CAPTURE: "1"
+          CORP_TEST_PG_DSN: postgresql://gateway:gateway@localhost:5432/gateway
