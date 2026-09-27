@@ -1,0 +1,24 @@
+# TEST ONLY. Never under compose/nginx/: test_nginx_runtime.py copies it over
+# the gateway snippet in its per-test copy of compose/nginx/, so the log gate
+# can be driven through a real proxied request before the allow-list exists.
+# stub-upstream is the harness's stub (nginx_fixtures/stub_upstream.py).
+
+location = /stub/ok {
+    set $stub_upstream http://stub-upstream:8000;
+    proxy_pass $stub_upstream/ok$is_args$args;
+}
+
+location = /stub/refused {
+    set $stub_upstream http://stub-upstream:8001;
+    proxy_pass $stub_upstream/refused$is_args$args;
+}
+
+location = /stub/slow {
+    set $stub_upstream http://stub-upstream:8002;
+    proxy_read_timeout 1s;
+    proxy_pass $stub_upstream/slow$is_args$args;
+}
+
+location / {
+    return 404;
+}

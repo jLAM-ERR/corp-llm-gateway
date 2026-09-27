@@ -301,6 +301,10 @@ def test_the_rendering_design_layout_is_in_place() -> None:
     assert (NGINX_DIR / "entrypoint.sh").is_file()
 
 
+TRUSTED_PEER_GATE = "if ($from_trusted_proxy = 0) { return 444; }"
+GATE_MARKER = "corp_trusted_peer_gate"
+
+
 def test_every_listener_server_block_is_one_include_of_a_snippet() -> None:
     templates = sorted((NGINX_DIR / "templates" / "listeners").glob("*.template"))
     assert templates
@@ -308,12 +312,19 @@ def test_every_listener_server_block_is_one_include_of_a_snippet() -> None:
         body = re.sub(r"#[^\n]*", "", template.read_text())
         # An envsubst placeholder's braces are not nginx blocks.
         body = re.sub(r"\$\{([A-Z_]+)\}", r"\1", body)
+        # The trusted-peer gate is the one nested block allowed, and only verbatim.
+        body = body.replace(TRUSTED_PEER_GATE, f"{GATE_MARKER};")
         blocks = re.findall(r"server\s*\{([^{}]*)\}", body)
         # A nested brace hides its server block from the pattern above.
         assert blocks, template.name
         assert len(re.findall(r"server\s*\{", body)) == len(blocks), template.name
+        gated = template.name.startswith("behind-proxy.")
         for block in blocks:
             directives = [d.strip() for d in block.split(";") if d.strip()]
+            if gated:
+                # Before anything else in the block, so nothing runs for an untrusted peer.
+                assert directives[0] == GATE_MARKER, (template.name, directives)
+                directives = directives[1:]
             payload = [
                 d for d in directives if not d.startswith(("listen ", "server_name ", "ssl_"))
             ]
@@ -322,6 +333,172 @@ def test_every_listener_server_block_is_one_include_of_a_snippet() -> None:
                 ["include /etc/nginx/rendered/snippets/gateway-locations.inc"],
                 ["include /etc/nginx/rendered/snippets/langfuse-locations.inc"],
             ), (template.name, directives)
+
+
+def test_both_behind_proxy_listeners_exist_and_every_server_block_is_gated() -> None:
+    listeners = NGINX_DIR / "templates" / "listeners"
+    for routing in ("host", "port"):
+        text = (listeners / f"behind-proxy.{routing}.conf.template").read_text()
+        body = re.sub(r"#[^\n]*", "", text)
+        servers = len(re.findall(r"server\s*\{", body))
+        assert servers >= 2, routing
+        assert body.count(TRUSTED_PEER_GATE) == servers, routing
+
+
+def test_the_terminate_listeners_do_not_carry_the_trusted_peer_gate() -> None:
+    # The terminate listener is the public TLS endpoint: every client is a peer.
+    for template in (NGINX_DIR / "templates" / "listeners").glob("terminate.*.template"):
+        assert "$from_trusted_proxy" not in template.read_text(), template.name
+
+
+# --------------------------------------------------------------------------- #
+# the http context: the log gate, the trusted-peer check, real_ip, the maps
+# --------------------------------------------------------------------------- #
+
+HTTP_TEMPLATE = NGINX_DIR / "templates" / "00-http.conf.template"
+
+# Every variable the access log may carry. None is a header, a cookie, an
+# argument, the body, the request line or the Basic-auth user.
+SAFE_LOG_VARIABLES = {
+    "time_iso8601",
+    "realip_remote_addr",
+    "from_trusted_proxy",
+    "remote_addr",
+    "host",
+    "server_port",
+    "request_method",
+    "uri",
+    "status",
+    "body_bytes_sent",
+    "request_time",
+    "upstream_addr",
+    "upstream_status",
+    "upstream_response_time",
+}
+DIAGNOSTIC_LOG_VARIABLES = {
+    "realip_remote_addr",
+    "status",
+    "upstream_status",
+    "upstream_response_time",
+    "from_trusted_proxy",
+    "uri",
+}
+
+
+def _directives(text: str) -> str:
+    return re.sub(r"#[^\n]*", "", text)
+
+
+def _every_config_file() -> list[Path]:
+    return [NGINX_CONF, *sorted((NGINX_DIR / "templates").rglob("*.template"))]
+
+
+def _log_formats() -> dict[str, str]:
+    """name -> the whole directive, across nginx.conf and every template."""
+    formats: dict[str, str] = {}
+    for path in _every_config_file():
+        for match in re.finditer(
+            r"^\s*log_format\s+(\S+)\s+([^;]*(?:'[^']*'[^;]*)*);",
+            _directives(path.read_text()),
+            re.MULTILINE,
+        ):
+            assert match.group(1) not in formats, match.group(1)
+            formats[match.group(1)] = match.group(0)
+    return formats
+
+
+def _log_variables(directive: str) -> set[str]:
+    return set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", directive))
+
+
+def test_the_corp_gate_log_format_carries_no_credential_and_no_body() -> None:
+    formats = _log_formats()
+    assert set(formats) == {"corp_gate"}
+    corp_gate = formats["corp_gate"]
+    variables = _log_variables(corp_gate)
+
+    assert not re.search(r"authorization|corp_auth", corp_gate, re.IGNORECASE)
+    assert not {v for v in variables if v.startswith(("http_", "cookie_", "sent_http_"))}
+    assert not {v for v in variables if "body" in v and v != "body_bytes_sent"}
+    assert "remote_user" not in variables
+    assert variables <= SAFE_LOG_VARIABLES, variables - SAFE_LOG_VARIABLES
+    assert variables >= DIAGNOSTIC_LOG_VARIABLES, DIAGNOSTIC_LOG_VARIABLES - variables
+
+
+def test_no_log_format_carries_the_request_line_or_the_query_string() -> None:
+    for name, directive in _log_formats().items():
+        variables = _log_variables(directive)
+        assert not variables & {"request", "request_uri", "args", "query_string"}, name
+        assert not {v for v in variables if v.startswith("arg_")}, name
+
+
+def test_error_log_is_crit_in_nginx_conf_and_nowhere_else() -> None:
+    assert re.findall(
+        r"^\s*error_log\s+([^;]+);", _directives(NGINX_CONF.read_text()), re.MULTILINE
+    ) == ["/dev/stderr crit"]
+    for template in sorted((NGINX_DIR / "templates").rglob("*.template")):
+        assert not re.search(r"\berror_log\b", _directives(template.read_text())), template.name
+
+
+def _depth_at(text: str, offset: int) -> int:
+    return text.count("{", 0, offset) - text.count("}", 0, offset)
+
+
+def test_there_is_exactly_one_access_log_and_it_names_the_format_beside_it() -> None:
+    found = [
+        (path, match)
+        for path in _every_config_file()
+        for match in re.finditer(r"\baccess_log\b[^;]*;", _directives(path.read_text()))
+    ]
+    assert [(path.name, match.group(0)) for path, match in found] == [
+        ("00-http.conf.template", "access_log /dev/stdout corp_gate;")
+    ]
+    body = re.sub(r"\$\{([A-Z_]+)\}", r"\1", _directives(HTTP_TEMPLATE.read_text()))
+    # A quoted log_format string's braces are JSON, not blocks.
+    body = re.sub(r"'[^']*'", "''", body)
+    access_log = body.index("access_log /dev/stdout corp_gate;")
+    # The http context: not inside a server, map or geo block of the template.
+    assert _depth_at(body, access_log) == 0
+    # Immediately after the log_format it names, never before it.
+    before = [d.strip() for d in re.split(r"[;{}]", body[:access_log]) if d.strip()]
+    assert before[-1].startswith("log_format corp_gate "), before[-1]
+
+
+def test_the_trusted_peer_check_reads_the_real_peer() -> None:
+    body = re.sub(r"\$\{([A-Z_]+)\}", r"@\1@", _directives(HTTP_TEMPLATE.read_text()))
+    geo = re.search(r"geo\s+(\S+)\s+(\S+)\s*\{([^{}]*)\}", body)
+
+    assert geo, body
+    # $realip_remote_addr is the connecting peer; $remote_addr is what it claims.
+    assert (geo.group(1), geo.group(2)) == ("$realip_remote_addr", "$from_trusted_proxy")
+    entries = [line.strip() for line in geo.group(3).splitlines() if line.strip()]
+    assert entries == ["default 0;", "@TRUSTED_GEO_LINES@"]
+    assert len(re.findall(r"^\s*geo\b", body, re.MULTILINE)) == 1
+
+
+def test_real_ip_trusts_only_the_rendered_list() -> None:
+    body = _directives(HTTP_TEMPLATE.read_text())
+
+    assert re.findall(r"^\s*real_ip_header\s+([^;]+);", body, re.MULTILINE) == ["X-Forwarded-For"]
+    assert re.findall(r"^\s*\$\{TRUSTED_SET_REAL_IP_LINES\}\s*$", body, re.MULTILINE)
+    # The only source of set_real_ip_from is the entrypoint's validated expansion.
+    for path in _every_config_file():
+        assert "set_real_ip_from" not in _directives(path.read_text()), path.name
+    assert "real_ip_recursive" not in body
+
+
+def test_the_two_shared_maps_are_defined_once() -> None:
+    body = re.sub(r"\s+", " ", _directives(HTTP_TEMPLATE.read_text()))
+
+    assert "map $http_upgrade $connection_upgrade { default upgrade; '' close; }" in body
+    assert "map $http_host $proxy_host_header { default $http_host; '' $host; }" in body
+    assert body.count("$connection_upgrade {") == 1
+    assert body.count("$proxy_host_header {") == 1
+
+
+def test_no_config_reads_the_inbound_x_forwarded_proto() -> None:
+    for path in _every_config_file():
+        assert "$http_x_forwarded_proto" not in path.read_text().lower(), path.name
 
 
 def _git_ignores(path: str) -> bool:

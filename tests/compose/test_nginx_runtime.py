@@ -12,6 +12,7 @@ Skips without Docker on a laptop and FAILS on CI (``nginx_support.skip_or_fail``
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import shutil
 import subprocess
@@ -33,6 +34,12 @@ from tests.compose.nginx_support import (
     require_compose_cli,
     skip_or_fail,
 )
+
+FIXTURES = Path(__file__).resolve().parent / "nginx_fixtures"
+TEST_ONLY_PROXY_SNIPPET = FIXTURES / "test-only-proxy-locations.inc.template"
+STUB_UPSTREAM_SCRIPT = FIXTURES / "stub_upstream.py"
+STUB_IMAGE = "python:3.12-slim"
+STUB_ALIAS = "stub-upstream"
 
 RENDERED = "/etc/nginx/rendered"
 BOOT_TIMEOUT_SECONDS = 30
@@ -115,23 +122,86 @@ def specs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Spec]:
         result[ROUTING[profile]] = _spec(rendered.services[profile], rendered.project_dir)
     images = {spec.image for spec in result.values()}
     for image in images:
-        if docker("image", "inspect", image).returncode != 0:
-            pulled = docker("pull", image, timeout=300)
-            if pulled.returncode != 0:
-                skip_or_fail(f"cannot pull {image}: {pulled.stderr.strip()[-300:]}")
+        _pull_if_missing(image)
     return result
 
 
+@dataclass(frozen=True)
+class Network:
+    name: str
+    # The peer address nginx sees ($realip_remote_addr) for a request this
+    # test process sends to a published port: the network's gateway.
+    client_peer: str
+
+
+def _pull_if_missing(image: str) -> None:
+    if docker("image", "inspect", image).returncode != 0:
+        pulled = docker("pull", image, timeout=300)
+        if pulled.returncode != 0:
+            skip_or_fail(f"cannot pull {image}: {pulled.stderr.strip()[-300:]}")
+
+
 @pytest.fixture(scope="module")
-def network(specs: dict[str, Spec]) -> Iterator[str]:
+def network(specs: dict[str, Spec]) -> Iterator[Network]:
     # A user-defined network, as compose gives the service: Docker's DNS at
     # 127.0.0.11 (the resolver line) exists only there.
     name = f"corp-nginx-rt-{uuid.uuid4().hex[:8]}"
     created = docker("network", "create", name)
     if created.returncode != 0:
         skip_or_fail(f"cannot create a docker network: {created.stderr.strip()}")
-    yield name
-    docker("network", "rm", name)
+    try:
+        # From the container's side: its default route is the address a
+        # published-port connection arrives from.
+        routes = docker(
+            "run", "--rm", "--network", name, "--entrypoint", "ip", specs["host"].image, "route"
+        )
+        via = re.search(r"^default via (\S+)", routes.stdout, re.MULTILINE)
+        assert via, f"no default route in the container:\n{routes.stdout}{routes.stderr}"
+        yield Network(name, via.group(1))
+    finally:
+        docker("network", "rm", name)
+
+
+@dataclass(frozen=True)
+class Stub:
+    name: str
+
+    def hits(self) -> int:
+        result = docker("logs", self.name)
+        return (result.stdout + result.stderr).count("stub-hit")
+
+
+@pytest.fixture(scope="module")
+def stub_upstream(network: Network) -> Iterator[Stub]:
+    """200 on :8000, refused on :8001, never answers on :8002 — reachable as
+    ``stub-upstream`` from nginx on the same network."""
+    _pull_if_missing(STUB_IMAGE)
+    stub = Stub(f"corp-nginx-stub-{uuid.uuid4().hex[:8]}")
+    launched = docker(
+        "run",
+        "-d",
+        "--name",
+        stub.name,
+        "--network",
+        network.name,
+        "--network-alias",
+        STUB_ALIAS,
+        "-v",
+        f"{STUB_UPSTREAM_SCRIPT}:/stub/stub_upstream.py:ro",
+        STUB_IMAGE,
+        "python",
+        "-u",
+        "/stub/stub_upstream.py",
+    )
+    try:
+        assert launched.returncode == 0, launched.stderr
+        deadline = time.monotonic() + BOOT_TIMEOUT_SECONDS
+        while "stub-ready" not in docker("logs", stub.name).stdout:
+            assert time.monotonic() < deadline, docker("logs", stub.name).stderr
+            time.sleep(0.2)
+        yield stub
+    finally:
+        docker("rm", "-f", stub.name)
 
 
 @pytest.fixture
@@ -141,6 +211,13 @@ def project(tmp_path: Path) -> Path:
     shutil.copytree(NGINX_DIR, project_dir / "nginx")
     (project_dir / "nginx" / "certs").mkdir(exist_ok=True)
     return project_dir
+
+
+def inject_test_only_proxy(project_dir: Path) -> None:
+    """Replace the gateway snippet in the per-test copy — never the tracked one —
+    with locations that proxy to the stub upstream."""
+    target = project_dir / "nginx" / "templates" / "snippets" / "gateway-locations.inc.template"
+    shutil.copy(TEST_ONLY_PROXY_SNIPPET, target)
 
 
 def _environment(spec: Spec, overrides: Mapping[str, str | None]) -> dict[str, str]:
@@ -186,27 +263,78 @@ class Running:
         return docker("exec", self.name, *argv)
 
     def logs(self) -> str:
-        result = docker("logs", self.name)
-        return result.stdout + result.stderr
+        stdout, stderr = self.log_streams()
+        return stdout + stderr
 
-    def status(self, port: int, path: str, host: str, method: str = "GET") -> int:
+    def log_streams(self) -> tuple[str, str]:
+        result = docker("logs", self.name)
+        return result.stdout, result.stderr
+
+    def access_log(self, expected: int) -> list[dict[str, str]]:
+        """The access-log entries for the published listeners (not the loopback
+        health probes), once ``expected`` of them have been written."""
+        deadline = time.monotonic() + 10
+        while True:
+            entries = [
+                entry
+                for entry in _access_entries(self.log_streams()[0])
+                if entry["server_port"] != "8090"
+            ]
+            if len(entries) >= expected or time.monotonic() > deadline:
+                return entries
+            time.sleep(0.2)
+
+    def status(
+        self,
+        port: int,
+        path: str,
+        host: str,
+        method: str = "GET",
+        headers: Mapping[str, str] | None = None,
+    ) -> int:
         """The HTTP status, or 444 when nginx closes the connection with no response."""
         url = f"http://127.0.0.1:{self.ports[port]}{path}"
         with httpx.Client(trust_env=False, timeout=10) as client:
             try:
-                return client.request(method, url, headers={"Host": host}).status_code
+                return client.request(
+                    method, url, headers={"Host": host, **(headers or {})}
+                ).status_code
             except (httpx.RemoteProtocolError, httpx.ReadError):
                 return 444
+
+
+def _corp_gate_fields() -> set[str]:
+    template = (NGINX_DIR / "templates" / "00-http.conf.template").read_text()
+    return set(re.findall(r'"([a-z0-9_]+)":"\$', template))
+
+
+def _access_entries(stdout: str) -> list[dict[str, str]]:
+    """Every stdout line, each of which must be one corp_gate access-log entry."""
+    fields = _corp_gate_fields()
+    entries = []
+    for line in stdout.splitlines():
+        entry = json.loads(line)
+        assert set(entry) == fields, line
+        entries.append(entry)
+    return entries
 
 
 @contextlib.contextmanager
 def started(
     spec: Spec,
     project_dir: Path,
-    network: str,
+    network: Network,
     env: Mapping[str, str | None],
+    *,
+    trust_client: bool = True,
 ) -> Iterator[Running]:
+    """nginx as compose would start it. In behind-proxy every peer outside
+    NGINX_TRUSTED_PROXIES gets a 444, so this test process's peer address is
+    added to the list unless ``trust_client`` is False."""
     running = Running(f"corp-nginx-up-{uuid.uuid4().hex[:8]}")
+    if trust_client and env.get("NGINX_TLS_MODE") == "behind-proxy":
+        listed = env.get("NGINX_TRUSTED_PROXIES") or ""
+        env = {**env, "NGINX_TRUSTED_PROXIES": f"{listed} {network.client_peer}".strip()}
     publish = [arg for target in spec.targets for arg in ("-p", f"127.0.0.1::{target}")]
     argv = [
         "run",
@@ -214,7 +342,7 @@ def started(
         "--name",
         running.name,
         "--network",
-        network,
+        network.name,
         *publish,
         *_run_args(spec, project_dir, env, None),
     ]
@@ -495,7 +623,7 @@ STARTS = [
 def test_a_valid_config_starts(
     specs: dict[str, Spec],
     project: Path,
-    network: str,
+    network: Network,
     routing: str,
     env: dict[str, str],
 ) -> None:
@@ -529,7 +657,7 @@ RENDERED_FILES = {
 
 @pytest.mark.parametrize("routing", ["host", "port"])
 def test_a_valid_behind_proxy_config_renders_only_the_design(
-    specs: dict[str, Spec], project: Path, network: str, routing: str
+    specs: dict[str, Spec], project: Path, network: Network, routing: str
 ) -> None:
     spec = specs[routing]
     with started(spec, project, network, VALID_BEHIND_PROXY) as nginx:
@@ -558,14 +686,19 @@ def test_a_valid_behind_proxy_config_renders_only_the_design(
         # The stock default.conf server: its docroot and its server_name.
         assert "/usr/share/nginx/html" not in dump.stdout
         assert not re.search(r"server_name\s+localhost", dump.stdout)
-        # Without one, nginx's compiled-in `combined` log goes to the image's
-        # /var/log/nginx/access.log -> /dev/stdout, request line and all.
+        # Exactly one, and ours: any other would replace it for its scope, and with
+        # none nginx logs its compiled-in `combined`, request line and all.
         directives = re.sub(r"#[^\n]*", "", dump.stdout)
-        assert re.findall(r"^\s*access_log\s+([^;]+);", directives, re.MULTILINE) == ["off"]
+        assert re.findall(r"^\s*access_log\s+([^;]+);", directives, re.MULTILINE) == [
+            "/dev/stdout corp_gate"
+        ]
+        assert re.findall(r"^\s*error_log\s+([^;]+);", directives, re.MULTILINE) == [
+            "/dev/stderr crit"
+        ]
 
 
 def test_envsubst_substitutes_only_the_listed_names(
-    specs: dict[str, Spec], project: Path, network: str
+    specs: dict[str, Spec], project: Path, network: Network
 ) -> None:
     # A bare `envsubst` (no list) would blank every nginx runtime variable.
     probe = 'map $host $corp_render_probe { default "$remote_addr ${GATEWAY_DOMAIN}"; }'
@@ -600,7 +733,7 @@ UNMATCHED_HOSTS = ("other.example.test", "127.0.0.1", f"{GATEWAY_HOST}.evil.test
 
 
 def test_host_routing_answers_404_for_its_names_and_444_for_any_other(
-    specs: dict[str, Spec], project: Path, network: str
+    specs: dict[str, Spec], project: Path, network: Network
 ) -> None:
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         for host in (GATEWAY_HOST, LANGFUSE_HOST):
@@ -613,7 +746,7 @@ def test_host_routing_answers_404_for_its_names_and_444_for_any_other(
 
 
 def test_a_denied_request_writes_nothing_of_itself_to_the_container_log(
-    specs: dict[str, Spec], project: Path, network: str
+    specs: dict[str, Spec], project: Path, network: Network
 ) -> None:
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         url = f"http://127.0.0.1:{nginx.ports[8080]}/v1/messages?code={LEAK_CANARY}"
@@ -622,15 +755,18 @@ def test_a_denied_request_writes_nothing_of_itself_to_the_container_log(
                 url, headers={"Host": GATEWAY_HOST}, auth=("leak-user", LEAK_CANARY)
             )
         assert response.status_code == 404
+        entries = nginx.access_log(expected=1)
         logs = nginx.logs()
 
     assert LEAK_CANARY not in logs
     assert "leak-user" not in logs
-    assert "/v1/messages" not in logs
+    # The path is logged — as the normalized $uri, once, in the corp_gate line.
+    assert [(e["uri"], e["status"]) for e in entries] == [("/v1/messages", "404")]
+    assert logs.count("/v1/messages") == 1
 
 
 def test_port_routing_answers_404_on_both_ports_whatever_the_host(
-    specs: dict[str, Spec], project: Path, network: str
+    specs: dict[str, Spec], project: Path, network: Network
 ) -> None:
     with started(specs["port"], project, network, VALID_BEHIND_PROXY) as nginx:
         for port in (8080, 8081):
@@ -643,3 +779,196 @@ def test_port_routing_answers_404_on_both_ports_whatever_the_host(
                             method,
                             path,
                         )
+
+
+# --------------------------------------------------------------------------- #
+# the http context: real_ip, the log gate, the trusted-peer gate
+# --------------------------------------------------------------------------- #
+
+
+def _block(dump: str, opener: str) -> list[str]:
+    body = re.search(rf"{re.escape(opener)}\s*\{{([^{{}}]*)\}}", dump)
+    assert body, opener
+    return [line.strip() for line in body.group(1).splitlines() if line.strip()]
+
+
+def test_the_trusted_list_renders_one_real_ip_line_and_one_geo_entry_per_entry(
+    specs: dict[str, Spec], project: Path, network: Network
+) -> None:
+    env = {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": "10.0.0.0/8 192.168.0.0/16"}
+    with started(specs["host"], project, network, env, trust_client=False) as nginx:
+        dump = nginx.exec("nginx", "-T")
+
+    assert dump.returncode == 0, dump.stderr
+    directives = re.sub(r"#[^\n]*", "", dump.stdout)
+    assert re.findall(r"^\s*set_real_ip_from\s+([^;]+);", directives, re.MULTILINE) == [
+        "10.0.0.0/8",
+        "192.168.0.0/16",
+    ]
+    assert re.findall(r"^\s*real_ip_header\s+([^;]+);", directives, re.MULTILINE) == [
+        "X-Forwarded-For"
+    ]
+    assert _block(directives, "geo $realip_remote_addr $from_trusted_proxy") == [
+        "default 0;",
+        "10.0.0.0/8 1;",
+        "192.168.0.0/16 1;",
+    ]
+
+
+PROXY_CANARY = "LEAK-CANARY-7f3a"
+AUTHORIZATION = "Bearer sk-ant-api03-LEAK-AUTH-5d2b"
+CORP_AUTH = "corp-LEAK-TOKEN-8e4a"
+SECRETS = (PROXY_CANARY, AUTHORIZATION, "LEAK-AUTH-5d2b", "LEAK-TOKEN-8e4a")
+CREDENTIALS = {"Authorization": AUTHORIZATION, "X-Corp-Auth": CORP_AUTH}
+
+
+def _assert_no_secret_in(nginx: Running) -> None:
+    stdout, stderr = nginx.log_streams()
+    for secret in SECRETS:
+        assert secret not in stdout, secret
+        assert secret not in stderr, secret
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_a_proxied_success_logs_one_corp_gate_line_and_no_secret(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    stub_upstream: Stub,
+    routing: str,
+) -> None:
+    inject_test_only_proxy(project)
+    hits = stub_upstream.hits()
+    with started(specs[routing], project, network, VALID_BEHIND_PROXY) as nginx:
+        status = nginx.status(
+            8080, f"/stub/ok?code={PROXY_CANARY}", GATEWAY_HOST, headers=CREDENTIALS
+        )
+        entries = nginx.access_log(expected=1)
+        _assert_no_secret_in(nginx)
+
+    assert status == 200
+    assert stub_upstream.hits() == hits + 1
+    assert len(entries) == 1, entries
+    entry = entries[0]
+    assert (entry["uri"], entry["status"], entry["upstream_status"]) == ("/stub/ok", "200", "200")
+    assert entry["upstream_response_time"] not in ("", "-")
+    assert (entry["realip_remote_addr"], entry["from_trusted_proxy"]) == (network.client_peer, "1")
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [("/stub/refused", "502"), ("/stub/slow", "504")],
+    ids=["upstream-refuses", "upstream-times-out"],
+)
+def test_a_failed_upstream_logs_its_status_and_no_secret(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    stub_upstream: Stub,
+    path: str,
+    expected: str,
+) -> None:
+    # At error/warn nginx would write the request line and the upstream URL,
+    # query string included, to stderr for exactly these two failures.
+    inject_test_only_proxy(project)
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        status = nginx.status(
+            8080, f"{path}?code={PROXY_CANARY}", GATEWAY_HOST, headers=CREDENTIALS
+        )
+        entries = nginx.access_log(expected=1)
+        _assert_no_secret_in(nginx)
+
+    assert str(status) == expected
+    assert [(e["uri"], e["status"]) for e in entries] == [(path, expected)]
+    assert entries[0]["upstream_status"] == expected
+
+
+UNTRUSTED_ONLY = "192.0.2.1"
+# (port, path, host) per routing: an admitted (proxied) path, a denied path,
+# and a Host that names neither origin.
+PEER_PROBES = {
+    "host": [
+        (8080, "/stub/ok", GATEWAY_HOST),
+        (8080, "/v1/models", GATEWAY_HOST),
+        (8080, "/", LANGFUSE_HOST),
+        (8080, "/stub/ok", "other.example.test"),
+    ],
+    "port": [
+        (8080, "/stub/ok", GATEWAY_HOST),
+        (8080, "/v1/models", GATEWAY_HOST),
+        (8081, "/", LANGFUSE_HOST),
+        (8080, "/stub/ok", "other.example.test"),
+        (8081, "/", "other.example.test"),
+    ],
+}
+TRUSTED_STATUS = {"/stub/ok": 200, "/v1/models": 404, "/": 404}
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_an_untrusted_peer_gets_no_response_at_all(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    stub_upstream: Stub,
+    routing: str,
+) -> None:
+    assert network.client_peer != UNTRUSTED_ONLY
+    inject_test_only_proxy(project)
+    env = {**VALID_BEHIND_PROXY, "NGINX_TRUSTED_PROXIES": UNTRUSTED_ONLY}
+    hits = stub_upstream.hits()
+    probes = PEER_PROBES[routing]
+    with started(specs[routing], project, network, env, trust_client=False) as nginx:
+        for port, path, host in probes:
+            assert nginx.status(port, path, host, "POST") == 444, (port, path, host)
+        # Naming a trusted address in X-Forwarded-For changes nothing: the gate
+        # reads the peer that connected, not what it claims.
+        spoofed = nginx.status(
+            8080, "/stub/ok", GATEWAY_HOST, headers={"X-Forwarded-For": UNTRUSTED_ONLY}
+        )
+        assert spoofed == 444
+        entries = nginx.access_log(expected=len(probes) + 1)
+        assert nginx.exec(*HEALTH_PROBE).returncode == 0
+
+    assert stub_upstream.hits() == hits
+    assert len(entries) == len(probes) + 1, entries
+    for entry in entries:
+        assert entry["status"] == "444", entry
+        assert entry["realip_remote_addr"] == network.client_peer, entry
+        assert entry["remote_addr"] == network.client_peer, entry
+        assert entry["from_trusted_proxy"] == "0", entry
+        assert entry["upstream_status"] in ("", "-"), entry
+
+
+@pytest.mark.parametrize("routing", ["host", "port"])
+def test_a_trusted_peer_is_served_and_its_forwarded_client_is_logged(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    stub_upstream: Stub,
+    routing: str,
+) -> None:
+    inject_test_only_proxy(project)
+    hits = stub_upstream.hits()
+    probes = PEER_PROBES[routing]
+    client = "203.0.113.9"
+    # Host routing still drops a Host that names neither origin.
+    expected = [
+        444 if routing == "host" and host == "other.example.test" else TRUSTED_STATUS[path]
+        for _, path, host in probes
+    ]
+    with started(specs[routing], project, network, VALID_BEHIND_PROXY) as nginx:
+        statuses = [
+            nginx.status(port, path, host, "POST", {"X-Forwarded-For": client})
+            for port, path, host in probes
+        ]
+        entries = nginx.access_log(expected=len(probes))
+        assert nginx.exec(*HEALTH_PROBE).returncode == 0
+
+    assert statuses == expected
+    assert stub_upstream.hits() == hits + expected.count(200)
+    assert len(entries) == len(probes), entries
+    for entry in entries:
+        assert entry["realip_remote_addr"] == network.client_peer, entry
+        assert entry["from_trusted_proxy"] == "1", entry
+        # real_ip: behind a trusted terminator, the client is its X-Forwarded-For.
+        assert entry["remote_addr"] == client, entry

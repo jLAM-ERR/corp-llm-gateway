@@ -1,19 +1,23 @@
 # behind-proxy, host routing: plain HTTP on the internal hop behind the
 # admins' TLS terminator. A Host that names neither origin gets no response.
+# A peer that is not in NGINX_TRUSTED_PROXIES gets none either.
 
 server {
+    if ($from_trusted_proxy = 0) { return 444; }
     listen 8080 default_server;
     server_name _;
     return 444;
 }
 
 server {
+    if ($from_trusted_proxy = 0) { return 444; }
     listen 8080;
     server_name gateway.${GATEWAY_DOMAIN};
     include /etc/nginx/rendered/snippets/gateway-locations.inc;
 }
 
 server {
+    if ($from_trusted_proxy = 0) { return 444; }
     listen 8080;
     server_name langfuse.${GATEWAY_DOMAIN};
     include /etc/nginx/rendered/snippets/langfuse-locations.inc;
