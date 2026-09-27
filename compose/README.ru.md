@@ -26,9 +26,13 @@
 - **Режим подписки — production.** `docker compose -f docker-compose.yml -f
   docker-compose.oauth.yml up -d`. Требует, чтобы `LITELLM_MASTER_KEY` не
   существовал вовсе, обслуживает только `claude-*` и пробрасывает наверх
-  собственный токен подписки Anthropic разработчика. Токен `X-Corp-Auth`
-  разработчик получает через `scripts/install.sh` (вход в Keycloak →
-  `POST /internal/issue-token`).
+  собственный токен подписки Anthropic разработчика. `scripts/deploy/deploy.sh`
+  разворачивает этот режим по умолчанию. Токен `X-Corp-Auth` разработчик
+  получает через `scripts/install.sh` (вход в Keycloak →
+  `POST /internal/issue-token`), когда выдача настроена, — а этот стек её пока
+  не настраивает: он не передаёт ни одного ключа `CORP_GATEWAY_ISSUE_*` и не
+  монтирует `config.toml` для карты команд (см. «Выдача токенов разработчикам»
+  ниже). До тех пор — `gateway-admin token issue`.
 - **Режим API-ключей (дефолт compose) — только тестовая поза.** `docker compose
   up -d`. `LITELLM_MASTER_KEY` обязателен, запросы несут виртуальный ключ
   LiteLLM, но **выдать его нечем**: route gate отклоняет `/key/*`, админ-UI и
@@ -810,6 +814,36 @@ deployment».
 `settings.py` — `"1"`), поэтому посадка по умолчанию безопасна; не ставьте его в
 `0` в `.env`, не выставив одновременно `CORP_LLM_ORACLE_ENABLED=1`, иначе
 контейнер не поднимется и других предупреждений не будет.
+
+## Лимит одновременных запросов
+
+Сервис `litellm` передаёт ключи лимита одновременных запросов route gate
+(`docs/ops/capacity.md`, `docs/ops/configuration.md`). Чтобы изменить значение,
+задайте ключ в `.env`; закомментированный блок в `.env.example` показывает
+значения по умолчанию.
+
+| Ключ | По умолчанию здесь | Что ограничивает |
+|-----|--------------|----------------|
+| `CORP_LLM_MAX_INFLIGHT` | `64` | одновременные LLM-запросы на этом хосте, слот держится весь стрим; сверх — 429 `E_CAPACITY`. `0` = выключено, при `CORP_ENV=production` старт отказывает |
+| `CORP_LLM_CANCEL_GRACE_SECONDS` | `5` | время на завершение после отключения клиента; слот возвращается не позже 2 × этого |
+| `CORP_LLM_BODY_READ_SECONDS` | `30` | время, за которое должно прийти всё тело, до занятия слота; после — 408 `E_BODY_TIMEOUT` |
+| `CORP_LLM_MAX_DRAINING` | не задан → 4 × лимит | запросы, одновременно читающие тело; передаётся голым именем, чтобы следовать за лимитом |
+| `CORP_LLM_MAX_DRAINING_BYTES` | `536870912` (512 MiB) | байты тел, буферизованные одновременно, — считайте от того, что хост может отдать |
+
+Плохое значение — отказ старта (exit 78) с именем ключа в логе.
+
+## Выдача токенов разработчикам
+
+`POST /internal/issue-token` на этом стеке выключен: сервис `litellm` не
+передаёт ни одного ключа `CORP_GATEWAY_ISSUE_*`, а карта команд
+(`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`) — TOML-таблица, которую может нести только
+смонтированный `config.toml`. Чтобы включить выдачу, добавьте скалярные ключи в
+`environment:` сервиса и смонтируйте `config.toml` с картой в
+`/etc/corp-llm-gateway/config.toml` — `docs/ops/install.md`, «Developer
+onboarding», и `docs/ops/configuration.md`, «Developer token issuance». Схема
+`corp_tokens`, которую подкладывает `deploy.sh`, содержит issuance-колонки, но
+init-скрипты отрабатывают только на пустом томе: на существующем сначала
+повторно примените `tokens/schema.sql` (`docs/ops/upgrade.md`).
 
 ## Операторский CLI (gateway-admin)
 

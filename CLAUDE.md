@@ -30,27 +30,36 @@ src/corp_llm_gateway/
   detectors/    PIIDetector + regex_checksum + dual_ner (RU Natasha + EN spaCy); NerUnavailableError (fail-closed)
   extensions/   ExtensionRegistry + ExtensionSpec (kind/api_version/fail_policy); fail-closed register; api-version gate
   healthz/      live / ready / sanitization / extensions checks + ASGI server (build_health_router, serves /healthz/*)
-                token issuance is not an HTTP route today — operators mint tokens with `gateway-admin token issue`
+                + POST /internal/issue-token: gateway-owned, terminates locally (never reaches litellm), bounded
+                (own in-flight cap + rate, header-only bearer, no body, one store bound); off unless
+                CORP_GATEWAY_ISSUE_OIDC_ISSUER is set. `gateway-admin token issue` is break-glass only
   metrics/      MetricsExporter (noop default / prometheus); emits blocked_requests_total{block_reason} + gateway_failure{component}
   payload/      size threshold + gzip + per-team quota + oversize policy (fail-closed default)
   profiles/     plugin bundles — ProfileBundle/PolicyKnobs(merge) + loaders/resolver + DETECTOR_REGISTRY + manifest (hash-integrity) + defaults/
   providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
   route_gate/   default-deny gate: table.py (hand-classified against litellm's source, guarded by the
-                collector test) + classify.py + middleware.py
+                collector test) + classify.py + middleware.py; litellm's admin/auth/spend/public/UI/non-probe
+                health surfaces are REFUSE (litellm rows 26 PASSTHROUGH / 879 REFUSE / 8 REWRITTEN + 6 gateway rows)
+                + inflight.py: the gateway-owned in-flight cap (CORP_LLM_MAX_INFLIGHT), single owner of `receive`,
+                disconnect-aware cancellation, spawn_shared for tasks several requests await
   rules/        replace.md parser + gazetteer + cached file loader
   sanitizer/    local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator (live profiles)
                 + identity_preamble (rewrite-vs-scan carve-out, see below)
-  settings.py   single source of truth (typed KEYS registry + validate()); config.py delegates; backs `config check`
+  settings.py   single source of truth (typed KEYS registry + validate()); config.py delegates; backs `config check`;
+                capacity() / serving_issuance() are the resolvers the boot and `config check` share
+  pg_session.py bounded asyncpg use (cancel within 0.5 s, then terminate) + store_unavailable() + the boot-probe
+                outcome table (BOOT_PROBE_OUTCOMES: refuse vs warn-and-boot)
   storage/      MappingStore (in-memory + Redis)
   team_config/  TeamConfig (+ profile_ids) + store (in-memory + Postgres) + schema.sql
-  tokens/       schema.sql + AuthMiddleware + TokenIssuer + stores
+  tokens/       schema.sql (+ oidc columns) + AuthMiddleware (single-flight lookup) + TokenIssuer + stores
+                + oidc_verifier (Keycloak RS256) + per-(iss, sub) issuance policy
   litellm_hook.py  CorpLlmGuardrail — LiteLLM callback adapter (sanitize/desanitize incl. OpenAI tool_calls + streaming)
 helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret + HPA/PDB/SA + ServiceMonitor + config-check
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto (2559 passed / 201 skipped on 3.14; 2768 / 40 on 3.12 + litellm 1.101.0,
-                         where NER, RS256 crypto and the entrypoint/route-gate suites actually run)
+tests/                   pytest, pytest-asyncio mode=auto (~3530 passed / ~360 skipped on .venv; ~4200 / 16 on .venv-bench with
+                         Postgres, where NER, RS256 crypto, the Postgres contracts and the entrypoint/route-gate suites run)
 ```
 
 The GA-readiness / security / extensibility build is `docs/plans/20260708-ga-readiness-security-extensibility.md`
@@ -100,8 +109,9 @@ greps the tree for either). Details: `docs/security.md` §14.
 The old three tiers (FunctionCall → JSON → Regex, `sanitizer/engine.py`) still parse the oracle's
 response when it IS called; they are no longer the primary detection path. Local detectors live in
 `detectors/` (`regex_checksum`, `ner_ru`/`ner_en`/`dual_ner`) + `rules/gazetteer.py` +
-`sanitizer/segmenter/`; NER needs Python 3.12 (no 3.14 wheels — lazy imports keep the package
-importable on 3.14 with graceful degradation).
+`sanitizer/segmenter/`. NER runs on 3.12 and 3.14 (the `ner` extra has wheels for both, and brings
+`pymorphy3` for the gazetteer's RU lemmas); lazy imports keep the package importable without the
+extra, with graceful degradation.
 
 Two caches:
 
@@ -114,13 +124,26 @@ Two caches:
 ## Running tests
 
 ```
-# Full unit suite. Local .venv is Python 3.14, no litellm (graceful NER degradation):
-# last known 2558 passed + 201 skipped, ~2min. Authoritative run is Python 3.12
-# (.venv-bench, with the `ner`/`postgres`/`oidc`/`asgi`/`metrics` extras + litellm
-# 1.101.0): 2767 passed + 40 skipped, ~3min — the entrypoint and route-guard suites
-# only RUN there. Always run both before committing.
+# Full unit suite. Local .venv is Python 3.14 with no extras and no litellm (graceful
+# NER degradation): last known ~3530 passed + ~360 skipped, ~4min. The authoritative
+# local run is .venv-bench = Python 3.14.7 with every extra (`ner` incl. pymorphy3,
+# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: ~4200 passed + 16 skipped
+# with Postgres, ~8min — the entrypoint, route-guard, served-stack and container suites
+# only RUN there. CI runs the same suite on 3.12 and 3.14. Always run both before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
-PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs
+NO_PROXY=127.0.0.1,localhost PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs
+
+# NO_PROXY: on a machine with a system HTTP proxy the served-stack tests would talk to
+# the proxy instead of the local server.
+# Postgres-backed tests (token/team stores, issuance races) skip locally without a
+# server and FAIL on CI (CI=true). To run them locally:
+docker run --rm -d --name pg-test -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=gateway \
+  -e POSTGRES_DB=gateway -p 55432:5432 postgres:16
+CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway NO_PROXY=127.0.0.1,localhost \
+  PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs
+# The route-gate container suite (tests/integration/test_route_gate_container.py) builds
+# corp-llm-gateway:route-gate-test-<digest of the build inputs> on first use (CI's
+# integration-container job does the same); CORP_GATEWAY_IMAGE=<image> uses a prebuilt one.
 
 # Single test / file / node
 PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py -q
@@ -141,11 +164,15 @@ docker compose run --rm e2e pytest -q tests/e2e
 - httpx for HTTP, Redis via `redis.asyncio`, fakeredis for tests
 - First-time setup: `pip install -e ".[dev]" && pre-commit install` — `dev` pulls
   `asgi` (litellm[proxy] + fastapi + uvicorn, so `tests/test_asgi_entrypoint.py`
-  runs instead of skipping) and `metrics` (prometheus-client)
+  runs instead of skipping) and `metrics` (prometheus-client). The full suite
+  also wants `ner,postgres,oidc` — `ner` is natasha + spaCy + `pymorphy3` (the
+  gazetteer's RU lemmatizer) — plus the `en_core_web_md` wheel CI installs
 - `.github/workflows/ci.yml` gates every PR: a lint job (`ruff check` AND
   `ruff format --check` — running only `ruff check` locally can still leave
   you with a CI format failure) and a test job running the full pytest suite
-  on Python 3.12 with the `ner`/`postgres`/`oidc`/`asgi`/`metrics` extras + helm
+  on a Python **3.12 + 3.14 matrix** (both legs required, `fail-fast: false`)
+  with the `ner`/`postgres`/`oidc`/`asgi`/`metrics` extras, a Postgres 16
+  service and `CORP_TEST_PG_DSN`, + helm
   render tests
 
 ## CLI entry points
@@ -198,7 +225,21 @@ When adding a new tunable, plumb it through this loader — don't read
    switch (`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` adds PASSTHROUGH rows
    only). Startup exits 78 without litellm's config and 70 without a
    `CorpLlmGuardrail` in `litellm.callbacks` — `docs/security.md` §14,
-   invariant row 7 in §9.
+   invariant row 7 in §9. Two rules under it (rows 7a/7b):
+   - **No slot before the body is complete.** The in-flight limiter drains
+     the whole body under `CORP_LLM_BODY_READ_SECONDS`, `CORP_LLM_MAX_DRAINING`
+     and `CORP_LLM_MAX_DRAINING_BYTES` before it takes a slot; never acquire
+     first. The cap is capacity, not authorization.
+   - **Shared tasks via `inflight.spawn_shared`.** A task more than one
+     request awaits (single-flight lookup, JWKS fetch, a shared refresh) must
+     be started with `spawn_shared`, or one request's disconnect cancels it
+     under every other waiter (`docs/extending.md`).
+
+**Mode A (API keys / litellm virtual keys) is a test posture only; subscription
+mode is production** (DRI decision 2026-09-27). The route gate refuses litellm's
+whole management surface, so nothing can issue a virtual key; `deploy.sh`
+defaults to `--mode oauth`. The container suite seeds a key straight into
+litellm's DB to keep Mode A covered.
 
 **Rewrite-vs-scan carve-out** (`sanitizer/identity_preamble.py`): a fixed client
 protocol literal may be exempt from *rewriting* when the provider matches it

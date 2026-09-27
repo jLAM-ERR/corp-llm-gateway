@@ -1,9 +1,11 @@
 # Upgrade notes
 
-Read before upgrading an existing deployment. Three items need operator action:
-the `team_config` schema change, the RS256 operator-token breaking change, and
+Read before upgrading an existing deployment. Items that need operator action:
+the `team_config` schema change, the issuance columns on `corp_tokens` (before
+enabling developer token issuance), the RS256 operator-token breaking change,
 the new launch command (`python -m corp_llm_gateway.serve`) that the route gate
-requires.
+requires, the refused litellm management surface, the in-flight cap now on by
+default, and `deploy.sh` defaulting to subscription mode.
 
 ## Database schema
 
@@ -52,6 +54,37 @@ layers). `corp_tokens` is unchanged — no token migration needed.
 
 Run this before rolling out the new image, or the team CLI and any team-config
 read on the request path will error.
+
+### Before enabling developer token issuance: re-run `tokens/schema.sql`
+
+`POST /internal/issue-token` records the Keycloak identity each token was minted
+for. `tokens/schema.sql` adds three nullable columns to `corp_tokens`
+(`oidc_issuer`, `oidc_subject`, `oidc_jti`), a unique index
+`corp_tokens_oidc_jti_key` on `oidc_jti` and a lookup index — all
+`IF NOT EXISTS`. Re-run it **before** setting `CORP_GATEWAY_ISSUE_OIDC_ISSUER`:
+
+```
+psql "$CORP_LLM_PG_DSN" -f src/corp_llm_gateway/tokens/schema.sql
+```
+
+Existing rows and CLI-issued tokens keep NULLs; nothing else changes. The index
+builds are plain `CREATE INDEX`, which blocks writes to `corp_tokens` while they
+run — seconds on a token table, but run it outside peak. With issuance on, the
+entrypoint checks this at boot and exits 78 naming the fix when a column or the
+index is missing.
+
+**An INVALID index.** If a `CREATE INDEX CONCURRENTLY` or a `REINDEX` of
+`corp_tokens_oidc_jti_key` was interrupted, the index exists but is INVALID, and
+re-running `schema.sql` skips it (`IF NOT EXISTS` sees the name). The boot
+refuses with exit 78 and says so. Fix:
+
+```
+DROP INDEX corp_tokens_oidc_jti_key;          -- or: REINDEX INDEX corp_tokens_oidc_jti_key;
+\i src/corp_llm_gateway/tokens/schema.sql
+```
+
+The same `DROP INDEX` then `schema.sql` applies when an index of that name exists
+but is not a UNIQUE index on `oidc_jti` alone.
 
 ## RS256 operator-token breaking change (F11)
 
@@ -264,6 +297,33 @@ review: `../security.md` §14, "The management surface is refused".
   to crash the import. Remove any such item before rolling out.
 
 No data migration. Rollback is a redeploy of the previous image tag.
+
+## The in-flight cap is on by default (64 per pod)
+
+**Behaviour change.** Every pod now admits at most `CORP_LLM_MAX_INFLIGHT` (64)
+concurrent LLM requests, a slot held for the whole stream; the next gets
+`429 E_CAPACITY` with `Retry-After: 1`. Bodies must arrive within 30 s (408
+`E_BODY_TIMEOUT`), and body memory is capped at 512 MiB per pod
+(`CORP_LLM_MAX_DRAINING_BYTES`). Before rolling out, size replicas by concurrent
+streams (`capacity.md`, "Sizing formula") and check that every capacity value you
+set is in range: the entrypoint exits 78 on a bad one, and on
+`CORP_LLM_MAX_INFLIGHT=0` under `CORP_ENV=prod`. Watch
+`corp_llm_gateway_blocked_requests_total{block_reason="capacity"}` after the
+rollout.
+
+**Behind PgBouncer**, add the keepalive parameters to
+`ignore_startup_parameters` before this rollout (`configuration.md`,
+"Backends"): the gateway's Postgres pools now send them, and PgBouncer refuses
+the connection otherwise — every LLM request would answer 503.
+
+## `deploy.sh` defaults to subscription mode
+
+`scripts/deploy/deploy.sh` without `--mode` now deploys `--mode oauth`
+(`docker-compose.yml` + `docker-compose.oauth.yml`), the production mode. A host
+deployed in API-key mode must now be driven with `--mode virtual-keys` on
+**every** run — `up`, `logs`, `status`, `down`, `restart`. A bare run against
+such a host would recreate the stack in subscription mode, which then refuses to
+boot because its `.env` still has `LITELLM_MASTER_KEY`.
 
 ## `CORP_LLM_STRIP_INBOUND_HEADERS` now defaults to `1`
 

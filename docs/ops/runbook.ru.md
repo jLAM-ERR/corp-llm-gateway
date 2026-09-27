@@ -143,6 +143,67 @@ staging-гейта апгрейда (согласно задаче M0-7 в пл�
    Рост `internal` означает баг в собственном pre/post-call коде шлюза, а не
    отказ провайдера и не дубль блокировки конкретного компонента.
 
+### 429 `E_CAPACITY` / 408 `E_BODY_TIMEOUT`
+
+Симптом: клиенты получают 429 с `Retry-After: 1` или 408; растёт
+`corp_llm_gateway_blocked_requests_total{block_reason="capacity"}` или
+`{block_reason="body_timeout"}`.
+
+Поведение: лимит одновременных запросов (`capacity.ru.md`). 429 — на этом pod'е
+заняты все слоты (`CORP_LLM_MAX_INFLIGHT`), все места чтения тела
+(`CORP_LLM_MAX_DRAINING`) или бюджет байтов тел
+(`CORP_LLM_MAX_DRAINING_BYTES`); 408 — тело не пришло целиком за
+`CORP_LLM_BODY_READ_SECONDS`. До litellm и провайдера ничего не дошло.
+
+Действия:
+1. `gateway_inflight_requests` на пределе на всех pod'ах: реальная нагрузка.
+   Добавьте реплики; не поднимайте лимит выше того, что тянут CPU и память
+   одного pod'а.
+2. `gateway_draining_bytes` у бюджета при свободных слотах: большие тела.
+   Поднимайте `CORP_LLM_MAX_DRAINING_BYTES`, только если позволяет лимит памяти.
+3. Постоянные 408 от одного источника при свободных слотах: медленный или
+   зависший клиент либо зондирование. На шлюзе чинить нечего.
+4. Рядом `gateway_failure{component="route_gate"}`: отменённый запрос не
+   завершился за свой бюджет; слот всё равно освобождён. Заведите задачу со
+   строкой лога `route_gate_cancel_*`.
+
+### 503 `E_STORE_UNAVAILABLE` / 503 `E_PROFILE_UNAVAILABLE` (Postgres)
+
+Симптом: каждый LLM-запрос отвечает 503; растёт
+`gateway_failure{component="token_store"}` (`E_STORE_UNAVAILABLE`) или
+`gateway_failure{component="team_config"}` (`E_PROFILE_UNAVAILABLE`).
+
+Поведение: fail-closed. Каждый переписываемый запрос ищет свой corp-токен
+(граница 6 с) и читает конфигурацию своей команды (граница 5 с), даже если у
+команды нет профилей; хранилище, которое не может ответить, отклоняет запрос, а
+не пропускает его без аутентификации или без профиля. `E_PROFILE_UNAVAILABLE`
+без `component="team_config"` — это сломанный профиль.
+
+Действия:
+1. Проверьте доступность Postgres (и PgBouncer, если он есть) из pod'а; строка
+   лога несёт только класс исключения драйвера.
+2. За PgBouncer убедитесь, что `ignore_startup_parameters` перечисляет
+   параметры keepalive (`configuration.md`, «Backends»).
+3. Как только хранилище отвечает, всё восстанавливается само; сбрасывать кэш
+   не нужно.
+
+### Выдача токена разработчику не удаётся
+
+Симптом: `scripts/install.sh` печатает HTTP-статус и код ошибки
+`POST /internal/issue-token`.
+
+| Код | Статус | Значение / действие |
+|---|---|---|
+| `E_ISSUE_DISABLED` | 404 | выдача выключена (`CORP_GATEWAY_ISSUE_OIDC_ISSUER` не задан) |
+| `E_OIDC_*` | 401 | токен Keycloak не прошёл проверку — клиент, audience или groups-маппер (`install.md`, «Keycloak realm and client») |
+| `E_ISSUE_NO_TEAM` / `E_ISSUE_UNKNOWN_TEAM` | 403 | нет группы из карты / команды из карты нет (`gateway-admin team create`) |
+| `E_ISSUE_RATE` | 403 | выдача раньше `CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS`; подождите — отзыв это не сбрасывает |
+| `E_ISSUE_REPLAY` | 403 | этот токен Keycloak уже использован; запустите установщик ещё раз |
+| `E_ISSUE_INFLIGHT` / `E_ISSUE_THROTTLED` | 429 | собственные лимиты маршрута; повторите |
+| `E_ISSUE_BUSY` | 503 | блокировка субъекта или запрос к базе не уложились (5 с / 8 с); повторите |
+| `E_JWKS_UNAVAILABLE` | 503 | pod не может загрузить JWKS Keycloak — NetworkPolicy (`networkPolicy.keycloak`), CA bundle, сам Keycloak |
+| `E_ISSUE_STORE_TIMEOUT` / `E_ISSUE_STORE_UNAVAILABLE` | 503 | Postgres медленный или недоступен (см. выше) |
+
 ### Отзыв токена не подействовал сразу
 
 Симптом: `gateway-admin token revoke --user alice` выполнена, но трафик

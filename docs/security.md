@@ -479,6 +479,8 @@ scoped by the k8s log collector, and a different trust model applies.
 | — | **Depth-guard fail-closed** (`_MAX_JSON_DEPTH=64` → `400 E_BAD_REQUEST` on sanitize) | `content_blocks.py`, `litellm_hook.py` |
 | — | **NEVER gate, in-process (recursive, primary) + Vector (flat backstop)** (defense in depth) | `audit/invariants.py` + Vector VRL |
 | 7 | **Default-deny route gate**: no request reaches a provider unless the table says the hook rewrites its body, and the gateway does not serve at all unless that hook is registered. An unclassified `(method, path)` is refused; an unarmed gate refuses every rewritten route; startup exits rather than serve half-configured (§14) | `route_gate/table.py` + `tests/route_gate/test_litellm_route_guard.py` + `asgi.py` (exit 78 / 70) |
+| 7a | **The issuance surface terminates in the gateway and is bounded**: `POST /internal/issue-token` never reaches litellm; header-only bearer, no body, own in-flight cap and rate, per-subject minting under an advisory lock, one store bound; error bodies and logs carry codes only (§14) | `route_gate/table.py` (`GATEWAY_ROUTE_TABLE`) + `healthz/server.py` + `tests/invariants/test_issuance_no_leak.py` + `tests/invariants/test_issuance_error_codes.py` |
+| 7b | **The limiter's refusals never inspect, echo or log the body, and no slot is held before the body is complete**: `E_CAPACITY` (429), `E_BODY_TIMEOUT` (408), `oversize:blocked` (422) answer before auth, litellm and the sanitizer; a task several requests share is started with `inflight.spawn_shared` and never cancelled by one request's disconnect; the cap is not authorization (§14) | `route_gate/inflight.py` + `tests/route_gate/test_inflight.py` + `tests/test_inflight_served_stack.py` |
 
 ## 10. Forensic breadcrumbs (incident investigation)
 
@@ -855,20 +857,67 @@ rewritten route rather than forward it.
 `POST /internal/issue-token` is the one body-method row in `GATEWAY_ROUTE_TABLE`.
 It is PASSTHROUGH so the gate hands it to the gateway's own `HealthRouter`, which
 answers it and never forwards it to litellm — with issuance off
-(`CORP_GATEWAY_ISSUE_OIDC_ISSUER` unset) it is a local 404 for every method.
-When on, it is bounded like any public endpoint: the Keycloak access token comes
-from the `Authorization: Bearer` header only, any request body byte is refused
-(400; the read stops at 1 KiB and at 2 s, 408), the route has its own in-flight
-cap and token bucket (`CORP_GATEWAY_ISSUE_MAX_INFLIGHT` / `_RATE_PER_MINUTE`, 429
-without queueing), and the JWKS fetch has its own timeout (503). Error bodies
-carry a code only, and the one log line per request carries the status and the
-code — never the bearer, the minted token, `sub`, groups or username
-(`tests/invariants/test_issuance_no_leak.py`). Issuance needs Postgres: set
-without `CORP_LLM_PG_DSN`, partially configured, or against a `corp_tokens`
-table that predates `tokens/schema.sql`'s issuance columns, the entrypoint exits
-78 at boot. The issuer's work after the body is bounded by
-`CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS` (503 `E_ISSUE_STORE_TIMEOUT`; a
-connection-class store failure is 503 `E_ISSUE_STORE_UNAVAILABLE`).
+(`CORP_GATEWAY_ISSUE_OIDC_ISSUER` unset) it is a local 404 `E_ISSUE_DISABLED`
+for every method. It never takes an in-flight slot. When on, it is bounded like
+any public endpoint, in this order:
+
+1. **Route caps, before any work.** Its own in-flight cap
+   (`CORP_GATEWAY_ISSUE_MAX_INFLIGHT`, default 4) and token bucket
+   (`CORP_GATEWAY_ISSUE_RATE_PER_MINUTE`, default 30), answered 429
+   `E_ISSUE_INFLIGHT` and 429 `E_ISSUE_THROTTLED` without queueing; a request
+   refused by the first spends no bucket token.
+2. **No body.** The Keycloak access token comes from the `Authorization:
+   Bearer` header only. Any request body byte is refused (400 `E_ISSUE_BODY`);
+   the read stops at 1 KiB and at 2 s (408 `E_ISSUE_BODY_TIMEOUT`).
+3. **The JWT.** RS256 only; `exp`, `iat`, `iss`, `aud`, `sub`, `jti` and `azp`
+   required; `aud` must include `CORP_GATEWAY_ISSUE_OIDC_AUDIENCE` and must not
+   include the operator audience `CORP_GATEWAY_OIDC_AUDIENCE` (the two must
+   differ — config check and boot refuse otherwise); `azp` must equal
+   `CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID`. The JWKS fetch is HTTPS (in prod), no
+   redirects, 3 s, 64 KiB, one shared in-flight refresh, and it is verified
+   against `CORP_LLM_CA_BUNDLE` when set. A failure is 401 `E_OIDC_*`; a JWKS
+   that cannot be fetched is 503 `E_JWKS_UNAVAILABLE`.
+4. **Team.** The first group of `CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`, in the map's
+   order, that the user belongs to names the team; none is 403 `E_ISSUE_NO_TEAM`,
+   and a mapped team that does not exist is 403 `E_ISSUE_UNKNOWN_TEAM` — the
+   gateway never creates a team from claims.
+5. **Minting policy, per `(iss, sub)`, in one Postgres transaction** under a
+   transaction-scoped advisory lock (so replicas serialise, not just one
+   process): a `jti` already used is 403 `E_ISSUE_REPLAY` (a unique index is the
+   backstop); a second issuance within `CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS`
+   is 403 `E_ISSUE_RATE` (revoked and expired rows count, so revoking does not
+   reset it); past `CORP_GATEWAY_ISSUE_MAX_ACTIVE` live tokens the oldest are
+   revoked. The transaction runs with `lock_timeout` 5 s and
+   `statement_timeout` 8 s; either firing is 503 `E_ISSUE_BUSY`.
+6. **One bound over steps 3-5**: `CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS`
+   (default 10, 5-300). Past it the request answers 503 `E_ISSUE_STORE_TIMEOUT`
+   and frees its slot; a connection-class store failure is 503
+   `E_ISSUE_STORE_UNAVAILABLE`; anything else is 500 `E_ISSUE_INTERNAL`. A
+   cancelled statement gets a server-side cancel request within 0.5 s, then its
+   connection is terminated (`pg_session.py`).
+
+Success is 200 `{"corp_token", "expires_at"}`. Every issuance response carries
+`cache-control: no-store`. Error bodies carry a code only, and the one log line
+per request carries the status and the code — never the bearer, the minted
+token, `sub`, groups or username (`tests/invariants/test_issuance_no_leak.py`;
+the code set is pinned by `tests/invariants/test_issuance_error_codes.py`).
+
+**Boot.** Issuance needs Postgres. The entrypoint exits 78 when it is set without
+`CORP_LLM_PG_DSN`, partially configured, missing the `oidc` or `postgres` extra,
+naming an unreadable `CORP_LLM_CA_BUNDLE`, or when Postgres refuses the DSN
+(credentials, database name, syntax), the TLS handshake (including a DSN
+`sslmode=require|verify-*` the server declines), or the privilege to read
+`corp_tokens`, and when `corp_tokens` lacks the issuance columns or a valid
+unique index `corp_tokens_oidc_jti_key` on `oidc_jti` alone. A Postgres the
+network cannot reach (08xxx, 57P0x, 53300, a socket error) warns and boots;
+readiness reports it (`pg_session.BOOT_PROBE_OUTCOMES`).
+
+**The runtime auth path is bounded too.** Every rewritten request looks its
+`X-Corp-Auth` token up in the same store: one lookup per token at a time
+(single-flight, started outside the request so one caller's disconnect cannot
+cancel it for the others), a 5 s statement bound and 6 s overall. A store that
+cannot answer is 503 `E_STORE_UNAVAILABLE` with
+`gateway_failure{component="token_store"}` — never a pass.
 
 ### The management surface is refused
 
@@ -879,8 +928,10 @@ API, spend analytics, login / SSO / invitations, the unauthenticated public
 catalogue, UI assets, `GET /` and `GET /routes`, lazy-router warm-up and the
 non-probe `/health/*` rows — 462 admin-family rows plus 8 health rows. In
 litellm 1.101.0 the litellm tables hold 26 PASSTHROUGH / 879 REFUSE / 8
-REWRITTEN rows (913); `tests/route_gate/test_table.py` pins those counts and
-that no admitted row carries a refused-family reason.
+REWRITTEN rows (913), plus 6 PASSTHROUGH rows in the gateway's own
+`GATEWAY_ROUTE_TABLE` (the `/healthz/*` probes, `/metrics` and the issuance
+route); `tests/route_gate/test_table.py` pins those counts and that no admitted
+row carries a refused-family reason.
 
 **Why refuse, not gate by network.** Nothing the gateway needs at runtime lives
 in litellm's management plane. Identity is the opaque `X-Corp-Auth` token in the
@@ -933,26 +984,52 @@ a key up.
 
 An armed REWRITTEN request also takes a slot in the gateway's in-flight limiter
 (`route_gate/inflight.py`, `CORP_LLM_MAX_INFLIGHT`, default 64 per pod) and holds
-it for the whole request, stream included; with every slot taken the gate answers
-429 `E_CAPACITY` (`block_reason` `capacity`) before litellm or the sanitizer runs.
-PASSTHROUGH routes never count. The cap is the gateway's because litellm's own is
-dead here: litellm 1.101.0 honours `general_settings.global_max_parallel_requests`
-only in its legacy limiter (selected by `LEGACY_MULTI_INSTANCE_RATE_LIMITING`), and
-no shipped config sets either. The limiter is the single reader of the request's
-`receive`: it drains the body (a body over 25 MiB is `oversize:blocked`, 422),
-replays it to litellm, and watches the socket, so a client that disconnects —
-during our pre-call hook, before the first byte or mid-stream — gets its request
-cancelled, its leftover tasks cancelled, one `cancelled` audit record with counts
-only, and its slot back within 2 × `CORP_LLM_CANCEL_GRACE_SECONDS`
-(`docs/ops/capacity.md`). The body is read BEFORE a slot is taken and before any
-authentication, so it is bounded twice: it must arrive within
-`CORP_LLM_BODY_READ_SECONDS` (408 `E_BODY_TIMEOUT`), and at most
-`CORP_LLM_MAX_DRAINING` requests read one at once (429 unread) — an
-unauthenticated client that never finishes its body holds no slot. A task that
-several requests await (the per-token auth lookup, the JWKS fetch) is started
-outside every request (`inflight.spawn_shared`), so one caller's disconnect never
-cancels it under the others. The cap is capacity, not authorization: it decides
-how many requests run, never which.
+it for the whole request, stream included. PASSTHROUGH routes (probes, model
+listing, the issuance route) never count. The cap is the gateway's because
+litellm's own is dead here: litellm 1.101.0 honours
+`general_settings.global_max_parallel_requests` only in its legacy limiter
+(selected by `LEGACY_MULTI_INSTANCE_RATE_LIMITING`), and no shipped config sets
+either.
+
+**No slot before the body is complete.** The limiter is the single reader of the
+request's `receive`. It drains the whole body first, before any slot is taken
+and before any authentication, and only then tries to acquire; so the body is
+bounded on its own:
+
+- it must arrive within `CORP_LLM_BODY_READ_SECONDS` (default 30): past it 408
+  `E_BODY_TIMEOUT` (`block_reason` `body_timeout`);
+- at most `CORP_LLM_MAX_DRAINING` requests read a body at once (default 4 ×
+  the cap): the next gets 429 `E_CAPACITY` unread;
+- all buffered body bytes, being read or held for an admitted request until it
+  ends, share `CORP_LLM_MAX_DRAINING_BYTES` (default 512 MiB): a declared
+  `Content-Length`, or a chunk, that would pass it gets 429 `E_CAPACITY` and
+  gives back what it held;
+- one body over 25 MiB is `oversize:blocked`, 422.
+
+An unauthenticated client that never finishes its body therefore holds no slot,
+and one that finishes it after the last slot went gets 429 then. Every
+`E_CAPACITY` carries `Retry-After: 1` and is counted as
+`corp_llm_gateway_blocked_requests_total{block_reason="capacity"}`; the limiter
+answers before litellm or the sanitizer runs, and none of its refusals reads,
+echoes or logs the body.
+
+**Disconnects end the request.** The limiter replays the body to litellm and
+watches the socket. A client that disconnects — during our pre-call hook, before
+the first byte or mid-stream — gets its request cancelled, its leftover tasks
+cancelled, one `cancelled` audit record with counts only (`E_CLIENT_DISCONNECTED`)
+and its slot back within 2 × `CORP_LLM_CANCEL_GRACE_SECONDS`
+(`docs/ops/capacity.md`). A pre-call litellm reaches after the cancel is refused
+408 `E_CLIENT_DISCONNECTED` and writes no second record.
+
+**Shared tasks are never a request's.** A task that several requests await (the
+per-token auth lookup, the JWKS fetch) is started outside every request
+(`inflight.spawn_shared`), and litellm's logging worker is started in the
+lifespan and never tagged, so one caller's disconnect never cancels work under
+the others or stops later audit callbacks.
+
+**The cap is capacity, not authorization.** It decides how many requests run,
+never which: every admitted request still passes the corp-token check, the
+sanitizer, the DLP guard and the audit, and a refusal here grants nothing.
 
 ### Consequences to know
 
@@ -969,11 +1046,16 @@ how many requests run, never which.
   a mounted ASGI app, so `/ui`, `/swagger`, `/docs`, `/openapi.json` and the
   other mounts get no table entry and are refused as unlisted. The JSON admin
   API (`/key/*`, `/team/*`, …) is pinned route by route as REFUSE — see "The
-  management surface is refused" below.
+  management surface is refused" above.
 - **`HEAD` on a litellm route answers 405, not a refusal.** The gate's rule is
   that HEAD inherits its path's GET verdict, so it is admitted — but FastAPI's
   `APIRoute`, unlike a plain Starlette `Route`, does not add HEAD to a GET route,
   so litellm answers 405. The gateway's own `HEAD /healthz/*` answers 200.
+- **An unreachable team-config store stops every rewritten request.** The
+  guardrail reads the caller's team config on every request, even for a team
+  with no profiles, and a store that cannot answer within its bound (5 s) is
+  503 `E_PROFILE_UNAVAILABLE` with `gateway_failure{component="team_config"}`
+  — fail-closed, never an un-profiled pass (`docs/ops/runbook.md`).
 - **Background responses are unsupported, not blocked.** `POST /v1/responses`
   with `background: true` is admitted and the upstream body is sanitized, but the
   client then polls `GET /v1/responses/{id}`, which re-runs under a different

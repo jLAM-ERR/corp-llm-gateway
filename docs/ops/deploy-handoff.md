@@ -200,16 +200,17 @@ stages the token-store SQL schema, syncs `compose/`, runs `pull` + `up -d` and
 waits for the healthchecks.
 
 ```
-# mode A
+# mode B — subscription, the production mode (the default)
 scripts/deploy/deploy.sh --host user@server up
 
-# mode B
-scripts/deploy/deploy.sh --host user@server --mode oauth up
+# mode A — API keys, a test posture only
+scripts/deploy/deploy.sh --host user@server --mode virtual-keys up
 ```
 
 **The same `--mode` must be passed to every later run against that host** —
 `logs`, `status`, `down` and `restart` all resolve the stack through this file
-list. A run without `--mode oauth` reports on (or recreates) a different stack.
+list. On a mode A host, a run without `--mode virtual-keys` reports on (or
+recreates) a different stack.
 
 Other subcommands: `down` (volumes survive, asks for confirmation), `restart`,
 `logs`, `status`. Useful flags: `--dry-run`, `--yes`, `--dir PATH`,

@@ -18,10 +18,11 @@
 | Стек | `compose/` | `compose/` + `docker-compose.oauth.yml` |
 | Credential наверх | собственные `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` шлюза | OAuth-токен самого разработчика, пробрасывается |
 | Разработчик шлёт | `Authorization: Bearer <виртуальный ключ litellm>` | `Authorization: Bearer <OAuth-токен>` |
-| Идентичность команды | `X-Corp-Auth: <токен команды>` | `X-Corp-Auth: <токен команды>` |
+| Идентичность команды | `X-Corp-Auth: <corp-токен>` | `X-Corp-Auth: <corp-токен>`, выданный `scripts/install.sh` через Keycloak |
 | `LITELLM_MASTER_KEY` | **обязателен** | **должен отсутствовать** |
 | Обслуживаемые маршруты | `claude-*`, `gpt-*`, `corp-*` | только `claude-*` |
-| Отзыв ключа / учёт расходов по разработчику | нет — `/key/*` и admin UI отклоняются | нет |
+| Отзыв доступа разработчика | только corp-токен (`gateway-admin token revoke`) — `/key/*` и admin UI отклоняются | corp-токен (`gateway-admin token revoke`) |
+| Учёт расходов / бюджеты по разработчику | нет | нет |
 | Статус | **только тестовая поза** | **production** |
 | Аудит | Vector → Langfuse / S3 / SIEM | так же |
 
@@ -83,15 +84,17 @@ chmod 0600 .env
 docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d
 ```
 
-С ноутбука, на сервер, подготовленный `scripts/deploy/bootstrap-server.sh`:
+С ноутбука, на сервер, подготовленный `scripts/deploy/bootstrap-server.sh`
+(`--mode oauth` — режим по умолчанию, его можно не указывать):
 
 ```
 scripts/deploy/deploy.sh --host user@server --mode oauth up
 ```
 
-Передавайте **тот же** `--mode oauth` во все последующие запуски по этому хосту:
-`logs`, `status`, `down` и `restart` резолвят стек через этот список файлов, и
-запуск с одним базовым файлом покажет (или пересоздаст) другой стек.
+Все последующие запуски по этому хосту должны резолвить тот же список файлов,
+включая `logs`, `status`, `down` и `restart`. Для этого режима это делает
+значение по умолчанию; хостом в режиме A нужно управлять с `--mode virtual-keys`
+в каждом запуске, иначе голый запуск пересоздаст его в этом режиме.
 
 **Для автозапуска при загрузке хоста раскомментируйте `COMPOSE_FILE` в `.env`:**
 
@@ -144,12 +147,22 @@ litellm всё равно никого не аутентифицирует, и �
 
 ### Чем платим и что нужно закрыть
 
-В режиме B **нет виртуальных ключей на разработчика**, а значит нет ни отзыва, ни
-учёта расходов по конкретному человеку через UI. Идентичность команды,
-санитизация и аудит не меняются: разработчики по-прежнему шлют
-`X-Corp-Auth: <токен команды>`, шлюз проверяет его в `pre_call` по Postgres-
-хранилищу токенов, и запрос без валидного токена отклоняется
-(`MissingTokenError` / `InvalidTokenError`).
+В режиме B **нет виртуальных ключей на разработчика**, а значит нет учёта
+расходов по конкретному человеку через UI LiteLLM. Идентичность, санитизация и
+аудит не меняются: разработчики шлют `X-Corp-Auth: <corp-токен>`, шлюз
+проверяет его в `pre_call` по Postgres-хранилищу токенов, и запрос без валидного
+токена отклоняется (`MissingTokenError` / `InvalidTokenError`). Corp-токен —
+личный: `scripts/install.sh` выпускает его через Keycloak на
+`POST /internal/issue-token`, когда выдача настроена (`install.md`, «Developer
+onboarding»), а `gateway-admin token revoke --user` отзывает. Этот compose-стек
+пока не передаёт ключи `CORP_GATEWAY_ISSUE_*` и не монтирует `config.toml`, в
+котором нужна карта команд, поэтому до тех пор corp-токены здесь выдаёт
+`gateway-admin token issue` (аварийный путь).
+
+**Postgres за PgBouncer.** Пулы шлюза передают параметры TCP keepalive при
+старте соединения; PgBouncer их отвергает, если они не перечислены в
+`ignore_startup_parameters` (`configuration.md`, «Backends»). Без этого падает
+каждое обращение к хранилищу, и каждый LLM-запрос отвечает 503.
 
 **Собственные management-эндпоинты litellm отклоняются, в обоих режимах.** Без
 мастер-ключа litellm принимает любого как internal user

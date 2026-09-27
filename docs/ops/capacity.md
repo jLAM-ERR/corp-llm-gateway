@@ -135,6 +135,28 @@ The route gate caps concurrent LLM requests per pod. The cap is
   selected by `LEGACY_MULTI_INSTANCE_RATE_LIMITING`, and that limiter skips
   `/v1/messages`. No shipped config sets either, and a render test keeps it so.
 
+### Sizing formula
+
+Per pod, with *S* concurrent streams expected at peak:
+
+- **replicas** = ceil(*S* / `CORP_LLM_MAX_INFLIGHT`), plus one for a rollout or
+  a lost pod. The cap is per pod; the HPA scales on CPU, not on 429s, so size
+  the minimum replica count by streams.
+- **body memory** = min(`CORP_LLM_MAX_DRAINING` × 25 MiB,
+  `CORP_LLM_MAX_DRAINING_BYTES`) — in practice the byte budget. This is the
+  memory knob: pod memory limit ≥ NER models + litellm + the sanitizer's copies
+  + this budget. Raise the cap without raising the budget and large bodies get
+  429 before the slots fill.
+- **slot turnover after a disconnect** ≤ 2 × `CORP_LLM_CANCEL_GRACE_SECONDS`
+  (default 10 s).
+- **issuance** is outside all of this: its own `CORP_GATEWAY_ISSUE_MAX_INFLIGHT`
+  (4) and `CORP_GATEWAY_ISSUE_RATE_PER_MINUTE` (30) per pod; a developer needs
+  it once per `CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS`.
+
+Every fixed bound behind these numbers (the 25 MiB body cap, statement and
+lookup timeouts, pool release budgets) is listed in `configuration.md`, "Fixed
+bounds".
+
 ### Client disconnects
 
 uvicorn does not stop a request whose client went away; the limiter does. It
@@ -190,9 +212,11 @@ Working set estimate at Phase 3:
 
 ## Postgres
 
-Single HA pair. Read load is dominated by token lookups (cached 60s in `AuthMiddleware`, so steady ≤ 1 QPS even at Phase 3). Write load is negligible — token issuance + team config edits are admin-driven.
+Single HA pair. Read load is dominated by token lookups (cached 60s in `AuthMiddleware`, so steady ≤ 1 QPS even at Phase 3) and by the team-config read every rewritten request makes. Write load is small: developer token issuance is bounded per pod (`CORP_GATEWAY_ISSUE_RATE_PER_MINUTE`) and per developer (`CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS`), and team config edits are admin-driven.
 
-No tuning needed at Phase 0–3 sizes.
+Both are on the request path, and both fail closed: a token store that cannot answer within its bound is 503 `E_STORE_UNAVAILABLE`, a team-config store 503 `E_PROFILE_UNAVAILABLE` (`runbook.md`). Postgres availability is gateway availability.
+
+No tuning needed at Phase 0–3 sizes. Behind PgBouncer, set `ignore_startup_parameters` for the keepalive parameters (`configuration.md`, "Backends").
 
 ## Sizing review cadence
 

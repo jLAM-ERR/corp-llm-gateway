@@ -49,6 +49,16 @@ team-x   Team X  90        7           -
 
 Issue, revoke, and list corp tokens.
 
+**`token issue` is break-glass only.** Developers get their corp token from
+`scripts/install.sh`, which signs them in to Keycloak and calls
+`POST /internal/issue-token` (`install.md`). Use `token issue` when that path is
+down or for a service account. A CLI-issued token carries no Keycloak identity:
+it does not count toward the per-developer cap
+(`CORP_GATEWAY_ISSUE_MAX_ACTIVE`) or the issuance interval. `token revoke --user`
+revokes both kinds; for an issued token the user is the Keycloak
+`preferred_username` (or `sub`, if the claim is absent —
+`CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM`).
+
 ```
 gateway-admin token issue --user alice --team team-x [--scopes a,b] [--ttl-days 30] [--json]
 gateway-admin token revoke --user alice
@@ -135,6 +145,20 @@ $ echo $?
 `--no-probe` validates config only (skips the Postgres / Redis / corp-LLM
 reachability probes). `--json` emits a machine-readable report and still sets
 the exit code.
+
+It runs the same resolvers the entrypoint's boot check runs, so it also reports:
+
+- **issuance** — a partial or out-of-range `CORP_GATEWAY_ISSUE_*` set, an
+  issuance audience equal to the operator audience, HTTP issuer/JWKS URLs under
+  `CORP_ENV=prod`, issuance without `CORP_LLM_PG_DSN`, and (with issuance on)
+  the missing `oidc` / `postgres` extras and an unreadable or non-PEM
+  `CORP_LLM_CA_BUNDLE`;
+- **the in-flight cap** — any of the five `CORP_LLM_*` capacity keys out of
+  range, and `CORP_LLM_MAX_INFLIGHT=0` under `CORP_ENV=prod`;
+- **route-gate extras** — see `--routes` below.
+
+It does not check the `corp_tokens` schema; the boot does, and exits 78 on it
+(`upgrade.md`).
 
 `--routes` also prints the effective route-gate table — row counts per verdict,
 the REWRITTEN routes (the only ones whose body the guardrail rewrites), and every

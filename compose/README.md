@@ -25,9 +25,12 @@ off. Both run **this** stack. Short version:
 - **Subscription mode — the production mode.** `docker compose -f
   docker-compose.yml -f docker-compose.oauth.yml up -d`. Requires that no
   `LITELLM_MASTER_KEY` exist at all, serves `claude-*` only, and forwards the
-  developer's own Anthropic subscription token upstream. Developers get their
-  `X-Corp-Auth` token from `scripts/install.sh` (Keycloak login →
-  `POST /internal/issue-token`).
+  developer's own Anthropic subscription token upstream. `scripts/deploy/deploy.sh`
+  deploys this mode by default. Developers get their `X-Corp-Auth` token from
+  `scripts/install.sh` (Keycloak login → `POST /internal/issue-token`) once
+  issuance is configured — which this stack does not do yet: it passes no
+  `CORP_GATEWAY_ISSUE_*` key and mounts no `config.toml` for the team map (see
+  "Developer token issuance" below). Until then, `gateway-admin token issue`.
 - **API-key mode (the compose default) — a test posture only.** `docker compose
   up -d`. `LITELLM_MASTER_KEY` is required and requests carry a LiteLLM virtual
   key, but there is **no way to issue one**: the route gate refuses `/key/*`, the
@@ -796,6 +799,35 @@ This stack leaves `CORP_LLM_LOCAL_FIRST` unset (its `settings.py` default is
 `"1"`), so the default posture is safe; don't set it to `0` in `.env`
 without also setting `CORP_LLM_ORACLE_ENABLED=1`, or the container fails to
 boot with no other warning.
+
+## In-flight cap
+
+The `litellm` service passes the route gate's in-flight cap keys
+(`docs/ops/capacity.md`, `docs/ops/configuration.md`). Set any of them in `.env`
+to change it; the commented block in `.env.example` shows the defaults.
+
+| Key | Default here | What it bounds |
+|-----|--------------|----------------|
+| `CORP_LLM_MAX_INFLIGHT` | `64` | concurrent LLM requests on this host, a slot held for the whole stream; 429 `E_CAPACITY` past it. `0` = off, refused at boot under `CORP_ENV=production` |
+| `CORP_LLM_CANCEL_GRACE_SECONDS` | `5` | unwind budget after a client disconnect; a slot is back within 2 × this |
+| `CORP_LLM_BODY_READ_SECONDS` | `30` | time for the whole body to arrive, before a slot is taken; 408 `E_BODY_TIMEOUT` past it |
+| `CORP_LLM_MAX_DRAINING` | unset → 4 × the cap | requests reading a body at once; passed by bare name so it follows the cap |
+| `CORP_LLM_MAX_DRAINING_BYTES` | `536870912` (512 MiB) | body bytes buffered at once — size it against what the host can spare |
+
+A bad value is a boot refusal (exit 78) with the key named in the log.
+
+## Developer token issuance
+
+`POST /internal/issue-token` is off on this stack: the `litellm` service passes
+no `CORP_GATEWAY_ISSUE_*` key, and the team map
+(`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`) is a TOML table that only a mounted
+`config.toml` can carry. To turn it on, add the scalar keys to the service's
+`environment:` and mount a `config.toml` with the map at
+`/etc/corp-llm-gateway/config.toml` — `docs/ops/install.md`, "Developer
+onboarding", and `docs/ops/configuration.md`, "Developer token issuance". The
+`corp_tokens` schema staged by `deploy.sh` carries the issuance columns, but
+init scripts run only on an empty volume: on an existing one, re-run
+`tokens/schema.sql` first (`docs/ops/upgrade.md`).
 
 ## Operator CLI (gateway-admin)
 

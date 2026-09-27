@@ -202,16 +202,17 @@ HTTP-клиентом, а не через маршрут litellm.
 `pull` + `up -d` и дожидается healthcheck'ов.
 
 ```
-# режим A
+# режим B — подписка, production-режим (по умолчанию)
 scripts/deploy/deploy.sh --host user@server up
 
-# режим B
-scripts/deploy/deploy.sh --host user@server --mode oauth up
+# режим A — API-ключи, только тестовая поза
+scripts/deploy/deploy.sh --host user@server --mode virtual-keys up
 ```
 
 **Тот же `--mode` нужно передавать во все последующие запуски по этому хосту** —
-`logs`, `status`, `down`, `restart` резолвят стек через этот список файлов.
-Запуск без `--mode oauth` покажет (или пересоздаст) другой стек.
+`logs`, `status`, `down`, `restart` резолвят стек через этот список файлов. На
+хосте в режиме A запуск без `--mode virtual-keys` покажет (или пересоздаст)
+другой стек.
 
 Остальные подкоманды: `down` (тома сохраняются, спрашивает подтверждение),
 `restart`, `logs`, `status`. Полезные флаги: `--dry-run`, `--yes`,
