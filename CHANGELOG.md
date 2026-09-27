@@ -7,6 +7,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Keycloak-issued corp tokens, gateway-owned capacity cap
+
+- **`POST /internal/issue-token`** — trades a Keycloak access token (RS256 only; `iss`/`aud`/`azp`
+  required; the operator audience refused; single-flight JWKS) for an `X-Corp-Auth` token under a
+  per-`(iss, sub)` policy: at most `MAX_ACTIVE` active tokens (oldest rotated out), a minimum
+  interval, `jti` replay refused, a Postgres advisory lock. The route is header-only, bounded (body,
+  time, in-flight, rate) and terminates locally. `install.sh` runs the real device flow; Helm gets
+  `issuance.*` values and Keycloak egress in the NetworkPolicy; compose gets
+  `docker-compose.issuance.yml` (`deploy.sh --issuance`). Issuance needs Postgres and a token-table
+  migration (oidc columns + a unique `jti` index).
+- **In-flight cap** (`route_gate/inflight.py`) — request N+1 gets 429 `E_CAPACITY` before litellm and
+  before the sanitizer. On a client disconnect the gateway cancels, waits a bounded grace, sweeps the
+  request's tasks, writes one `cancelled` audit record and releases the slot once. Both litellm
+  configs set `cancel_on_disconnect: true`.
+- **New settings:** `CORP_GATEWAY_ISSUE_OIDC_{ISSUER,AUDIENCE,CLIENT_ID,JWKS_URL,TEAM_CLAIM,USER_CLAIM,TEAM_MAP}`,
+  `CORP_GATEWAY_ISSUE_{TOKEN_TTL_DAYS,MAX_ACTIVE,MIN_INTERVAL_SECONDS,MAX_INFLIGHT,RATE_PER_MINUTE,STORE_TIMEOUT_SECONDS}`,
+  `CORP_LLM_{MAX_INFLIGHT,MAX_DRAINING,MAX_DRAINING_BYTES,BODY_READ_SECONDS,CANCEL_GRACE_SECONDS}`.
+- **CI** — a new `integration-container` job (digest-tagged image, route-gate container suite); the
+  `test` job runs on Python 3.14 only, with a Postgres service. `pymorphy3` is now in the `ner` extra.
+
+### Changed — litellm management surface refused; Mode A is a test posture
+
+- **462 admin/auth/spend/UI/public rows + 8 health rows now return 403 `E_ROUTE_BLOCKED`** (`/key/*`,
+  `/policies`, `/guardrails/*`, `/login`, `/sso/*`, `GET /`, `/health`, `/health/drain`, …). The
+  table is 26 PASSTHROUGH / 879 REFUSE / 8 REWRITTEN; `/health/liveliness` and `/health/readiness`
+  stay. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` can no longer re-admit a refused row — boot exits 78.
+- **Mode A (virtual keys) is a test posture only.** `deploy.sh` defaults to `--mode oauth`; hosts
+  still on Mode A must pass `--mode virtual-keys` on every run.
+- **The gateway owns `litellm_call_id`**: a client-sent `x-litellm-call-id` header is stripped at
+  the gate.
+- **Boot also exits 78** on issuance without Postgres, partial issuance config, out-of-range
+  capacity settings, a wrong token schema, or (issuance on) a PgBouncer that rejects the keepalive
+  startup parameters. **PgBouncer operators:** add
+  `ignore_startup_parameters = tcp_keepalives_idle,tcp_keepalives_interval,tcp_keepalives_count`,
+  or every LLM request answers 503 (`docs/ops/configuration.md`).
+
+### Security
+
+- `docs/security.md` §14 gains "The issuance route: gateway-owned, terminates locally, bounded",
+  "The management surface is refused" and "The in-flight cap: after the verdict, gateway-owned"
+  (the cap is not authorization). Properties the cap guarantees: tasks shared between requests
+  survive a client disconnect; no slot is held before the request body is complete; a cancelled
+  request never retains user content.
+
 ### Added — production compose deploy target (`compose/`)
 
 - **A second production deploy target**, for hosts without Kubernetes, alongside the Helm chart:
@@ -17,7 +61,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   to the Helm chart's configmap). Every secret comes from `.env`; the four keys with no default make
   `docker compose up` refuse to start rather than boot half-configured.
 - **Two mutually exclusive auth modes.** Mode A — corp API keys, developers hold a LiteLLM
-  virtual key (per-person revocation + spend). Mode B (`docker-compose.oauth.yml`) — the
+  virtual key (per-person revocation + spend) (superseded: virtual keys are a test-only posture
+  since the management surface was refused — see above). Mode B (`docker-compose.oauth.yml`) — the
   developer's own Anthropic subscription OAuth bearer is forwarded upstream and **no corp
   `ANTHROPIC_API_KEY` exists at all**; it serves `claude-*` only, which is a binding control
   rather than a simplification (litellm resolves the deployment after the hook runs, so an
