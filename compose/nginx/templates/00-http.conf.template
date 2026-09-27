@@ -35,6 +35,7 @@ map $http_host $proxy_host_header {
 # limit_conn skips a key over 255 bytes instead of truncating it, and a repeated
 # header joins into "A, A" -- a fresh bucket, while the gateway reads the first.
 # Empty, oversize, repeated or garbage values all share the address bucket.
+# nginx keeps a trailing tab: `ct_<43>\t` is keyed by address yet authenticates (fairness only).
 map $http_x_corp_auth $corp_token_key {
     "~^ct_[A-Za-z0-9_-]{43}$" $http_x_corp_auth;
     default                   $binary_remote_addr;

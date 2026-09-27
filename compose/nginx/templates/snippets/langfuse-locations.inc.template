@@ -25,6 +25,10 @@ proxy_set_header Host $proxy_host_header;
 # The literal: the public side is always HTTPS, and $scheme is http in
 # behind-proxy.
 proxy_set_header X-Forwarded-Proto https;
+# Appended to, never passed through as the client sent it.
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+# nginx's default is 1m; Langfuse's own ingestion route takes about 4.5 MB.
+client_max_body_size 25m;
 
 location / {
     proxy_pass $langfuse_upstream$request_uri;

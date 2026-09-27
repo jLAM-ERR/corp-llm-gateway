@@ -1050,8 +1050,9 @@ into a token in the container log.
 pins both: `error_log` is `crit`, and no config sets either `*_log_level`. The
 one `[crit]` the limits can reach: a full `corp_conn` zone writes
 `[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone "corp_conn"` once
-per refused request, with no request context and no key, and the request gets the edge's 429. At 10m that takes on the order
-of 10^5 distinct keys in flight at once, more than nginx's `worker_connections`.
+per refused request, with no request context and no key, and the request gets
+the edge's 429. At 10m that takes on the order of 10^5 distinct keys in flight
+at once, more than nginx's `worker_connections`.
 
 **Disconnects end the request.** The limiter replays the body to litellm and
 watches the socket. A client that disconnects — during our pre-call hook, before

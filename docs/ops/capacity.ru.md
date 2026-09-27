@@ -170,10 +170,11 @@ EN [`capacity.md`](capacity.md).
   `limit_req_log_level` / `limit_conn_log_level` отправит токены в лог
   контейнера. Оба условия закрепляет
   `tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`.
-  Единственный достижимый у лимитов `[crit]`: заполненная зона `corp_conn` пишет `[crit] ngx_slab_alloc() failed:
-  no memory in limit_conn_zone "corp_conn"` на каждый отклонённый запрос — без
-  контекста запроса и без ключа; запрос получает 429. При 10m для этого нужно
-  около 10^5 разных ключей в полёте одновременно — больше `worker_connections`.
+  Единственный достижимый у лимитов `[crit]`: заполненная зона `corp_conn`
+  пишет `[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone "corp_conn"`
+  на каждый отклонённый запрос — без контекста запроса и без ключа; запрос
+  получает 429. При 10m для этого нужно около 10^5 разных ключей в полёте
+  одновременно — больше `worker_connections`.
 - **Кто отвечает первым** — граница: **429** `{"error":{"code":"E_RATE_LIMITED"}}`
   с `Retry-After: 1`, и запрос до шлюза не доходит, поэтому его нет ни в аудите,
   ни в метриках шлюза; access-лог nginx записывает его (`status` 429, без

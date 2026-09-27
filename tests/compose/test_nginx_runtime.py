@@ -118,14 +118,21 @@ class Stub:
         result = docker("logs", self.name)
         return (result.stdout + result.stderr).count("stub-hit")
 
-    def _recorded(self, port: int) -> list[dict[str, Any]]:
+    def _recorded(self, port: int | None = None) -> list[dict[str, Any]]:
         result = docker("logs", self.name)
         records = [
             json.loads(line.removeprefix("stub-hit "))
             for line in result.stdout.splitlines()
             if line.startswith("stub-hit {")
         ]
-        return [record for record in records if record["port"] == port]
+        return [record for record in records if port is None or record["port"] == port]
+
+    def recorded(self) -> list[dict[str, Any]]:
+        """What reached either stand-in (:4000 and :3000), oldest first."""
+        return self._recorded()
+
+    def recorded_since(self, seen: int) -> list[dict[str, Any]]:
+        return self.recorded()[seen:]
 
     def requests(self) -> list[dict[str, Any]]:
         """What reached the ``litellm`` stand-in (:4000), oldest first."""
@@ -391,6 +398,39 @@ REFUSALS = [
     pytest.param(
         _langfuse("https://user@10.1.2.3:8443", routing="port"), id="langfuse-userinfo-port"
     ),
+    # NEXTAUTH_URL is this value: anything but https://<host>[:port][/] is an
+    # origin NextAuth cannot match, whatever the routing.
+    *(
+        pytest.param(_langfuse(value, routing=routing), id=f"langfuse-{name}-{routing}")
+        for value, name, routings in (
+            ("https:///x", "empty-host", ("host", "port")),
+            ("https://:8443", "port-only", ("host", "port")),
+            ("https://10.1.2.3:abc", "ip-bad-port", ("port",)),
+            ("https://10.1.2.3:8443/some/path?x=1", "ip-path", ("port",)),
+            (f"https://{LANGFUSE_HOST}/some/path", "path", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}:abc", "bad-port", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}:123456", "six-digit-port", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}//", "two-slashes", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}?x=1", "query", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}#x", "fragment", ("host", "port")),
+            ("https://-langfuse.example.test", "leading-hyphen", ("port",)),
+            ("https://langfuse", "one-label", ("port",)),
+            ("https://langfuse_x.example.test", "underscore", ("port",)),
+        )
+        for routing in routings
+    ),
+    *(
+        pytest.param(
+            Refusal(
+                {**VALID_BEHIND_PROXY, "LANGFUSE_PUBLIC_URL": "https://[fd00::1]:8443"},
+                69,
+                ("LANGFUSE_PUBLIC_URL", "IPv6"),
+                routing=routing,
+            ),
+            id=f"langfuse-ipv6-{routing}",
+        )
+        for routing in ("host", "port")
+    ),
     # Rendered into limit_req_zone / limit_req / limit_conn: a bare positive integer.
     *(
         pytest.param(_limit("NGINX_TOKEN_RATE", value), id=f"token-rate-{name}")
@@ -521,6 +561,14 @@ STARTS = [
         "host",
         {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST.upper()}:8443/"},
         id="langfuse-port-path-case",
+    ),
+    pytest.param("host", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}"}, id="langfuse-origin"),
+    pytest.param(
+        "host", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}:8443/"}, id="langfuse-port-slash"
+    ),
+    pytest.param("port", {"LANGFUSE_PUBLIC_URL": "https://10.1.2.3:8443"}, id="langfuse-ipv4-port"),
+    pytest.param(
+        "port", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}:8443"}, id="langfuse-name-port"
     ),
     pytest.param(
         "port",
@@ -1097,13 +1145,14 @@ def test_a_websocket_handshake_and_every_other_method_are_refused_by_nginx(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
 ) -> None:
     seen = len(stub_upstream.requests())
+    seen_any = len(stub_upstream.recorded())
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         # `Connection: Upgrade` rides in the raw request's own header block.
         handshake = WEBSOCKET_HANDSHAKE.replace(b"Connection: close", b"Connection: Upgrade")
         assert _raw_status(nginx.ports[8080], handshake) == 403
         for method, path in REFUSED_METHODS:
             assert nginx.status(8080, path, GATEWAY_HOST, method) == 403, (method, path)
-        refused = stub_upstream.requests_since(seen)
+        refused = stub_upstream.recorded_since(seen_any)
         # limit_except GET always lets HEAD through: nginx does not refuse it,
         # whatever the gateway then answers.
         head = nginx.status(8080, "/healthz/live", GATEWAY_HOST, "HEAD")
@@ -1205,14 +1254,14 @@ def test_an_absolute_form_request_forwards_the_host_nginx_selected_on(
 def test_an_issuance_body_over_1k_is_refused_by_nginx(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
 ) -> None:
-    seen = len(stub_upstream.requests())
+    seen = len(stub_upstream.recorded())
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         status = nginx.status(
             8080, "/internal/issue-token", GATEWAY_HOST, "POST", content=b"x" * 2048
         )
 
     assert status == 413
-    assert stub_upstream.requests_since(seen) == []
+    assert stub_upstream.recorded_since(seen) == []
 
 
 # Denied by the allow-list's shape, not by these names: the control-plane
@@ -1257,7 +1306,7 @@ DENIED_BY_NAME = (
 def test_every_named_route_is_404_and_reaches_nothing(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
 ) -> None:
-    seen = len(stub_upstream.requests())
+    seen = len(stub_upstream.recorded())
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         for path in DENIED_BY_NAME:
             for method in ("GET", "POST"):
@@ -1266,7 +1315,7 @@ def test_every_named_route_is_404_and_reaches_nothing(
                     path,
                 )
 
-    assert stub_upstream.requests_since(seen) == []
+    assert stub_upstream.recorded_since(seen) == []
 
 
 # Spelled so that a location match and the forwarded path could disagree.
@@ -1284,16 +1333,17 @@ TRICK_TARGETS = (
 def test_the_gateway_never_sees_a_path_nginx_did_not_admit(
     specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub, target: str
 ) -> None:
-    seen = len(stub_upstream.requests())
+    seen = len(stub_upstream.recorded())
     with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
         status = _raw_status(nginx.ports[8080], _raw_request("POST", target, body=b"{}"))
 
-    records = stub_upstream.requests_since(seen)
+    records = stub_upstream.recorded_since(seen)
     if status == 404:
         assert records == [], target
     else:
         assert status == 200, (target, status)
         assert len(records) == 1, (target, records)
+        assert records[0]["port"] == GATEWAY_STAND_IN_PORT, (target, records[0])
         assert (records[0]["method"], records[0]["target"]) in DECLARED, (target, records[0])
 
 
@@ -1403,7 +1453,8 @@ def _read_slowly(
 
 def _wait_for_crit(nginx: Running) -> None:
     deadline = time.monotonic() + 10
-    while "[crit]" not in nginx.log_streams()[1] and time.monotonic() < deadline:
+    while "[crit]" not in (stderr := nginx.log_streams()[1]):
+        assert time.monotonic() < deadline, f"no [crit] within 10 s:\n{stderr}"
         time.sleep(0.1)
 
 
@@ -1551,6 +1602,39 @@ def test_a_websocket_upgrade_reaches_langfuse_and_is_tunnelled(
     assert headers["upgrade"] == ["websocket"]
     assert headers["connection"] == ["upgrade"]
     assert headers["host"] == [LANGFUSE_HOST]
+
+
+def test_a_2_mib_ingestion_body_reaches_langfuse_intact(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    # Over nginx's 1m default: the origin's own cap is what admits it.
+    body = b'{"batch":"' + b"x" * TWO_MIB + b'"}'
+    seen = len(stub_upstream.langfuse_requests())
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        status = nginx.status(8080, "/api/public/ingestion", LANGFUSE_HOST, "POST", content=body)
+
+    assert status == 200
+    (record,) = stub_upstream.langfuse_requests()[seen:]
+    assert (record["method"], record["target"]) == ("POST", "/api/public/ingestion")
+    assert record["body_length"] == len(body)
+    assert record["body_sha256"] == hashlib.sha256(body).hexdigest()
+
+
+def test_langfuse_gets_the_forwarded_for_chain_nginx_builds(
+    specs: dict[str, Spec], project: Path, network: Network, stub_upstream: Stub
+) -> None:
+    forwarded = "1.2.3.4"
+    seen = len(stub_upstream.langfuse_requests())
+    with started(specs["host"], project, network, VALID_BEHIND_PROXY) as nginx:
+        status = nginx.status(
+            8080, "/api/public/health", LANGFUSE_HOST, headers={"X-Forwarded-For": forwarded}
+        )
+        (entry,) = nginx.access_log(expected=1)
+
+    assert status == 200
+    (record,) = stub_upstream.langfuse_requests()[seen:]
+    # Appended by nginx, never the inbound header passed through as sent.
+    assert _headers(record)["x-forwarded-for"] == [f"{forwarded}, {entry['remote_addr']}"]
 
 
 def test_a_temp_file_fault_cannot_write_the_request_line_on_the_langfuse_origin(

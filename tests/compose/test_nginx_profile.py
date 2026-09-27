@@ -373,6 +373,8 @@ LANGFUSE_SERVER_DIRECTIVES = [
     "proxy_set_header Connection $connection_upgrade",
     "proxy_set_header Host $proxy_host_header",
     "proxy_set_header X-Forwarded-Proto https",
+    "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for",
+    "client_max_body_size 25m",
 ]
 
 # What the front door admits: the gateway's allow-list ("The security
@@ -973,6 +975,14 @@ def test_nginxs_limiting_line_is_below_the_error_log_level() -> None:
     assert re.findall(
         r"^\s*error_log\s+([^;]+);", _directives(NGINX_CONF.read_text()), re.MULTILINE
     ) == ["/dev/stderr crit"]
+
+
+def test_no_config_intercepts_an_upstream_error() -> None:
+    # error_page 429 = @rate_limited answers nginx's own refusals only; with
+    # interception on, the gateway's E_CAPACITY 429 would be rewritten too.
+    for path in _every_config_file():
+        text = _directives(path.read_text())
+        assert not re.search(r"\bproxy_intercept_errors\b", text), path.name
 
 
 def test_no_config_reads_the_inbound_x_forwarded_proto() -> None:

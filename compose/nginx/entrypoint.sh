@@ -185,6 +185,9 @@ if [ "$NGINX_TLS_MODE" = behind-proxy ] && is_unspecified_address "$NGINX_BIND_A
 fi
 
 # ---- 6. gateway domain (host routing) -----------------------------------------
+# Lowercase labels of a-z 0-9 -, no hyphen at either end, at least two labels.
+HOSTNAME_ERE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+
 GATEWAY_DOMAIN=${GATEWAY_DOMAIN:-}
 if [ "$routing" = host ]; then
     case $GATEWAY_DOMAIN in
@@ -192,8 +195,7 @@ if [ "$routing" = host ]; then
             fail 64 "GATEWAY_DOMAIN must be a lowercase DNS name (a-z 0-9 . -) under host routing, got '$GATEWAY_DOMAIN'"
             ;;
     esac
-    if ! printf '%s\n' "$GATEWAY_DOMAIN" |
-        grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
+    if ! printf '%s\n' "$GATEWAY_DOMAIN" | grep -Eq "$HOSTNAME_ERE"; then
         fail 64 "GATEWAY_DOMAIN must be a DNS name with at least two labels (example.corp), got '$GATEWAY_DOMAIN'"
     fi
 else
@@ -247,8 +249,37 @@ authority=${authority%%[/?#]*}
 case $authority in
     *@*) fail 69 "LANGFUSE_PUBLIC_URL must not carry credentials (userinfo), got '$langfuse_origin'" ;;
 esac
+# It is NEXTAUTH_URL: anything but an origin is one NextAuth cannot match.
+origin_rule="LANGFUSE_PUBLIC_URL must be https://<host>[:port] with no path"
+case $authority in
+    "["*) fail 69 "$origin_rule; a bracketed IPv6 literal is refused (use a DNS name or an IPv4 address), got '$langfuse_origin'" ;;
+esac
+langfuse_host=${authority%%:*}
+langfuse_port=
+case $authority in
+    *:*) langfuse_port=${authority#*:} ;;
+esac
+langfuse_rest=${LANGFUSE_PUBLIC_URL#"https://$authority"}
+valid=1
+# Checked before lowercase(), whose $(...) would drop a trailing newline.
+case $langfuse_host in
+    '' | *[!A-Za-z0-9.-]*) valid=0 ;;
+esac
+langfuse_host=$(lowercase "$langfuse_host")
+# The hostname rule of step 6; a dotted-quad IPv4 address matches it too.
+printf '%s\n' "$langfuse_host" | grep -Eq "$HOSTNAME_ERE" || valid=0
+case $langfuse_port in
+    *[!0-9]*) valid=0 ;;
+esac
+[ ${#langfuse_port} -le 5 ] || valid=0
+case $langfuse_rest in
+    '' | /) ;;
+    *) valid=0 ;;
+esac
+if [ "$valid" -eq 0 ]; then
+    fail 69 "$origin_rule, got '$langfuse_origin'"
+fi
 if [ "$routing" = host ]; then
-    langfuse_host=$(lowercase "${authority%%:*}")
     if [ "$langfuse_host" != "langfuse.$GATEWAY_DOMAIN" ]; then
         fail 69 "LANGFUSE_PUBLIC_URL must name langfuse.$GATEWAY_DOMAIN under host routing, got '$langfuse_origin'"
     fi
