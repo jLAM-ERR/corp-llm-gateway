@@ -1,0 +1,15 @@
+# http context. Rendered by entrypoint.sh with an explicit envsubst list, so
+# nginx's own runtime variables pass through untouched.
+
+# Docker's embedded DNS. Upstreams are variables, resolved per request, so
+# nginx starts before they exist and follows a restarted container's new IP.
+resolver 127.0.0.11 valid=30s ipv6=off;
+
+# Loopback only and never published: the compose healthcheck probes this, so
+# health does not depend on an upstream being up.
+server {
+    listen 127.0.0.1:8090;
+    location = /nginx-health {
+        return 200;
+    }
+}

@@ -1,0 +1,20 @@
+# behind-proxy, host routing: plain HTTP on the internal hop behind the
+# admins' TLS terminator. A Host that names neither origin gets no response.
+
+server {
+    listen 8080 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 8080;
+    server_name gateway.${GATEWAY_DOMAIN};
+    include /etc/nginx/rendered/snippets/gateway-locations.inc;
+}
+
+server {
+    listen 8080;
+    server_name langfuse.${GATEWAY_DOMAIN};
+    include /etc/nginx/rendered/snippets/langfuse-locations.inc;
+}

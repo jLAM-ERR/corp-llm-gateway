@@ -768,6 +768,66 @@ services:
       start_period: 20s
     restart: unless-stopped
 
+  # ---- nginx front door (opt-in) --------------------------------------------
+  # Off unless the server's .env sets COMPOSE_PROFILES=nginx (host routing:
+  # gateway.<domain> / langfuse.<domain>) or COMPOSE_PROFILES=nginx-ports (the
+  # no-DNS fallback: gateway and Langfuse on two ports). Never both.
+  # compose/nginx/entrypoint.sh validates the NGINX_* keys and renders the
+  # config; every key here uses ${VAR:-...} because compose interpolates this
+  # whole file before it filters by profile, so a ${VAR:?} would break stacks
+  # that never asked for nginx. The entrypoint enforces what is required.
+  nginx: &nginx-front-door
+    image: nginx:1.27-alpine
+    profiles: ["nginx"]
+    entrypoint: ["/bin/sh", "/corp/entrypoint.sh"]
+    command: ["host"]
+    environment:
+      - NGINX_TLS_MODE=${NGINX_TLS_MODE:-}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN:-}
+      - NGINX_TLS_CERT=${NGINX_TLS_CERT:-}
+      - NGINX_TLS_KEY=${NGINX_TLS_KEY:-}
+      - NGINX_TRUSTED_PROXIES=${NGINX_TRUSTED_PROXIES:-}
+      - NGINX_BIND_ADDR=${NGINX_BIND_ADDR:-127.0.0.1}
+      - LANGFUSE_PUBLIC_URL=${LANGFUSE_PUBLIC_URL:-}
+      - NGINX_TOKEN_RATE=${NGINX_TOKEN_RATE:-}
+      - NGINX_TOKEN_BURST=${NGINX_TOKEN_BURST:-}
+      - NGINX_TOKEN_CONN=${NGINX_TOKEN_CONN:-}
+      - NGINX_ISSUE_RATE=${NGINX_ISSUE_RATE:-}
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/entrypoint.sh:/corp/entrypoint.sh:ro
+      - ./nginx/templates:/corp/templates:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    # The render lives here, so a stale one cannot survive a restart.
+    tmpfs:
+      - /etc/nginx/rendered
+    # Loopback unless NGINX_BIND_ADDR names a NIC: an empty host IP would
+    # publish on every interface.
+    ports:
+      - "${NGINX_BIND_ADDR:-127.0.0.1}:${NGINX_PORT:-443}:8080"
+    # Start order only: upstreams are resolved per request, so nginx does not
+    # need them up.
+    depends_on:
+      - litellm
+      - langfuse-web
+    healthcheck:
+      # The loopback health listener, not an upstream: deploy.sh waits for
+      # every declared healthcheck, and a slow Langfuse must not fail nginx.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  nginx-ports:
+    <<: *nginx-front-door
+    profiles: ["nginx-ports"]
+    command: ["port"]
+    ports:
+      - "${NGINX_BIND_ADDR:-127.0.0.1}:${NGINX_PORT:-443}:8080"
+      - "${NGINX_BIND_ADDR:-127.0.0.1}:${NGINX_LANGFUSE_PORT:-8443}:8081"
+
 volumes:
   gateway-redis-data:
   gateway-postgres-data:

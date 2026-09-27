@@ -1,0 +1,5 @@
+# The gateway allow-list — the only copy; every listener includes it.
+
+location / {
+    return 404;
+}

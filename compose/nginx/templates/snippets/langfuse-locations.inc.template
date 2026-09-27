@@ -1,0 +1,5 @@
+# The Langfuse origin — the only copy; every listener includes it.
+
+location / {
+    return 404;
+}
