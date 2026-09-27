@@ -174,8 +174,16 @@ master key litellm accepts any caller as an internal user
 `/user/*`, `/policies*`, `/guardrails*` and the UI would otherwise answer anyone
 who reaches the port. The route gate refuses all of them (`403
 E_ROUTE_BLOCKED`) before litellm sees the request, on every path in — loopback,
-SSH tunnel or a future nginx front door. The LLM routes are still gated by the
+SSH tunnel or the nginx front door. The LLM routes are still gated by the
 gateway's `X-Corp-Auth` check in `pre_call`. See `../security.md` §14.
+
+The front door (`COMPOSE_PROFILES=nginx` or `nginx-ports`, `compose/README.md`,
+"HTTPS front door (nginx)") **additionally** answers the whole surface with 404
+at the edge, unconditionally and in both modes: its exact-path allow-list admits
+only `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
+`GET /v1/models`, `GET /healthz/live` and `POST /internal/issue-token`. That is
+defence in depth — the refusal above holds without nginx — and administration
+stays on the SSH tunnel to `127.0.0.1:4000`.
 
 ---
 

@@ -150,7 +150,10 @@ The gateway image mounts these onto LiteLLM's ASGI app (probes target them):
 
 Every litellm admin, auth, spend, public, UI and non-probe health route answers
 `403 E_ROUTE_BLOCKED` ([`../security.md`](../security.md) §14). Probes use
-`/healthz/*` only.
+`/healthz/*` only. Behind the compose HTTPS front door only `GET /healthz/live`
+and `POST /internal/issue-token` of these are reachable from outside; the rest
+answer on the server's loopback port (`compose/README.md`, "HTTPS front door
+(nginx)").
 
 ## Developer onboarding: Keycloak issuance
 
@@ -249,7 +252,16 @@ Before the first issuance:
   token, prints how to get one and exits 0.
 - `ANTHROPIC_AUTH_TOKEN` — the developer's subscription token; it drives the
   smoke test at the end, which is skipped with a message when it is unset.
-- `CORP_GATEWAY_URL` (default `https://gateway.corp.lan`).
+- `CORP_GATEWAY_URL` (default `https://gateway.corp.lan`). On a compose
+  deployment it is the front door's origin once a profile is on:
+  `https://gateway.<domain>` under `nginx`, `https://<address>:<NGINX_PORT>`
+  under `nginx-ports`. The installer's `POST /internal/issue-token` goes through
+  nginx, which admits it (header only, a body over 1 KiB is 413, at most
+  `NGINX_ISSUE_RATE` calls per minute per address) and hands it to the gateway.
+  `corp-llm-gateway status` needs only `GET /healthz/live`, which nginx admits
+  too. The installer has no CA option of its own: for a certificate from a CA
+  the laptop does not trust, its `curl` reads `CURL_CA_BUNDLE`, and
+  `corp-llm-gateway status` reads `SSL_CERT_FILE`.
 - `CORP_GATEWAY_TOKEN_FILE` (default `~/.corp-llm-gateway/token`) — must be an
   absolute path with no quote or newline; the token is written mode 0600, and
   when the path is a symlink the installer writes through it to its target.

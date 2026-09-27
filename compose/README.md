@@ -10,10 +10,10 @@ A production deploy target for non-k8s hosts, alongside `helm/corp-llm-gateway/`
   `langfuse-postgres`, `clickhouse`, `minio`, `minio-init` and
   `langfuse-redis`, publishing no host port (see "Langfuse" below);
 - the **audit pipeline** — `vector`, which tails the gateway's stdout and
-  forwards audit records to Langfuse (see "Audit pipeline" below).
-
-The optional nginx front door lands in a later revision of this stack — see
-`docs/plans/20260802-production-compose-corp-ner.md` for the full build order.
+  forwards audit records to Langfuse (see "Audit pipeline" below);
+- the optional **HTTPS front door** — `nginx` or `nginx-ports`, an nginx that
+  publishes the gateway and Langfuse over HTTPS. Off unless the server's `.env`
+  sets `COMPOSE_PROFILES` (see "HTTPS front door (nginx)" below).
 
 ## Which mode am I deploying?
 
@@ -277,7 +277,7 @@ Self-hosted Langfuse v3, ported from `docker-compose.demo.yml` and hardened:
 - **no host port is published by any Langfuse service** (the demo publishes
   `3000` for the UI and `9001` for the MinIO console). Langfuse holds
   request-level traces and the audit trail, so it is reachable only through
-  the nginx profile (C1) or an SSH tunnel;
+  the HTTPS front door (see "HTTPS front door (nginx)") or an SSH tunnel;
 - **named volumes** for all four stateful services (`langfuse-postgres-data`,
   `langfuse-clickhouse-data`, `langfuse-clickhouse-logs`,
   `langfuse-minio-data`, `langfuse-redis-data`);
@@ -382,11 +382,14 @@ discards accepted-but-unprocessed audit events, which is the exact failure
 
 ### Reaching the UI
 
-Once `--profile nginx` (C1) lands: `langfuse.<domain>` → `langfuse-web:3000`,
-and `LANGFUSE_PUBLIC_URL` must be that public origin.
+**Through the front door** (a profile on, see "HTTPS front door (nginx)"):
+`https://langfuse.<GATEWAY_DOMAIN>` under `nginx`,
+`https://<address>:<NGINX_LANGFUSE_PORT>` under `nginx-ports`. nginx forwards
+it to `langfuse-web:3000`, and `LANGFUSE_PUBLIC_URL` must be exactly that
+origin.
 
-Until then, an SSH tunnel. Nothing is published on the host, so tunnel to the
-container address (the docker bridge is routable from the host on Linux):
+**Without it**, an SSH tunnel. Langfuse publishes nothing on the host, so tunnel
+to the container address (the docker bridge is routable from the host on Linux):
 
 ```
 # on the server
@@ -400,8 +403,8 @@ ssh -N -L 3000:<container-ip>:3000 <user>@<server>
 
 `LANGFUSE_PUBLIC_URL` (→ `NEXTAUTH_URL`) must match the origin the **browser**
 uses. Its default `http://localhost:3000` is right for the tunnel and wrong
-behind nginx; the two cannot be correct at the same time, so change it when
-nginx lands.
+behind nginx; the two cannot be correct at the same time, so set the one in
+use. With a profile on, nginx refuses to start unless it is `https://` (exit 69).
 
 ### First login
 
@@ -739,12 +742,224 @@ staged (git-ignored — never committed, so it cannot drift from
 
 ## Loopback bind
 
-The `litellm` port publishes on `127.0.0.1`, not `0.0.0.0`. Until the nginx
-profile (`--profile nginx`) lands there is no TLS in front of this stack, and
-virtual keys + `X-Corp-Auth` would otherwise cross a server-class network in
-cleartext. It is the only published port in the stack: no Langfuse service
-publishes one at all (see "Langfuse"), and `vector`'s API is bound to
-`127.0.0.1` *inside* its own container, purely so its healthcheck can reach it.
+The `litellm` port publishes on `127.0.0.1`, not `0.0.0.0`, with or without
+the front door. It speaks plain HTTP, and subscription tokens, virtual keys and
+`X-Corp-Auth` must not cross a server-class network in cleartext: developers
+reach the gateway across the network only through the HTTPS front door, which
+talks to `litellm` over the compose network. With no profile on it is the only
+published port in the stack: no Langfuse service publishes one at all (see
+"Langfuse"), and `vector`'s API is bound to `127.0.0.1` *inside* its own
+container, purely so its healthcheck can reach it. The admin path — the SSH
+tunnel to this port — stays as it is.
+
+## HTTPS front door (nginx)
+
+Off by default. With `COMPOSE_PROFILES` unset the stack is exactly the one
+above: no nginx, `litellm` on loopback only, and no `NGINX_*` key is read. With
+a profile on, an nginx (`nginx:1.27-alpine`) publishes the gateway and Langfuse
+over HTTPS. Its configuration is `compose/nginx/`: `entrypoint.sh` validates the
+keys, renders one listener from `templates/` and runs `nginx -t` before it
+serves; `nginx.conf` is static. Every key, with its default, is in
+`.env.example` ("nginx front door").
+
+### Turning it on
+
+One line in the server's `.env` is the only switch:
+
+```
+COMPOSE_PROFILES=nginx        # or nginx-ports; never both
+```
+
+`deploy.sh` has no flag for it and never sets it, and the boot-time unit runs a
+bare `docker compose up -d` that reads the same `.env`: a deploy and a reboot
+start the same services. `deploy.sh up` refuses a `.env` that enables both
+profiles before it pulls anything, and fails at once, naming the service, when
+the front door exits or restarts — `deploy.sh logs nginx` shows the
+entrypoint's one-line reason.
+
+| Profile | Routing | Published (host → container) | Needs |
+|---|---|---|---|
+| `nginx` | by name: `gateway.<GATEWAY_DOMAIN>` and `langfuse.<GATEWAY_DOMAIN>` on one port | `${NGINX_BIND_ADDR}:${NGINX_PORT:-443}` → `8080` | DNS records for both names, pointing at this host or at the load balancer in front of it |
+| `nginx-ports` | by port, no DNS: the gateway on `NGINX_PORT`, Langfuse on `NGINX_LANGFUSE_PORT`, whatever name the client uses | the line above plus `${NGINX_BIND_ADDR}:${NGINX_LANGFUSE_PORT:-8443}` → `8081` | the IP address or local name clients dial |
+
+Langfuse gets an origin of its own under both profiles: Langfuse v3 cannot be
+hosted on a sub-path.
+
+`NGINX_BIND_ADDR` defaults to `127.0.0.1`, so a profile with nothing else set
+answers on loopback only. Set it to the address of the NIC the clients
+(`terminate`) or the load balancer (`behind-proxy`) reach. An IPv6 address must
+be bracketed (`[fd00::1]`). There is no "all interfaces" default on purpose: an
+empty host IP makes Compose publish on every interface.
+
+### The two TLS modes
+
+The public endpoint is always HTTPS. There is no plain-HTTP public listener and
+no `:80 → :443` redirect. `NGINX_TLS_MODE` is **required and has no default**:
+unset, empty or misspelled, nginx does not start (exit 64). The two modes
+differ only in who terminates TLS:
+
+| `NGINX_TLS_MODE` | nginx speaks | TLS terminated by | Certificate on this host |
+|---|---|---|---|
+| `terminate` | TLS 1.2 / 1.3 | nginx | yes — `compose/nginx/certs/` |
+| `behind-proxy` | plain HTTP, on the internal hop only | the admins' load balancer | no |
+
+**Which one:** your admins already publish HTTPS in front of this host and
+forward HTTP to it internally → `behind-proxy`. You own the edge, or the load
+balancer re-encrypts to this host → `terminate`.
+
+- **`terminate`** — nginx is the public TLS endpoint. `NGINX_TLS_CERT` and
+  `NGINX_TLS_KEY` name the certificate and key in `compose/nginx/certs/`. Every
+  answer carries `Strict-Transport-Security: max-age=31536000`, the edge's own
+  429 included. Under `nginx`, a TLS handshake for any other name (or none) is
+  rejected. Every client that reaches the port is served; there is no peer
+  check.
+- **`behind-proxy`** — nginx serves only the peers in `NGINX_TRUSTED_PROXIES`
+  and closes the connection with no response (nginx's `444`) for everyone else:
+  the bind address picks a NIC, it is not access control. `NGINX_BIND_ADDR` may
+  not be the unspecified address in any spelling (`0.0.0.0`, `::`, `[::]`, …;
+  exit 68) — that would be a plain-HTTP listener on every interface. No HSTS
+  here: the terminator owns that header.
+
+`NGINX_TRUSTED_PROXIES` is a space-separated list of IPs or CIDRs, prefix at
+least `/8` (IPv4) or `/16` (IPv6): the terminator's address **as nginx sees it
+inside the container**. It does two jobs:
+
+- **It stops source-IP spoofing.** Only a listed peer may set the client address
+  through `X-Forwarded-For` (`real_ip`, one hop). A wide range would let any
+  client choose its own address, and that address keys the edge limits for
+  requests without a corp token. That is why `/0`-style prefixes are refused.
+- **In `behind-proxy` it is access control.** It is required there, and a wrong
+  value is a hard outage, not a degradation: every request gets `444`. The
+  access log records each refused peer — `"realip_remote_addr"` with
+  `"from_trusted_proxy":"0"` and status `444` — and that address is the value to
+  list. At least one entry must be IPv4 (exit 66 otherwise): the listeners are
+  IPv4.
+
+In `terminate` the list is optional (a load balancer that re-encrypts). Either
+way nginx sends `X-Forwarded-Proto: https`, the constant, to both upstreams; the
+inbound header is never read.
+
+`LANGFUSE_PUBLIC_URL` must be the public `https://` origin whenever a profile is
+on — **in `behind-proxy` too**: nginx speaks HTTP there, but the browser uses
+the load balancer's HTTPS origin, and that is what NextAuth checks. nginx
+refuses to start otherwise (exit 69). See "Reaching the UI".
+
+### Certificates (`terminate`)
+
+Bring your own; `compose/nginx/certs/README.md` is the reference (SANs, file
+modes, a corp-CA example). In short:
+
+- **SANs:** one certificate for `gateway.<GATEWAY_DOMAIN>` and
+  `langfuse.<GATEWAY_DOMAIN>` under `nginx`; under `nginx-ports`, the IP address
+  or local name clients dial (an IP SAN for an address).
+- **Files:** the full chain (leaf first) and an unencrypted key, mode `0600`,
+  named by `NGINX_TLS_CERT` / `NGINX_TLS_KEY` as bare file names.
+- **Installed on the server**, in `nginx/certs/` of the deploy directory
+  (`/opt/corp-llm-gateway/nginx/certs/` by default). `deploy.sh` never syncs
+  anything there except the README, and git ignores the rest.
+- **Rotation:** replace both files, then `docker compose restart nginx` (or
+  `nginx-ports`). nginx reads the certificate at start, and the entrypoint
+  checks the new files first. nginx does not warn before a certificate expires.
+- **Self-signed, for pilots and tests only:**
+  `scripts/deploy/make-selfsigned-certs.sh --domain <domain> [SAN …]` makes a
+  throwaway CA and a leaf signed by it. Verify with
+  `curl --cacert compose/nginx/certs/selfsigned-ca.crt …`, never with `-k`.
+  Claude Code reads an extra CA from `NODE_EXTRA_CA_CERTS`.
+- **ACME / Let's Encrypt is out of scope:** it needs inbound port 80 from the
+  internet or API control of the public DNS zone, plus one more container.
+
+### What nginx admits
+
+An exact-path allow-list, the same under both TLS modes, both routings and both
+auth modes (`nginx/templates/snippets/gateway-locations.inc.template` is the
+only copy). Each entry is one method on one exact path:
+
+| Method + path | What |
+|---|---|
+| `POST /v1/messages` | Anthropic Messages — Claude Code |
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/responses` | OpenAI Responses — Codex; HTTP only |
+| `GET /v1/models` | model listing; no body |
+| `GET /healthz/live` | the gateway's own liveness probe; never rate-limited |
+| `POST /internal/issue-token` | developer token issuance (`scripts/install.sh`); a body over 1 KiB is 413 — the gateway refuses any body anyway |
+
+**Everything else is 404 from nginx**, before a byte of the body is read and
+without reaching the gateway. The route gate refuses the same routes inside the
+image (`docs/security.md` §14), so this is defence in depth, and nginx never
+admits a route the gate refuses (`tests/compose/test_nginx_allowlist_routes.py`).
+Worth knowing by name:
+
+- **`/v1/embeddings`, `/v1/completions`, `/v1/moderations`, `/v1/audio/*`** —
+  the guardrail does not rewrite these bodies, so a public door that admitted
+  them would be a door for unsanitized text.
+- **`/v1/messages/count_tokens` and `/v1/responses/input_tokens`** — litellm
+  serves them without the guardrail: the raw prompt would reach the provider's
+  token counter unsanitized and unaudited. Token counting is advisory for
+  Claude Code, and the gateway refuses both routes on the tunnel too (403).
+- **The Responses WebSocket transport** (`/v1/responses` with `Upgrade`) —
+  frames after the handshake never pass the guardrail. nginx never forwards an
+  upgrade to the gateway, and the `POST`-only rule refuses the handshake.
+- **Polling a `background: true` response** — `POST /v1/responses` with
+  `background: true` is accepted, but `GET /v1/responses/{id}` (and cancel,
+  `input_items`, `/v1/responses/compact`) is 404. Desanitization is keyed to
+  the request that created the response, so a later poll would return
+  placeholders, not originals.
+- **litellm's admin surface and UI, `/health*`, `/healthz/ready`,
+  `/healthz/sanitization`, `/healthz/extensions` and `/metrics`** — these stay
+  on the SSH tunnel to `127.0.0.1:${GATEWAY_PORT:-4000}`, as before.
+
+Past a per-token limit nginx answers 429 `E_RATE_LIMITED` itself:
+`docs/ops/capacity.md`, "Edge limits". Streams are not buffered (SSE passes
+through as the gateway sends it), and bodies up to 25 MiB pass: the gateway's
+100 KiB figure is a per-text-leaf threshold, not a body cap.
+
+### Logs
+
+One JSON access-log line per request on nginx's stdout
+(`docker compose logs nginx`): the peer and client address, `from_trusted_proxy`,
+host, method, path (`$uri`), status, upstream status and time. It carries no
+`Authorization`, no `X-Corp-Auth`, no body and no query string. The error log is
+set to `crit`: at `error` and `warn` nginx appends the full request line, query
+string included, to its messages. Diagnose a 502/504 from the access log's
+`status` and `upstream_status`. The healthcheck's own requests are not logged.
+
+### Troubleshooting
+
+The entrypoint writes one line naming the key it refused, then exits:
+
+| Exit | Cause |
+|---|---|
+| 64 | `NGINX_TLS_MODE` is not exactly `terminate` or `behind-proxy`; `GATEWAY_DOMAIN` is missing or not a lowercase DNS name with two labels (under `nginx`); an edge-limit key (`NGINX_TOKEN_RATE`, `NGINX_TOKEN_BURST`, `NGINX_TOKEN_CONN`, `NGINX_ISSUE_RATE`) is not a whole number from 1 to 999999; or the service's routing argument is not `host` / `port` (an edited compose file) |
+| 65 | `terminate`: `NGINX_TLS_CERT` or `NGINX_TLS_KEY` is not a bare file name (`A-Z a-z 0-9 . _ -`), or that file in `compose/nginx/certs/` is missing or empty |
+| 66 | an `NGINX_TRUSTED_PROXIES` entry is not an IP/CIDR with a prefix of at least `/8` (IPv4) or `/16` (IPv6); or, in `behind-proxy`, the list is empty or has no IPv4 entry |
+| 67 | a template is missing, or names a variable the entrypoint does not render — a damaged `nginx/templates/`, not a setting |
+| 68 | `behind-proxy` with `NGINX_BIND_ADDR` set to the unspecified address in any spelling |
+| 69 | `LANGFUSE_PUBLIC_URL` is not `https://<host>[:port]` (no path, no credentials, no bracketed IPv6), or under `nginx` names a host other than `langfuse.<GATEWAY_DOMAIN>` |
+
+Any other non-zero exit is `nginx -t` rejecting the rendered config; its own
+message is in the same log. Facts that surprise operators:
+
+- **The listeners are IPv4** (`listen 8080`). An IPv6-only
+  `NGINX_TRUSTED_PROXIES` could never match a peer, so `behind-proxy` refuses it
+  (exit 66); `::ffff:a.b.c.d` never matches an IPv4 peer either.
+- **An untrusted peer can still get a `400`.** nginx answers a malformed request
+  (no `Host`, an oversize header) with its own 400 before the trusted-peer
+  check runs. It tells the peer that nginx listens there — a fingerprint, never
+  content. By design.
+- **`%3F` in a path reaches the log decoded.** The access log records `$uri`,
+  which nginx percent-decodes: `GET /x%3Fcode%3DSECRET` is logged as
+  `"uri":"/x?code=SECRET"`. "No query string in the log" holds for a literal
+  `?` only. Only a client that encodes a secret into its own path can cause it;
+  a header or a body never reaches the log.
+- **An absolute-form request line picks the server.**
+  `POST http://gateway.<domain>/v1/messages` with a different `Host:` is routed
+  by the name in the request line, so a `Host` naming neither origin does not
+  always get no response. The allow-list applies all the same — no bypass — and
+  the gateway receives the name nginx routed on.
+- **HSTS:** every `terminate` answer carries it, the edge's 429 included; no
+  `behind-proxy` answer does.
+- **A replaced certificate** takes effect only after
+  `docker compose restart nginx` (or `nginx-ports`).
 
 ## Durability
 

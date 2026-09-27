@@ -800,6 +800,23 @@ ASGI app — by wrapping, not `add_middleware` — so `RouteGateMiddleware` is
 ahead of the gate. The `litellm` CLI and `litellm.proxy.proxy_server:app` must
 never be the served target again; both serve the routers with nothing in front.
 
+On the compose stack the opt-in HTTPS front door (`compose/nginx/`) sits outside
+the image, so a request crosses these layers, outermost first:
+
+```
+nginx front door    compose, COMPOSE_PROFILES=nginx|nginx-ports, off by default:
+                    TLS (or a trusted terminator), exact-path allow-list → 404,
+                    per-token edge limits → 429 E_RATE_LIMITED
+   ↓
+RouteGateMiddleware classify (METHOD, path) → PASSTHROUGH / REWRITTEN / REFUSE
+   ↓
+in-flight limiter   REWRITTEN only: body drained, then a slot → 429 E_CAPACITY
+   ↓
+litellm router      pre_call_hook → sanitize → provider
+```
+
+Without a profile, and on Helm, the route gate is the outermost layer.
+
 The middleware is pure ASGI, not `BaseHTTPMiddleware`, for two reasons that are
 security-relevant: it must see `websocket` scopes (an HTTP middleware never
 does, so a handshake would pass unclassified), and it must not buffer — SSE
@@ -1102,7 +1119,8 @@ sanitizer, the DLP guard and the audit, and a refusal here grants nothing.
   client then polls `GET /v1/responses/{id}`, which re-runs under a different
   request id. Cache B is keyed per conversation and `conversation_id ==
   request_id`, so desanitization of the polled result is not guaranteed. Neither
-  the create nor the poll returns an original.
+  the create nor the poll returns an original. Through the compose front door the
+  poll does not get that far: nginx answers `GET /v1/responses/{id}` with 404.
 
 ### Widening it
 
@@ -1123,7 +1141,9 @@ admin UI either: a mounted sub-app serves many paths under its prefix, and listi
 one by one is not a widening anyone should write. `gateway-admin config check
 --routes` prints the effective table and every extra.
 
-The nginx front door (`docs/plans/20260806-nginx-profile-tls.md`) denies the same
-routes at the edge. That is defence in depth, not a substitute: the gate runs
-inside the image, so it holds on the SSH-tunnel path and under compose too, where
+The nginx front door (`compose/nginx/`; operator reference: `compose/README.md`,
+"HTTPS front door (nginx)") denies the same routes at the edge with 404, and
+admits nothing the gate refuses (`tests/compose/test_nginx_allowlist_routes.py`).
+That is defence in depth, not a substitute: the gate runs inside the image, so
+it holds on the SSH-tunnel path and on a compose stack with no profile on, where
 there is no nginx.

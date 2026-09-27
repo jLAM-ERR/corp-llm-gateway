@@ -176,8 +176,16 @@ corp-токены выдаёт `gateway-admin token issue` (аварийный �
 `/model/*`, `/user/*`, `/policies*`, `/guardrails*` и UI иначе отвечала бы любому,
 кто дошёл до порта. Route gate отклоняет их все (`403 E_ROUTE_BLOCKED`) раньше,
 чем запрос увидит litellm, на любом пути внутрь — loopback, SSH-туннель или
-будущий фронт на nginx. LLM-маршруты по-прежнему закрывает проверка `X-Corp-Auth`
+фронт на nginx. LLM-маршруты по-прежнему закрывает проверка `X-Corp-Auth`
 в `pre_call`. См. `../security.md` §14.
+
+Фронт (`COMPOSE_PROFILES=nginx` или `nginx-ports`, `compose/README.ru.md`,
+«HTTPS-фронт (nginx)») **дополнительно** отвечает на всю эту поверхность 404 на
+периметре, безусловно и в обоих режимах: его allow-list по точным путям
+пропускает только `POST /v1/messages`, `POST /v1/chat/completions`,
+`POST /v1/responses`, `GET /v1/models`, `GET /healthz/live` и
+`POST /internal/issue-token`. Это эшелонированная защита — отказ выше действует и
+без nginx, — а администрирование остаётся на SSH-туннеле к `127.0.0.1:4000`.
 
 ---
 

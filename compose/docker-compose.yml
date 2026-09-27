@@ -1,11 +1,12 @@
 # Production compose stack for non-k8s hosts — data plane + self-hosted
-# Langfuse + the audit pipeline (this revision). See compose/README.md. The
-# optional nginx front door lands in a later revision of this file (`nginx/`
-# -> `--profile nginx`); `vector` below is always-on, because audit is not
+# Langfuse + the audit pipeline + an opt-in HTTPS front door. See
+# compose/README.md. The front door (`nginx` / `nginx-ports` at the end of this
+# file, configured in `nginx/`) is off unless the server's .env sets
+# COMPOSE_PROFILES; `vector` below is always-on, because audit is not
 # optional. The offline corp-NER mock (workstream B) will register a service
 # carrying `profiles: ["mock"]`.
-# Langfuse publishes NO host port: it is reachable only through the nginx
-# profile or an SSH tunnel (compose/README.md "Langfuse").
+# Langfuse publishes NO host port: it is reachable only through the front door
+# or an SSH tunnel (compose/README.md "Langfuse").
 #
 # Distinct from docker-compose.demo.yml's default project name
 # (`corp-llm-gateway`, derived from the repo directory basename): reusing it
@@ -342,9 +343,10 @@ services:
         # / `journald`), so it is valid exactly where this driver is pinned.
         compress: "false"
     ports:
-      # Loopback only — no TLS on this port until the nginx profile (C1)
-      # lands; subscription tokens, virtual keys and X-Corp-Auth must not cross
-      # a server-class network in cleartext.
+      # Loopback only, with or without the front door — no TLS on this port;
+      # subscription tokens, virtual keys and X-Corp-Auth must not cross a
+      # server-class network in cleartext. The front door reaches it over the
+      # compose network.
       - "127.0.0.1:${GATEWAY_PORT:-4000}:4000"
     depends_on:
       redis:
@@ -374,9 +376,10 @@ services:
   # ENCRYPTION_KEY / minioadmin are literal "change-in-production"
   # placeholders), named volumes for all four stateful services, and NO
   # published ports anywhere — Langfuse holds request-level traces and the
-  # audit trail, so it is reachable only through the nginx profile (C1) or an
-  # SSH tunnel. Each service lists only the keys it needs; there is no
-  # `env_file:` here for the same reason as on the litellm service above.
+  # audit trail, so it is reachable only through the front door (nginx /
+  # nginx-ports) or an SSH tunnel. Each service lists only the keys it needs;
+  # there is no `env_file:` here for the same reason as on the litellm service
+  # above.
 
   langfuse-redis:
     image: redis:8-alpine
@@ -568,8 +571,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://langfuse:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/langfuse
       # Must match the origin the browser actually uses, or NextAuth's
-      # sign-in redirect loops: the nginx host (C1) or the local end of your
-      # SSH tunnel. See compose/README.md "Langfuse".
+      # sign-in redirect loops: the front door's https:// origin (its
+      # entrypoint refuses anything else) or the local end of your SSH tunnel.
+      # See compose/README.md "Langfuse".
       - NEXTAUTH_URL=${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
       - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET:?set LANGFUSE_NEXTAUTH_SECRET in .env}
       - SALT=${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}

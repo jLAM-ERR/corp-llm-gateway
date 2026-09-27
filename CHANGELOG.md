@@ -7,6 +7,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — HTTPS front door for the compose stack (nginx, opt-in)
+
+- **`nginx` / `nginx-ports` profiles** in `compose/docker-compose.yml`, off unless the server's
+  `.env` sets `COMPOSE_PROFILES` — the one switch a deploy and a reboot both read. `nginx` routes
+  `gateway.<GATEWAY_DOMAIN>` / `langfuse.<GATEWAY_DOMAIN>` by name; `nginx-ports` is the no-DNS
+  fallback on two ports. Published on `NGINX_BIND_ADDR`, loopback by default. With no profile the
+  stack is unchanged.
+- **HTTPS only, two TLS modes, no default.** `NGINX_TLS_MODE=terminate` (nginx serves a
+  bring-your-own certificate from `compose/nginx/certs/`, TLS 1.2+, HSTS) or `behind-proxy` (the
+  admins' load balancer terminates; every peer outside `NGINX_TRUSTED_PROXIES` gets no response).
+  A validating entrypoint refuses a bad key with one log line and exit 64-69.
+- **Exact-path allow-list**: `POST /v1/messages`, `/v1/chat/completions`, `/v1/responses`,
+  `GET /v1/models`, `GET /healthz/live`, `POST /internal/issue-token`; everything else is 404 at
+  the edge — defence in depth over the route gate, and nginx admits nothing the gate refuses.
+- **Per-token edge limits** (`NGINX_TOKEN_RATE`, `NGINX_TOKEN_BURST`, `NGINX_TOKEN_CONN`,
+  `NGINX_ISSUE_RATE`): 429 `E_RATE_LIMITED` before the gateway (`docs/ops/capacity.md`, "Edge
+  limits").
+- **Deploy:** `deploy.sh` refuses a `.env` that enables both profiles, fails at once on a dead
+  front door, and never syncs `nginx/certs/`; certificates are installed on the server
+  (`docs/ops/deploy-handoff.md`, step 4a). `scripts/deploy/make-selfsigned-certs.sh` makes a
+  throwaway CA + leaf for pilots and tests.
+- **Logs:** a JSON access log with no credential header, body or query string; `error_log` at
+  `crit`, since nginx appends the request line at `error` and `warn`.
+
 ### Added — Keycloak-issued corp tokens, gateway-owned capacity cap
 
 - **`POST /internal/issue-token`** — trades a Keycloak access token (RS256 only; `iss`/`aud`/`azp`
@@ -117,8 +141,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Known limitations of the compose target
 
-- **No TLS in front of the stack yet** — the only published port is `127.0.0.1:4000`; the nginx
-  front door is a later revision.
+- **No TLS in front of the stack yet** — the only published port is `127.0.0.1:4000`. (Resolved
+  before release: the opt-in HTTPS front door, "Added — HTTPS front door" above.)
 - **In Mode B litellm's management endpoints are unauthenticated** (`/key/*`, `/model/*`,
   `/user/*`, the UI) — its proxy auth is skipped without a master key, which is what the mode
   requires. The LLM routes stay gated by `X-Corp-Auth`. Must be closed at nginx before the port
