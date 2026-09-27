@@ -7,6 +7,10 @@ image:
 
 litellm:
   versionPin: "1.40"
+  # litellm's general_settings.cancel_on_disconnect: litellm also watches for a
+  # client disconnect while the upstream call is in flight. A second layer only —
+  # the gateway's in-flight limiter cancels a disconnected request on its own.
+  cancelOnDisconnect: true
 
 guardrail:
   contentSizeThresholdBytes: 102400
@@ -76,6 +80,40 @@ token:
   ttlDays: 30
   revocationCacheSeconds: 60
 
+# Developer token issuance (POST /internal/issue-token; docs/ops/install.md,
+# docs/ops/configuration.md). Enabled renders these values into
+# /etc/corp-llm-gateway/config.toml, mounted read-only on the gateway and the
+# config-check initContainer, and points CORP_LLM_GATEWAY_CONFIG_FILE at it. Set
+# the CORP_GATEWAY_ISSUE_* keys here only — the chart refuses them under
+# `config:`, where an env var would shadow the file. Also needed: CORP_LLM_PG_DSN
+# in the Secret and tokens/schema.sql applied (docs/ops/upgrade.md). With
+# networkPolicy.enabled, networkPolicy.keycloak must be enabled too (the gateway
+# fetches the realm JWKS; without the egress rule every issuance is a 503) — the
+# chart refuses to render otherwise.
+issuance:
+  enabled: false
+  issuer: ""          # Keycloak realm URL; required when enabled
+  audience: ""        # required; must differ from CORP_GATEWAY_OIDC_AUDIENCE
+  clientId: ""        # required; the device-flow client (the token's azp)
+  jwksUrl: ""         # empty -> {issuer}/protocol/openid-connect/certs
+  teamClaim: "groups"
+  userClaim: "preferred_username"
+  ttlDays: 30
+  maxActive: 2
+  minIntervalSeconds: 600
+  maxInflight: 4
+  ratePerMinute: 30
+  storeTimeoutSeconds: 10
+  # Keycloak group -> existing team_id, as a LIST so the order survives (a YAML
+  # map has none). First group in this order that the user belongs to wins;
+  # an unmapped user gets 403. Required when enabled. Example:
+  #   teamMap:
+  #     - group: "/devs/payments"
+  #       team: payments
+  #     - group: "/devs/core"
+  #       team: core
+  teamMap: []
+
 ingress:
   host: gateway.corp.lan
   tls: true
@@ -88,6 +126,13 @@ networkPolicy:
   enabled: false
   upstreamCidrs: []
   corpInternalCidrs: []
+  # Egress from the gateway pods to Keycloak: the gateway fetches the realm
+  # JWKS to verify developer sign-ins. Developers' laptops reach Keycloak
+  # directly; this rule is not for them. cidr is required once enabled.
+  keycloak:
+    enabled: false
+    cidr: ""   # the Keycloak endpoint, e.g. "10.20.30.40/32"
+    port: 443
 
 failPolicy:
   corpLlmDown: "fail-closed"
@@ -112,6 +157,24 @@ config:
   # it, so every Helm deploy took the old off-by-default. Never drops
   # Authorization (invariant 3).
   CORP_LLM_STRIP_INBOUND_HEADERS: "1"
+  # The in-flight cap per pod (route gate, docs/ops/capacity.md): concurrent
+  # rewritten requests, a slot held for the whole stream; the next gets 429
+  # E_CAPACITY. Scale replicas rather than raise it. 0 = off, refused at boot
+  # when CORP_ENV is prod/production.
+  CORP_LLM_MAX_INFLIGHT: "64"
+  # Seconds a request cancelled by a client disconnect gets to unwind; a slot is
+  # held at most 2 x this after a disconnect. (0, 60].
+  CORP_LLM_CANCEL_GRACE_SECONDS: "5"
+  # Seconds a rewritten request gets to deliver its whole body, before it takes
+  # a slot; past it 408 E_BODY_TIMEOUT. (0, 300].
+  CORP_LLM_BODY_READ_SECONDS: "30"
+  # Requests reading a body at once per pod; the next gets 429 E_CAPACITY
+  # unread. Empty = 4 x CORP_LLM_MAX_INFLIGHT, so it follows the cap; a number
+  # must be at least CORP_LLM_MAX_INFLIGHT (config check and boot refuse less).
+  CORP_LLM_MAX_DRAINING: ""
+  # Request-body bytes buffered at once per pod — the memory knob. Size it
+  # against the pod's memory limit (docs/ops/capacity.md); 25 MiB to 16 GiB.
+  CORP_LLM_MAX_DRAINING_BYTES: "536870912"
 
 # Set to the name of an external (Vault / external-secrets) Secret to source the
 # sensitive env contract from it. When set, the chart renders no Secret and the

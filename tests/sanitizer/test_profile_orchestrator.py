@@ -7,8 +7,11 @@ result never bleeds across profiles. Empty profile_ids → the core orchestrator
 no fingerprint (byte-identical to today).
 """
 
+import asyncio
 import json
+import logging
 import os
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +22,7 @@ from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.corp_llm import CorpLlmClient
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
+from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.profiles import (
     CODE_SAFE_DETECTORS,
     DETECTOR_REGISTRY,
@@ -44,7 +48,7 @@ from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
 from tests.sanitizer.test_orchestrator import _client_returning_pairs
-from tests.test_litellm_hook import _corp_llm_returning
+from tests.test_litellm_hook import _corp_llm_returning, _RecordingMetrics
 
 _CONFIG_PAYLOAD = (
     "DATABASE_URL=postgres://admin:pass@db/prod\n"
@@ -562,6 +566,7 @@ def _guardrail(
     *,
     corp_llm: CorpLlmClient | None = None,
     dlp_guard: object | None = None,
+    metrics: MetricsExporter | None = None,
 ) -> tuple[CorpLlmGuardrail, ListSink]:
     store = InMemoryMappingStore()
     corp = corp_llm if corp_llm is not None else _corp_llm_returning([])
@@ -585,6 +590,7 @@ def _guardrail(
         AuthMiddleware(token_store),
         AuditLogger(sink, gateway_version="0.0.1"),
         dlp_guard=dlp_guard,  # type: ignore[arg-type]
+        metrics=metrics,
     )
     return guardrail, sink
 
@@ -720,3 +726,115 @@ async def test_pre_call_misconfigured_profile_fails_closed(tmp_path: Path) -> No
     assert ei.value.error_code == "E_PROFILE_UNAVAILABLE"
     assert sink.records[0].get("status") == "failed"
     assert sink.records[0].get("error_code") == "E_PROFILE_UNAVAILABLE"
+
+
+# --- a team-config store that cannot answer --------------------------------
+
+_STORE_CANARY = "team-store-secret-AKIAIOSFODNN7EXAMPLE"
+
+
+class _FailingTeamStore(InMemoryTeamConfigStore):
+    def __init__(self, fault: Callable[[], Awaitable[None]]) -> None:
+        super().__init__()
+        self._fault = fault
+
+    async def get(self, team_id: str) -> TeamConfig:
+        await self._fault()
+        raise AssertionError("unreachable")
+
+
+async def _stall_past_bound() -> None:
+    # The store's own per-call bound firing on a server that stopped answering.
+    async with asyncio.timeout(0.2):
+        await asyncio.sleep(3600)
+
+
+async def _refused() -> None:
+    raise ConnectionRefusedError(f"connect to {_STORE_CANARY} refused")
+
+
+@pytest.mark.parametrize(
+    ("fault", "exc_type"),
+    [(_stall_past_bound, "TimeoutError"), (_refused, "ConnectionRefusedError")],
+    ids=["stall", "refused"],
+)
+async def test_an_unreachable_team_config_store_is_503_profile_unavailable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    fault: Callable[[], Awaitable[None]],
+    exc_type: str,
+) -> None:
+    metrics = _RecordingMetrics()
+    g, sink = _guardrail(tmp_path, _FailingTeamStore(fault), metrics=metrics)
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(_data(content="hello"))
+
+    assert loop.time() - start < 1.0
+    assert (ei.value.status_code, ei.value.error_code) == (503, "E_PROFILE_UNAVAILABLE")
+    assert metrics.failures == ["team_config"]
+    (record,) = sink.records
+    assert (record["status"], record["error_code"]) == ("failed", "E_PROFILE_UNAVAILABLE")
+    assert exc_type in caplog.text
+    assert _STORE_CANARY not in caplog.text
+    assert _STORE_CANARY not in str(ei.value)
+    chained = ei.value.__cause__
+    while chained is not None:
+        assert _STORE_CANARY not in str(chained)
+        chained = chained.__cause__ or chained.__context__
+
+
+async def test_a_team_config_query_fault_is_not_mistaken_for_an_outage(tmp_path: Path) -> None:
+    async def query_fault() -> None:
+        raise ValueError("bad row")
+
+    metrics = _RecordingMetrics()
+    g, _ = _guardrail(tmp_path, _FailingTeamStore(query_fault), metrics=metrics)
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(_data(content="hello"))
+    assert (ei.value.status_code, ei.value.error_code) == (500, "E_INTERNAL")
+    assert "team_config" not in metrics.failures
+
+
+async def test_a_stalled_postgres_team_config_store_is_503_within_its_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from corp_llm_gateway.team_config import postgres_store
+    from tests.postgres_support import pg_dsn, require_asyncpg, skip_or_fail
+    from tests.stalling_proxy import StallingProxy
+
+    require_asyncpg()
+    import asyncpg
+
+    try:
+        conn = await asyncpg.connect(pg_dsn(), timeout=5)
+        await conn.close()
+    except Exception as exc:
+        skip_or_fail(f"Postgres unreachable: {type(exc).__name__}")
+    bound = 0.5
+    monkeypatch.setattr(postgres_store, "_GET_TIMEOUT_S", bound)
+    proxy = StallingProxy(pg_dsn())
+    store = postgres_store.PostgresTeamConfigStore(await proxy.start())
+    try:
+        await store.init_schema()
+        await store.upsert(TeamConfig(team_id="t1", name="t1"))
+        metrics = _RecordingMetrics()
+        g, _ = _guardrail(tmp_path, store, metrics=metrics)  # type: ignore[arg-type]
+        loop = asyncio.get_running_loop()
+        proxy.stall()
+        start = loop.time()
+
+        with pytest.raises(GuardrailHttpException) as ei:
+            await g.pre_call(_data(content="hello"))
+
+        # The statement bound plus the cancel request's own budget.
+        assert loop.time() - start < bound + 1.5
+        assert (ei.value.status_code, ei.value.error_code) == (503, "E_PROFILE_UNAVAILABLE")
+        assert metrics.failures == ["team_config"]
+    finally:
+        proxy.resume()
+        await store.close()
+        await proxy.close()

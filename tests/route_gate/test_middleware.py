@@ -18,7 +18,9 @@ from corp_llm_gateway.route_gate import (
     ROUTE_GATE_UNARMED,
     ROUTE_GATE_UNLISTED,
     ROUTE_GATE_WEBSOCKET,
+    Entry,
     RouteGateMiddleware,
+    Verdict,
     parse_extras,
 )
 
@@ -473,10 +475,13 @@ async def test_a_refusal_writes_one_audit_record_with_the_block_reason() -> None
 
 def test_every_block_reason_has_a_status_a_code_and_a_type() -> None:
     from corp_llm_gateway.route_gate import middleware
+    from corp_llm_gateway.route_gate.inflight import LIMITER_BLOCK_REASONS
 
-    assert set(middleware._STATUS) == BLOCK_REASONS
-    assert set(middleware._ERROR_CODE) == BLOCK_REASONS
-    assert set(middleware._ERROR_TYPE) == BLOCK_REASONS
+    # The classifier's reasons plus the two the in-flight limiter refuses with.
+    answered = BLOCK_REASONS | LIMITER_BLOCK_REASONS
+    assert set(middleware._STATUS) == answered
+    assert set(middleware._ERROR_CODE) == answered
+    assert set(middleware._ERROR_TYPE) == answered
 
 
 async def test_a_passthrough_writes_no_audit_record() -> None:
@@ -500,3 +505,111 @@ async def test_a_failing_audit_sink_does_not_unblock_the_refusal() -> None:
     assert _status(sent) == 403
     assert metrics.blocks == [ROUTE_GATE_LISTED]
     assert metrics.failures == [COMPONENT]
+
+
+# ── the management surface is refused (docs/security.md §14) ─────────────────
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/key/list"),
+        ("POST", "/key/generate"),
+        ("POST", "/policies"),
+        ("PUT", "/guardrails/g1"),
+        ("POST", "/guardrails/apply_guardrail"),
+        ("POST", "/login"),
+        ("GET", "/sso/key/generate"),
+        ("GET", "/"),
+        ("GET", "/health"),
+        ("GET", "/health/drain"),
+    ],
+)
+async def test_the_management_surface_answers_403(method: str, path: str) -> None:
+    stub = _Stub()
+    metrics = _RecordingMetrics()
+    sent = await _drive(
+        _gate(stub, metrics=metrics, armed=True),
+        _http_scope(method, path),
+        body=CANARY.encode(),
+    )
+    assert _status(sent) == 403
+    assert _json(sent)["error"]["code"] == "E_ROUTE_BLOCKED"
+    assert _json(sent)["error"]["reason"] == ROUTE_GATE_LISTED
+    assert metrics.blocks == [ROUTE_GATE_LISTED]
+    assert not stub.called
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/health/liveliness"),
+        ("GET", "/health/readiness"),
+        ("GET", "/v1/models"),
+        ("GET", "/healthz/live"),
+        ("GET", "/healthz/ready"),
+        ("GET", "/healthz/sanitization"),
+        ("GET", "/healthz/extensions"),
+        ("GET", "/metrics"),
+        ("GET", "/v1/responses/resp_123"),
+    ],
+)
+async def test_the_probes_models_and_stored_responses_still_pass(method: str, path: str) -> None:
+    stub = _Stub()
+    sent = await _drive(_gate(stub), _http_scope(method, path))
+    assert stub.called
+    assert _status(sent) == 200
+
+
+# One refused row per family the admin-surface decision closed.
+REFUSED_FAMILY_ROWS = [
+    pytest.param("GET", "/key/list", id="admin"),
+    pytest.param("PUT", "/guardrails/g1", id="admin-regex"),
+    pytest.param("GET", "/global/spend", id="spend"),
+    pytest.param("POST", "/login", id="auth"),
+    pytest.param("GET", "/public/model_hub", id="public"),
+    pytest.param("GET", "/get_logo_url", id="ui"),
+    pytest.param("GET", "/", id="home"),
+    pytest.param("POST", "/lazy/warm/mcp", id="lazy"),
+    pytest.param("GET", "/health", id="health"),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), REFUSED_FAMILY_ROWS)
+def test_an_extra_naming_a_refused_row_is_refused_at_load(method: str, path: str) -> None:
+    with pytest.raises(ValueError, match="refused"):
+        parse_extras(f"{method} {path}")
+
+
+@pytest.mark.parametrize(("method", "path"), REFUSED_FAMILY_ROWS)
+async def test_an_extra_cannot_re_admit_a_refused_row(method: str, path: str) -> None:
+    # Built by hand, past parse_extras: the runtime must hold on its own.
+    stub = _Stub()
+    extras = {(method, path): Entry(Verdict.PASSTHROUGH, "hand-built extra")}
+    sent = await _drive(_gate(stub, armed=True, extras=extras), _http_scope(method, path))
+    assert _status(sent) == 403
+    assert _json(sent)["error"]["reason"] == ROUTE_GATE_LISTED
+    assert not stub.called
+
+
+def test_a_head_extra_on_a_refused_get_is_refused_at_load() -> None:
+    with pytest.raises(ValueError, match="refused"):
+        parse_extras("HEAD /health")
+
+
+async def test_a_head_extra_cannot_re_admit_a_refused_get() -> None:
+    # HEAD inherits its path's GET verdict; an extra must not slip in between.
+    stub = _Stub()
+    extras = {("HEAD", "/health"): Entry(Verdict.PASSTHROUGH, "hand-built extra")}
+    sent = await _drive(_gate(stub, extras=extras), _http_scope("HEAD", "/health"))
+    assert _status(sent) == 403
+    assert _json(sent)["error"]["reason"] == ROUTE_GATE_LISTED
+    assert not stub.called
+
+
+async def test_a_head_extra_still_admits_an_unlisted_path() -> None:
+    stub = _Stub()
+    gate = _gate(stub, extras=parse_extras("HEAD /internal/ops-status"))
+    sent = await _drive(gate, _http_scope("HEAD", "/internal/ops-status"))
+    assert stub.called
+    assert _status(sent) == 200

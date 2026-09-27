@@ -35,7 +35,7 @@ Revisions list: `helm history gw`. Default Helm keeps the last 10.
 
 The fail-policy matrix in the plan (M4) is the source of truth for what "should" happen on each component failure. When reality disagrees, that's the bug.
 
-Metrics note: the alert series `gateway_failure{component}` and `corp_llm_gateway_blocked_requests_total{block_reason}` are emitted by the metrics module and scraped via the ServiceMonitor — with `CORP_METRICS_EXPORTER=prometheus` (default `noop` emits nothing). The same conditions also surface in the gateway's structured logs — grep `error_code=` (e.g. `E_CORP_LLM_DOWN`, `E_NER_UNAVAILABLE`, `E_OVERSIZE_BLOCKED`, `E_DLP_BLOCKED`, `E_INTERNAL`, `E_ROUTE_BLOCKED`, `E_ROUTE_GATE_UNARMED`, `E_ROUTE_GATE_ERROR`) and `block_reason=` (`litellm_pre_call_blocked` / `litellm_egress_blocked` / `route_gate_*`).
+Metrics note: the alert series `gateway_failure{component}` and `corp_llm_gateway_blocked_requests_total{block_reason}` are emitted by the metrics module and scraped via the ServiceMonitor — with `CORP_METRICS_EXPORTER=prometheus` (default `noop` emits nothing). The same conditions also surface in the gateway's structured logs — grep `error_code=` (e.g. `E_CORP_LLM_DOWN`, `E_NER_UNAVAILABLE`, `E_OVERSIZE_BLOCKED`, `E_DLP_BLOCKED`, `E_INTERNAL`, `E_ROUTE_BLOCKED`, `E_ROUTE_GATE_UNARMED`, `E_ROUTE_GATE_ERROR`, `E_CAPACITY`, `E_BODY_TIMEOUT`, `E_STORE_UNAVAILABLE`, `E_PROFILE_UNAVAILABLE`) and `block_reason=` (`litellm_pre_call_blocked` / `litellm_egress_blocked` / `route_gate_*`).
 
 ### Corp-LLM unreachable
 
@@ -140,14 +140,14 @@ Action — read `reason` first, it names the cause:
 
 | `reason` | Status | What happened | What to do |
 |---|---|---|---|
-| `route_gate_listed` | 403 | the table refuses this route (token counting, embeddings, `/v1/completions`, provider-native passthrough, the telemetry batch, …) | Nothing. Expected. For token counting, see [`../security.md`](../security.md) §11 (i): clients use `usage.input_tokens`. |
+| `route_gate_listed` | 403 | the table refuses this route (token counting, embeddings, `/v1/completions`, provider-native passthrough, the telemetry batch, litellm's management surface — `/key/*`, the admin API, `GET /health`, …) | Nothing. Expected. For token counting, see [`../security.md`](../security.md) §11 (i): clients use `usage.input_tokens`. For litellm's admin API or UI: refused by design, use `gateway-admin` (§14). |
 | `route_gate_unlisted` | 404 | no table entry — default-deny | Either the client asked for a route litellm does not have, or a litellm bump added one and the table has no row for it yet — rows are hand-classified against litellm's source, guarded by the collector test (`docs/extending.md`). For an operator route you own, widen with `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`. |
 | `route_gate_websocket` | 403 | a `websocket` scope, or `Upgrade: websocket` on any path | Expected: frames after the handshake never reach the hook. Clients must use the HTTP transport. |
 | `route_gate_malformed` | 403 | the raw path carries `%2f`, `%00`, `%2e%2e` or a non-ASCII byte, or the decoded path carries `..`, `//` or NUL | Not a config problem. A normal client does not send these — treat a sustained rate as probing and check the audit records. |
 
 There is **no off switch.** The only knob is
 `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` (`configuration.md`), it adds
-PASSTHROUGH entries only, and `gateway-admin config check --routes` prints the
+PASSTHROUGH entries only — an item naming a refused route exits 78 at boot — and `gateway-admin config check --routes` prints the
 effective table plus every extra. If a route genuinely needs to be *rewritten*,
 that is a code change: a `table.py` row plus the guard test, never a knob.
 
@@ -182,7 +182,7 @@ half-configured rather than start litellm with no guardrail.
 
 | Exit | Meaning | What to check |
 |---|---|---|
-| **78** (`EX_CONFIG`) | litellm's config is unusable | `CORP_LLM_LITELLM_CONFIG` (default `/etc/litellm/config.yaml`): file present, named `.yaml`/`.yml`, readable, a non-empty YAML mapping. Also refused: `general_settings.pass_through_endpoints` (registered at runtime, so the gate cannot classify them) and `general_settings.database_url` (the Prisma step reads `DATABASE_URL`/`DIRECT_URL` only). Same code when `CORP_LLM_SERVE_PORT` is not a port number. |
+| **78** (`EX_CONFIG`) | litellm's config is unusable | `CORP_LLM_LITELLM_CONFIG` (default `/etc/litellm/config.yaml`): file present, named `.yaml`/`.yml`, readable, a non-empty YAML mapping. Also refused: `general_settings.pass_through_endpoints` (registered at runtime, so the gate cannot classify them) and `general_settings.database_url` (the Prisma step reads `DATABASE_URL`/`DIRECT_URL` only). Same code when `CORP_LLM_SERVE_PORT` is not a port number, when a `CORP_LLM_*` in-flight key is out of range (or `CORP_LLM_MAX_INFLIGHT=0` in prod), when `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` is malformed or names a refused route, and when issuance is on but cannot be served: partial config, no `CORP_LLM_PG_DSN`, missing extras, a bad CA bundle, Postgres refusing the DSN, TLS or `SELECT`, or a `corp_tokens` without the issuance columns / a valid `corp_tokens_oidc_jti_key` (`upgrade.md`). The log line names the key or the fix; `configuration.md` lists every case. |
 | **70** (`EX_SOFTWARE`) | litellm started, but no `CorpLlmGuardrail` in `litellm.callbacks` | The `litellm_settings.callbacks` line in the config — it must name `corp_llm_gateway.bootstrap.guardrail`. This is the fail-open that used to start a proxy with no sanitization at all. |
 | **2** | Prisma schema migration cannot proceed | `DATABASE_URL` / `DIRECT_URL` reachable? The log line carries the RuntimeError text from litellm's `PrismaManager`. Same condition litellm's own CLI exits on. |
 | **1** | Prisma schema setup failed after retries, with `ENFORCE_PRISMA_MIGRATION_CHECK` set | The database. Unset that variable to downgrade it to a warning — only if you accept booting against an unmigrated schema. |
@@ -193,6 +193,66 @@ record. `prisma schema setup complete` is the proof the Prisma step ran.
 
 `bash scripts/release/gates.sh` exercises exactly this path before a release: it
 runs the built image with no config mounted and requires exit 78.
+
+### 429 `E_CAPACITY` / 408 `E_BODY_TIMEOUT`
+
+Symptom: clients get 429 with `Retry-After: 1`, or 408;
+`corp_llm_gateway_blocked_requests_total{block_reason="capacity"}` or
+`{block_reason="body_timeout"}` rises.
+
+Behavior: the in-flight cap (`capacity.md`). 429 means every slot
+(`CORP_LLM_MAX_INFLIGHT`), every body-read place (`CORP_LLM_MAX_DRAINING`) or the
+body-byte budget (`CORP_LLM_MAX_DRAINING_BYTES`) is taken on this pod; 408 means
+a body did not arrive whole within `CORP_LLM_BODY_READ_SECONDS`. Nothing reached
+litellm or a provider.
+
+Action:
+1. `gateway_inflight_requests` at the cap on every pod: real load. Add replicas;
+   do not raise the cap past what one pod's CPU and memory carry.
+2. `gateway_draining_bytes` near the budget while slots are free: large bodies.
+   Raise `CORP_LLM_MAX_DRAINING_BYTES` only if the pod's memory limit allows.
+3. Sustained 408s from one source with slots free: a slow or stalled client, or
+   probing. Nothing to fix on the gateway.
+4. `gateway_failure{component="route_gate"}` alongside: a cancelled request did
+   not unwind within its grace; the slot was freed anyway. File it with the
+   log line `route_gate_cancel_*`.
+
+### 503 `E_STORE_UNAVAILABLE` / 503 `E_PROFILE_UNAVAILABLE` (Postgres)
+
+Symptom: every LLM request answers 503; `gateway_failure{component="token_store"}`
+(`E_STORE_UNAVAILABLE`) or `gateway_failure{component="team_config"}`
+(`E_PROFILE_UNAVAILABLE`) rises.
+
+Behavior: fail-closed. Every rewritten request looks its corp token up
+(bounded at 6 s) and reads its team config (bounded at 5 s), even for a team
+with no profiles; a store that cannot answer refuses the request rather than
+pass it unauthenticated or un-profiled. `E_PROFILE_UNAVAILABLE` without
+`component="team_config"` is a broken profile instead (`profiles.md`).
+
+Action:
+1. Check Postgres (and PgBouncer, if any) reachability from the pod; the log
+   line carries the driver's exception class only.
+2. Behind PgBouncer, confirm `ignore_startup_parameters` lists the keepalive
+   parameters (`configuration.md`, "Backends").
+3. Recovery is automatic once the store answers; there is no cache to flush.
+
+### Developer token issuance fails
+
+Symptom: `scripts/install.sh` prints an HTTP status and an error code from
+`POST /internal/issue-token`.
+
+| Code | Status | Meaning / action |
+|---|---|---|
+| `E_ISSUE_DISABLED` | 404 | issuance is off (`CORP_GATEWAY_ISSUE_OIDC_ISSUER` unset) |
+| `E_OIDC_*` | 401 | the Keycloak token failed verification — client, audience or groups mapper (`install.md`, "Keycloak realm and client") |
+| `E_ISSUE_NO_TEAM` / `E_ISSUE_UNKNOWN_TEAM` | 403 | no mapped group / the mapped team does not exist (`gateway-admin team create`) |
+| `E_ISSUE_RATE` | 403 | issued within `CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS`; wait — revoking does not reset it |
+| `E_ISSUE_REPLAY` | 403 | this Keycloak token was already used; run the installer again for a new one |
+| `E_ISSUE_INFLIGHT` / `E_ISSUE_THROTTLED` | 429 | the route's own caps; retry |
+| `E_ISSUE_BUSY` | 503 | the subject's lock or statement timed out (5 s / 8 s); retry |
+| `E_JWKS_UNAVAILABLE` | 503 | the pod cannot fetch Keycloak's JWKS — NetworkPolicy (`networkPolicy.keycloak`), CA bundle, Keycloak itself |
+| `E_ISSUE_STORE_TIMEOUT` / `E_ISSUE_STORE_UNAVAILABLE` | 503 | Postgres slow or unreachable (see above) |
+| `E_ISSUE_SCHEMA` | 503 | the pod booted while Postgres was unreachable and has not yet seen `corp_tokens` current; `/healthz/ready` names the problem — apply `tokens/schema.sql` (`upgrade.md`); readiness and the route re-check at most every 15 s, so retry after that |
 
 ### Token revocation didn't take effect immediately
 

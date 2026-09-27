@@ -14,14 +14,20 @@ wires up — this keeps the issuance code free of any specific OIDC SDK
 choice.
 """
 
+from __future__ import annotations
+
 import asyncio
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from corp_llm_gateway.tokens.models import TokenInfo
 from corp_llm_gateway.tokens.store import TokenStore
+
+if TYPE_CHECKING:
+    from corp_llm_gateway.tokens.issuance_policy import IssuancePolicy
 
 DEFAULT_TOKEN_TTL_DAYS = 30
 
@@ -31,13 +37,25 @@ class OidcClaims:
     user_id: str
     team_id: str
     scopes: tuple[str, ...] = field(default_factory=tuple)
+    issuer: str = ""
+    subject: str = ""
+    jti: str = ""
 
 
 OidcVerifier = Callable[[str], Awaitable[OidcClaims]]
 
 
+# Exception args carry an error code only — never the token or a claim value (M1-14).
 class OidcVerificationError(Exception):
-    pass
+    """The bearer is not a valid issuance token (401)."""
+
+
+class OidcTeamMappingError(Exception):
+    """The token is valid but none of its groups maps to a team (403)."""
+
+
+class JwksUnavailableError(Exception):
+    """The issuer's signing keys could not be fetched (503)."""
 
 
 @dataclass(frozen=True)
@@ -52,18 +70,28 @@ class TokenIssuer:
         store: TokenStore,
         verifier: OidcVerifier,
         *,
-        ttl: timedelta = timedelta(days=DEFAULT_TOKEN_TTL_DAYS),
+        ttl: timedelta | None = None,
         token_factory: Callable[[], str] | None = None,
+        policy: IssuancePolicy | None = None,
     ) -> None:
+        """With ``policy``, TTL and token minting come from the policy, so passing
+        ``ttl`` or ``token_factory`` as well raises ``ValueError``."""
+        if policy is not None and (ttl is not None or token_factory is not None):
+            raise ValueError(
+                "TokenIssuer: ttl and token_factory are the policy's; do not pass them with policy"
+            )
         self._store = store
         self._verifier = verifier
-        self._ttl = ttl
-        self._token_factory = token_factory or _default_token_factory
+        self._ttl = ttl if ttl is not None else timedelta(days=DEFAULT_TOKEN_TTL_DAYS)
+        self._token_factory = token_factory or default_token_factory
+        self._policy = policy
 
     async def issue(self, oidc_token: str) -> IssueResult:
         if not oidc_token:
             raise OidcVerificationError("missing OIDC token")
         claims = await self._verifier(oidc_token)
+        if self._policy is not None:
+            return await self._policy.issue(claims)
         now = datetime.now(UTC)
         corp_token = self._token_factory()
         info = TokenInfo(
@@ -78,7 +106,7 @@ class TokenIssuer:
         return IssueResult(corp_token=corp_token, expires_at=info.expires_at)
 
 
-def _default_token_factory() -> str:
+def default_token_factory() -> str:
     return f"ct_{secrets.token_urlsafe(32)}"
 
 

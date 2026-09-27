@@ -1,3 +1,4 @@
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -45,6 +46,9 @@ class ReadyCheck(HealthCheck):
     own health, not a duplicate of it: ``ExtensionsCheck`` is deliberately kept out
     of readiness, but corp NER is fail-closed on the request path, so a pod that
     cannot reach the service would 503 every request and must leave rotation.
+
+    With issuance on, ``check_issuance_schema`` (``IssuanceSchemaGate.problem``)
+    keeps the pod unready while the token schema has not been seen current.
     """
 
     def __init__(
@@ -54,11 +58,13 @@ class ReadyCheck(HealthCheck):
         *,
         check_ner: Callable[[], Awaitable[bool]] | None = None,
         check_corp_ner: Callable[[], Awaitable[bool]] | None = None,
+        check_issuance_schema: Callable[[], Awaitable[str | None]] | None = None,
     ) -> None:
         self._check_redis = check_redis
         self._check_postgres = check_postgres
         self._check_ner = check_ner
         self._check_corp_ner = check_corp_ner
+        self._check_issuance_schema = check_issuance_schema
 
     async def check(self) -> HealthStatus:
         try:
@@ -73,6 +79,13 @@ class ReadyCheck(HealthCheck):
             return HealthStatus(False, f"postgres_error:{type(exc).__name__}")
         if not pg_ok:
             return HealthStatus(False, "postgres_unhealthy")
+        if self._check_issuance_schema is not None:
+            try:
+                schema_problem = await self._check_issuance_schema()
+            except Exception as exc:
+                return HealthStatus(False, f"issuance_schema_error:{type(exc).__name__}")
+            if schema_problem is not None:
+                return HealthStatus(False, schema_problem)
         if self._check_ner is not None:
             try:
                 ner_ok = await self._check_ner()
@@ -89,6 +102,59 @@ class ReadyCheck(HealthCheck):
             if not corp_ner_ok:
                 return HealthStatus(False, "corp_ner_unhealthy")
         return HealthStatus(True, "ready")
+
+
+ISSUANCE_SCHEMA_RECHECK_S = 15.0
+
+
+class IssuanceSchemaGate:
+    """Whether the token schema issuance needs has been seen current.
+
+    The boot's check passes it in as ``verified``; a boot that could not reach
+    Postgres leaves it unverified. Then ``problem()`` runs ``check`` at most once
+    per ``recheck_s`` across all its callers (readiness and the issuance route,
+    so a deployment without a readiness poller still recovers); once it passes it
+    is never run again.
+    """
+
+    def __init__(
+        self,
+        check: Callable[[], Awaitable[str | None]],
+        *,
+        verified: bool,
+        recheck_s: float = ISSUANCE_SCHEMA_RECHECK_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._check = check
+        self._verified = verified
+        self._recheck_s = recheck_s
+        self._clock = clock
+        self._checked_at: float | None = None
+        self._last = "issuance_schema_unverified"
+
+    @property
+    def verified(self) -> bool:
+        return self._verified
+
+    async def problem(self) -> str | None:
+        """The readiness detail while the schema is unverified; ``None`` once it is."""
+        if self._verified:
+            return None
+        now = self._clock()
+        if self._checked_at is not None and now - self._checked_at < self._recheck_s:
+            return self._last
+        self._checked_at = now
+        try:
+            problem = await self._check()
+        except Exception as exc:
+            # The class only: a driver message can carry the DSN.
+            self._last = f"issuance_schema_error:{type(exc).__name__}"
+            return self._last
+        if problem is None:
+            self._verified = True
+            return None
+        self._last = f"issuance_schema: {problem}"
+        return self._last
 
 
 def make_ner_ready_probe(

@@ -1,0 +1,30 @@
+# Gateway config file for developer token issuance, mounted read-only at
+# /etc/corp-llm-gateway/config.toml by docker-compose.issuance.yml.
+#
+#   cp gateway/config.toml.example gateway/config.toml
+#
+# gateway/config.toml is site-specific and gitignored. Keys are the env var
+# names. An env var set in .env wins over the same key here, so set each scalar
+# in ONE place: here (uncomment) or in .env. docs/ops/configuration.md,
+# "Developer token issuance", lists the defaults and ranges.
+
+# CORP_GATEWAY_ISSUE_OIDC_ISSUER = "https://keycloak.corp.lan/realms/dev"
+# CORP_GATEWAY_ISSUE_OIDC_AUDIENCE = "corp-gateway-issuance"
+# CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID = "corp-gateway-cli"
+# CORP_GATEWAY_ISSUE_OIDC_JWKS_URL = "https://keycloak.corp.lan/realms/dev/protocol/openid-connect/certs"
+# CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM = "groups"
+# CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM = "preferred_username"
+# CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS = "30"
+# CORP_GATEWAY_ISSUE_MAX_ACTIVE = "2"
+# CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS = "600"
+# CORP_GATEWAY_ISSUE_MAX_INFLIGHT = "4"
+# CORP_GATEWAY_ISSUE_RATE_PER_MINUTE = "30"
+# CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS = "10"
+
+# Keycloak group -> existing team_id (`gateway-admin team create`). Order
+# matters: the first group in THIS order that the user belongs to wins; a user
+# in no listed group gets 403 E_ISSUE_NO_TEAM. Quote the group names. This
+# section must stay LAST: every key after a [section] header belongs to it.
+[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]
+"/devs/payments" = "payments"
+"/devs/core" = "core"

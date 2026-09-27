@@ -9,9 +9,11 @@ stub's log; there is nowhere else for it to go.
 
 Two modes, the two the deployment supports:
 
-* **Mode A** — litellm virtual keys. ``LITELLM_MASTER_KEY`` is set, Postgres is
-  attached so the entrypoint's Prisma schema sequence runs, and requests carry a
-  virtual key minted through ``POST /key/generate``.
+* **Mode A** — litellm virtual keys, a **test posture only** since the admin
+  surface (``/key/*`` included) is refused. ``LITELLM_MASTER_KEY`` is set,
+  Postgres is attached so the entrypoint's Prisma schema sequence runs, and
+  requests carry a synthetic ``sk-…`` key whose sha256 is inserted straight into
+  litellm's ``LiteLLM_VerificationToken`` — litellm authenticates by that hash.
 * **Mode B** — Anthropic subscription (OAuth) passthrough. No master key at all
   (``settings.master_key_conflict`` refuses the combination), one native
   ``anthropic/`` route, and the developer's own bearer as the credential.
@@ -23,6 +25,7 @@ is provably the gate's and not a 401.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import socket
@@ -52,6 +55,8 @@ CANARY = "route.gate.canary.a41f@corp.lan"
 
 CORP_TOKEN = "route-gate-team-token"
 MASTER_KEY = "sk-corp-route-gate-master"
+# Seeded, never minted: POST /key/generate is refused by the gate.
+VIRTUAL_KEY = "sk-corp-route-gate-virtual-7c2e"
 # Obvious fake; the `sk-ant-oat` prefix is the only part litellm reads.
 OAUTH_TOKEN = "sk-ant-oat01-fake-route-gate-container"
 
@@ -129,7 +134,6 @@ class Mode:
     name: str
     stack: Stack
     key: str
-    admin_key: str | None = None
 
     def headers(self, **extra: str) -> dict[str, str]:
         return {
@@ -211,14 +215,23 @@ def mode_a(gateway_image: str, tmp_path_factory: pytest.TempPathFactory) -> Iter
     config = _write(tmp_path_factory, "route-gate-a", MODE_A_CONFIG)
     env = {**BASE_ENV, "LITELLM_MASTER_KEY": MASTER_KEY}
     with running_stack(gateway_image, config, env, with_postgres=True) as stack:
-        minted = httpx.post(
-            f"{stack.base_url}/key/generate",
-            headers={"Authorization": f"Bearer {MASTER_KEY}", "content-type": "application/json"},
-            json={"models": ["claude-*", "gpt-*"], "duration": "1h"},
-            timeout=90,
-        )
-        assert minted.status_code == 200, minted.text
-        yield Mode(name="A", stack=stack, key=minted.json()["key"], admin_key=MASTER_KEY)
+        _seed_virtual_key(stack, VIRTUAL_KEY)
+        yield Mode(name="A", stack=stack, key=VIRTUAL_KEY)
+
+
+def _seed_virtual_key(stack: Stack, key: str) -> None:
+    """What ``POST /key/generate`` used to write, minus everything with a default.
+
+    litellm hashes an ``sk-`` bearer with sha256 and looks the hex digest up as
+    ``LiteLLM_VerificationToken.token`` (``proxy/auth/user_api_key_auth.py:1895-1906``).
+    The insert only succeeds once the entrypoint's Prisma sequence built the table.
+    """
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    stack.psql(
+        'INSERT INTO "LiteLLM_VerificationToken" (token, key_alias, models, expires) '
+        f"VALUES ('{digest}', 'route-gate-mode-a', ARRAY['claude-*', 'gpt-*'], "
+        "now() + interval '1 hour')"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -301,7 +314,7 @@ def test_a_config_without_the_callback_exits_70(
 
 def test_mode_a_ran_the_prisma_schema_setup_at_boot(mode_a: Mode) -> None:
     # DATABASE_URL is set, so the entrypoint replicates the CLI's Prisma
-    # sequence; `/key/info` for a key that exists proves the schema is there.
+    # sequence; the seeded key row reading back proves the schema is there.
     # The line is read as a JSON record, not as a substring: this config sets
     # `json_logs: true` and Vector parses this stdout, so a boot line that is
     # plain text there is a defect of its own.
@@ -313,13 +326,38 @@ def test_mode_a_ran_the_prisma_schema_setup_at_boot(mode_a: Mode) -> None:
 
     assert "prisma schema setup complete" in messages
 
-    answered = httpx.get(
-        f"{mode_a.stack.base_url}/key/info",
-        params={"key": mode_a.key},
-        headers={"Authorization": f"Bearer {MASTER_KEY}"},
-        timeout=60,
+    digest = hashlib.sha256(mode_a.key.encode()).hexdigest()
+    stored = mode_a.stack.psql(
+        f"SELECT count(*) FROM \"LiteLLM_VerificationToken\" WHERE token = '{digest}'"
     )
-    assert answered.status_code == 200, answered.text
+    assert stored == "1"
+
+
+def test_mode_a_authenticates_the_seeded_key_and_refuses_an_unknown_one(mode_a: Mode) -> None:
+    # The seeded row is what admits the request: the same call with a key litellm
+    # has no row for is a 401 from litellm's own auth, and reaches no provider.
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    mode_a.stack.mark()
+
+    admitted = mode_a.post("/v1/messages", payload)
+
+    assert admitted.status_code == 200, admitted.text
+    assert len(mode_a.stack.new_captures()) == 1
+
+    mode_a.stack.mark()
+    stranger = httpx.post(
+        f"{mode_a.stack.base_url}/v1/messages",
+        json=payload,
+        headers={**mode_a.headers(), "Authorization": "Bearer sk-corp-route-gate-unknown"},
+        timeout=90,
+    )
+
+    assert stranger.status_code == 401, stranger.text
+    assert mode_a.stack.new_captures() == []
 
 
 _ACCESS_LINE = re.compile(r'"(GET|POST|HEAD) \S+ HTTP/1\.1" \d{3}')
@@ -603,6 +641,7 @@ def test_streaming_is_not_buffered_by_the_gate(mode_a: Mode) -> None:
 
 PASSTHROUGH_GETS = (
     "/health/liveliness",
+    "/health/readiness",
     "/v1/models",
     "/healthz/live",
     "/healthz/ready",
@@ -645,16 +684,43 @@ def test_metrics_is_scrapable_without_a_litellm_credential(mode_a: Mode) -> None
     assert "corp_llm_gateway_blocked_requests_total" in response.text
 
 
-def test_the_litellm_admin_surface_is_untouched(mode_a: Mode) -> None:
-    response = httpx.get(
-        f"{mode_a.stack.base_url}/key/info",
-        params={"key": mode_a.key},
-        headers={"Authorization": f"Bearer {MASTER_KEY}"},
+ADMIN_SURFACE: tuple[tuple[str, str], ...] = (
+    ("GET", "/key/info"),
+    ("GET", "/key/list"),
+    ("POST", "/key/generate"),
+    ("POST", "/policies"),
+    ("PUT", "/guardrails/g1"),
+    ("POST", "/login"),
+    ("GET", "/sso/key/generate"),
+    ("GET", "/"),
+    ("GET", "/health"),
+    ("GET", "/health/drain"),
+)
+
+
+@pytest.mark.parametrize("method,path", ADMIN_SURFACE, ids=[f"{m} {p}" for m, p in ADMIN_SURFACE])
+def test_the_litellm_admin_surface_is_refused(mode: Mode, method: str, path: str) -> None:
+    # The master key is the strongest litellm credential there is; the gate
+    # answers before litellm's auth ever reads it.
+    mode.stack.mark()
+
+    response = httpx.request(
+        method,
+        f"{mode.stack.base_url}{path}",
+        json={"models": ["claude-*"], "text": CANARY} if method != "GET" else None,
+        headers={
+            "Authorization": f"Bearer {MASTER_KEY}",
+            "X-Corp-Auth": CORP_TOKEN,
+            "content-type": "application/json",
+        },
         timeout=60,
     )
 
-    assert response.status_code == 200
-    assert "E_ROUTE_BLOCKED" not in response.text
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "E_ROUTE_BLOCKED"
+    assert response.json()["error"]["reason"] == "route_gate_listed"
+    assert CANARY not in response.text
+    assert mode.stack.new_captures() == []
 
 
 def test_nothing_reached_a_provider_the_gate_refused(mode_a: Mode, mode_b: Mode) -> None:

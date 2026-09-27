@@ -11,6 +11,9 @@ without updating them together:
     (helm/corp-llm-gateway/templates/siem-alerts.yaml)
   * ``gateway_failure{component}`` (docs/ops/runbook.md)
   * ``corp_llm_gateway_request_latency_seconds`` (histogram)
+  * ``gateway_inflight_requests`` (gauge), ``gateway_cancelled_requests_total``
+    (counter) and ``gateway_draining_bytes`` (gauge) — the route gate's in-flight
+    cap and body byte budget (docs/ops/capacity.md)
 
 ``BLOCK_REASONS`` and ``FAILURE_COMPONENTS`` below enumerate the label values
 those first two series can carry.
@@ -48,15 +51,19 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
         "route_gate_unarmed",
         "route_gate_error",
     ),
+    # The route gate's in-flight cap, after the verdict (route_gate/inflight.py):
+    # every slot (or body-read place) taken, or a body past its read deadline.
+    "capacity": ("capacity", "body_timeout"),
 }
 
 # Every ``gateway_failure{component}`` label value. The hook maps an error code
 # to its component (``litellm_hook._FAILURE_COMPONENT``, ``other`` for anything
-# unmapped); ``route_gate`` is the one recorded outside that map — the gate
+# unmapped); ``route_gate`` is recorded outside that map — the gate
 # refuses a route it should have forwarded (the guardrail callback never
 # registered), cannot classify one at all, or loses the refusal's audit record
-# (``route_gate/middleware.py:228-233``). Pinned against both sources in
-# tests/metrics/test_metrics.py.
+# (``route_gate/middleware.py:228-233``) — and so is ``team_config``, a team
+# config the store could not return (``litellm_hook.TEAM_CONFIG_COMPONENT``).
+# Pinned against every source in tests/metrics/test_metrics.py.
 FAILURE_COMPONENTS: tuple[str, ...] = (
     "auth",
     "corp_llm",
@@ -72,6 +79,8 @@ FAILURE_COMPONENTS: tuple[str, ...] = (
     "request",
     "route_gate",
     "sanitize",
+    "team_config",
+    "token_store",
 )
 
 
@@ -93,6 +102,20 @@ class MetricsExporter(ABC):
     @abstractmethod
     def observe_request_latency(self, seconds: float, *, status: str) -> None:
         """Observe one end-to-end request latency, labelled ok|failed."""
+
+    # Not abstract: an exporter written before the in-flight cap existed still
+    # instantiates, it just does not export these series.
+    def set_inflight(self, count: int) -> None:
+        """Set the number of requests holding an in-flight slot right now."""
+        return None
+
+    def record_cancelled(self) -> None:
+        """Count one admitted request the gateway cancelled because its client left."""
+        return None
+
+    def set_draining_bytes(self, count: int) -> None:
+        """Set the body bytes buffered right now, being read or replayed to an admitted request."""
+        return None
 
     def render(self) -> bytes:
         """Prometheus exposition for a ``/metrics`` route. Non-scraping exporters return empty."""

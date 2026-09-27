@@ -7,18 +7,24 @@ off. Russian mirror: `deployment-modes.ru.md`.
 There are two authentication modes and they are **mutually exclusive**. Pick one
 before you write `.env`.
 
-Both are production modes. They run the same stack, the same sanitization
-cascade and the same audit chain; what differs is the upstream credential.
+**Mode B is the production mode. Mode A is a test posture only** (DRI decision,
+2026-09-27): the route gate refuses litellm's whole management surface,
+`POST /key/generate` and the admin UI included, so there is no way to hand a
+developer a virtual key (`../security.md` §14). Both modes run the same stack,
+the same sanitization cascade and the same audit chain; what differs is the
+upstream credential.
 
 | | Mode A — API keys | Mode B — subscription (OAuth) |
 |---|---|---|
 | Stack | `compose/` | `compose/` + `docker-compose.oauth.yml` |
 | Upstream credential | the gateway's own `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | the developer's own OAuth bearer, forwarded |
 | Developer sends | `Authorization: Bearer <litellm virtual key>` | `Authorization: Bearer <OAuth token>` |
-| Team identity | `X-Corp-Auth: <team token>` | `X-Corp-Auth: <team token>` |
+| Team identity | `X-Corp-Auth: <corp token>` | `X-Corp-Auth: <corp token>`, minted by `scripts/install.sh` through Keycloak |
 | `LITELLM_MASTER_KEY` | **required** | **must be absent** |
 | Routes served | `claude-*`, `gpt-*`, `corp-*` | `claude-*` only |
-| Per-developer revocation / spend | yes, via the LiteLLM Admin UI | no |
+| Per-developer revocation | corp token only (`gateway-admin token revoke`) — `/key/*` and the admin UI are refused | corp token (`gateway-admin token revoke`) |
+| Per-developer spend / budgets | no | no |
+| Status | **test posture only** | **production** |
 | Audit trail | Vector → Langfuse / S3 / SIEM | same |
 
 There is also a **demo-only** OAuth stack — `docker-compose.demo.yml` +
@@ -29,10 +35,14 @@ subscription bridge on a laptop and is **not** a deployment target: it runs
 
 ---
 
-## Mode A — API keys
+## Mode A — API keys (test posture only)
 
-The stack in `compose/`. Developers authenticate with a **LiteLLM virtual key**;
-the gateway holds the provider credentials.
+The stack in `compose/`. Requests authenticate with a **LiteLLM virtual key**;
+the gateway holds the provider credentials. There is no onboarding path for that
+key: `/key/*`, the admin UI and every other litellm management route answer
+`403 E_ROUTE_BLOCKED` at the route gate. The container tests write a key's hash
+straight into litellm's `LiteLLM_VerificationToken` table; nothing else should.
+Do not deploy this mode for developers.
 
 ```
 cd compose
@@ -75,15 +85,17 @@ chmod 0600 .env
 docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d
 ```
 
-From a laptop, against a server prepared by `scripts/deploy/bootstrap-server.sh`:
+From a laptop, against a server prepared by `scripts/deploy/bootstrap-server.sh`
+(`--mode oauth` is the default and may be omitted):
 
 ```
 scripts/deploy/deploy.sh --host user@server --mode oauth up
 ```
 
-Pass the **same** `--mode oauth` to every later run against that host — `logs`,
-`status`, `down` and `restart` all resolve the stack through this file list, and
-a run with the base file alone would report on (or recreate) a different stack.
+Every later run against that host must resolve the same file list — `logs`,
+`status`, `down` and `restart` included. The default does that for this mode; a
+Mode A host has to be driven with `--mode virtual-keys` on every run, or a bare
+run would recreate it in this mode.
 
 **For boot-time autostart, uncomment `COMPOSE_FILE` in `.env`:**
 
@@ -134,22 +146,36 @@ admin UI cannot authenticate anyone, so they have nothing to guard.
 
 ### What you give up, and what to close
 
-Mode B has **no per-developer virtual keys**, so no per-developer revocation or
-spend accounting through the LiteLLM UI. Team identity, sanitization and audit
-are unchanged: developers still send `X-Corp-Auth: <team token>`, which the
-gateway validates in `pre_call` against the Postgres token store, and a request
-without a valid one is refused (`MissingTokenError` / `InvalidTokenError`).
+Mode B has **no per-developer virtual keys**, so no spend accounting through the
+LiteLLM UI. Identity, sanitization and audit are unchanged: developers send
+`X-Corp-Auth: <corp token>`, which the gateway validates in `pre_call` against
+the Postgres token store, and a request without a valid one is refused
+(`MissingTokenError` / `InvalidTokenError`). The corp token is per developer:
+`scripts/install.sh` mints it through Keycloak at `POST /internal/issue-token`
+once issuance is configured (`install.md`, "Developer onboarding"), and
+`gateway-admin token revoke --user` revokes it. On this compose stack issuance
+is the optional `docker-compose.issuance.yml` overlay, layered on top of
+`docker-compose.oauth.yml`; it mounts `gateway/config.toml` with the team map
+(`compose/README.md`, "Developer token issuance"). On Helm it is the
+`issuance.*` values (`install.md`, "Developer onboarding"). Without it, corp
+tokens come from `gateway-admin token issue` (break-glass).
 
-**Litellm's own management endpoints are unauthenticated in this mode.** Its
-proxy auth is skipped entirely when the master key is `None`, which is precisely
-the posture this mode requires. That covers `/key/*`, `/model/*`, `/user/*` and
-the UI — *not* the LLM routes, which the gateway's `X-Corp-Auth` check in
-`pre_call` still gates. Today the port is published as
-`127.0.0.1:${GATEWAY_PORT:-4000}` (loopback only), so the surface is reachable
-only from the host itself; anyone with a shell on that host can reach it. When
-the nginx front door lands, that management surface must be blocked there before
-the port is exposed beyond loopback. Mode A does not have this gap — the master
-key authenticates those endpoints.
+**Postgres behind PgBouncer.** The gateway's pools send TCP keepalive startup
+parameters; PgBouncer refuses them unless `ignore_startup_parameters` lists them
+(`configuration.md`, "Backends"). Without that, every store call fails and
+every LLM request answers 503; readiness connects the same way, so the pod
+leaves rotation. With issuance on, the gateway does not start: it
+exits 78, and the log line names `ignore_startup_parameters` and the three
+parameters to list.
+
+**Litellm's own management endpoints are refused, in both modes.** Without a
+master key litellm accepts any caller as an internal user
+(`user_api_key_auth.py:1622-1633` in 1.101.0), so much of `/key/*`, `/model/*`,
+`/user/*`, `/policies*`, `/guardrails*` and the UI would otherwise answer anyone
+who reaches the port. The route gate refuses all of them (`403
+E_ROUTE_BLOCKED`) before litellm sees the request, on every path in — loopback,
+SSH tunnel or a future nginx front door. The LLM routes are still gated by the
+gateway's `X-Corp-Auth` check in `pre_call`. See `../security.md` §14.
 
 ---
 

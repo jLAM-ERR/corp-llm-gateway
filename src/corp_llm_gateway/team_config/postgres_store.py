@@ -17,6 +17,11 @@ import types
 from pathlib import Path
 from typing import Any
 
+from corp_llm_gateway.pg_session import (
+    KEEPALIVE_SERVER_SETTINGS,
+    RELEASE_BUDGET_S,
+    run_on_connection,
+)
 from corp_llm_gateway.team_config.models import FailPolicyOverrides, TeamConfig
 from corp_llm_gateway.team_config.store import TeamConfigStore, TeamNotFoundError
 
@@ -24,6 +29,14 @@ _SCHEMA_SQL = Path(__file__).parent / "schema.sql"
 
 _asyncpg_mod: types.ModuleType | None = None
 _asyncpg_tried = False
+
+# Waiting for a pooled connection, and opening one; asyncio.TimeoutError past it.
+_ACQUIRE_TIMEOUT_S = 5.0
+_CONNECT_TIMEOUT_S = 5.0
+# Returning a `get` connection to the pool; past it the connection is dropped.
+_RELEASE_BUDGET_S = RELEASE_BUDGET_S
+# The `get` statement, client-side: it also bounds a server that stopped answering.
+_GET_TIMEOUT_S = 5.0
 
 _COLUMNS = (
     "team_id, name, replace_md_path, profile_ids, "
@@ -107,30 +120,41 @@ class PostgresTeamConfigStore(TeamConfigStore):
                     self._dsn,
                     min_size=1,
                     max_size=5,
+                    timeout=_CONNECT_TIMEOUT_S,
+                    server_settings=KEEPALIVE_SERVER_SETTINGS,
                 )
         return self._pool
+
+    def _acquire(self, pool: Any) -> Any:
+        return pool.acquire(timeout=_ACQUIRE_TIMEOUT_S)
 
     async def init_schema(self) -> None:
         """Apply schema.sql idempotently; safe on an already-initialised DB."""
         pool = await self._get_pool()
         sql = _SCHEMA_SQL.read_text()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             await conn.execute(sql)
 
     async def get(self, team_id: str) -> TeamConfig:
+        # On the issuance route and the request path: bounded like issuance.
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row: Any = await conn.fetchrow(
+        row: Any = await run_on_connection(
+            pool,
+            lambda conn: conn.fetchrow(
                 f"SELECT {_COLUMNS} FROM team_config WHERE team_id = $1",
                 team_id,
-            )
+                timeout=_GET_TIMEOUT_S,
+            ),
+            acquire_timeout=_ACQUIRE_TIMEOUT_S,
+            release_budget=_RELEASE_BUDGET_S,
+        )
         if row is None:
             raise TeamNotFoundError(team_id)
         return _row_to_team_config(row)
 
     async def upsert(self, config: TeamConfig) -> None:
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             await conn.execute(
                 """
                 INSERT INTO team_config
@@ -156,7 +180,7 @@ class PostgresTeamConfigStore(TeamConfigStore):
 
     async def list_all(self) -> tuple[TeamConfig, ...]:
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._acquire(pool) as conn:
             rows: Any = await conn.fetch(f"SELECT {_COLUMNS} FROM team_config ORDER BY team_id")
         return tuple(_row_to_team_config(r) for r in rows)
 

@@ -65,6 +65,132 @@ Choose deliberately:
 - set `deliver-flag` only for teams in `CORP_LLM_OVERSIZE_DELIVER_TEAMS`, and
   only knowing a clean full rescan is required before anything is forwarded.
 
+## In-flight cap per pod
+
+The route gate caps concurrent LLM requests per pod. The cap is
+`CORP_LLM_MAX_INFLIGHT` (default **64**), enforced by the gateway itself in
+`route_gate/inflight.py`:
+
+- **What counts.** Only an armed rewritten request (`/v1/messages`,
+  `/v1/chat/completions`, `/v1/responses`, …). Health probes, `/metrics`, model
+  listing and the issuance route never take a slot — issuance has its own bound
+  (`CORP_GATEWAY_ISSUE_MAX_INFLIGHT`).
+- **How long.** A slot is held for the **whole request**, SSE stream included.
+  A Claude Code session that streams for two minutes holds its slot for two
+  minutes, so size the cap by concurrent streams, not by requests per second.
+- **When it is full.** A request that arrives with every slot taken gets **429**
+  before its body is read, before litellm and before the sanitizer; one that
+  loses the last slot while its body was still arriving gets the same 429 after
+  it. The response carries `Retry-After: 1`:
+
+  ```json
+  {"error": {"type": "capacity", "code": "E_CAPACITY", "route": "POST /v1/messages", "reason": "capacity"}}
+  ```
+
+  It is counted in `corp_llm_gateway_blocked_requests_total{block_reason="capacity"}`
+  and audited with `block_reason` `capacity`. `gateway_inflight_requests` is the
+  current number of held slots.
+- **Scale replicas, not the cap.** The cap protects one pod's CPU (the
+  local-first cascade runs in-process) and memory (each admitted body, up to
+  25 MiB, is buffered once). More concurrent sessions means more pods: 200
+  concurrent sessions at the default cap is 4 pods with headroom.
+- **The body comes first, under a deadline.** A slot is taken only once the
+  whole body has arrived, so a client that announces a body and never sends it
+  holds no slot. The body must arrive within `CORP_LLM_BODY_READ_SECONDS`
+  (default **30**, above 0 and at most 300); past it the gate answers **408**
+  `E_BODY_TIMEOUT` (`block_reason` `body_timeout`). At most
+  `CORP_LLM_MAX_DRAINING` requests per pod read a body at once (default **4 ×
+  `CORP_LLM_MAX_INFLIGHT`**, never below it, at most 40000); the next gets 429
+  `E_CAPACITY` without a byte read. Measured on a real socket (loopback, default
+  cap 64, a 2 s deadline): 65 unauthenticated clients announcing a 10-byte body
+  and sending nothing kept `gateway_inflight_requests` at 0 while a normal
+  request was served (200 in about 20 ms); all 65 got 408 at 2.04 s.
+- **Body memory has its own budget.** Each body is buffered, up to 25 MiB, while
+  it is read and then until its request ends (litellm replays it from that
+  buffer). All of these bytes together, bodies being read and bodies of admitted
+  requests, share `CORP_LLM_MAX_DRAINING_BYTES` (bytes, default **536870912** =
+  512 MiB, from 25 MiB to 16 GiB). A body whose declared `Content-Length` would
+  take the sum past it gets 429 `E_CAPACITY` (`block_reason` `capacity`,
+  `Retry-After: 1`) without a byte read; a body sent without a length is
+  counted chunk by chunk and refused the same way at the chunk that passes the
+  budget, and what it had buffered is freed at once. The 25 MiB per-body cap
+  and its 422 stay as they are. `gateway_draining_bytes` is the number of
+  bytes held right now.
+
+  Worst-case body memory per pod = min(`CORP_LLM_MAX_DRAINING` × 25 MiB,
+  `CORP_LLM_MAX_DRAINING_BYTES`). With the defaults that is min(256 × 25 MiB ≈
+  6.4 GB, 512 MiB) = 512 MiB. Size the pod against the byte budget, not the
+  draining count: set `CORP_LLM_MAX_DRAINING_BYTES` to what the pod's memory
+  limit can spare for request bodies (leave room for the NER models, the
+  sanitizer's copies of each body and litellm). Measured on a real socket
+  (loopback, budget 25 MiB): two admitted 10 MiB bodies held 20971520 bytes
+  (`gateway_draining_bytes` read the same); a third declaring 10 MiB got 429
+  unread; once the two finished (200 each) the same request got 200, and the
+  gauge read 0.
+- **Off.** `0` turns the cap off. The entrypoint refuses it (exit 78) when
+  `CORP_ENV` is `prod`/`production`, and so does `gateway-admin config check`;
+  so do a negative value, a non-integer and anything above 10000.
+- **litellm's own setting does nothing.** litellm 1.101.0 honours
+  `general_settings.global_max_parallel_requests` only in its legacy limiter,
+  selected by `LEGACY_MULTI_INSTANCE_RATE_LIMITING`, and that limiter skips
+  `/v1/messages`. No shipped config sets either, and a render test keeps it so.
+
+### Sizing formula
+
+Per pod, with *S* concurrent streams expected at peak:
+
+- **replicas** = ceil(*S* / `CORP_LLM_MAX_INFLIGHT`), plus one for a rollout or
+  a lost pod. The cap is per pod; the HPA scales on CPU, not on 429s, so size
+  the minimum replica count by streams.
+- **body memory** = min(`CORP_LLM_MAX_DRAINING` × 25 MiB,
+  `CORP_LLM_MAX_DRAINING_BYTES`) — in practice the byte budget. This is the
+  memory knob: pod memory limit ≥ NER models + litellm + the sanitizer's copies
+  + this budget. Raise the cap without raising the budget and large bodies get
+  429 before the slots fill.
+- **slot turnover after a disconnect** ≤ 2 × `CORP_LLM_CANCEL_GRACE_SECONDS`
+  (default 10 s).
+- **issuance** is outside all of this: its own `CORP_GATEWAY_ISSUE_MAX_INFLIGHT`
+  (4) and `CORP_GATEWAY_ISSUE_RATE_PER_MINUTE` (30) per pod; a developer needs
+  it once per `CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS`.
+
+Every fixed bound behind these numbers (the 25 MiB body cap, statement and
+lookup timeouts, pool release budgets) is listed in `configuration.md`, "Fixed
+bounds".
+
+### Client disconnects
+
+uvicorn does not stop a request whose client went away; the limiter does. It
+reads the request body up front (over 25 MiB is `oversize:blocked`, 422, the
+same outcome as an oversize text leaf), replays it to litellm and watches the
+socket for the whole request. When the client disconnects before the response
+is complete — during auth or sanitization, while waiting for the first byte, or
+mid-stream — the gateway:
+
+1. cancels the request and gives it `CORP_LLM_CANCEL_GRACE_SECONDS` (default 5)
+   to unwind, which closes the upstream connection;
+2. cancels any task the request started that is still running — never a task
+   other requests share, such as a token lookup or a JWKS fetch several requests
+   wait on — and
+3. writes one audit record with `status` `cancelled` and `error_code`
+   `E_CLIENT_DISCONNECTED` (counts only), counted in
+   `gateway_cancelled_requests_total`; steps 2 and 3 share one more grace, so a
+   slot is held **at most 2 × `CORP_LLM_CANCEL_GRACE_SECONDS`** after a
+   disconnect. The request's content (its placeholder mapping) is dropped at
+   once, whatever the sink does. If the sink fails or runs out of that budget,
+   only the record's counts are kept (at most 4096 such requests, oldest dropped
+   first) and the next litellm event for the request, or the next cancel, writes
+   the record from them. A pre-call litellm reaches after the cancel is refused
+   with 408 `E_CLIENT_DISCONNECTED` and writes no second record (litellm 1.101.0
+   serves any status outside 400-599 as 500, so not 499);
+4. frees the slot — once, whatever happened above.
+
+Measured on a real socket (loopback, stalled upstream stub): the slot is back
+and the upstream socket closed within about 10 ms of the client closing, in every
+case. A request that does not unwind within the grace still frees its slot and
+records `gateway_failure{component="route_gate"}`. litellm's own
+`general_settings.cancel_on_disconnect: true` is set in the shipped configs as a
+second layer.
+
 ## Corp-LLM throughput floor
 
 Per the plan's open-question #2 settlement: assume **10 RPS sustained / 20 RPS burst** until the corp-LLM team confirms higher.
@@ -86,9 +212,11 @@ Working set estimate at Phase 3:
 
 ## Postgres
 
-Single HA pair. Read load is dominated by token lookups (cached 60s in `AuthMiddleware`, so steady ≤ 1 QPS even at Phase 3). Write load is negligible — token issuance + team config edits are admin-driven.
+Single HA pair. Read load is dominated by token lookups (cached 60s in `AuthMiddleware`, so steady ≤ 1 QPS even at Phase 3) and by the team-config read every rewritten request makes. Write load is small: developer token issuance is bounded per pod (`CORP_GATEWAY_ISSUE_RATE_PER_MINUTE`) and per developer (`CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS`), and team config edits are admin-driven.
 
-No tuning needed at Phase 0–3 sizes.
+Both are on the request path, and both fail closed: a token store that cannot answer within its bound is 503 `E_STORE_UNAVAILABLE`, a team-config store 503 `E_PROFILE_UNAVAILABLE` (`runbook.md`). Postgres availability is gateway availability.
+
+No tuning needed at Phase 0–3 sizes. Behind PgBouncer, set `ignore_startup_parameters` for the keepalive parameters (`configuration.md`, "Backends").
 
 ## Sizing review cadence
 

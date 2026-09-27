@@ -114,21 +114,25 @@ profile (`base`) has no English model, and the stack ships with
 
 ## Step 4. Choose the authentication mode
 
-There are two modes, they are **mutually exclusive**, and both are production.
-The decision is made before you fill in `.env`.
+There are two modes and they are **mutually exclusive**. **Mode B is the
+production mode; Mode A is a test posture only** (DRI decision, 2026-09-27). The
+decision is made before you fill in `.env`.
 
-### Mode A — corporate API keys
+### Mode A — corporate API keys (test posture only)
 
-The gateway holds the provider keys. Developers call with a **LiteLLM virtual
-key** issued from the admin UI; that gives per-person revocation and spend
-accounting.
+The gateway holds the provider keys, and requests carry a **LiteLLM virtual
+key**. There is no way to issue one: the route gate refuses `/key/*`, the admin
+UI and the rest of litellm's management surface (`403 E_ROUTE_BLOCKED`,
+`docs/security.md` §14). The container tests seed a key straight into litellm's
+database; do not deploy this mode for developers. The rest of this subsection
+describes what the stack still requires if you run it for testing.
 
 Additionally in `.env`:
 
 | Key | Value |
 |---|---|
 | `LITELLM_MASTER_KEY` | `sk-` + `openssl rand -hex 32` |
-| `UI_USERNAME`, `UI_PASSWORD` | the admin-UI account |
+| `UI_USERNAME`, `UI_PASSWORD` | required by the entrypoint; the admin UI itself is refused at the gate |
 | `ANTHROPIC_API_KEY` | needed for the `claude-*` route |
 | `OPENAI_API_KEY` | needed for the `gpt-*` route |
 
@@ -196,23 +200,34 @@ stages the token-store SQL schema, syncs `compose/`, runs `pull` + `up -d` and
 waits for the healthchecks.
 
 ```
-# mode A
+# mode B — subscription, the production mode (the default)
 scripts/deploy/deploy.sh --host user@server up
 
-# mode B
-scripts/deploy/deploy.sh --host user@server --mode oauth up
+# mode B + developer token issuance (docker-compose.issuance.yml)
+scripts/deploy/deploy.sh --host user@server --issuance up
+
+# mode A — API keys, a test posture only
+scripts/deploy/deploy.sh --host user@server --mode virtual-keys up
 ```
 
 **The same `--mode` must be passed to every later run against that host** —
 `logs`, `status`, `down` and `restart` all resolve the stack through this file
-list. A run without `--mode oauth` reports on (or recreates) a different stack.
+list. On a mode A host, a run without `--mode virtual-keys` reports on (or
+recreates) a different stack. The same holds for `--issuance`
+(`DEPLOY_ISSUANCE=1`).
+
+`--issuance` works in mode B only. It needs `gateway/config.toml` in the
+server's deploy directory (start from `compose/gateway/config.toml.example`);
+`up` refuses before it syncs or starts anything if the file is missing. The
+sync never uploads or overwrites that file. Setup and the manual three-file
+command: `compose/README.md`, "Developer token issuance".
 
 Other subcommands: `down` (volumes survive, asks for confirmation), `restart`,
 `logs`, `status`. Useful flags: `--dry-run`, `--yes`, `--dir PATH`,
 `--force-unlock`.
 
-The local `.env` is never uploaded; the server's `.env` is never touched. Keys
-and certificates are excluded from the sync.
+The local `.env` is never uploaded; the server's `.env` is never touched. Keys,
+certificates and `gateway/config.toml` are excluded from the sync.
 
 > If you deploy by hand, without the script, stage the schema before the first
 > start:
@@ -318,10 +333,8 @@ container's environment**. Set one on the machine you run the CLI from. Details:
 
 ## Step 10. Connecting a developer
 
-**Mode A:** two headers on every request —
-`Authorization: Bearer <litellm virtual key>` (who may call this proxy at all)
-and `X-Corp-Auth: <team token>` (whose rules and audit identity apply). The base
-URL is the gateway's address.
+**Mode A:** not for developers — there is no way to issue the virtual key it
+needs (test posture only, see Step 4).
 
 **Mode B:**
 
@@ -343,13 +356,12 @@ Only `sk-ant-oat…` tokens are accepted; anything else is `401 E_PROVIDER_AUTH`
   `127.0.0.1` without TLS; the nginx front door is a separate, unfinished task.
   Until it lands, developers connect through an SSH tunnel rather than over the
   network.
-- **In Mode B litellm's management endpoints are unauthenticated.** Without a
-  master key its proxy auth is skipped entirely. That covers `/key/*`,
-  `/model/*`, `/user/*` and the UI — **not** the LLM routes, which the
-  `X-Corp-Auth` check still gates. Today the surface is reachable only from the
-  host itself (loopback), but it is reachable by anyone with a shell there. When
-  nginx lands, that surface must be blocked there **before** the port is exposed
-  beyond loopback. Mode A does not have this gap.
+- **litellm's management endpoints are refused, in both modes.** Without a
+  master key litellm accepts any caller as an internal user, so much of
+  `/key/*`, `/model/*`, `/user/*`, `/policies*`, `/guardrails*` and the UI would
+  otherwise answer anyone who reaches the port. The route gate answers all of them with `403
+  E_ROUTE_BLOCKED` before litellm sees the request, on every path in
+  (`docs/security.md` §14). Operators use `gateway-admin`, not litellm's UI.
 - **No untrusted `docker run` on this host.** The container label Vector selects
   audit records by is public: anyone who can start containers on this host can
   forge audit records. That is a hard requirement of the deployment model, not a
@@ -360,8 +372,9 @@ Only `sk-ant-oat…` tokens are accepted; anything else is `401 E_PROVIDER_AUTH`
   default). If Langfuse can be down for longer, raise both values together.
 - **Never run `FLUSHDB` against the gateway's redis.** It holds the mappings
   without which the response cannot be restored to its original form.
-- **Virtual-key revocation exists only in Mode A.** Mode B has neither
-  per-developer revocation nor per-person spend accounting.
+- **There are no litellm virtual keys.** Neither mode has per-person spend
+  accounting through litellm. Per-developer revocation is the corp token:
+  `gateway-admin token revoke`.
 
 ## Where to look next
 

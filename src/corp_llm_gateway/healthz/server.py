@@ -1,4 +1,4 @@
-"""HTTP surface for the health probes + token issuance (Task B3).
+"""HTTP surface for the health probes + developer token issuance.
 
 `build_health_router` returns a dependency-injected ASGI app that serves:
 
@@ -6,46 +6,52 @@
     GET|HEAD /healthz/ready        -> ReadyCheck          (503 when unhealthy)
     GET|HEAD /healthz/sanitization -> SanitizationCheck   (503 when unhealthy)
     GET|HEAD /healthz/extensions   -> ExtensionsCheck     (503 when unhealthy)
-    POST     /internal/issue-token -> TokenIssuer         (fixes install.sh:149)
+    POST     /internal/issue-token -> TokenIssuer         (404 when no issuer)
 
 Framework choice: a framework-free ASGI app. LiteLLM is built on
 FastAPI/Starlette, but neither (nor litellm) ships wheels for the 3.14
 graceful-degradation venv, so a hand-rolled ASGI callable keeps this
 importable + unit-testable everywhere (via `httpx.ASGITransport`) with no
-new dependency. A pure-ASGI app mounts unchanged onto LiteLLM's ASGI app.
+new dependency. A pure-ASGI app mounts unchanged in front of LiteLLM's app.
 
-The issue-token route reads the OIDC token from the `Authorization: Bearer`
-header (matching `scripts/install.sh`), falling back to a JSON body
-`{"oidc_token": "..."}`. It never logs either token (M1-14).
+The issue-token route is a public endpoint and is bounded like one: the Keycloak
+access token comes from the `Authorization: Bearer` header only, any request
+body byte is refused (the read stops at 1 KiB and at 2 s), and the route has its
+own in-flight cap and token bucket, answered with 429 without queueing. The
+issuer's work after the body (verifier and its JWKS fetch, team lookup, token
+store) is bounded too, by one bound: past it the request answers 503
+``E_ISSUE_STORE_TIMEOUT`` and frees its slot. Until the token schema has been
+seen current (``IssuanceSchemaGate``, re-checked at most once per interval
+across the route and readiness) the route answers 503 ``E_ISSUE_SCHEMA``. With
+no issuer
+the path is a local 404 for every method — it never falls through. Error bodies
+carry a code only, every issuance response is ``cache-control: no-store``, and
+the one log line per request carries the status and the code: never the bearer,
+the minted token or a claim (M1-14).
 
-Production wiring is a thin hook (do NOT edit bootstrap.py to test this) --
-construct the checks + issuer, then serve the router as the ASGI entrypoint
-with LiteLLM's app as `fallthrough`::
-
-    from corp_llm_gateway.extensions import REGISTRY
-    from corp_llm_gateway.healthz import build_health_router
-
-    router = build_health_router(
-        live_check=LiveCheck(),
-        ready_check=ReadyCheck(check_redis=..., check_postgres=...),
-        sanitization_check=SanitizationCheck(run_round_trip=...),
-        extensions_check=ExtensionsCheck(health_all=REGISTRY.health_all),
-        token_issuer=TokenIssuer(store, verifier),
-        fallthrough=litellm_asgi_app,  # unknown paths delegate to litellm
-    )
-
-Every dependency is a parameter; this module imports no bootstrap/composition
-root.
+Production wiring lives in `corp_llm_gateway.bootstrap.build_health_router`;
+this module imports no composition root.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import re
+import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
-from corp_llm_gateway.healthz.checks import HealthCheck
-from corp_llm_gateway.tokens.issuance import OidcVerificationError, TokenIssuer
+from corp_llm_gateway.healthz.checks import HealthCheck, IssuanceSchemaGate
+from corp_llm_gateway.pg_session import store_unavailable
+from corp_llm_gateway.tokens.errors import IssuancePolicyError
+from corp_llm_gateway.tokens.issuance import (
+    JwksUnavailableError,
+    OidcTeamMappingError,
+    OidcVerificationError,
+    TokenIssuer,
+)
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
@@ -54,6 +60,37 @@ Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 _ISSUE_TOKEN_PATH = "/internal/issue-token"
+
+ISSUE_MAX_BODY_BYTES = 1024
+ISSUE_BODY_TIMEOUT_S = 2.0
+DEFAULT_ISSUE_MAX_INFLIGHT = 4
+DEFAULT_ISSUE_RATE_PER_MINUTE = 30
+DEFAULT_ISSUE_TIMEOUT_S = 10.0
+
+_CODE = re.compile(r"E_[A-Z0-9_]{1,64}")
+_DISCONNECTED = "disconnected"
+
+_log = logging.getLogger(__name__)
+
+
+class _TokenBucket:
+    """``per_minute`` requests a minute, bursting to the same number."""
+
+    def __init__(self, per_minute: int, clock: Callable[[], float]) -> None:
+        self._capacity = float(per_minute)
+        self._per_second = per_minute / 60.0
+        self._clock = clock
+        self._tokens = self._capacity
+        self._at = clock()
+
+    def take(self) -> bool:
+        now = self._clock()
+        self._tokens = min(self._capacity, self._tokens + (now - self._at) * self._per_second)
+        self._at = now
+        if self._tokens < 1.0:
+            return False
+        self._tokens -= 1.0
+        return True
 
 
 class HealthRouter:
@@ -68,7 +105,18 @@ class HealthRouter:
         extensions_check: HealthCheck,
         token_issuer: TokenIssuer | None = None,
         fallthrough: ASGIApp | None = None,
+        issue_max_inflight: int = DEFAULT_ISSUE_MAX_INFLIGHT,
+        issue_rate_per_minute: int = DEFAULT_ISSUE_RATE_PER_MINUTE,
+        issue_body_timeout_s: float = ISSUE_BODY_TIMEOUT_S,
+        issue_timeout_s: float = DEFAULT_ISSUE_TIMEOUT_S,
+        issue_clock: Callable[[], float] = time.monotonic,
+        on_close: Callable[[], Awaitable[None]] | None = None,
+        issuance_schema: IssuanceSchemaGate | None = None,
     ) -> None:
+        bounds = (issue_max_inflight, issue_rate_per_minute, issue_body_timeout_s, issue_timeout_s)
+        # `not x > 0` also refuses NaN.
+        if any(not bound > 0 for bound in bounds):
+            raise ValueError("issuance bounds must be positive")
         self._checks: dict[str, HealthCheck] = {
             "/healthz/live": live_check,
             "/healthz/ready": ready_check,
@@ -77,6 +125,13 @@ class HealthRouter:
         }
         self._issuer = token_issuer
         self._fallthrough = fallthrough
+        self._issue_max_inflight = issue_max_inflight
+        self._issue_inflight = 0
+        self._issue_bucket = _TokenBucket(issue_rate_per_minute, issue_clock)
+        self._issue_body_timeout_s = issue_body_timeout_s
+        self._issue_timeout_s = issue_timeout_s
+        self._on_close = on_close
+        self._issuance_schema = issuance_schema
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         scope_type = scope["type"]
@@ -102,11 +157,19 @@ class HealthRouter:
             await self._handle_health(check, send, body=method == "GET")
             return
 
-        if path == _ISSUE_TOKEN_PATH and self._issuer is not None:
-            if method != "POST":
-                await _send_json(send, 405, {"error": "method not allowed"})
-                return
-            await self._handle_issue_token(scope, receive, send)
+        if path == _ISSUE_TOKEN_PATH:
+            # A response to HEAD carries no body (h11 refuses to send one).
+            if self._issuer is None:
+                await _issue_respond(send, 404, "E_ISSUE_DISABLED", body=method != "HEAD")
+            elif method != "POST":
+                await _issue_respond(send, 405, "E_METHOD_NOT_ALLOWED", body=method != "HEAD")
+            elif (
+                self._issuance_schema is not None
+                and await self._issuance_schema.problem() is not None
+            ):
+                await _issue_respond(send, 503, "E_ISSUE_SCHEMA")
+            else:
+                await self._handle_issue_token(self._issuer, scope, receive, send)
             return
 
         if self._fallthrough is not None:
@@ -124,32 +187,113 @@ class HealthRouter:
             body=body,
         )
 
-    async def _handle_issue_token(self, scope: Scope, receive: Receive, send: Send) -> None:
-        raw = await _read_body(receive)
-        oidc_token = _bearer_token(scope) or _oidc_from_body(raw)
-        if not oidc_token:
-            await _send_json(send, 400, {"error": "missing OIDC token"})
+    async def _handle_issue_token(
+        self, issuer: TokenIssuer, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        # Checked in this order so a refused request spends no bucket token.
+        if self._issue_inflight >= self._issue_max_inflight:
+            await _issue_respond(send, 429, "E_ISSUE_INFLIGHT")
+            return
+        if not self._issue_bucket.take():
+            await _issue_respond(send, 429, "E_ISSUE_THROTTLED")
+            return
+        self._issue_inflight += 1
+        try:
+            outcome = await self._issue(issuer, scope, receive)
+        finally:
+            self._issue_inflight -= 1
+        if outcome is None:
+            return
+        status, code, payload = outcome
+        await _issue_respond(send, status, code, payload)
+
+    async def _issue(
+        self, issuer: TokenIssuer, scope: Scope, receive: Receive
+    ) -> tuple[int, str, dict[str, Any] | None] | None:
+        refused = await self._refuse_body(receive)
+        if refused == _DISCONNECTED:
+            return None
+        if refused is not None:
+            return (408 if refused == "E_ISSUE_BODY_TIMEOUT" else 400), refused, None
+        bearer = _bearer_token(scope)
+        if not bearer:
+            return 401, "E_OIDC_MISSING", None
+        bound = asyncio.timeout(self._issue_timeout_s)
+        try:
+            async with bound:
+                result = await issuer.issue(bearer)
+        except OidcVerificationError as exc:
+            return 401, _code_of(exc, "E_OIDC_INVALID"), None
+        except OidcTeamMappingError as exc:
+            return 403, _code_of(exc, "E_ISSUE_NO_TEAM"), None
+        except IssuancePolicyError as exc:
+            code = _code_of(exc, "E_ISSUE_REFUSED")
+            return (503 if code == IssuancePolicyError.BUSY else 403), code, None
+        except JwksUnavailableError:
+            return 503, "E_JWKS_UNAVAILABLE", None
+        except Exception as exc:
+            # The class name only: a driver message can quote a token or a claim.
+            if bound.expired():
+                _log.warning(
+                    "issue_token issuance timed out (verifier, team lookup or store): %s",
+                    type(exc).__name__,
+                )
+                return 503, "E_ISSUE_STORE_TIMEOUT", None
+            if store_unavailable(exc):
+                _log.warning("issue_token store unavailable: %s", type(exc).__name__)
+                return 503, "E_ISSUE_STORE_UNAVAILABLE", None
+            _log.error("issue_token internal failure: %s", type(exc).__name__)
+            return 500, "E_ISSUE_INTERNAL", None
+        payload = {"corp_token": result.corp_token, "expires_at": result.expires_at.isoformat()}
+        return 200, "ok", payload
+
+    async def _refuse_body(self, receive: Receive) -> str | None:
+        """Drain the request body within the bounds; ``None`` when it was empty."""
+        size = 0
+        try:
+            async with asyncio.timeout(self._issue_body_timeout_s):
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return _DISCONNECTED
+                    if message["type"] != "http.request":
+                        continue
+                    size += len(message.get("body") or b"")
+                    if size > ISSUE_MAX_BODY_BYTES:
+                        return "E_ISSUE_BODY"
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            return "E_ISSUE_BODY_TIMEOUT"
+        return "E_ISSUE_BODY" if size else None
+
+    async def aclose(self) -> None:
+        """Release what the issuance route holds open (the JWKS HTTP client).
+        Idempotent; a failure is logged by class name and never raised."""
+        on_close, self._on_close = self._on_close, None
+        if on_close is None:
             return
         try:
-            result = await self._issuer.issue(oidc_token)
-        except OidcVerificationError:
-            await _send_json(send, 401, {"error": "OIDC verification failed"})
-            return
-        await _send_json(
-            send,
-            200,
-            {"corp_token": result.corp_token, "expires_at": result.expires_at.isoformat()},
-        )
+            await on_close()
+        except Exception as exc:
+            _log.warning("issuance resources not closed cleanly: %s", type(exc).__name__)
 
     async def _handle_lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self._fallthrough is not None:
-            await self._fallthrough(scope, receive, send)
+
+            async def send_after_closing(message: Message) -> None:
+                if message["type"] in ("lifespan.shutdown.complete", "lifespan.shutdown.failed"):
+                    await self.aclose()
+                await send(message)
+
+            await self._fallthrough(scope, receive, send_after_closing)
             return
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
+                await self.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -162,13 +306,19 @@ def build_health_router(
     extensions_check: HealthCheck,
     token_issuer: TokenIssuer | None = None,
     fallthrough: ASGIApp | None = None,
+    issue_max_inflight: int = DEFAULT_ISSUE_MAX_INFLIGHT,
+    issue_rate_per_minute: int = DEFAULT_ISSUE_RATE_PER_MINUTE,
+    issue_body_timeout_s: float = ISSUE_BODY_TIMEOUT_S,
+    issue_timeout_s: float = DEFAULT_ISSUE_TIMEOUT_S,
+    issue_clock: Callable[[], float] = time.monotonic,
+    on_close: Callable[[], Awaitable[None]] | None = None,
+    issuance_schema: IssuanceSchemaGate | None = None,
 ) -> HealthRouter:
     """Build the ASGI router with all dependencies injected as parameters.
 
-    ``token_issuer=None`` leaves ``POST /internal/issue-token`` unserved: the
-    gateway server mounts this router at ``/healthz`` only, and the route gate
-    refuses the issuance path, so wiring an issuer there would be a second,
-    unreachable copy of `gateway-admin token issue`.
+    ``token_issuer=None`` disables issuance: the path answers 404 locally.
+    ``on_close`` runs once, at lifespan shutdown or on ``aclose()``.
+    ``issuance_schema`` not yet passing refuses issuance with 503 ``E_ISSUE_SCHEMA``.
     """
     return HealthRouter(
         live_check=live_check,
@@ -177,48 +327,58 @@ def build_health_router(
         extensions_check=extensions_check,
         token_issuer=token_issuer,
         fallthrough=fallthrough,
+        issue_max_inflight=issue_max_inflight,
+        issue_rate_per_minute=issue_rate_per_minute,
+        issue_body_timeout_s=issue_body_timeout_s,
+        issue_timeout_s=issue_timeout_s,
+        issue_clock=issue_clock,
+        on_close=on_close,
+        issuance_schema=issuance_schema,
     )
 
 
 def _bearer_token(scope: Scope) -> str:
-    for name, value in scope.get("headers", []):
-        if name.lower() == b"authorization":
-            text = value.decode("latin-1")
-            if text.startswith("Bearer "):
-                return text[len("Bearer ") :].strip()
-            return ""
-    return ""
-
-
-def _oidc_from_body(raw: bytes) -> str:
-    if not raw:
+    """The one ``Authorization: Bearer`` value; empty when absent, another scheme
+    or sent twice (two credentials are ambiguous, never a choice to make)."""
+    values = [v for k, v in scope.get("headers", []) if k.lower() == b"authorization"]
+    if len(values) != 1:
         return ""
-    try:
-        payload = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    scheme, _, token = values[0].decode("latin-1").partition(" ")
+    if scheme.lower() != "bearer":
         return ""
-    if isinstance(payload, dict):
-        token = payload.get("oidc_token")
-        if isinstance(token, str):
-            return token
-    return ""
+    return token.strip()
 
 
-async def _read_body(receive: Receive) -> bytes:
-    chunks: list[bytes] = []
-    while True:
-        message = await receive()
-        if message["type"] == "http.request":
-            chunks.append(message.get("body", b"") or b"")
-            if not message.get("more_body", False):
-                break
-        elif message["type"] == "http.disconnect":
-            break
-    return b"".join(chunks)
+def _code_of(exc: BaseException, default: str) -> str:
+    arg = exc.args[0] if exc.args else None
+    return arg if isinstance(arg, str) and _CODE.fullmatch(arg) else default
+
+
+async def _issue_respond(
+    send: Send,
+    status: int,
+    code: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    body: bool = True,
+) -> None:
+    _log.info("issue_token status=%d code=%s", status, code)
+    await _send_json(
+        send,
+        status,
+        payload if payload is not None else {"error": code},
+        body=body,
+        extra_headers=[(b"cache-control", b"no-store")],
+    )
 
 
 async def _send_json(
-    send: Send, status: int, payload: dict[str, Any], *, body: bool = True
+    send: Send,
+    status: int,
+    payload: dict[str, Any],
+    *,
+    body: bool = True,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
 ) -> None:
     encoded = json.dumps(payload).encode("utf-8")
     await send(
@@ -229,6 +389,7 @@ async def _send_json(
                 (b"content-type", b"application/json"),
                 # The length the GET would have, as RFC 9110 allows for HEAD.
                 (b"content-length", str(len(encoded)).encode("ascii")),
+                *(extra_headers or []),
             ],
         }
     )

@@ -1,9 +1,13 @@
 import asyncio
 import json
+import sys
+import types
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
+from corp_llm_gateway import config, settings
 from corp_llm_gateway.cli.admin import main
 from corp_llm_gateway.extensions import Extension, ExtensionRegistry, ExtensionSpec
 from corp_llm_gateway.healthz import HealthStatus
@@ -702,3 +706,141 @@ def test_config_check_without_routes_prints_no_table(
 
     assert rc == 0
     assert "route_gate" not in json.loads(capsys.readouterr().out)
+
+
+def _issuance_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "issuance.toml"
+    cfg.write_text('[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]\n"/devs" = "t1"\n')
+    monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(cfg))
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", "https://kc.corp.lan/realms/dev")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_AUDIENCE", "corp-gateway-issuance")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID", "corp-gateway-cli")
+    for name in ("cryptography", "jwt", "asyncpg"):
+        if name not in sys.modules:
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    config.reset_cache()
+
+
+def test_config_check_reports_what_the_boot_refuses_at_runtime(
+    hermetic_gateway_config: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _issuance_config(tmp_path, monkeypatch)
+    monkeypatch.setitem(sys.modules, "asyncpg", None)
+    monkeypatch.setenv("CORP_LLM_CA_BUNDLE", str(tmp_path / "missing-bundle-6d0e.pem"))
+
+    rc = main(["config", "check", "--no-probe", "--json"])
+
+    assert rc == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["config_valid"] is False
+    assert data["problems"] == [
+        settings.ISSUANCE_NEEDS_POSTGRES_EXTRA,
+        settings.ISSUANCE_CA_BUNDLE_UNREADABLE,
+    ]
+    assert "missing-bundle-6d0e" not in json.dumps(data)
+
+
+def test_config_check_passes_a_servable_issuance_config(
+    hermetic_gateway_config: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _issuance_config(tmp_path, monkeypatch)
+
+    rc = main(["config", "check", "--no-probe"])
+
+    assert rc == 0
+    assert "config: OK" in capsys.readouterr().out
+
+
+def test_config_check_refuses_an_issuance_bound_past_its_ceiling(
+    hermetic_gateway_config: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _issuance_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS", str(10**14))
+
+    rc = main(["config", "check", "--no-probe"])
+
+    assert rc == 1
+    assert "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("env", "cap"),
+    [("production", "0"), ("prod", "0"), ("", "-5"), ("production", "10001")],
+    ids=["zero-in-production", "zero-in-prod", "negative", "past-the-ceiling"],
+)
+def test_config_check_refuses_the_capacity_the_boot_refuses(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    env: str,
+    cap: str,
+) -> None:
+    # The same resolver as the entrypoint's boot step: settings.capacity().
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_ENV", env)
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", cap)
+    config.reset_cache()
+
+    rc = main(["config", "check", "--no-probe", "--json"])
+
+    assert rc == 1
+    problems = json.loads(capsys.readouterr().out)["problems"]
+    assert any(problem.startswith("CORP_LLM_MAX_INFLIGHT") for problem in problems)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("CORP_LLM_BODY_READ_SECONDS", "0"),
+        ("CORP_LLM_BODY_READ_SECONDS", "301"),
+        ("CORP_LLM_MAX_DRAINING", "3"),
+        ("CORP_LLM_MAX_DRAINING_BYTES", "1048576"),
+        ("CORP_LLM_MAX_DRAINING_BYTES", "17179869185"),
+    ],
+    ids=[
+        "body-deadline-zero",
+        "body-deadline-past-the-ceiling",
+        "draining-below-the-cap",
+        "byte-budget-below-the-body-cap",
+        "byte-budget-past-the-ceiling",
+    ],
+)
+def test_config_check_refuses_the_body_limits_the_boot_refuses(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv(name, value)
+    config.reset_cache()
+
+    rc = main(["config", "check", "--no-probe", "--json"])
+
+    assert rc == 1
+    problems = json.loads(capsys.readouterr().out)["problems"]
+    assert any(problem.startswith(name) for problem in problems)
+
+
+def test_config_check_accepts_a_zero_cap_outside_prod(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "0")
+    config.reset_cache()
+
+    assert main(["config", "check", "--no-probe"]) == 0

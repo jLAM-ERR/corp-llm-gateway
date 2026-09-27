@@ -20,18 +20,25 @@ The optional nginx front door lands in a later revision of this stack — see
 Read `docs/ops/deployment-modes.md` (RU: `deployment-modes.ru.md`) first. It
 covers the two **mutually exclusive** auth modes — API keys vs subscription/OAuth
 — and exactly how to turn the corp-LLM oracle and the corp NER service on and
-off. Both are production modes and both run **this** stack. Short version:
+off. Both run **this** stack. Short version:
 
-- **API-key mode (default).** `docker compose up -d`. `LITELLM_MASTER_KEY` is
-  required; developers use LiteLLM virtual keys. `ANTHROPIC_API_KEY` /
-  `OPENAI_API_KEY` are **optional** — set only the routes you use, or neither if
-  you only call `corp-*`.
-- **Subscription mode.** `docker compose -f docker-compose.yml -f
-  docker-compose.oauth.yml up -d`. Requires that no `LITELLM_MASTER_KEY` exist at
-  all, serves `claude-*` only, and forwards the developer's own Anthropic
-  subscription token upstream. Everything below about virtual keys applies to
-  the API-key mode only; the rest of this file (audit, NER, oracle, Vector,
-  volumes, TLS) is identical in both.
+- **Subscription mode — the production mode.** `docker compose -f
+  docker-compose.yml -f docker-compose.oauth.yml up -d`. Requires that no
+  `LITELLM_MASTER_KEY` exist at all, serves `claude-*` only, and forwards the
+  developer's own Anthropic subscription token upstream. `scripts/deploy/deploy.sh`
+  deploys this mode by default. Developers get their `X-Corp-Auth` token from
+  `scripts/install.sh` (Keycloak login → `POST /internal/issue-token`) once
+  issuance is on: add the `docker-compose.issuance.yml` overlay (see "Developer
+  token issuance" below). `gateway-admin token issue` stays as break-glass.
+- **API-key mode (the compose default) — a test posture only.** `docker compose
+  up -d`. `LITELLM_MASTER_KEY` is required and requests carry a LiteLLM virtual
+  key, but there is **no way to issue one**: the route gate refuses `/key/*`, the
+  admin UI and the rest of litellm's management surface
+  (`docs/security.md` §14). The master key exists for the container tests
+  (`tests/integration/test_route_gate_container.py`), which seed a key straight
+  into litellm's database. Do not deploy this mode for developers. Everything
+  below about virtual keys describes this test posture; the rest of this file
+  (audit, NER, oracle, Vector, volumes, TLS) is identical in both.
   The root-level `docker-compose.anthropic-oauth.yml` is a **demo-only** variant
   of the same idea over `docker-compose.demo.yml` — not a deployment target.
 - **Oracle:** `CORP_LLM_ORACLE_ENABLED` (default `0`), needs `CORP_LLM_ENDPOINT`
@@ -120,20 +127,20 @@ per-request rather than failing config load.
 
 ## Virtual keys
 
-**API-key mode only.** In subscription mode there is no master key, so there are
-no virtual keys and no Admin UI; the developer's OAuth bearer is the credential
-and `X-Corp-Auth` remains the team identity. See `docs/ops/deployment-modes.md`.
+**API-key mode only, and that mode is a test posture.** In subscription mode
+there is no master key, so there are no virtual keys; the developer's OAuth
+bearer is the credential and `X-Corp-Auth` remains the team identity. See
+`docs/ops/deployment-modes.md`.
 
-Developers authenticate with a **LiteLLM virtual key**
-(`Authorization: Bearer sk-...`), issued from the litellm Admin UI or API and
-consumed at the proxy — not forwarded, not logged. This is why
-`LITELLM_MASTER_KEY` + `DATABASE_URL` + `STORE_MODEL_IN_DB=True` +
-`UI_USERNAME`/`UI_PASSWORD` are set on this instance: virtual keys ARE the
-developer credential here, giving per-developer revocation and traffic
-accounting through the Admin UI. There is no second admin-only instance —
-that pattern existed only to keep the master key away from a BYOK data
-plane, and BYOK against Anthropic/OpenAI directly isn't possible (next
-section), so the tradeoff that motivated it no longer applies.
+In API-key mode litellm checks a **LiteLLM virtual key**
+(`Authorization: Bearer sk-...`) at the proxy — not forwarded, not logged —
+which is why `LITELLM_MASTER_KEY` + `DATABASE_URL` + `STORE_MODEL_IN_DB=True` +
+`UI_USERNAME`/`UI_PASSWORD` are set on this instance. **Nothing can issue one.**
+The route gate answers `403 E_ROUTE_BLOCKED` on `/key/*`, the admin UI and every
+other litellm management route, in both modes, so there is no per-developer
+revocation or spend accounting through litellm (`docs/security.md` §14,
+"The management surface is refused"). Per-developer revocation is the corp
+token: `gateway-admin token revoke`.
 
 `X-Corp-Auth` is **unchanged** and unrelated to virtual keys — it still
 carries team → profile → rules → audit identity through the guardrail
@@ -238,23 +245,24 @@ mount already available to the container works).
 Note the published `GATEWAY_IMAGE_TAG` predates this work — see "Building from
 this branch".
 
-## Two UIs — which one answers which question
+## Which tool answers which question
 
-The stack ships two web UIs. They do not overlap; reaching for the wrong one
-is the usual reason an operator concludes "the gateway has no data".
+The stack ships one web UI, Langfuse. litellm's own UI is refused at the route
+gate; reaching for it is the usual reason an operator concludes "the gateway has
+no data".
 
 | Question | Where |
 |---|---|
-| Who has a virtual key, and is it still valid? | LiteLLM UI |
-| How much has a developer/team spent, and what are their rate limits? | LiteLLM UI |
-| Which models does this proxy expose, and is a route healthy? | LiteLLM UI |
+| Who holds a corp token, and is it still valid? | `gateway-admin token list` (the LiteLLM UI is refused at the route gate) |
+| Which models does this proxy expose? | `GET /v1/models` |
 | What did request `<id>` look like end to end — latency, token counts, upstream error? | Langfuse |
 | Was that request sanitized, and how many redactions did it carry (`redaction_count`, `finding_label_counts`)? | Langfuse |
 | Why was a request blocked (`block_reason`), and which team was it? | Langfuse |
 | What is the audit trail for the last 90 days? | Langfuse |
 
-Short version: **LiteLLM = keys, models, spend. Langfuse = request-level
-traces and the audit trail.** Neither ever holds original user content —
+Short version: **the LiteLLM UI is not served** — the route gate refuses it
+with the rest of litellm's management surface (`docs/security.md` §14).
+**Langfuse = request-level traces and the audit trail.** Neither ever holds original user content —
 audit records pass the NEVER-fields gate (`audit/invariants.py`) plus
 Vector's VRL gate before they reach Langfuse (invariant #2).
 
@@ -790,6 +798,58 @@ This stack leaves `CORP_LLM_LOCAL_FIRST` unset (its `settings.py` default is
 `"1"`), so the default posture is safe; don't set it to `0` in `.env`
 without also setting `CORP_LLM_ORACLE_ENABLED=1`, or the container fails to
 boot with no other warning.
+
+## In-flight cap
+
+The `litellm` service passes the route gate's in-flight cap keys
+(`docs/ops/capacity.md`, `docs/ops/configuration.md`). Set any of them in `.env`
+to change it; the commented block in `.env.example` shows the defaults.
+
+| Key | Default here | What it bounds |
+|-----|--------------|----------------|
+| `CORP_LLM_MAX_INFLIGHT` | `64` | concurrent LLM requests on this host, a slot held for the whole stream; 429 `E_CAPACITY` past it. `0` = off, refused at boot under `CORP_ENV=production` |
+| `CORP_LLM_CANCEL_GRACE_SECONDS` | `5` | unwind budget after a client disconnect; a slot is back within 2 × this |
+| `CORP_LLM_BODY_READ_SECONDS` | `30` | time for the whole body to arrive, before a slot is taken; 408 `E_BODY_TIMEOUT` past it |
+| `CORP_LLM_MAX_DRAINING` | unset → 4 × the cap | requests reading a body at once; passed by bare name so it follows the cap |
+| `CORP_LLM_MAX_DRAINING_BYTES` | `536870912` (512 MiB) | body bytes buffered at once — size it against what the host can spare |
+
+A bad value is a boot refusal (exit 78) with the key named in the log.
+
+## Developer token issuance
+
+`POST /internal/issue-token` is off unless you add the optional
+`docker-compose.issuance.yml` overlay. The base stack passes no
+`CORP_GATEWAY_ISSUE_*` key and mounts no config file, so a subscription deploy
+without Keycloak is unaffected. To turn issuance on:
+
+1. On the server, in the deploy directory: `cp gateway/config.toml.example
+   gateway/config.toml` and edit the team map
+   (`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP`). It is a TOML table, so it can only live
+   in this file. Order matters: the first listed group the user belongs to wins.
+   `gateway/config.toml` is gitignored, and `deploy.sh` never syncs it: the
+   server's copy is the only copy.
+2. Set the scalar keys — at least `CORP_GATEWAY_ISSUE_OIDC_ISSUER`, `_AUDIENCE`
+   and `_CLIENT_ID` — in `.env` (the commented block in `.env.example`) or in
+   `gateway/config.toml`. The overlay passes them by bare name, so an unset key
+   in `.env` does not shadow the file; set each key in one place only.
+3. Deploy with the overlay from your laptop:
+   `scripts/deploy/deploy.sh --host user@server --issuance up`
+   (or `DEPLOY_ISSUANCE=1`). It refuses before it changes anything if
+   `gateway/config.toml` is missing on the server, and refuses `--mode
+   virtual-keys`. Pass `--issuance` to every later `logs`/`status`/`down`/
+   `restart` run too. Without the script, run this on the server:
+   `docker compose -f docker-compose.yml -f docker-compose.oauth.yml -f docker-compose.issuance.yml up -d`.
+   For the autostart unit, uncomment the three-file `COMPOSE_FILE` line in `.env`.
+
+The overlay mounts `./gateway/config.toml` read-only at
+`/etc/corp-llm-gateway/config.toml` and sets `CORP_LLM_GATEWAY_CONFIG_FILE` to
+that path. A missing `gateway/config.toml` fails `up` rather than booting with
+issuance off. Keys, defaults and ranges:
+`docs/ops/configuration.md`, "Developer token issuance"; Keycloak setup:
+`docs/ops/install.md`, "Developer onboarding". The `corp_tokens` schema staged
+by `deploy.sh` carries the issuance columns, but init scripts run only on an
+empty volume: on an existing one, re-run `tokens/schema.sql` first
+(`docs/ops/upgrade.md`). `gateway-admin token issue` stays as break-glass.
 
 ## Operator CLI (gateway-admin)
 

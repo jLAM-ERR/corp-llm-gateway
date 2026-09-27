@@ -1,9 +1,11 @@
 # Upgrade notes
 
-Read before upgrading an existing deployment. Three items need operator action:
-the `team_config` schema change, the RS256 operator-token breaking change, and
+Read before upgrading an existing deployment. Items that need operator action:
+the `team_config` schema change, the issuance columns on `corp_tokens` (before
+enabling developer token issuance), the RS256 operator-token breaking change,
 the new launch command (`python -m corp_llm_gateway.serve`) that the route gate
-requires.
+requires, the refused litellm management surface, the in-flight cap now on by
+default, and `deploy.sh` defaulting to subscription mode.
 
 ## Database schema
 
@@ -52,6 +54,37 @@ layers). `corp_tokens` is unchanged — no token migration needed.
 
 Run this before rolling out the new image, or the team CLI and any team-config
 read on the request path will error.
+
+### Before enabling developer token issuance: re-run `tokens/schema.sql`
+
+`POST /internal/issue-token` records the Keycloak identity each token was minted
+for. `tokens/schema.sql` adds three nullable columns to `corp_tokens`
+(`oidc_issuer`, `oidc_subject`, `oidc_jti`), a unique index
+`corp_tokens_oidc_jti_key` on `oidc_jti` and a lookup index — all
+`IF NOT EXISTS`. Re-run it **before** setting `CORP_GATEWAY_ISSUE_OIDC_ISSUER`:
+
+```
+psql "$CORP_LLM_PG_DSN" -f src/corp_llm_gateway/tokens/schema.sql
+```
+
+Existing rows and CLI-issued tokens keep NULLs; nothing else changes. The index
+builds are plain `CREATE INDEX`, which blocks writes to `corp_tokens` while they
+run — seconds on a token table, but run it outside peak. With issuance on, the
+entrypoint checks this at boot and exits 78 naming the fix when a column or the
+index is missing.
+
+**An INVALID index.** If a `CREATE INDEX CONCURRENTLY` or a `REINDEX` of
+`corp_tokens_oidc_jti_key` was interrupted, the index exists but is INVALID, and
+re-running `schema.sql` skips it (`IF NOT EXISTS` sees the name). The boot
+refuses with exit 78 and says so. Fix:
+
+```
+DROP INDEX corp_tokens_oidc_jti_key;          -- or: REINDEX INDEX corp_tokens_oidc_jti_key;
+\i src/corp_llm_gateway/tokens/schema.sql
+```
+
+The same `DROP INDEX` then `schema.sql` applies when an index of that name exists
+but is not a UNIQUE index on `oidc_jti` alone.
 
 ## RS256 operator-token breaking change (F11)
 
@@ -222,8 +255,9 @@ Rationale and the full refused set: [`../security.md`](../security.md) §14.
   estimate for the context indicator. `../security.md` §11 (i) records the trade.
 - **litellm's admin UI is no longer served.** `ast` cannot see inside a mounted
   ASGI app, so `/ui`, `/swagger`, `/docs` and `/openapi.json` get no table entry
-  and are refused as unlisted. The JSON admin API (`/key/*`, `/team/*`, …) is
-  pinned route by route and still answers. The escape hatch is
+  and are refused as unlisted. The JSON admin API (`/key/*`, `/team/*`, …) was
+  pinned route by route and still answered in that release; it is refused now —
+  see "litellm's management surface is refused" below. The escape hatch is
   `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` — but it
   admits one exact `(method, path)` per item and has no prefix form, so it fits a
   single operator route, not a mounted SPA.
@@ -242,6 +276,55 @@ Rationale and the full refused set: [`../security.md`](../security.md) §14.
 No data migration. Rollback is a redeploy of the previous image tag, which
 carries the old ENTRYPOINT — and the open bypass routes with it.
 
+## litellm's management surface is refused
+
+**Breaking for anyone who used litellm's admin API or UI.** Every litellm route
+that is not generation, model listing, a stored response by id or one of the
+probes `/health/liveliness`, `/health/liveness`, `/health/readiness` now answers
+`403 E_ROUTE_BLOCKED` — `/key/*`, `/team/*`, `/user/*`, `/model/*` writes,
+`/policies*`, `/guardrails*`, spend, login/SSO, the public catalogue, `GET /`,
+`GET /health` and the other `/health/*` routes. Rationale and the health-row
+review: `../security.md` §14, "The management surface is refused".
+
+- **API-key mode (virtual keys) is a test posture only.** Nothing can mint a
+  virtual key any more. Move developers to subscription mode
+  (`deployment-modes.md`); corp tokens come from `scripts/install.sh` and are
+  revoked with `gateway-admin token revoke`.
+- **A probe or dashboard on `GET /health` breaks.** Use `/healthz/live` and
+  `/healthz/ready`, which the shipped Helm and compose probes already do.
+- **`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` naming a refused route now exits 78
+  at boot** (and `config check` reports it), as does a malformed item — it used
+  to crash the import. Remove any such item before rolling out.
+
+No data migration. Rollback is a redeploy of the previous image tag.
+
+## The in-flight cap is on by default (64 per pod)
+
+**Behaviour change.** Every pod now admits at most `CORP_LLM_MAX_INFLIGHT` (64)
+concurrent LLM requests, a slot held for the whole stream; the next gets
+`429 E_CAPACITY` with `Retry-After: 1`. Bodies must arrive within 30 s (408
+`E_BODY_TIMEOUT`), and body memory is capped at 512 MiB per pod
+(`CORP_LLM_MAX_DRAINING_BYTES`). Before rolling out, size replicas by concurrent
+streams (`capacity.md`, "Sizing formula") and check that every capacity value you
+set is in range: the entrypoint exits 78 on a bad one, and on
+`CORP_LLM_MAX_INFLIGHT=0` under `CORP_ENV=prod`. Watch
+`corp_llm_gateway_blocked_requests_total{block_reason="capacity"}` after the
+rollout.
+
+**Behind PgBouncer**, add the keepalive parameters to
+`ignore_startup_parameters` before this rollout (`configuration.md`,
+"Backends"): the gateway's Postgres pools now send them, and PgBouncer refuses
+the connection otherwise — every LLM request would answer 503.
+
+## `deploy.sh` defaults to subscription mode
+
+`scripts/deploy/deploy.sh` without `--mode` now deploys `--mode oauth`
+(`docker-compose.yml` + `docker-compose.oauth.yml`), the production mode. A host
+deployed in API-key mode must now be driven with `--mode virtual-keys` on
+**every** run — `up`, `logs`, `status`, `down`, `restart`. A bare run against
+such a host would recreate the stack in subscription mode, which then refuses to
+boot because its `.env` still has `LITELLM_MASTER_KEY`.
+
 ## `CORP_LLM_STRIP_INBOUND_HEADERS` now defaults to `1`
 
 **Behaviour change, no action needed unless you set it explicitly.** The flag was
@@ -259,6 +342,23 @@ explicitly. The dropped set (`_WIRE_HEADERS_TO_DROP`) is hop-by-hop / wire-level
 only and never contains `authorization`, so BYOK passthrough is untouched, and
 `X-Corp-Auth` was already stripped unconditionally one step earlier. Set it to
 `0` only to reproduce the old behaviour. Recorded as `../security.md` §11 (h).
+
+## The `ner` extra now carries pymorphy3: RU gazetteer terms are lemmatised
+
+The `ner` extra now installs `pymorphy3` and `pymorphy3-dicts-ru`, and the
+production image is built with it (`Dockerfile.gateway`). The gazetteer uses it
+to lemmatise Russian terms and text; before, it matched Russian surface forms
+only. No config change is needed.
+
+- **Detection widens.** Inflected forms of a gazetteer term (other cases,
+  numbers) now match, so more Russian text is redacted. With the oracle on and
+  the default `gazetteer_hit` trigger, more hits also mean more oracle calls.
+- **Cache A entries from the old build do not match.** The gazetteer's
+  lemmatiser identity, pymorphy3 version included, is part of the policy
+  fingerprint in the Cache-A key. Entries written without pymorphy3 (or with
+  another version) are never served to the new pods; expect fewer cache hits
+  until the new keys fill.
+- An image built without the `ner` extra keeps surface matching.
 
 ## Cache A is invalidated by this release (no action required *for the cache*)
 

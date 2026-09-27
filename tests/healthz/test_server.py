@@ -189,20 +189,21 @@ async def test_issue_token_via_bearer_header_returns_valid_token() -> None:
 
 
 @pytest.mark.asyncio
-async def test_issue_token_via_json_body_returns_valid_token() -> None:
+async def test_issue_token_refuses_a_json_body_token() -> None:
+    # Header-only: the old `{"oidc_token": ...}` body fallback is gone, and any
+    # body byte is refused before the token is looked at.
     router = _router(issuer=_make_issuer())
     async with _client(router) as client:
         resp = await client.post("/internal/issue-token", json={"oidc_token": "valid-oidc"})
-    assert resp.status_code == 200
-    assert resp.json()["corp_token"].startswith("ct_")
+    assert resp.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_issue_token_missing_token_returns_400() -> None:
+async def test_issue_token_missing_token_returns_401() -> None:
     router = _router(issuer=_make_issuer())
     async with _client(router) as client:
         resp = await client.post("/internal/issue-token")
-    assert resp.status_code == 400
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -287,13 +288,11 @@ async def test_fallthrough_delegates_unknown_paths_but_serves_health() -> None:
     assert health.json()["status"] == "healthy"
 
 
-# ── issuance is optional (the gateway server does not serve it) ──────────────
+# ── issuance is optional (off unless CORP_GATEWAY_ISSUE_OIDC_ISSUER is set) ──
 
 
 async def test_without_an_issuer_the_issue_token_path_is_not_served() -> None:
-    # The gateway mounts this router at /healthz only and the route gate refuses
-    # POST /internal/issue-token; wiring an issuer there would be a second,
-    # unreachable copy of `gateway-admin token issue`.
+    # Disabled issuance answers 404 locally; it never falls through downstream.
     router = build_health_router(
         live_check=LiveCheck(),
         ready_check=ReadyCheck(check_redis=_ok, check_postgres=_ok),
@@ -318,3 +317,135 @@ async def test_without_an_issuer_the_health_routes_still_answer() -> None:
     async with _client(router) as client:
         assert (await client.get("/healthz/live")).status_code == 200
         assert (await client.get("/healthz/ready")).status_code == 200
+
+
+# Shutdown: the issuance resources are released ------------------------------
+
+
+def _closing_router(
+    fallthrough: object | None = None, closed: list[str] | None = None
+) -> tuple[HealthRouter, list[str]]:
+    closed = closed if closed is not None else []
+
+    async def on_close() -> None:
+        closed.append("closed")
+
+    router = build_health_router(
+        live_check=LiveCheck(),
+        ready_check=ReadyCheck(check_redis=_ok, check_postgres=_ok),
+        sanitization_check=SanitizationCheck(run_round_trip=_ok),
+        extensions_check=ExtensionsCheck(health_all=_ext_healthy),
+        token_issuer=_make_issuer(),
+        fallthrough=fallthrough,  # type: ignore[arg-type]
+        on_close=on_close,
+    )
+    return router, closed
+
+
+async def _run_lifespan(router: HealthRouter) -> list[str]:
+    incoming = iter([{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}])
+    sent: list[str] = []
+
+    async def receive() -> dict:
+        return next(incoming)
+
+    async def send(message: dict) -> None:
+        sent.append(message["type"])
+
+    await router({"type": "lifespan"}, receive, send)
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_aclose_runs_the_closer_once() -> None:
+    router, closed = _closing_router()
+
+    await router.aclose()
+    await router.aclose()
+
+    assert closed == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_aclose_without_a_closer_is_a_no_op() -> None:
+    await _router().aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_closer_is_logged_by_class_and_never_raised(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def explode() -> None:
+        raise RuntimeError("secret detail")
+
+    router = build_health_router(
+        live_check=LiveCheck(),
+        ready_check=ReadyCheck(check_redis=_ok, check_postgres=_ok),
+        sanitization_check=SanitizationCheck(run_round_trip=_ok),
+        extensions_check=ExtensionsCheck(health_all=_ext_healthy),
+        on_close=explode,
+    )
+
+    await router.aclose()
+
+    assert "RuntimeError" in caplog.text
+    assert "secret detail" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_standalone_lifespan_closes_at_shutdown() -> None:
+    router, closed = _closing_router()
+
+    sent = await _run_lifespan(router)
+
+    assert sent == ["lifespan.startup.complete", "lifespan.shutdown.complete"]
+    assert closed == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_a_fallthrough_lifespan_closes_before_shutdown_completes() -> None:
+    order: list[str] = []
+
+    async def downstream(scope: Scope, receive: Receive, send: Send) -> None:
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    router, _ = _closing_router(fallthrough=downstream, closed=order)
+    incoming = iter([{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}])
+
+    async def receive() -> dict:
+        return next(incoming)
+
+    async def send(message: dict) -> None:
+        order.append(message["type"])
+
+    await router({"type": "lifespan"}, receive, send)
+
+    assert order == ["lifespan.startup.complete", "closed", "lifespan.shutdown.complete"]
+
+
+@pytest.mark.asyncio
+async def test_a_fallthrough_whose_startup_fails_does_not_close() -> None:
+    async def downstream(scope: Scope, receive: Receive, send: Send) -> None:
+        await receive()
+        await send({"type": "lifespan.startup.failed", "message": "boom"})
+
+    router, closed = _closing_router(fallthrough=downstream)
+
+    async def receive() -> dict:
+        return {"type": "lifespan.startup"}
+
+    sent: list[str] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message["type"])
+
+    await router({"type": "lifespan"}, receive, send)
+
+    assert sent == ["lifespan.startup.failed"]
+    assert closed == []

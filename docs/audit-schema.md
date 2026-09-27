@@ -29,7 +29,7 @@ and Vector drops it.
 | `finding_label_counts` | object\<string, int\> | `{"EMAIL": 2, "PERSON": 1}` style; label histogram only — no text; always populated; `sum(values) == redaction_count` |
 | `cache_a_hit` | bool | Whether this request hit the dedup cache |
 | `gateway_version` | string | App version that handled the request |
-| `status` | string | `ok` / `failed` / `degraded` |
+| `status` | string | `ok` / `failed` / `degraded` / `cancelled` (the client disconnected before the response completed and the gateway cancelled the request — `error_code` `E_CLIENT_DISCONNECTED`, counts only, no `placeholder_list`) |
 
 ## NEVER fields
 
@@ -60,8 +60,8 @@ Present only under the conditions noted; absent otherwise.
 | Field | Condition | Description |
 |---|---|---|
 | `placeholder_list` | `redaction_count > 0` | Unique, sorted list of placeholder strings only (e.g. `["[EMAIL_001]", "[NAME_002]"]`) — NEVER includes the originals |
-| `error_code` | `status != "ok"` | Stable error code; no exception text |
-| `block_reason` | a block site fired | Short reason code for the refusal. Stage 0 (content policy): `config:env`, `config:kube`, `config:nginx`, `config:ini`, `log:dump`. Stage 5 (DLP egress guard): `dlp:canary`, `dlp:secret_leak`. Content-size and request policy: `oversize:blocked`, `request:ambiguous_shape`, `provider:not_allowed`. Route gate (before litellm's router, `route_gate/classify.py`): `route_gate_listed` (the table refuses this route), `route_gate_unlisted` (no table entry), `route_gate_websocket` (a handshake on any path), `route_gate_malformed` (encoded or traversing path), `route_gate_unarmed` (the guardrail callback is not registered) and `route_gate_error` (the gate could not classify). Never contains raw payload content, a path or a header. |
+| `error_code` | `status != "ok"` | Stable error code; no exception text. Among them: the route gate's `E_ROUTE_BLOCKED`, `E_ROUTE_GATE_UNARMED`, `E_ROUTE_GATE_ERROR`; the in-flight cap's `E_CAPACITY`, `E_BODY_TIMEOUT`, `E_OVERSIZE_BLOCKED`; `E_CLIENT_DISCONNECTED` (with `status` `cancelled`); `E_STORE_UNAVAILABLE` (the token store could not answer); `E_PROFILE_UNAVAILABLE` (a broken profile, or a team-config store that could not answer). The issuance route writes no audit record |
+| `block_reason` | a block site fired | Short reason code for the refusal. Stage 0 (content policy): `config:env`, `config:kube`, `config:nginx`, `config:ini`, `log:dump`. Stage 5 (DLP egress guard): `dlp:canary`, `dlp:secret_leak`. Content-size and request policy: `oversize:blocked`, `request:ambiguous_shape`, `provider:not_allowed`. Route gate (before litellm's router, `route_gate/classify.py`): `route_gate_listed` (the table refuses this route), `route_gate_unlisted` (no table entry), `route_gate_websocket` (a handshake on any path), `route_gate_malformed` (encoded or traversing path), `route_gate_unarmed` (the guardrail callback is not registered) and `route_gate_error` (the gate could not classify). In-flight cap (after the route gate admits a rewritten route, `route_gate/inflight.py`): `capacity` (the pod's `CORP_LLM_MAX_INFLIGHT` slots or its `CORP_LLM_MAX_DRAINING` body-read places are all taken, or the body would pass the `CORP_LLM_MAX_DRAINING_BYTES` budget; 429 `E_CAPACITY`) and `body_timeout` (the body did not arrive whole within `CORP_LLM_BODY_READ_SECONDS`; 408 `E_BODY_TIMEOUT`); a body over the 25 MiB cap there is `oversize:blocked`. Never contains raw payload content, a path or a header. |
 | `corp_llm_latency_ms` | corp-LLM path was taken | Sub-stage latency for capacity tuning |
 | `pre_pass_latency_ms` | pre-pass path was taken | Sub-stage latency |
 | `audit_buffer_full` | Vector buffer at ≥50% | Operational signal |

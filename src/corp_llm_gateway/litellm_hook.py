@@ -21,6 +21,7 @@ The class is duck-typed; LiteLLM doesn't require strict subclassing.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -28,6 +29,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -44,7 +46,9 @@ from corp_llm_gateway.detectors import NerUnavailableError
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.payload.size_threshold import OversizeContentError, should_skip_sanitization
+from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.providers import detect_provider
+from corp_llm_gateway.route_gate.inflight import RequestTicket, bind_call_id, current_ticket
 from corp_llm_gateway.sanitizer import (
     OpenAiToolCallDesanitizer,
     ResponsesStreamDesanitizer,
@@ -94,6 +98,7 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     PROFILE_ERRORS,
     ProfileAwareOrchestrator,
     ResolvedProfile,
+    TeamConfigUnavailableError,
     passthrough_resolved,
 )
 from corp_llm_gateway.sanitizer.streaming import _json_string_escape, coerce_tool_index
@@ -102,6 +107,7 @@ from corp_llm_gateway.tokens import (
     AuthMiddleware,
     MissingTokenError,
 )
+from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
 
 # litellm v1.85's proxy dispatcher filters callbacks via
 # `isinstance(cb, CustomLogger)` before invoking any hook method.
@@ -134,6 +140,17 @@ logger = logging.getLogger(__name__)
 # for one request (inline block-audit + any litellm event) happen ms apart, so a
 # small window suffices; this just prevents unbounded growth over process life.
 _AUDIT_DEDUP_CAP = 4096
+
+# The error code of a request the route gate cancelled because its client left.
+E_CLIENT_DISCONNECTED = "E_CLIENT_DISCONNECTED"
+# A pre-call reached after its request was cancelled. litellm 1.101.0 serves any
+# status outside 400-599 as 500, so not nginx's 499: a client-side 4xx.
+LATE_PRE_CALL_STATUS = 408
+# `cancelled` records whose emit failed, waiting for a retry; oldest dropped past it.
+_CANCEL_PENDING_CAP = 4096
+
+# The auth lookup's own bound on the request path; past it: 503 E_STORE_UNAVAILABLE.
+AUTH_LOOKUP_BOUND_S = LOOKUP_TIMEOUT_S + 1.0
 
 # `role` is echoed straight from the request body into a log line. Only these
 # known message roles are logged verbatim; anything else logs as "invalid" so a
@@ -268,6 +285,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # via audit() — a failed emit + safety-net retry call audit() twice
         # for one request; the histogram must only see it once.
         self._latency_observed_ids: OrderedDict[str, None] = OrderedDict()
+        # Cancelled requests whose `cancelled` record never landed, counts only:
+        # a later audit() or cancel for one of them writes it.
+        self._cancel_pending: OrderedDict[str, _CancelRecord] = OrderedDict()
+        # Ids whose `cancelled` record is being written; set once the write resolves.
+        self._cancel_emitting: dict[str, asyncio.Event] = {}
+        # Ids whose audit() record is being written; set once the write resolves.
+        self._audit_emitting: dict[str, asyncio.Event] = {}
 
     @property
     def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
@@ -416,6 +440,20 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         `async_pre_call_hook` wiring supplies a call_type.
         """
         request_id = self._ensure_request_id(data)
+        ticket = current_ticket()
+        if ticket is not None and ticket.cancelled:
+            # The route gate already wrote this request's `cancelled` record; a
+            # call id bound now would never be audited and its state never freed.
+            self._metrics.record_failure("route_gate")
+            logger.error(
+                "route_gate_cancel_incomplete request_id=%s late_pre_call=true", request_id
+            )
+            raise GuardrailHttpException(
+                LATE_PRE_CALL_STATUS, E_CLIENT_DISCONNECTED, "client disconnected"
+            )
+        # The route gate's ticket for this HTTP request learns litellm's call id,
+        # so a client disconnect can find this request's state.
+        bind_call_id(request_id)
         model = str(data.get("model") or "unknown")
         raw_messages, request_shape = _request_items(data, call_type)
         message_count = len(raw_messages) if isinstance(raw_messages, list) else 0
@@ -441,7 +479,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         inbound_headers = _extract_auth_headers(data)
         try:
-            ctx = await self._auth.authenticate_headers(inbound_headers)
+            async with asyncio.timeout(AUTH_LOOKUP_BOUND_S):
+                ctx = await self._auth.authenticate_headers(inbound_headers)
         except MissingTokenError:
             logger.info(
                 "litellm_pre_call_auth_failed request_id=%s error_code=E_MISSING_TOKEN",
@@ -468,6 +507,23 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             raise GuardrailHttpException(
                 401, error_code, _AUTH_ERROR_MESSAGES.get(error_code, "authentication failed")
             ) from exc
+        except Exception as exc:
+            if not store_unavailable(exc):
+                raise
+            # The class name only: a driver message can quote the token.
+            logger.warning(
+                "litellm_pre_call_token_store_unavailable request_id=%s exc_type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            self._record_failure(request_id, error_code="E_STORE_UNAVAILABLE")
+            _now = datetime.now(UTC)
+            await self.audit(
+                data, None, _now, _now, status="failed", error_code="E_STORE_UNAVAILABLE"
+            )
+            raise GuardrailHttpException(
+                503, "E_STORE_UNAVAILABLE", "token store unavailable"
+            ) from None
 
         logger.info(
             "litellm_pre_call_auth_ok request_id=%s team_id=%s user_id=%s",
@@ -702,12 +758,17 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         try:
             resolved = await self._resolve_profile(ctx.team_id)
         except PROFILE_ERRORS as exc:
-            self._record_failure(request_id, error_code="E_PROFILE_UNAVAILABLE")
+            store_down = isinstance(exc, TeamConfigUnavailableError)
+            self._record_failure(
+                request_id,
+                error_code="E_PROFILE_UNAVAILABLE",
+                component=TEAM_CONFIG_COMPONENT if store_down else None,
+            )
             logger.warning(
                 "litellm_pre_call_profile_unavailable request_id=%s team_id=%s exception=%s",
                 request_id,
                 ctx.team_id,
-                type(exc).__name__,
+                exc.error_class if store_down else type(exc).__name__,
             )
             _now = datetime.now(UTC)
             await self.audit(data, None, _now, _now, status="failed")
@@ -1533,8 +1594,21 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         error_code: str | None = None,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
+        # A record in flight decides the terminal record: wait for it.
+        await self._emits_resolved(request_id)
         if request_id in self._audited_ids:
             logger.debug("litellm_audit_deduped request_id=%s status=%s", request_id, status)
+            return
+        pending = self._cancel_pending.get(request_id)
+        if pending is not None:
+            # The client left and that record never landed: it is the terminal one.
+            await self._emit_cancelled(request_id, pending)
+            return
+        ticket = current_ticket()
+        if ticket is not None and ticket.cancelled:
+            # The route gate is cancelling this request; its terminal record is
+            # the `cancelled` one `on_request_cancelled` writes.
+            logger.debug("litellm_audit_deferred_to_cancel request_id=%s", request_id)
             return
         # Do NOT pop yet: a failed emit below must leave `state` in place for
         # a genuine retry (the F8 safety net's own guarded audit() call) to
@@ -1583,17 +1657,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             profile_ids=(state.profile_ids if state else ()),
         )
         try:
-            await self._audit.emit(event)
+            with _emitting(self._audit_emitting, request_id):
+                await self._audit.emit(event)
         except AuditWriteAmbiguousError:
             # The sink may have already persisted this record before raising
             # (e.g. an HTTP response was accepted but reading the ack timed
             # out) — treat it as delivered so a safety-net retry for the same
             # request_id doesn't write a second record for one logical write.
             logger.error("litellm_audit_emit_ambiguous request_id=%s status=%s", request_id, status)
-            self._req_state.pop(request_id, None)
-            self._audited_ids[request_id] = None
-            if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
-                self._audited_ids.popitem(last=False)
+            self._mark_audited(request_id)
             raise
         except Exception:
             # Do NOT mark dedup on a confirmed failed emit: a request whose
@@ -1605,10 +1677,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             raise
         # Pop only after a confirmed-successful emit, so `_req_state` never
         # grows unbounded past this point either.
-        self._req_state.pop(request_id, None)
-        self._audited_ids[request_id] = None
-        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
-            self._audited_ids.popitem(last=False)
+        self._mark_audited(request_id)
         logger.info(
             "litellm_audit_emitted request_id=%s status=%s latency_ms=%d "
             "redaction_count=%d cache_a_hit=%s prompt_tokens=%d completion_tokens=%d",
@@ -1620,6 +1689,93 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             prompt_tokens,
             completion_tokens,
         )
+
+    async def on_request_cancelled(self, request_id: str, *, latency_ms: int = 0) -> None:
+        """The terminal record of a request the route gate cancelled (client gone).
+
+        The request's state goes at once: its content never outlives the request.
+        One ``cancelled`` record is emitted with counts only — no placeholder list,
+        nothing of the content. The id is marked audited only once the emit is
+        confirmed (or ambiguous); after a failed or cut-short emit the counts wait
+        in a bounded queue, and a later litellm event for the call, or the next
+        cancel, writes the record from them. A request whose terminal record
+        already went out gets nothing.
+
+        Only the cancelled request's own state is touched: state another request
+        registered under the same call id is left alone, and nothing is written.
+        """
+        state = self._req_state.get(request_id)
+        if state is not None and not _cancel_reaches(state.ticket):
+            self._metrics.record_failure("route_gate")
+            logger.error(
+                "route_gate_cancel_call_id_mismatch redaction_count=%d", state.redaction_count
+            )
+            return
+        self._req_state.pop(request_id, None)
+        own = _CancelRecord.of(state, latency_ms)
+        try:
+            # A record in flight (an audit() from litellm's logging worker, or
+            # another cancel) decides the terminal record: wait for it.
+            await self._emits_resolved(request_id)
+        except asyncio.CancelledError:
+            # The route gate's deadline ended the wait: if that write fails,
+            # the next litellm event for the call writes these counts.
+            if request_id not in self._audited_ids and request_id not in self._cancel_pending:
+                self._queue_cancelled(request_id, own)
+            raise
+        if request_id in self._audited_ids:
+            self._cancel_pending.pop(request_id, None)
+            return
+        await self._emit_cancelled(request_id, self._cancel_pending.get(request_id) or own)
+
+    async def _emits_resolved(self, request_id: str) -> None:
+        while (
+            emitting := self._cancel_emitting.get(request_id)
+            or self._audit_emitting.get(request_id)
+        ) is not None:
+            await emitting.wait()
+
+    async def _emit_cancelled(self, request_id: str, record: _CancelRecord) -> None:
+        with _emitting(self._cancel_emitting, request_id):
+            await self._emit_cancelled_once(request_id, record)
+
+    def _queue_cancelled(self, request_id: str, record: _CancelRecord) -> None:
+        self._cancel_pending[request_id] = record
+        self._cancel_pending.move_to_end(request_id)
+        while len(self._cancel_pending) > _CANCEL_PENDING_CAP:
+            self._cancel_pending.popitem(last=False)
+
+    async def _emit_cancelled_once(self, request_id: str, record: _CancelRecord) -> None:
+        event = record.event(request_id)
+        try:
+            await self._audit.emit(event)
+        except AuditWriteAmbiguousError:
+            logger.error("litellm_audit_cancelled_emit_ambiguous request_id=%s", request_id)
+            self._mark_audited(request_id)
+            raise
+        except (Exception, asyncio.CancelledError) as exc:
+            # The class name only: a sink's message can quote what it was writing.
+            self._queue_cancelled(request_id, record)
+            logger.error(
+                "litellm_audit_cancelled_emit_failed request_id=%s error=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            raise
+        self._mark_audited(request_id)
+        logger.info(
+            "litellm_audit_emitted request_id=%s status=cancelled latency_ms=%d redaction_count=%d",
+            request_id,
+            event.latency_ms,
+            event.redaction_count,
+        )
+
+    def _mark_audited(self, request_id: str) -> None:
+        self._req_state.pop(request_id, None)
+        self._cancel_pending.pop(request_id, None)
+        self._audited_ids[request_id] = None
+        if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+            self._audited_ids.popitem(last=False)
 
     # ---- internals --------------------------------------------------------
 
@@ -1723,7 +1879,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         self._req_state[request_id] = state
         return state
 
-    def _record_failure(self, request_id: str, *, error_code: str) -> None:
+    def _record_failure(
+        self, request_id: str, *, error_code: str, component: str | None = None
+    ) -> None:
         if request_id in self._req_state:
             self._req_state[request_id].error_code = error_code
         self._failure_recorded_ids[request_id] = None
@@ -1731,7 +1889,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             self._failure_recorded_ids.popitem(last=False)
         # gateway_failure{component} — the single failure choke point. Fires even
         # when no _RequestState exists yet (e.g. an auth failure before state is built).
-        self._metrics.record_failure(_failure_component(error_code))
+        self._metrics.record_failure(component or _failure_component(error_code))
 
     async def _guard_unmanaged_input_size(
         self,
@@ -2155,6 +2313,59 @@ def _is_responses_event(chunk: Any) -> bool:
     return isinstance(event_type, str) and event_type.startswith("response.")
 
 
+@dataclass(frozen=True)
+class _CancelRecord:
+    """What a ``cancelled`` record carries: audit-safe identity and counts, no content."""
+
+    user_id: str
+    team_id: str
+    provider: Provider
+    model: str
+    latency_ms: int
+    redaction_count: int
+    finding_label_counts: dict[str, int] = field(default_factory=dict)
+    cache_a_hit: bool = False
+    block_reason: str | None = None
+    profile_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def of(cls, state: _RequestState | None, latency_ms: int) -> _CancelRecord:
+        if state is None:
+            return cls("unknown", "unknown", "unknown", "unknown", max(0, latency_ms), 0)
+        return cls(
+            user_id=state.user_id,
+            team_id=state.team_id,
+            provider=state.provider,
+            model=state.model,
+            latency_ms=max(0, latency_ms),
+            redaction_count=state.redaction_count,
+            finding_label_counts=_label_counts(state.placeholders),
+            cache_a_hit=state.cache_a_hit,
+            block_reason=state.block_reason,
+            profile_ids=state.profile_ids,
+        )
+
+    def event(self, request_id: str) -> AuditEvent:
+        return AuditEvent(
+            timestamp=datetime.now(UTC),
+            request_id=request_id,
+            user_id=self.user_id,
+            team_id=self.team_id,
+            provider=self.provider,
+            model=self.model,
+            latency_ms=self.latency_ms,
+            prompt_token_count=0,
+            completion_token_count=0,
+            redaction_count=self.redaction_count,
+            finding_label_counts=dict(self.finding_label_counts),
+            cache_a_hit=self.cache_a_hit,
+            status="cancelled",
+            error_code=E_CLIENT_DISCONNECTED,
+            block_reason=self.block_reason,
+            profile_ids=self.profile_ids,
+        )
+
+
 class _RequestState:
     __slots__ = (
         "block_reason",
@@ -2169,6 +2380,7 @@ class _RequestState:
         "request_id",
         "response_alias_exclusions",
         "team_id",
+        "ticket",
         "user_id",
     )
 
@@ -2195,11 +2407,36 @@ class _RequestState:
         self.cache_a_hit = cache_a_hit
         self.mapping = mapping
         self.response_alias_exclusions: set[str] = set()
+        # The route gate's request this state belongs to, when one is being served.
+        self.ticket: RequestTicket | None = current_ticket()
         self.error_code: str | None = None
         self.block_reason: str | None = None
         # Resolved profile layer-key (D4) — metadata for the audit trail; set
         # after profile resolution in pre_call. Empty == no profile applied.
         self.profile_ids: tuple[str, ...] = ()
+
+
+@contextlib.contextmanager
+def _emitting(table: dict[str, asyncio.Event], request_id: str) -> Iterator[None]:
+    """Mark ``request_id`` as being written in ``table`` until the write resolves."""
+    resolved = asyncio.Event()
+    table[request_id] = resolved
+    try:
+        yield
+    finally:
+        if table.get(request_id) is resolved:
+            del table[request_id]
+        resolved.set()
+
+
+def _cancel_reaches(owner: RequestTicket | None) -> bool:
+    """Whether a cancel may end the state ``owner``'s request registered."""
+    if owner is None:
+        return True
+    canceller = current_ticket()
+    if canceller is not None:
+        return canceller is owner
+    return owner.cancelled
 
 
 def _response_mapping(state: _RequestState, *, include_bare_aliases: bool) -> StrategyResult:
@@ -2324,6 +2561,7 @@ _FAILURE_COMPONENT: dict[str, str] = {
     "E_TOKEN_REVOKED": "auth",
     "E_TOKEN_INVALID": "auth",
     "E_AUTH": "auth",
+    "E_STORE_UNAVAILABLE": "token_store",
     "E_PROVIDER_AUTH": "auth",
     "E_PROVIDER_BLOCKED": "provider",
     "E_POLICY_BLOCKED": "policy",
@@ -2333,6 +2571,11 @@ _FAILURE_COMPONENT: dict[str, str] = {
     "E_SPAN_INVALID": "sanitize",
     "E_INTERNAL": "internal",
 }
+
+
+# The component of a failure one error code cannot name alone: a team config that
+# cannot be read answers E_PROFILE_UNAVAILABLE, like a broken profile.
+TEAM_CONFIG_COMPONENT = "team_config"
 
 
 def _failure_component(error_code: str) -> str:

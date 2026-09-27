@@ -2542,3 +2542,213 @@ async def test_a_classifier_exception_leaks_neither_its_message_nor_a_trace(
     assert _haystack_contains_any_original(json.dumps(sink.records)) is None
     assert metrics.blocks == ["route_gate_error"]
     assert metrics.failures == ["route_gate"]
+
+
+# (xix) the in-flight limiter's refusals: unlike a route refusal, these have
+# read (part of) the body — up to 25 MiB for the oversize one. Not one body byte
+# may reach any surface. ----------------------------------------------------------
+
+_LIMITER_BODY = json.dumps(
+    {"model": "claude", "messages": [{"role": "user", "content": " ".join(ORIGINAL_CORPUS)}]}
+).encode()
+
+
+def _limited(inner: object, **limits: object) -> tuple[object, object, ListSink, _RecordingMetrics]:
+    from corp_llm_gateway.route_gate import RouteGateMiddleware
+    from corp_llm_gateway.route_gate.inflight import InflightLimiter
+
+    sink = ListSink()
+    metrics = _RecordingMetrics()
+    limiter = InflightLimiter(metrics=metrics, **limits)  # type: ignore[arg-type]
+    gate = RouteGateMiddleware(
+        inner,  # type: ignore[arg-type]
+        metrics=metrics,
+        audit_logger=AuditLogger(sink, gateway_version="0.0.1"),
+        limiter=limiter,
+    )
+    gate.arm()
+    return gate, limiter, sink, metrics
+
+
+class _BodyClient:
+    """uvicorn's side of one connection: the given body messages, then silence."""
+
+    def __init__(self, *messages: dict) -> None:
+        import asyncio
+
+        self.incoming: asyncio.Queue[dict] = asyncio.Queue()
+        for message in messages:
+            self.incoming.put_nowait(message)
+        self.sent: list[dict] = []
+
+    async def receive(self) -> dict:
+        return await self.incoming.get()
+
+    async def send(self, message: dict) -> None:
+        self.sent.append(message)
+
+    def response(self) -> tuple[int, str]:
+        status = next(m["status"] for m in self.sent if m["type"] == "http.response.start")
+        body = b"".join(m.get("body", b"") for m in self.sent if m["type"] == "http.response.body")
+        return status, body.decode()
+
+
+def _limited_scope() -> dict:
+    return {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "headers": _GATE_HEADERS,
+    }
+
+
+def _chunk(body: bytes, *, more: bool) -> dict:
+    return {"type": "http.request", "body": body, "more_body": more}
+
+
+async def _never_forwarded(scope: object, receive: object, send: object) -> None:
+    raise AssertionError("the limiter forwarded a request it had to refuse")
+
+
+@pytest.mark.asyncio
+async def test_a_body_timeout_refusal_leaks_no_body_byte(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gate, _, sink, metrics = _limited(_never_forwarded, max_inflight=1, body_read_s=0.05)
+    client = _BodyClient(_chunk(_LIMITER_BODY, more=True))
+
+    with caplog.at_level(logging.DEBUG):
+        await gate(_limited_scope(), client.receive, client.send)  # type: ignore[operator]
+
+    status, body = client.response()
+    assert status == 408
+    _assert_gate_surfaces_are_clean(
+        body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason="body_timeout"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_oversize_refusal_after_25_mib_leaks_no_body_byte(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from corp_llm_gateway.route_gate.inflight import MAX_BODY_BYTES
+
+    gate, limiter, sink, metrics = _limited(_never_forwarded, max_inflight=1)
+    padding = b"x" * MAX_BODY_BYTES
+    client = _BodyClient(
+        _chunk(_LIMITER_BODY, more=True),
+        _chunk(padding, more=True),
+        _chunk(_LIMITER_BODY, more=False),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        await gate(_limited_scope(), client.receive, client.send)  # type: ignore[operator]
+
+    status, body = client.response()
+    assert status == 422
+    assert "x" * 64 not in body + caplog.text
+    _assert_gate_surfaces_are_clean(
+        body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason="oversize:blocked"
+    )
+    assert metrics.failures == ["oversize"]
+    assert limiter.inflight == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_capacity_refusal_after_its_body_was_read_leaks_no_body_byte(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder(scope: object, receive: object, send: object) -> None:
+        while (await receive())["more_body"]:  # type: ignore[operator]
+            pass
+        holding.set()
+        await release.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})  # type: ignore[operator]
+        await send({"type": "http.response.body", "body": b"ok"})  # type: ignore[operator]
+
+    gate, _, sink, metrics = _limited(holder, max_inflight=1, body_read_s=5.0)
+    slow = _BodyClient(_chunk(_LIMITER_BODY, more=True))
+    fast = _BodyClient(_chunk(b"{}", more=False))
+
+    with caplog.at_level(logging.DEBUG):
+        slow_task = asyncio.create_task(gate(_limited_scope(), slow.receive, slow.send))  # type: ignore[operator]
+        await asyncio.sleep(0.02)
+        fast_task = asyncio.create_task(gate(_limited_scope(), fast.receive, fast.send))  # type: ignore[operator]
+        await asyncio.wait_for(holding.wait(), 2)
+        slow.incoming.put_nowait(_chunk(_LIMITER_BODY, more=False))
+        await asyncio.wait_for(slow_task, 2)
+        release.set()
+        await asyncio.wait_for(fast_task, 2)
+
+    status, body = slow.response()
+    assert status == 429
+    _assert_gate_surfaces_are_clean(
+        body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason="capacity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_byte_budget_refusal_mid_body_leaks_no_body_byte(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+
+    size = len(_LIMITER_BODY)
+    gate, limiter, sink, metrics = _limited(
+        _never_forwarded,
+        max_inflight=4,
+        max_body_bytes=2 * size,
+        max_draining_bytes=2 * size,
+        body_read_s=5.0,
+    )
+    stalled = _BodyClient(_chunk(_LIMITER_BODY, more=True))
+    refused = _BodyClient(_chunk(_LIMITER_BODY, more=True), _chunk(_LIMITER_BODY, more=False))
+
+    with caplog.at_level(logging.DEBUG):
+        stalling = asyncio.create_task(gate(_limited_scope(), stalled.receive, stalled.send))  # type: ignore[operator]
+        await asyncio.sleep(0.02)
+        await gate(_limited_scope(), refused.receive, refused.send)  # type: ignore[operator]
+
+    status, body = refused.response()
+    assert status == 429
+    _assert_gate_surfaces_are_clean(
+        body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason="capacity"
+    )
+    assert limiter.buffered_bytes == size  # type: ignore[attr-defined]
+    stalling.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await stalling
+    assert limiter.buffered_bytes == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_capacity_refusal_before_the_body_leaks_no_body_byte(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+
+    gate, _, sink, metrics = _limited(
+        _never_forwarded, max_inflight=1, max_draining=1, body_read_s=5.0
+    )
+    stalled = _BodyClient(_chunk(_LIMITER_BODY, more=True))
+    refused = _BodyClient(_chunk(_LIMITER_BODY, more=False))
+
+    with caplog.at_level(logging.DEBUG):
+        stalling = asyncio.create_task(gate(_limited_scope(), stalled.receive, stalled.send))  # type: ignore[operator]
+        await asyncio.sleep(0.02)
+        await gate(_limited_scope(), refused.receive, refused.send)  # type: ignore[operator]
+
+    status, body = refused.response()
+    assert status == 429
+    _assert_gate_surfaces_are_clean(
+        body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason="capacity"
+    )
+    stalling.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await stalling

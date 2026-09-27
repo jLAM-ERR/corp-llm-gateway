@@ -35,16 +35,14 @@ import httpx
 import pytest
 
 from corp_llm_gateway.settings import parse_flag
+from tests.integration.gateway_image import ensure_image
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 
 REQUIRE_ENV_VAR = "CORP_REQUIRE_PROXY_CAPTURE"
+# Skips the build: the named image is used as is.
 IMAGE_ENV_VAR = "CORP_GATEWAY_IMAGE"
-
-# Built from Dockerfile.gateway when CORP_GATEWAY_IMAGE is unset.
-DEFAULT_IMAGE_TAG = "corp-llm-gateway:route-gate-test"
-LITELLM_VERSION = "v1.101.0"
 
 GATEWAY_PORT = 4000
 STUB_PORT = 8000
@@ -85,7 +83,8 @@ def docker_daemon_ready() -> bool:
 
 @pytest.fixture(scope="session")
 def gateway_image() -> str:
-    """The built gateway image: ``CORP_GATEWAY_IMAGE``, or a local build."""
+    """``CORP_GATEWAY_IMAGE``, or the image tagged with the digest of its build
+    inputs — built when that tag is absent, so edited sources never reuse a stale one."""
     if not docker_daemon_ready():
         skip_or_fail("docker daemon not reachable — the route gate is tested on the real image")
     preset = os.environ.get(IMAGE_ENV_VAR)
@@ -93,24 +92,13 @@ def gateway_image() -> str:
         if docker("image", "inspect", preset, timeout=60).returncode != 0:
             skip_or_fail(f"{IMAGE_ENV_VAR}={preset} is not present locally")
         return preset
-    if docker("image", "inspect", DEFAULT_IMAGE_TAG, timeout=60).returncode == 0:
-        return DEFAULT_IMAGE_TAG
-    built = docker(
-        "build",
-        "-f",
-        str(ROOT / "Dockerfile.gateway"),
-        "--build-arg",
-        f"LITELLM_VERSION={LITELLM_VERSION}",
-        "--build-arg",
-        "NER_PROFILE=base",
-        "-t",
-        DEFAULT_IMAGE_TAG,
-        str(ROOT),
-        timeout=3600,
-    )
-    if built.returncode != 0:
-        skip_or_fail(f"cannot build {DEFAULT_IMAGE_TAG}: {built.stderr.strip()[-400:]}")
-    return DEFAULT_IMAGE_TAG
+    try:
+        result = ensure_image()
+    except (OSError, subprocess.SubprocessError) as exc:
+        skip_or_fail(f"cannot tag or build the gateway image: {exc}")
+    if result.error is not None:
+        skip_or_fail(f"cannot build {result.tag}: {result.error}")
+    return result.tag
 
 
 @dataclass
@@ -122,6 +110,7 @@ class Stack:
     stub: str
     relay: str
     network: str
+    postgres: str | None = None
     seen: int = field(default=0)
 
     def gateway_logs(self) -> str:
@@ -154,6 +143,29 @@ class Stack:
                 if isinstance(record, dict) and "request_id" in record:
                     records.append(record)
         return records
+
+    def psql(self, sql: str) -> str:
+        """Run one statement in the stack's Postgres; the unaligned result rows."""
+        if self.postgres is None:
+            pytest.fail("this stack runs without Postgres")
+        result = docker(
+            "exec",
+            self.postgres,
+            "psql",
+            "-U",
+            "gw",
+            "-d",
+            "litellm",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-At",
+            "-c",
+            sql,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            pytest.fail(f"psql failed:\n{result.stderr}")
+        return result.stdout.strip()
 
     def metrics(self) -> str:
         return httpx.get(f"{self.base_url}/metrics", timeout=30).text
@@ -308,6 +320,7 @@ def running_stack(
             stub=stub,
             relay=relay,
             network=network,
+            postgres=postgres if with_postgres else None,
         )
         _wait_for_health(stack)
         yield stack

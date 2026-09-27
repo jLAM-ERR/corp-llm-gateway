@@ -4,7 +4,7 @@ Config for the Langfuse services declared in `compose/docker-compose.yml`:
 `langfuse-web`, `langfuse-worker`, `langfuse-postgres`, `clickhouse`,
 `minio`, `minio-init` (the bucket job — v3 does not auto-create it) and
 `langfuse-redis`. Operator-facing docs live in `compose/README.md`
-("Langfuse", "Two UIs — which one answers which question"); this file only
+("Langfuse", "Which tool answers which question"); this file only
 covers what is in this directory.
 
 ## `clickhouse-config.xml`

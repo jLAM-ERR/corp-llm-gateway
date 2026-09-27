@@ -1,0 +1,11 @@
+{{- if .Values.issuance.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "corp-llm-gateway.fullname" . }}-gateway-config
+  labels:
+    {{- include "corp-llm-gateway.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    {{- include "corp-llm-gateway.issuanceToml" . | nindent 4 }}
+{{- end }}

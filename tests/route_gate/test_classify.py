@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from corp_llm_gateway.route_gate import (
@@ -147,7 +149,11 @@ def test_extras_can_only_be_passthrough() -> None:
 @pytest.mark.parametrize("path", ["/v1/messages/count_tokens", "/search/brave"])
 def test_an_extra_never_overrides_a_listed_refusal(path: str) -> None:
     # The second path is refused by the regex table, which extras never reach.
-    extras = parse_extras([f"POST {path}"])
+    # parse_extras refuses the item at load; a hand-built extra proves the
+    # runtime holds on its own.
+    with pytest.raises(ValueError, match="refused"):
+        parse_extras([f"POST {path}"])
+    extras = {("POST", path): Entry(Verdict.PASSTHROUGH, "hand-built extra")}
     decision = classify("POST", path, path.encode(), extras=extras)
     assert decision.verdict is Verdict.REFUSE
     assert decision.block_reason == ROUTE_GATE_LISTED
@@ -160,9 +166,14 @@ def test_an_extra_can_never_promise_a_rewrite() -> None:
     assert decision.block_reason == ROUTE_GATE_UNLISTED
 
 
-def test_issue_token_is_unlisted_because_nothing_mounts_it() -> None:
-    # The health router is mounted for /healthz/* only; issuance stays refused.
+def test_issue_token_passes_to_the_gateway_owned_router() -> None:
+    # The HealthRouter terminates it (404 locally when issuance is off).
     decision = classify("POST", "/internal/issue-token", b"/internal/issue-token")
+    assert decision.verdict is Verdict.PASSTHROUGH
+
+
+def test_issue_token_is_unlisted_for_any_other_method() -> None:
+    decision = classify("GET", "/internal/issue-token", b"/internal/issue-token")
     assert decision.verdict is Verdict.REFUSE
     assert decision.block_reason == ROUTE_GATE_UNLISTED
 
@@ -186,6 +197,54 @@ def test_issue_token_is_unlisted_because_nothing_mounts_it() -> None:
 def test_a_malformed_extra_raises_at_load(raw: str) -> None:
     with pytest.raises(ValueError):
         parse_extras(raw)
+
+
+SECRET = "sk-live-9f3a2c-extra-canary"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        SECRET,
+        f"POST /a {SECRET}",
+        f"{SECRET} /internal/ops",
+        f"POST {SECRET}",
+        f"POST /internal/ops?key={SECRET}",
+        f"POST /internal/../{SECRET}",
+    ],
+)
+def test_a_malformed_extra_never_echoes_its_value(hostile: str) -> None:
+    # The message reaches stdout at boot; the env value may hold anything.
+    with pytest.raises(ValueError) as caught:
+        parse_extras(f"GET /internal/ok, {hostile}")
+    message = str(caught.value)
+    assert SECRET.lower() not in message.lower()
+    assert "item 2" in message
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("/internal/ops", "item 1: malformed (expected 'METHOD /path')"),
+        ("POST /a /b", "item 1: malformed (expected 'METHOD /path')"),
+        ("GET /x,,TRACE /internal/ops", "item 3: malformed (expected 'METHOD /path')"),
+        ("POST internal/ops", "item 1: malformed (expected 'METHOD /path')"),
+        ("POST /internal/ops?x=1", "item 1: malformed (expected 'METHOD /path')"),
+    ],
+)
+def test_a_malformed_extra_names_its_position(raw: str, expected: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(expected)):
+        parse_extras(raw)
+
+
+def test_a_path_extra_names_the_offending_token_not_the_path() -> None:
+    with pytest.raises(ValueError, match=re.escape("'?'")):
+        parse_extras("POST /internal/ops?x=1")
+
+
+def test_a_refused_extra_names_its_position_and_route() -> None:
+    with pytest.raises(ValueError, match=re.escape("item 2 (GET /key/list)")):
+        parse_extras("GET /internal/ok, get /key/list")
 
 
 def test_empty_extras_are_accepted() -> None:

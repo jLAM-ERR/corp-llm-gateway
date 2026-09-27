@@ -56,3 +56,10 @@ litellm_settings:
   drop_params: true
   # Emit AuditEvent JSON as single-line records for the Vector sidecar.
   json_logs: true
+general_settings:
+  # A second layer under the gateway's own disconnect handling (the route gate's
+  # in-flight limiter cancels the request itself): litellm watches the replayed
+  # receive for a disconnect while the upstream call is in flight. The request
+  # cap is the gateway's CORP_LLM_MAX_INFLIGHT; litellm's own parallel-request
+  # setting is not honoured by its default limiter — do not add it here.
+  cancel_on_disconnect: true

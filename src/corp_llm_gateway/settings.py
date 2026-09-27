@@ -27,9 +27,13 @@ oversize cases.
 
 from __future__ import annotations
 
+import importlib
+import os
+import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 from corp_llm_gateway import config
 
@@ -242,6 +246,52 @@ KEYS: tuple[Key, ...] = (
     Key("CORP_GATEWAY_OIDC_AUDIENCE", default="", help="expected RBAC JWT audience (aud); F11"),
     Key("CORP_GATEWAY_OIDC_ISSUER", default="", help="expected RBAC JWT issuer (iss); F11"),
     Key("CORP_GATEWAY_ADMIN_TOKEN", secret=True, default="", help="operator JWT for gateway-admin"),
+    # ── Developer token issuance (tokens/oidc_verifier.py, healthz/server.py) ─
+    # Unset issuer ⇒ issuance disabled; the rest is validated only when it is set.
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_ISSUER",
+        default="",
+        help="Keycloak realm issuer URL for /internal/issue-token; unset disables issuance",
+    ),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE",
+        default="",
+        help="expected issuance JWT aud; must differ from CORP_GATEWAY_OIDC_AUDIENCE",
+    ),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID",
+        default="",
+        help="Keycloak client id install.sh uses; the JWT azp must equal it",
+    ),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_JWKS_URL",
+        default="",
+        help="JWKS URL; unset → {issuer}/protocol/openid-connect/certs; HTTPS in prod",
+    ),
+    Key("CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM", default="groups", help="claim holding groups"),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP",
+        help="ordered group → team_id TOML table (config file only); first mapped group wins",
+    ),
+    Key(
+        "CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM",
+        default="preferred_username",
+        help="claim used as user_id (falls back to sub)",
+    ),
+    Key("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", default="30", help="issued corp token lifetime"),
+    Key("CORP_GATEWAY_ISSUE_MAX_ACTIVE", default="2", help="live corp tokens per (iss, sub)"),
+    Key(
+        "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS",
+        default="600",
+        help="min seconds between issuances per (iss, sub)",
+    ),
+    Key("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", default="4", help="concurrent issuance requests"),
+    Key("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", default="30", help="issuance requests per minute"),
+    Key(
+        "CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS",
+        default="10",
+        help="bound on one issuance: verifier, team lookup, token store; 503 past it (5-300)",
+    ),
     # ── Providers (providers/registry.py) ────────────────────────────────────
     Key("CORP_ALLOW_V2_PROVIDERS", flag=True, default="0", help="allow non-v1 providers"),
     # ── Profiles (profiles/) ─────────────────────────────────────────────────
@@ -292,6 +342,41 @@ KEYS: tuple[Key, ...] = (
         help="extra passthrough routes for the route gate, 'METHOD /path' "
         "comma- or newline-separated (e.g. 'GET /internal/ops-status'); "
         "PASSTHROUGH only — it can never admit a route as rewritten",
+    ),
+    # ── In-flight cap (route_gate/inflight.py) ───────────────────────────────
+    Key(
+        "CORP_LLM_MAX_INFLIGHT",
+        default="64",
+        help="concurrent rewritten (LLM) requests per pod, 0-10000; the next one gets 429 "
+        "E_CAPACITY; 0 turns the cap off and is refused when CORP_ENV is prod/production",
+    ),
+    Key(
+        "CORP_LLM_CANCEL_GRACE_SECONDS",
+        default="5",
+        help="seconds a request cancelled by a client disconnect gets to unwind; its leftover "
+        "tasks and the cancel audit record then share one more such budget, so a slot is "
+        "held at most 2 x this after a disconnect (0 < value <= 60)",
+    ),
+    Key(
+        "CORP_LLM_BODY_READ_SECONDS",
+        default="30",
+        help="seconds a rewritten request gets to deliver its whole body, before any slot "
+        "is taken; past it the gate answers 408 E_BODY_TIMEOUT (0 < value <= 300)",
+    ),
+    Key(
+        "CORP_LLM_MAX_DRAINING",
+        default="",
+        help="rewritten requests reading their body at once per pod (before a slot is "
+        "taken); the next gets 429 E_CAPACITY unread; default 4 x CORP_LLM_MAX_INFLIGHT, "
+        "at least CORP_LLM_MAX_INFLIGHT, at most 40000",
+    ),
+    Key(
+        "CORP_LLM_MAX_DRAINING_BYTES",
+        default="536870912",
+        help="request body bytes buffered at once per pod, being read or held for an "
+        "admitted request until it ends; a body whose Content-Length (or next chunk) would "
+        "pass it gets 429 E_CAPACITY; size it against pod memory; bytes, 26214400 (25 MiB) "
+        "to 17179869184 (16 GiB), default 536870912 (512 MiB)",
     ),
     # ── Test-data allowlist (sanitizer/allowlist.py) ─────────────────────────
     Key("CORP_LLM_TESTDATA_ALLOWLIST", default="", help="inline never-redact test values"),
@@ -569,6 +654,351 @@ def _check_no_op_sanitizer(values: Mapping[str, str | None], problems: list[str]
     problems.append(NO_OP_SANITIZER_MESSAGE)
 
 
+ISSUANCE_TEAM_MAP_KEY = "CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"
+
+# (key, field, lowest, highest). The ceilings keep every accepted value one the
+# gateway can serve with: a TTL or interval past them overflows datetime maths at
+# issuance. The store timeout's floor is the store's own 5 s lock wait.
+_ISSUANCE_BOUNDS: tuple[tuple[str, str, int, int], ...] = (
+    ("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", "token_ttl_days", 1, 3650),
+    ("CORP_GATEWAY_ISSUE_MAX_ACTIVE", "max_active", 1, 100),
+    ("CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS", "min_interval_seconds", 1, 30 * 86400),
+    ("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", "max_inflight", 1, 1000),
+    ("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", "rate_per_minute", 1, 100_000),
+    ("CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS", "store_timeout_seconds", 5, 300),
+)
+
+
+@dataclass(frozen=True)
+class IssuanceSettings:
+    """Resolved developer-token issuance config. Built by :func:`issuance`."""
+
+    issuer: str
+    audience: str
+    client_id: str
+    jwks_url: str
+    team_claim: str
+    team_map: tuple[tuple[str, str], ...]
+    user_claim: str
+    operator_audience: str
+    ca_bundle: str | None
+    token_ttl_days: int
+    max_active: int
+    min_interval_seconds: int
+    max_inflight: int
+    rate_per_minute: int
+    allow_insecure_http: bool = False
+    store_timeout_seconds: int = 10
+
+
+def _stripped(values: Mapping[str, str | None], name: str) -> str:
+    return (values.get(name) or "").strip()
+
+
+def _url_problem(name: str, url: str, *, prod: bool) -> str | None:
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.netloc:
+        return f"{name}: must be an absolute http(s) URL"
+    if prod and scheme != "https":
+        return f"{name}: must be HTTPS when CORP_ENV is prod/production"
+    return None
+
+
+def _issuance_team_map(
+    table: Mapping[str, object], problems: list[str]
+) -> tuple[tuple[str, str], ...]:
+    if not table:
+        problems.append(
+            f"{ISSUANCE_TEAM_MAP_KEY}: required when CORP_GATEWAY_ISSUE_OIDC_ISSUER is set — "
+            "a non-empty group → team_id TOML table in the config file (env vars cannot "
+            "carry tables)"
+        )
+        return ()
+    pairs: list[tuple[str, str]] = []
+    for group, team in table.items():
+        if not group.strip() or not isinstance(team, str) or not team.strip():
+            problems.append(
+                f"{ISSUANCE_TEAM_MAP_KEY}: every entry must map a group to a non-empty "
+                "team_id string"
+            )
+            return ()
+        pairs.append((group, team.strip()))
+    return tuple(pairs)
+
+
+def _build_issuance(
+    values: Mapping[str, str | None], table: Mapping[str, object], problems: list[str]
+) -> IssuanceSettings | None:
+    issuer = _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_ISSUER").rstrip("/")
+    if not issuer:
+        return None
+    start = len(problems)
+    prod = _stripped(values, "CORP_ENV").lower() in ("prod", "production")
+    required = {
+        name: _stripped(values, name)
+        for name in ("CORP_GATEWAY_ISSUE_OIDC_AUDIENCE", "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID")
+    }
+    for name, value in required.items():
+        if not value:
+            problems.append(
+                f"{name}: required when CORP_GATEWAY_ISSUE_OIDC_ISSUER is set. "
+                f"{_BY_NAME[name].help}"
+            )
+    audience = required["CORP_GATEWAY_ISSUE_OIDC_AUDIENCE"]
+    operator_audience = _stripped(values, "CORP_GATEWAY_OIDC_AUDIENCE")
+    if audience and audience == operator_audience:
+        problems.append(
+            "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE must differ from CORP_GATEWAY_OIDC_AUDIENCE — "
+            "an operator RBAC token must never mint developer tokens"
+        )
+    jwks_url = (
+        _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_JWKS_URL")
+        or f"{issuer}/protocol/openid-connect/certs"
+    )
+    for name, url in (
+        ("CORP_GATEWAY_ISSUE_OIDC_ISSUER", issuer),
+        ("CORP_GATEWAY_ISSUE_OIDC_JWKS_URL", jwks_url),
+    ):
+        problem = _url_problem(name, url, prod=prod)
+        if problem is not None:
+            problems.append(problem)
+    team_map = _issuance_team_map(table, problems)
+    bounds: dict[str, int] = {}
+    for name, field_name, lowest, highest in _ISSUANCE_BOUNDS:
+        raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+        try:
+            bounds[field_name] = int(raw)
+        except ValueError:
+            problems.append(f"{name}={raw!r} is not an integer")
+            continue
+        if not lowest <= bounds[field_name] <= highest:
+            problems.append(f"{name}: must be an integer from {lowest} to {highest}")
+    if len(problems) > start:
+        return None
+    return IssuanceSettings(
+        issuer=issuer,
+        audience=audience,
+        client_id=required["CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID"],
+        jwks_url=jwks_url,
+        team_claim=_stripped(values, "CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM") or "groups",
+        team_map=team_map,
+        user_claim=_stripped(values, "CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM") or "preferred_username",
+        operator_audience=operator_audience,
+        ca_bundle=_stripped(values, "CORP_LLM_CA_BUNDLE") or None,
+        allow_insecure_http=not prod,
+        **bounds,
+    )
+
+
+ISSUANCE_NEEDS_POSTGRES = (
+    "CORP_LLM_PG_DSN: required when CORP_GATEWAY_ISSUE_OIDC_ISSUER is set — developer token "
+    "issuance serialises per subject across replicas in Postgres; the in-memory token store "
+    "is for tests and the demo only"
+)
+
+
+def _serving_issuance(
+    values: Mapping[str, str | None], problems: list[str]
+) -> IssuanceSettings | None:
+    result = _build_issuance(values, config.get_table(ISSUANCE_TEAM_MAP_KEY), problems)
+    if _stripped(values, "CORP_GATEWAY_ISSUE_OIDC_ISSUER") and not _stripped(
+        values, "CORP_LLM_PG_DSN"
+    ):
+        problems.append(ISSUANCE_NEEDS_POSTGRES)
+        return None
+    return result
+
+
+def _check_issuance(values: Mapping[str, str | None], problems: list[str]) -> None:
+    _serving_issuance(values, problems)
+
+
+def issuance() -> IssuanceSettings | None:
+    """Resolve issuance config: ``None`` when disabled, :class:`ConfigError` when unsafe."""
+    problems: list[str] = []
+    result = _build_issuance(_resolve(), config.get_table(ISSUANCE_TEAM_MAP_KEY), problems)
+    if problems:
+        raise ConfigError(problems)
+    return result
+
+
+def serving_issuance() -> IssuanceSettings | None:
+    """:func:`issuance` plus what serving it needs (Postgres); the one resolver the
+    entrypoint's boot check, ``build_health_router`` and ``config check`` share."""
+    problems: list[str] = []
+    result = _serving_issuance(_resolve(), problems)
+    if problems:
+        raise ConfigError(problems)
+    return result
+
+
+ISSUANCE_NEEDS_OIDC_EXTRA = (
+    "CORP_GATEWAY_ISSUE_OIDC_ISSUER is set but PyJWT + cryptography are not installed — "
+    "pip install 'corp-llm-gateway[oidc]'"
+)
+ISSUANCE_NEEDS_POSTGRES_EXTRA = (
+    "CORP_GATEWAY_ISSUE_OIDC_ISSUER is set but asyncpg is not installed — "
+    "pip install 'corp-llm-gateway[postgres]'"
+)
+ISSUANCE_CA_BUNDLE_UNREADABLE = (
+    "CORP_LLM_CA_BUNDLE is not readable — it must name a readable PEM file; the issuance "
+    "JWKS fetch verifies Keycloak's TLS against it"
+)
+ISSUANCE_CA_BUNDLE_INVALID = (
+    "CORP_LLM_CA_BUNDLE does not load as a PEM CA bundle; the issuance JWKS fetch "
+    "verifies Keycloak's TLS against it"
+)
+
+
+def _importable(*modules: str) -> bool:
+    try:
+        for module in modules:
+            importlib.import_module(module)
+    except ImportError:
+        return False
+    return True
+
+
+def _ca_bundle_problem(path: str) -> str | None:
+    if not (os.path.isfile(path) and os.access(path, os.R_OK)):
+        return ISSUANCE_CA_BUNDLE_UNREADABLE
+    try:
+        ssl.create_default_context(cafile=path)
+    except (OSError, ValueError):  # ssl.SSLError is an OSError
+        return ISSUANCE_CA_BUNDLE_INVALID
+    return None
+
+
+def issuance_runtime_problems() -> list[str]:
+    """What serving issuance needs from this machine rather than from the config:
+    the 'oidc' and 'postgres' extras, and a loadable CA bundle when one is named.
+    Empty when issuance is off or its config is refused (reported elsewhere)."""
+    try:
+        configured = serving_issuance()
+    except ConfigError:
+        return []
+    if configured is None:
+        return []
+    problems: list[str] = []
+    if not _importable("cryptography", "jwt"):
+        problems.append(ISSUANCE_NEEDS_OIDC_EXTRA)
+    if not _importable("asyncpg"):
+        problems.append(ISSUANCE_NEEDS_POSTGRES_EXTRA)
+    if configured.ca_bundle is not None:
+        problem = _ca_bundle_problem(configured.ca_bundle)
+        if problem is not None:
+            problems.append(problem)
+    return problems
+
+
+MAX_INFLIGHT_CEILING = 10_000
+CANCEL_GRACE_CEILING_S = 60.0
+BODY_READ_CEILING_S = 300.0
+DRAINING_PER_SLOT = 4
+MAX_DRAINING_CEILING = DRAINING_PER_SLOT * MAX_INFLIGHT_CEILING
+# The floor is the per-request body cap: one largest body always fits the budget.
+MAX_DRAINING_BYTES_FLOOR = 25 * 1024 * 1024
+MAX_DRAINING_BYTES_CEILING = 16 * 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class CapacitySettings:
+    """The route gate's in-flight cap. Built by :func:`capacity`."""
+
+    max_inflight: int
+    cancel_grace_seconds: float
+    body_read_seconds: float
+    max_draining: int
+    max_draining_bytes: int
+
+
+def _prod(values: Mapping[str, str | None]) -> bool:
+    return _stripped(values, "CORP_ENV").lower() in ("prod", "production")
+
+
+def _build_capacity(
+    values: Mapping[str, str | None], problems: list[str]
+) -> CapacitySettings | None:
+    start = len(problems)
+    name = "CORP_LLM_MAX_INFLIGHT"
+    raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+    max_inflight = 0
+    if not raw.isdigit() and not (raw.startswith("-") and raw[1:].isdigit()):
+        problems.append(f"{name}={raw!r} is not an integer")
+    else:
+        max_inflight = int(raw)
+        if not 0 <= max_inflight <= MAX_INFLIGHT_CEILING:
+            problems.append(f"{name}: must be an integer from 0 to {MAX_INFLIGHT_CEILING}")
+        elif max_inflight == 0 and _prod(values):
+            problems.append(
+                f"{name}=0 turns the in-flight cap off; refused when CORP_ENV is "
+                "prod/production — set a positive cap per pod and scale replicas"
+            )
+    grace = _seconds(values, "CORP_LLM_CANCEL_GRACE_SECONDS", CANCEL_GRACE_CEILING_S, problems)
+    body_read = _seconds(values, "CORP_LLM_BODY_READ_SECONDS", BODY_READ_CEILING_S, problems)
+    name = "CORP_LLM_MAX_DRAINING"
+    raw = _stripped(values, name)
+    max_draining = DRAINING_PER_SLOT * max_inflight
+    if raw:
+        if not raw.isdigit():
+            problems.append(f"{name}={raw!r} is not a non-negative integer")
+        else:
+            max_draining = int(raw)
+            if max_draining > MAX_DRAINING_CEILING:
+                problems.append(f"{name}: must be at most {MAX_DRAINING_CEILING}")
+            elif max_draining < max_inflight or (max_inflight and not max_draining):
+                problems.append(f"{name}: must be at least CORP_LLM_MAX_INFLIGHT ({max_inflight})")
+    name = "CORP_LLM_MAX_DRAINING_BYTES"
+    raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+    max_draining_bytes = 0
+    if not (raw.isascii() and raw.isdigit()):
+        problems.append(f"{name}={raw!r} is not a whole number of bytes")
+    else:
+        max_draining_bytes = int(raw)
+        if not MAX_DRAINING_BYTES_FLOOR <= max_draining_bytes <= MAX_DRAINING_BYTES_CEILING:
+            problems.append(
+                f"{name}: must be from {MAX_DRAINING_BYTES_FLOOR} (25 MiB) "
+                f"to {MAX_DRAINING_BYTES_CEILING} (16 GiB) bytes"
+            )
+    if len(problems) > start:
+        return None
+    return CapacitySettings(
+        max_inflight=max_inflight,
+        cancel_grace_seconds=grace,
+        body_read_seconds=body_read,
+        max_draining=max_draining,
+        max_draining_bytes=max_draining_bytes,
+    )
+
+
+def _seconds(
+    values: Mapping[str, str | None], name: str, ceiling: float, problems: list[str]
+) -> float:
+    raw = _stripped(values, name) or (_BY_NAME[name].default or "")
+    try:
+        seconds = float(raw)
+    except ValueError:
+        problems.append(f"{name}={raw!r} is not a number")
+        return 0.0
+    if not 0 < seconds <= ceiling:
+        problems.append(f"{name}: must be a number above 0 and at most {ceiling:g}")
+    return seconds
+
+
+def _check_capacity(values: Mapping[str, str | None], problems: list[str]) -> None:
+    _build_capacity(values, problems)
+
+
+def capacity() -> CapacitySettings:
+    """The in-flight cap; the one resolver ``config check`` and the entrypoint share."""
+    problems: list[str] = []
+    result = _build_capacity(_resolve(), problems)
+    if result is None:
+        raise ConfigError(problems)
+    return result
+
+
 def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) -> bool:
     """Validate required-endpoint + choices with pydantic. Returns False if absent.
 
@@ -640,6 +1070,8 @@ def validate() -> Settings:
     _check_no_op_sanitizer(values, problems)
     _check_forward_auth_exclusive(values, problems)
     _check_master_key_conflict(values, problems)
+    _check_issuance(values, problems)
+    _check_capacity(values, problems)
     if problems:
         raise ConfigError(list(dict.fromkeys(problems)))
     return Settings(values=values)

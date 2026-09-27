@@ -49,4 +49,15 @@ spec:
         - protocol: TCP
           port: 6379
     {{- end }}
+    {{- with .Values.networkPolicy.keycloak }}
+    {{- if .enabled }}
+    # Keycloak — the gateway fetches the realm JWKS to verify developer sign-ins
+    - to:
+        - ipBlock:
+            cidr: {{ required "networkPolicy.keycloak.cidr is required when networkPolicy.keycloak.enabled is true" .cidr | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .port | int }}
+    {{- end }}
+    {{- end }}
 {{- end }}

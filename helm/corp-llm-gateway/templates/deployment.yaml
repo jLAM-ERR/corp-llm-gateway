@@ -15,6 +15,12 @@ spec:
     metadata:
       labels:
         {{- include "corp-llm-gateway.selectorLabels" . | nindent 8 }}
+      {{- if .Values.issuance.enabled }}
+      annotations:
+        # config.toml is a subPath mount, which never sees a ConfigMap update:
+        # a changed issuance.* rolls the pods instead.
+        checksum/gateway-config: {{ include "corp-llm-gateway.issuanceToml" . | sha256sum }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "corp-llm-gateway.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -44,11 +50,19 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "corp-llm-gateway.secretName" . }}
-          {{- if .Values.caBundle.enabled }}
+          {{- if or .Values.caBundle.enabled .Values.issuance.enabled }}
           volumeMounts:
+            {{- if .Values.caBundle.enabled }}
             - name: ca-bundle
               mountPath: {{ .Values.caBundle.mountPath }}
               readOnly: true
+            {{- end }}
+            {{- if .Values.issuance.enabled }}
+            - name: gateway-config
+              mountPath: {{ include "corp-llm-gateway.configTomlPath" . }}
+              subPath: config.toml
+              readOnly: true
+            {{- end }}
           {{- end }}
       {{- end }}
       containers:
@@ -100,6 +114,13 @@ spec:
             {{- if .Values.caBundle.enabled }}
             - name: ca-bundle
               mountPath: {{ .Values.caBundle.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.issuance.enabled }}
+            # A single file, so the image's /etc/corp-llm-gateway (rules, ca) stays.
+            - name: gateway-config
+              mountPath: {{ include "corp-llm-gateway.configTomlPath" . }}
+              subPath: config.toml
               readOnly: true
             {{- end }}
           resources:
@@ -177,4 +198,9 @@ spec:
         - name: ca-bundle
           secret:
             secretName: {{ .Values.caBundle.existingSecret | default (printf "%s-ca" (include "corp-llm-gateway.fullname" .)) }}
+        {{- end }}
+        {{- if .Values.issuance.enabled }}
+        - name: gateway-config
+          configMap:
+            name: {{ include "corp-llm-gateway.fullname" . }}-gateway-config
         {{- end }}

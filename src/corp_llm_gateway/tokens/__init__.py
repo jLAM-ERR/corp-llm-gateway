@@ -2,6 +2,7 @@ from corp_llm_gateway.tokens.errors import (
     AuthError,
     ExpiredTokenError,
     InvalidTokenError,
+    IssuancePolicyError,
     MissingTokenError,
     RevokedTokenError,
 )
@@ -9,12 +10,16 @@ from corp_llm_gateway.tokens.in_memory import InMemoryTokenStore
 from corp_llm_gateway.tokens.issuance import (
     DEFAULT_TOKEN_TTL_DAYS,
     IssueResult,
+    JwksUnavailableError,
     OidcClaims,
+    OidcTeamMappingError,
     OidcVerificationError,
     TokenIssuer,
 )
+from corp_llm_gateway.tokens.issuance_policy import IssuancePolicy
 from corp_llm_gateway.tokens.middleware import AuthContext, AuthMiddleware
 from corp_llm_gateway.tokens.models import TokenInfo
+from corp_llm_gateway.tokens.oidc_verifier import JwksClient, KeycloakOidcVerifier
 from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
 from corp_llm_gateway.tokens.store import TokenStore
 
@@ -26,9 +31,15 @@ __all__ = [
     "ExpiredTokenError",
     "InMemoryTokenStore",
     "InvalidTokenError",
+    "IssuancePolicy",
+    "IssuancePolicyError",
     "IssueResult",
+    "JwksClient",
+    "JwksUnavailableError",
+    "KeycloakOidcVerifier",
     "MissingTokenError",
     "OidcClaims",
+    "OidcTeamMappingError",
     "OidcVerificationError",
     "PostgresTokenStore",
     "RevokedTokenError",

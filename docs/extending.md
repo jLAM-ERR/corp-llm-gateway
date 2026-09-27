@@ -242,6 +242,21 @@ Every seam above is built to fail safe:
   fail-closed at load.
 - **No third-party runtime code** on the egress path — algorithms are in-tree and named.
 
+## Tasks several requests await: `inflight.spawn_shared`
+
+The route gate's in-flight limiter (`route_gate/inflight.py`) owns every task a
+request starts: when the client disconnects, it cancels the request and then every
+task still pending that the request created. A task whose result **more than one
+request** awaits — a single-flight lookup, a shared key or config fetch, a
+background refresh — must therefore be started with `inflight.spawn_shared(coro,
+name=...)`, never `asyncio.create_task` / `ensure_future` from request code.
+Started from inside a request, it belongs to that request, and that request's
+disconnect cancels it under every other waiter. The token-store auth lookup
+(`tokens/middleware.py`) and the JWKS fetch (`tokens/oidc_verifier.py`) are the
+two existing callers. litellm's logging worker is recognised by its module and
+never tagged; it is also started in the lifespan (`asgi.py`) so the first
+request never owns it.
+
 ## Governance
 
 CODEOWNERS splits review by blast radius: `profiles/**` (data bundles) → compliance;

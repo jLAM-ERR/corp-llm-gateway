@@ -370,6 +370,16 @@ def test_validate_rejects_a_malformed_route_gate_extra(
         config.validate()
 
 
+@pytest.mark.parametrize("raw", ["GET /key/list", "POST /lazy/warm/mcp", "HEAD /health"])
+def test_validate_rejects_a_route_gate_extra_naming_a_refused_row(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", raw)
+    with pytest.raises(ConfigError, match="refused"):
+        config.validate()
+
+
 def test_validate_accepts_route_gate_extras_and_resolves_them(
     hermetic: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -535,3 +545,793 @@ def test_validate_uses_pydantic_when_present(
     monkeypatch.setenv("CORP_LLM_AUTH_PROVIDER", "bogus")
     with pytest.raises(ConfigError, match="CORP_LLM_AUTH_PROVIDER"):
         config.validate()
+
+
+# ── developer token issuance (settings.issuance()) ───────────────────────────
+
+_ISSUER = "https://keycloak.corp.lan/realms/dev"
+_TEAM_MAP_TOML = (
+    "[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]\n"
+    '"/devs/payments" = "payments"\n'
+    '"/devs/core" = "core"\n'
+    '"/devs/aaa" = "aaa"\n'
+)
+
+
+def _issuance_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_AUDIENCE", "corp-gateway-issuance")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID", "corp-gateway-cli")
+
+
+def test_issuance_keys_are_registered() -> None:
+    assert {
+        "CORP_GATEWAY_ISSUE_OIDC_ISSUER",
+        "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE",
+        "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID",
+        "CORP_GATEWAY_ISSUE_OIDC_JWKS_URL",
+        "CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM",
+        "CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP",
+        "CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM",
+        "CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS",
+        "CORP_GATEWAY_ISSUE_MAX_ACTIVE",
+        "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS",
+        "CORP_GATEWAY_ISSUE_MAX_INFLIGHT",
+        "CORP_GATEWAY_ISSUE_RATE_PER_MINUTE",
+    } <= set(settings.all_keys())
+
+
+def test_issuance_is_disabled_when_issuer_unset(hermetic: Path) -> None:
+    assert settings.issuance() is None
+
+
+def test_issuance_is_disabled_when_issuer_blank(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", "  ")
+    assert settings.issuance() is None
+
+
+def test_issuance_resolves_with_defaults(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_OIDC_AUDIENCE", "corp-llm-gateway")
+    result = settings.issuance()
+    assert result is not None
+    assert result.issuer == _ISSUER
+    assert result.audience == "corp-gateway-issuance"
+    assert result.client_id == "corp-gateway-cli"
+    assert result.jwks_url == f"{_ISSUER}/protocol/openid-connect/certs"
+    assert result.team_claim == "groups"
+    assert result.user_claim == "preferred_username"
+    assert result.operator_audience == "corp-llm-gateway"
+    assert result.ca_bundle is None
+    assert result.token_ttl_days == 30
+    assert result.max_active == 2
+    assert result.min_interval_seconds == 600
+    assert result.max_inflight == 4
+    assert result.rate_per_minute == 30
+
+
+def test_issuance_team_map_keeps_config_file_order(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    result = settings.issuance()
+    assert result is not None
+    assert result.team_map == (
+        ("/devs/payments", "payments"),
+        ("/devs/core", "core"),
+        ("/devs/aaa", "aaa"),
+    )
+
+
+def test_issuance_accepts_an_inline_team_map_table(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, 'CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP = { "devs" = "t1" }\n')
+    _issuance_env(monkeypatch)
+    result = settings.issuance()
+    assert result is not None
+    assert result.team_map == (("devs", "t1"),)
+
+
+def test_issuance_strips_a_trailing_slash_from_the_issuer_and_default_jwks_url(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER + "/")
+    result = settings.issuance()
+    assert result is not None
+    assert result.issuer == _ISSUER
+    assert result.jwks_url == f"{_ISSUER}/protocol/openid-connect/certs"
+
+
+def test_issuance_explicit_overrides(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_JWKS_URL", "https://jwks.corp.lan/certs")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM", "teams")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM", "email")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", "7")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_MAX_ACTIVE", "1")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", "8")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", "120")
+    monkeypatch.setenv("CORP_LLM_CA_BUNDLE", "/etc/ssl/corp-root.pem")
+    result = settings.issuance()
+    assert result is not None
+    assert result.jwks_url == "https://jwks.corp.lan/certs"
+    assert result.team_claim == "teams"
+    assert result.user_claim == "email"
+    assert (
+        result.token_ttl_days,
+        result.max_active,
+        result.min_interval_seconds,
+        result.max_inflight,
+        result.rate_per_minute,
+    ) == (7, 1, 60, 8, 120)
+    assert result.ca_bundle == "/etc/ssl/corp-root.pem"
+
+
+def test_issuance_settings_are_frozen(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import dataclasses
+
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    result = settings.issuance()
+    assert result is not None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.max_active = 99  # type: ignore[misc]
+
+
+def test_issuance_refuses_a_partial_config(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER)
+    with pytest.raises(ConfigError) as exc:
+        settings.issuance()
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE" in joined
+    assert "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID" in joined
+    assert "CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP" in joined
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE",
+        "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID",
+    ],
+)
+def test_issuance_refuses_each_missing_required_key(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.delenv(missing)
+    with pytest.raises(ConfigError) as exc:
+        settings.issuance()
+    assert [p for p in exc.value.problems if missing in p]
+
+
+def test_issuance_refuses_a_missing_team_map(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _issuance_env(monkeypatch)
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"):
+        settings.issuance()
+
+
+def test_issuance_refuses_a_team_map_given_as_a_scalar(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, 'CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP = "devs=t1"\n')
+    _issuance_env(monkeypatch)
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"):
+        settings.issuance()
+
+
+def test_issuance_refuses_an_empty_team_map(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, "[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]\n")
+    _issuance_env(monkeypatch)
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"):
+        settings.issuance()
+
+
+@pytest.mark.parametrize("value", ["3", '""', '"  "'])
+def test_issuance_refuses_a_team_map_entry_without_a_team_string(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    _write(hermetic, f'[CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP]\n"devs" = {value}\n')
+    _issuance_env(monkeypatch)
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP"):
+        settings.issuance()
+
+
+def test_issuance_refuses_the_operator_audience(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_OIDC_AUDIENCE", "corp-gateway-issuance")
+    with pytest.raises(ConfigError) as exc:
+        settings.issuance()
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE" in joined
+    assert "CORP_GATEWAY_OIDC_AUDIENCE" in joined
+
+
+@pytest.mark.parametrize("env", ["prod", "production", " PROD "])
+def test_issuance_refuses_a_non_https_issuer_in_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", env)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", "http://keycloak.corp.lan/realms/dev")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_JWKS_URL", "https://jwks.corp.lan/certs")
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_OIDC_ISSUER"):
+        settings.issuance()
+
+
+def test_issuance_refuses_a_non_https_jwks_url_in_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", "prod")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_JWKS_URL", "http://jwks.corp.lan/certs")
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_OIDC_JWKS_URL"):
+        settings.issuance()
+
+
+def test_issuance_derived_jwks_url_inherits_an_http_issuer_refusal_in_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", "prod")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", "http://keycloak.corp.lan/realms/dev")
+    with pytest.raises(ConfigError) as exc:
+        settings.issuance()
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_GATEWAY_ISSUE_OIDC_ISSUER" in joined
+    assert "CORP_GATEWAY_ISSUE_OIDC_JWKS_URL" in joined
+
+
+def test_issuance_allows_http_outside_prod(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", "dev")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", "http://keycloak:8080/realms/dev")
+    result = settings.issuance()
+    assert result is not None
+    assert result.jwks_url == "http://keycloak:8080/realms/dev/protocol/openid-connect/certs"
+    assert result.allow_insecure_http is True
+
+
+@pytest.mark.parametrize(("env", "allowed"), [("", True), ("dev", True), ("production", False)])
+def test_issuance_allows_insecure_http_exactly_outside_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, env: str, allowed: bool
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_ENV", env)
+    result = settings.issuance()
+    assert result is not None
+    assert result.allow_insecure_http is allowed
+
+
+@pytest.mark.parametrize("url", ["ftp://jwks.corp.lan/certs", "not-a-url", "https://"])
+def test_issuance_refuses_a_malformed_jwks_url_everywhere(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_JWKS_URL", url)
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_OIDC_JWKS_URL"):
+        settings.issuance()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS",
+        "CORP_GATEWAY_ISSUE_MAX_ACTIVE",
+        "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS",
+        "CORP_GATEWAY_ISSUE_MAX_INFLIGHT",
+        "CORP_GATEWAY_ISSUE_RATE_PER_MINUTE",
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5"])
+def test_issuance_refuses_non_positive_bounds(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, key: str, value: str
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ConfigError, match=key):
+        settings.issuance()
+
+
+def test_issuance_bounds_resolve_from_the_config_file(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, "CORP_GATEWAY_ISSUE_MAX_ACTIVE = 5\n" + _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    result = settings.issuance()
+    assert result is not None
+    assert result.max_active == 5
+
+
+def test_validate_reports_issuance_problems(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER)
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE" in joined
+    assert "CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP" in joined
+
+
+def test_validate_accepts_a_complete_issuance_config(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    _issuance_env(monkeypatch)
+    assert isinstance(config.validate(), Settings)
+
+
+def test_validate_refuses_issuance_without_postgres(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `config check` and the entrypoint's boot check share this resolver.
+    _write(hermetic, _TEAM_MAP_TOML)
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    _issuance_env(monkeypatch)
+    with pytest.raises(ConfigError, match="CORP_LLM_PG_DSN"):
+        config.validate()
+
+
+def test_serving_issuance_requires_postgres(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    with pytest.raises(ConfigError) as exc:
+        settings.serving_issuance()
+    assert [p for p in exc.value.problems if p.startswith("CORP_LLM_PG_DSN")]
+
+
+def test_serving_issuance_resolves_with_postgres(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    assert settings.serving_issuance() == settings.issuance()
+    assert settings.serving_issuance() is not None
+
+
+def test_serving_issuance_is_none_when_disabled(hermetic: Path) -> None:
+    assert settings.serving_issuance() is None
+
+
+def test_serving_issuance_reports_a_partial_config_and_the_missing_dsn_together(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER)
+    with pytest.raises(ConfigError) as exc:
+        settings.serving_issuance()
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE" in joined
+    assert "CORP_LLM_PG_DSN" in joined
+
+
+def test_validate_ignores_issuance_keys_when_issuer_unset(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_MAX_ACTIVE", "0")
+    assert isinstance(config.validate(), Settings)
+
+
+@pytest.mark.parametrize("operator", [" corp-gateway-issuance", "corp-gateway-issuance  "])
+def test_issuance_refuses_an_operator_audience_that_differs_only_by_whitespace(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, operator: str
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_OIDC_AUDIENCE", operator)
+    with pytest.raises(ConfigError, match="must differ"):
+        settings.issuance()
+
+
+async def test_issuance_bounds_of_one_resolve_and_are_usable(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from corp_llm_gateway.tokens import InMemoryTokenStore, IssuancePolicy, OidcClaims
+
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    for key in (
+        "CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS",
+        "CORP_GATEWAY_ISSUE_MAX_ACTIVE",
+        "CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS",
+        "CORP_GATEWAY_ISSUE_MAX_INFLIGHT",
+        "CORP_GATEWAY_ISSUE_RATE_PER_MINUTE",
+    ):
+        monkeypatch.setenv(key, " 1 ")
+    resolved = settings.issuance()
+    assert resolved is not None
+    t0 = datetime(2026, 9, 1, tzinfo=UTC)
+    clock = [t0]
+    store = InMemoryTokenStore()
+    policy = IssuancePolicy(store, resolved, clock=lambda: clock[0])
+
+    first = await policy.issue(OidcClaims("u", "t1", issuer="i", subject="s", jti="j1"))
+    clock[0] = t0 + timedelta(seconds=1)
+    second = await policy.issue(OidcClaims("u", "t1", issuer="i", subject="s", jti="j2"))
+
+    assert second.expires_at == t0 + timedelta(days=1, seconds=1)
+    old = await store.lookup(first.corp_token)
+    assert old is not None and old.revoked_at is not None
+
+
+# ── issuance: upper bounds, the store bound, runtime needs ───────────────────
+
+
+def test_the_store_timeout_key_is_registered_with_its_default(hermetic: Path) -> None:
+    assert "CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS" in settings.all_keys()
+
+
+def test_issuance_store_timeout_defaults_to_ten_seconds(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    result = settings.issuance()
+    assert result is not None
+    assert result.store_timeout_seconds == 10
+
+
+@pytest.mark.parametrize(
+    ("key", "highest"),
+    [
+        ("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", 3650),
+        ("CORP_GATEWAY_ISSUE_MAX_ACTIVE", 100),
+        ("CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS", 30 * 86400),
+        ("CORP_GATEWAY_ISSUE_MAX_INFLIGHT", 1000),
+        ("CORP_GATEWAY_ISSUE_RATE_PER_MINUTE", 100_000),
+        ("CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS", 300),
+    ],
+)
+def test_issuance_bounds_accept_their_ceiling_and_refuse_one_past_it(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, key: str, highest: int
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv(key, str(highest))
+    assert settings.issuance() is not None
+
+    monkeypatch.setenv(key, str(highest + 1))
+    with pytest.raises(ConfigError) as exc:
+        settings.issuance()
+    assert [p for p in exc.value.problems if p.startswith(key) and str(highest) in p]
+
+
+@pytest.mark.parametrize(("value", "ok"), [("4", False), ("5", True), ("0", False)])
+def test_the_store_timeout_is_never_below_the_stores_lock_wait(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str, ok: bool
+) -> None:
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS", value)
+    if ok:
+        assert settings.issuance() is not None
+        return
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS"):
+        settings.issuance()
+
+
+def test_validate_refuses_an_issuance_bound_past_its_ceiling(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `config check` runs validate(): it must refuse what the boot refuses.
+    _write(hermetic, _TEAM_MAP_TOML)
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS", "3000000")
+    with pytest.raises(ConfigError, match="CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS"):
+        config.validate()
+
+
+@pytest.fixture
+def serving(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """Issuance fully configured, with both extras present as far as imports go."""
+    import sys
+    import types
+
+    _write(hermetic, _TEAM_MAP_TOML)
+    _issuance_env(monkeypatch)
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+    for name in ("cryptography", "jwt", "asyncpg"):
+        if name not in sys.modules:
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    return monkeypatch
+
+
+def test_runtime_problems_are_empty_when_issuance_is_off(hermetic: Path) -> None:
+    assert settings.issuance_runtime_problems() == []
+
+
+def test_runtime_problems_are_empty_when_the_config_is_refused(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # validate() and the boot report the config itself; this adds nothing twice.
+    monkeypatch.setenv("CORP_GATEWAY_ISSUE_OIDC_ISSUER", _ISSUER)
+    assert settings.issuance_runtime_problems() == []
+
+
+def test_runtime_problems_are_empty_when_everything_is_there(
+    serving: pytest.MonkeyPatch,
+) -> None:
+    assert settings.issuance_runtime_problems() == []
+
+
+@pytest.mark.parametrize(
+    ("module", "problem"),
+    [
+        ("cryptography", settings.ISSUANCE_NEEDS_OIDC_EXTRA),
+        ("jwt", settings.ISSUANCE_NEEDS_OIDC_EXTRA),
+        ("asyncpg", settings.ISSUANCE_NEEDS_POSTGRES_EXTRA),
+    ],
+)
+def test_runtime_problems_name_the_missing_extra(
+    serving: pytest.MonkeyPatch, module: str, problem: str
+) -> None:
+    import sys
+
+    serving.setitem(sys.modules, module, None)
+
+    assert settings.issuance_runtime_problems() == [problem]
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "not-pem"])
+def test_runtime_problems_refuse_a_ca_bundle_that_cannot_be_used(
+    serving: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    bundle = tmp_path / "bundle-path-91c4"
+    if kind == "directory":
+        bundle.mkdir()
+    elif kind == "not-pem":
+        bundle.write_text("not a certificate\n")
+    serving.setenv("CORP_LLM_CA_BUNDLE", str(bundle))
+
+    problems = settings.issuance_runtime_problems()
+
+    expected = (
+        settings.ISSUANCE_CA_BUNDLE_INVALID
+        if kind == "not-pem"
+        else settings.ISSUANCE_CA_BUNDLE_UNREADABLE
+    )
+    assert problems == [expected]
+    assert "bundle-path-91c4" not in problems[0]
+
+
+def test_runtime_problems_accept_a_loadable_ca_bundle(serving: pytest.MonkeyPatch) -> None:
+    import certifi  # httpx's own dependency
+
+    serving.setenv("CORP_LLM_CA_BUNDLE", certifi.where())
+
+    assert settings.issuance_runtime_problems() == []
+
+
+# ── in-flight cap (route_gate/inflight.py) ───────────────────────────────────
+
+
+def test_capacity_keys_are_registered() -> None:
+    keys = set(settings.all_keys())
+    assert {
+        "CORP_LLM_MAX_INFLIGHT",
+        "CORP_LLM_CANCEL_GRACE_SECONDS",
+        "CORP_LLM_BODY_READ_SECONDS",
+        "CORP_LLM_MAX_DRAINING",
+        "CORP_LLM_MAX_DRAINING_BYTES",
+    } <= keys
+
+
+def test_capacity_defaults(hermetic: Path) -> None:
+    capacity = settings.capacity()
+
+    assert capacity.max_inflight == 64
+    assert capacity.cancel_grace_seconds == 5.0
+    assert capacity.body_read_seconds == 30.0
+    assert capacity.max_draining == 256
+    assert capacity.max_draining_bytes == 512 * 1024 * 1024
+
+
+def test_the_byte_budget_bounds_match_the_limiter() -> None:
+    from corp_llm_gateway.route_gate.inflight import DEFAULT_MAX_DRAINING_BYTES, MAX_BODY_BYTES
+
+    assert settings.MAX_DRAINING_BYTES_FLOOR == MAX_BODY_BYTES
+    (key,) = [k for k in settings.KEYS if k.name == "CORP_LLM_MAX_DRAINING_BYTES"]
+    assert int(key.default or "") == DEFAULT_MAX_DRAINING_BYTES
+
+
+@pytest.mark.parametrize("value", ["26214400", "536870912", "17179869184", " 1073741824 "])
+def test_capacity_accepts_a_byte_budget_in_range(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING_BYTES", value)
+
+    assert settings.capacity().max_draining_bytes == int(value)
+
+
+@pytest.mark.parametrize(
+    "value", ["26214399", "0", "-1", "17179869185", "1.5", "512MiB", "1e9", "0x100000", "²"]
+)
+def test_capacity_refuses_a_bad_byte_budget(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING_BYTES", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_MAX_DRAINING_BYTES" in str(exc.value)
+
+
+def test_the_draining_default_follows_the_inflight_cap(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from corp_llm_gateway.route_gate.inflight import DRAINING_PER_SLOT
+
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "10")
+
+    assert settings.capacity().max_draining == 40
+    assert settings.DRAINING_PER_SLOT == DRAINING_PER_SLOT
+
+
+@pytest.mark.parametrize(
+    ("inflight", "draining"), [("10", "10"), ("10", "40000"), ("0", "0"), ("0", "5")]
+)
+def test_capacity_accepts_a_draining_cap_in_range(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, inflight: str, draining: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", inflight)
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING", draining)
+
+    assert settings.capacity().max_draining == int(draining)
+
+
+@pytest.mark.parametrize("value", ["9", "0", "-1", "40001", "1.5", "lots"])
+def test_capacity_refuses_a_bad_draining_cap(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "10")
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_MAX_DRAINING" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["0.5", "30", "300"])
+def test_capacity_accepts_a_body_deadline_in_range(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_BODY_READ_SECONDS", value)
+
+    assert settings.capacity().body_read_seconds == float(value)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "300.5", "nan", "inf", "soon"])
+def test_capacity_refuses_a_bad_body_deadline(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_BODY_READ_SECONDS", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_BODY_READ_SECONDS" in str(exc.value)
+
+
+def test_capacity_resolves_through_the_config_file(hermetic: Path) -> None:
+    _write(hermetic, 'CORP_LLM_MAX_INFLIGHT = "12"\nCORP_LLM_CANCEL_GRACE_SECONDS = "0.5"\n')
+
+    capacity = settings.capacity()
+
+    assert (capacity.max_inflight, capacity.cancel_grace_seconds) == (12, 0.5)
+
+
+@pytest.mark.parametrize("value", ["0", "1", "10000", " 64 "])
+def test_capacity_accepts_a_cap_in_range_outside_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", value)
+
+    assert settings.capacity().max_inflight == int(value)
+
+
+@pytest.mark.parametrize("env", ["prod", "production", "PROD", " Production "])
+def test_capacity_refuses_zero_in_prod(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    monkeypatch.setenv("CORP_ENV", env)
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "0")
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_MAX_INFLIGHT" in str(exc.value)
+    assert "prod" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["-1", "10001", "1.5", "sixty-four", "0x10", "1e3"])
+@pytest.mark.parametrize("env", ["", "prod"])
+def test_capacity_refuses_a_bad_cap_everywhere(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str, env: str
+) -> None:
+    monkeypatch.setenv("CORP_ENV", env)
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_MAX_INFLIGHT" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "60.5", "nan", "inf", "soon"])
+def test_capacity_refuses_a_bad_cancel_grace(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CORP_LLM_CANCEL_GRACE_SECONDS", value)
+
+    with pytest.raises(ConfigError) as exc:
+        settings.capacity()
+
+    assert "CORP_LLM_CANCEL_GRACE_SECONDS" in str(exc.value)
+
+
+def test_validate_reports_the_capacity_problems(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_ENV", "production")
+    monkeypatch.setenv("CORP_LLM_MAX_INFLIGHT", "0")
+    monkeypatch.setenv("CORP_LLM_CANCEL_GRACE_SECONDS", "-2")
+    monkeypatch.setenv("CORP_LLM_BODY_READ_SECONDS", "0")
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING", "many")
+    monkeypatch.setenv("CORP_LLM_MAX_DRAINING_BYTES", "1024")
+
+    with pytest.raises(ConfigError) as exc:
+        settings.validate()
+
+    joined = "\n".join(exc.value.problems)
+    assert "CORP_LLM_MAX_INFLIGHT" in joined
+    assert "CORP_LLM_CANCEL_GRACE_SECONDS" in joined
+    assert "CORP_LLM_BODY_READ_SECONDS" in joined
+    assert "CORP_LLM_MAX_DRAINING=" in joined
+    assert "CORP_LLM_MAX_DRAINING_BYTES" in joined
+
+
+def test_validate_passes_the_default_capacity(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_ENV", "production")
+
+    settings.validate()

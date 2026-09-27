@@ -5637,3 +5637,222 @@ async def test_pre_call_wellformed_litellm_call_id_used_verbatim() -> None:
     out = await g.pre_call(data)
 
     assert out["_corp_gateway_request_id"] == call_id
+
+
+# ---- Token store unavailable on the auth path ------------------------------
+
+_STORE_DETAIL = "store-detail-tok-5e2a"
+
+
+class _UnavailableTokenStore(TokenStore):
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def lookup(self, corp_token: str) -> TokenInfo | None:
+        raise self._exc
+
+    async def revoke_user(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    async def list_tokens(self, user_id: str | None = None) -> tuple[TokenInfo, ...]:
+        raise NotImplementedError
+
+
+def _asyncpg_error(name: str) -> BaseException:
+    asyncpg = pytest.importorskip("asyncpg")
+    return getattr(asyncpg.exceptions, name)(_STORE_DETAIL)
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: TimeoutError(),  # the pool's acquire past its timeout
+        lambda: OSError(_STORE_DETAIL),
+        lambda: ConnectionResetError(_STORE_DETAIL),
+        lambda: _asyncpg_error("PostgresConnectionError"),
+        lambda: _asyncpg_error("ConnectionDoesNotExistError"),
+        lambda: _asyncpg_error("InterfaceError"),
+        lambda: _asyncpg_error("AdminShutdownError"),
+    ],
+    ids=[
+        "acquire-timeout",
+        "oserror",
+        "reset",
+        "PostgresConnectionError",
+        "ConnectionDoesNotExistError",
+        "InterfaceError",
+        "AdminShutdownError",
+    ],
+)
+async def test_an_unavailable_token_store_is_503_not_500(make_exc: Any, caplog: Any) -> None:
+    exc = make_exc()
+    sink = ListSink()
+    metrics = _RecordingMetrics()
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(
+        orch,
+        AuthMiddleware(_UnavailableTokenStore(exc)),
+        AuditLogger(sink, gateway_version="0.0.1"),
+        metrics=metrics,
+    )
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(GuardrailHttpException) as ei:
+        await g.pre_call(_data_with_token("tok-secret-7c1f"))
+
+    assert (ei.value.status_code, ei.value.error_code) == (503, "E_STORE_UNAVAILABLE")
+    assert ei.value.__cause__ is None
+    assert _STORE_DETAIL not in str(ei.value)
+    assert type(exc).__name__ in caplog.text
+    assert _STORE_DETAIL not in caplog.text
+    assert "tok-secret-7c1f" not in caplog.text
+    assert len(sink.records) == 1
+    assert sink.records[0]["status"] == "failed"
+    assert sink.records[0]["error_code"] == "E_STORE_UNAVAILABLE"
+    assert _STORE_DETAIL not in json.dumps(sink.records[0])
+    assert metrics.failures == ["token_store"]
+
+
+async def test_a_saturated_token_store_pool_is_503_within_the_acquire_bound() -> None:
+    from tests.postgres_support import pg_dsn, require_asyncpg, skip_or_fail
+
+    require_asyncpg()
+    from corp_llm_gateway.tokens.postgres_store import _ACQUIRE_TIMEOUT_S, PostgresTokenStore
+
+    store = PostgresTokenStore(pg_dsn(), pool_max_size=1)
+    try:
+        pool = await store._get_pool()
+    except Exception as exc:
+        await store.close()
+        skip_or_fail(f"Postgres unreachable: {type(exc).__name__}")
+    sink = ListSink()
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(orch, AuthMiddleware(store), AuditLogger(sink, gateway_version="0.0.1"))
+    try:
+        async with pool.acquire():
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            with pytest.raises(GuardrailHttpException) as ei:
+                await asyncio.wait_for(g.pre_call(_data_with_token("tok-1")), timeout=15)
+            elapsed = loop.time() - start
+    finally:
+        await store.close()
+
+    assert (ei.value.status_code, ei.value.error_code) == (503, "E_STORE_UNAVAILABLE")
+    assert elapsed < _ACQUIRE_TIMEOUT_S + 1.0
+
+
+class _HangingTokenStore(InMemoryTokenStore):
+    """Lookups of ``hung`` tokens never return until ``release`` is set."""
+
+    def __init__(self, *hung: str) -> None:
+        super().__init__()
+        self.hung = set(hung)
+        self.release = asyncio.Event()
+
+    async def lookup(self, corp_token: str) -> TokenInfo | None:
+        if corp_token in self.hung:
+            await self.release.wait()
+        return await super().lookup(corp_token)
+
+
+def _token(corp_token: str, user_id: str) -> TokenInfo:
+    now = datetime.now(UTC)
+    return TokenInfo(
+        corp_token=corp_token,
+        user_id=user_id,
+        team_id="t1",
+        scopes=("read",),
+        issued_at=now,
+        expires_at=now + timedelta(days=30),
+    )
+
+
+async def test_a_hung_token_lookup_is_503_at_the_auth_bound_and_spares_other_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from corp_llm_gateway import litellm_hook
+
+    bound_s = 0.3
+    monkeypatch.setattr(litellm_hook, "AUTH_LOOKUP_BOUND_S", bound_s)
+    store = _HangingTokenStore("tok-stuck")
+    store.upsert(_token("tok-stuck", "alice"))
+    store.upsert(_token("tok-free", "bob"))
+    sink = ListSink()
+    orch = SanitizationOrchestrator(_corp_llm_returning([]), InMemoryMappingStore(), _StaticRules())
+    g = CorpLlmGuardrail(orch, AuthMiddleware(store), AuditLogger(sink, gateway_version="0.0.1"))
+    loop = asyncio.get_running_loop()
+    try:
+        start = loop.time()
+        stuck = asyncio.create_task(g.pre_call(_data_with_token("tok-stuck")))
+        await asyncio.sleep(0)
+        out = await asyncio.wait_for(g.pre_call(_data_with_token("tok-free")), timeout=1)
+        assert "X-Corp-Auth" not in out["headers"]
+        assert not stuck.done()
+
+        with pytest.raises(GuardrailHttpException) as ei:
+            await asyncio.wait_for(stuck, timeout=5)
+        assert (ei.value.status_code, ei.value.error_code) == (503, "E_STORE_UNAVAILABLE")
+        assert loop.time() - start < bound_s + 0.5
+    finally:
+        store.release.set()
+
+
+async def test_a_token_store_stalled_mid_query_is_503_and_its_connection_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.postgres_support import pg_dsn, require_asyncpg, skip_or_fail
+    from tests.stalling_proxy import StallingProxy
+
+    require_asyncpg()
+    from corp_llm_gateway import litellm_hook
+    from corp_llm_gateway.pg_session import CANCEL_BUDGET_S
+    from corp_llm_gateway.tokens import postgres_store
+
+    lookup_s = 1.0
+    monkeypatch.setattr(postgres_store, "LOOKUP_TIMEOUT_S", lookup_s)
+    monkeypatch.setattr(litellm_hook, "AUTH_LOOKUP_BOUND_S", lookup_s + 1.0)
+    proxy = StallingProxy(pg_dsn())
+    store = postgres_store.PostgresTokenStore(await proxy.start(), pool_max_size=1)
+    corp_token = f"pg-itest-stall-{time.monotonic_ns()}"
+    reached = False
+    try:
+        try:
+            await store.init_schema()
+        except Exception as exc:
+            skip_or_fail(f"Postgres unreachable: {type(exc).__name__}")
+        reached = True
+        await store.upsert(_token(corp_token, "pg-test-stall"))
+        pool = await store._get_pool()
+        assert pool.get_size() == 1
+        sink = ListSink()
+        orch = SanitizationOrchestrator(
+            _corp_llm_returning([]), InMemoryMappingStore(), _StaticRules()
+        )
+        g = CorpLlmGuardrail(
+            orch, AuthMiddleware(store), AuditLogger(sink, gateway_version="0.0.1")
+        )
+
+        proxy.stall()
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        with pytest.raises(GuardrailHttpException) as ei:
+            await asyncio.wait_for(g.pre_call(_data_with_token(corp_token)), timeout=15)
+        elapsed = loop.time() - start
+
+        assert (ei.value.status_code, ei.value.error_code) == (503, "E_STORE_UNAVAILABLE")
+        assert elapsed < lookup_s + CANCEL_BUDGET_S + 0.5
+        # The stalled connection was terminated, not handed back to the pool.
+        assert pool.get_size() == 0
+        proxy.resume()
+        assert await asyncio.wait_for(store.lookup(corp_token), timeout=5) is not None
+        assert pool.get_size() == 1
+    finally:
+        proxy.resume()
+        try:
+            if reached:
+                pool = await store._get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute("DELETE FROM corp_tokens WHERE corp_token = $1", corp_token)
+        finally:
+            await store.close()
+            await proxy.close()

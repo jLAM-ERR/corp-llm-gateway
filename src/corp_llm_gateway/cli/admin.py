@@ -19,7 +19,7 @@ from typing import Any, cast, get_args
 
 import httpx
 
-from corp_llm_gateway import config, extensions, providers
+from corp_llm_gateway import config, extensions, providers, settings
 from corp_llm_gateway.audit import get_sink, register_sink, sink_name_for
 from corp_llm_gateway.auth import BearerAuthProvider, NoopAuthProvider
 from corp_llm_gateway.auth.rbac import OperatorDenied, get_admin_token, verify_operator
@@ -442,10 +442,11 @@ def _dispatch_config(args: argparse.Namespace) -> int:
     problems: list[str] = []
     try:
         config.validate()
-        config_ok = True
     except ConfigError as exc:
-        config_ok = False
         problems = exc.problems
+    # What the entrypoint's boot also refuses on: the issuance extras, the CA bundle.
+    problems += settings.issuance_runtime_problems()
+    config_ok = not problems
 
     probes: list[tuple[str, bool, str]] = []
     if not args.no_probe:

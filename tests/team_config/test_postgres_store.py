@@ -1,7 +1,8 @@
 """Parametrised TeamConfigStore contract tests.
 
 Runs against InMemoryTeamConfigStore (always) and PostgresTeamConfigStore
-(skips when asyncpg is absent or the demo Postgres is unreachable).
+(skips when asyncpg is absent or the demo Postgres is unreachable; fails
+instead on CI, see tests/postgres_support.py).
 
 Pattern mirrors tests/storage/test_mapping_store.py and
 tests/tokens/test_token_store_contract.py.
@@ -21,8 +22,7 @@ from corp_llm_gateway.team_config import (
     TeamConfigStore,
     TeamNotFoundError,
 )
-
-_DEMO_PG_DSN = "postgresql://gateway:gateway@localhost:5432/gateway"
+from tests.postgres_support import pg_dsn, require_asyncpg, skip_or_fail
 
 StoreFactory = Callable[[], Awaitable[TeamConfigStore]]
 
@@ -32,10 +32,10 @@ async def _make_in_memory() -> TeamConfigStore:
 
 
 async def _try_make_postgres() -> TeamConfigStore:
-    pytest.importorskip("asyncpg", reason="PostgresTeamConfigStore requires the 'postgres' extra")
+    require_asyncpg()
     from corp_llm_gateway.team_config.postgres_store import PostgresTeamConfigStore
 
-    store = PostgresTeamConfigStore(_DEMO_PG_DSN)
+    store = PostgresTeamConfigStore(pg_dsn())
     try:
         await store.init_schema()
         pool = await store._get_pool()
@@ -43,7 +43,7 @@ async def _try_make_postgres() -> TeamConfigStore:
             await conn.execute("TRUNCATE team_config")
     except Exception as exc:
         await store.close()
-        pytest.skip(f"Postgres unreachable: {exc}")
+        skip_or_fail(f"Postgres unreachable: {exc}")
     return store
 
 
@@ -169,15 +169,15 @@ CREATE TABLE team_config (
 async def test_init_schema_adds_profile_ids_to_preexisting_table() -> None:
     """A DB created before D2 lacks profile_ids; init_schema must ADD it, not
     error, so the store's SELECT/upsert of profile_ids works after upgrade."""
-    pytest.importorskip("asyncpg", reason="PostgresTeamConfigStore requires the 'postgres' extra")
+    require_asyncpg()
     from corp_llm_gateway.team_config.postgres_store import PostgresTeamConfigStore
 
-    store = PostgresTeamConfigStore(_DEMO_PG_DSN)
+    store = PostgresTeamConfigStore(pg_dsn())
     try:
         pool = await store._get_pool()
     except Exception as exc:
         await store.close()
-        pytest.skip(f"Postgres unreachable: {exc}")
+        skip_or_fail(f"Postgres unreachable: {exc}")
     try:
         async with pool.acquire() as conn:
             await conn.execute("DROP TABLE IF EXISTS team_config CASCADE")
@@ -192,3 +192,26 @@ async def test_init_schema_adds_profile_ids_to_preexisting_table() -> None:
         async with pool.acquire() as conn:
             await conn.execute("DROP TABLE IF EXISTS team_config CASCADE")
         await store.close()
+
+
+async def test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from contextlib import AsyncExitStack
+
+    from corp_llm_gateway.team_config import postgres_store
+
+    store = await _try_make_postgres()
+    monkeypatch.setattr(postgres_store, "_ACQUIRE_TIMEOUT_S", 0.2)
+    try:
+        pool = await store._get_pool()  # type: ignore[attr-defined]
+        async with AsyncExitStack() as held:
+            for _ in range(pool.get_max_size()):
+                await held.enter_async_context(pool.acquire())
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(store.get("t1"), timeout=5)
+        with pytest.raises(TeamNotFoundError):
+            await store.get("t1")
+    finally:
+        await store.close()  # type: ignore[attr-defined]

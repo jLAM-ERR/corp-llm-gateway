@@ -44,6 +44,7 @@ compose/nginx/certs/*.key
 compose/nginx/certs/*.p12
 compose/nginx/certs/*.pfx
 compose/postgres/initdb/*.sql
+compose/gateway/config.toml
 
 # Internal research, decision records, and benchmarks — maintainer / product-owner only.
 # Kept on disk locally, excluded from the published tree (see README: only public docs are linked).

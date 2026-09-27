@@ -296,3 +296,72 @@ def test_config_check_accepts_the_default_serve_port(
     assert (
         _validate(monkeypatch, CORP_LLM_LITELLM_CONFIG=str(valid), CORP_LLM_SERVE_PORT="4000") == []
     )
+
+
+# ── concurrency: the gateway owns the cap, litellm's own is dead ─────────────
+
+_ROOT = Path(__file__).resolve().parents[1]
+_SERVING_LITELLM_CONFIGS = (
+    _ROOT / "compose" / "litellm" / "config.yaml",
+    _ROOT / "compose" / "litellm" / "config.oauth.yaml",
+)
+# Everything a deploy renders litellm's config or env from.
+_DEPLOY_INPUTS = ("compose", "docker", "examples", "helm")
+_DEPLOY_ROOT_FILES = (
+    ".env.demo.example",
+    "docker-compose.yml",
+    "docker-compose.demo.yml",
+    "docker-compose.anthropic-oauth.yml",
+    "docker-compose.chatgpt-codex.yml",
+    "Dockerfile.gateway",
+)
+# litellm 1.101.0 honours the first only in its legacy limiter, which the second
+# selects; neither is a cap in this deployment (docs/ops/capacity.md).
+_DEAD_CONCURRENCY_KNOBS = ("global_max_parallel_requests", "LEGACY_MULTI_INSTANCE_RATE_LIMITING")
+
+
+@pytest.mark.parametrize("path", _SERVING_LITELLM_CONFIGS, ids=lambda p: p.name)
+def test_the_shipped_litellm_configs_arm_cancel_on_disconnect(path: Path) -> None:
+    import yaml
+
+    document = yaml.safe_load(path.read_text())
+
+    assert document["general_settings"]["cancel_on_disconnect"] is True
+    assert litellm_config.problems(path, require_file=True) == []
+
+
+def _deploy_files() -> list[Path]:
+    files = [_ROOT / name for name in _DEPLOY_ROOT_FILES if (_ROOT / name).is_file()]
+    for top in _DEPLOY_INPUTS:
+        files.extend(
+            path
+            for path in sorted((_ROOT / top).rglob("*"))
+            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".md"
+        )
+    return files
+
+
+def test_no_deploy_input_sets_litellms_dead_concurrency_knobs() -> None:
+    files = _deploy_files()
+    assert any(path.name == "configmap-litellm.yaml" for path in files)
+
+    offending = [
+        f"{path.relative_to(_ROOT)}: {knob}"
+        for path in files
+        for knob in _DEAD_CONCURRENCY_KNOBS
+        if knob in path.read_text(encoding="utf-8", errors="replace")
+    ]
+
+    assert not offending, offending
+
+
+def test_the_compose_gateway_carries_the_in_flight_cap() -> None:
+    import yaml
+
+    compose = yaml.safe_load((_ROOT / "compose" / "docker-compose.yml").read_text())
+    environment = compose["services"]["litellm"]["environment"]
+
+    assert "CORP_LLM_MAX_INFLIGHT=${CORP_LLM_MAX_INFLIGHT:-64}" in environment
+    assert "CORP_LLM_CANCEL_GRACE_SECONDS=${CORP_LLM_CANCEL_GRACE_SECONDS:-5}" in environment
+    # The compose default is production, where a cap of 0 refuses to boot.
+    assert "CORP_ENV=${CORP_ENV:-production}" in environment

@@ -473,10 +473,14 @@ def test_every_recorded_block_reason_literal_is_enumerated() -> None:
 
 
 def test_the_failure_components_match_the_hooks_own_map() -> None:
-    from corp_llm_gateway.litellm_hook import _FAILURE_COMPONENT
+    from corp_llm_gateway.litellm_hook import _FAILURE_COMPONENT, TEAM_CONFIG_COMPONENT
     from corp_llm_gateway.route_gate.middleware import COMPONENT
 
-    assert set(FAILURE_COMPONENTS) == set(_FAILURE_COMPONENT.values()) | {"other", COMPONENT}
+    assert set(FAILURE_COMPONENTS) == set(_FAILURE_COMPONENT.values()) | {
+        "other",
+        COMPONENT,
+        TEAM_CONFIG_COMPONENT,
+    }
 
 
 @pytest.mark.parametrize("reason", ALL_BLOCK_REASONS)
@@ -543,3 +547,120 @@ async def test_the_gate_records_its_reason_and_component_through_the_exporter() 
     for reason in ("route_gate_listed", "route_gate_unlisted", "route_gate_unarmed"):
         assert f'corp_llm_gateway_blocked_requests_total{{block_reason="{reason}"}} 1.0' in text
     assert f'gateway_failure{{component="{COMPONENT}"}} 1.0' in text
+
+
+# ── the in-flight cap's series (route_gate/inflight.py) ──────────────────────
+
+
+def test_the_limiter_reasons_are_enumerated() -> None:
+    from corp_llm_gateway.route_gate.inflight import (
+        LIMITER_BLOCK_REASONS,
+        OVERSIZE_BLOCKED,
+        ROUTE_GATE_BODY_TIMEOUT,
+        ROUTE_GATE_CAPACITY,
+    )
+
+    assert BLOCK_REASONS["capacity"] == (ROUTE_GATE_CAPACITY, ROUTE_GATE_BODY_TIMEOUT)
+    assert OVERSIZE_BLOCKED in BLOCK_REASONS["policy"]
+    assert set(ALL_BLOCK_REASONS) >= LIMITER_BLOCK_REASONS
+
+
+def test_prometheus_exports_the_inflight_gauge_and_the_cancelled_counter() -> None:
+    exporter = _prom()
+
+    exporter.set_inflight(3)
+    exporter.set_inflight(2)
+    exporter.record_cancelled()
+    exporter.record_cancelled()
+
+    text = exporter.render().decode()
+    assert "# TYPE gateway_inflight_requests gauge" in text
+    assert "gateway_inflight_requests 2.0" in text
+    assert "# TYPE gateway_cancelled_requests_total counter" in text
+    assert "gateway_cancelled_requests_total 2.0" in text
+
+
+def test_prometheus_exports_the_draining_bytes_gauge() -> None:
+    exporter = _prom()
+
+    exporter.set_draining_bytes(4096)
+    exporter.set_draining_bytes(1024)
+
+    text = exporter.render().decode()
+    assert "# TYPE gateway_draining_bytes gauge" in text
+    assert "gateway_draining_bytes 1024.0" in text
+
+
+def test_the_noop_exporter_ignores_the_inflight_series() -> None:
+    exporter = NoopExporter()
+
+    assert exporter.set_inflight(5) is None
+    assert exporter.record_cancelled() is None
+    assert exporter.set_draining_bytes(7) is None
+    assert exporter.render() == b""
+
+
+def test_an_exporter_written_before_the_inflight_series_still_instantiates() -> None:
+    # Extension exporters implement the three original abstract methods only.
+    class _Legacy(MetricsExporter):
+        def record_block(self, block_reason: str) -> None:
+            return None
+
+        def record_failure(self, component: str) -> None:
+            return None
+
+        def observe_request_latency(self, seconds: float, *, status: str) -> None:
+            return None
+
+    legacy = _Legacy()
+
+    assert legacy.set_inflight(1) is None
+    assert legacy.record_cancelled() is None
+    assert legacy.set_draining_bytes(1) is None
+
+
+async def test_the_capacity_refusal_is_counted_on_the_real_series() -> None:
+    import asyncio
+
+    from corp_llm_gateway.route_gate import RouteGateMiddleware
+    from corp_llm_gateway.route_gate.inflight import InflightLimiter
+
+    exporter = _prom()
+    release = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def holding(scope: object, receive: object, send: object) -> None:
+        entered.set()
+        await release.wait()
+
+    gate = RouteGateMiddleware(
+        holding,
+        metrics=exporter,
+        audit_logger=AuditLogger(ListSink(), gateway_version="0.0.1"),
+        limiter=InflightLimiter(1, metrics=exporter),
+    )
+    gate.arm()
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "headers": [],
+    }
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message: dict) -> None:
+        return None
+
+    held = asyncio.create_task(gate(scope, receive, send))
+    await asyncio.wait_for(entered.wait(), 2)
+    await gate(scope, receive, send)
+    held_text = exporter.render().decode()
+    release.set()
+    await held
+
+    assert 'corp_llm_gateway_blocked_requests_total{block_reason="capacity"} 1.0' in held_text
+    assert "gateway_inflight_requests 1.0" in held_text
+    assert "gateway_inflight_requests 0.0" in exporter.render().decode()

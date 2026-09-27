@@ -66,14 +66,15 @@ What a developer notices, and why:
 | `POST /v1/completions` | Reaches the hook, but the hook reads `messages` / `input` — a text-completion `prompt` is never rewritten |
 | `POST /v1/embeddings`, `/v1/moderations`, `/v1/audio/speech` | LiteLLM's documented no-rewrite set: previously DLP-scanned only, and a DLP scan blocks a *known* pattern rather than sanitizing |
 | `POST /anthropic/…`, `/openai/…`, `/{provider}/…` and the other provider-native trees | Raw passthrough to the provider — the body is forwarded as sent |
-| anything not in the table, including LiteLLM's admin **UI** mounts | Default-deny, so a route a future LiteLLM release adds is refused until someone classifies it. The JSON admin API (`/key/*`, `/team/*`, …) is pinned route by route and still answers |
+| LiteLLM's management surface — the JSON admin API (`/key/*`, `/team/*`, `/policies*`, `/guardrails*`, …), spend, login/SSO, the public catalogue, `GET /health` and the other non-probe `/health/*` routes | Refused by design: identity is `X-Corp-Auth` and observability is Langfuse, and several of these routes could switch the sanitizer off after boot ([`docs/security.md`](docs/security.md) §14) |
+| anything not in the table, including LiteLLM's admin **UI** mounts | Default-deny, so a route a future LiteLLM release adds is refused until someone classifies it |
 
-There is no off switch. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` can add PASSTHROUGH routes an operator owns and nothing else; `gateway-admin config check --routes` prints the effective table. Startup is fail-closed too: the gateway exits rather than serve with its config missing (78) or its guardrail callback unregistered (70).
+There is no off switch. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` can add PASSTHROUGH routes an operator owns and nothing else — an extra naming a refused route exits 78 at boot; `gateway-admin config check --routes` prints the effective table. Startup is fail-closed too: the gateway exits rather than serve with its config missing (78) or its guardrail callback unregistered (70).
 
 ### Auth & compliance
 
 - **X-Corp-Auth + Postgres token store** — `AuthMiddleware` validates tokens against `PostgresTokenStore` (asyncpg); 60 s revocation-propagation upper bound
-- **Two upstream credential modes** — corp API keys (developers hold a per-person LiteLLM virtual key: revocation + spend accounting) or **subscription passthrough**, where the developer's own Anthropic OAuth bearer is forwarded untouched and no corp `ANTHROPIC_API_KEY` exists at all. Mutually exclusive, chosen at deploy time; sanitization, team identity and audit are identical in both — [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md)
+- **Subscription passthrough is the production mode** — the developer's own Anthropic OAuth bearer is forwarded untouched and no corp `ANTHROPIC_API_KEY` exists at all. Corp API-key mode (LiteLLM virtual keys) survives only as a test posture: the route gate refuses `/key/*`, so no virtual key can be issued — [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md)
 - **`gateway:operator` RBAC** — admin CLI commands gated on JWT claim `gateway:operator`; verified via PyJWT against Keycloak realm roles
 - **Audit pipeline** — rich `AuditEvent` schema (ALWAYS / CONDITIONAL field tiers) + NEVER-fields gate: the logger refuses records containing `mapping`, `original`, or `credentials`
 - **SIEM sink** — Vector HTTP sink with inherited NEVER-gate + Helm alerts (`AuditVectorDropHigh`, `LeakAttemptDetected`)
@@ -123,7 +124,7 @@ examples/compose/       lightweight local sanitizing proxy (one container, oracl
 docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
 scripts/deploy/         server bootstrap (bootstrap-server.sh + systemd unit) + deploy.sh (push/upgrade a host)
-tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipped on 3.12 + litellm; 3.14 = graceful NER)
+tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipped on 3.14 + every extra + litellm; no extras = graceful NER)
 ```
 
 ## Developer quickstart (laptop)
@@ -131,14 +132,17 @@ tests/                  pytest, pytest-asyncio mode=auto (2767 passed / 40 skipp
 ### Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh \
+  | KEYCLOAK_ISSUER='https://keycloak.corp.lan/realms/corp' KEYCLOAK_CLIENT_ID='corp-gateway-cli' bash
 ```
 
 What it does ([`scripts/install.sh`](scripts/install.sh)):
 
 1. Detects shell (bash / zsh / fish), writes `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `CORP_GATEWAY_TOKEN_FILE`, and (for Claude Code) `ANTHROPIC_CUSTOM_HEADERS` into your rc file between `# >>> corp-llm-gateway >>>` markers.
-2. Runs Keycloak device-flow OAuth and writes a 30-day corp token to `~/.corp-llm-gateway/token` (`0600`).
-3. Smokes the gateway with a redactable string and verifies round-trip.
+2. Signs you in to Keycloak (device flow: open the printed URL and approve), trades that sign-in at the gateway for a 30-day corp token, and writes it to `~/.corp-llm-gateway/token` (`0600`; set `CORP_GATEWAY_TOKEN_FILE` to use another path).
+3. Smoke-tests the gateway with your subscription token, if `ANTHROPIC_AUTH_TOKEN` is exported; otherwise it says it skipped the test.
+
+Without `KEYCLOAK_ISSUER` the installer writes the rc block only: it issues no token, prints how to get one (ask your gateway operator), and exits 0. `CORP_GATEWAY_URL` overrides the default gateway URL (`https://gateway.corp.lan`).
 
 Re-running the installer is idempotent — it rotates the token and rewrites the rc block.
 
@@ -206,7 +210,7 @@ Four things in this repo run the gateway. Only the first two are deploy targets.
 
 ### Pick an auth mode first
 
-Two modes, both production, **mutually exclusive** — decide before you write `.env`. They run the same stack, the same cascade and the same audit chain; only the upstream credential differs.
+Two modes, **mutually exclusive** — decide before you write `.env`. **Mode B is the production mode; Mode A is a test posture only**: the route gate refuses LiteLLM's management surface, `/key/*` included, so nothing can issue the virtual key Mode A needs. They run the same stack, the same cascade and the same audit chain; only the upstream credential differs.
 
 | | **Mode A** — corp API keys | **Mode B** — subscription (OAuth) |
 |---|---|---|
@@ -216,7 +220,8 @@ Two modes, both production, **mutually exclusive** — decide before you write `
 | Team identity | `X-Corp-Auth: <team token>` | same |
 | `LITELLM_MASTER_KEY` | **required** | **must be absent** (a blank line counts as set — delete it) |
 | Routes served | `claude-*`, `gpt-*`, `corp-*` | `claude-*` only, and that is a load-bearing control, not a simplification |
-| Per-developer revocation / spend | yes, via the LiteLLM Admin UI | no |
+| Per-developer revocation / spend | no — `/key/*` and the admin UI are refused | no |
+| Status | **test posture only** | **production** |
 
 Full matrix, every failure mode, and why the two cannot coexist: [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md) · RU: [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md).
 
@@ -270,7 +275,7 @@ Don't confuse `CORP_NER_ENABLED` (the remote service) with `CORP_LLM_REQUIRE_NER
 ### Know before going live
 
 - **No TLS in front of the stack yet.** The only published port is `127.0.0.1:4000`; the nginx front door is a later revision. Until then developers reach it through an SSH tunnel, not across the network.
-- **In Mode B, litellm's management endpoints are unauthenticated** (`/key/*`, `/model/*`, `/user/*`, the UI) — its proxy auth is skipped entirely without a master key, which is exactly what the mode requires. The LLM routes are still gated by the guardrail's `X-Corp-Auth` check. Loopback-only today; this must be closed at nginx before the port is exposed. Mode A doesn't have this gap.
+- **litellm's management endpoints are refused, in both modes** (`/key/*`, `/model/*`, `/user/*`, `/policies*`, `/guardrails*`, the UI) — without a master key litellm accepts any caller as an internal user, so the route gate answers them with `403 E_ROUTE_BLOCKED` before litellm sees the request, on every path in. The LLM routes are gated by the guardrail's `X-Corp-Auth` check.
 - **No untrusted `docker run` on that host.** Vector selects audit records by a public container label, so anyone who can start a container there can forge audit records. That is a deployment-model requirement, not advice.
 - **Audit is buffered but not fail-closed** — a documented deviation from the `vectorBufferFull` default in [`docs/security.md`](docs/security.md) §8. A stalled audit path does not stop egress; durability is bounded by docker log rotation, not by Vector's disk buffer.
 
@@ -420,13 +425,13 @@ Full per-surface guide (sinks, providers, the extensions registry, safety rules,
 
 ## Development
 
-Requires Python 3.12+.
+Requires Python 3.12+. CI runs Python 3.14 only.
 
 ```bash
 pip install -e ".[dev]"     # dev pulls the asgi + metrics extras too
 pre-commit install
 PYTHONPATH=src .venv/bin/pytest tests/ -q     # 2558 passed / 201 skipped, ~2min (3.14, no litellm: graceful NER)
-PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs   # 2767 / 40 (3.12 + litellm: NER, RS256, entrypoint, route guard)
+PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs   # 2767 / 40 (3.14 + every extra + litellm: NER, RS256, entrypoint, route guard)
 PYTHONPATH=src .venv/bin/ruff check src tests
 PYTHONPATH=src .venv/bin/ruff format --check src tests
 ```

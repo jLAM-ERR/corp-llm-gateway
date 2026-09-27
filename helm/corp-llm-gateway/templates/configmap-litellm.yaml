@@ -26,6 +26,10 @@ data:
       drop_params: true
       # Emit AuditEvent JSON as single-line records for the Vector sidecar.
       json_logs: true
+    general_settings:
+      # Second layer under the route gate's in-flight limiter, which owns the
+      # request cap (CORP_LLM_MAX_INFLIGHT) and cancels on disconnect itself.
+      cancel_on_disconnect: {{ .Values.litellm.cancelOnDisconnect }}
   bootstrap.py: |
     # litellm resolves litellm_settings.callbacks as a FILE under the config dir
     # (<config-dir>/corp_llm_gateway/bootstrap.py) — it never falls back to a

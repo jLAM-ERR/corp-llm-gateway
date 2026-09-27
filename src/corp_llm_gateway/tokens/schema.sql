@@ -10,7 +10,10 @@ CREATE TABLE IF NOT EXISTS corp_tokens (
     issued_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at           TIMESTAMPTZ NOT NULL,
     revoked_at           TIMESTAMPTZ,
-    last_used_at         TIMESTAMPTZ
+    last_used_at         TIMESTAMPTZ,
+    oidc_issuer          TEXT,
+    oidc_subject         TEXT,
+    oidc_jti             TEXT
 );
 
 CREATE INDEX IF NOT EXISTS corp_tokens_user_id_idx
@@ -22,6 +25,22 @@ CREATE INDEX IF NOT EXISTS corp_tokens_team_id_idx
 CREATE INDEX IF NOT EXISTS corp_tokens_revoked_at_idx
     ON corp_tokens (revoked_at)
     WHERE revoked_at IS NOT NULL;
+
+-- Migration: developer token issuance (POST /internal/issue-token) records the
+-- Keycloak identity each token was minted for. Additive and idempotent: existing
+-- rows and CLI-issued tokens keep NULLs, which the per-subject cap ignores. Re-run
+-- this file on an existing DB before enabling CORP_GATEWAY_ISSUE_OIDC_ISSUER.
+ALTER TABLE corp_tokens ADD COLUMN IF NOT EXISTS oidc_issuer TEXT;
+ALTER TABLE corp_tokens ADD COLUMN IF NOT EXISTS oidc_subject TEXT;
+ALTER TABLE corp_tokens ADD COLUMN IF NOT EXISTS oidc_jti TEXT;
+
+-- A Keycloak jti mints at most one corp token: the replay backstop behind the
+-- store's in-transaction check. NULLs (CLI-issued) never conflict.
+CREATE UNIQUE INDEX IF NOT EXISTS corp_tokens_oidc_jti_key
+    ON corp_tokens (oidc_jti);
+
+CREATE INDEX IF NOT EXISTS corp_tokens_oidc_subject_idx
+    ON corp_tokens (oidc_issuer, oidc_subject, revoked_at);
 
 -- Per-team config: replace.md location, retention overrides, fail-policy
 -- overrides per the M4 fail-policy matrix. Plan ref: M2-4, M3-7, M4-7.

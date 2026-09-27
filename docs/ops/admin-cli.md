@@ -49,6 +49,16 @@ team-x   Team X  90        7           -
 
 Issue, revoke, and list corp tokens.
 
+**`token issue` is break-glass only.** Developers get their corp token from
+`scripts/install.sh`, which signs them in to Keycloak and calls
+`POST /internal/issue-token` (`install.md`). Use `token issue` when that path is
+down or for a service account. A CLI-issued token carries no Keycloak identity:
+it does not count toward the per-developer cap
+(`CORP_GATEWAY_ISSUE_MAX_ACTIVE`) or the issuance interval. `token revoke --user`
+revokes both kinds; for an issued token the user is the Keycloak
+`preferred_username` (or `sub`, if the claim is absent —
+`CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM`).
+
 ```
 gateway-admin token issue --user alice --team team-x [--scopes a,b] [--ttl-days 30] [--json]
 gateway-admin token revoke --user alice
@@ -136,6 +146,20 @@ $ echo $?
 reachability probes). `--json` emits a machine-readable report and still sets
 the exit code.
 
+It runs the same resolvers the entrypoint's boot check runs, so it also reports:
+
+- **issuance** — a partial or out-of-range `CORP_GATEWAY_ISSUE_*` set, an
+  issuance audience equal to the operator audience, HTTP issuer/JWKS URLs under
+  `CORP_ENV=prod`, issuance without `CORP_LLM_PG_DSN`, and (with issuance on)
+  the missing `oidc` / `postgres` extras and an unreadable or non-PEM
+  `CORP_LLM_CA_BUNDLE`;
+- **the in-flight cap** — any of the five `CORP_LLM_*` capacity keys out of
+  range, and `CORP_LLM_MAX_INFLIGHT=0` under `CORP_ENV=prod`;
+- **route-gate extras** — see `--routes` below.
+
+It does not check the `corp_tokens` schema; the boot does, and exits 78 on it
+(`upgrade.md`).
+
 `--routes` also prints the effective route-gate table — row counts per verdict,
 the REWRITTEN routes (the only ones whose body the guardrail rewrites), and every
 `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` entry the operator added:
@@ -144,11 +168,11 @@ the REWRITTEN routes (the only ones whose body the guardrail rewrites), and ever
 $ gateway-admin config check --no-probe --routes
 config: OK
 
-route gate: 551 exact + 362 regex litellm rows, 5 gateway rows (no off switch)
+route gate: 551 exact + 362 regex litellm rows, 6 gateway rows (no off switch). The verdict counts below cover those litellm + gateway rows; operator extras are listed separately.
 VERDICT      ROWS
-PASSTHROUGH  501
+PASSTHROUGH  32
 REWRITTEN    8
-REFUSE       409
+REFUSE       879
 
 REWRITTEN (the only routes whose body the guardrail rewrites):
   POST /chat/completions
@@ -158,8 +182,9 @@ CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH:
   (none)
 ```
 
-A malformed extra prints `INVALID: …` on stderr and makes the whole check exit
-nonzero — the same value already fails `validate()`. See
+A malformed extra, or one naming a route the table refuses, prints `INVALID: …`
+on stderr and makes the whole check exit nonzero — the same value already fails
+`validate()`, and the gateway exits 78 on it at boot. See
 [`../security.md`](../security.md) §14 for what the gate refuses and why.
 
 ## `sanitize`

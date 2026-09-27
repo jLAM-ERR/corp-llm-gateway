@@ -58,12 +58,17 @@ The internal-CA bundle rides a separate Secret (`caBundle.existingSecret`, key
 deployment sets `CORP_LLM_CA_BUNDLE` (httpx oracle client) and `SSL_CERT_FILE`
 (LiteLLM's aiohttp) at the mount path.
 
-### Prod keys the chart does NOT template yet
+### Non-secret keys: the `config:` map
 
-`values-prod.yaml` flips `networkPolicy` and `coreDnsSinkhole` on, but it does
-**not** set the security-relevant keys below, and `deployment.yaml` has no
-generic env passthrough. Add them to the Secret map (they inject via
-`envFrom`) or to a mounted `config.toml`. See `configuration.md` for why each
+Non-secret keys go in `values.config` (or a `-f` values file's `config:`): the
+chart renders each entry as an env var on the gateway container **and** the
+config-check initContainer. `values.yaml` already sets
+`CORP_LLM_STRIP_INBOUND_HEADERS` and the five in-flight cap keys
+(`CORP_LLM_MAX_INFLIGHT`, `CORP_LLM_CANCEL_GRACE_SECONDS`,
+`CORP_LLM_BODY_READ_SECONDS`, `CORP_LLM_MAX_DRAINING`,
+`CORP_LLM_MAX_DRAINING_BYTES`); the issuance scalars go here too. Secrets
+never do. `values-prod.yaml` sets the keys below, the two OIDC ones as
+placeholders the DRI must replace. See `configuration.md` for why each
 matters.
 
 | Key | Set to | Without it |
@@ -72,8 +77,6 @@ matters.
 | `CORP_ENV` | `prod` | the `SSL_VERIFY=false` guard (F9) stays off |
 | `CORP_GATEWAY_OIDC_AUDIENCE` | your aud | operator RBAC cannot verify → all mutations denied |
 | `CORP_GATEWAY_OIDC_ISSUER` | your iss | same |
-
-(Wiring these into `values-prod.yaml` is a tracked plan follow-up.)
 
 ## Install flow
 
@@ -142,11 +145,119 @@ The gateway image mounts these onto LiteLLM's ASGI app (probes target them):
 - `GET  /healthz/extensions` — registered-extension health (does not gate readiness)
 - `GET  /metrics` — Prometheus scrape (the series ship with the metrics module; see `configuration.md`)
 
-`POST /internal/issue-token` is **not served today**, although `scripts/install.sh`
-still calls it: the health router is mounted without a `TokenIssuer`, and the route
-gate leaves the path unlisted, so it answers 404 `route_gate_unlisted`. Until it is
-wired, mint tokens with `gateway-admin token issue` (see `admin-cli.md`) and hand
-them to developers out-of-band.
+- `POST /internal/issue-token` — developer token issuance (see below); a local
+  404 while `CORP_GATEWAY_ISSUE_OIDC_ISSUER` is unset. Never forwarded to litellm.
+
+Every litellm admin, auth, spend, public, UI and non-probe health route answers
+`403 E_ROUTE_BLOCKED` ([`../security.md`](../security.md) §14). Probes use
+`/healthz/*` only.
+
+## Developer onboarding: Keycloak issuance
+
+Developers get their `X-Corp-Auth` corp token from `scripts/install.sh`: it signs
+them in to Keycloak with the device flow (RFC 8628) and trades the access token
+at `POST /internal/issue-token` for a 30-day corp token. `gateway-admin token
+issue` is the break-glass path only (`admin-cli.md`).
+
+### Keycloak realm and client
+
+Use a client of its own — **not** the operator RBAC client whose audience is
+`CORP_GATEWAY_OIDC_AUDIENCE`. The gateway refuses a token whose `aud` carries the
+operator audience, and refuses to boot when the two audiences are equal.
+
+1. **Client** (e.g. `corp-gateway-cli`): OpenID Connect, **public** (client
+   authentication off — the installer holds no secret), **OAuth 2.0 Device
+   Authorization Grant** enabled, standard and direct-access flows off unless
+   another tool needs them. Its id is `KEYCLOAK_CLIENT_ID` on laptops and
+   `CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID` on the gateway; the token's `azp` must
+   equal it.
+2. **Audience mapper** on that client (mapper type *Audience*, *Add to access
+   token* on): included custom audience = `CORP_GATEWAY_ISSUE_OIDC_AUDIENCE`
+   (e.g. `corp-gateway-issuance`).
+3. **Groups mapper** (mapper type *Group Membership*, token claim name `groups`
+   — or whatever `CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM` says — *Add to access
+   token* on). With *Full group path* on, the values look like
+   `/devs/payments`; the keys of `CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP` must match
+   the form you choose.
+4. Keep the default `basic` client scope: it puts `sub` in the access token
+   (Keycloak 25+). The gateway requires `exp`, `iat`, `iss`, `aud`, `sub`,
+   `jti` and `azp`, RS256 only.
+5. One Keycloak group per team, each listed in the team map; every mapped
+   `team_id` must already exist (`gateway-admin team create`). A developer in no
+   mapped group gets 403 `E_ISSUE_NO_TEAM`; in several, the first in the map's
+   order wins.
+
+### Gateway side
+
+Set the issuance keys (`configuration.md`, "Developer token issuance").
+`CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP` is a TOML table with no env form, so both
+deploy targets carry the keys in a config file mounted read-only at
+`/etc/corp-llm-gateway/config.toml`:
+
+- **Helm:** the `issuance.*` values. `enabled: true` renders them into that
+  file, mounts it on the gateway and the `config-check` initContainer, and sets
+  `CORP_LLM_GATEWAY_CONFIG_FILE`. `issuer`, `audience`, `clientId` and `teamMap`
+  are required. `teamMap` is a list, so its order survives — the first listed
+  group the user belongs to wins:
+
+  ```yaml
+  issuance:
+    enabled: true
+    issuer: https://keycloak.corp.lan/realms/dev
+    audience: corp-gateway-issuance
+    clientId: corp-gateway-cli
+    teamMap:
+      - group: "/devs/payments"
+        team: payments
+      - group: "/devs/core"
+        team: core
+  ```
+
+  The chart refuses to render with a `CORP_GATEWAY_ISSUE_*` key under `config:`
+  (an env var would shadow the file), and with `networkPolicy.enabled` but not
+  `networkPolicy.keycloak.enabled`. A changed `issuance.*` rolls the pods.
+- **Compose:** the `docker-compose.issuance.yml` overlay with
+  `compose/gateway/config.toml` (`compose/README.md`, "Developer token
+  issuance").
+
+Before the first issuance:
+
+- Postgres is required (`CORP_LLM_PG_DSN`), and `tokens/schema.sql` must have
+  been re-run on it (`upgrade.md`); the boot exits 78 otherwise;
+- the gateway fetches the realm JWKS, so on Helm with the NetworkPolicy on set
+  `networkPolicy.keycloak.{enabled,cidr,port}` (443 by default); an internal CA
+  goes in `caBundle` (`CORP_LLM_CA_BUNDLE`);
+- run `gateway-admin config check` — it reports a partial issuance config, the
+  missing extras and a bad CA bundle; the `corp_tokens` schema is checked at
+  boot only.
+
+### The developer installer
+
+`scripts/install.sh` reads:
+
+- `KEYCLOAK_ISSUER` + `KEYCLOAK_CLIENT_ID` — the realm URL and the public client.
+  The issuer must be `https://` (plain `http` only for `localhost` /
+  `127.0.0.1`); a trailing slash is dropped; the client id is required whenever
+  the issuer is set. Export both:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corp-llm-gateway/main/scripts/install.sh \
+    | KEYCLOAK_ISSUER='https://keycloak.corp.lan/realms/corp' KEYCLOAK_CLIENT_ID='corp-gateway-cli' bash
+  ```
+
+  Without `KEYCLOAK_ISSUER` the installer writes the rc block only, issues no
+  token, prints how to get one and exits 0.
+- `ANTHROPIC_AUTH_TOKEN` — the developer's subscription token; it drives the
+  smoke test at the end, which is skipped with a message when it is unset.
+- `CORP_GATEWAY_URL` (default `https://gateway.corp.lan`).
+- `CORP_GATEWAY_TOKEN_FILE` (default `~/.corp-llm-gateway/token`) — must be an
+  absolute path with no quote or newline; the token is written mode 0600, and
+  when the path is a symlink the installer writes through it to its target.
+
+A second run within `CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS` (default 10 min)
+is refused with 403 `E_ISSUE_RATE`; a third live token revokes the oldest
+(`CORP_GATEWAY_ISSUE_MAX_ACTIVE`, default 2). Revoke a developer's tokens with
+`gateway-admin token revoke --user <preferred_username>`.
 
 ## Rollback
 
@@ -170,11 +281,10 @@ client side below applies unchanged to it.
 and that wildcard is the one shape where a `claude-…` alias could carry the
 subscription token to the wrong upstream.
 
-Subscription auth and litellm virtual-key governance (budgets, rate limits,
-quotas) **cannot be used at the same time**, in any stack: both would need the
-`Authorization` header, and the subscription mode is the one that gets it. Moving
-one of the two credentials to another header is an open decision, not a missing
-feature. See `configuration.md` for the operator view and
+There is no litellm virtual-key governance (budgets, rate limits, quotas) in any
+stack: litellm's management surface, `/key/*` included, is refused at the route
+gate, so no virtual key can be issued ([`../security.md`](../security.md) §14).
+API-key mode survives only as a test posture. See `configuration.md` for the operator view and
 [`../security.md`](../security.md) §13 for what the bridge does and does not
 forward.
 

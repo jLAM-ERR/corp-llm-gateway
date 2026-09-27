@@ -29,7 +29,7 @@ Vector (M3-3) парсит каждую запись и проверяет пр�
 | `finding_label_counts` | object\<string, int\> | Формат `{"EMAIL": 2, "PERSON": 1}`; только гистограмма меток — без текста; всегда заполнено; `sum(values) == redaction_count` |
 | `cache_a_hit` | bool | Попал ли запрос в кэш дедупликации |
 | `gateway_version` | string | Версия приложения, обработавшего запрос |
-| `status` | string | `ok` / `failed` / `degraded` |
+| `status` | string | `ok` / `failed` / `degraded` / `cancelled` (клиент отключился до конца ответа, шлюз отменил запрос; `error_code` `E_CLIENT_DISCONNECTED`, только счётчики) |
 
 ## Поля NEVER
 
@@ -61,8 +61,8 @@ NEVER — это предохранитель эшелонированной з�
 | Поле | Условие | Описание |
 |---|---|---|
 | `placeholder_list` | `redaction_count > 0` | Только уникальный отсортированный список строк-placeholder (напр. `["[EMAIL_001]", "[NAME_002]"]`) — НИКОГДА не включает оригиналы |
-| `error_code` | `status != "ok"` | Стабильный код ошибки; без текста исключения |
-| `block_reason` | Сработала блокировка payload на Stage-0 | Короткий код причины отказа по контент-политике: `config:env`, `config:kube`, `config:nginx`, `config:ini`, `log:dump`. Никогда не содержит сырое содержимое payload. |
+| `error_code` | `status != "ok"` | Стабильный код ошибки; без текста исключения. Среди них: коды route gate `E_ROUTE_BLOCKED`, `E_ROUTE_GATE_UNARMED`, `E_ROUTE_GATE_ERROR`; коды лимита одновременных запросов `E_CAPACITY`, `E_BODY_TIMEOUT`, `E_OVERSIZE_BLOCKED`; `E_CLIENT_DISCONNECTED` (со `status` `cancelled`); `E_STORE_UNAVAILABLE` (хранилище токенов не ответило); `E_PROFILE_UNAVAILABLE` (сломанный профиль или хранилище конфигурации команд, которое не ответило). Маршрут выдачи токенов аудит-записей не пишет |
+| `block_reason` | Сработала точка блокировки | Короткий код причины отказа. Stage 0 (контент-политика): `config:env`, `config:kube`, `config:nginx`, `config:ini`, `log:dump`. Stage 5 (DLP-гейт на выходе): `dlp:canary`, `dlp:secret_leak`. Размер контента и политика запроса: `oversize:blocked`, `request:ambiguous_shape`, `provider:not_allowed`. Route gate (до роутера litellm, `route_gate/classify.py`): `route_gate_listed` (таблица отклоняет этот маршрут), `route_gate_unlisted` (записи в таблице нет), `route_gate_websocket` (рукопожатие на любом пути), `route_gate_malformed` (закодированный или обходящий путь), `route_gate_unarmed` (guardrail-callback не зарегистрирован) и `route_gate_error` (гейт не смог классифицировать). Лимит одновременных запросов (после того как route gate допустил переписываемый маршрут, `route_gate/inflight.py`): `capacity` (заняты все слоты `CORP_LLM_MAX_INFLIGHT` пода или все места чтения тела `CORP_LLM_MAX_DRAINING`, либо тело превысило бы бюджет `CORP_LLM_MAX_DRAINING_BYTES`; 429 `E_CAPACITY`) и `body_timeout` (тело не пришло целиком за `CORP_LLM_BODY_READ_SECONDS`; 408 `E_BODY_TIMEOUT`); тело больше 25 MiB там — `oversize:blocked`. Никогда не содержит сырое содержимое payload, путь или заголовок. |
 | `corp_llm_latency_ms` | Был выбран путь через корп-LLM | Латентность под-стадии для тюнинга ёмкости |
 | `pre_pass_latency_ms` | Был выбран путь pre-pass | Латентность под-стадии |
 | `audit_buffer_full` | Буфер Vector на ≥50% | Эксплуатационный сигнал |

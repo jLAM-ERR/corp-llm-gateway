@@ -39,8 +39,11 @@ from corp_llm_gateway.tokens import (
 
 
 @pytest.fixture(autouse=True)
-def _clean_config(hermetic_gateway_config: None) -> None:
-    """Resolve config hermetically for every test here (see tests/conftest.py)."""
+def _clean_config(hermetic_gateway_config: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve config hermetically for every test here (see tests/conftest.py),
+    with the process's shared stores unbuilt so no test inherits another's."""
+    monkeypatch.setattr(bootstrap, "_token_store", None)
+    monkeypatch.setattr(bootstrap, "_team_config_store", None)
 
 
 # ── build_guardrail: defaults ────────────────────────────────────────────────
@@ -67,6 +70,8 @@ def test_importing_module_does_not_build_guardrail() -> None:
 
     assert reloaded._guardrail is None
     assert "guardrail" not in vars(reloaded)
+    assert reloaded._token_store is None
+    assert reloaded._team_config_store is None
 
 
 def test_guardrail_attribute_builds_once_and_caches(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,8 +154,46 @@ def test_build_health_router_wires_the_four_checks_and_no_issuer() -> None:
         "/healthz/ready",
         "/healthz/sanitization",
     ]
-    # Issuance is `gateway-admin token issue`; the route gate refuses the path.
+    # Issuance is off unless CORP_GATEWAY_ISSUE_OIDC_ISSUER is set.
     assert router._issuer is None
+
+
+def test_the_lazy_guardrail_uses_the_shared_stores(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The issuance route mints into get_token_store(); the guardrail must
+    # authenticate against that same object, not a second store.
+    monkeypatch.setattr(bootstrap, "_guardrail", None)
+
+    guardrail = bootstrap.guardrail
+
+    assert guardrail._auth._store is bootstrap.get_token_store()
+    assert guardrail.orchestrator._team_store is bootstrap.get_team_config_store()
+
+
+async def test_the_lazy_guardrail_still_seeds_the_dev_team_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_DEV_TEAM_TOKEN", "solo-dev-token")
+    monkeypatch.setattr(bootstrap, "_guardrail", None)
+
+    ctx = await bootstrap.guardrail._auth.authenticate("solo-dev-token")
+
+    assert ctx.team_id == "local-dev"
+
+
+def test_the_shared_token_store_selects_postgres_when_dsn_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("asyncpg", reason="PostgresTokenStore requires the 'postgres' extra")
+    from corp_llm_gateway.tokens import PostgresTokenStore
+
+    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
+
+    store = bootstrap.get_token_store()
+
+    assert isinstance(store, PostgresTokenStore)
+    # No issuance configured: the pool keeps its auth-lookup size.
+    assert store._pool_max_size == bootstrap.TOKEN_POOL_BASE_SIZE
+    assert isinstance(bootstrap.get_team_config_store(), PostgresTeamConfigStore)
 
 
 async def test_the_health_router_is_ready_without_redis_or_postgres() -> None:

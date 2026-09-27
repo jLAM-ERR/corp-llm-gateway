@@ -16,3 +16,12 @@ class NoopExporter(MetricsExporter):
 
     def observe_request_latency(self, seconds: float, *, status: str) -> None:
         return None
+
+    def set_inflight(self, count: int) -> None:
+        return None
+
+    def record_cancelled(self) -> None:
+        return None
+
+    def set_draining_bytes(self, count: int) -> None:
+        return None
