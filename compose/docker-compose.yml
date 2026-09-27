@@ -136,6 +136,15 @@ services:
       # 78) under the CORP_ENV=production default above.
       - CORP_LLM_MAX_INFLIGHT=${CORP_LLM_MAX_INFLIGHT:-64}
       - CORP_LLM_CANCEL_GRACE_SECONDS=${CORP_LLM_CANCEL_GRACE_SECONDS:-5}
+      # The body must arrive whole within this many seconds, before a slot is
+      # taken (408 E_BODY_TIMEOUT past it), and all bodies buffered at once
+      # share the byte budget below (429 E_CAPACITY past it) — the memory knob.
+      - CORP_LLM_BODY_READ_SECONDS=${CORP_LLM_BODY_READ_SECONDS:-30}
+      - CORP_LLM_MAX_DRAINING_BYTES=${CORP_LLM_MAX_DRAINING_BYTES:-536870912}
+      # Bare name: its default is derived (4 x CORP_LLM_MAX_INFLIGHT), so an
+      # unset value must stay absent rather than pin a number that a raised cap
+      # would then fall below.
+      - CORP_LLM_MAX_DRAINING
       # F2: a self-disabled NER engine must fail closed, not silently return
       # no findings and let a PERSON/ORG egress. Load-bearing in production —
       # see helm/corp-llm-gateway/values-prod.yaml.
@@ -174,8 +183,9 @@ services:
       # disable certificate verification stack-wide. See
       # docs/security.md "Known gaps" and compose/README.md.
       - SSL_VERIFY=true
-      # Gateway-held provider keys (see compose/README.md "Virtual keys" —
-      # native anthropic/openai routing can't forward a per-developer key).
+      # Gateway-held provider keys, API-key mode only (see compose/README.md
+      # "Virtual keys" — native anthropic/openai routing can't forward a
+      # per-developer key). Subscription mode forwards the developer's own token.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       # Subscription-auth bridge (Mode B, docker-compose.oauth.yml). Named here
@@ -185,10 +195,12 @@ services:
       # bootstrap.build_guardrail() reads the same two keys.
       - CORP_LLM_FORWARD_ANTHROPIC_AUTH=${CORP_LLM_FORWARD_ANTHROPIC_AUTH:-0}
       - CORP_LLM_FORWARD_CHATGPT_AUTH=${CORP_LLM_FORWARD_CHATGPT_AUTH:-0}
-      # Virtual-key auth: the developer credential on this instance. Litellm
-      # intercepts Authorization and validates it against a virtual key
-      # (its own DB, not $POSTGRES_DB) instead of forwarding it — see
-      # compose/README.md "Virtual keys".
+      # API-key mode (the base file alone) is a TEST POSTURE: litellm checks
+      # Authorization against a virtual key in its own DB (not $POSTGRES_DB),
+      # but the route gate refuses /key/* and the admin UI, so nothing can issue
+      # one (docs/security.md §14). The developer credential in production is
+      # the subscription token (docker-compose.oauth.yml) plus the corp token on
+      # X-Corp-Auth. See compose/README.md "Virtual keys".
       #
       # BARE NAMES, not `${X:?...}`, and that is load-bearing for Mode B.
       # Compose interpolates every `-f` file BEFORE merging them, so a `:?`
@@ -230,10 +242,10 @@ services:
     #
     # The first block is the mode-aware replacement for the `${LITELLM_MASTER_KEY:?}`
     # that used to sit in the environment list (see the note there). Mode A
-    # (no bridge) authenticates developers with litellm virtual keys and is
-    # unserviceable without a master key — and worse, litellm skips proxy auth
-    # entirely when the key is None, so a missing key silently downgrades the
-    # only per-developer credential this mode has. Mode B (a bridge on) is
+    # (no bridge, the virtual-key test posture) is unserviceable without a master
+    # key — and worse, litellm skips proxy auth entirely when the key is None, so
+    # a missing key would silently drop the only litellm-side check that mode
+    # has. Mode B (a bridge on, the production mode) is
     # legitimately master-key-less: the developer's own OAuth bearer is the
     # credential, and build_guardrail() refuses to boot if a master key is
     # present anyway. It runs before the certifi work so a misconfigured stack
@@ -331,8 +343,8 @@ services:
         compress: "false"
     ports:
       # Loopback only — no TLS on this port until the nginx profile (C1)
-      # lands; virtual keys + X-Corp-Auth must not cross a server-class
-      # network in cleartext.
+      # lands; subscription tokens, virtual keys and X-Corp-Auth must not cross
+      # a server-class network in cleartext.
       - "127.0.0.1:${GATEWAY_PORT:-4000}:4000"
     depends_on:
       redis:

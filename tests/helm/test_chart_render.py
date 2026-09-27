@@ -216,6 +216,62 @@ def test_the_in_flight_cap_reaches_the_gateway_and_the_config_check(
     )
 
 
+_CAPACITY_DEFAULTS = {
+    "CORP_LLM_MAX_INFLIGHT": "64",
+    "CORP_LLM_CANCEL_GRACE_SECONDS": "5",
+    "CORP_LLM_BODY_READ_SECONDS": "30",
+    # Empty follows the cap: 4 x CORP_LLM_MAX_INFLIGHT.
+    "CORP_LLM_MAX_DRAINING": "",
+    "CORP_LLM_MAX_DRAINING_BYTES": "536870912",
+}
+
+
+def _init_env(deployment: dict[str, Any]) -> list[dict[str, Any]]:
+    init = deployment["spec"]["template"]["spec"]["initContainers"]
+    return [{e["name"]: e.get("value") for e in c.get("env", [])} for c in init]
+
+
+@pytest.mark.parametrize(("key", "value"), sorted(_CAPACITY_DEFAULTS.items()))
+def test_every_capacity_key_reaches_the_gateway_and_the_config_check(
+    rendered_docs: list[dict[str, Any]], key: str, value: str
+) -> None:
+    deployment = _first_of_kind(rendered_docs, "Deployment")
+
+    assert _env_of(deployment, "litellm")[key] == value
+    assert all(env.get(key) == value for env in _init_env(deployment))
+
+
+def test_the_rendered_capacity_defaults_pass_the_boot_check(
+    rendered_docs: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from corp_llm_gateway import settings
+
+    env = _env_of(_first_of_kind(rendered_docs, "Deployment"), "litellm")
+    for key in _CAPACITY_DEFAULTS:
+        monkeypatch.setenv(key, env[key])
+    monkeypatch.setenv("CORP_ENV", "prod")
+
+    capacity = settings.capacity()
+
+    assert capacity.max_inflight == 64
+    assert capacity.max_draining == 4 * 64
+    assert capacity.max_draining_bytes == 512 * 1024 * 1024
+
+
+def test_raising_the_cap_alone_keeps_the_draining_cap_valid() -> None:
+    # The draining cap follows the in-flight cap, so an operator who raises only
+    # CORP_LLM_MAX_INFLIGHT past 4 x 64 does not trip the boot check.
+    result = _render("config.CORP_LLM_MAX_INFLIGHT=300")
+    assert result.returncode == 0, result.stderr
+    deployment = _first_of_kind(
+        [doc for doc in yaml.safe_load_all(result.stdout) if doc], "Deployment"
+    )
+
+    env = _env_of(deployment, "litellm")
+    assert env["CORP_LLM_MAX_INFLIGHT"] == "300"
+    assert env["CORP_LLM_MAX_DRAINING"] == ""
+
+
 def test_the_render_never_sets_litellms_dead_concurrency_knobs() -> None:
     result = _render()
     assert result.returncode == 0, result.stderr

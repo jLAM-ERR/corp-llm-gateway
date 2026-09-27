@@ -24,14 +24,16 @@ set -euo pipefail
 
 REMOTE_DIR="${CORP_GATEWAY_DEPLOY_DIR:-/opt/corp-llm-gateway}"
 COMPOSE_FILE="docker-compose.yml"
-# Mode B (--mode oauth) layers docker-compose.oauth.yml on top. Every remote
-# `docker compose` call has to carry the SAME file list: a `logs` or `status`
-# run with only the base file resolves a different config than the running
-# stack, and `up -d` with the wrong list would silently recreate the containers
-# in the other mode. Hence one variable, used everywhere.
-DEPLOY_MODE="virtual-keys"
+# The default mode is oauth (subscription, the production mode): it layers
+# docker-compose.oauth.yml on top. virtual-keys (the base file alone) is a test
+# posture and has to be asked for. Every remote `docker compose` call has to
+# carry the SAME file list: a `logs` or `status` run with only the base file
+# resolves a different config than the running stack, and `up -d` with the wrong
+# list would silently recreate the containers in the other mode. Hence one
+# variable, used everywhere.
+DEPLOY_MODE="oauth"
 OAUTH_OVERLAY_FILE="docker-compose.oauth.yml"
-COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE}"
+COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE} -f ${OAUTH_OVERLAY_FILE}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/compose"
@@ -81,13 +83,15 @@ Subcommands:
 Options:
   --host USER@SERVER  SSH destination (required)
   --dir PATH          Remote deploy directory (default /opt/corp-llm-gateway)
-  --mode MODE         virtual-keys (default) or oauth. `oauth` adds
-                      docker-compose.oauth.yml: developers authenticate with
-                      their own Anthropic subscription token instead of a
-                      litellm virtual key. The server's .env must then contain
-                      NO LITELLM_MASTER_KEY line at all. Pass the SAME --mode
-                      to every later run against that host — logs/status/down
-                      resolve the stack through this file list.
+  --mode MODE         oauth (default) or virtual-keys. `oauth` is the
+                      production subscription mode: it adds
+                      docker-compose.oauth.yml, developers authenticate with
+                      their own Anthropic subscription token, and the server's
+                      .env must contain NO LITELLM_MASTER_KEY line at all.
+                      `virtual-keys` is the base file alone, a test posture
+                      only (nothing can issue a litellm virtual key). Pass the
+                      SAME --mode to every later run against that host —
+                      logs/status/down resolve the stack through this file list.
   --tail N            Lines of history for `logs` (default 200)
   --dry-run           Print what would change; transfers and starts nothing
   --yes               Skip the confirmation prompt (needed for `down`)
@@ -193,10 +197,9 @@ parse_args() {
     [[ "$TAIL_LINES" =~ ^[0-9]+$ ]] || fatal "--tail needs a number (got: ${TAIL_LINES})"
 
     # Resolved here, not at parse time, so `--mode` is order-independent. A
-    # typo must be a refusal: falling back to the default would silently deploy
-    # the virtual-key mode onto a host whose .env has no master key, and the
-    # stack would then refuse to boot with a message about a variable the
-    # operator never meant to use.
+    # typo must be a refusal: falling back to the default would silently switch
+    # a host to the other mode, and the stack would then refuse to boot with a
+    # message about a variable the operator never meant to touch.
     case "$DEPLOY_MODE" in
         virtual-keys)
             COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE}"
@@ -482,9 +485,9 @@ confirm() {
 # subcommands
 # --------------------------------------------------------------------------- #
 
-# --mode oauth against a server whose .env still has a LITELLM_MASTER_KEY line
-# is deliberately NOT pre-checked here: this script never reads the server's
-# .env, not even to test whether a key is present. The stack already refuses
+# oauth mode (the default) against a server whose .env still has a
+# LITELLM_MASTER_KEY line is deliberately NOT pre-checked here: this script never
+# reads the server's .env, not even to test whether a key is present. The stack already refuses
 # that combination at boot with a named cause
 # (settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE), and wait_for_healthcheck below
 # surfaces it as a failed deploy. See docs/ops/deployment-modes.md.

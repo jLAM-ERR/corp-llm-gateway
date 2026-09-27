@@ -128,6 +128,19 @@ config:
   # E_CAPACITY. Scale replicas rather than raise it. 0 = off, refused at boot
   # when CORP_ENV is prod/production.
   CORP_LLM_MAX_INFLIGHT: "64"
+  # Seconds a request cancelled by a client disconnect gets to unwind; a slot is
+  # held at most 2 x this after a disconnect. (0, 60].
+  CORP_LLM_CANCEL_GRACE_SECONDS: "5"
+  # Seconds a rewritten request gets to deliver its whole body, before it takes
+  # a slot; past it 408 E_BODY_TIMEOUT. (0, 300].
+  CORP_LLM_BODY_READ_SECONDS: "30"
+  # Requests reading a body at once per pod; the next gets 429 E_CAPACITY
+  # unread. Empty = 4 x CORP_LLM_MAX_INFLIGHT, so it follows the cap; a number
+  # must be at least CORP_LLM_MAX_INFLIGHT (config check and boot refuse less).
+  CORP_LLM_MAX_DRAINING: ""
+  # Request-body bytes buffered at once per pod — the memory knob. Size it
+  # against the pod's memory limit (docs/ops/capacity.md); 25 MiB to 16 GiB.
+  CORP_LLM_MAX_DRAINING_BYTES: "536870912"
 
 # Set to the name of an external (Vault / external-secrets) Secret to source the
 # sensitive env contract from it. When set, the chart renders no Secret and the

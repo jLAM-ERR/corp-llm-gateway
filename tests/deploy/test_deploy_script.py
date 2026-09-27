@@ -615,8 +615,8 @@ def test_up_stages_syncs_pulls_and_reports(tmp_path: Path) -> None:
     assert (remote / "postgres" / "initdb" / "01-schema.sql").exists()
     assert (remote / ".env").read_text() == "POSTGRES_PASSWORD=real-server-secret\n"
     docker_log = _log(tmp_path, "docker.log")
-    assert "compose -f docker-compose.yml pull" in docker_log
-    assert "compose -f docker-compose.yml up -d" in docker_log
+    assert f"compose {BOTH_FILES} pull" in docker_log
+    assert f"compose {BOTH_FILES} up -d" in docker_log
     assert not (remote / ".deploy.lock").exists(), "the lock must be released on exit"
 
 
@@ -642,7 +642,7 @@ def test_down_needs_confirmation_and_never_removes_volumes(tmp_path: Path) -> No
     assert "--yes" in refused.stderr  # type: ignore[attr-defined]
     assert "down" not in after_refusal, "an unconfirmed run must not touch the stack"
     assert confirmed.returncode == 0, confirmed.stderr  # type: ignore[attr-defined]
-    assert "compose -f docker-compose.yml down" in _log(tmp_path, "docker.log")
+    assert f"compose {BOTH_FILES} down" in _log(tmp_path, "docker.log")
     assert " -v" not in _log(tmp_path, "docker.log")
 
 
@@ -659,7 +659,7 @@ def test_restart_without_a_service_argument_works(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
-    assert "compose -f docker-compose.yml restart" in _log(tmp_path, "docker.log")
+    assert f"compose {BOTH_FILES} restart" in _log(tmp_path, "docker.log")
 
 
 def test_a_service_argument_that_could_inject_a_command_is_refused(tmp_path: Path) -> None:
@@ -721,13 +721,43 @@ def test_oauth_mode_layers_the_overlay_on_every_remote_compose_call(tmp_path: Pa
             assert line.startswith(f"compose {BOTH_FILES}"), line
 
 
-def test_the_default_mode_keeps_the_base_file_alone(tmp_path: Path) -> None:
+def test_the_default_mode_is_the_subscription_mode(tmp_path: Path) -> None:
+    # Subscription mode is the production one; a bare `up` must deploy it, not
+    # the virtual-key test posture.
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
 
-    _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "status"], ps=HEALTHY_PS)
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "up"], ps=HEALTHY_PS)
 
-    assert "docker-compose.oauth.yml" not in _log(tmp_path, "docker.log")
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    docker_log = _log(tmp_path, "docker.log")
+    assert f"compose {BOTH_FILES} up -d" in docker_log
+    for line in docker_log.splitlines():
+        if line.startswith("compose "):
+            assert line.startswith(f"compose {BOTH_FILES}"), line
+    assert (remote / "docker-compose.oauth.yml").exists()
+
+
+def test_virtual_keys_mode_keeps_the_base_file_alone(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "--mode", "virtual-keys", "status"],
+        ps=HEALTHY_PS,
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    docker_log = _log(tmp_path, "docker.log")
+    assert "compose -f docker-compose.yml ps --all" in docker_log
+    assert "docker-compose.oauth.yml" not in docker_log
+
+
+def test_the_usage_names_oauth_as_the_default(script_text: str) -> None:
+    assert re.search(r"^DEPLOY_MODE=\"oauth\"$", script_text, re.M)
+    assert "oauth (default) or virtual-keys" in script_text
 
 
 def test_the_oauth_overlay_is_synced_unlike_the_dev_only_build_overlay(tmp_path: Path) -> None:
