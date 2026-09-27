@@ -194,3 +194,127 @@ def test_postgres_store_without_asyncpg_raises() -> None:
             PostgresTokenStore("postgresql://x")
     else:
         pytest.skip("asyncpg is installed; cannot test the absent-asyncpg path")
+
+
+# Per-token single-flight ---------------------------------------------------
+
+
+class _GatedStore(InMemoryTokenStore):
+    """Lookups of ``gated`` tokens wait on ``release``; every call is counted."""
+
+    def __init__(self, *gated: str) -> None:
+        super().__init__()
+        self.gated = set(gated)
+        self.release = asyncio.Event()
+        self.calls: list[str] = []
+        self.fail_with: BaseException | None = None
+
+    async def lookup(self, corp_token: str) -> TokenInfo | None:
+        self.calls.append(corp_token)
+        if corp_token in self.gated:
+            await self.release.wait()
+            if self.fail_with is not None:
+                raise self.fail_with
+        return await super().lookup(corp_token)
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_lookup_does_not_hold_up_a_different_token() -> None:
+    store = _GatedStore("tok-stuck")
+    store.upsert(_info("tok-stuck"))
+    store.upsert(_info("tok-free", user_id="bob"))
+    mw = AuthMiddleware(store)
+
+    stuck = asyncio.create_task(mw.authenticate("tok-stuck"))
+    await asyncio.sleep(0)
+    free = await asyncio.wait_for(mw.authenticate("tok-free"), timeout=1)
+
+    assert free.user_id == "bob"
+    assert not stuck.done()
+    store.release.set()
+    assert (await stuck).user_id == "alice"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_lookups_of_one_token_share_one_store_call() -> None:
+    store = _GatedStore("tok-1")
+    store.upsert(_info("tok-1"))
+    mw = AuthMiddleware(store)
+
+    waiters = [asyncio.create_task(mw.authenticate("tok-1")) for _ in range(5)]
+    await asyncio.sleep(0)
+    store.release.set()
+    results = await asyncio.gather(*waiters)
+
+    assert store.calls == ["tok-1"]
+    assert {r.user_id for r in results} == {"alice"}
+    # Then served from the cache.
+    await mw.authenticate("tok-1")
+    assert store.calls == ["tok-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_reaches_every_waiter_and_is_not_cached() -> None:
+    store = _GatedStore("tok-1")
+    store.upsert(_info("tok-1"))
+    store.fail_with = TimeoutError()
+    mw = AuthMiddleware(store)
+
+    waiters = [asyncio.create_task(mw.authenticate("tok-1")) for _ in range(3)]
+    await asyncio.sleep(0)
+    store.release.set()
+    results = await asyncio.gather(*waiters, return_exceptions=True)
+
+    assert all(isinstance(r, TimeoutError) for r in results)
+    assert store.calls == ["tok-1"]
+    store.fail_with = None
+    assert (await mw.authenticate("tok-1")).user_id == "alice"
+    assert store.calls == ["tok-1", "tok-1"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_token_is_looked_up_again_next_time() -> None:
+    store = _GatedStore()
+    mw = AuthMiddleware(store)
+
+    for _ in range(2):
+        with pytest.raises(InvalidTokenError):
+            await mw.authenticate("tok-unknown")
+
+    assert store.calls == ["tok-unknown", "tok-unknown"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_waiter_does_not_fail_the_others_sharing_its_lookup() -> None:
+    store = _GatedStore("tok-1")
+    store.upsert(_info("tok-1"))
+    mw = AuthMiddleware(store)
+
+    first = asyncio.create_task(mw.authenticate("tok-1"))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(mw.authenticate("tok-1"))
+    await asyncio.sleep(0)
+    first.cancel()
+    await asyncio.sleep(0)
+    store.release.set()
+
+    assert (await asyncio.wait_for(second, timeout=1)).user_id == "alice"
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert store.calls == ["tok-1"]
+
+
+@pytest.mark.asyncio
+async def test_no_lookup_bookkeeping_outlives_its_lookup() -> None:
+    store = _GatedStore("tok-1")
+    store.upsert(_info("tok-1"))
+    store.fail_with = OSError()
+    mw = AuthMiddleware(store)
+    store.release.set()
+
+    with pytest.raises(OSError):
+        await mw.authenticate("tok-1")
+    with pytest.raises(InvalidTokenError):
+        await mw.authenticate("tok-other")
+
+    assert mw._inflight == {}

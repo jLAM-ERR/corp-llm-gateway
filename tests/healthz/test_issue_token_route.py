@@ -888,6 +888,46 @@ async def test_an_asyncpg_connection_failure_is_503(name: str) -> None:
     assert (resp.status_code, resp.json()) == (503, {"error": "E_ISSUE_STORE_UNAVAILABLE"})
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["PostgresConnectionError", "InterfaceError", "AdminShutdownError", "CrashShutdownError"],
+)
+async def test_an_asyncpg_store_failure_that_is_no_oserror_is_503_by_its_class(
+    name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+    exc = getattr(asyncpg.exceptions, name)(f"server closed the connection for {BEARER}")
+    # Not an OSError: only the asyncpg-class branch can classify it.
+    assert not isinstance(exc, (OSError, ConnectionError))
+
+    with caplog.at_level(logging.DEBUG):
+        resp = await _post(_policy_router(_FailingStore(exc)))
+
+    assert (resp.status_code, resp.json()) == (503, {"error": "E_ISSUE_STORE_UNAVAILABLE"})
+    assert name in caplog.text
+    assert BEARER not in caplog.text
+
+
+async def test_a_cancelled_statement_reaching_the_route_stays_500() -> None:
+    # 57014 is an OperatorInterventionError, but a statement bound, not an outage.
+    asyncpg = pytest.importorskip("asyncpg")
+    exc = asyncpg.exceptions.QueryCanceledError("canceling statement due to statement timeout")
+
+    resp = await _post(_policy_router(_FailingStore(exc)))
+
+    assert (resp.status_code, resp.json()) == (500, {"error": "E_ISSUE_INTERNAL"})
+
+
+async def test_the_bound_log_names_every_leg_it_covers(caplog: pytest.LogCaptureFixture) -> None:
+    router = _policy_router(_HangingStore(), issue_timeout_s=0.1)
+
+    with caplog.at_level(logging.DEBUG):
+        resp = await asyncio.wait_for(_post(router), timeout=5)
+
+    assert resp.json() == {"error": "E_ISSUE_STORE_TIMEOUT"}
+    assert "issuance timed out (verifier, team lookup or store)" in caplog.text
+
+
 async def test_an_asyncpg_query_failure_stays_500() -> None:
     asyncpg = pytest.importorskip("asyncpg")
     exc = asyncpg.exceptions.UndefinedColumnError("column oidc_jti does not exist")

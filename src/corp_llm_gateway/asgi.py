@@ -80,7 +80,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from corp_llm_gateway import config, litellm_cli, litellm_config, settings
+from corp_llm_gateway import config, litellm_cli, litellm_config, pg_session, settings
 from corp_llm_gateway.audit import AuditLogger, get_sink
 from corp_llm_gateway.metrics import get_exporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware
@@ -192,33 +192,54 @@ _TOKEN_SCHEMA_PROBLEM = (
     "src/corp_llm_gateway/tokens/schema.sql (idempotent) before enabling "
     "CORP_GATEWAY_ISSUE_OIDC_ISSUER"
 )
-_TOKEN_SCHEMA_REFUSED = (
-    "issuance schema check: Postgres refused CORP_LLM_PG_DSN ({}) — check the DSN syntax, "
-    "the credentials and the database name"
+# CREATE UNIQUE INDEX IF NOT EXISTS skips an index that already carries the name,
+# so for these two re-applying schema.sql alone changes nothing.
+_JTI_INDEX_INVALID = (
+    "corp_tokens_oidc_jti_key exists but is INVALID (an interrupted CREATE INDEX "
+    "CONCURRENTLY, or a failed REINDEX) — DROP INDEX corp_tokens_oidc_jti_key (or "
+    "REINDEX INDEX corp_tokens_oidc_jti_key), then re-apply "
+    "src/corp_llm_gateway/tokens/schema.sql"
 )
+_JTI_INDEX_MISSHAPEN = (
+    "corp_tokens_oidc_jti_key is not a UNIQUE index on corp_tokens (oidc_jti) alone — "
+    "DROP INDEX corp_tokens_oidc_jti_key, then re-apply "
+    "src/corp_llm_gateway/tokens/schema.sql"
+)
+_TOKEN_SCHEMA_REFUSED = {
+    pg_session.BOOT_REFUSE: (
+        "issuance schema check: Postgres refused CORP_LLM_PG_DSN ({}) — check the DSN "
+        "syntax, the credentials and the database name"
+    ),
+    pg_session.BOOT_REFUSE_TLS: (
+        "issuance schema check: TLS to CORP_LLM_PG_DSN failed ({}) — check sslmode, the "
+        "server certificate and the CA the driver trusts"
+    ),
+    pg_session.BOOT_REFUSE_PRIVILEGE: (
+        "issuance schema check: the CORP_LLM_PG_DSN role lacks SELECT on corp_tokens ({}) "
+        "— grant the gateway role SELECT, INSERT and UPDATE on corp_tokens"
+    ),
+}
 
 # The index the store's replay mapping names, proven to be what the name claims:
 # valid, UNIQUE, not partial, not on an expression, keyed on exactly oidc_jti of
-# the corp_tokens the store's unqualified queries resolve to.
+# the corp_tokens the store's unqualified queries resolve to. No row: no such index.
 _JTI_INDEX_SQL = """
-SELECT EXISTS (
-    SELECT 1
-    FROM pg_index i
-    JOIN pg_class ic ON ic.oid = i.indexrelid
-    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
-    WHERE i.indrelid = to_regclass('corp_tokens')
-      AND ic.relname = 'corp_tokens_oidc_jti_key'
-      AND i.indisunique
-      AND i.indisvalid
-      AND i.indnatts = 1
-      AND i.indpred IS NULL
-      AND i.indexprs IS NULL
-      AND a.attname = 'oidc_jti'
-)
+SELECT i.indisvalid AS valid,
+       coalesce(i.indisunique
+                AND i.indnatts = 1
+                AND i.indpred IS NULL
+                AND i.indexprs IS NULL
+                AND a.attname = 'oidc_jti', false) AS keyed_on_jti
+FROM pg_index i
+JOIN pg_class ic ON ic.oid = i.indexrelid
+LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+WHERE i.indrelid = to_regclass('corp_tokens')
+  AND ic.relname = 'corp_tokens_oidc_jti_key'
 """
 
 
-async def _token_schema_is_current(dsn: str) -> bool:
+async def _token_schema_state(dsn: str) -> str | None:
+    """The schema problem to refuse on; ``None`` when the table is current."""
     import asyncpg
 
     conn = await asyncpg.connect(dsn, timeout=_TOKEN_SCHEMA_TIMEOUT_S)
@@ -230,20 +251,17 @@ async def _token_schema_is_current(dsn: str) -> bool:
                 timeout=_TOKEN_SCHEMA_TIMEOUT_S,
             )
         except (asyncpg.exceptions.UndefinedTableError, asyncpg.exceptions.UndefinedColumnError):
-            return False
-        return bool(await conn.fetchval(_JTI_INDEX_SQL, timeout=_TOKEN_SCHEMA_TIMEOUT_S))
+            return _TOKEN_SCHEMA_PROBLEM
+        index = await conn.fetchrow(_JTI_INDEX_SQL, timeout=_TOKEN_SCHEMA_TIMEOUT_S)
     finally:
         await conn.close()
-
-
-def _unreachable(exc: BaseException) -> bool:
-    """A network-class failure: the database may come back without a config change."""
-    import asyncpg
-
-    return isinstance(
-        exc,
-        (OSError, TimeoutError, asyncpg.CannotConnectNowError, asyncpg.TooManyConnectionsError),
-    )
+    if index is None:
+        return _TOKEN_SCHEMA_PROBLEM
+    if not index["keyed_on_jti"]:
+        return _JTI_INDEX_MISSHAPEN
+    if not index["valid"]:
+        return _JTI_INDEX_INVALID
+    return None
 
 
 def _token_schema_problem(dsn: str) -> str | None:
@@ -252,18 +270,18 @@ def _token_schema_problem(dsn: str) -> str | None:
     # loop of its own on a worker thread.
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            current = pool.submit(lambda: asyncio.run(_token_schema_is_current(dsn))).result()
+            return pool.submit(lambda: asyncio.run(_token_schema_state(dsn))).result()
     except Exception as exc:
         # The type only: a driver message can carry the DSN.
-        if not _unreachable(exc):
-            return _TOKEN_SCHEMA_REFUSED.format(type(exc).__name__)
+        outcome = pg_session.boot_probe_outcome(exc)
+        if outcome != pg_session.BOOT_WARN:
+            return _TOKEN_SCHEMA_REFUSED[outcome].format(type(exc).__name__)
         log.warning(
             "issuance schema check skipped, Postgres not reachable at boot (%s); "
             "readiness reports it",
             type(exc).__name__,
         )
         return None
-    return None if current else _TOKEN_SCHEMA_PROBLEM
 
 
 def _check_issuance() -> bool:

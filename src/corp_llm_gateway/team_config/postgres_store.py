@@ -17,6 +17,11 @@ import types
 from pathlib import Path
 from typing import Any
 
+from corp_llm_gateway.pg_session import (
+    KEEPALIVE_SERVER_SETTINGS,
+    RELEASE_BUDGET_S,
+    run_on_connection,
+)
 from corp_llm_gateway.team_config.models import FailPolicyOverrides, TeamConfig
 from corp_llm_gateway.team_config.store import TeamConfigStore, TeamNotFoundError
 
@@ -28,6 +33,8 @@ _asyncpg_tried = False
 # Waiting for a pooled connection, and opening one; asyncio.TimeoutError past it.
 _ACQUIRE_TIMEOUT_S = 5.0
 _CONNECT_TIMEOUT_S = 5.0
+# Returning a `get` connection to the pool; past it the connection is dropped.
+_RELEASE_BUDGET_S = RELEASE_BUDGET_S
 
 _COLUMNS = (
     "team_id, name, replace_md_path, profile_ids, "
@@ -112,6 +119,7 @@ class PostgresTeamConfigStore(TeamConfigStore):
                     min_size=1,
                     max_size=5,
                     timeout=_CONNECT_TIMEOUT_S,
+                    server_settings=KEEPALIVE_SERVER_SETTINGS,
                 )
         return self._pool
 
@@ -126,12 +134,16 @@ class PostgresTeamConfigStore(TeamConfigStore):
             await conn.execute(sql)
 
     async def get(self, team_id: str) -> TeamConfig:
+        # On the issuance route and the request path: bounded like issuance.
         pool = await self._get_pool()
-        async with self._acquire(pool) as conn:
-            row: Any = await conn.fetchrow(
-                f"SELECT {_COLUMNS} FROM team_config WHERE team_id = $1",
-                team_id,
-            )
+        row: Any = await run_on_connection(
+            pool,
+            lambda conn: conn.fetchrow(
+                f"SELECT {_COLUMNS} FROM team_config WHERE team_id = $1", team_id
+            ),
+            acquire_timeout=_ACQUIRE_TIMEOUT_S,
+            release_budget=_RELEASE_BUDGET_S,
+        )
         if row is None:
             raise TeamNotFoundError(team_id)
         return _row_to_team_config(row)

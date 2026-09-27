@@ -44,6 +44,7 @@ from corp_llm_gateway.detectors import NerUnavailableError
 from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
 from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.payload.size_threshold import OversizeContentError, should_skip_sanitization
+from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.sanitizer import (
     OpenAiToolCallDesanitizer,
@@ -468,6 +469,23 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             raise GuardrailHttpException(
                 401, error_code, _AUTH_ERROR_MESSAGES.get(error_code, "authentication failed")
             ) from exc
+        except Exception as exc:
+            if not store_unavailable(exc):
+                raise
+            # The class name only: a driver message can quote the token.
+            logger.warning(
+                "litellm_pre_call_token_store_unavailable request_id=%s exc_type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            self._record_failure(request_id, error_code="E_STORE_UNAVAILABLE")
+            _now = datetime.now(UTC)
+            await self.audit(
+                data, None, _now, _now, status="failed", error_code="E_STORE_UNAVAILABLE"
+            )
+            raise GuardrailHttpException(
+                503, "E_STORE_UNAVAILABLE", "token store unavailable"
+            ) from None
 
         logger.info(
             "litellm_pre_call_auth_ok request_id=%s team_id=%s user_id=%s",
@@ -2324,6 +2342,7 @@ _FAILURE_COMPONENT: dict[str, str] = {
     "E_TOKEN_REVOKED": "auth",
     "E_TOKEN_INVALID": "auth",
     "E_AUTH": "auth",
+    "E_STORE_UNAVAILABLE": "token_store",
     "E_PROVIDER_AUTH": "auth",
     "E_PROVIDER_BLOCKED": "provider",
     "E_POLICY_BLOCKED": "policy",

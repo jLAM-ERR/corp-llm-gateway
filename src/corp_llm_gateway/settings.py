@@ -290,7 +290,7 @@ KEYS: tuple[Key, ...] = (
     Key(
         "CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS",
         default="10",
-        help="bound on one issuance's team lookup + token store work; 503 past it (5-300)",
+        help="bound on one issuance: verifier, team lookup, token store; 503 past it (5-300)",
     ),
     # ── Providers (providers/registry.py) ────────────────────────────────────
     Key("CORP_ALLOW_V2_PROVIDERS", flag=True, default="0", help="allow non-v1 providers"),

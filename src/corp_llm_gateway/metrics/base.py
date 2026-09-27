@@ -72,6 +72,7 @@ FAILURE_COMPONENTS: tuple[str, ...] = (
     "request",
     "route_gate",
     "sanitize",
+    "token_store",
 )
 
 

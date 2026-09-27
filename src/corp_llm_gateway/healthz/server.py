@@ -18,8 +18,9 @@ The issue-token route is a public endpoint and is bounded like one: the Keycloak
 access token comes from the `Authorization: Bearer` header only, any request
 body byte is refused (the read stops at 1 KiB and at 2 s), and the route has its
 own in-flight cap and token bucket, answered with 429 without queueing. The
-issuer's work after the body (verification, team lookup, token store) is bounded
-too: past the bound the request answers 503 and frees its slot. With no issuer
+issuer's work after the body (verifier and its JWKS fetch, team lookup, token
+store) is bounded too, by one bound: past it the request answers 503
+``E_ISSUE_STORE_TIMEOUT`` and frees its slot. With no issuer
 the path is a local 404 for every method — it never falls through. Error bodies
 carry a code only, every issuance response is ``cache-control: no-store``, and
 the one log line per request carries the status and the code: never the bearer,
@@ -35,12 +36,12 @@ import asyncio
 import json
 import logging
 import re
-import sys
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
 from corp_llm_gateway.healthz.checks import HealthCheck
+from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.tokens.errors import IssuancePolicyError
 from corp_llm_gateway.tokens.issuance import (
     JwksUnavailableError,
@@ -223,9 +224,12 @@ class HealthRouter:
         except Exception as exc:
             # The class name only: a driver message can quote a token or a claim.
             if bound.expired():
-                _log.warning("issue_token store work past its bound: %s", type(exc).__name__)
+                _log.warning(
+                    "issue_token issuance timed out (verifier, team lookup or store): %s",
+                    type(exc).__name__,
+                )
                 return 503, "E_ISSUE_STORE_TIMEOUT", None
-            if _store_unavailable(exc):
+            if store_unavailable(exc):
                 _log.warning("issue_token store unavailable: %s", type(exc).__name__)
                 return 503, "E_ISSUE_STORE_UNAVAILABLE", None
             _log.error("issue_token internal failure: %s", type(exc).__name__)
@@ -330,23 +334,6 @@ def _bearer_token(scope: Scope) -> str:
     if scheme.lower() != "bearer":
         return ""
     return token.strip()
-
-
-def _store_unavailable(exc: BaseException) -> bool:
-    """A connection-class store failure. asyncpg is only consulted when something
-    already imported it: without it loaded, none of its errors can be in flight."""
-    if isinstance(exc, OSError):  # ConnectionRefusedError, TimeoutError (pool acquire), …
-        return True
-    asyncpg = sys.modules.get("asyncpg")
-    return asyncpg is not None and isinstance(
-        exc,
-        (
-            asyncpg.PostgresConnectionError,
-            asyncpg.InterfaceError,
-            asyncpg.CannotConnectNowError,
-            asyncpg.TooManyConnectionsError,
-        ),
-    )
 
 
 def _code_of(exc: BaseException, default: str) -> str:

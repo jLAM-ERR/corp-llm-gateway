@@ -52,7 +52,9 @@ class AuthMiddleware:
         self._store = store
         self._cache_ttl = float(revocation_cache_seconds)
         self._cache: dict[str, tuple[TokenInfo, float]] = {}
-        self._lock = asyncio.Lock()
+        # One store lookup per token in flight, shared by its concurrent callers; a
+        # stalled lookup holds up only the callers of that token.
+        self._inflight: dict[str, asyncio.Task[TokenInfo | None]] = {}
 
     async def authenticate(
         self,
@@ -86,20 +88,28 @@ class AuthMiddleware:
         return None
 
     async def _lookup(self, corp_token: str) -> TokenInfo | None:
-        now_mono = time.monotonic()
         cached = self._cache.get(corp_token)
-        if cached is not None and (now_mono - cached[1]) < self._cache_ttl:
+        if cached is not None and (time.monotonic() - cached[1]) < self._cache_ttl:
             return cached[0]
+        task = self._inflight.get(corp_token)
+        if task is None:
+            task = asyncio.ensure_future(self._fetch(corp_token))
+            self._inflight[corp_token] = task
+            task.add_done_callback(lambda done: self._forget(corp_token, done))
+        # Shielded: one caller giving up does not cancel the lookup the others share.
+        return await asyncio.shield(task)
 
-        async with self._lock:
-            now_mono = time.monotonic()
-            cached = self._cache.get(corp_token)
-            if cached is not None and (now_mono - cached[1]) < self._cache_ttl:
-                return cached[0]
-            info = await self._store.lookup(corp_token)
-            if info is not None:
-                self._cache[corp_token] = (info, now_mono)
-            return info
+    async def _fetch(self, corp_token: str) -> TokenInfo | None:
+        info = await self._store.lookup(corp_token)
+        if info is not None:
+            self._cache[corp_token] = (info, time.monotonic())
+        return info
+
+    def _forget(self, corp_token: str, done: asyncio.Task[TokenInfo | None]) -> None:
+        if self._inflight.get(corp_token) is done:
+            del self._inflight[corp_token]
+        if not done.cancelled():
+            done.exception()  # retrieved, even when every waiter gave up
 
     @staticmethod
     def _validate(info: TokenInfo, now: datetime) -> AuthContext:
