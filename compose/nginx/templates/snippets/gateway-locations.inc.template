@@ -90,10 +90,11 @@ location / {
 }
 
 # add_header here REPLACES every add_header of an enclosing level, it does not
-# merge with them. So this 429 carries no HSTS in terminate: a known gap, since
-# this snippet also serves behind-proxy, where HSTS on plain HTTP is wrong.
+# merge with them, so the listener's HSTS is restated: $hsts_value (00-http) is
+# the header over TLS and empty, so not sent, on behind-proxy's plain HTTP.
 location @rate_limited {
     default_type application/json;
     add_header Retry-After 1 always;
+    add_header Strict-Transport-Security $hsts_value always;
     return 429 '{"error":{"code":"E_RATE_LIMITED"}}';
 }

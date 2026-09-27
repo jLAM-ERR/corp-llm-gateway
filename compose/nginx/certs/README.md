@@ -63,7 +63,9 @@ Clients that already trust that CA verify with no extra flag:
 
 `scripts/deploy/make-selfsigned-certs.sh` makes a throwaway CA and a leaf
 signed by it, and prints the path of the CA certificate. It is **not for
-production**.
+production**. By default it writes into this directory,
+for a pilot or a local run; on a real deployment, generate or install the
+files on the server itself.
 
 ```
 scripts/deploy/make-selfsigned-certs.sh --domain corp.example 10.1.2.3

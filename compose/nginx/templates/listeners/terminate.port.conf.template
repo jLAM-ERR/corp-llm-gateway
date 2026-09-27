@@ -2,7 +2,8 @@
 # and on 8081 for Langfuse, whatever the name. nginx is the public TLS
 # endpoint, so there is no trusted-peer gate. The certificate must carry the
 # IP or local name clients dial. No plain listener and no :80 redirect; HSTS
-# only on the TLS blocks here.
+# only on the TLS blocks here. No session tickets: nginx never rotates their
+# key, which would undo forward secrecy.
 
 server {
     listen 8080 ssl default_server;
@@ -12,6 +13,9 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:corp_tls:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
     add_header Strict-Transport-Security "max-age=31536000" always;
     include /etc/nginx/rendered/snippets/gateway-locations.inc;
 }
@@ -24,6 +28,9 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:corp_tls:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
     add_header Strict-Transport-Security "max-age=31536000" always;
     include /etc/nginx/rendered/snippets/langfuse-locations.inc;
 }

@@ -268,10 +268,20 @@ esac
 langfuse_host=$(lowercase "$langfuse_host")
 # The hostname rule of step 6; a dotted-quad IPv4 address matches it too.
 printf '%s\n' "$langfuse_host" | grep -Eq "$HOSTNAME_ERE" || valid=0
+# Only digits and dots is an IPv4 address, never a hostname: 999.1.2.3 is refused.
+case $langfuse_host in
+    *[!0-9.]*) ;;
+    *) is_ipv4 "$langfuse_host" || valid=0 ;;
+esac
 case $langfuse_port in
     *[!0-9]*) valid=0 ;;
+    *)
+        # The length check first: it keeps the comparison inside the shell's integers.
+        if [ ${#langfuse_port} -gt 5 ] || [ "${langfuse_port:-0}" -gt 65535 ]; then
+            valid=0
+        fi
+        ;;
 esac
-[ ${#langfuse_port} -le 5 ] || valid=0
 case $langfuse_rest in
     '' | /) ;;
     *) valid=0 ;;

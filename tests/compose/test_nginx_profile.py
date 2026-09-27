@@ -353,9 +353,13 @@ TOKEN_LIMITS = [
     "limit_conn corp_conn ${NGINX_TOKEN_CONN}",
 ]
 ISSUE_LIMIT = "limit_req zone=corp_issue burst=2 nodelay"
+# Empty over plain HTTP, and nginx sends no header for an empty add_header value.
+HSTS_ON_TLS = "add_header Strict-Transport-Security $hsts_value always"
+HSTS_VALUE_MAP = 'map $https $hsts_value { on "max-age=31536000"; default ""; }'
 RATE_LIMITED_BODY = [
     "default_type application/json",
     "add_header Retry-After 1 always",
+    HSTS_ON_TLS,
     """return 429 '{"error":{"code":"E_RATE_LIMITED"}}'""",
 ]
 
@@ -719,10 +723,18 @@ TLS_CIPHERS = ":".join(
     ]
 )
 HSTS = 'add_header Strict-Transport-Security "max-age=31536000" always'
+# Mozilla "intermediate": a shared cache and no tickets, whose key nginx never
+# rotates, which would undo forward secrecy until a restart.
+TLS_SESSION = [
+    "ssl_session_cache shared:corp_tls:10m",
+    "ssl_session_timeout 1d",
+    "ssl_session_tickets off",
+]
 TLS_POLICY = [
     "ssl_protocols TLSv1.2 TLSv1.3",
     f"ssl_ciphers {TLS_CIPHERS}",
     "ssl_prefer_server_ciphers off",
+    *TLS_SESSION,
 ]
 CERT_AND_KEY = [
     "ssl_certificate /etc/nginx/certs/NGINX_TLS_CERT",
@@ -854,16 +866,27 @@ def test_the_behind_proxy_listeners_carry_no_tls_and_no_hsts(routing: str) -> No
         )
 
 
-def test_hsts_is_set_in_the_terminate_listeners_alone() -> None:
+def test_hsts_is_set_in_the_terminate_listeners_and_on_the_edges_429_over_tls_alone() -> None:
     # Strict-Transport-Security on a plain-HTTP (behind-proxy) response is wrong,
-    # and the snippets serve both modes.
-    carriers = {
-        path.name
-        for path in _every_config_file()
-        if "strict-transport-security" in _directives(path.read_text()).lower()
-    }
+    # and the snippets serve both modes. The 429's add_header replaces the
+    # listener's, so it carries its own, empty unless the connection is TLS.
+    carriers: dict[str, list[str]] = {}
+    for path in _every_config_file():
+        lines = [
+            line.strip()
+            for line in _directives(path.read_text()).splitlines()
+            if re.search(r"strict-transport-security|\$hsts_value\b", line, re.IGNORECASE)
+        ]
+        if lines:
+            carriers[path.name] = lines
 
-    assert carriers == {"terminate.host.conf.template", "terminate.port.conf.template"}
+    assert carriers == {
+        "00-http.conf.template": ["map $https $hsts_value {"],
+        "gateway-locations.inc.template": [f"{HSTS_ON_TLS};"],
+        "terminate.host.conf.template": [f"{HSTS};"] * 2,
+        "terminate.port.conf.template": [f"{HSTS};"] * 2,
+    }
+    assert HSTS_VALUE_MAP in re.sub(r"\s+", " ", _directives(HTTP_TEMPLATE.read_text()))
 
 
 def test_no_listener_redirects_to_https_or_listens_on_another_port() -> None:
@@ -1177,6 +1200,7 @@ def test_the_certs_readme_covers_what_an_operator_must_supply() -> None:
         "0600",
         "on the server",
         "make-selfsigned-certs.sh",
+        "for a pilot or a local run",
         "--cacert",
         "ACME",
         "port 80",
@@ -1244,6 +1268,9 @@ def test_the_env_example_says_what_langfuse_public_url_must_be_under_each_profil
     assert "https://langfuse.<GATEWAY_DOMAIN> under `nginx`" in comment
     assert "https://<address>:<NGINX_LANGFUSE_PORT> under `nginx-ports`" in comment
     assert "cannot both be correct" in comment
+    # The entrypoint's step-7 rule, stated where the value is set.
+    for rule in ("`https://<host>[:port]`", "no path", "no credentials", "no bracketed IPv6"):
+        assert rule in comment, rule
     assert 'compose/README.md, "Reaching the UI"' in comment
     assert "### Reaching the UI" in (COMPOSE_DIR / "README.md").read_text()
 

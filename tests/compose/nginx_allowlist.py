@@ -25,7 +25,8 @@ GATEWAY_SNIPPET = NGINX_DIR / "templates" / "snippets" / "gateway-locations.inc.
 
 WEBSOCKET = "WEBSOCKET"
 
-# The one named location the gateway snippet may carry: the edge's 429 body.
+# The one named location the gateway snippet may carry: the edge's 429 (its
+# body, Retry-After, and HSTS when the connection is TLS).
 RATE_LIMITED = "@rate_limited"
 # The only placeholders the gateway snippet may carry: the edge limits, which
 # the entrypoint renders as bare positive integers (never a path or a method).

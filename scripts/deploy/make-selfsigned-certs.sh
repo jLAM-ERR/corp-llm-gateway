@@ -43,7 +43,7 @@ IPV4_ERE='^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|
 IPV6_ERE='^[0-9a-f:.]*:[0-9a-f:.]*$'
 
 fatal() {
-    echo "FATAL: $*" >&2
+    echo "FATAL: $(printf '%s' "$*" | tr -c ' -~' '?')" >&2
     exit 1
 }
 
@@ -143,7 +143,12 @@ san_entry() {
     elif [[ "$value" =~ ^[0-9.]+$ ]]; then
         fatal "SAN '$1' is not a valid IPv4 address"
     elif [[ "$value" == *:* ]]; then
-        [[ "$value" =~ $IPV6_ERE ]] || fatal "SAN '$1' is not an IPv6 address"
+        # IPV6_ERE alone admits ':', '::::' or 'f:': a hex digit is required, and
+        # a colon run is '::' at most and never a lone ':' at either end.
+        if [[ "$value" != *[0-9a-f]* || "$value" == *:::* || "$value" == :[!:]* \
+            || "$value" == *[!:]: || ! "$value" =~ $IPV6_ERE ]]; then
+            fatal "SAN '$1' is not an IPv6 address"
+        fi
         printf 'IP:%s' "$value"
     elif [[ "$value" =~ $DNS_ERE ]]; then
         (( ${#value} <= 253 )) || fatal "SAN '$1' is longer than 253 characters"
@@ -233,7 +238,10 @@ generate() {
         -extfile "$config" -extensions v3_leaf -out "${work}/leaf.crt"
 }
 
-# Staged beside the targets, then renamed: a failure leaves no half-written set.
+# Staged beside the targets, then renamed one at a time: not atomic as a set.
+# The key goes last, so a failure part-way can leave a new certificate beside
+# the old key (nginx refuses that pair), never a new key beside an old
+# certificate.
 install_outputs() {
     local work="$1"
     cp "${work}/leaf.key" "${OUT_DIR}/.${LEAF_KEY}.new"
@@ -241,9 +249,9 @@ install_outputs() {
     cp "${work}/ca.crt" "${OUT_DIR}/.${CA_CERT}.new"
     chmod 600 "${OUT_DIR}/.${LEAF_KEY}.new"
     chmod 644 "${OUT_DIR}/.${LEAF_CERT}.new" "${OUT_DIR}/.${CA_CERT}.new"
-    mv -f "${OUT_DIR}/.${LEAF_KEY}.new" "${OUT_DIR}/${LEAF_KEY}"
-    mv -f "${OUT_DIR}/.${LEAF_CERT}.new" "${OUT_DIR}/${LEAF_CERT}"
     mv -f "${OUT_DIR}/.${CA_CERT}.new" "${OUT_DIR}/${CA_CERT}"
+    mv -f "${OUT_DIR}/.${LEAF_CERT}.new" "${OUT_DIR}/${LEAF_CERT}"
+    mv -f "${OUT_DIR}/.${LEAF_KEY}.new" "${OUT_DIR}/${LEAF_KEY}"
 }
 
 main() {

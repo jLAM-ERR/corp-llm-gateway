@@ -50,6 +50,7 @@ from tests.compose.nginx_container import (
     user_network,
 )
 from tests.compose.nginx_support import COMPOSE, NGINX_DIR, OAUTH, ROOT, skip_or_fail
+from tests.compose.test_nginx_profile import TLS_CIPHERS, TLS_SESSION
 
 FIXTURES = Path(__file__).resolve().parent / "nginx_fixtures"
 TEST_ONLY_PROXY_SNIPPET = FIXTURES / "test-only-proxy-locations.inc.template"
@@ -447,6 +448,12 @@ REFUSALS = [
             (f"https://{LANGFUSE_HOST}/some/path", "path", ("host", "port")),
             (f"https://{LANGFUSE_HOST}:abc", "bad-port", ("host", "port")),
             (f"https://{LANGFUSE_HOST}:123456", "six-digit-port", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}:65536", "port-out-of-range", ("host", "port")),
+            # All digits and dots is an IPv4 address, not a hostname.
+            ("https://999.1.2.3", "ip-bad-octet", ("port",)),
+            (f"https://{LANGFUSE_HOST}.", "trailing-dot", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}\n", "trailing-newline", ("host", "port")),
+            (f"https://{LANGFUSE_HOST}\r", "trailing-cr", ("host", "port")),
             (f"https://{LANGFUSE_HOST}//", "two-slashes", ("host", "port")),
             (f"https://{LANGFUSE_HOST}?x=1", "query", ("host", "port")),
             (f"https://{LANGFUSE_HOST}#x", "fragment", ("host", "port")),
@@ -602,6 +609,9 @@ STARTS = [
     pytest.param("host", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}"}, id="langfuse-origin"),
     pytest.param(
         "host", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}:8443/"}, id="langfuse-port-slash"
+    ),
+    pytest.param(
+        "host", {"LANGFUSE_PUBLIC_URL": f"https://{LANGFUSE_HOST}:65535"}, id="langfuse-max-port"
     ),
     pytest.param("port", {"LANGFUSE_PUBLIC_URL": "https://10.1.2.3:8443"}, id="langfuse-ipv4-port"),
     pytest.param(
@@ -2023,6 +2033,7 @@ class TlsAnswer:
     headers: dict[str, str]
     version: str | None
     cipher: str | None
+    body: bytes = b""
 
 
 def _tls_context(material: Path) -> ssl.SSLContext:
@@ -2037,29 +2048,33 @@ def _tls_request(
     context: ssl.SSLContext,
     path: str = "/v1/models",
     host: str | None = None,
+    *headers: str,
+    method: str = "GET",
+    body: bytes = b"",
 ) -> TlsAnswer:
-    """One HTTP/1.1 GET over TLS to 127.0.0.1:port, with ``server_hostname`` as
-    the SNI (none for an IP literal) and the name the certificate must carry.
+    """One HTTP/1.1 request over TLS to 127.0.0.1:port, with ``server_hostname``
+    as the SNI (none for an IP literal) and the name the certificate must carry.
     A connection closed with no response is status 444."""
-    request = f"GET {path} HTTP/1.1\r\nHost: {host or server_hostname}\r\nConnection: close\r\n\r\n"
+    request = _raw_request(method, path, *headers, body=body, host=host or server_hostname)
     with (
         socket.create_connection(("127.0.0.1", port), timeout=10) as raw,
         context.wrap_socket(raw, server_hostname=server_hostname) as conn,
     ):
         version, cipher = conn.version(), conn.cipher()[0]
-        conn.sendall(request.encode())
+        conn.sendall(request)
         chunks = []
         while chunk := conn.recv(65536):
             chunks.append(chunk)
     received = b"".join(chunks)
     if not received:
         return TlsAnswer(444, {}, version, cipher)
-    head = received.split(b"\r\n\r\n", 1)[0].decode("latin-1").split("\r\n")
-    headers = {}
+    raw_head, _, content = received.partition(b"\r\n\r\n")
+    head = raw_head.decode("latin-1").split("\r\n")
+    fields = {}
     for line in head[1:]:
         name, _, value = line.partition(":")
-        headers[name.strip().lower()] = value.strip()
-    return TlsAnswer(int(head[0].split(" ", 2)[1]), headers, version, cipher)
+        fields[name.strip().lower()] = value.strip()
+    return TlsAnswer(int(head[0].split(" ", 2)[1]), fields, version, cipher, content)
 
 
 def _plain_headers(port: int, path: str, host: str) -> tuple[int, httpx.Headers]:
@@ -2126,11 +2141,60 @@ def test_tls_and_hsts_are_on_every_published_listener_in_terminate_alone(
         assert all("ssl" in listen[1:] for listen in published), published
         assert hsts == [HSTS_VALUE] * len(probes)
         assert re.search(r"^\s*ssl_protocols\s+TLSv1\.2 TLSv1\.3;", directives, re.MULTILINE)
+        # One server block per published listen line, each with the whole policy.
+        assert re.findall(r"^\s*ssl_ciphers\s+([^;]+);", directives, re.MULTILINE) == [
+            TLS_CIPHERS
+        ] * len(published)
+        assert re.findall(r"^\s*(ssl_session_\w+\s+[^;]+);", directives, re.MULTILINE) == (
+            TLS_SESSION * len(published)
+        )
     else:
         assert not any("ssl" in listen for listen in published), published
         assert hsts == [None] * len(probes)
         assert not re.search(r"^\s*ssl_", directives, re.MULTILINE)
-        assert "strict-transport-security" not in directives.lower()
+        # Only the edge 429's: its value is empty on plain HTTP, so it is never sent.
+        assert re.findall(
+            r"^\s*(.*strict-transport-security.*)$", directives, re.MULTILINE | re.IGNORECASE
+        ) == ["add_header Strict-Transport-Security $hsts_value always;"]
+
+
+@pytest.mark.parametrize(("mode", "routing"), MODES_AND_ROUTINGS)
+def test_the_edges_429_carries_hsts_in_terminate_alone(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    tls_material: Path,
+    stub_upstream: Stub,
+    mode: str,
+    routing: str,
+) -> None:
+    """``add_header`` in ``@rate_limited`` replaces the listener's HSTS, so it
+    carries its own: the map's value over TLS, and nothing over plain HTTP.
+    ``NGINX_ISSUE_RATE`` defaults to 5/min with burst 2: three admitted, then 429."""
+    env = _mode_env(mode, project, tls_material)
+    name = GATEWAY_HOST if routing == "host" else TLS_IP_SAN
+    with started(specs[routing], project, network, env) as nginx:
+        port = nginx.ports[8080]
+        if mode == "terminate":
+            context = _tls_context(tls_material)
+            answers = [
+                _tls_request(
+                    port, name, context, "/internal/issue-token", method="POST", body=b"{}"
+                )
+                for _ in range(4)
+            ]
+        else:
+            answers = [_answer(_send_post(port, "/internal/issue-token")) for _ in range(4)]
+
+    assert [a.status for a in answers] == [200, 200, 200, 429]
+    refused = answers[-1]
+    assert json.loads(refused.body) == RATE_LIMITED_BODY
+    assert refused.headers["retry-after"] == "1"
+    expected = HSTS_VALUE if mode == "terminate" else None
+    assert [a.headers.get("strict-transport-security") for a in answers] == [expected] * 4
+
+
+SPOOFED_CLIENT = "1.2.3.4"
 
 
 @pytest.mark.parametrize("routing", ["host", "port"])
@@ -2150,16 +2214,25 @@ def test_terminate_serves_a_peer_outside_the_trusted_list(
     name = GATEWAY_HOST if routing == "host" else TLS_IP_SAN
     seen = len(stub_upstream.requests())
     with started(specs[routing], project, network, env, trust_client=False) as nginx:
-        answer = _tls_request(nginx.ports[8080], name, _tls_context(tls_material))
+        answer = _tls_request(
+            nginx.ports[8080],
+            name,
+            _tls_context(tls_material),
+            "/v1/models",
+            None,
+            f"X-Forwarded-For: {SPOOFED_CLIENT}",
+        )
         entries = nginx.access_log(expected=1)
 
     assert answer.status == 200
     assert [(r["method"], r["target"]) for r in stub_upstream.requests_since(seen)] == [
         ("GET", "/v1/models")
     ]
-    assert [(e["status"], e["from_trusted_proxy"], e["realip_remote_addr"]) for e in entries] == [
-        ("200", "0", network.client_peer)
-    ]
+    # An untrusted peer's X-Forwarded-For is not honoured here either.
+    assert [
+        (e["status"], e["from_trusted_proxy"], e["realip_remote_addr"], e["remote_addr"])
+        for e in entries
+    ] == [("200", "0", network.client_peer, network.client_peer)]
 
 
 # SNI values host routing has no certificate for; an IP literal sends no SNI.
@@ -2226,6 +2299,8 @@ def test_the_helpers_certificate_verifies_by_name_and_ip_san_and_by_nothing_else
         assert "mismatch" in error.verify_message.lower(), (name, error.verify_message)
 
 
+# The TLS 1.0/1.1 client is deliberate: it is what nginx must refuse.
+@pytest.mark.filterwarnings("ignore:ssl.TLSVersion.TLSv1:DeprecationWarning")
 def test_terminate_negotiates_tls_1_2_or_later_with_a_forward_secret_aead_suite(
     specs: dict[str, Spec], project: Path, network: Network, tls_material: Path
 ) -> None:
@@ -2238,12 +2313,20 @@ def test_terminate_negotiates_tls_1_2_or_later_with_a_forward_secret_aead_suite(
     cbc_only = _tls_context(tls_material)
     cbc_only.maximum_version = ssl.TLSVersion.TLSv1_2
     cbc_only.set_ciphers("ECDHE-ECDSA-AES128-SHA256")
+    # A client that offers nothing newer than TLS 1.1, with every suite enabled,
+    # so the protocol version is the only reason to refuse it.
+    legacy = _tls_context(tls_material)
+    legacy.minimum_version = ssl.TLSVersion.TLSv1
+    legacy.maximum_version = ssl.TLSVersion.TLSv1_1
+    legacy.set_ciphers("ALL:@SECLEVEL=0")
     with started(specs["port"], project, network, TERMINATE) as nginx:
         port = nginx.ports[8080]
         latest = _tls_request(port, TLS_IP_SAN, newest, "/ui")
         pinned = _tls_request(port, TLS_IP_SAN, tls12, "/ui")
         with pytest.raises(ssl.SSLError) as refused:
             _tls_request(port, TLS_IP_SAN, cbc_only, "/ui")
+        with pytest.raises(ssl.SSLError) as too_old:
+            _tls_request(port, TLS_IP_SAN, legacy, "/ui")
 
     assert (latest.status, latest.version) == (404, "TLSv1.3")
     assert (pinned.status, pinned.version) == (404, "TLSv1.2")
@@ -2251,4 +2334,8 @@ def test_terminate_negotiates_tls_1_2_or_later_with_a_forward_secret_aead_suite(
     assert re.fullmatch(
         r"ECDHE-(ECDSA|RSA)-(AES(128|256)-GCM-SHA(256|384)|CHACHA20-POLY1305)", pinned.cipher
     )
+    # nginx's alert, not this client's verification: no suite in common.
     assert not isinstance(refused.value, ssl.SSLCertVerificationError)
+    assert "HANDSHAKE_FAILURE" in str(refused.value), refused.value
+    # Alert 70: nginx speaks neither TLS 1.0 nor 1.1.
+    assert "TLSV1_ALERT_PROTOCOL_VERSION" in str(too_old.value), too_old.value

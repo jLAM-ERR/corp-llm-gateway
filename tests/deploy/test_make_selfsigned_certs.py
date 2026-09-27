@@ -186,6 +186,10 @@ def test_an_existing_output_is_kept_unless_forced(tmp_path: Path) -> None:
         (("*.corp.example",), "'*.corp.example'"),
         (("10.1.2.300",), "'10.1.2.300'"),
         (("fd00::1\nDNS:evil",), "IPv6"),
+        # Shaped like IPv6 to a character class; the script says so, not openssl.
+        ((":",), "':' is not an IPv6 address"),
+        (("::::",), "'::::' is not an IPv6 address"),
+        (("f:",), "'f:' is not an IPv6 address"),
         (("--days", "0", "10.1.2.3"), "--days"),
         (("--days", "826", "10.1.2.3"), "--days"),
         (("--days", "1x", "10.1.2.3"), "--days"),
@@ -204,6 +208,47 @@ def test_a_bad_argument_is_refused_before_anything_is_written(
     assert message in result.stderr
     assert result.stdout == ""
     assert not out.exists()
+
+
+def test_the_refusal_is_one_printable_line_whatever_the_argument_held(tmp_path: Path) -> None:
+    result = _make("--out", str(tmp_path / "out"), "a\x1b[31m\nb")
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "FATAL: SAN 'a?[31m?b' is neither an IP address nor a DNS name (a-z 0-9 . - only)\n"
+    )
+
+
+def test_the_key_is_installed_after_both_certificates(tmp_path: Path) -> None:
+    """A failure between the renames never leaves a new key beside an old
+    certificate: here the key's rename fails, and the old key is still there."""
+    out = tmp_path / "out"
+    assert _make("--out", str(out), "10.1.2.3").returncode == 0
+    before = {name: (out / name).read_bytes() for name in OUTPUTS}
+    real_mv = shutil.which("mv")
+    assert real_mv
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    shim = shims / "mv"
+    shim.write_text(
+        f'#!/bin/sh\ncase "$*" in *.gateway.key.new*) exit 1 ;; esac\nexec {real_mv} "$@"\n'
+    )
+    shim.chmod(0o755)
+    env = {**os.environ, "PATH": f"{shims}{os.pathsep}{os.environ['PATH']}"}
+
+    failed = subprocess.run(
+        [str(SCRIPT), "--force", "--out", str(out), "10.1.2.3"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env=env,
+    )
+
+    assert failed.returncode != 0
+    assert (out / "gateway.key").read_bytes() == before["gateway.key"]
+    for name in ("gateway.crt", "selfsigned-ca.crt"):
+        assert (out / name).read_bytes() != before[name], name
 
 
 def test_help_exits_zero_and_writes_nothing(tmp_path: Path) -> None:
