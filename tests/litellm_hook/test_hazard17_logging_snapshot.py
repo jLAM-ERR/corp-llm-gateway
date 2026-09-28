@@ -13,6 +13,7 @@ import json
 from collections.abc import Iterator
 from typing import Any
 
+import httpx
 import pytest
 
 pytest.importorskip("litellm.proxy.proxy_server", reason="litellm proxy not installed")
@@ -312,3 +313,57 @@ async def test_a_failure_before_the_provider_call_logs_the_sanitised_input(
     for _, kwargs in capture.events:
         assert PLACEHOLDER in serialize(kwargs["input"])
         assert _kwargs_holding(kwargs, ORIGINAL_MARK) == set()
+
+
+def test_serialize_unwraps_httpx_request_and_response() -> None:
+    """``repr`` of an httpx message shows ``<Response [200 OK]>``; the bodies ride inside,
+    so the leak checks must see them. Credential headers stay out of the rendering."""
+    request = httpx.Request(
+        "POST",
+        "http://upstream/v1/messages",
+        headers={"authorization": "Bearer sk-live", "x-api-key": "sk-key", "x-trace": "t1"},
+        content=f"sent {EMAIL}".encode(),
+    )
+    response = httpx.Response(200, request=request, text=f"echo {EMAIL}")
+
+    for rendered in (serialize(request), serialize(response)):
+        assert f"sent {EMAIL}" in rendered
+        assert "t1" in rendered
+        assert "sk-live" not in rendered and "sk-key" not in rendered
+    assert f"echo {EMAIL}" in serialize(response)
+
+
+def test_serialize_survives_an_unread_streaming_response() -> None:
+    async def body() -> Any:
+        yield EMAIL.encode()
+
+    request = httpx.Request("POST", "http://upstream/v1/messages", content=b"{}")
+    response = httpx.Response(200, request=request, content=body())
+
+    rendered = serialize(response)
+
+    assert "<unread>" in rendered and EMAIL not in rendered
+
+
+async def test_the_messages_success_log_carries_an_httpx_response_the_checks_now_read(
+    monkeypatch: pytest.MonkeyPatch, healthy_upstream: StubUpstream
+) -> None:
+    """``/v1/messages`` hands the success log ``httpx_response``; unwrapped, it shows the
+    provider-bound request and the provider's reply, and both hold placeholders only."""
+    ours, _ = build_ours()
+    capture = LogCapture()
+    harness = DispatchHarness(monkeypatch, healthy_upstream, [ours, capture])
+
+    exchange = await harness.send("messages", stream=False)
+    await until(lambda: len(capture.events) >= 1)
+
+    assert exchange.status == 200
+    (kind, kwargs), *_ = capture.events
+    assert kind == "success"
+    responses = [value for value in kwargs.values() if isinstance(value, httpx.Response)]
+    assert responses
+    for response in responses:
+        rendered = serialize(response)
+        assert PLACEHOLDER in rendered
+        assert ORIGINAL_MARK not in rendered
+    _assert_sanitised(kwargs, exchange.provider_bodies)

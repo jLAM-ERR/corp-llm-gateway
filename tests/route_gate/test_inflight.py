@@ -26,6 +26,7 @@ from corp_llm_gateway.route_gate.inflight import (
     ROUTE_GATE_BODY_TIMEOUT,
     ROUTE_GATE_CAPACITY,
     InflightLimiter,
+    RequestTicket,
     bind_call_id,
     current_ticket,
     install_task_factory,
@@ -1670,3 +1671,145 @@ async def test_a_server_cancel_during_the_disconnect_grace_leaves_nothing_unretr
     assert straggler[0]() is None
     assert seen == [], describe(seen)
     assert limiter.inflight == 0
+
+
+# ── the ticket's end ─────────────────────────────────────────────────────────
+
+
+class _Closes:
+    """A close hook that records the ticket state it saw."""
+
+    def __init__(self, limiter: InflightLimiter | None = None) -> None:
+        self.limiter = limiter
+        self.calls: list[tuple[str, bool, int | None]] = []
+
+    def __call__(self, ticket: RequestTicket) -> None:
+        inflight = self.limiter.inflight if self.limiter is not None else None
+        self.calls.append((ticket.gateway_id, ticket.cancelled, inflight))
+
+
+def _registering(hook: Callable[[RequestTicket], None], app: Any) -> Any:
+    async def registered(scope: Any, receive: Any, send: Any) -> None:
+        ticket = current_ticket()
+        assert ticket is not None and ticket.on_close(hook)
+        await app(scope, receive, send)
+
+    return registered
+
+
+async def test_the_ticket_closes_once_when_the_request_ends_while_it_holds_the_slot() -> None:
+    closes = _Closes()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await _respond(send)
+
+    gate, limiter, _, _ = _stack(_registering(closes, app))
+    closes.limiter = limiter
+    client = _Client()
+
+    await gate(_scope(), client.receive, client.send)
+
+    assert client.status == 200
+    assert [(cancelled, inflight) for _, cancelled, inflight in closes.calls] == [(False, 1)]
+    assert limiter.inflight == 0
+
+
+async def test_a_downstream_that_ignores_cancellation_still_closes_its_ticket() -> None:
+    """The grace-release path: the limiter lets go of a downstream that never unwinds, and
+    closing the ticket is what frees what the request left behind."""
+    stop = asyncio.Event()
+    entered = asyncio.Event()
+    closes = _Closes()
+    tickets: list[RequestTicket] = []
+
+    async def stubborn(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        ticket = current_ticket()
+        assert ticket is not None
+        tickets.append(ticket)
+        ticket.on_close(closes)
+        entered.set()
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    gate, limiter, _, _ = _stack(stubborn, grace=0.1)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert [cancelled for _, cancelled, _ in closes.calls] == [True]
+    assert tickets[0].closed and limiter.inflight == 0
+    stop.set()
+    await asyncio.sleep(0.05)
+    assert len(closes.calls) == 1
+
+
+async def test_the_ticket_closes_when_the_server_cancels_the_request() -> None:
+    closes = _Closes()
+    app = _Holding()
+    gate, limiter, _, _ = _stack(_registering(closes, app))
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(app.entered.acquire(), 2)
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert len(closes.calls) == 1 and limiter.inflight == 0
+
+
+async def test_a_hook_offered_to_a_closed_ticket_is_refused_and_never_run() -> None:
+    ticket = RequestTicket("f" * 32)
+    ran: list[RequestTicket] = []
+
+    assert ticket.close() == 0
+    assert ticket.on_close(ran.append) is False
+    assert ticket.close() == 0
+    assert ran == []
+
+
+def test_a_hook_is_registered_once_and_run_once() -> None:
+    ticket = RequestTicket("f" * 32)
+    ran: list[RequestTicket] = []
+
+    assert ticket.on_close(ran.append) and ticket.on_close(ran.append)
+    ticket.close()
+    ticket.close()
+
+    assert ran == [ticket]
+
+
+async def test_a_failing_close_hook_is_counted_content_free_and_the_rest_still_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    after = _Closes()
+
+    def failing(ticket: RequestTicket) -> None:
+        raise RuntimeError(CANARY)
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        ticket = current_ticket()
+        assert ticket is not None
+        ticket.on_close(failing)
+        ticket.on_close(after)
+        await _read_body(receive)
+        await _respond(send)
+
+    gate, limiter, metrics, _ = _stack(app)
+    client = _Client()
+
+    with caplog.at_level(logging.DEBUG):
+        await gate(_scope(), client.receive, client.send)
+
+    assert len(after.calls) == 1 and limiter.inflight == 0
+    assert metrics.failures == [COMPONENT]
+    assert "route_gate_ticket_close_hook_failed" in caplog.text and "RuntimeError" in caplog.text
+    assert CANARY not in caplog.text

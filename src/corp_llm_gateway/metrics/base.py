@@ -62,12 +62,15 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
 # refuses a route it should have forwarded (the guardrail callback never
 # registered), cannot classify one at all, or loses the refusal's audit record
 # (``route_gate/middleware.py:228-233``) — and so is ``team_config``, a team
-# config the store could not return (``litellm_hook.TEAM_CONFIG_COMPONENT``).
+# config the store could not return (``litellm_hook.TEAM_CONFIG_COMPONENT``), and
+# ``desanitize``, a response the ASGI restorer could not restore
+# (``route_gate.DesanitizeMiddleware``, not yet wired).
 # Pinned against every source in tests/metrics/test_metrics.py.
 FAILURE_COMPONENTS: tuple[str, ...] = (
     "auth",
     "corp_llm",
     "corp_ner",
+    "desanitize",
     "dlp",
     "internal",
     "ner",

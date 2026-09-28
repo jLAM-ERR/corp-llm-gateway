@@ -95,21 +95,68 @@ class RequestTicket:
     ``cancelled`` is set before the downstream is cancelled, so any audit the
     unwinding request (or a litellm callback run in its context) attempts can
     stand down for the one ``cancelled`` record the guardrail writes after.
+
+    ``close()`` is the limiter letting go of the request: normally when the
+    downstream returns, on a disconnect after the grace even if the downstream
+    never unwound. State a request leaves outside its own frames (a response
+    mapping, a restorer) is dropped by a hook registered with ``on_close``.
+    ``audit_facts`` holds the content-free facts its terminal audit record is
+    written from.
     """
 
-    __slots__ = ("__weakref__", "call_ids", "cancelled", "gateway_id", "tasks")
+    __slots__ = (
+        "__weakref__",
+        "_on_close",
+        "audit_facts",
+        "call_ids",
+        "cancelled",
+        "closed",
+        "gateway_id",
+        "tasks",
+    )
 
     def __init__(self, gateway_id: str) -> None:
         self.gateway_id = gateway_id
         self.call_ids: list[str] = []
         self.cancelled = False
+        self.closed = False
         self.tasks: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
+        self.audit_facts: Any = None
+        self._on_close: list[Callable[[RequestTicket], None]] = []
 
     def request_ids(self) -> list[str]:
         return list(self.call_ids) or [self.gateway_id]
 
     def pending(self) -> list[asyncio.Task[Any]]:
         return [task for task in list(self.tasks) if not task.done()]
+
+    def on_close(self, hook: Callable[[RequestTicket], None]) -> bool:
+        """Run ``hook(ticket)`` once, at ``close()``; refused (False) once closed."""
+        if self.closed:
+            return False
+        if hook not in self._on_close:
+            self._on_close.append(hook)
+        return True
+
+    def close(self) -> int:
+        """Run every hook once, each guarded; the number that raised."""
+        if self.closed:
+            return 0
+        self.closed = True
+        hooks, self._on_close = self._on_close, []
+        failed = 0
+        for hook in hooks:
+            try:
+                hook(self)
+            except Exception as exc:
+                failed += 1
+                # Type only: a hook's message can quote request content.
+                logger.error(
+                    "route_gate_ticket_close_hook_failed request_id=%s error=%s",
+                    self.gateway_id,
+                    type(exc).__name__,
+                )
+        return failed
 
 
 _TICKET: ContextVar[RequestTicket | None] = ContextVar("corp_llm_gateway_request", default=None)
@@ -364,6 +411,22 @@ class InflightLimiter:
             return
         started = time.monotonic()
         ticket = RequestTicket(uuid.uuid4().hex)
+        try:
+            await self._admit_ticket(ticket, started, held, scope, receive, send, app, refuse)
+        finally:
+            self._close(ticket)
+
+    async def _admit_ticket(
+        self,
+        ticket: RequestTicket,
+        started: float,
+        held: _Held,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        app: ASGIApp,
+        refuse: Refuse,
+    ) -> None:
         self._draining += 1
         try:
             try:
@@ -397,7 +460,15 @@ class InflightLimiter:
         try:
             await self._serve(ticket, started, scope, receive, send, app, drained)
         finally:
-            self._release()
+            try:
+                # Before the slot frees: what the request left behind goes first.
+                self._close(ticket)
+            finally:
+                self._release()
+
+    def _close(self, ticket: RequestTicket) -> None:
+        for _ in range(ticket.close()):
+            self._metric("record_failure", _COMPONENT)
 
     async def _drain(self, receive: Receive, held: _Held) -> object:
         chunks: list[bytes] = []

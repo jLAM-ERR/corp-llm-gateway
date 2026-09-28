@@ -349,11 +349,42 @@ class StubUpstream:
 # ── what a capture sees ──────────────────────────────────────────────────────
 
 
+_CREDENTIAL_HEADERS = frozenset({"authorization", "x-api-key", "x-corp-auth", "cookie"})
+
+
+def _unread(read: Callable[[], Any]) -> str:
+    try:
+        return serialize(read())
+    except httpx.StreamError:
+        return "<unread>"
+
+
+def _http_message(obj: httpx.Request | httpx.Response) -> str:
+    """``repr`` shows ``<Response [200 OK]>`` while the bodies ride inside."""
+    request = obj if isinstance(obj, httpx.Request) else obj._request
+    parts: dict[str, Any] = {}
+    if request is not None:
+        parts["method"] = request.method
+        parts["url"] = str(request.url)
+        parts["request_headers"] = {
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() not in _CREDENTIAL_HEADERS
+        }
+        parts["request_content"] = _unread(lambda: request.content)
+    if isinstance(obj, httpx.Response):
+        parts["status"] = obj.status_code
+        parts["response_text"] = _unread(lambda: obj.text)
+    return json.dumps(parts, default=str)
+
+
 def serialize(obj: Any) -> str:
     if isinstance(obj, bytes):
         return obj.decode("utf-8", "replace")
     if isinstance(obj, str):
         return obj
+    if isinstance(obj, (httpx.Request, httpx.Response)):
+        return _http_message(obj)
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
         try:

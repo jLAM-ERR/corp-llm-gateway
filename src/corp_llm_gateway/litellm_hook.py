@@ -49,6 +49,8 @@ from corp_llm_gateway.payload.size_threshold import OversizeContentError, should
 from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.route_gate.inflight import RequestTicket, bind_call_id, current_ticket
+from corp_llm_gateway.route_gate.terminal_audit import AuditFacts
+from corp_llm_gateway.route_gate.terminal_audit import deposit as deposit_audit_facts
 from corp_llm_gateway.sanitizer import (
     OpenAiToolCallDesanitizer,
     ResponsesStreamDesanitizer,
@@ -444,6 +446,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         `async_pre_call_hook` wiring supplies a call_type.
         """
         request_id = self._ensure_request_id(data)
+        pre_call_started = time.monotonic()
         ticket = current_ticket()
         if ticket is not None and ticket.cancelled:
             # The route gate already wrote this request's `cancelled` record; a
@@ -1207,6 +1210,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.redaction_count,
             len(state.placeholders),
         )
+        # Content-free facts for the terminal-audit contract; today's audit() path is
+        # unchanged and does not read them.
+        deposit_audit_facts(current_ticket(), _audit_facts(state, started=pre_call_started))
         return data
 
     async def _sanitize_prompt_field(
@@ -1945,6 +1951,24 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
 
 # ---- helpers --------------------------------------------------------------
+
+
+def _audit_facts(state: _RequestState, *, started: float) -> AuditFacts:
+    return AuditFacts(
+        request_id=state.request_id,
+        user_id=state.user_id,
+        team_id=state.team_id,
+        provider=state.provider,
+        model=state.model,
+        redaction_count=state.redaction_count,
+        finding_label_counts=_label_counts(state.placeholders),
+        cache_a_hit=state.cache_a_hit,
+        block_reason=state.block_reason,
+        error_code=state.error_code,
+        profile_ids=state.profile_ids,
+        status="ok",
+        started=started,
+    )
 
 
 def _label_counts(placeholders: list[str]) -> dict[str, int]:

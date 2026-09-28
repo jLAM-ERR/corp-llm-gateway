@@ -1,13 +1,25 @@
-"""PROTOTYPE, NOT WIRED: restore originals in the response at the ASGI layer (plan 20260926,
+"""NOT WIRED: restore originals in the response at the ASGI layer (plan 20260926,
 Option A). ``asgi.py`` does not import it and ``enabled`` defaults to False.
 
-Sits between the route gate and litellm's app and wraps ``send`` only (``receive`` belongs
-to the in-flight limiter). Restoration state is keyed by the gateway ``RequestTicket`` and
-owned here, released on the final body or when the request unwinds, never by ``audit()``.
+Sits between the in-flight limiter and litellm's app and wraps ``send`` only (``receive``
+belongs to the limiter). Restoration state is keyed by the gateway ``RequestTicket`` and
+owned here, never by ``audit()``: the mapping is released on the final body in every mode
+(restored, non-2xx, pass-through), when the request unwinds, and at the ticket's close,
+which the limiter reaches after its grace even if the downstream never unwinds; the
+restorer's buffers go with it. A mapping offered for a cancelled or closed ticket is
+refused.
+
 A restoration failure never raises into litellm's app: before ``http.response.start`` it
 answers a content-free 500, after it the events already restored are sent and the stream
-is closed without a message. Either way the failure is reported (content-free log line +
-``gateway_failure{component="desanitize"}``) and marked on the ticket for the audit.
+is closed without a message. Either way it is reported (content-free log line +
+``gateway_failure{component="desanitize"}``). The audit does not learn about it from a
+marker: litellm's success event can be written before the marker is set. The terminal
+record is published once through ``terminal_audit.TerminalAudit``, here at the final body
+or the failure, and at the ticket's close for a request that got neither.
+
+``Content-Encoding``: a response carrying one passes through untouched (placeholders,
+never originals); ``compressor_problems`` is the arm check that nothing in the served
+stack compresses a response before it reaches this middleware.
 """
 
 from __future__ import annotations
@@ -22,8 +34,13 @@ from typing import Any
 
 from corp_llm_gateway.metrics import MetricsExporter, get_exporter
 from corp_llm_gateway.route_gate.inflight import RequestTicket, current_ticket
+from corp_llm_gateway.route_gate.terminal_audit import Outcome, TerminalAudit
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
-from corp_llm_gateway.sanitizer.streaming import ResponsesStreamDesanitizer, SseStreamDesanitizer
+from corp_llm_gateway.sanitizer.streaming import (
+    ResponsesStreamDesanitizer,
+    SseStreamDesanitizer,
+    is_stream_error_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +61,7 @@ INTERNAL_ERROR_BODY = json.dumps(
 ).encode()
 
 _SSE_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
+_COMPRESSORS = ("gzip", "brotli", "zstd", "deflate", "compress")
 
 
 class ResponseMappings:
@@ -53,11 +71,28 @@ class ResponseMappings:
         self._by_ticket: weakref.WeakKeyDictionary[RequestTicket, StrategyResult] = (
             weakref.WeakKeyDictionary()
         )
-        # Outlives release(): the audit, written after the response, reads it.
+        # Diagnostic only; the terminal audit record is what reports the failure.
         self._failed: weakref.WeakSet[RequestTicket] = weakref.WeakSet()
 
-    def register(self, ticket: RequestTicket, mapping: StrategyResult) -> None:
-        self._by_ticket[ticket] = mapping
+    def register(self, ticket: RequestTicket, mapping: StrategyResult) -> bool:
+        """Hold ``mapping`` until the ticket's final body, unwind or close; False, with a
+        content-free log line, for a ticket already cancelled or closed. Never raises."""
+        try:
+            refused = "cancelled" if ticket.cancelled else "closed" if ticket.closed else None
+            if refused is None and not ticket.on_close(self.release):
+                refused = "closed"
+            if refused is not None:
+                logger.warning(
+                    "gateway_desanitize_register_refused request_id=%s reason=%s",
+                    ticket.gateway_id,
+                    refused,
+                )
+                return False
+            self._by_ticket[ticket] = mapping
+            return True
+        except Exception as exc:
+            logger.error("gateway_desanitize_register_failed error=%s", type(exc).__name__)
+            return False
 
     def get(self, ticket: RequestTicket) -> StrategyResult | None:
         return self._by_ticket.get(ticket)
@@ -78,6 +113,18 @@ class ResponseMappings:
         return len(self._by_ticket)
 
 
+def compressor_problems(app: Any) -> list[str]:
+    """Middleware on ``app`` (a Starlette/FastAPI app) that would compress a response
+    before this middleware sees it; the arm check for the Content-Encoding pass-through."""
+    found: list[str] = []
+    for entry in getattr(app, "user_middleware", None) or ():
+        cls = getattr(entry, "cls", entry)
+        name = getattr(cls, "__name__", type(cls).__name__)
+        if any(word in name.lower() for word in _COMPRESSORS):
+            found.append(name)
+    return found
+
+
 def _default_restore_json(payload: Any, mapping: StrategyResult) -> Any:
     from corp_llm_gateway.litellm_hook import _apply_reverse_to_response
 
@@ -96,6 +143,7 @@ class DesanitizeMiddleware:
         restore_json: RestoreJson | None = None,
         metrics: MetricsExporter | None = None,
         on_failure: FailureReporter | None = None,
+        terminal: TerminalAudit | None = None,
     ) -> None:
         self.app = app
         self._mappings = mappings
@@ -103,6 +151,7 @@ class DesanitizeMiddleware:
         self._restore_json = restore_json or _default_restore_json
         self._metrics = metrics
         self._on_failure = on_failure or self._report_failure
+        self._terminal = terminal
 
     def _report_failure(self, request_id: str, phase: str, error_type: type[BaseException]) -> None:
         logger.error(
@@ -118,11 +167,24 @@ class DesanitizeMiddleware:
         if not self._enabled or ticket is None:
             await self.app(scope, receive, send)
             return
-        response = _Response(ticket, self._mappings, send, self._restore_json, self._on_failure)
+        response = _Response(
+            ticket, self._mappings, send, self._restore_json, self._on_failure, self._terminal
+        )
+        ticket.on_close(response.close)
+        if self._terminal is not None:
+            self._terminal.bind(ticket)
+        raised: Exception | None = None
         try:
-            await self.app(scope, receive, response.send)
+            try:
+                await self.app(scope, receive, response.send)
+            except Exception as exc:
+                raised = exc
+            if raised is not None:
+                # Outside the handler: the tails' send must not chain the app's error.
+                await response.app_failed()
+                raise raised
         finally:
-            self._mappings.release(ticket)
+            response.close()
 
 
 class _Response:
@@ -133,17 +195,29 @@ class _Response:
         send: Send,
         restore_json: RestoreJson,
         on_failure: FailureReporter,
+        terminal: TerminalAudit | None,
     ) -> None:
         self._ticket = ticket
         self._mappings = mappings
         self._send = send
         self._restore_json = restore_json
         self._on_failure = on_failure
+        self._terminal = terminal
         self._mode = "unstarted"
+        self._status = 0
         self._start: Message | None = None
         self._mapping: StrategyResult | None = None
         self._body = bytearray()
         self._sse: _SseRestorer | None = None
+
+    def close(self, _ticket: RequestTicket | None = None) -> None:
+        """Drop everything restoration holds; later messages are not sent."""
+        self._mode = "closed"
+        self._mappings.release(self._ticket)
+        self._mapping = None
+        self._start = None
+        self._sse = None
+        self._body.clear()
 
     async def send(self, message: Message) -> None:
         if self._mode == "closed":
@@ -152,11 +226,19 @@ class _Response:
         if kind == "http.response.start":
             await self._on_start(message)
             return
-        if kind != "http.response.body" or self._mode in ("unstarted", "pass"):
+        if kind != "http.response.body" or self._mode == "unstarted":
             await self._send(message)
             return
-        chunk = bytes(message.get("body") or b"")
         more = bool(message.get("more_body", False))
+        if self._mode == "pass":
+            if more:
+                await self._send(message)
+                return
+            self.close()
+            await self._send(message)
+            await self._publish("ok" if 200 <= self._status < 300 else "failed")
+            return
+        chunk = bytes(message.get("body") or b"")
         if self._mode == "unary":
             self._body += chunk
             if not more:
@@ -164,12 +246,44 @@ class _Response:
             return
         await self._on_sse(chunk, more)
 
+    async def app_failed(self) -> None:
+        """The app raised: restored tails of a stream still go out, then the record."""
+        sse = self._sse if self._mode == "sse" else None
+        self.close()
+        if sse is not None:
+            out = b""
+            failure: type[BaseException] | None = None
+            try:
+                sse.flush()
+            except Exception as exc:
+                failure = type(exc)
+            out = sse.take()
+            if failure is not None:
+                self._failed("after_start", failure)
+            if out:
+                try:
+                    await self._send({"type": "http.response.body", "body": out, "more_body": True})
+                except Exception as exc:
+                    logger.warning(
+                        "gateway_desanitize_tail_send_failed request_id=%s error=%s",
+                        self._ticket.gateway_id,
+                        type(exc).__name__,
+                    )
+        await self._publish("failed")
+
     async def _on_start(self, message: Message) -> None:
         mapping = self._mappings.get(self._ticket)
-        status = int(message.get("status") or 0)
+        self._status = int(message.get("status") or 0)
         content_type = _header(message, b"content-type").lower()
-        if mapping is None or not mapping.pairs or not 200 <= status < 300:
+        encoding = _header(message, b"content-encoding").strip().lower()
+        if (
+            mapping is None
+            or not mapping.pairs
+            or not 200 <= self._status < 300
+            or encoding not in ("", "identity")
+        ):
             self._mode = "pass"
+            self._mappings.release(self._ticket)
             await self._send(message)
             return
         self._mapping = mapping
@@ -192,58 +306,65 @@ class _Response:
             self._start = message
             return
         self._mode = "pass"
+        self._mappings.release(self._ticket)
         await self._send(message)
 
     async def _finish_unary(self) -> None:
-        assert self._start is not None and self._mapping is not None
+        start, mapping = self._start, self._mapping
+        assert start is not None and mapping is not None
         body = b""
         failure: type[BaseException] | None = None
         try:
             payload = json.loads(bytes(self._body))
-            restored = self._restore_json(payload, self._mapping)
+            restored = self._restore_json(payload, mapping)
             body = json.dumps(restored, ensure_ascii=False, separators=(",", ":")).encode()
         except Exception as exc:
             failure = type(exc)
         finally:
-            self._body.clear()
+            self.close()
         # Sent outside the handler: a failing send must not carry the failure as __context__.
         if failure is not None:
             self._failed("before_start", failure)
             await self._internal_error()
             return
         headers = [
-            *_without(self._start, b"content-length"),
+            *_without(start, b"content-length"),
             (b"content-length", str(len(body)).encode()),
         ]
-        self._mappings.release(self._ticket)
-        await self._send({**self._start, "headers": headers})
+        await self._send({**start, "headers": headers})
         await self._send({"type": "http.response.body", "body": body, "more_body": False})
+        await self._publish("ok")
 
     async def _on_sse(self, chunk: bytes, more: bool) -> None:
-        assert self._sse is not None
+        sse = self._sse
+        if sse is None:
+            return
         failure: type[BaseException] | None = None
         try:
-            self._sse.feed(chunk)
+            sse.feed(chunk)
             if not more:
-                self._sse.flush()
+                sse.flush()
         except Exception as exc:
             failure = type(exc)
         # Whole events restored before a failure; the failing one is dropped.
-        out = self._sse.take()
+        out = sse.take()
         if failure is not None:
-            self._mode = "closed"
+            self.close()
             self._failed("after_start", failure)
             if out:
                 await self._send({"type": "http.response.body", "body": out, "more_body": True})
             await self._send({"type": "http.response.body", "body": b"", "more_body": False})
+            await self._publish("failed", E_INTERNAL)
             return
         if not more:
-            self._mappings.release(self._ticket)
-        await self._send({"type": "http.response.body", "body": out, "more_body": more})
+            self.close()
+            await self._send({"type": "http.response.body", "body": out, "more_body": False})
+            await self._publish("failed" if sse.saw_error else "ok")
+            return
+        await self._send({"type": "http.response.body", "body": out, "more_body": True})
 
     async def _internal_error(self) -> None:
-        self._mode = "closed"
-        self._mappings.release(self._ticket)
+        self.close()
         await self._send(
             {
                 "type": "http.response.start",
@@ -257,6 +378,11 @@ class _Response:
         await self._send(
             {"type": "http.response.body", "body": INTERNAL_ERROR_BODY, "more_body": False}
         )
+        await self._publish("failed", E_INTERNAL)
+
+    async def _publish(self, outcome: Outcome, error_code: str | None = None) -> None:
+        if self._terminal is not None:
+            await self._terminal.publish(self._ticket, outcome, error_code=error_code)
 
     def _failed(self, phase: str, error_type: type[BaseException]) -> None:
         self._mappings.mark_failed(self._ticket)
@@ -272,7 +398,10 @@ class _Response:
 
 
 class _SseRestorer:
-    """Complete SSE events in, restored events out; Responses events by their own adapter."""
+    """Complete SSE events in, restored events out; Responses events by their own adapter.
+
+    Held Responses text goes out before ``[DONE]`` and before an error event, never
+    after; the chat / Anthropic adapter does the same for its own buffers."""
 
     def __init__(self, mapping: StrategyResult) -> None:
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
@@ -280,6 +409,9 @@ class _SseRestorer:
         self._ready: list[str] = []
         self._events = SseStreamDesanitizer(mapping)
         self._responses = ResponsesStreamDesanitizer(mapping)
+        self._event_lines = False
+        # An error event or ``response.failed`` went out: the response did not succeed.
+        self.saw_error = False
 
     def feed(self, chunk: bytes) -> None:
         """Restore every complete event; if one raises, those before it stay in ``take()``."""
@@ -293,32 +425,45 @@ class _SseRestorer:
         if self._buffer:
             event, self._buffer = self._buffer, ""
             self._ready.extend(self._event(event))
+        self._ready.extend(self._responses_tails())
         self._ready.extend(_text(item) for item in self._events.flush())
-        self._ready.extend(
-            _frame(json.loads(item), with_event_line=False) for item in self._responses.flush()
-        )
 
     def take(self) -> bytes:
         out, self._ready = "".join(self._ready), []
         return out.encode()
 
     def _event(self, event: str) -> list[str]:
-        payload = _data_payload(event)
-        if isinstance(payload, dict) and str(payload.get("type") or "").startswith("response."):
+        data = _data_field(event)
+        payload = _json_or_none(data)
+        head: list[str] = []
+        if data == "[DONE]" or is_stream_error_event(payload):
+            self.saw_error = self.saw_error or data != "[DONE]"
+            head = self._responses_tails()
+        event_type = str(payload.get("type") or "") if isinstance(payload, dict) else ""
+        if event_type.startswith("response."):
             with_event_line = any(line.startswith("event:") for line in event.splitlines())
-            return [
+            self._event_lines = self._event_lines or with_event_line
+            self.saw_error = self.saw_error or event_type == "response.failed"
+            return head + [
                 _frame(item if isinstance(item, dict) else json.loads(item), with_event_line)
                 for item in self._responses.feed(payload)
             ]
-        return [_text(item) for item in self._events.feed(event)]
+        return head + [_text(item) for item in self._events.feed(event)]
+
+    def _responses_tails(self) -> list[str]:
+        return [_frame(json.loads(item), self._event_lines) for item in self._responses.flush()]
 
 
-def _data_payload(event: str) -> Any:
+def _data_field(event: str) -> str | None:
     data = [line[5:].lstrip() for line in event.splitlines() if line.startswith("data:")]
-    if not data:
+    return "\n".join(data) if data else None
+
+
+def _json_or_none(data: str | None) -> Any:
+    if data is None:
         return None
     try:
-        return json.loads("\n".join(data))
+        return json.loads(data)
     except ValueError:
         return None
 

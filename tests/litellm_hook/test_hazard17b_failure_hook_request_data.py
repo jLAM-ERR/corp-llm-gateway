@@ -180,3 +180,13 @@ def test_without_a_body_snapshot_the_refresh_is_a_no_op(data: dict[str, Any]) ->
     _refresh_request_body_snapshot(data)
 
     assert data == before
+
+
+def test_no_callback_of_ours_overrides_the_failure_hook() -> None:
+    """The premise of the Stage 0 characterisation: litellm hands the failure hook the
+    original request, and our guardrail never takes it."""
+    from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+
+    assert (
+        CorpLlmGuardrail.async_post_call_failure_hook is CustomLogger.async_post_call_failure_hook
+    )

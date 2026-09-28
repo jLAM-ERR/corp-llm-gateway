@@ -9,9 +9,12 @@ never by ``audit()``; a content-free exception boundary; a wire-format adapter p
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import gc
 import json
 import logging
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,12 +35,21 @@ from corp_llm_gateway.route_gate.desanitize_middleware import (
     INTERNAL_ERROR_BODY,
     DesanitizeMiddleware,
     ResponseMappings,
+    compressor_problems,
 )
 from corp_llm_gateway.route_gate.inflight import (
     _TICKET,
     InflightLimiter,
     RequestTicket,
     current_ticket,
+    install_task_factory,
+)
+from corp_llm_gateway.route_gate.terminal_audit import (
+    AuditFacts,
+    TerminalAudit,
+    TerminalRecord,
+    deposit,
+    deposit_usage,
 )
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
 from tests.litellm_hook import _dispatch_fixtures
@@ -67,9 +79,11 @@ ASGIApp = Callable[[Any, Any, Any], Awaitable[None]]
 # ── driving one request ──────────────────────────────────────────────────────
 
 
-async def drive(app: ASGIApp, ticket: RequestTicket | None = None) -> list[Message]:
+async def drive(
+    app: ASGIApp, ticket: RequestTicket | None = None, sent: list[Message] | None = None
+) -> list[Message]:
     """One HTTP request, in the ticket's context as the in-flight limiter runs it."""
-    sent: list[Message] = []
+    sent = sent if sent is not None else []
     delivered = False
     done = asyncio.Event()
 
@@ -950,3 +964,1153 @@ async def test_disabled_it_passes_everything_through() -> None:
     sent = await drive(DesanitizeMiddleware(json_app(CHAT), mappings), ticket)
 
     assert json.loads(body_of(sent)) == CHAT
+
+
+# ══ Task 2: the hardened, still unwired middleware ════════════════════════════
+
+TOKEN_COUNTS = (7, 3)
+
+
+def ticketed(app: ASGIApp) -> ASGIApp:
+    """Run each request in a fresh ticket, as the in-flight limiter would."""
+
+    async def with_ticket(scope: Any, receive: Any, send: Any) -> None:
+        token = _TICKET.set(RequestTicket(uuid.uuid4().hex))
+        try:
+            await app(scope, receive, send)
+        finally:
+            _TICKET.reset(token)
+
+    return with_ticket
+
+
+def byte_app(pieces: list[bytes], *, raise_after: BaseException | None = None) -> ASGIApp:
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        for piece in pieces:
+            await send({"type": "http.response.body", "body": piece, "more_body": True})
+        if raise_after is not None:
+            raise raise_after
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    return app
+
+
+class Records:
+    """A terminal-audit sink: what was published, in order."""
+
+    def __init__(self, *failures: BaseException) -> None:
+        self.records: list[TerminalRecord] = []
+        self.failures = list(failures)
+
+    async def __call__(self, record: TerminalRecord) -> None:
+        if self.failures:
+            raise self.failures.pop(0)
+        self.records.append(record)
+
+    @property
+    def outcomes(self) -> list[tuple[str, str | None]]:
+        return [(r.outcome, r.error_code) for r in self.records]
+
+
+def facts_for(request_id: str = "call-1") -> AuditFacts:
+    return AuditFacts(
+        request_id=request_id,
+        user_id="alice",
+        team_id="t1",
+        provider="anthropic",
+        model="claude",
+        redaction_count=2,
+        finding_label_counts={"EMAIL": 1, "NAME": 1},
+    )
+
+
+def with_facts(app: ASGIApp, mappings: ResponseMappings) -> ASGIApp:
+    """The pre-call's two effects on the ticket: the response mapping and the audit facts."""
+
+    async def registered(scope: Any, receive: Any, send: Any) -> None:
+        ticket = current_ticket()
+        assert ticket is not None
+        assert mappings.register(ticket, MAPPING)
+        assert deposit(ticket, facts_for())
+        await app(scope, receive, send)
+
+    return registered
+
+
+async def run_until_the_client_leaves(limiter: InflightLimiter, app: ASGIApp) -> None:
+    """One request through the limiter; the client disconnects once a body byte arrived."""
+    first_chunk = asyncio.Event()
+    served = {"n": 0}
+
+    async def receive() -> Message:
+        served["n"] += 1
+        if served["n"] == 1:
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+        await first_chunk.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_chunk.set()
+
+    async def refuse(reason: str) -> None:
+        raise AssertionError(reason)
+
+    await asyncio.wait_for(limiter.run(_scope(), receive, send, app, refuse=refuse), 5)
+
+
+# ── chat SSE through the installed OpenAI SDK ────────────────────────────────
+
+CHAT_META = {
+    "id": "chatcmpl-9",
+    "object": "chat.completion.chunk",
+    "created": 1758500000,
+    "model": "gpt-4o-mini",
+}
+
+
+def chat_chunk(*choices: dict[str, Any]) -> bytes:
+    body = json.dumps({**CHAT_META, "choices": list(choices)}, ensure_ascii=False)
+    return f"data: {body}\n\n".encode()
+
+
+def chat_choice(index: int, finish: str | None = None, **delta: Any) -> dict[str, Any]:
+    return {"index": index, "delta": delta, "finish_reason": finish}
+
+
+async def sdk_stream(app: ASGIApp) -> tuple[Any, list[Any]]:
+    """``client.chat.completions.stream`` over the ASGI app: the SDK's own SSE decoding,
+    chunk building and ``ChatCompletionStreamState`` accumulator."""
+    openai = pytest.importorskip("openai")
+    import httpx
+
+    transport = httpx.ASGITransport(app=ticketed(app))
+    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as http:
+        client = openai.AsyncOpenAI(
+            api_key="sk-test", base_url="http://gateway/v1", http_client=http
+        )
+        async with client.chat.completions.stream(
+            model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}]
+        ) as stream:
+            events = [event async for event in stream]
+            final = await stream.get_final_completion()
+    return final, events
+
+
+async def test_chat_sse_through_the_middleware_is_what_the_sdk_accumulates() -> None:
+    """Two choices, placeholders split inside each, a Cyrillic character split across two
+    ASGI messages: the SDK builds every chunk, and each choice's ``content.done`` holds the
+    whole restored text."""
+    whole = b"".join(
+        [
+            chat_chunk(
+                chat_choice(0, role="assistant", content="Привет, [EM"),
+                chat_choice(1, role="assistant", content="b [NA"),
+            ),
+            chat_chunk(chat_choice(0, content="AIL_1] и [NA"), chat_choice(1, content="ME_1]")),
+            chat_chunk(chat_choice(0, content="ME_1]")),
+            chat_chunk(chat_choice(0, "stop"), chat_choice(1, "stop")),
+            b"data: [DONE]\n\n",
+        ]
+    )
+    cut = whole.index("Привет".encode()) + 1
+    mappings = ResponseMappings()
+
+    final, events = await sdk_stream(mounted(byte_app([whole[:cut], whole[cut:]]), mappings))
+
+    assert [c.message.content for c in final.choices] == [
+        f"Привет, {EMAIL} и {QUOTED}",
+        f"b {QUOTED}",
+    ]
+    done = sorted(e.content for e in events if e.type == "content.done")
+    assert done == sorted([f"Привет, {EMAIL} и {QUOTED}", f"b {QUOTED}"])
+    assert len(mappings) == 0
+
+
+async def test_chat_tool_call_arguments_through_the_middleware_are_complete_in_the_sdk() -> None:
+    first = json.dumps({"to": PLACEHOLDER})
+    second = json.dumps({"who": NAME})
+
+    def call(index: int, arguments: str, head: bool = False) -> dict[str, Any]:
+        entry: dict[str, Any] = {"index": index, "function": {"arguments": arguments}}
+        if head:
+            entry.update(id=f"call_{index}", type="function")
+            entry["function"]["name"] = f"f{index}"
+        return entry
+
+    pieces = [
+        chat_chunk(chat_choice(0, role="assistant", tool_calls=[call(0, "", head=True)])),
+        chat_chunk(chat_choice(0, tool_calls=[call(0, first[:10])])),
+        chat_chunk(chat_choice(0, tool_calls=[call(0, first[10:])])),
+        chat_chunk(chat_choice(0, tool_calls=[call(1, "", head=True)])),
+        chat_chunk(chat_choice(0, tool_calls=[call(1, second[:11])])),
+        chat_chunk(chat_choice(0, tool_calls=[call(1, second[11:])])),
+        chat_chunk(chat_choice(0, "tool_calls")),
+        b"data: [DONE]\n\n",
+    ]
+
+    final, events = await sdk_stream(mounted(byte_app(pieces), ResponseMappings()))
+
+    args = [json.loads(c.function.arguments) for c in final.choices[0].message.tool_calls]
+    assert args == [{"to": EMAIL}, {"who": QUOTED}]
+    done = [
+        json.loads(e.arguments) for e in events if e.type == "tool_calls.function.arguments.done"
+    ]
+    assert done == [{"to": EMAIL}, {"who": QUOTED}]
+
+
+# ── Responses terminal ordering ──────────────────────────────────────────────
+
+
+def _responses_frames(*events: dict[str, Any]) -> list[str]:
+    return [f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events]
+
+
+_TEXT_IDS = {"item_id": "msg_1", "output_index": 0, "content_index": 0}
+_HELD = [
+    {"type": "response.output_text.delta", "sequence_number": 1, **_TEXT_IDS, "delta": "mail [EM"},
+    {"type": "response.output_text.delta", "sequence_number": 2, **_TEXT_IDS, "delta": "AIL_1]"},
+]
+_ENDINGS: dict[str, list[str]] = {
+    "done": ["data: [DONE]\n\n"],
+    "completed": [
+        *_responses_frames(
+            {"type": "response.completed", "sequence_number": 3, "response": RESPONSES}
+        ),
+        "data: [DONE]\n\n",
+    ],
+    "failed": _responses_frames(
+        {"type": "response.failed", "sequence_number": 3, "response": {"id": "resp_1"}}
+    ),
+    "error": _responses_frames(
+        {"type": "error", "sequence_number": 3, "code": "server_error", "message": "gone"}
+    ),
+}
+
+
+@pytest.mark.parametrize("ending", sorted(_ENDINGS))
+async def test_responses_tails_go_out_before_the_end_never_after(ending: str) -> None:
+    """No ``output_text.done`` arrived: the held tail must precede ``[DONE]``, the terminal
+    ``response.*`` event and an ``error`` event, the points where a client stops reading."""
+    mappings = ResponseMappings()
+    records = Records()
+    chunks = [*_responses_frames(*_HELD), *_ENDINGS[ending]]
+
+    sent = await drive(
+        DesanitizeMiddleware(
+            with_facts(sse_app(chunks), mappings),
+            mappings,
+            enabled=True,
+            terminal=TerminalAudit(records),
+        )
+    )
+
+    stream = body_of(sent).decode()
+    ordered = _ordered(stream)
+    end = next(i for i, e in enumerate(ordered) if _type_of(e) == _type(ending))
+    head, tail = ordered[:end], ordered[end:]
+    assert "".join(e.get("delta", "") for e in head) == f"mail {EMAIL}"
+    assert not any(_type_of(e) == "response.output_text.delta" for e in tail)
+    assert PLACEHOLDER_MARK not in stream
+    ok = ending in ("done", "completed")
+    assert records.outcomes == [("ok", None) if ok else ("failed", None)]
+
+
+def _type(ending: str) -> str:
+    return {"done": "[DONE]", "error": "error"}.get(ending, f"response.{ending}")
+
+
+def _type_of(event: Any) -> str:
+    return event if isinstance(event, str) else str(event.get("type"))
+
+
+def _ordered(stream: str) -> list[Any]:
+    """Every ``data:`` payload in order; ``[DONE]`` as the string."""
+    out: list[Any] = []
+    for line in stream.splitlines():
+        if line.startswith("data:"):
+            data = line[5:].strip()
+            out.append(data if data == "[DONE]" else json.loads(data))
+    return out
+
+
+_PROVIDER_ERRORS: dict[str, tuple[list[str], str]] = {
+    "chat": (
+        [
+            "data: "
+            + json.dumps(
+                {**CHAT_META, "choices": [{"index": 0, "delta": {"content": f"to {PLACEHOLDER}"}}]}
+            )
+            + "\n\n",
+            'data: {"error": {"message": "provider failed", "code": "500"}}\n\n',
+        ],
+        'data: {"error"',
+    ),
+    "anthropic": (
+        [
+            *_anthropic_chunks()[:1],
+            "event: content_block_delta\ndata: "
+            + json.dumps(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": f"to {PLACEHOLDER}"},
+                }
+            )
+            + "\n\n",
+            'event: error\ndata: {"type": "error", "error": {"type": "overloaded_error"}}\n\n',
+        ],
+        "event: error",
+    ),
+    "responses": (
+        [
+            *_responses_frames(
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    **_TEXT_IDS,
+                    "delta": f"to {PLACEHOLDER}",
+                },
+                {"type": "error", "sequence_number": 2, "code": "server_error", "message": "gone"},
+            )
+        ],
+        "event: error",
+    ),
+}
+
+
+@pytest.mark.parametrize("family", sorted(_PROVIDER_ERRORS))
+async def test_a_provider_error_mid_stream_flushes_the_held_tail_first(family: str) -> None:
+    """litellm turns a provider exception mid-stream into an error event and ends the
+    stream; the callback path flushes tails before it propagates (litellm_hook.py
+    ``_post_call_stream_impl``), and so does the middleware."""
+    chunks, marker = _PROVIDER_ERRORS[family]
+    mappings = ResponseMappings()
+    records = Records()
+
+    sent = await drive(
+        DesanitizeMiddleware(
+            with_facts(sse_app(chunks), mappings),
+            mappings,
+            enabled=True,
+            terminal=TerminalAudit(records),
+        )
+    )
+
+    stream = body_of(sent).decode()
+    at = stream.index(marker)
+    assert _stream_text(stream[:at]) == f"to {EMAIL}"
+    assert _stream_text(stream[at:]) == ""
+    assert PLACEHOLDER not in stream
+    assert records.outcomes == [("failed", None)]
+    assert len(mappings) == 0
+
+
+def _stream_text(stream: str) -> str:
+    """The model text of any family's events, in order."""
+    out: list[str] = []
+    for event in _ordered(stream):
+        if not isinstance(event, dict):
+            continue
+        for choice in event.get("choices") or []:
+            out.append(choice.get("delta", {}).get("content") or "")
+        delta = event.get("delta")
+        if isinstance(delta, dict) and delta.get("type") == "text_delta":
+            out.append(delta["text"])
+        elif event.get("type") == "response.output_text.delta":
+            out.append(event["delta"])
+    return "".join(out)
+
+
+async def test_an_app_that_raises_mid_stream_still_gets_the_restored_tail_out() -> None:
+    """Parity with the callback path: tails first, then the app's own exception, untouched."""
+    held = (
+        "data: "
+        + json.dumps(
+            {**CHAT_META, "choices": [{"index": 0, "delta": {"content": f"to {PLACEHOLDER}"}}]}
+        )
+        + "\n\n"
+    )
+    mappings = ResponseMappings()
+    records = Records()
+    boom = RuntimeError("upstream transport broke")
+    ticket = RequestTicket("7" * 32)
+    middleware = DesanitizeMiddleware(
+        with_facts(byte_app([held.encode()], raise_after=boom), mappings),
+        mappings,
+        enabled=True,
+        terminal=TerminalAudit(records),
+    )
+
+    sent: list[Message] = []
+
+    with pytest.raises(RuntimeError) as raised:
+        await drive(middleware, ticket, sent)
+
+    assert raised.value is boom
+    assert _stream_text(body_of(sent).decode()) == f"to {EMAIL}"
+    assert all(m.get("more_body") for m in sent if m["type"] == "http.response.body")
+    assert len(mappings) == 0
+    assert records.outcomes == [("failed", None)]
+
+
+async def test_the_app_error_stays_the_error_when_the_tail_send_fails_too() -> None:
+    held = (
+        "data: "
+        + json.dumps({"choices": [{"index": 0, "delta": {"content": f"to {PLACEHOLDER}"}}]})
+        + "\n\n"
+    )
+    mappings = ResponseMappings()
+    boom = RuntimeError("upstream transport broke")
+    ticket = RequestTicket("8" * 32)
+    mappings.register(ticket, MAPPING)
+    sends = {"n": 0}
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message: Message) -> None:
+        sends["n"] += 1
+        # The start and the restored head go out; the tail after the app's error does not.
+        if sends["n"] > 2:
+            raise OSError("client gone")
+
+    token = _TICKET.set(ticket)
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await DesanitizeMiddleware(
+                byte_app([held.encode()], raise_after=boom), mappings, enabled=True
+            )(_scope(), receive, send)
+    finally:
+        _TICKET.reset(token)
+
+    assert raised.value is boom
+    assert sends["n"] == 3
+    assert len(mappings) == 0
+
+
+# ── mapping lifecycle ────────────────────────────────────────────────────────
+
+
+def _text_app(status: int, headers: list[tuple[bytes, bytes]], body: bytes) -> ASGIApp:
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    return app
+
+
+_GZIPPED = __import__("gzip").compress(json.dumps(CHAT).encode())
+_MODES: dict[str, ASGIApp] = {
+    "2xx-json": json_app(CHAT),
+    "2xx-sse": sse_app(_anthropic_chunks()),
+    "non-2xx": json_app({"error": {"message": f"no {PLACEHOLDER}"}}, status=429),
+    "non-json": _text_app(200, [(b"content-type", b"text/plain")], f"hi {PLACEHOLDER}".encode()),
+    "gzip": _text_app(
+        200, [(b"content-type", b"application/json"), (b"content-encoding", b"gzip")], _GZIPPED
+    ),
+}
+
+
+@pytest.mark.parametrize("mode", sorted(_MODES))
+async def test_the_mapping_goes_on_the_final_body_in_every_mode(mode: str) -> None:
+    """Not only in ``finally``: a response that finished while its app keeps running (a
+    pass-through, an error) holds no mapping past its final body."""
+    mappings = ResponseMappings()
+    seen_after: list[bool] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _MODES[mode](scope, receive, send)
+        seen_after.append(current_ticket() in mappings)
+
+    sent = await drive(mounted(app, mappings))
+
+    assert seen_after == [False]
+    if mode == "gzip":
+        assert body_of(sent) == _GZIPPED
+        assert header(start_of(sent), b"content-encoding") == b"gzip"
+
+
+@pytest.mark.parametrize("state", ["cancelled", "closed"])
+async def test_a_mapping_is_refused_for_a_cancelled_or_closed_ticket(
+    state: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    ticket = RequestTicket("9" * 32)
+    if state == "cancelled":
+        ticket.cancelled = True
+    else:
+        ticket.close()
+    mappings = ResponseMappings()
+
+    with caplog.at_level(logging.DEBUG):
+        registered = mappings.register(ticket, MAPPING)
+
+    assert registered is False and len(mappings) == 0
+    assert "gateway_desanitize_register_refused" in caplog.text and f"reason={state}" in caplog.text
+    assert ORIGINAL_MARK not in caplog.text and QUOTED not in caplog.text
+
+
+async def test_closing_the_ticket_releases_the_mapping_and_the_restorer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The limiter's close reaches a request whose downstream never returns: the mapping
+    and every buffer holding restored text are gone at once."""
+    restorers: list[weakref.ref[Any]] = []
+
+    class Tracked(desanitize_middleware._SseRestorer):
+        def __init__(self, mapping: StrategyResult) -> None:
+            super().__init__(mapping)
+            restorers.append(weakref.ref(self))
+
+    monkeypatch.setattr(desanitize_middleware, "_SseRestorer", Tracked)
+    mappings = ResponseMappings()
+    ticket = RequestTicket("a1" * 16)
+    mapped = StrategyResult(pairs=MAPPING.pairs)
+    mapping_ref = weakref.ref(mapped)
+    mappings.register(ticket, mapped)
+    del mapped
+    hang = asyncio.Event()
+    middleware = DesanitizeMiddleware(
+        sse_app(_stream_for("responses"), after_last=hang.wait), mappings, enabled=True
+    )
+    task = asyncio.create_task(drive(middleware, ticket))
+    while not restorers:
+        await asyncio.sleep(0.01)
+
+    ticket.close()
+    gc.collect()
+
+    assert len(mappings) == 0
+    assert restorers[0]() is None and mapping_ref() is None
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_cancellation_resistant_requests_leave_nothing_behind(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """N requests whose downstream ignores cancellation, under the production task factory
+    and cancel hook: after each disconnect the store is empty, no restorer or mapping
+    survives, the guardrail holds no state, and each has one ``cancelled`` terminal record."""
+    restorers: list[weakref.ref[Any]] = []
+    mapping_refs: list[weakref.ref[Any]] = []
+
+    class Tracked(desanitize_middleware._SseRestorer):
+        def __init__(self, mapping: StrategyResult) -> None:
+            super().__init__(mapping)
+            restorers.append(weakref.ref(self))
+
+    class TrackedMappings(ResponseMappings):
+        def register(self, ticket: RequestTicket, mapping: StrategyResult) -> bool:
+            mapping_refs.append(weakref.ref(mapping))
+            return super().register(ticket, mapping)
+
+    monkeypatch.setattr(desanitize_middleware, "_SseRestorer", Tracked)
+    restore_factory = install_task_factory(asyncio.get_running_loop())
+    guardrail, sink = build_ours()
+    limiter = InflightLimiter(0, metrics=NoopExporter(), cancel_grace_s=0.05)
+    limiter.bind_cancel_hook(guardrail.on_request_cancelled)
+    mappings = TrackedMappings()
+    records = Records()
+    terminal = TerminalAudit(records)
+    stop = asyncio.Event()
+    sizes: list[int] = []
+
+    async def resist() -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        data = _data_with_token("tok-1", content=f"write to {EMAIL}")
+        data["litellm_call_id"] = f"call-{uuid.uuid4().hex}"
+        await guardrail.pre_call(data)
+        register_response_mapping(guardrail, mappings, data)
+        sizes.append(len(mappings))
+        stream = DesanitizeMiddleware(
+            sse_app(_stream_for("anthropic"), after_last=resist),
+            mappings,
+            enabled=True,
+            terminal=terminal,
+        )
+        await stream(scope, receive, send)
+
+    n = 5
+    try:
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(n):
+                await run_until_the_client_leaves(limiter, app)
+                await terminal.drain()
+                gc.collect()
+                assert len(mappings) == 0
+                assert all(ref() is None for ref in restorers)
+                assert all(ref() is None for ref in mapping_refs)
+                assert guardrail._req_state == {}
+    finally:
+        stop.set()
+        await asyncio.sleep(0.05)
+        restore_factory()
+
+    assert sizes == [1] * n and len(restorers) == n
+    assert records.outcomes == [("cancelled", "E_CLIENT_DISCONNECTED")] * n
+    assert [r["status"] for r in sink.records] == ["cancelled"] * n
+    assert ORIGINAL_MARK not in caplog.text
+
+
+# ── the terminal-audit contract through the middleware ───────────────────────
+
+
+async def test_a_callback_before_the_response_adds_to_the_one_record() -> None:
+    """litellm's deferred success log can run before ``http.response.start``: it deposits
+    and never publishes; the middleware publishes at the final body."""
+    mappings = ResponseMappings()
+    records = Records()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        assert deposit_usage(current_ticket(), *TOKEN_COUNTS)
+        assert records.records == []
+        await json_app(CHAT)(scope, receive, send)
+
+    sent = await drive(
+        DesanitizeMiddleware(
+            with_facts(app, mappings), mappings, enabled=True, terminal=TerminalAudit(records)
+        )
+    )
+
+    assert EMAIL in body_of(sent).decode()
+    (record,) = records.records
+    event = record.event()
+    assert record.outcome == "ok"
+    assert (event.prompt_token_count, event.completion_token_count) == TOKEN_COUNTS
+    assert event.redaction_count == 2 and event.finding_label_counts == {"EMAIL": 1, "NAME": 1}
+
+
+async def test_a_callback_after_the_response_changes_nothing() -> None:
+    mappings = ResponseMappings()
+    records = Records()
+    late: list[bool] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await json_app(CHAT)(scope, receive, send)
+        assert [r.outcome for r in records.records] == ["ok"]
+        late.append(deposit_usage(current_ticket(), *TOKEN_COUNTS))
+
+    ticket = RequestTicket("b1" * 16)
+    terminal = TerminalAudit(records)
+    await drive(
+        DesanitizeMiddleware(with_facts(app, mappings), mappings, enabled=True, terminal=terminal),
+        ticket,
+    )
+    ticket.close()
+    await terminal.drain()
+
+    assert late == [False]
+    (record,) = records.records
+    assert record.event().prompt_token_count == 0 and record.event().redaction_count == 2
+
+
+@pytest.mark.parametrize("phase", ["before_start", "after_start"])
+async def test_a_restoration_failure_is_one_failed_internal_record(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    """Matches ``_report_internal_failure``: ``status="failed"``, ``error_code="E_INTERNAL"``."""
+    mappings = ResponseMappings()
+    records = Records()
+    if phase == "before_start":
+        inner = json_app(CHAT)
+        middleware = DesanitizeMiddleware(
+            with_facts(inner, mappings),
+            mappings,
+            enabled=True,
+            restore_json=_raising_restore,
+            terminal=TerminalAudit(records),
+        )
+    else:
+        _raise_on(monkeypatch, PLACEHOLDER_MARK)
+        middleware = DesanitizeMiddleware(
+            with_facts(sse_app(_anthropic_chunks()), mappings),
+            mappings,
+            enabled=True,
+            terminal=TerminalAudit(records),
+        )
+    ticket = RequestTicket("c1" * 16)
+
+    await drive(middleware, ticket)
+    ticket.close()
+
+    assert records.outcomes == [("failed", "E_INTERNAL")]
+    assert records.records[0].event().redaction_count == 2
+
+
+async def test_a_cancel_before_the_final_body_takes_precedence_over_ok() -> None:
+    """The client left mid-stream: the limiter cancels, the ticket's close publishes
+    ``cancelled``; nothing publishes ``ok``, whatever order the rest runs in."""
+    mappings = ResponseMappings()
+    records = Records()
+    terminal = TerminalAudit(records)
+    first_chunk = asyncio.Event()
+    served = {"n": 0}
+    hang = asyncio.Event()
+
+    async def receive() -> Message:
+        served["n"] += 1
+        if served["n"] == 1:
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+        await first_chunk.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_chunk.set()
+
+    async def app(scope: Any, receive_: Any, send_: Any) -> None:
+        await DesanitizeMiddleware(
+            with_facts(sse_app(_stream_for("chat"), after_last=hang.wait), mappings),
+            mappings,
+            enabled=True,
+            terminal=terminal,
+        )(scope, receive_, send_)
+
+    async def refuse(reason: str) -> None:
+        raise AssertionError(reason)
+
+    limiter = InflightLimiter(0, metrics=NoopExporter(), cancel_grace_s=0.5)
+    await asyncio.wait_for(limiter.run(_scope(), receive, send, app, refuse=refuse), 5)
+    await terminal.drain()
+
+    assert records.outcomes == [("cancelled", "E_CLIENT_DISCONNECTED")]
+
+
+async def test_a_failed_terminal_write_is_retried_at_close_and_written_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mappings = ResponseMappings()
+    records = Records(RuntimeError(f"sink down {CANARY}"))
+    terminal = TerminalAudit(records)
+    ticket = RequestTicket("d1" * 16)
+
+    with caplog.at_level(logging.DEBUG):
+        await drive(
+            DesanitizeMiddleware(
+                with_facts(json_app(CHAT), mappings), mappings, enabled=True, terminal=terminal
+            ),
+            ticket,
+        )
+        assert records.records == []
+        ticket.close()
+        await terminal.drain()
+
+    assert records.outcomes == [("ok", None)]
+    assert CANARY not in caplog.text
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
+@pytest.mark.parametrize("route", ["chat", "messages", "responses"])
+async def test_over_litellms_app_the_terminal_record_keeps_todays_counts(
+    monkeypatch: pytest.MonkeyPatch, upstream: StubUpstream, route: str, stream: bool
+) -> None:
+    """Our real pre-call deposits the facts; the terminal record carries the same identity
+    and counts as the record today's ``audit()`` writes for the same request."""
+    mappings = ResponseMappings()
+    records = Records()
+    terminal = TerminalAudit(records)
+    engine, sink = build_ours()
+    harness = DispatchHarness(
+        monkeypatch,
+        upstream,
+        [OptionAPreCall(engine, mappings)],
+        wrap=lambda app: DesanitizeMiddleware(app, mappings, enabled=True, terminal=terminal),
+    )
+
+    exchange = await harness.send(route, stream=stream)
+    await terminal.drain()
+
+    assert exchange.status == 200 and ORIGINAL_MARK in exchange.text
+    (record,) = records.records
+    (today,) = [r for r in sink.records if r["status"] == "ok"]
+    event = record.event()
+    assert record.outcome == "ok"
+    assert event.request_id == today["request_id"]
+    assert (event.user_id, event.team_id) == (today["user_id"], today["team_id"])
+    assert event.redaction_count == today["redaction_count"] == 1
+    assert event.finding_label_counts == today["finding_label_counts"]
+    assert len(mappings) == 0
+
+
+# ── boundaries, across the three families ────────────────────────────────────
+
+FAIL_HERE = "FAIL-HERE-3c2"
+
+
+def _family_stream(family: str) -> list[str]:
+    """A restored placeholder, then an event carrying ``FAIL_HERE``, then more."""
+    if family == "chat":
+
+        def c(text: str) -> str:
+            return (
+                "data: "
+                + json.dumps({**CHAT_META, "choices": [{"index": 0, "delta": {"content": text}}]})
+                + "\n\n"
+            )
+
+        return [
+            c(f"to {PLACEHOLDER}. "),
+            c(f"{'x' * 12} ok. "),
+            c(FAIL_HERE),
+            c("never"),
+            "data: [DONE]\n\n",
+        ]
+    if family == "anthropic":
+
+        def d(text: str) -> str:
+            return (
+                "event: content_block_delta\ndata: "
+                + json.dumps(
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": text},
+                    }
+                )
+                + "\n\n"
+            )
+
+        return [
+            _anthropic_chunks()[0],
+            d(f"to {PLACEHOLDER}. "),
+            d("x" * 12 + " ok. "),
+            d(FAIL_HERE),
+            d("never"),
+        ]
+    return _responses_frames(
+        *(
+            {"type": "response.output_text.delta", "sequence_number": i, **_TEXT_IDS, "delta": text}
+            for i, text in enumerate(
+                [f"to {PLACEHOLDER}. ", "x" * 12 + " ok. ", FAIL_HERE, "never"]
+            )
+        )
+    )
+
+
+def _fail_on_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = desanitize_middleware._SseRestorer._event
+
+    def event(self: Any, text: str) -> list[str]:
+        if FAIL_HERE in text:
+            raise ValueError(f"{CANARY} {EMAIL}")
+        return real(self, text)
+
+    monkeypatch.setattr(desanitize_middleware._SseRestorer, "_event", event)
+
+
+@pytest.mark.parametrize("family", ["chat", "anthropic", "responses"])
+async def test_restored_text_reaches_the_client_before_a_later_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, family: str
+) -> None:
+    _fail_on_marker(monkeypatch)
+    mappings = ResponseMappings()
+    metrics = _Failures()
+
+    with caplog.at_level(logging.DEBUG):
+        sent = await drive(mounted(sse_app(_family_stream(family)), mappings, metrics=metrics))
+
+    stream = body_of(sent).decode()
+    assert _stream_text(stream).startswith(f"to {EMAIL}")
+    assert FAIL_HERE not in stream and "never" not in stream and CANARY not in stream
+    assert [bool(m.get("more_body")) for m in sent if m["type"] == "http.response.body"][
+        -1
+    ] is False
+    assert metrics.components == [COMPONENT]
+    assert CANARY not in caplog.text and "Traceback" not in caplog.text
+    assert len(mappings) == 0
+
+
+class _UnbuildableResponses:
+    def __init__(self, mapping: StrategyResult) -> None:
+        raise ValueError(f"{CANARY} {EMAIL}")
+
+
+@pytest.mark.parametrize("adapter", ["SseStreamDesanitizer", "ResponsesStreamDesanitizer"])
+@pytest.mark.parametrize("family", ["chat", "anthropic", "responses"])
+async def test_an_adapter_that_cannot_be_built_is_a_content_free_500_for_every_family(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, adapter: str, family: str
+) -> None:
+    monkeypatch.setattr(desanitize_middleware, adapter, _UnbuildableResponses)
+    mappings = ResponseMappings()
+
+    with caplog.at_level(logging.DEBUG):
+        sent = await drive(mounted(sse_app(_family_stream(family)), mappings))
+
+    assert start_of(sent)["status"] == 500 and body_of(sent) == INTERNAL_ERROR_BODY
+    assert CANARY not in caplog.text and "phase=before_start" in caplog.text
+    assert len(mappings) == 0
+
+
+@pytest.mark.parametrize("family", ["chat", "anthropic", "responses"])
+async def test_a_flush_failure_delivers_what_was_restored_and_closes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, family: str
+) -> None:
+    def flush(self: Any) -> None:
+        raise ValueError(f"{CANARY} {EMAIL}")
+
+    monkeypatch.setattr(desanitize_middleware._SseRestorer, "flush", flush)
+    mappings = ResponseMappings()
+    chunks = [c for c in _family_stream(family) if FAIL_HERE not in c]
+
+    with caplog.at_level(logging.DEBUG):
+        sent = await drive(mounted(sse_app(chunks), mappings))
+
+    stream = body_of(sent).decode()
+    assert _stream_text(stream).startswith(f"to {EMAIL}") and CANARY not in stream
+    assert "phase=after_start" in caplog.text and CANARY not in caplog.text
+    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    assert len(mappings) == 0
+
+
+def _chain(exc: BaseException | None) -> list[BaseException]:
+    seen: list[BaseException] = []
+    while exc is not None and exc not in seen:
+        seen.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    return seen
+
+
+@pytest.mark.parametrize("fail_at", ["restored-chunk", "final-body", "reporter-then-send"])
+async def test_a_client_send_failing_after_an_after_start_failure_chains_no_content(
+    monkeypatch: pytest.MonkeyPatch, fail_at: str
+) -> None:
+    _fail_on_marker(monkeypatch)
+    mappings = ResponseMappings()
+    ticket = RequestTicket("e1" * 16)
+    mappings.register(ticket, MAPPING)
+    bodies = {"n": 0}
+
+    def reporter(request_id: str, phase: str, error_type: type[BaseException]) -> None:
+        raise RuntimeError(f"exporter down {CANARY}")
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message: Message) -> None:
+        if message["type"] != "http.response.body":
+            return
+        bodies["n"] += 1
+        final = not message.get("more_body")
+        if fail_at == "restored-chunk" and message.get("body") and bodies["n"] > 1:
+            raise OSError("client gone")
+        if fail_at in ("final-body", "reporter-then-send") and final:
+            raise OSError("client gone")
+
+    middleware = DesanitizeMiddleware(
+        sse_app(_family_stream("anthropic")),
+        mappings,
+        enabled=True,
+        on_failure=reporter if fail_at == "reporter-then-send" else None,
+        metrics=_Failures(),
+    )
+    token = _TICKET.set(ticket)
+    try:
+        with pytest.raises(OSError) as raised:
+            await middleware(_scope(), receive, send)
+    finally:
+        _TICKET.reset(token)
+
+    chain = _chain(raised.value)
+    assert all(CANARY not in repr(e) and EMAIL not in repr(e) for e in chain)
+    assert raised.value.__context__ is None and raised.value.__cause__ is None
+    assert len(mappings) == 0
+
+
+@pytest.fixture
+def failing_upstream() -> Iterator[StubUpstream]:
+    stub = StubUpstream(error_status=500)
+    yield stub
+    stub.close()
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
+@pytest.mark.parametrize("route", ["chat", "messages", "responses"])
+async def test_a_provider_error_after_the_mapping_was_registered_passes_and_releases(
+    monkeypatch: pytest.MonkeyPatch, failing_upstream: StubUpstream, route: str, stream: bool
+) -> None:
+    mappings = ResponseMappings()
+    records = Records()
+    terminal = TerminalAudit(records)
+    engine, _ = build_ours()
+    harness = DispatchHarness(
+        monkeypatch,
+        failing_upstream,
+        [OptionAPreCall(engine, mappings)],
+        wrap=lambda app: DesanitizeMiddleware(app, mappings, enabled=True, terminal=terminal),
+    )
+
+    exchange = await harness.send(route, stream=stream)
+    await terminal.drain()
+
+    assert exchange.status >= 400 and ORIGINAL_MARK not in exchange.text
+    assert failing_upstream.bodies and all(ORIGINAL_MARK not in b for b in failing_upstream.bodies)
+    assert len(mappings) == 0
+    assert [r.outcome for r in records.records] == ["failed"]
+
+
+def _thinking_stream() -> list[str]:
+    def ev(data: dict[str, Any]) -> str:
+        return f"event: {data['type']}\ndata: {json.dumps(data)}\n\n"
+
+    return [
+        ev(
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""},
+            }
+        ),
+        ev(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": f"user {PLACEHOLDER}"},
+            }
+        ),
+        ev(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "c2ln"},
+            }
+        ),
+        ev({"type": "content_block_stop", "index": 0}),
+        ev(
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "tool_use", "id": "t", "name": "mail", "input": {}},
+            }
+        ),
+        ev(
+            {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": '{"to": "[NA'},
+            }
+        ),
+        ev(
+            {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": 'ME_1]"}'},
+            }
+        ),
+        ev({"type": "content_block_stop", "index": 1}),
+    ]
+
+
+async def test_thinking_and_its_signature_pass_through_and_tool_input_is_restored() -> None:
+    """Anthropic signs thinking blocks: they go out as received, placeholder and all;
+    the tool input beside them is restored and stays valid JSON."""
+    chunks = _thinking_stream()
+
+    sent = await drive(mounted(sse_app(chunks), ResponseMappings()))
+
+    stream = body_of(sent).decode()
+    for event in chunks[:4]:
+        assert event in stream
+    partial = "".join(
+        e["delta"]["partial_json"]
+        for e in _events(stream)
+        if e.get("delta", {}).get("type") == "input_json_delta"
+    )
+    assert json.loads(partial) == {"to": QUOTED}
+
+
+async def test_a_unary_thinking_block_passes_through_untouched() -> None:
+    payload = {
+        **ANTHROPIC,
+        "content": [
+            {"type": "thinking", "thinking": f"user {PLACEHOLDER}", "signature": "c2ln"},
+            {"type": "text", "text": f"mail {PLACEHOLDER}"},
+        ],
+    }
+
+    sent = await drive(mounted(json_app(payload), ResponseMappings()))
+
+    body = json.loads(body_of(sent))
+    assert body["content"][0] == payload["content"][0]
+    assert body["content"][1]["text"] == f"mail {EMAIL}"
+
+
+def test_litellms_app_carries_no_compressor() -> None:
+    """The Content-Encoding pass-through is only safe with nothing compressing upstream of
+    the middleware: litellm's own app adds none."""
+    from litellm.proxy import proxy_server
+
+    assert compressor_problems(proxy_server.app) == []
+
+
+def test_a_compressor_on_the_app_is_detected() -> None:
+    from starlette.middleware.gzip import GZipMiddleware
+
+    app = Starlette()
+    app.add_middleware(GZipMiddleware)
+
+    assert compressor_problems(app) == ["GZipMiddleware"]
+
+
+# ── pins ─────────────────────────────────────────────────────────────────────
+
+
+def test_head_never_reaches_a_rewritten_verdict_on_any_shipped_route() -> None:
+    """A HEAD response has a Content-Length and no body: were it ever REWRITTEN, the unary
+    path would parse an empty body. Every path the tables make REWRITTEN refuses HEAD."""
+    from corp_llm_gateway.route_gate import LITELLM_ROUTE_TABLE, Verdict, classify
+    from corp_llm_gateway.route_gate.table import GATEWAY_ROUTE_TABLE
+
+    rewritten = {
+        path
+        for table in (LITELLM_ROUTE_TABLE, GATEWAY_ROUTE_TABLE)
+        for (_, path), entry in table.items()
+        if entry.verdict is Verdict.REWRITTEN
+    }
+    assert rewritten
+    for path in sorted(rewritten):
+        assert classify("HEAD", path, path.encode()).verdict is not Verdict.REWRITTEN, path
+
+
+async def test_restoration_does_not_depend_on_cache_b(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The middleware restores from the mapping the pre-call handed it; Cache B (the
+    conversation store) can expire in between."""
+    from corp_llm_gateway.storage import in_memory
+
+    guardrail, _ = build_ours()
+    mappings = ResponseMappings()
+    ticket = RequestTicket("f1" * 16)
+    token = _TICKET.set(ticket)
+    try:
+        data = _data_with_token("tok-1", content=f"write to {EMAIL}")
+        data["litellm_call_id"] = "call-cache-b"
+        await guardrail.pre_call(data)
+        register_response_mapping(guardrail, mappings, data)
+    finally:
+        _TICKET.reset(token)
+    store = guardrail.orchestrator._mapping_store  # type: ignore[union-attr]
+    held = [key for key in store._p2o if key[1] == PLACEHOLDER]
+    assert held, "the pre-call wrote no Cache B entry; the test proves nothing"
+    real_now = in_memory._now
+    monkeypatch.setattr(in_memory, "_now", lambda: real_now() + 10 * 24 * 3600)
+    for conversation, placeholder in held:
+        assert await store.get_original(conversation, placeholder) is None
+    guardrail._req_state.clear()
+
+    sent = await drive(DesanitizeMiddleware(json_app(CHAT), mappings, enabled=True), ticket)
+
+    assert EMAIL in body_of(sent).decode()
