@@ -333,6 +333,14 @@ KEYS: tuple[Key, ...] = (
         default="4000",
         help="port `python -m corp_llm_gateway.serve` binds (litellm CLI default)",
     ),
+    Key(
+        "CORP_LLM_ALLOW_LITELLM_DEBUG",
+        flag=True,
+        default="0",
+        help="TEST-ONLY: let the gateway arm with litellm's DEBUG logging or set_verbose on "
+        "(both log the original request before it is sanitized); refused when CORP_ENV "
+        "is prod/production",
+    ),
     # ── Route gate (route_gate/) ─────────────────────────────────────────────
     # The only knob the gate has. It can widen the table with PASSTHROUGH routes
     # an operator owns; it can never add REWRITTEN and there is no off switch.
@@ -999,6 +1007,42 @@ def capacity() -> CapacitySettings:
     return result
 
 
+ALLOW_LITELLM_DEBUG_IN_PROD = (
+    "CORP_LLM_ALLOW_LITELLM_DEBUG=1 is test-only: litellm's DEBUG logging and set_verbose "
+    "log the original request before it is sanitized; refused when CORP_ENV is "
+    "prod/production"
+)
+
+
+def _build_litellm_debug(values: Mapping[str, str | None], problems: list[str]) -> bool:
+    allowed = _as_flag(values.get("CORP_LLM_ALLOW_LITELLM_DEBUG"))
+    if allowed and _prod(values):
+        problems.append(ALLOW_LITELLM_DEBUG_IN_PROD)
+        return False
+    return allowed
+
+
+def _check_litellm_debug(values: Mapping[str, str | None], problems: list[str]) -> None:
+    from pathlib import Path
+
+    from corp_llm_gateway.litellm_config import DEFAULT_CONFIG_PATH, debug_problems
+
+    if _build_litellm_debug(values, problems):
+        return
+    raw = values.get("CORP_LLM_LITELLM_CONFIG") or DEFAULT_CONFIG_PATH
+    problems.extend(debug_problems(Path(raw.strip())))
+
+
+def litellm_debug_allowed() -> bool:
+    """Whether litellm DEBUG / set_verbose may be on at arm; the one resolver the
+    entrypoint and ``config check`` share."""
+    problems: list[str] = []
+    allowed = _build_litellm_debug(_resolve(), problems)
+    if problems:
+        raise ConfigError(problems)
+    return allowed
+
+
 def _check_with_pydantic(values: Mapping[str, str | None], problems: list[str]) -> bool:
     """Validate required-endpoint + choices with pydantic. Returns False if absent.
 
@@ -1072,6 +1116,7 @@ def validate() -> Settings:
     _check_master_key_conflict(values, problems)
     _check_issuance(values, problems)
     _check_capacity(values, problems)
+    _check_litellm_debug(values, problems)
     if problems:
         raise ConfigError(list(dict.fromkeys(problems)))
     return Settings(values=values)

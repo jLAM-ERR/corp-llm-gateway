@@ -28,7 +28,8 @@ In order —
    a non-integer, negative or oversized ``CORP_LLM_MAX_INFLIGHT``, ``0`` under
    ``CORP_ENV=prod|production``, or a bad ``CORP_LLM_CANCEL_GRACE_SECONDS``,
    ``CORP_LLM_BODY_READ_SECONDS``, ``CORP_LLM_MAX_DRAINING`` or
-   ``CORP_LLM_MAX_DRAINING_BYTES`` exits 78.
+   ``CORP_LLM_MAX_DRAINING_BYTES`` exits 78. So does the test-only
+   ``CORP_LLM_ALLOW_LITELLM_DEBUG`` under ``CORP_ENV=prod|production``.
    Last, ``CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH``: a malformed item, or one naming
    a route the table refused, exits 78;
 2. run litellm's Prisma schema sequence when ``DATABASE_URL`` is set, with the
@@ -42,8 +43,10 @@ In order —
    routes in front of it, and wrap the app's **lifespan** (not ``on_startup``,
    which Starlette never runs for an app built with an explicit ``lifespan=``) so
    that after litellm's startup has run, a ``CorpLlmGuardrail`` must be in
-   ``litellm.callbacks``. If it is not, the process exits 70 (``EX_SOFTWARE``)
-   rather than serve unsanitized;
+   ``litellm.callbacks``, set up so litellm cannot bypass it, and litellm's DEBUG
+   output (which logs the original request) must be off
+   (``route_gate/arm_checks.py``). Otherwise the process exits 70
+   (``EX_SOFTWARE``) rather than serve, one log line per problem;
 5. wrap the whole chain in ``RouteGateMiddleware`` — by wrapping, not
    ``add_middleware``, so the gate is outermost. Every middleware litellm adds
    sits inside it and none can answer ahead of the gate. The gate carries the
@@ -93,7 +96,7 @@ from typing import Any, NoReturn
 from corp_llm_gateway import config, litellm_cli, litellm_config, pg_session, settings
 from corp_llm_gateway.audit import AuditLogger, get_sink
 from corp_llm_gateway.metrics import get_exporter
-from corp_llm_gateway.route_gate import RouteGateMiddleware
+from corp_llm_gateway.route_gate import RouteGateMiddleware, arm_checks
 from corp_llm_gateway.route_gate.inflight import InflightLimiter, install_task_factory
 
 # `corp_llm_gateway.bootstrap` is NOT imported here: it reaches
@@ -295,6 +298,20 @@ def _check_capacity() -> settings.CapacitySettings:
     return capacity
 
 
+def _check_litellm_debug() -> bool:
+    """Refuse (exit 78) the test-only litellm DEBUG allowance in prod."""
+    try:
+        allowed = settings.litellm_debug_allowed()
+    except settings.ConfigError as exc:
+        _fail_gateway_config(exc.problems)
+    if allowed:
+        log.warning(
+            "CORP_LLM_ALLOW_LITELLM_DEBUG=1: litellm DEBUG logging will not block arming "
+            "(test-only; it logs the original request)"
+        )
+    return allowed
+
+
 def _route_gate_extras() -> dict[Any, Any]:
     """Refuse (exit 78) a malformed extra, or one naming a route the table refused."""
     try:
@@ -362,6 +379,17 @@ def _guardrail_registered() -> bool:
     return _registered_guardrail() is not None
 
 
+def _arm_problems() -> list[str]:
+    """``arm_checks.live_problems``, less the DEBUG ones when the test-only key allows them."""
+    problems = arm_checks.live_problems()
+    if ALLOW_LITELLM_DEBUG:
+        allowed = [p for p in problems if p in arm_checks.DEBUG_PROBLEMS]
+        if allowed:
+            log.warning("arming with litellm DEBUG output on (%s): test-only", ", ".join(allowed))
+        problems = [p for p in problems if p not in arm_checks.DEBUG_PROBLEMS]
+    return problems
+
+
 def _nothing() -> None:
     return None
 
@@ -393,6 +421,7 @@ if _problems:
 log.info("litellm config accepted: %s", CONFIG_PATH)
 ISSUANCE_ENABLED, ISSUANCE_SCHEMA_VERIFIED = _check_issuance()
 CAPACITY = _check_capacity()
+ALLOW_LITELLM_DEBUG = _check_litellm_debug()
 ROUTE_GATE_EXTRAS = _route_gate_extras()
 
 # ── 2. Prisma schema setup ───────────────────────────────────────────────────
@@ -492,7 +521,7 @@ _litellm_lifespan = _app.router.lifespan_context
 
 @asynccontextmanager
 async def _armed_lifespan(scoped_app: Any) -> AsyncIterator[None]:
-    """litellm's lifespan, then the arming check.
+    """litellm's lifespan, then the arming check (``arm_checks.live_problems``).
 
     Wrapping `lifespan_context` is the only hook that runs: Starlette ignores
     `on_startup` / `add_event_handler("startup")` on an app built with an
@@ -502,23 +531,26 @@ async def _armed_lifespan(scoped_app: Any) -> AsyncIterator[None]:
     is a different list and would pass while the hook was absent.
     """
     async with _litellm_lifespan(scoped_app):
-        guardrail = _registered_guardrail()
+        problems = _arm_problems()
         restore_task_factory: Callable[[], None] = _nothing
-        if guardrail is not None:
+        if problems:
+            for problem in problems:
+                log.error(
+                    "arm refused (%s): %s. Config: %s. Refusing to serve.",
+                    problem,
+                    arm_checks.REASONS[problem],
+                    CONFIG_PATH,
+                )
+            # _exit, not sys.exit: this runs inside uvicorn's lifespan task,
+            # where an exception is caught and logged and the server keeps going.
+            os._exit(EXIT_NO_CALLBACK)
+        else:
+            guardrail = _registered_guardrail()
             _start_litellm_logging_worker()
             restore_task_factory = install_task_factory(asyncio.get_running_loop())
             limiter.bind_cancel_hook(guardrail.on_request_cancelled)
             gate.arm()
             log.info("CorpLlmGuardrail found in litellm.callbacks; route gate armed")
-        else:
-            log.error(
-                "no CorpLlmGuardrail in litellm.callbacks after startup — the config at %s "
-                "did not register corp_llm_gateway.bootstrap.guardrail. Refusing to serve.",
-                CONFIG_PATH,
-            )
-            # _exit, not sys.exit: this runs inside uvicorn's lifespan task,
-            # where an exception is caught and logged and the server keeps going.
-            os._exit(EXIT_NO_CALLBACK)
         try:
             yield
         finally:

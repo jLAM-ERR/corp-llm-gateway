@@ -41,6 +41,7 @@ from tests.litellm_hook._dispatch_fixtures import (
     EMAIL,
     GUARDRAIL_NAME,
     ORIGINAL_MARK,
+    PLACEHOLDER,
     PLACEHOLDER_MARK,
     ApplyGuardrailMigrated,
     Capture,
@@ -111,11 +112,9 @@ async def test_standard_logging_payload_is_content_free(
 ) -> None:
     """Hazards 1 and 16, and the Option 0 proof for Task 3.
 
-    Hazard 1: no original in the payload a sink receives, metadata included. Holds on chat
-    and ``/v1/messages``. On ``/v1/responses`` the payload's ``messages`` field carries the
-    ORIGINAL input: litellm's logging object snapshots the request before the pre-call hook
-    rewrites it, and nothing refreshes it on that route. A new request-side exposure (every
-    success-log sink), untouched by Option A; recorded in the plan's rev 6.
+    Hazard 1: no original in the payload a sink receives, metadata included, on all six
+    flows. ``/v1/responses`` holds only since our pre-call refreshes litellm's logging
+    snapshot (hazard 17, ``test_hazard17_logging_snapshot.py``).
 
     Hazard 16: a plain ``CustomLogger`` writes an allow-listed entry with litellm's
     ``add_standard_logging_guardrail_information_to_request_data`` (from a never-registered
@@ -136,8 +135,10 @@ async def test_standard_logging_payload_is_content_free(
     assert len(sink.seen.logged) == 2, sink.seen.logged
     payload = json.loads(sink.seen.logged[0])
     response_obj = sink.seen.logged[1]
-    leaking = {"messages"} if route == "responses" else set()
-    assert _payload_fields_holding(payload, ORIGINAL_MARK) == leaking
+    # TODAY_BEFORE_TASK1: on /v1/responses the payload's `messages` held the ORIGINAL
+    # input (leaking == {"messages"}): litellm's logging object snapshots the request
+    # before the pre-call hook rewrites it, and nothing refreshed it on that route.
+    assert _payload_fields_holding(payload, ORIGINAL_MARK) == set()
     assert ORIGINAL_MARK not in response_obj
     ours_entries = [
         entry
@@ -169,11 +170,11 @@ async def test_responses_list_input_reaches_the_success_log_payload(
     """Hazard 17, list-shaped ``input`` (the test above sends ``input: str`` only).
 
     litellm's logging object copies only the outer list (``copy.copy``,
-    litellm_logging.py:479), so its items are the request's own dicts. Our pre-call does
-    not edit those in place: it stores a new list of new items (``_store_request_items``,
-    litellm_hook.py:2306). The payload's ``messages`` therefore holds the ORIGINAL input,
-    item for item, while the provider got placeholders. A fix must replace the logging
-    object's ``messages``; relying on the shared items would not reach it.
+    litellm_logging.py:479), so its items are the request's own dicts: an in-place edit of
+    those dicts WOULD reach a list input (never an ``input: str``, which the logging object
+    wraps in a dict of its own). Our pre-call does not edit in place; it stores a new list
+    of new items (``_store_request_items``), so the fix replaces the logging object's
+    ``messages`` (``_refresh_logging_snapshot``).
     """
     ours, _ = build_ours()
     sink = Capture("sink")
@@ -187,8 +188,11 @@ async def test_responses_list_input_reaches_the_success_log_payload(
     assert len(exchange.provider_bodies) == 1
     assert ORIGINAL_MARK not in exchange.provider_bodies[0]
     payload = json.loads(sink.seen.logged[0])
-    assert _payload_fields_holding(payload, ORIGINAL_MARK) == {"messages"}
-    assert payload["messages"] == sent_input
+    # TODAY_BEFORE_TASK1: the payload's `messages` was the ORIGINAL input, item for item
+    # (holding == {"messages"}, payload["messages"] == sent_input).
+    assert _payload_fields_holding(payload, ORIGINAL_MARK) == set()
+    assert payload["messages"] != sent_input
+    assert PLACEHOLDER in json.dumps(payload["messages"])
     assert ORIGINAL_MARK not in sink.seen.logged[1]
 
 

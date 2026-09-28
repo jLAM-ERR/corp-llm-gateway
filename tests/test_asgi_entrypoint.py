@@ -143,6 +143,7 @@ def _run(
     payload = json.loads(lines[-1][len(SENTINEL) :])
     payload["returncode"] = completed.returncode
     payload["stdout"] = completed.stdout
+    payload["stderr"] = completed.stderr
     return payload
 
 
@@ -1559,6 +1560,148 @@ def test_a_config_listing_a_different_callback_exits_70(tmp_path: Path) -> None:
     assert result["exits"] == [70]
     assert result["armed"] is False
     assert "CorpLlmGuardrail" not in result["callbacks"]
+
+
+# ── step 4: the arm refusals beyond a missing guardrail ──────────────────────
+
+# litellm's real startup runs; TAMPER then breaks the registered guardrail the way a
+# config or a later litellm could, before the arm check looks at it.
+_ARM_REFUSAL_SCRIPT = f"""
+    import asyncio, contextlib, json, os
+    import corp_llm_gateway.asgi as asgi
+    from corp_llm_gateway import settings
+
+    exits = []
+    os._exit = exits.append
+    TAMPER = os.environ.get("ARM_TAMPER", "")
+    real_lifespan = asgi._litellm_lifespan
+
+    @contextlib.asynccontextmanager
+    async def _tampered(app):
+        async with real_lifespan(app):
+            import litellm
+            from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
+
+            (ours,) = [cb for cb in litellm.callbacks if isinstance(cb, CorpLlmGuardrail)]
+            if TAMPER in ("scan_raw_request", "run_in_parallel"):
+                setattr(ours, TAMPER, True)
+            elif TAMPER == "apply_guardrail":
+                async def apply_guardrail(self, inputs, request_data, input_type, **kw):
+                    return inputs
+
+                ours.__class__ = type(
+                    "Flipped", (CorpLlmGuardrail,), {{"apply_guardrail": apply_guardrail}}
+                )
+            yield
+
+    asgi._litellm_lifespan = _tampered
+
+    async def drive():
+        async with asgi._app.router.lifespan_context(asgi._app):
+            pass
+
+    asyncio.run(drive())
+    try:
+        settings.validate()
+        problems = []
+    except settings.ConfigError as exc:
+        problems = exc.problems
+    print("{SENTINEL}" + json.dumps({{
+        "exits": exits, "armed": asgi.gate.armed, "config_check": problems,
+    }}))
+"""
+
+SET_VERBOSE_CONFIG = VALID_CONFIG.replace(
+    "  drop_params: true\n", "  drop_params: true\n  set_verbose: true\n"
+)
+
+
+def _log_messages(result: dict, needle: str) -> list[str]:
+    # litellm's JSON handler writes WARNING and above to stderr, the rest to stdout.
+    lines = _lines_carrying(result["stdout"] + result["stderr"], needle)
+    return [json.loads(line)["message"] for line in lines]
+
+
+def _arm_refusals(result: dict) -> list[str]:
+    return _log_messages(result, "arm refused (")
+
+
+@pytest.mark.parametrize(
+    ("config", "env", "problem"),
+    [
+        (VALID_CONFIG, {"LITELLM_LOG": "DEBUG"}, "litellm_debug_logging"),
+        (VALID_CONFIG, {"DETAILED_DEBUG": "true"}, "litellm_debug_logging"),
+        (SET_VERBOSE_CONFIG, {}, "litellm_set_verbose"),
+    ],
+    ids=["LITELLM_LOG", "DETAILED_DEBUG", "set_verbose"],
+)
+def test_litellm_debug_exits_70_and_config_check_reports_it(
+    tmp_path: Path, config: str, env: dict[str, str], problem: str
+) -> None:
+    # litellm's DEBUG request logs print the original request before any pre-call hook.
+    path = tmp_path / "config.yaml"
+    path.write_text(config)
+
+    result = _run(_ARM_REFUSAL_SCRIPT, path, env=env)
+
+    assert result["exits"] == [70]
+    assert result["armed"] is False
+    refusals = _arm_refusals(result)
+    assert [r for r in refusals if r.startswith(f"arm refused ({problem})")], refusals
+    assert [p for p in result["config_check"] if p.startswith(f"{problem}:")], result[
+        "config_check"
+    ]
+
+
+@pytest.mark.parametrize("tamper", ["apply_guardrail", "scan_raw_request", "run_in_parallel"])
+def test_a_bypassable_guardrail_exits_70_with_its_own_line(valid_config: Path, tamper: str) -> None:
+    result = _run(_ARM_REFUSAL_SCRIPT, valid_config, env={"ARM_TAMPER": tamper})
+
+    assert result["exits"] == [70]
+    assert result["armed"] is False
+    assert [r.split(":", 1)[0] for r in _arm_refusals(result)] == [f"arm refused ({tamper})"]
+
+
+def test_a_clean_boot_arms_and_config_check_raises_no_debug_problem(valid_config: Path) -> None:
+    result = _run(_ARM_REFUSAL_SCRIPT, valid_config)
+
+    assert result["exits"] == []
+    assert result["armed"] is True
+    assert _arm_refusals(result) == []
+    assert not [p for p in result["config_check"] if p.startswith("litellm_")]
+
+
+def test_the_test_only_key_lets_litellm_debug_arm_outside_prod(valid_config: Path) -> None:
+    env = {"LITELLM_LOG": "DEBUG", "CORP_LLM_ALLOW_LITELLM_DEBUG": "1"}
+
+    result = _run(_ARM_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exits"] == []
+    assert result["armed"] is True
+    assert not [p for p in result["config_check"] if p.startswith("litellm_")]
+    assert _log_messages(result, "arming with litellm DEBUG output on")
+
+
+def test_the_test_only_key_never_lets_a_bypassable_guardrail_arm(valid_config: Path) -> None:
+    env = {"CORP_LLM_ALLOW_LITELLM_DEBUG": "1", "ARM_TAMPER": "scan_raw_request"}
+
+    result = _run(_ARM_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exits"] == [70]
+    assert result["armed"] is False
+
+
+@pytest.mark.parametrize("env_name", ["prod", "production"])
+def test_the_test_only_key_exits_78_in_prod_before_litellm_is_imported(
+    valid_config: Path, env_name: str
+) -> None:
+    env = {"CORP_ENV": env_name, "CORP_LLM_ALLOW_LITELLM_DEBUG": "1"}
+
+    result = _run(_REFUSAL_SCRIPT, valid_config, env=env)
+
+    assert result["exit_code"] == 78
+    assert result["litellm_imported"] is False
+    assert "CORP_LLM_ALLOW_LITELLM_DEBUG=1 is test-only" in result["stdout"]
 
 
 # ── the gateway-owned routes answer through the gate ─────────────────────────

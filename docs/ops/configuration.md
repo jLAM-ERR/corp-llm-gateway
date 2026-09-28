@@ -330,6 +330,7 @@ serve litellm's routers with no route gate in front. See
 | `CORP_LLM_LITELLM_CONFIG` | path to litellm's proxy config YAML | `/etc/litellm/config.yaml` | no |
 | `CORP_LLM_SERVE_HOST` | address uvicorn binds | `0.0.0.0` | no |
 | `CORP_LLM_SERVE_PORT` | port uvicorn binds | `4000` | no |
+| `CORP_LLM_ALLOW_LITELLM_DEBUG` | **test-only**: arm even with litellm's DEBUG output on (see below); refused when `CORP_ENV` is prod/production | `0` | no |
 
 The entrypoint refuses to start (**exit 78**, `EX_CONFIG`) when
 `CORP_LLM_LITELLM_CONFIG` is missing, not a file, not named `.yaml`/`.yml`,
@@ -471,7 +472,19 @@ boot does).
 - any in-flight key out of range, or `CORP_LLM_MAX_INFLIGHT=0` in prod;
 - `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` malformed or naming a refused route.
 
-Exit 70 (`EX_SOFTWARE`): litellm started without a `CorpLlmGuardrail` callback.
+- `CORP_LLM_ALLOW_LITELLM_DEBUG=1` with `CORP_ENV` prod/production.
+
+Exit 70 (`EX_SOFTWARE`), after litellm's startup, one log line
+`arm refused (<problem>)` per problem (`route_gate/arm_checks.py`):
+
+- `guardrail_absent`: litellm started without a `CorpLlmGuardrail` callback;
+- `apply_guardrail`, `scan_raw_request`, `run_in_parallel`: the guardrail is set
+  up so litellm would skip its pre-call hook or discard its rewrite;
+- `litellm_debug_logging`, `litellm_set_verbose`: litellm's DEBUG output is on
+  (`LITELLM_LOG=DEBUG`, `DETAILED_DEBUG`, `--detailed_debug`,
+  `litellm_settings.set_verbose`). litellm logs the original request before any
+  pre-call hook runs. `config check` reports the env vars and `set_verbose` too.
+  `CORP_LLM_ALLOW_LITELLM_DEBUG=1` lets these two through outside prod, for tests.
 
 **Warn and boot:**
 

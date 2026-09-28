@@ -217,6 +217,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     silently dropped.
     """
 
+    # litellm's guardrails_only pre-call walk (one record of a batch input file)
+    # skips a plain CustomLogger's pre-call hook unless this is set.
+    enforces_request_content = True
+
     def __init__(
         self,
         orchestrator: SanitizationOrchestrator | ProfileAwareOrchestrator,
@@ -1136,6 +1140,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 sanitize_one,
                 identity_exempt=identity_exempt,
             )
+
+        _refresh_logging_snapshot(data, request_shape)
 
         # Stage 5: DLP egress guard — re-scan the SANITIZED outbound request.
         # Defence-in-depth: catches canaries / raw secrets that survived the
@@ -2304,6 +2310,21 @@ def _store_request_items(data: dict[str, Any], items: list[Any], shape: str) -> 
         data["input"] = first.get("content", "") if isinstance(first, dict) else ""
     else:
         data["input"] = items
+
+
+def _refresh_logging_snapshot(data: dict[str, Any], shape: str) -> None:
+    """Hand litellm's logging object the rewritten request, as a new list in its snapshot
+    shape: it snapshotted the original before any pre-call hook ran, every success and
+    failure ``StandardLoggingPayload`` reads ``messages`` from it, and the proxy
+    re-points it afterwards for a ``messages`` body only (not a Responses ``input``)."""
+    update = getattr(data.get("litellm_logging_obj"), "update_messages", None)
+    if not callable(update) or shape == "unmanaged":
+        return
+    items = data.get("messages") if shape == "messages" else data.get("input")
+    if isinstance(items, str):
+        update([{"role": "user", "content": items}])
+    elif isinstance(items, list):
+        update([{"role": "user", "content": i} if isinstance(i, str) else i for i in items])
 
 
 def _is_responses_event(chunk: Any) -> bool:

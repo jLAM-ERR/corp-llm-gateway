@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import logging
 import re
 import threading
 import time
@@ -39,7 +38,7 @@ from litellm.types.guardrails import GuardrailEventHooks
 from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.metrics import NoopExporter
-from corp_llm_gateway.route_gate import RouteGateMiddleware
+from corp_llm_gateway.route_gate import RouteGateMiddleware, arm_checks
 from corp_llm_gateway.route_gate.inflight import InflightLimiter, RequestTicket, current_ticket
 from tests.test_litellm_hook import _build_guardrail
 
@@ -249,11 +248,13 @@ class StubUpstream:
     every later hop, which is what the capture assertions need to see.
     """
 
-    def __init__(self, *, event_delay: float = 0.0) -> None:
+    def __init__(self, *, event_delay: float = 0.0, error_status: int | None = None) -> None:
         self.bodies: list[str] = []
         # One entry per streamed reply: "completed", or "broken" when the gateway hung up.
         self.stream_outcomes: list[str] = []
         self.event_delay = event_delay
+        # Answer every request with this status and a provider-style error body.
+        self.error_status = error_status
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -272,7 +273,9 @@ class StubUpstream:
                 echo = found.group(0) if found else (EMAIL if EMAIL in text else "nothing")
                 parsed = _parsed(raw)
                 stream = isinstance(parsed, dict) and bool(parsed.get("stream"))
-                if stream:
+                if upstream.error_status is not None:
+                    self._send_error(upstream.error_status)
+                elif stream:
                     self._send_stream(_stream(self.path, reply_text(echo)))
                 else:
                     payload = json.dumps(_unary(self.path, reply_text(echo))).encode()
@@ -281,6 +284,16 @@ class StubUpstream:
                     self.send_header("content-length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
+
+            def _send_error(self, status: int) -> None:
+                payload = json.dumps(
+                    {"type": "error", "error": {"type": "invalid_request_error", "message": "no"}}
+                ).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
             def _drain(self, prefix: bytes) -> bytes:
                 rest = b""
@@ -604,7 +617,7 @@ class SentinelCallback(CustomLogger):
         return data
 
 
-# ── prototypes of the Task 1 checks ──────────────────────────────────────────
+# ── the arm checks, plus the ones only a base-class switch would need ───────
 
 
 def arm_problems(
@@ -615,32 +628,16 @@ def arm_problems(
     proxy_logger: Any = None,
     set_verbose: bool = False,
 ) -> list[str]:
-    """What an arm step would refuse to serve with. Empty = arm."""
-    problems: list[str] = []
-    ours = [cb for cb in callbacks if _is_ours(cb)]
-    if not ours:
-        problems.append("guardrail_absent")
-    for cb in ours:
-        if getattr(cb, "scan_raw_request", False):
-            problems.append("scan_raw_request")
-        if getattr(cb, "run_in_parallel", False):
-            problems.append("run_in_parallel")
-        # Anywhere in the MRO, native hooks or not: the plan forbids it outright (hazard 7).
-        if getattr(type(cb), "apply_guardrail", None) not in (
-            None,
-            CustomGuardrail.apply_guardrail,
-        ):
-            problems.append("apply_guardrail")
+    """What the arm step refuses to serve with (``route_gate.arm_checks``, the code
+    ``asgi.py`` runs), plus name uniqueness and pipeline membership. Empty = arm."""
+    problems = arm_checks.guardrail_problems(callbacks, is_ours=_is_ours)
     named = [g for g in getattr(router, "guardrail_list", None) or () if _names_us(g)]
     if len(named) > 1:
         problems.append("guardrail_name_not_unique")
     if registry is not None and pipeline_names_us(registry):
         problems.append("pipeline_manages_us")
-    if proxy_logger is not None and proxy_logger.isEnabledFor(logging.DEBUG):
-        problems.append("litellm_debug_logging")
-    if set_verbose:
-        problems.append("litellm_set_verbose")
-    return problems
+    loggers = (proxy_logger,) if proxy_logger is not None else ()
+    return problems + arm_checks.debug_problems(loggers=loggers, set_verbose=set_verbose)
 
 
 def _is_ours(cb: Any) -> bool:
