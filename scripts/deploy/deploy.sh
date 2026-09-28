@@ -23,7 +23,8 @@
 
 set -euo pipefail
 
-REMOTE_DIR="${CORP_GATEWAY_DEPLOY_DIR:-/opt/corp-llm-gateway}"
+DEFAULT_REMOTE_DIR="/opt/corp-llm-gateway"
+REMOTE_DIR="${CORP_GATEWAY_DEPLOY_DIR:-$DEFAULT_REMOTE_DIR}"
 COMPOSE_FILE="docker-compose.yml"
 # The default mode is oauth (subscription, the production mode): it layers
 # docker-compose.oauth.yml on top. virtual-keys (the base file alone) is a test
@@ -41,6 +42,24 @@ COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE} -f ${OAUTH_OVERLAY_FILE}"
 DEPLOY_ISSUANCE="${DEPLOY_ISSUANCE:-0}"
 ISSUANCE_OVERLAY_FILE="docker-compose.issuance.yml"
 ISSUANCE_CONFIG="gateway/config.toml"
+# The front door's TLS certificate and key are installed on the server by hand;
+# only the README in that directory is synced.
+NGINX_CERTS_DIR="nginx/certs"
+NGINX_CERTS_README="${NGINX_CERTS_DIR}/README.md"
+# The two front-door services. COMPOSE_PROFILES in the server's .env picks at
+# most one of them; this script never sets, exports or clears it, because a
+# value here would override that file and diverge from what the boot-time
+# unit (a bare `docker compose up -d`) starts.
+NGINX_SERVICES=(nginx nginx-ports)
+# The front doors the current compose files enable, space-separated; set by
+# ensure_one_front_door.
+ENABLED_FRONT_DOORS=""
+# Container names come back from the server and go into a remote `docker rm`.
+CONTAINER_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+# The `restart: "no"` services: the only ones that are done once they exit 0.
+# Compose prints an empty Health for every exited container, so the state alone
+# cannot tell a finished one-shot from a service that stopped.
+ONE_SHOT_SERVICES=(minio-init)
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/compose"
@@ -59,6 +78,9 @@ ASSUME_YES=0
 FORCE_UNLOCK=0
 LOCK_DIR=""
 LOCK_HELD=0
+# The non-default stack-selecting flags of this run, each with a leading space,
+# for the hints that tell the operator what to run next.
+SELF_FLAGS=""
 
 fatal() {
     echo "FATAL: $*" >&2
@@ -251,6 +273,11 @@ parse_args() {
     done
 
     LOCK_DIR="${REMOTE_DIR}/.deploy.lock"
+
+    SELF_FLAGS=""
+    [[ "$REMOTE_DIR" == "$DEFAULT_REMOTE_DIR" ]] || SELF_FLAGS+=" --dir ${REMOTE_DIR}"
+    [[ "$DEPLOY_MODE" == "oauth" ]] || SELF_FLAGS+=" --mode ${DEPLOY_MODE}"
+    (( DEPLOY_ISSUANCE == 0 )) || SELF_FLAGS+=" --issuance"
 }
 
 require_cmd() {
@@ -390,7 +417,10 @@ assert_env_excluded() {
 }
 
 rsync_args() {
-    # Order matters: the include is matched before the .env* excludes.
+    # Order matters: rsync applies the first rule that matches, so each include
+    # sits before the exclude it carves out of. nginx/certs/ is excluded by
+    # name, not by extension: NGINX_TLS_CERT / NGINX_TLS_KEY may name a file
+    # `privkey` or `server.cer` (mirrors .gitignore).
     printf '%s\n' \
         --archive \
         --compress \
@@ -401,6 +431,8 @@ rsync_args() {
         --exclude=.env.* \
         --exclude=docker-compose.build.yml \
         --exclude="${ISSUANCE_CONFIG}" \
+        --include="${NGINX_CERTS_README}" \
+        --exclude="${NGINX_CERTS_DIR}/*" \
         --exclude=*.pem \
         --exclude=*.crt \
         --exclude=*.key \
@@ -425,7 +457,7 @@ sync_compose() {
     assert_env_excluded "${args[@]}"
 
     [[ -d "$COMPOSE_DIR" ]] || fatal "no compose/ directory at ${COMPOSE_DIR}"
-    info "syncing compose/ to ${HOST}:${REMOTE_DIR}/ (.env, ${ISSUANCE_CONFIG}, certs and keys excluded)"
+    info "syncing compose/ to ${HOST}:${REMOTE_DIR}/ (.env, ${ISSUANCE_CONFIG}, ${NGINX_CERTS_DIR}/, certs and keys excluded)"
     rsync "${args[@]}" "${COMPOSE_DIR}/" "${HOST}:${REMOTE_DIR}/"
 }
 
@@ -433,14 +465,50 @@ sync_compose() {
 # health + status
 # --------------------------------------------------------------------------- #
 
-# One TSV line per service: name, state, health. Compose v2 prints either a
-# JSON array or one object per line depending on the version; both are handled.
+# One line per container: service, state, health, exit code, container name,
+# separated by FIELD_SEP. Not tabs: `read` collapses a run of whitespace
+# separators, so an empty health would shift the exit code into its place.
+# Line breaks and FIELD_SEP inside a value become spaces, so one value cannot
+# forge a second row. Compose v2 prints either a JSON array or one object per
+# line depending on the version; both are handled.
+FIELD_SEP=$'\x1f'
 service_states() {
     ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} ps --all --format json" \
         | jq -s -r '[.[] | if type == "array" then .[] else . end]
                     | .[]
-                    | [(.Service // .Name // "?"), (.State // ""), (.Health // "")]
-                    | @tsv'
+                    | [(.Service // .Name // "?"), (.State // ""), (.Health // ""),
+                       (if .ExitCode == null then "" else (.ExitCode|tostring) end),
+                       (.Name // "")]
+                    | map(gsub("[\n\r\u001f]"; " "))
+                    | join("\u001f")'
+}
+
+is_front_door() {
+    local name
+    for name in "${NGINX_SERVICES[@]}"; do
+        if [[ "$1" == "$name" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_one_shot() {
+    local name
+    for name in "${ONE_SHOT_SERVICES[@]}"; do
+        if [[ "$1" == "$name" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The front door's entrypoint exits 64-69 on a bad NGINX_* key or a missing
+# certificate, and `restart: unless-stopped` then cycles it through
+# "restarting". Neither heals by waiting, so neither waits out the timeout.
+front_door_is_down() {
+    local state="$1" health="$2"
+    [[ "$state" == "exited" || "$state" == "restarting" || "$health" == "unhealthy" ]]
 }
 
 wait_for_healthcheck() {
@@ -453,7 +521,7 @@ wait_for_healthcheck() {
 
     while (( elapsed < max_wait )); do
         local all_healthy=true
-        local states service state health
+        local states service state health exit_code down_service="" failed_service=""
         stuck=""
         states="$(service_states || true)"
 
@@ -461,23 +529,61 @@ wait_for_healthcheck() {
             all_healthy=false
             stuck="none reported"
         else
-            while IFS=$'\t' read -r service state health; do
+            while IFS="$FIELD_SEP" read -r service state health exit_code _; do
+                if is_front_door "$service"; then
+                    if front_door_is_down "$state" "$health"; then
+                        down_service="$service"
+                        stuck="${service} (state=${state:-?} health=${health:-none})"
+                        break
+                    fi
+                    # nginx always declares a healthcheck. Between two restarts
+                    # of a crash loop it shows `running` with no health for an
+                    # instant, so "running" alone never counts here.
+                    if [[ "$state" == "running" && "$health" == "healthy" ]]; then
+                        continue
+                    fi
+                elif [[ "$state" == "exited" && -n "$exit_code" && "$exit_code" != "0" ]]; then
+                    # A failed one-shot never recovers, and whatever waits for it
+                    # to complete stays `created` until the timeout.
+                    failed_service="$service"
+                    stuck="${service} exited with code ${exit_code}"
+                    break
+                elif [[ "$state" == "exited" && "$exit_code" == "0" ]] && is_one_shot "$service"; then
+                    # A one-shot that finished: `ps --all` keeps listing it.
+                    continue
                 # A service that DECLARES a healthcheck must actually report
                 # "healthy": "starting" is not healthy yet and can still flip to
                 # "unhealthy", so accepting it ended the wait on the first poll.
                 # Only a service with NO healthcheck (empty Health) falls back to
                 # "is it running".
-                if [[ -n "$health" ]]; then
-                    if [[ "$health" == "healthy" ]]; then
+                elif [[ -n "$health" ]]; then
+                    if [[ "$state" == "running" && "$health" == "healthy" ]]; then
                         continue
                     fi
                 elif [[ "$state" == "running" ]]; then
                     continue
                 fi
                 all_healthy=false
-                stuck="${service} (state=${state:-?} health=${health:-none})"
-                break
+                [[ -n "$stuck" ]] || stuck="${service} (state=${state:-?} health=${health:-none})"
             done <<< "$states"
+        fi
+
+        if [[ -n "$down_service" ]]; then
+            print_status
+            fatal "the nginx front door is down: ${stuck}.
+       Its entrypoint names the setting it refused in one log line. Read it with:
+       scripts/deploy/deploy.sh --host ${HOST}${SELF_FLAGS} logs ${down_service}"
+        fi
+
+        if [[ -n "$failed_service" ]]; then
+            local consequence=""
+            if is_one_shot "$failed_service"; then
+                consequence="; the services that wait for it will not start"
+            fi
+            print_status
+            fatal "${stuck}${consequence}.
+       Read its log with:
+       scripts/deploy/deploy.sh --host ${HOST}${SELF_FLAGS} logs ${failed_service}"
         fi
 
         if [[ "$all_healthy" == "true" ]]; then
@@ -491,7 +597,7 @@ wait_for_healthcheck() {
 
     print_status
     fatal "services did not reach a healthy state within ${max_wait}s — stuck: ${stuck}.
-       Inspect with: scripts/deploy/deploy.sh --host ${HOST} logs"
+       Inspect with: scripts/deploy/deploy.sh --host ${HOST}${SELF_FLAGS} logs"
 }
 
 print_status() {
@@ -505,7 +611,7 @@ print_status() {
 
     {
         printf '\n%-24s %-12s %s\n' SERVICE STATE HEALTH
-        while IFS=$'\t' read -r service state health; do
+        while IFS="$FIELD_SEP" read -r service state health _; do
             printf '%-24s %-12s %s\n' "$service" "${state:-?}" "${health:--}"
         done <<< "$states"
         printf '\n'
@@ -538,6 +644,55 @@ confirm() {
 # that combination at boot with a named cause
 # (settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE), and wait_for_healthcheck below
 # surfaces it as a failed deploy. See docs/ops/deployment-modes.md.
+# Runs after the sync, so it checks the compose files `up` is about to start.
+# `config --services` prints service names only, never a value, so the
+# server's .env stays unread here too.
+ensure_one_front_door() {
+    local services name enabled=()
+    ENABLED_FRONT_DOORS=""
+    services="$(ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} config --services")" \
+        || fatal "docker compose could not resolve the stack in ${HOST}:${REMOTE_DIR} (its
+       error is above); nothing was pulled or started."
+    while IFS= read -r name; do
+        if is_front_door "$name"; then
+            enabled+=("$name")
+            ENABLED_FRONT_DOORS+=" ${name}"
+        fi
+    done <<< "$services"
+    if (( ${#enabled[@]} > 1 )); then
+        fatal "COMPOSE_PROFILES in ${HOST}:${REMOTE_DIR}/.env enables both ${enabled[*]}.
+       Pick ONE: nginx (host routing) or nginx-ports (no DNS). Both publish
+       NGINX_PORT, so the second would fail to start. Nothing was pulled or started."
+    fi
+}
+
+# Compose profiles only filter what `up` starts: a front-door container an
+# earlier profile created keeps running, and keeps NGINX_PORT. `ps --all` still
+# lists it, so it is removed by name. $1 is the front doors to keep. Every name
+# is checked before the first one is removed.
+remove_front_doors() {
+    local keep=" $1 " states service name stale=()
+    states="$(service_states)" \
+        || fatal "could not list the containers in ${HOST}:${REMOTE_DIR} (the error is above)."
+    while IFS="$FIELD_SEP" read -r service _ _ _ name; do
+        [[ -n "$service" ]] || continue
+        is_front_door "$service" || continue
+        [[ "$keep" == *" ${service} "* ]] && continue
+        [[ "$name" =~ $CONTAINER_NAME_RE ]] \
+            || fatal "refusing to remove the ${service} container: its container name has
+       characters outside letters, digits and . _ - (got: ${name}). Nothing was removed."
+        stale+=("${service}${FIELD_SEP}${name}")
+    done <<< "$states"
+
+    local entry
+    for entry in ${stale+"${stale[@]}"}; do
+        service="${entry%%"${FIELD_SEP}"*}"
+        name="${entry#*"${FIELD_SEP}"}"
+        info "removing the ${service} front-door container ${name}"
+        ssh_run "docker rm -f ${name}"
+    done
+}
+
 cmd_up() {
     stage_schema
     ensure_remote_ready
@@ -548,6 +703,8 @@ cmd_up() {
         info "[dry-run] would pull images and start the stack in ${REMOTE_DIR}"
         return 0
     fi
+    ensure_one_front_door
+    remove_front_doors "$ENABLED_FRONT_DOORS"
     ssh_run "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} pull \
 && docker compose ${COMPOSE_FILE_ARGS} up -d"
     wait_for_healthcheck
@@ -561,6 +718,12 @@ cmd_down() {
     acquire_lock
     # Volumes are kept: the token store and audit spool live in them.
     compose_remote down
+    if (( DRY_RUN )); then
+        info "[dry-run] would remove any front-door container compose down leaves"
+        return 0
+    fi
+    # `down` leaves the containers of services outside the active profiles.
+    remove_front_doors ""
     info "stopped ${HOST}:${REMOTE_DIR} (volumes kept)"
 }
 
@@ -568,6 +731,8 @@ cmd_restart() {
     ensure_remote_ready
     confirm "This restarts the gateway on ${HOST} — in-flight requests will fail."
     acquire_lock
+    # Restarts only the active profile's services. A front door an old profile
+    # left behind is not touched here; `up` removes it.
     compose_remote restart ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"}
     if (( DRY_RUN )); then
         return 0
@@ -601,6 +766,7 @@ main() {
             cmd_up
             ;;
         down)
+            require_cmd jq
             cmd_down
             ;;
         restart)

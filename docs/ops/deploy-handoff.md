@@ -193,6 +193,62 @@ table. Do not add a second route there.
 The corp vLLM oracle still works: the gateway reaches it with its own HTTP
 client, not through a litellm route.
 
+## Step 4a. The HTTPS front door (optional)
+
+Without it, the gateway listens on `127.0.0.1:4000` only, in plain HTTP, and
+developers need an SSH tunnel. With it, an nginx publishes the gateway and
+Langfuse over HTTPS and admits only the LLM routes, `/v1/models`,
+`/healthz/live` and `POST /internal/issue-token` — everything else is 404. Full
+reference: `compose/README.md`, "HTTPS front door (nginx)".
+
+1. **Pick the routing.** `nginx` routes by name and needs two DNS records,
+   `gateway.<domain>` and `langfuse.<domain>`, pointing at this host (or at the
+   load balancer in front of it). `nginx-ports` needs no DNS: the gateway on
+   `NGINX_PORT` (443), Langfuse on `NGINX_LANGFUSE_PORT` (8443).
+2. **Pick the TLS mode — required, no default.** Your admins already publish
+   HTTPS in front of this host and forward HTTP to it internally →
+   `NGINX_TLS_MODE=behind-proxy`, plus `NGINX_TRUSTED_PROXIES` = the load
+   balancer's address as nginx sees it. Every other peer gets no response at
+   all, so a wrong value is an outage: the refused address is in
+   `docker compose logs nginx` (or `nginx-ports`; status `444`). Otherwise →
+   `NGINX_TLS_MODE=terminate`, and nginx needs a certificate (point 4).
+3. **Fill in `.env` on the server** (the commented "nginx front door" block):
+
+   ```
+   COMPOSE_PROFILES=nginx          # or nginx-ports; never both
+   NGINX_TLS_MODE=terminate        # or behind-proxy
+   GATEWAY_DOMAIN=corp.example     # nginx only
+   NGINX_BIND_ADDR=10.1.2.3        # the NIC clients (or the LB) reach; default 127.0.0.1
+   NGINX_TLS_CERT=gateway.crt      # terminate only
+   NGINX_TLS_KEY=gateway.key       # terminate only
+   LANGFUSE_PUBLIC_URL=https://langfuse.corp.example
+   ```
+
+   `COMPOSE_PROFILES` is the only switch. `deploy.sh` has no flag for it, and
+   the autostart unit reads the same `.env`, so a reboot brings back what a
+   deploy started. `NGINX_BIND_ADDR` defaults to loopback: leave it and nothing
+   outside the host reaches nginx. `LANGFUSE_PUBLIC_URL` must be the public
+   `https://` origin (`https://<address>:8443` under `nginx-ports`), in
+   `behind-proxy` too. To switch or drop the profile later, run `deploy.sh up`:
+   it removes the container of the front door the `.env` no longer selects. A
+   bare `docker compose up -d` does NOT, so the old one keeps the port; remove
+   it by hand with `docker rm -f <container>`.
+4. **Install the certificate on the server** (`terminate` only): directly in
+   `/opt/corp-llm-gateway/nginx/certs/`, never through the sync (as
+   `compose/certs/corp-ca-bundle.pem` in step 6, which the sync also
+   excludes). One certificate with both names as SANs (or the IP clients dial,
+   under `nginx-ports`), the full chain in PEM, the key unencrypted and `0600`.
+   The deploy script never uploads anything there. SANs, a CSR example and a
+   throwaway self-signed helper: `compose/nginx/certs/README.md`.
+5. **Rotating it:** replace both files in the same directory, then
+   `docker compose restart nginx` (or `nginx-ports`) on the server. nginx reads
+   the certificate only at start, and does not warn before it expires.
+
+A misconfigured front door does not start: its entrypoint names the bad key in
+one log line and exits 64-69 (`compose/README.md`, "Troubleshooting"), and
+`deploy.sh up` fails at once and names the service. It also refuses a `.env`
+that enables both profiles, before it pulls anything.
+
 ## Step 5. Deploying from the operator's laptop (day N)
 
 Rather than running `docker compose` by hand on the server, use the script — it
@@ -301,18 +357,20 @@ production either way.
 
 ```
 docker compose ps                                   # every service healthy
-curl -fsS http://127.0.0.1:4000/health/liveliness    # the gateway answers
+curl -fsS http://127.0.0.1:4000/healthz/live         # the gateway answers
 docker compose logs --tail=100 litellm
 docker compose logs --tail=50 vector                 # audit is being delivered
 ```
 
 Port `4000` is published **on loopback only** (`127.0.0.1:4000`). Langfuse
-publishes no host port at all — reach the UI through an SSH tunnel (forward a
-local `3000`).
+publishes no host port at all — reach the UI through the front door
+(`https://langfuse.<domain>`) or an SSH tunnel (forward a local `3000`).
 
-> `/health/liveliness` is litellm's own probe. The `/healthz/*` endpoints
-> (`ready`, `sanitization`) are **not mounted** on this stack; they belong to the
-> k8s variant. Do not build monitoring for a compose deployment around them.
+With the front door on, check it from a developer's machine too:
+`curl -fsS https://gateway.<domain>/healthz/live` (add
+`--cacert <the CA>` for a self-signed certificate, never `-k`). Only
+`/healthz/live` is reachable there; `/healthz/ready`, `/healthz/sanitization`
+and `/metrics` answer on `127.0.0.1:4000` only.
 
 ## Step 9. Issuing team tokens (`X-Corp-Auth`)
 
@@ -340,7 +398,7 @@ needs (test posture only, see Step 4).
 
 ```
 export ANTHROPIC_AUTH_TOKEN='sk-ant-oat...'    # the developer's subscription token
-export ANTHROPIC_BASE_URL='http://<gateway>:4000'
+export ANTHROPIC_BASE_URL='https://gateway.<domain>'
 export ANTHROPIC_CUSTOM_HEADERS='X-Corp-Auth: <team token>'
 unset ANTHROPIC_API_KEY                        # otherwise it shadows the subscription
 claude
@@ -348,14 +406,25 @@ claude
 
 Only `sk-ant-oat…` tokens are accepted; anything else is `401 E_PROVIDER_AUTH`.
 
+`ANTHROPIC_BASE_URL` is the front door's HTTPS origin (step 4a):
+`https://gateway.<domain>` under `nginx`, `https://<address>:<NGINX_PORT>`
+under `nginx-ports` (the port may be left out when it is 443). A certificate
+from a CA the laptop does not trust needs `NODE_EXTRA_CA_CERTS=<the CA file>`.
+Without the front door, the developer opens an SSH tunnel to the server's
+`127.0.0.1:4000` and uses `http://localhost:4000`. With issuance on,
+`scripts/install.sh` gets the team token through the same origin
+(`CORP_GATEWAY_URL`, `docs/ops/install.md`). Token counting
+(`/v1/messages/count_tokens`) answers 404 at the front door (and 403 from the
+gateway on the tunnel): it is advisory for Claude Code.
+
 ---
 
 ## What to know before going live
 
-- **There is no TLS in front of the gateway yet.** The port listens on
-  `127.0.0.1` without TLS; the nginx front door is a separate, unfinished task.
-  Until it lands, developers connect through an SSH tunnel rather than over the
-  network.
+- **HTTPS comes only from the front door.** Port `4000` listens on
+  `127.0.0.1` without TLS. Developers reach the gateway over the network only
+  through the nginx front door (step 4a); without it they use an SSH tunnel.
+  Never publish `4000` beyond loopback instead.
 - **litellm's management endpoints are refused, in both modes.** Without a
   master key litellm accepts any caller as an internal user, so much of
   `/key/*`, `/model/*`, `/user/*`, `/policies*`, `/guardrails*` and the UI would

@@ -1,0 +1,100 @@
+# The gateway allow-list — the only copy; every listener includes it.
+# One exact location per admitted (method, path) pair, each forwarding a
+# literal path; everything else is 404 before a byte of body is read.
+
+# A variable, so nginx starts before litellm exists and re-resolves it after a
+# restart (the resolver line is in 00-http).
+set $gateway_upstream http://litellm:4000;
+
+# Streaming is mandatory: Claude Code and Codex use SSE, and a buffered stream
+# looks like a hung gateway.
+proxy_http_version 1.1;
+proxy_buffering off;
+proxy_request_buffering off;
+proxy_read_timeout 3600s;
+chunked_transfer_encoding on;
+# With both buffers off nothing is written to a temp file. A temp-file fault is
+# a [crit] entry, and nginx appends the request line (query string included).
+proxy_max_temp_file_size 0;
+
+# Cleared, never forwarded: litellm's WebSocket at /v1/responses bypasses the
+# guardrail. The upgrade maps in 00-http are for the Langfuse snippet only.
+proxy_set_header Upgrade "";
+proxy_set_header Connection "";
+# $host, not the Host header: an absolute-form request line selects the server
+# by its authority, and litellm must see that name, never a foreign Host.
+# Under port routing (server_name _) any name selects the server, so $host is
+# whatever the client chose (request-line authority or Host header): an
+# explicit trade, not a bypass -- the allow-list below is the same either way.
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-Proto https;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+# A real Claude Code body (system prompt, tool schemas, history) is far larger
+# than the gateway's 100 KiB figure, which is a per-text-leaf threshold with an
+# audited oversize policy, not a body cap.
+client_max_body_size 25m;
+
+# Past an edge limit nginx answers 429 E_RATE_LIMITED itself; the gateway's own
+# refusal is E_CAPACITY, so the code says which layer answered. limit_conn
+# would answer 503 by default.
+limit_req_status 429;
+limit_conn_status 429;
+error_page 429 = @rate_limited;
+
+location = /v1/messages {
+    limit_except POST { deny all; }
+    limit_req zone=corp_token burst=${NGINX_TOKEN_BURST} nodelay;
+    limit_conn corp_conn ${NGINX_TOKEN_CONN};
+    proxy_pass $gateway_upstream/v1/messages$is_args$args;
+}
+
+location = /v1/chat/completions {
+    limit_except POST { deny all; }
+    limit_req zone=corp_token burst=${NGINX_TOKEN_BURST} nodelay;
+    limit_conn corp_conn ${NGINX_TOKEN_CONN};
+    proxy_pass $gateway_upstream/v1/chat/completions$is_args$args;
+}
+
+location = /v1/responses {
+    limit_except POST { deny all; }
+    limit_req zone=corp_token burst=${NGINX_TOKEN_BURST} nodelay;
+    limit_conn corp_conn ${NGINX_TOKEN_CONN};
+    proxy_pass $gateway_upstream/v1/responses$is_args$args;
+}
+
+location = /v1/models {
+    limit_except GET { deny all; }
+    limit_req zone=corp_token burst=${NGINX_TOKEN_BURST} nodelay;
+    limit_conn corp_conn ${NGINX_TOKEN_CONN};
+    proxy_pass $gateway_upstream/v1/models$is_args$args;
+}
+
+# Never limited: a load balancer's probe must not be told 429.
+location = /healthz/live {
+    limit_except GET { deny all; }
+    proxy_pass $gateway_upstream/healthz/live$is_args$args;
+}
+
+location = /internal/issue-token {
+    limit_except POST { deny all; }
+    # Keyed by client address: the caller has no corp token yet.
+    limit_req zone=corp_issue burst=2 nodelay;
+    # The gateway answers 400 to any body; this keeps a large upload off it.
+    client_max_body_size 1k;
+    proxy_pass $gateway_upstream/internal/issue-token$is_args$args;
+}
+
+location / {
+    return 404;
+}
+
+# add_header here REPLACES every add_header of an enclosing level, it does not
+# merge with them, so the listener's HSTS is restated: $hsts_value (00-http) is
+# the header over TLS and empty, so not sent, on behind-proxy's plain HTTP.
+location @rate_limited {
+    default_type application/json;
+    add_header Retry-After 1 always;
+    add_header Strict-Transport-Security $hsts_value always;
+    return 429 '{"error":{"code":"E_RATE_LIMITED"}}';
+}

@@ -79,11 +79,13 @@ jobs:
           CORP_REQUIRE_PROXY_CAPTURE: "1"
           CORP_TEST_PG_DSN: postgresql://gateway:gateway@localhost:5432/gateway
 
-  # The route gate on the real image (tests/integration/test_route_gate_container.py),
-  # in parallel with the unit suite. The suite drives the image over HTTP, so the
-  # runner's interpreter is not what it tests. The image tag carries a digest of
-  # its build inputs, so a build step and the suite's own fixture resolve the same
-  # tag and the suite never runs against an image built from other sources.
+  # The route gate on the real image (tests/integration/test_route_gate_container.py)
+  # and the nginx front door in front of it (test_nginx_allowlist_image.py: the
+  # warmed route table, the canary through nginx), in parallel with the unit suite.
+  # The suites drive the image over HTTP, so the runner's interpreter is not what
+  # they test. The image tag carries a digest of its build inputs, so a build step
+  # and the suites' own fixture resolve the same tag and never run against an image
+  # built from other sources.
   integration-container:
     needs: [lint]
     runs-on: ubuntu-latest
@@ -100,6 +102,9 @@ jobs:
         run: python -m tests.integration.gateway_image
       # CORP_REQUIRE_PROXY_CAPTURE turns the harness's docker/image skips into
       # failures: a skipped container suite must not report green.
-      - run: PYTHONPATH=src python -m pytest tests/integration/test_route_gate_container.py -q -rs
+      - run: >-
+          PYTHONPATH=src python -m pytest -q -rs
+          tests/integration/test_route_gate_container.py
+          tests/integration/test_nginx_allowlist_image.py
         env:
           CORP_REQUIRE_PROXY_CAPTURE: "1"

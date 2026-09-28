@@ -207,6 +207,48 @@ def _wait_for_health(stack: Stack) -> None:
 
 POSTGRES_IMAGE = "postgres:16-alpine"
 POSTGRES_DSN = "postgresql://gw:gw@pg:5432/litellm"
+POSTGRES_BOOT_SECONDS = 120
+
+POSTGRES_INIT_DONE = "PostgreSQL init process complete; ready for start up."
+POSTGRES_READY = "database system is ready to accept connections"
+# Only a server that is not (or no longer) listening; any other psql error,
+# `database "litellm" does not exist` included, is a real failure.
+PSQL_TRANSIENT_ERRORS = (
+    "Connection refused",
+    "server closed the connection unexpectedly",
+)
+RUN_SQL_ATTEMPTS = 30
+RUN_SQL_RETRY_SECONDS = 1.0
+
+
+def postgres_init_done(log: str) -> bool:
+    """The image's init finished and the final server came up after it.
+
+    The official image boots a temporary server (socket only) to create
+    ``POSTGRES_DB`` and run the init scripts, stops it, then starts the real
+    one. Both answer ``pg_isready``, so the probe alone can pass on the
+    temporary server. Two CI failures came from that window: psql connecting
+    before ``POSTGRES_DB`` existed (``database "litellm" does not exist``), and
+    psql connecting just as the temporary server shut down (``server closed
+    the connection unexpectedly``). The final server's ready line only follows
+    the init marker, so this gate closes both.
+    """
+    done = log.find(POSTGRES_INIT_DONE)
+    return done >= 0 and POSTGRES_READY in log[done + len(POSTGRES_INIT_DONE) :]
+
+
+def _postgres_log(name: str) -> str:
+    """Both streams in the order docker wrote them: the init marker is on
+    stdout, the server's ready line on stderr."""
+    result = subprocess.run(
+        ["docker", "logs", name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return result.stdout
 
 
 def _start_postgres(name: str, network: str) -> None:
@@ -233,12 +275,38 @@ def _start_postgres(name: str, network: str) -> None:
     # The entrypoint runs the Prisma schema sequence at import, so the database
     # has to answer before the gateway starts or the boot warns and continues
     # with no schema.
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + POSTGRES_BOOT_SECONDS
     while time.monotonic() < deadline:
-        if docker("exec", name, "pg_isready", "-U", "gw", timeout=30).returncode == 0:
+        if (
+            postgres_init_done(_postgres_log(name))
+            and docker("exec", name, "pg_isready", "-U", "gw", timeout=30).returncode == 0
+        ):
             return
         time.sleep(1)
-    pytest.fail(f"postgres never became ready:\n{docker('logs', name).stderr[-2000:]}")
+    pytest.fail(f"postgres never became ready:\n{_postgres_log(name)[-2000:]}")
+
+
+def _run_sql(name: str, sql: str) -> None:
+    """Retries only a server that is not listening, for a bounded window: a
+    restart after the init gate above passed. Any other error fails at once.
+    One transaction, so a retry never re-runs half-applied SQL."""
+    psql = ["psql", "-U", "gw", "-d", "litellm", "-v", "ON_ERROR_STOP=1", "--single-transaction"]
+    for attempt in range(1, RUN_SQL_ATTEMPTS + 1):
+        result = subprocess.run(
+            ["docker", "exec", "-i", name, *psql],
+            input=sql,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        transient = any(marker in result.stderr for marker in PSQL_TRANSIENT_ERRORS)
+        if not transient or attempt == RUN_SQL_ATTEMPTS:
+            break
+        time.sleep(RUN_SQL_RETRY_SECONDS)
+    pytest.fail(f"psql failed after {attempt} attempt(s):\n{result.stderr}")
 
 
 @contextlib.contextmanager
@@ -248,8 +316,14 @@ def running_stack(
     env: Mapping[str, str],
     *,
     with_postgres: bool = False,
+    postgres_sql: str | None = None,
+    gateway_args: Sequence[str] = (),
 ) -> Iterator[Stack]:
-    """Stub + gateway on an egress-blocked network, reachable through a relay."""
+    """Stub + gateway on an egress-blocked network, reachable through a relay.
+
+    ``postgres_sql`` runs in the stack's Postgres before the gateway boots;
+    ``gateway_args`` are extra ``docker run`` arguments for the gateway (an alias,
+    a mount)."""
     suffix = uuid.uuid4().hex[:8]
     network = f"corp-rg-net-{suffix}"
     stub = f"corp-rg-stub-{suffix}"
@@ -280,6 +354,8 @@ def running_stack(
         if with_postgres:
             _start_postgres(postgres, network)
             extra = ["-e", f"DATABASE_URL={POSTGRES_DSN}"]
+            if postgres_sql is not None:
+                _run_sql(postgres, postgres_sql)
         _run_detached(
             gateway,
             [
@@ -291,6 +367,7 @@ def running_stack(
                 f"{config_path}:/etc/litellm/config.yaml:ro",
                 *_env_args(env),
                 *extra,
+                *gateway_args,
                 image,
             ],
         )

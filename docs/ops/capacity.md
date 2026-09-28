@@ -191,6 +191,93 @@ records `gateway_failure{component="route_gate"}`. litellm's own
 `general_settings.cancel_on_disconnect: true` is set in the shipped configs as a
 second layer.
 
+## Edge limits
+
+With a front-door profile on (`COMPOSE_PROFILES=nginx` or `nginx-ports`,
+`compose/nginx/`), nginx limits each corp token before the gateway sees the
+request. The gateway's caps above are **global** — per pod, whoever sends. The
+edge adds the **per-token** fairness the gateway cannot cheaply give: one
+runaway laptop gets 429 while the others keep their share, and the refused
+request never reaches the gateway, so it drains no body there.
+
+| Key | Default | What it limits |
+|---|---|---|
+| `NGINX_TOKEN_RATE` | `10` | requests per second per corp token on `/v1/messages`, `/v1/chat/completions`, `/v1/responses` and `/v1/models` together |
+| `NGINX_TOKEN_BURST` | `20` | requests a token may send above that rate; nginx admits **1 + burst** at once, then one per 1/rate seconds |
+| `NGINX_TOKEN_CONN` | `8` | requests in flight per corp token; a stream holds its place for its whole length |
+| `NGINX_ISSUE_RATE` | `5` | `POST /internal/issue-token` per **minute** per client address, burst 2: three at once, then one every 60/rate seconds |
+
+Each is a whole number from 1 to 999999; unset or empty is the default, anything
+else stops nginx at startup (exit 64, naming the key). `/healthz/live` is never
+limited: a load balancer's probe must not be told 429. The limits live in
+nginx's memory and start empty when the container restarts.
+
+- **The key.** The `X-Corp-Auth` token itself when it has a corp token's shape
+  (`ct_` + 43 url-safe characters); a request without one — or with an empty,
+  oversize, repeated or malformed value — is keyed by the client address (the
+  real client's, via `real_ip`). nginx's `limit_conn` skips a key over 255
+  bytes rather than limiting it, and a repeated header joins into a fresh key,
+  so neither may be a key of its own. The token lives only in nginx's shared
+  memory: it is in no access-log field, and nginx's own "limiting requests"
+  line is written at `error`, below the front door's `crit` log level, so it is
+  never emitted.
+- **The `crit` level keeps the token out of stderr.** Two nginx lines at `error`
+  carry the key bytes themselves (`limit_conn`'s `… is more than 255 bytes:
+  "<key>"` and `limit_req`'s twin at 65535 bytes). The shape-keyed map keeps
+  them from firing today; relaxing `error_log … crit` or setting
+  `limit_req_log_level` / `limit_conn_log_level` would put tokens in the
+  container log.
+  `tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`
+  pins both. The one `[crit]` the limits can reach: a full `corp_conn` zone
+  writes `[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone
+  "corp_conn"` per refused request — no request context, no
+  key; the request gets 429. At 10m that needs about 10^5 distinct keys in
+  flight at once, more than `worker_connections`.
+- **Which answers first.** The edge. A request over a per-token limit gets
+  **429** from nginx with `Retry-After: 1`, rate or in-flight alike:
+
+  ```json
+  {"error":{"code":"E_RATE_LIMITED"}}
+  ```
+
+  It never reaches the gateway, so it is not audited and not in the gateway's
+  metrics; nginx's access log records it (`status` 429, no upstream). A request
+  the edge admits can still get the gateway's 429 `E_CAPACITY` when the pod's
+  global cap is full. The code says which layer answered: `E_RATE_LIMITED` is
+  one token over its share, `E_CAPACITY` is the gateway full.
+- **Issuance** is keyed by client address, not by token: an issuance call has no
+  corp token yet. Behind the edge, the gateway's own
+  `CORP_GATEWAY_ISSUE_MAX_INFLIGHT` and `CORP_GATEWAY_ISSUE_RATE_PER_MINUTE`
+  are global per pod.
+- **Behind two proxies.** nginx trusts one hop (`real_ip` without
+  `real_ip_recursive`). When a request passes two proxies before nginx
+  (`X-Forwarded-For: client, lb-internal`), the address nginx sees is the
+  internal load balancer's, so every request **without** a well-formed token
+  shares one bucket. That is accepted: the gateway refuses a request without a token
+  anyway. Requests with a token are keyed by the token and are not affected.
+- **What it does not stop.** A client that sends a different `X-Corp-Auth` on
+  every request gets a new bucket each time. The per-token limits bound an
+  honest runaway client, not a hostile one; the gateway's token check refuses
+  those requests, and its global caps still bound them.
+
+### Sizing `NGINX_TOKEN_CONN`
+
+Keep `NGINX_TOKEN_CONN` well below `CORP_LLM_MAX_INFLIGHT`, so one token can
+never hold every slot. With *D* developers streaming at once at peak and
+*R* gateway replicas (compose runs one):
+
+- *D* × `NGINX_TOKEN_CONN` ≤ `CORP_LLM_MAX_INFLIGHT` × *R*: the gateway's cap
+  is never reached; only a token over its own share is refused, by the edge.
+- *D* × `NGINX_TOKEN_CONN` > `CORP_LLM_MAX_INFLIGHT` × *R* — the usual case,
+  since not everyone streams at their limit: at peak the gateway's
+  `E_CAPACITY` answers, and the edge still keeps any one token to
+  `NGINX_TOKEN_CONN` slots.
+
+With the defaults (64 slots, 8 per token), eight developers at their limit fill
+the gateway; a ninth request gets `E_CAPACITY`, and no laptop holds more than 8
+of the 64. A Claude Code session with subagents can run several requests at
+once; lower the value knowing that.
+
 ## Corp-LLM throughput floor
 
 Per the plan's open-question #2 settlement: assume **10 RPS sustained / 20 RPS burst** until the corp-LLM team confirms higher.

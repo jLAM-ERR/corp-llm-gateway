@@ -1,0 +1,91 @@
+# http context. Rendered by entrypoint.sh with an explicit envsubst list, so
+# nginx's own runtime variables pass through untouched.
+
+# Docker's embedded DNS. Upstreams are variables, resolved per request, so
+# nginx starts before they exist and follows a restarted container's new IP.
+resolver 127.0.0.11 valid=30s ipv6=off;
+
+# The peer that actually connected, before real_ip rewrites $remote_addr.
+# The behind-proxy listeners answer 444 to anyone this does not mark 1.
+geo $realip_remote_addr $from_trusted_proxy {
+    default 0;
+    ${TRUSTED_GEO_LINES}
+}
+
+real_ip_header X-Forwarded-For;
+${TRUSTED_SET_REAL_IP_LINES}
+
+# HSTS for the edge's own 429 (gateway snippet): only on a TLS connection. An
+# add_header whose value is empty is not sent, so behind-proxy's plain HTTP
+# answer carries none.
+map $https $hsts_value {
+    on      "max-age=31536000";
+    default "";
+}
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# $host drops the port, which breaks NextAuth on a non-default port. Its
+# consumer is the Langfuse snippet's proxy block, not the gateway snippet
+# (which sends $host) -- not dead config.
+map $http_host $proxy_host_header {
+    default $http_host;
+    ''      $host;
+}
+
+# Per-token fairness at the edge: keyed by the corp token itself, or by the
+# client address (the real client's, via real_ip) when there is none. The key
+# lives only in these shared zones; it is in no log_format.
+# Keyed on the token's shape (`ct_` + token_urlsafe(32)), not on "any value":
+# limit_conn skips a key over 255 bytes instead of truncating it, and a repeated
+# header joins into "A, A" -- a fresh bucket, while the gateway reads the first.
+# Empty, oversize, repeated or garbage values all share the address bucket.
+# nginx keeps a trailing tab: `ct_<43>\t` is keyed by address yet authenticates (fairness only).
+map $http_x_corp_auth $corp_token_key {
+    "~^ct_[A-Za-z0-9_-]{43}$" $http_x_corp_auth;
+    default                   $binary_remote_addr;
+}
+limit_req_zone $corp_token_key zone=corp_token:10m rate=${NGINX_TOKEN_RATE}r/s;
+limit_conn_zone $corp_token_key zone=corp_conn:10m;
+# An issuance call carries no corp token yet.
+limit_req_zone $binary_remote_addr zone=corp_issue:1m rate=${NGINX_ISSUE_RATE}r/m;
+
+# The loopback health listener is probed every few seconds; its requests are
+# not logged. A separate access_log there would break the one-directive rule.
+map $server_port $corp_loggable {
+    8090    0;
+    default 1;
+}
+
+# A leak surface (invariants 1 and 4): no credential header, no body, no query
+# string. $uri is the normalized path without its arguments.
+log_format corp_gate escape=json
+    '{"time_iso8601":"$time_iso8601",'
+    '"realip_remote_addr":"$realip_remote_addr",'
+    '"from_trusted_proxy":"$from_trusted_proxy",'
+    '"remote_addr":"$remote_addr",'
+    '"host":"$host",'
+    '"server_port":"$server_port",'
+    '"request_method":"$request_method",'
+    '"uri":"$uri",'
+    '"status":"$status",'
+    '"body_bytes_sent":"$body_bytes_sent",'
+    '"request_time":"$request_time",'
+    '"upstream_addr":"$upstream_addr",'
+    '"upstream_status":"$upstream_status",'
+    '"upstream_response_time":"$upstream_response_time"}';
+# The only access_log anywhere: one at server or location level would replace
+# it for that scope, and without it nginx logs `combined`, query string and all.
+access_log /dev/stdout corp_gate if=$corp_loggable;
+
+# Loopback only and never published: the compose healthcheck probes this, so
+# health does not depend on an upstream being up.
+server {
+    listen 127.0.0.1:8090;
+    location = /nginx-health {
+        return 200;
+    }
+}

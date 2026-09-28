@@ -1,0 +1,18 @@
+# behind-proxy, port routing (the no-DNS fallback): the gateway on 8080 and
+# Langfuse on 8081, whatever the Host. Langfuse v3 cannot be sub-path hosted,
+# so it needs an origin of its own. A peer that is not in
+# NGINX_TRUSTED_PROXIES gets no response.
+
+server {
+    if ($from_trusted_proxy = 0) { return 444; }
+    listen 8080 default_server;
+    server_name _;
+    include /etc/nginx/rendered/snippets/gateway-locations.inc;
+}
+
+server {
+    if ($from_trusted_proxy = 0) { return 444; }
+    listen 8081 default_server;
+    server_name _;
+    include /etc/nginx/rendered/snippets/langfuse-locations.inc;
+}

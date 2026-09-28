@@ -800,6 +800,23 @@ ASGI app — by wrapping, not `add_middleware` — so `RouteGateMiddleware` is
 ahead of the gate. The `litellm` CLI and `litellm.proxy.proxy_server:app` must
 never be the served target again; both serve the routers with nothing in front.
 
+On the compose stack the opt-in HTTPS front door (`compose/nginx/`) sits outside
+the image, so a request crosses these layers, outermost first:
+
+```
+nginx front door    compose, COMPOSE_PROFILES=nginx|nginx-ports, off by default:
+                    TLS (or a trusted terminator), exact-path allow-list → 404,
+                    per-token edge limits → 429 E_RATE_LIMITED
+   ↓
+RouteGateMiddleware classify (METHOD, path) → PASSTHROUGH / REWRITTEN / REFUSE
+   ↓
+in-flight limiter   REWRITTEN only: body drained, then a slot → 429 E_CAPACITY
+   ↓
+litellm router      pre_call_hook → sanitize → provider
+```
+
+Without a profile, and on Helm, the route gate is the outermost layer.
+
 The middleware is pure ASGI, not `BaseHTTPMiddleware`, for two reasons that are
 security-relevant: it must see `websocket` scopes (an HTTP middleware never
 does, so a handshake would pass unclassified), and it must not buffer — SSE
@@ -1024,6 +1041,36 @@ and one that finishes it after the last slot went gets 429 then. Every
 answers before litellm or the sanitizer runs, and none of its refusals reads,
 echoes or logs the body.
 
+**The edge answers `E_RATE_LIMITED`, the gateway `E_CAPACITY`.** With the nginx
+front door on (`compose/nginx/`), nginx limits each corp token before the
+gateway sees the request (`docs/ops/capacity.md`, "Edge limits"): past a
+per-token rate, burst or in-flight limit it answers 429
+`{"error":{"code":"E_RATE_LIMITED"}}` with `Retry-After: 1`, and the request
+never reaches the gateway, so it is neither audited nor counted here. The two
+codes say which layer answered: `E_RATE_LIMITED` is one token over its share,
+`E_CAPACITY` is this pod full. The token is the limiter's key only in nginx's
+shared memory; it is in no access-log field, and nginx's own "limiting requests"
+line is written at `error`, below the front door's `crit` log level. Only a
+value shaped like a corp token (`ct_` + 43 url-safe characters) is a key of its
+own; an empty, oversize, repeated or malformed `X-Corp-Auth` is keyed by the
+client address, because `limit_conn` skips a key over 255 bytes instead of
+limiting it, and a repeated header joins into a fresh key.
+
+**The `crit` level is what keeps the token out of stderr.** Two nginx lines at
+`error` carry the key bytes themselves: `limit_conn`'s `the value of the "…" key
+is more than 255 bytes: "<key>"` and `limit_req`'s twin at 65535 bytes. The
+shape-keyed map keeps every key far below both, so neither fires today; but a
+future change that relaxes `error_log /dev/stderr crit` (in `nginx.conf`) or
+sets `limit_req_log_level` / `limit_conn_log_level` turns the next oversize key
+into a token in the container log.
+`tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`
+pins both: `error_log` is `crit`, and no config sets either `*_log_level`. The
+one `[crit]` the limits can reach: a full `corp_conn` zone writes
+`[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone "corp_conn"` once
+per refused request, with no request context and no key, and the request gets
+the edge's 429. At 10m that takes on the order of 10^5 distinct keys in flight
+at once, more than nginx's `worker_connections`.
+
 **Disconnects end the request.** The limiter replays the body to litellm and
 watches the socket. A client that disconnects — during our pre-call hook, before
 the first byte or mid-stream — gets its request cancelled, its leftover tasks
@@ -1072,7 +1119,8 @@ sanitizer, the DLP guard and the audit, and a refusal here grants nothing.
   client then polls `GET /v1/responses/{id}`, which re-runs under a different
   request id. Cache B is keyed per conversation and `conversation_id ==
   request_id`, so desanitization of the polled result is not guaranteed. Neither
-  the create nor the poll returns an original.
+  the create nor the poll returns an original. Through the compose front door the
+  poll does not get that far: nginx answers `GET /v1/responses/{id}` with 404.
 
 ### Widening it
 
@@ -1093,7 +1141,9 @@ admin UI either: a mounted sub-app serves many paths under its prefix, and listi
 one by one is not a widening anyone should write. `gateway-admin config check
 --routes` prints the effective table and every extra.
 
-The nginx front door (`docs/plans/20260806-nginx-profile-tls.md`) denies the same
-routes at the edge. That is defence in depth, not a substitute: the gate runs
-inside the image, so it holds on the SSH-tunnel path and under compose too, where
+The nginx front door (`compose/nginx/`; operator reference: `compose/README.md`,
+"HTTPS front door (nginx)") denies the same routes at the edge with 404, and
+admits nothing the gate refuses (`tests/compose/test_nginx_allowlist_routes.py`).
+That is defence in depth, not a substitute: the gate runs inside the image, so
+it holds on the SSH-tunnel path and on a compose stack with no profile on, where
 there is no nginx.

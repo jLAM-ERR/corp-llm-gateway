@@ -29,6 +29,8 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.compose.nginx_support import MODE_A_ONLY_KEYS, REQUIRED_ENV
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_DIR = ROOT / "compose"
 COMPOSE = COMPOSE_DIR / "docker-compose.yml"
@@ -39,8 +41,6 @@ ENV_EXAMPLE = COMPOSE_DIR / ".env.example"
 LITELLM_CONFIG_TARGET = "/etc/litellm/config.yaml"
 OAUTH_CONFIG_SOURCE = Path("litellm/config.oauth.yaml")
 VIRTUAL_KEY_CONFIG_SOURCE = Path("litellm/config.yaml")
-
-MODE_A_ONLY_KEYS = ("LITELLM_MASTER_KEY", "UI_USERNAME", "UI_PASSWORD")
 
 
 def _service(path: Path, name: str = "litellm") -> dict[str, Any]:
@@ -189,21 +189,6 @@ def _compose_cli_available() -> bool:
 
 needs_compose_cli = pytest.mark.skipif(
     not _compose_cli_available(), reason="docker compose CLI not on PATH"
-)
-
-# Every `${X:?...}` in the base file, minus the Mode A keys this mode omits.
-# Values are obvious non-credentials; only their presence in the render matters.
-REQUIRED_ENV = (
-    "POSTGRES_PASSWORD",
-    "GATEWAY_IMAGE_TAG",
-    "CORP_LANGFUSE_PUBLIC_KEY",
-    "CORP_LANGFUSE_SECRET_KEY",
-    "LANGFUSE_CLICKHOUSE_PASSWORD",
-    "LANGFUSE_ENCRYPTION_KEY",
-    "LANGFUSE_NEXTAUTH_SECRET",
-    "LANGFUSE_POSTGRES_PASSWORD",
-    "LANGFUSE_SALT",
-    "MINIO_ROOT_PASSWORD",
 )
 
 

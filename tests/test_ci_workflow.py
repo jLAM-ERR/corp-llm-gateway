@@ -14,6 +14,7 @@ from corp_llm_gateway.settings import parse_flag
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 CONTAINER_SUITE = "tests/integration/test_route_gate_container.py"
+NGINX_IMAGE_SUITE = "tests/integration/test_nginx_allowlist_image.py"
 JOB = "integration-container"
 UNIT_JOB = "test"
 # The one interpreter CI runs, and the one .venv-bench runs.
@@ -37,6 +38,7 @@ def test_the_container_job_exists_and_runs_the_container_suite() -> None:
     pytest_steps = [step for step in _runs(job) if "pytest" in step["run"]]
     assert len(pytest_steps) == 1
     assert CONTAINER_SUITE in shlex.split(pytest_steps[0]["run"])
+    assert NGINX_IMAGE_SUITE in shlex.split(pytest_steps[0]["run"])
 
 
 def test_the_container_job_cannot_pass_by_skipping() -> None:
