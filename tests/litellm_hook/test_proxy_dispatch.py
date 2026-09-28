@@ -11,18 +11,22 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
 pytest.importorskip("litellm.proxy.proxy_server", reason="litellm proxy not installed")
 
+import litellm
 from litellm.proxy.policy_engine.policy_registry import get_policy_registry
+from litellm.proxy.utils import ProxyLogging
 
 from corp_llm_gateway.route_gate.desanitize_middleware import (
     DesanitizeMiddleware,
     ResponseMappings,
 )
 from tests.litellm_hook._dispatch_fixtures import (
+    _CALLBACK_LISTS,
     E_SANITIZER_SKIPPED,
     GUARDRAIL_NAME,
     ORIGINAL_MARK,
@@ -95,6 +99,40 @@ async def test_harness_drives_every_hook_litellm_dispatches(
         assert bool(capture.seen.per_chunk) is (route == "chat" and stream)
         assert capture.seen.logged
     assert [(r["status"], r["redaction_count"]) for r in sink.records] == [("ok", 1)]
+
+
+def _litellm_globals() -> dict[str, Any]:
+    clients = litellm.in_memory_llm_clients_cache
+    return {
+        **{name: getattr(litellm, name) for name in _CALLBACK_LISTS},
+        "clients.cache_dict": clients.cache_dict,
+        "clients.ttl_dict": clients.ttl_dict,
+        "clients.expiration_heap": clients.expiration_heap,
+        "callback_capabilities": ProxyLogging._callback_capabilities_cache,
+    }
+
+
+async def test_the_harness_leaves_litellms_globals_as_it_found_them(
+    upstream: StubUpstream,
+) -> None:
+    """``Router.__init__`` appends its deployment callbacks to litellm's process-wide lists
+    and a request caches a provider client: undoing the harness puts back the very objects
+    it found, at their old lengths, so nothing accumulates across the suite."""
+    before = _litellm_globals()
+    lengths = {name: len(value) for name, value in before.items()}
+    patch = pytest.MonkeyPatch()
+    try:
+        ours, _ = build_ours()
+        harness = DispatchHarness(patch, upstream, [Capture("c"), ours])
+        exchange = await harness.send("chat", stream=True)
+        assert exchange.status == 200
+        assert len(litellm.success_callback) > lengths["success_callback"]
+    finally:
+        patch.undo()
+
+    after = _litellm_globals()
+    assert [name for name in before if after[name] is not before[name]] == []
+    assert {name: len(value) for name, value in after.items()} == lengths
 
 
 @pytest.mark.parametrize(("route", "stream"), FLOWS, ids=FLOW_IDS)
@@ -299,6 +337,15 @@ async def test_duplicate_guardrail_name_substitutes_callback(
     today = DispatchHarness(monkeypatch, upstream, [plain], guardrail_list=duplicates)
     served = await today.send("chat", stream=False)
     assert _egressed_placeholders(served.provider_bodies)
+
+
+def test_a_stand_in_answering_to_our_name_is_not_our_guardrail() -> None:
+    """The arm check identifies our guardrail by type, never by ``guardrail_name``: a
+    stand-in that answers to ``corp-llm-sanitizer`` leaves the guardrail absent."""
+    ours, _ = build_ours()
+
+    assert arm_problems([StandInGuardrail()]) == ["guardrail_absent"]
+    assert arm_problems([StandInGuardrail(), ours]) == []
 
 
 # ── hazards 10 / 13 / 15 ─────────────────────────────────────────────────────

@@ -28,6 +28,7 @@ from starlette.routing import Route
 from corp_llm_gateway.metrics import NoopExporter
 from corp_llm_gateway.route_gate import desanitize_middleware
 from corp_llm_gateway.route_gate.desanitize_middleware import (
+    COMPONENT,
     INTERNAL_ERROR_BODY,
     DesanitizeMiddleware,
     ResponseMappings,
@@ -39,6 +40,7 @@ from corp_llm_gateway.route_gate.inflight import (
     current_ticket,
 )
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
+from tests.litellm_hook import _dispatch_fixtures
 from tests.litellm_hook._dispatch_fixtures import (
     EMAIL,
     ORIGINAL_MARK,
@@ -593,20 +595,80 @@ def _starlette(response: Callable[[], Any]) -> Starlette:
     return Starlette(routes=[Route("/v1/messages", endpoint, methods=["POST"])])
 
 
+class _Failures(NoopExporter):
+    def __init__(self) -> None:
+        self.components: list[str] = []
+
+    def record_failure(self, component: str) -> None:
+        self.components.append(component)
+
+
+def _raise_on(monkeypatch: pytest.MonkeyPatch, needle: str) -> None:
+    """Make the SSE restorer fail, with a canary in the message, on the event holding ``needle``."""
+    real_feed = desanitize_middleware.SseStreamDesanitizer.feed
+
+    def feed(self: Any, chunk: Any) -> Any:
+        if needle in str(chunk):
+            raise ValueError(f"{CANARY} {EMAIL}")
+        return real_feed(self, chunk)
+
+    monkeypatch.setattr(desanitize_middleware.SseStreamDesanitizer, "feed", feed)
+
+
+class _UnbuildableDesanitizer:
+    def __init__(self, mapping: StrategyResult) -> None:
+        raise ValueError(f"{CANARY} {EMAIL}")
+
+
 async def test_restoration_failure_before_start_is_a_content_free_500(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     mappings = ResponseMappings()
+    metrics = _Failures()
+    ticket = RequestTicket("1" * 32)
     app = _starlette(lambda: JSONResponse(CHAT))
 
     with caplog.at_level(logging.DEBUG):
-        sent = await drive(mounted(app, mappings, restore_json=_raising_restore))
+        sent = await drive(
+            mounted(app, mappings, restore_json=_raising_restore, metrics=metrics), ticket
+        )
 
     assert start_of(sent)["status"] == 500
     assert body_of(sent) == INTERNAL_ERROR_BODY
     assert CANARY not in caplog.text and EMAIL not in caplog.text
     assert "Traceback" not in caplog.text
     assert "gateway_desanitize_failed" in caplog.text and "phase=before_start" in caplog.text
+    assert metrics.components == [COMPONENT] == ["desanitize"]
+    assert mappings.failed(ticket)
+    assert len(mappings) == 0
+
+
+async def test_a_restorer_that_cannot_be_built_is_a_content_free_500(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Building the SSE restorer compiles a pattern from the originals; a failure there is
+    inside the boundary like any other: content-free 500, nothing raised into the app."""
+    monkeypatch.setattr(desanitize_middleware, "SseStreamDesanitizer", _UnbuildableDesanitizer)
+    mappings = ResponseMappings()
+    metrics = _Failures()
+    ticket = RequestTicket("2" * 32)
+
+    async def stream() -> Any:
+        for chunk in _anthropic_chunks():
+            yield chunk
+
+    app = _starlette(lambda: StreamingResponse(stream(), media_type="text/event-stream"))
+
+    with caplog.at_level(logging.DEBUG):
+        sent = await drive(mounted(app, mappings, metrics=metrics), ticket)
+
+    assert start_of(sent)["status"] == 500
+    assert body_of(sent) == INTERNAL_ERROR_BODY
+    assert CANARY not in caplog.text and EMAIL not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "phase=before_start" in caplog.text
+    assert metrics.components == [COMPONENT]
+    assert mappings.failed(ticket)
     assert len(mappings) == 0
 
 
@@ -643,15 +705,112 @@ async def test_restoration_failure_after_start_closes_the_stream_silently(
     assert len(mappings) == 0
 
 
-async def test_a_failing_client_send_after_a_restoration_failure_carries_no_content() -> None:
+@pytest.mark.parametrize("framing", ["event-per-chunk", "one-chunk"])
+async def test_after_start_failure_delivers_what_was_restored_then_closes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, framing: str
+) -> None:
+    """Events restored before the failing one reach the client, then one clean close; the
+    failure is counted as ``gateway_failure{component="desanitize"}`` and marked on the
+    ticket for the audit. ``one-chunk`` is the whole stream in one ASGI message, where an
+    all-or-nothing feed would hand the client 0 bytes."""
+    _raise_on(monkeypatch, PLACEHOLDER_MARK)
+    chunks = _anthropic_chunks()
+    if framing == "one-chunk":
+        chunks = ["".join(chunks)]
+    mappings = ResponseMappings()
+    metrics = _Failures()
+    ticket = RequestTicket("3" * 32)
+
+    with caplog.at_level(logging.DEBUG):
+        sent = await drive(mounted(sse_app(chunks), mappings, metrics=metrics), ticket)
+
+    stream = body_of(sent).decode()
+    assert start_of(sent)["status"] == 200
+    assert _events(stream) == [json.loads(_anthropic_chunks()[0].split("data: ", 1)[1])]
+    assert PLACEHOLDER_MARK not in stream and "message_stop" not in stream
+    bodies = [m for m in sent if m["type"] == "http.response.body"]
+    assert bodies[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    assert [bool(m.get("more_body")) for m in bodies].count(False) == 1
+    assert metrics.components == [COMPONENT]
+    assert mappings.failed(ticket)
+    assert len(mappings) == 0
+    assert CANARY not in stream
+    assert CANARY not in caplog.text and EMAIL not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+async def test_a_request_that_restored_cleanly_is_not_marked_failed() -> None:
+    mappings = ResponseMappings()
+    ticket = RequestTicket("4" * 32)
+
+    await drive(mounted(sse_app(_anthropic_chunks()), mappings), ticket)
+
+    assert not mappings.failed(ticket)
+
+
+async def test_the_failure_reporter_is_injectable_and_gets_no_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _raise_on(monkeypatch, PLACEHOLDER_MARK)
+    reports: list[tuple[Any, ...]] = []
+    ticket = RequestTicket("5" * 32)
+
+    await drive(
+        mounted(
+            sse_app(_anthropic_chunks()),
+            ResponseMappings(),
+            on_failure=lambda *args: reports.append(args),
+        ),
+        ticket,
+    )
+
+    assert reports == [(ticket.gateway_id, "after_start", ValueError)]
+
+
+async def test_a_raising_failure_reporter_still_closes_the_stream(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _raise_on(monkeypatch, PLACEHOLDER_MARK)
+    mappings = ResponseMappings()
+    ticket = RequestTicket("6" * 32)
+
+    def reporter(request_id: str, phase: str, error_type: type[BaseException]) -> None:
+        raise RuntimeError("exporter down")
+
+    with caplog.at_level(logging.DEBUG):
+        sent = await drive(
+            mounted(sse_app(_anthropic_chunks()), mappings, on_failure=reporter), ticket
+        )
+
+    bodies = [m for m in sent if m["type"] == "http.response.body"]
+    assert bodies[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    assert mappings.failed(ticket)
+    assert "gateway_desanitize_report_failed" in caplog.text and "Traceback" not in caplog.text
+
+
+def _broken_restore_json(mappings: ResponseMappings) -> ASGIApp:
+    return DesanitizeMiddleware(
+        json_app(CHAT), mappings, enabled=True, restore_json=_raising_restore
+    )
+
+
+def _unbuildable_restorer(mappings: ResponseMappings) -> ASGIApp:
+    return DesanitizeMiddleware(sse_app(_anthropic_chunks()), mappings, enabled=True)
+
+
+@pytest.mark.parametrize(
+    "build", [_broken_restore_json, _unbuildable_restorer], ids=["restore-json", "sse-restorer"]
+)
+async def test_a_failing_client_send_after_a_restoration_failure_carries_no_content(
+    monkeypatch: pytest.MonkeyPatch, build: Callable[[ResponseMappings], ASGIApp]
+) -> None:
     """The error response is sent outside the handler: if the client's ``send`` then fails
     too, that exception must not hold the canary-carrying failure as ``__context__``."""
+    monkeypatch.setattr(desanitize_middleware, "SseStreamDesanitizer", _UnbuildableDesanitizer)
     mappings = ResponseMappings()
     ticket = RequestTicket("e" * 32)
     mappings.register(ticket, MAPPING)
-    middleware = DesanitizeMiddleware(
-        json_app(CHAT), mappings, enabled=True, restore_json=_raising_restore
-    )
+    middleware = build(mappings)
 
     async def receive() -> Message:
         return {"type": "http.request", "body": b"{}", "more_body": False}
@@ -698,18 +857,22 @@ async def test_restoration_failure_never_reaches_litellms_handler(
 
         monkeypatch.setattr(desanitize_middleware.SseStreamDesanitizer, "feed", feed)
     mappings = ResponseMappings()
+    metrics = _Failures()
     engine, _ = build_ours()
     harness = DispatchHarness(
         monkeypatch,
         upstream,
         [OptionAPreCall(engine, mappings)],
         wrap=lambda app: DesanitizeMiddleware(
-            app, mappings, enabled=True, restore_json=_raising_restore
+            app, mappings, enabled=True, restore_json=_raising_restore, metrics=metrics
         ),
     )
 
     with caplog.at_level(logging.DEBUG):
         exchange = await harness.send("messages", stream=stream)
+
+    assert metrics.components == [COMPONENT]
+    assert exchange.ticket is not None and mappings.failed(exchange.ticket)
 
     if stream:
         assert exchange.status == 200 and ORIGINAL_MARK not in exchange.text
@@ -720,6 +883,52 @@ async def test_restoration_failure_never_reaches_litellms_handler(
     assert "Unhandled exception in request" not in caplog.text
     assert CANARY not in caplog.text and "Traceback" not in caplog.text
     assert len(mappings) == 0
+
+
+def _long_anthropic(path: str, text: str) -> list[str]:
+    events = _dispatch_fixtures._anthropic_sse(text)
+    filler = [
+        "event: content_block_delta\ndata: "
+        + json.dumps(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": f" w{i}"},
+            }
+        )
+        for i in range(30)
+    ]
+    return [*events[:4], *filler, *events[4:]]
+
+
+async def test_after_start_failure_tears_the_upstream_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the close, the server's ``receive`` yields ``http.disconnect``; starlette
+    cancels litellm's generator and litellm drops the provider connection mid-stream. The
+    stub, pacing 34 events 0.1 s apart, sees its connection broken rather than finishing."""
+    _raise_on(monkeypatch, PLACEHOLDER_MARK)
+    monkeypatch.setattr(_dispatch_fixtures, "_stream", _long_anthropic)
+    stub = StubUpstream(event_delay=0.1)
+    mappings = ResponseMappings()
+    engine, _ = build_ours()
+    try:
+        harness = DispatchHarness(
+            monkeypatch,
+            stub,
+            [OptionAPreCall(engine, mappings)],
+            wrap=lambda app: DesanitizeMiddleware(app, mappings, enabled=True),
+        )
+        exchange = await harness.send("messages", stream=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 10.0
+        while not stub.stream_outcomes and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+    finally:
+        stub.close()
+
+    assert exchange.status == 200 and "message_stop" not in exchange.text
+    assert stub.stream_outcomes == ["broken"]
 
 
 def test_the_prototype_is_not_wired() -> None:

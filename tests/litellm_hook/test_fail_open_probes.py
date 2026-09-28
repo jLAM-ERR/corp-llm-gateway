@@ -265,6 +265,28 @@ async def test_scan_raw_request_and_run_in_parallel_refused(
     assert flag in arm_problems([plain])
 
 
+async def test_sentinel_does_not_catch_scan_raw_request(
+    monkeypatch: pytest.MonkeyPatch, upstream: StubUpstream
+) -> None:
+    """A design limit of the sentinel. With ``scan_raw_request`` litellm runs our pre-call on
+    a snapshot carrying the same ``litellm_call_id`` (proxy/utils.py:1421-1466): the call id
+    is bound on the ticket, then litellm discards the rewrite. The marker proves "our
+    pre-call ran", not "the live dict was rewritten", so the sentinel passes and the
+    original egresses. Only the arm check (``scan_raw_request``) closes hazard 11.
+    """
+    ours, _ = build_ours()
+    migrated = UnsafeMigratedGuardrail(ours, scan_raw_request=True)
+    harness = DispatchHarness(monkeypatch, upstream, [migrated, SentinelCallback()])
+
+    exchange = await harness.send("chat", stream=False)
+
+    assert exchange.status == 200
+    assert "pre_call" in migrated.calls
+    assert exchange.ticket is not None and exchange.ticket.call_ids
+    assert _egressed_original(exchange.provider_bodies)
+    assert "scan_raw_request" in arm_problems([migrated])
+
+
 # ── hazards 14a / 14b: rows straight into litellm's Postgres ─────────────────
 
 _MIGRATIONS = Path(__import__("litellm_proxy_extras").__file__).parent / "migrations"

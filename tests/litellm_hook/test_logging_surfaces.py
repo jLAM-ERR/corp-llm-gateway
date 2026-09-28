@@ -149,6 +149,49 @@ async def test_standard_logging_payload_is_content_free(
     assert ours_entries[0]["guardrail_status"] == "success"
 
 
+RESPONSES_LIST_INPUTS: dict[str, list[dict[str, Any]]] = {
+    "role-content": [{"role": "user", "content": f"write to {EMAIL}"}],
+    "typed-items": [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": f"write to {EMAIL}"}],
+        }
+    ],
+}
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
+@pytest.mark.parametrize("shape", sorted(RESPONSES_LIST_INPUTS))
+async def test_responses_list_input_reaches_the_success_log_payload(
+    monkeypatch: pytest.MonkeyPatch, upstream: StubUpstream, shape: str, stream: bool
+) -> None:
+    """Hazard 17, list-shaped ``input`` (the test above sends ``input: str`` only).
+
+    litellm's logging object copies only the outer list (``copy.copy``,
+    litellm_logging.py:479), so its items are the request's own dicts. Our pre-call does
+    not edit those in place: it stores a new list of new items (``_store_request_items``,
+    litellm_hook.py:2306). The payload's ``messages`` therefore holds the ORIGINAL input,
+    item for item, while the provider got placeholders. A fix must replace the logging
+    object's ``messages``; relying on the shared items would not reach it.
+    """
+    ours, _ = build_ours()
+    sink = Capture("sink")
+    harness = DispatchHarness(monkeypatch, upstream, [ours, sink])
+    sent_input = RESPONSES_LIST_INPUTS[shape]
+
+    exchange = await harness.send("responses", stream=stream, extra={"input": sent_input})
+    await until(lambda: len(sink.seen.logged) >= 2)
+
+    assert exchange.status == 200
+    assert len(exchange.provider_bodies) == 1
+    assert ORIGINAL_MARK not in exchange.provider_bodies[0]
+    payload = json.loads(sink.seen.logged[0])
+    assert _payload_fields_holding(payload, ORIGINAL_MARK) == {"messages"}
+    assert payload["messages"] == sent_input
+    assert ORIGINAL_MARK not in sink.seen.logged[1]
+
+
 async def test_decorated_apply_guardrail_logs_exception_text() -> None:
     """Hazard 8: any ``apply_guardrail`` is wrapped by ``log_guardrail_information`` at class
     creation (custom_guardrail.py:155-160), and a raising one has ``str(exc)`` written into
@@ -287,7 +330,7 @@ def test_a_custom_guardrail_turns_per_chunk_hooks_on(monkeypatch: pytest.MonkeyP
     overrides the per-chunk hook. Today's plain callback keeps it off."""
     ours, _ = build_ours()
     monkeypatch.setattr(litellm, "callbacks", [ours, CaptureNoChunkHook("c")])
-    ProxyLogging._callback_capabilities_cache.clear()
+    monkeypatch.setattr(ProxyLogging, "_callback_capabilities_cache", {})
     assert proxy_server.proxy_logging_obj.needs_per_chunk_streaming_hook() is False
 
     monkeypatch.setattr(

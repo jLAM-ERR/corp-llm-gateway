@@ -5,7 +5,9 @@ Sits between the route gate and litellm's app and wraps ``send`` only (``receive
 to the in-flight limiter). Restoration state is keyed by the gateway ``RequestTicket`` and
 owned here, released on the final body or when the request unwinds, never by ``audit()``.
 A restoration failure never raises into litellm's app: before ``http.response.start`` it
-answers a content-free 500, after it the stream is closed without a message.
+answers a content-free 500, after it the events already restored are sent and the stream
+is closed without a message. Either way the failure is reported (content-free log line +
+``gateway_failure{component="desanitize"}``) and marked on the ticket for the audit.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import weakref
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
+from corp_llm_gateway.metrics import MetricsExporter, get_exporter
 from corp_llm_gateway.route_gate.inflight import RequestTicket, current_ticket
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
 from corp_llm_gateway.sanitizer.streaming import ResponsesStreamDesanitizer, SseStreamDesanitizer
@@ -30,7 +33,10 @@ Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 RestoreJson = Callable[[Any, StrategyResult], Any]
+# (gateway request id, phase, exception type): never the exception itself, it can quote content.
+FailureReporter = Callable[[str, str, type[BaseException]], None]
 
+COMPONENT = "desanitize"
 E_INTERNAL = "E_INTERNAL"
 INTERNAL_ERROR_BODY = json.dumps(
     {"error": {"type": "internal_error", "code": E_INTERNAL, "message": "internal error"}},
@@ -47,6 +53,8 @@ class ResponseMappings:
         self._by_ticket: weakref.WeakKeyDictionary[RequestTicket, StrategyResult] = (
             weakref.WeakKeyDictionary()
         )
+        # Outlives release(): the audit, written after the response, reads it.
+        self._failed: weakref.WeakSet[RequestTicket] = weakref.WeakSet()
 
     def register(self, ticket: RequestTicket, mapping: StrategyResult) -> None:
         self._by_ticket[ticket] = mapping
@@ -56,6 +64,12 @@ class ResponseMappings:
 
     def release(self, ticket: RequestTicket) -> None:
         self._by_ticket.pop(ticket, None)
+
+    def mark_failed(self, ticket: RequestTicket) -> None:
+        self._failed.add(ticket)
+
+    def failed(self, ticket: RequestTicket) -> bool:
+        return ticket in self._failed
 
     def __contains__(self, ticket: object) -> bool:
         return ticket in self._by_ticket
@@ -80,18 +94,31 @@ class DesanitizeMiddleware:
         *,
         enabled: bool = False,
         restore_json: RestoreJson | None = None,
+        metrics: MetricsExporter | None = None,
+        on_failure: FailureReporter | None = None,
     ) -> None:
         self.app = app
         self._mappings = mappings
         self._enabled = enabled
         self._restore_json = restore_json or _default_restore_json
+        self._metrics = metrics
+        self._on_failure = on_failure or self._report_failure
+
+    def _report_failure(self, request_id: str, phase: str, error_type: type[BaseException]) -> None:
+        logger.error(
+            "gateway_desanitize_failed request_id=%s phase=%s error=%s",
+            request_id,
+            phase,
+            error_type.__name__,
+        )
+        (self._metrics or get_exporter()).record_failure(COMPONENT)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         ticket = current_ticket() if scope.get("type") == "http" else None
         if not self._enabled or ticket is None:
             await self.app(scope, receive, send)
             return
-        response = _Response(ticket, self._mappings, send, self._restore_json)
+        response = _Response(ticket, self._mappings, send, self._restore_json, self._on_failure)
         try:
             await self.app(scope, receive, response.send)
         finally:
@@ -105,11 +132,13 @@ class _Response:
         mappings: ResponseMappings,
         send: Send,
         restore_json: RestoreJson,
+        on_failure: FailureReporter,
     ) -> None:
         self._ticket = ticket
         self._mappings = mappings
         self._send = send
         self._restore_json = restore_json
+        self._on_failure = on_failure
         self._mode = "unstarted"
         self._start: Message | None = None
         self._mapping: StrategyResult | None = None
@@ -145,8 +174,17 @@ class _Response:
             return
         self._mapping = mapping
         if content_type.startswith("text/event-stream"):
+            failure: type[BaseException] | None = None
+            try:
+                self._sse = _SseRestorer(mapping)
+            except Exception as exc:
+                failure = type(exc)
+            # Answered outside the handler, as in _finish_unary.
+            if failure is not None:
+                self._failed("before_start", failure)
+                await self._internal_error()
+                return
             self._mode = "sse"
-            self._sse = _SseRestorer(mapping)
             await self._send({**message, "headers": _without(message, b"content-length")})
             return
         if "json" in content_type:
@@ -159,18 +197,18 @@ class _Response:
     async def _finish_unary(self) -> None:
         assert self._start is not None and self._mapping is not None
         body = b""
-        failed = False
+        failure: type[BaseException] | None = None
         try:
             payload = json.loads(bytes(self._body))
             restored = self._restore_json(payload, self._mapping)
             body = json.dumps(restored, ensure_ascii=False, separators=(",", ":")).encode()
         except Exception as exc:
-            self._failed("before_start", exc)
-            failed = True
+            failure = type(exc)
         finally:
             self._body.clear()
         # Sent outside the handler: a failing send must not carry the failure as __context__.
-        if failed:
+        if failure is not None:
+            self._failed("before_start", failure)
             await self._internal_error()
             return
         headers = [
@@ -183,18 +221,20 @@ class _Response:
 
     async def _on_sse(self, chunk: bytes, more: bool) -> None:
         assert self._sse is not None
-        out = b""
-        failed = False
+        failure: type[BaseException] | None = None
         try:
-            out = self._sse.feed(chunk)
+            self._sse.feed(chunk)
             if not more:
-                out += self._sse.flush()
+                self._sse.flush()
         except Exception as exc:
-            self._failed("after_start", exc)
-            failed = True
-        if failed:
+            failure = type(exc)
+        # Whole events restored before a failure; the failing one is dropped.
+        out = self._sse.take()
+        if failure is not None:
             self._mode = "closed"
-            self._mappings.release(self._ticket)
+            self._failed("after_start", failure)
+            if out:
+                await self._send({"type": "http.response.body", "body": out, "more_body": True})
             await self._send({"type": "http.response.body", "body": b"", "more_body": False})
             return
         if not more:
@@ -218,14 +258,17 @@ class _Response:
             {"type": "http.response.body", "body": INTERNAL_ERROR_BODY, "more_body": False}
         )
 
-    def _failed(self, phase: str, exc: Exception) -> None:
-        # The class name only: the message can quote a restored original.
-        logger.error(
-            "gateway_desanitize_failed request_id=%s phase=%s error=%s",
-            self._ticket.gateway_id,
-            phase,
-            type(exc).__name__,
-        )
+    def _failed(self, phase: str, error_type: type[BaseException]) -> None:
+        self._mappings.mark_failed(self._ticket)
+        self._mappings.release(self._ticket)
+        try:
+            self._on_failure(self._ticket.gateway_id, phase, error_type)
+        except Exception as exc:
+            logger.error(
+                "gateway_desanitize_report_failed request_id=%s error=%s",
+                self._ticket.gateway_id,
+                type(exc).__name__,
+            )
 
 
 class _SseRestorer:
@@ -234,28 +277,30 @@ class _SseRestorer:
     def __init__(self, mapping: StrategyResult) -> None:
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
         self._buffer = ""
+        self._ready: list[str] = []
         self._events = SseStreamDesanitizer(mapping)
         self._responses = ResponsesStreamDesanitizer(mapping)
 
-    def feed(self, chunk: bytes) -> bytes:
+    def feed(self, chunk: bytes) -> None:
+        """Restore every complete event; if one raises, those before it stay in ``take()``."""
         self._buffer += self._utf8.decode(chunk, final=False)
-        out: list[str] = []
         while (match := _SSE_BOUNDARY.search(self._buffer)) is not None:
             event, self._buffer = self._buffer[: match.end()], self._buffer[match.end() :]
-            out.extend(self._event(event))
-        return "".join(out).encode()
+            self._ready.extend(self._event(event))
 
-    def flush(self) -> bytes:
+    def flush(self) -> None:
         self._buffer += self._utf8.decode(b"", final=True)
-        out: list[str] = []
         if self._buffer:
-            out.extend(self._event(self._buffer))
-            self._buffer = ""
-        out.extend(_text(item) for item in self._events.flush())
-        out.extend(
+            event, self._buffer = self._buffer, ""
+            self._ready.extend(self._event(event))
+        self._ready.extend(_text(item) for item in self._events.flush())
+        self._ready.extend(
             _frame(json.loads(item), with_event_line=False) for item in self._responses.flush()
         )
-        return "".join(out).encode()
+
+    def take(self) -> bytes:
+        out, self._ready = "".join(self._ready), []
+        return out.encode()
 
     def _event(self, event: str) -> list[str]:
         payload = _data_payload(event)

@@ -13,10 +13,12 @@ Import only after ``pytest.importorskip("litellm.proxy.proxy_server")``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -247,8 +249,11 @@ class StubUpstream:
     every later hop, which is what the capture assertions need to see.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, event_delay: float = 0.0) -> None:
         self.bodies: list[str] = []
+        # One entry per streamed reply: "completed", or "broken" when the gateway hung up.
+        self.stream_outcomes: list[str] = []
+        self.event_delay = event_delay
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -299,12 +304,20 @@ class StubUpstream:
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
-                for item in events:
-                    payload = (item + "\n\n").encode()
-                    self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+                try:
+                    for item in events:
+                        payload = (item + "\n\n").encode()
+                        self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+                        self.wfile.flush()
+                        if upstream.event_delay:
+                            time.sleep(upstream.event_delay)
+                    self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+                except OSError:
+                    upstream.stream_outcomes.append("broken")
+                    self.close_connection = True
+                    return
+                upstream.stream_outcomes.append("completed")
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 return
@@ -631,7 +644,8 @@ def arm_problems(
 
 
 def _is_ours(cb: Any) -> bool:
-    return isinstance(cb, CorpLlmGuardrail) or getattr(cb, "guardrail_name", None) == GUARDRAIL_NAME
+    # By type, never by name. _Migrated stands for CorpLlmGuardrail after a base-class switch.
+    return isinstance(cb, (CorpLlmGuardrail, _Migrated))
 
 
 def _names_us(entry: Mapping[str, Any]) -> bool:
@@ -717,6 +731,13 @@ class DispatchHarness:
         self.upstream = upstream
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
         monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+        # Router.__init__ and request handling append to these in place: patch them first.
+        for name in _CALLBACK_LISTS:
+            monkeypatch.setattr(litellm, name, list(getattr(litellm, name)))
+        clients = litellm.in_memory_llm_clients_cache
+        for name in ("cache_dict", "ttl_dict", "expiration_heap"):
+            monkeypatch.setattr(clients, name, type(getattr(clients, name))(getattr(clients, name)))
+        monkeypatch.setattr(ProxyLogging, "_callback_capabilities_cache", {})
         self.router = Router(
             model_list=[
                 _deployment(CHAT_MODEL, "openai/gpt-4o-mini", f"{upstream.base}/v1"),
@@ -729,15 +750,11 @@ class DispatchHarness:
         monkeypatch.setattr(proxy_server, "master_key", None)
         monkeypatch.setattr(proxy_server, "general_settings", dict(general_settings or {}))
         monkeypatch.setattr(litellm, "callbacks", list(callbacks))
-        # Request handling promotes litellm.callbacks into these process-wide lists.
-        for name in _CALLBACK_LISTS:
-            monkeypatch.setattr(litellm, name, list(getattr(litellm, name)))
         for name in ("IN_MEMORY_GUARDRAILS", "guardrail_id_to_custom_guardrail", "_sources"):
             monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, name, {})
         monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, "guardrail_id_to_sibling_callbacks", {})
         monkeypatch.setattr(policy_registry, "_policy_registry", None)
         monkeypatch.setattr(attachment_registry, "_attachment_registry", None)
-        ProxyLogging._callback_capabilities_cache.clear()
         inner = wrap(proxy_server.app) if wrap is not None else proxy_server.app
         self.probe = _TicketProbe(inner)
         self.gate = RouteGateMiddleware(
@@ -762,12 +779,14 @@ class DispatchHarness:
         body = request_body(route, stream=stream, content=content) | dict(extra or {})
         sent = {"X-Corp-Auth": token} if token is not None else {}
         before = len(self.upstream.bodies)
+        known_clients = set(litellm.in_memory_llm_clients_cache.cache_dict)
         transport = httpx.ASGITransport(app=self.gate)
         async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
             response = await client.post(
                 path or ROUTES[route][0], json=body, headers={**sent, **dict(headers or {})}
             )
         await _drain_logging()
+        await _close_clients_added_since(known_clients)
         return Exchange(
             status=response.status_code,
             headers=response.headers,
@@ -793,6 +812,20 @@ def _deployment(name: str, model: str, api_base: str) -> dict[str, Any]:
         "model_name": name,
         "litellm_params": {"model": model, "api_base": api_base, "api_key": "sk-stub-key"},
     }
+
+
+async def _close_clients_added_since(known: set[str]) -> None:
+    """Close the provider clients a request cached, on the loop that made them: undoing the
+    harness drops them from litellm's cache, and they would otherwise be collected open."""
+    cache = litellm.in_memory_llm_clients_cache
+    for key in [key for key in cache.cache_dict if key not in known]:
+        client = cache.cache_dict.pop(key)
+        cache.ttl_dict.pop(key, None)
+        close = getattr(client, "close", None) or getattr(client, "aclose", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
 
 
 async def _drain_logging() -> None:
