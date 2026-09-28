@@ -371,7 +371,7 @@ of truth** — do not add ad-hoc fail-open paths):
 | `providerBlocked` (D4) | **block** (403 `E_PROVIDER_BLOCKED`) — the merged `allowed_providers` policy rejects the upstream target; a clean policy denial before any content processing, no raw body |
 | `spanApplyFailed` | **fail-closed** (500 `E_SPAN_INVALID`) — `apply_spans` rejects a pre-selected replacement span that no longer matches the segment text (e.g. a stale Cache-A/allocator remap); `StaleSpanError` (`sanitizer/placeholder.py`) is mapped to an audit record + `gateway_failure{component="sanitize"}` rather than escaping as a generic, undocumented 500 |
 | `routeGate` | **default-deny, fail-closed.** Every request is classified by `(method, path)` before litellm's router sees it (`route_gate/table.py`, generated from litellm's own source). A route the table marks REFUSE is 403 `E_ROUTE_BLOCKED`; a route with no entry at all is 404, same error code; a websocket handshake is refused before connect; a path is 403 without ever being matched when its raw bytes carry `%2f`, `%00` or `%2e%2e` (any case) or any non-ASCII byte, or its decoded form carries `..`, `//` or NUL. The gate's OWN faults are failures, not refusals: a REWRITTEN route while the guardrail callback is not registered is 503 `E_ROUTE_GATE_UNARMED` and is never forwarded, and any exception in classification is 500 `E_ROUTE_GATE_ERROR` — both also record `gateway_failure{component="route_gate"}`. No off switch: the only widening is `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`, which can add PASSTHROUGH entries and nothing else. The process exits 70 at startup rather than serve with the callback absent |
-| `internalError` (F8) | **fail-closed** (500 `E_INTERNAL`) — an unexpected exception in `pre_call`/`post_call_unary`/`post_call_stream` (a DB error, a bug, an audit-sink outage) is never echoed to the client, the log, or the audit record: only the opaque error_code + `gateway_failure{component="internal"}`. The safety net that maps this is guarded against re-entrancy — a failure while recording the failure itself (e.g. the audit sink is also down) is caught and logged rather than replacing the client-visible 500. A request that already recorded a component-specific failure (e.g. `dlp`) is not double-counted as `internal` too |
+| `internalError` (F8) | **fail-closed** (500 `E_INTERNAL`) — an unexpected exception in `pre_call` or while restoring a response (the ASGI desanitiser, counted as `gateway_failure{component="desanitize"}`) (a DB error, a bug, an audit-sink outage) is never echoed to the client, the log, or the audit record: only the opaque error_code + `gateway_failure{component="internal"}`. The safety net that maps this is guarded against re-entrancy — a failure while recording the failure itself (e.g. the audit sink is also down) is caught and logged rather than replacing the client-visible 500. A request that already recorded a component-specific failure (e.g. `dlp`) is not double-counted as `internal` too |
 
 See plan §M4 for the full matrix (Redis transient retry, Cache A/C miss
 fall-through, single-audit-sink-down) and per-team override columns.
@@ -810,12 +810,31 @@ nginx front door    compose, COMPOSE_PROFILES=nginx|nginx-ports, off by default:
    ↓
 RouteGateMiddleware classify (METHOD, path) → PASSTHROUGH / REWRITTEN / REFUSE
    ↓
-in-flight limiter   REWRITTEN only: body drained, then a slot → 429 E_CAPACITY
+in-flight limiter   REWRITTEN only: body drained (a top-level `policies` key → 403),
+                    then a slot → 429 E_CAPACITY
+   ↓
+desanitiser         the response reversal, on the way out (below)
    ↓
 litellm router      pre_call_hook → sanitize → provider
 ```
 
 Without a profile, and on Helm, the route gate is the outermost layer.
+
+**The response reversal runs here, not in litellm.** `DesanitizeMiddleware`
+(`route_gate/desanitize_middleware.py`) sits inside the limiter, in front of
+litellm's app, and is the gateway's only reversal: the guardrail's pre-call hands
+the response mapping to the request's ticket, and the middleware restores the
+originals in the response litellm sends — unary JSON, chat / Anthropic SSE and
+Responses events — so litellm and every callback, hook and log inside it only
+ever see placeholders. It has no off switch. A restoration failure answers a
+content-free 500 `E_INTERNAL` (or, after the status went out, closes the stream)
+and counts `gateway_failure{component="desanitize"}`; a response with a
+`Content-Encoding` passes through unrestored, and the gateway refuses to arm
+(exit 70, `response_compressor`) if litellm's app compresses responses. Responses
+events are renumbered (`sequence_number`) whenever held text adds or moves an
+event, on every restored Responses stream. The request's one audit record is
+written when the response ends (`route_gate/terminal_audit.py`), never by a
+litellm callback.
 
 The middleware is pure ASGI, not `BaseHTTPMiddleware`, for two reasons that are
 security-relevant: it must see `websocket` scopes (an HTTP middleware never
@@ -845,6 +864,7 @@ that justification against the `ast`: a handler whose body calls
 | `route_gate_malformed` | 403 | `E_ROUTE_BLOCKED` | raw path carrying `%2f`, `%00`, `%2e%2e` (any case) or a non-ASCII byte, or decoded path carrying `..`, `//` or NUL (`route_gate/classify.py`); never matched against the table at all |
 | `route_gate_unarmed` | 503 | `E_ROUTE_GATE_UNARMED` | a REWRITTEN route while the guardrail callback is not registered; never forwarded |
 | `route_gate_error` | 500 | `E_ROUTE_GATE_ERROR` | classification raised; never forwarded |
+| `route_gate_body_policies` | 403 | `E_ROUTE_BLOCKED` | an admitted REWRITTEN request whose JSON body has a top-level `policies` key (litellm would apply those policies to it); checked once the limiter has read the body, before any slot is taken or litellm parses it |
 
 The last two also record `gateway_failure{component="route_gate"}`. Every one
 records `corp_llm_gateway_blocked_requests_total{block_reason=…}` and emits an
@@ -981,6 +1001,10 @@ each probe-confirmed:
 
 A network rule (loopback, tunnel, nginx allow-list) would leave all three one
 misconfiguration away. A REFUSE row holds inside the image, on every path in.
+Hazard 14 also has two non-HTTP entry points, both closed: a request body naming
+policies (`route_gate_body_policies`, above) and a policy row in litellm's
+database (the shipped litellm configs pin `general_settings.supported_db_objects`
+to `["models"]`).
 
 **Health rows, one by one.** Shipped probes use only the gateway's own
 `/healthz/live` and `/healthz/ready`.

@@ -712,7 +712,7 @@ async def test_a_restoration_failure_counts_on_the_shared_exporter_by_default(
     mappings.register(ticket, StrategyResult(pairs=(("a@b.c", "[EMAIL_1]"),)))
     token = _TICKET.set(ticket)
     try:
-        await DesanitizeMiddleware(app, mappings, enabled=True, restore_json=broken)(
+        await DesanitizeMiddleware(app, mappings, restore_json=broken)(
             {"type": "http"}, receive, send
         )
     finally:

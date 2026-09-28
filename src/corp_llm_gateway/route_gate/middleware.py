@@ -10,8 +10,11 @@ each message and forwards it unbuffered.
 Fail-closed: a REFUSE, an unarmed REWRITTEN route and any classifier exception
 all end here, never at litellm. A route refusal never reads the body; the
 limiter's oversize and body-timeout refusals have read (part of) it, and a
-capacity refusal may have. No request byte is ever echoed or logged (M1-14); the
-refusal names only the route the caller itself sent.
+capacity refusal may have. An admitted REWRITTEN body that names litellm policies
+(a top-level ``policies`` key, which litellm would apply to the request) is refused
+once the limiter has read it, before any slot is taken or litellm parses it. No
+request byte is ever echoed or logged (M1-14); the refusal names only the route
+the caller itself sent.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from corp_llm_gateway.audit.event import AuditEvent
 from corp_llm_gateway.audit.logger import AuditLogger
 from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.route_gate.classify import (
+    ROUTE_GATE_BODY_POLICIES,
     ROUTE_GATE_ERROR,
     ROUTE_GATE_LISTED,
     ROUTE_GATE_MALFORMED,
@@ -64,6 +68,7 @@ _BLOCKED = "E_ROUTE_BLOCKED"
 CALL_ID_HEADER = b"x-litellm-call-id"
 
 _STATUS: dict[str, int] = {
+    ROUTE_GATE_BODY_POLICIES: 403,
     ROUTE_GATE_UNLISTED: 404,
     ROUTE_GATE_LISTED: 403,
     ROUTE_GATE_WEBSOCKET: 403,
@@ -76,6 +81,7 @@ _STATUS: dict[str, int] = {
 }
 
 _ERROR_CODE: dict[str, str] = {
+    ROUTE_GATE_BODY_POLICIES: _BLOCKED,
     ROUTE_GATE_UNLISTED: _BLOCKED,
     ROUTE_GATE_LISTED: _BLOCKED,
     ROUTE_GATE_WEBSOCKET: _BLOCKED,
@@ -88,6 +94,7 @@ _ERROR_CODE: dict[str, str] = {
 }
 
 _ERROR_TYPE: dict[str, str] = {
+    ROUTE_GATE_BODY_POLICIES: "route_blocked",
     ROUTE_GATE_UNLISTED: "route_blocked",
     ROUTE_GATE_LISTED: "route_blocked",
     ROUTE_GATE_WEBSOCKET: "route_blocked",
@@ -109,7 +116,9 @@ _FAILURE_COMPONENT: dict[str, str] = {
 _CAPACITY_WHY = "the gateway's in-flight cap is reached; retry later"
 _OVERSIZE_WHY = "the request body is over the gateway's body cap"
 _BODY_TIMEOUT_WHY = "the request body did not arrive within the gateway's body-read deadline"
+_BODY_POLICIES_WHY = "the request body names litellm policies; the gateway applies its own"
 _WHY: dict[str, str] = {
+    ROUTE_GATE_BODY_POLICIES: _BODY_POLICIES_WHY,
     ROUTE_GATE_CAPACITY: _CAPACITY_WHY,
     ROUTE_GATE_BODY_TIMEOUT: _BODY_TIMEOUT_WHY,
     OVERSIZE_BLOCKED: _OVERSIZE_WHY,
@@ -204,7 +213,7 @@ class RouteGateMiddleware:
         async def refuse(reason: str) -> None:
             await self._refuse(scope, receive, send, method, path, reason, _WHY[reason])
 
-        await limiter.run(scope, receive, send, self.app, refuse=refuse)
+        await limiter.run(scope, receive, send, self.app, refuse=refuse, check=_body_problem)
 
     async def _refuse(
         self,
@@ -295,6 +304,22 @@ class RouteGateMiddleware:
             # The refusal stands either way; a lost audit record is a gate failure.
             self._metrics.record_failure(COMPONENT)
             logger.error("route_gate_audit_failed block_reason=%s", reason)
+
+
+def _body_problem(chunks: list[bytes]) -> str | None:
+    """``ROUTE_GATE_BODY_POLICIES`` for a JSON object body with a top-level ``policies``
+    key, however its key is escaped; anything else is litellm's to parse."""
+    body = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+    # A key can only spell a letter with a ``\\u`` escape; neither form, no such key.
+    if b"policies" not in body and b"\\u" not in body:
+        return None
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    if isinstance(parsed, dict) and "policies" in parsed:
+        return ROUTE_GATE_BODY_POLICIES
+    return None
 
 
 def _payload(method: str, path: str, reason: str) -> dict[str, Any]:

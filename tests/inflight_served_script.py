@@ -61,6 +61,7 @@ import uvicorn  # noqa: E402
 import corp_llm_gateway.asgi as asgi  # noqa: E402
 from corp_llm_gateway.audit import AuditLogger, ListSink  # noqa: E402
 from corp_llm_gateway.route_gate import inflight  # noqa: E402
+from corp_llm_gateway.route_gate.terminal_audit import emit_to  # noqa: E402
 
 _CHUNK = {
     "id": "c1",
@@ -231,6 +232,8 @@ async def main() -> None:
     guardrail = next(cb for cb in litellm.callbacks if type(cb).__name__ == "CorpLlmGuardrail")
     sink = StallOnceSink()
     guardrail._audit = AuditLogger(sink, gateway_version="served")
+    # A request the pre-call handed to its ticket is recorded by the terminal record.
+    asgi.terminal._emit = emit_to(AuditLogger(sink, gateway_version="served"))
     limiter = asgi.limiter
 
     # Which of litellm's own disconnect watchers saw the disconnect through the
@@ -300,6 +303,7 @@ async def main() -> None:
             await asyncio.wait_for(stub.closed.wait(), BOUND_S)
             upstream_closed_s = stub.closed_at - started if stub.closed_at else None
         await asyncio.sleep(0.5)  # late litellm callbacks, if any, land now
+        await asgi.terminal.drain()
         records = sink.records[base_records:]
         pending = inflight.pending_request_tasks()
         inflight_after = limiter.inflight
@@ -409,6 +413,7 @@ async def _shared_lookup(port: int, stub: Stub, guardrail: Any, sink: Any, limit
         del store.lookup
     await _until(lambda: limiter.inflight <= 0)
     await asyncio.sleep(0.5)
+    await asgi.terminal.drain()
     records = sink.records[base_records:]
     return {
         "lookups_in_flight": lookups_in_flight,
@@ -453,6 +458,7 @@ async def _shared_call_id(port: int, stub: Stub, guardrail: Any, sink: Any, limi
     stub.reset("ok")
     await _until(lambda: limiter.inflight <= 0)
     await asyncio.sleep(0.5)
+    await asgi.terminal.drain()
     records = sink.records[base_records:]
     head = b_rest.split(b"\r\n\r\n", 1)[0].decode("latin-1").lower()
     return {

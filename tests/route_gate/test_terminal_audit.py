@@ -111,6 +111,29 @@ async def test_a_restoration_failure_is_failed_with_the_internal_code() -> None:
     assert sink.outcomes == [("failed", "E_INTERNAL")]
 
 
+async def test_an_answer_published_after_the_client_left_is_cancelled() -> None:
+    """litellm's own disconnect watcher can end the request with an error response the
+    gone client never reads: that is the client's cancel, not a failure."""
+    sink = _Sink()
+    ticket = _ticket(_facts())
+    ticket.mark_cancelled(CANCEL_CLIENT)
+
+    await TerminalAudit(sink).publish(ticket, "failed")
+
+    assert sink.outcomes == [("cancelled", E_CLIENT_DISCONNECTED)]
+
+
+async def test_an_error_answer_published_after_a_server_cancel_stays_failed() -> None:
+    """The client is still there to read it."""
+    sink = _Sink()
+    ticket = _ticket(_facts())
+    ticket.mark_cancelled(CANCEL_SERVER)
+
+    await TerminalAudit(sink).publish(ticket, "failed")
+
+    assert sink.outcomes == [("failed", None)]
+
+
 async def test_ok_on_a_cancelled_ticket_is_cancelled() -> None:
     sink = _Sink()
     ticket = _ticket(_facts())
@@ -178,6 +201,7 @@ async def test_a_publish_between_the_close_and_its_write_keeps_the_closes_outcom
     await terminal.drain()
 
     assert sink.outcomes == [("cancelled", E_CLIENT_DISCONNECTED)]
+    assert ticket.audit_facts.attempts == 1
 
 
 async def test_the_close_decides_even_when_its_write_never_runs() -> None:
@@ -225,18 +249,25 @@ async def test_a_close_write_that_escapes_is_logged_by_type_and_counted(
     assert CANARY not in caplog.text
 
 
-async def test_the_close_write_has_no_retry_of_its_own() -> None:
-    sink = _Sink(RuntimeError("sink down"), RuntimeError("sink down"))
-    terminal = TerminalAudit(sink)
+async def test_the_close_write_has_no_retry_of_its_own(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    metrics = _Failures()
+    sink = _Sink(RuntimeError(CANARY), RuntimeError(CANARY))
+    terminal = TerminalAudit(sink, metrics=metrics)
     ticket = _ticket(_facts())
     terminal.bind(ticket)
 
-    ticket.close()
-    await terminal.drain()
-    await asyncio.sleep(0)
+    with caplog.at_level(logging.DEBUG):
+        ticket.close()
+        await terminal.drain()
+        await asyncio.sleep(0)
 
     assert len(sink.failures) == 1 and sink.records == []
     assert not ticket.audit_facts.published
+    assert metrics.failures == ["desanitize"]
+    assert caplog.text.count("gateway_terminal_audit_lost") == 1
+    assert "error=RuntimeError" in caplog.text and CANARY not in caplog.text
 
 
 async def test_a_failed_write_is_retried_once_at_close_with_the_same_outcome(
@@ -330,15 +361,14 @@ class _Gated:
         return [(r.outcome, r.error_code) for r in self.records]
 
 
-@pytest.mark.parametrize(
-    ("first_fails", "expected"),
-    [(True, [("cancelled", E_CLIENT_DISCONNECTED)]), (False, [("ok", None)])],
-)
+@pytest.mark.parametrize("first_fails", [True, False])
 async def test_a_close_during_an_in_flight_write_writes_only_if_that_write_fails(
-    first_fails: bool, expected: list[tuple[str, str | None]]
+    first_fails: bool,
 ) -> None:
-    """The close is not lost behind a write in flight: a failed write falls through to the
-    close's own record, a landed one leaves the close nothing to write."""
+    """The client leaves while the ``ok`` write is in flight: a failed write is retried once
+    with its own outcome (the client got the response), a landed one leaves nothing to
+    write. The sink never decides the outcome."""
+    expected = [("ok", None)]
     sink = _Gated(first_fails=first_fails)
     terminal = TerminalAudit(sink)
     ticket = _ticket(_facts())
@@ -358,8 +388,9 @@ async def test_a_close_during_an_in_flight_write_writes_only_if_that_write_fails
 
 
 async def test_the_close_behind_an_in_flight_write_is_the_last_attempt() -> None:
+    metrics = _Failures()
     sink = _Gated(first_fails=True, later_fail=True)
-    terminal = TerminalAudit(sink)
+    terminal = TerminalAudit(sink, metrics=metrics)
     ticket = _ticket(_facts())
     terminal.bind(ticket)
     publishing = asyncio.create_task(terminal.publish(ticket, "ok"))
@@ -373,6 +404,7 @@ async def test_the_close_behind_an_in_flight_write_is_the_last_attempt() -> None
 
     assert sink.calls == 2 and sink.records == []
     assert not ticket.audit_facts.published
+    assert metrics.failures == ["desanitize"]
 
 
 async def test_a_server_cancel_leaves_an_ok_published_before_the_close_ok() -> None:
@@ -480,28 +512,53 @@ async def _pre_call_in(ticket: RequestTicket, data: dict[str, object], guardrail
         _TICKET.reset(token)
 
 
-async def test_the_pre_call_deposits_the_counts_todays_audit_record_carries() -> None:
-    from datetime import UTC, datetime
+async def test_the_terminal_record_carries_every_field_todays_record_carried() -> None:
+    """The golden record: the same request, once outside the route gate (no ticket, so
+    the guardrail's ``audit()`` still writes the record, as every request did before the
+    desanitiser was wired) and once through a ticket (pre-call deposit, the log event's
+    token counts, the terminal record). Same keys, same values, but the call id, the
+    timestamp and the latency, which are present in both."""
+    from datetime import UTC, datetime, timedelta
 
     from tests.test_litellm_hook import _build_guardrail, _data_with_token
 
-    guardrail, sink = _build_guardrail([("alice@corp.example", "[EMAIL_1]"), ("Bob", "[NAME_1]")])
+    pairs = [("alice@corp.example", "[EMAIL_1]"), ("Bob", "[NAME_1]")]
+    # Two guardrails built alike: one Cache A would make the second request a hit.
+    golden_guardrail, golden_sink = _build_guardrail(pairs)
+    guardrail, sink = _build_guardrail(pairs)
+    usage = {"usage": {"prompt_tokens": 7, "completion_tokens": 2}}
+    end = datetime.now(UTC)
+    begin = end - timedelta(milliseconds=40)
+
+    golden = _data_with_token("tok-1", content="mail alice@corp.example for Bob")
+    golden["litellm_call_id"] = "call-golden"
+    await golden_guardrail.pre_call(golden)
+    await golden_guardrail.async_log_success_event(
+        {"litellm_call_id": "call-golden"}, usage, begin, end
+    )
+    (today,) = golden_sink.records
+
+    terminal_sink = ListSink()
+    terminal = TerminalAudit(emit_to(AuditLogger(terminal_sink, gateway_version="0.0.1")))
     ticket = RequestTicket("c" * 32)
     data = _data_with_token("tok-1", content="mail alice@corp.example for Bob")
     data["litellm_call_id"] = "call-9"
-
     await _pre_call_in(ticket, data, guardrail)
-    now = datetime.now(UTC)
-    await guardrail.audit(data, None, now, now, status="ok")
+    await guardrail.async_log_success_event({"litellm_call_id": "call-9"}, usage, begin, end)
+    assert sink.records == [], "the guardrail wrote a record for a ticketed request"
+    await terminal.publish(ticket, "ok")
 
+    (record,) = terminal_sink.records
+    varying = {"request_id", "timestamp", "latency_ms"}
+    assert set(record) == set(today)
+    assert {k: v for k, v in record.items() if k not in varying} == {
+        k: v for k, v in today.items() if k not in varying
+    }
+    assert record["request_id"] == "call-9"
+    assert isinstance(record["latency_ms"], int) and record["latency_ms"] >= 0
+    assert (record["prompt_token_count"], record["completion_token_count"]) == (7, 2)
+    assert record["redaction_count"] == 2 and record["status"] == "ok"
     facts = ticket.audit_facts
-    (record,) = sink.records
-    assert isinstance(facts, AuditFacts)
-    assert facts.request_id == record["request_id"] == "call-9"
-    assert (facts.user_id, facts.team_id) == (record["user_id"], record["team_id"])
-    assert facts.redaction_count == record["redaction_count"] == 2
-    assert facts.finding_label_counts == record["finding_label_counts"]
-    assert facts.status == "ok" and facts.error_code is None
     assert "alice@corp.example" not in repr(facts) and "Bob" not in repr(facts)
 
 
@@ -649,16 +706,14 @@ async def test_a_server_cancel_after_the_watcher_returned_is_the_servers_cancel(
     assert seen_by_downstream == [CANCEL_SERVER]
 
 
-@pytest.mark.parametrize(
-    ("first_fails", "expected"),
-    [(True, [("cancelled", E_CLIENT_DISCONNECTED)]), (False, [("ok", None)])],
-)
+@pytest.mark.parametrize("first_fails", [True, False])
 async def test_a_write_still_in_flight_when_the_limiter_lets_go_is_not_lost(
-    first_fails: bool, expected: list[tuple[str, str | None]]
+    first_fails: bool,
 ) -> None:
-    """The client leaves while the response path's write awaits the sink and ignores the
-    cancel; the limiter closes the ticket after the grace. A write that then fails falls
-    through to the close's record, written by a task the request does not own."""
+    """The client leaves while the response path's ``ok`` write awaits the sink and ignores
+    the cancel; the limiter closes the ticket after the grace. A write that then fails is
+    retried once with its own outcome, by a task the request does not own."""
+    expected = [("ok", None)]
     restore = install_task_factory(asyncio.get_running_loop())
     tickets: list[RequestTicket] = []
     downstreams: list[asyncio.Task[Any]] = []
@@ -712,3 +767,236 @@ async def test_a_write_still_in_flight_when_the_limiter_lets_go_is_not_lost(
 
     assert sink.outcomes == expected
     assert sink.owned == [True, False] if first_fails else [True]
+
+
+# ── the outcome policy, interleaving by interleaving ─────────────────────────
+# The request decides the outcome, never the sink: a restoration failure stands, an
+# outcome the response path published stands against a later cancel, otherwise the
+# close decides; a publish after the close is refused; one retry, then the record is
+# counted lost. Each case runs under the production task factory.
+
+
+@pytest.fixture
+async def task_factory() -> Any:
+    restore = install_task_factory(asyncio.get_running_loop())
+    try:
+        yield
+    finally:
+        restore()
+
+
+class _Scripted:
+    """Each write parks on its own gate (when given), then fails or lands as scripted.
+    ``shared`` says, per write, whether a task no request owns ran it."""
+
+    def __init__(self, *outcomes: str, gated: tuple[int, ...] = ()) -> None:
+        self.outcomes_script = list(outcomes)
+        self.gates = {n: asyncio.Event() for n in gated}
+        self.entered = {n: asyncio.Event() for n in gated}
+        self.records: list[TerminalRecord] = []
+        self.shared: list[bool] = []
+        self.calls = 0
+
+    async def __call__(self, record: TerminalRecord) -> None:
+        from corp_llm_gateway.route_gate.inflight import _SHARED
+
+        self.calls += 1
+        n = self.calls
+        self.shared.append(asyncio.current_task() in _SHARED)
+        if n in self.gates:
+            self.entered[n].set()
+            await self.gates[n].wait()
+        await asyncio.sleep(0)
+        step = self.outcomes_script[n - 1] if n <= len(self.outcomes_script) else "land"
+        if step == "fail":
+            raise RuntimeError(CANARY)
+        if step == "cancel":
+            raise asyncio.CancelledError
+        self.records.append(record)
+
+    @property
+    def outcomes(self) -> list[tuple[str, str | None]]:
+        return [(r.outcome, r.error_code) for r in self.records]
+
+
+def _bound(sink: Any, metrics: _Failures | None = None) -> tuple[TerminalAudit, RequestTicket]:
+    terminal = TerminalAudit(sink, metrics=metrics or _Failures())
+    ticket = _ticket(_facts())
+    terminal.bind(ticket)
+    return terminal, ticket
+
+
+@pytest.mark.usefixtures("task_factory")
+@pytest.mark.parametrize("first", ["fail", "land"])
+async def test_a_publish_after_the_close_is_refused_and_the_close_writes(first: str) -> None:
+    """Probe case 1 / pre-emption: the close schedules its write, a publish gets the loop
+    first. The publish writes nothing, so whatever the sink does to a request-task write
+    cannot touch the record: the close's write, from a shared task, is the only one."""
+    sink = _Scripted(first)
+    terminal, ticket = _bound(sink)
+    ticket.mark_cancelled(CANCEL_CLIENT)
+
+    ticket.close()
+    await terminal.publish(ticket, "ok")
+    await terminal.drain()
+
+    assert sink.shared == [True]
+    if first == "land":
+        assert sink.outcomes == [("cancelled", E_CLIENT_DISCONNECTED)]
+    else:
+        assert sink.records == [] and not ticket.audit_facts.published
+
+
+@pytest.mark.usefixtures("task_factory")
+@pytest.mark.parametrize("retry", ["land", "fail"])
+async def test_the_retry_behind_a_failed_in_flight_write_keeps_its_outcome(
+    retry: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Probe cases 2 and 3: the ``ok`` write in flight fails after the close, so the retry
+    starts from a shared task; a publish that gets the loop first is refused. The retry
+    writes ``ok``; if it fails too, the record is lost: one line and one count."""
+    metrics = _Failures()
+    sink = _Scripted("fail", retry, gated=(1,))
+    terminal, ticket = _bound(sink, metrics)
+    publishing = asyncio.create_task(terminal.publish(ticket, "ok"))
+    await asyncio.wait_for(sink.entered[1].wait(), 2)
+
+    ticket.mark_cancelled(CANCEL_CLIENT)
+    ticket.close()
+    sink.gates[1].set()
+    with caplog.at_level(logging.DEBUG):
+        await publishing
+        await terminal.publish(ticket, "ok")
+        await terminal.drain()
+
+    assert sink.calls == 2 and sink.shared == [False, True]
+    if retry == "land":
+        assert sink.outcomes == [("ok", None)] and metrics.failures == []
+    else:
+        assert sink.records == [] and metrics.failures == ["desanitize"]
+        assert caplog.text.count("gateway_terminal_audit_lost") == 1
+    assert CANARY not in caplog.text
+
+
+@pytest.mark.usefixtures("task_factory")
+async def test_a_second_close_and_a_late_publish_add_nothing() -> None:
+    """Probe case 4."""
+    sink = _Scripted("fail", gated=(1,))
+    terminal, ticket = _bound(sink)
+    publishing = asyncio.create_task(terminal.publish(ticket, "ok"))
+    await asyncio.wait_for(sink.entered[1].wait(), 2)
+
+    ticket.mark_cancelled(CANCEL_CLIENT)
+    ticket.close()
+    ticket.close()
+    sink.gates[1].set()
+    await publishing
+    await terminal.drain()
+    await terminal.publish(ticket, "failed", error_code=E_INTERNAL)
+    await terminal.drain()
+
+    assert sink.outcomes == [("ok", None)] and sink.calls == 2
+
+
+@pytest.mark.usefixtures("task_factory")
+@pytest.mark.parametrize("who", [CANCEL_SERVER, CANCEL_CLIENT])
+async def test_an_ok_whose_write_fails_after_a_later_cancel_stays_ok(who: str) -> None:
+    """Probe case 5 (server) and its client twin: ``ok`` was published at the final body,
+    the cancel came later, the write failed. The retry writes ``ok``."""
+    sink = _Scripted("fail", gated=(1,))
+    terminal, ticket = _bound(sink)
+    publishing = asyncio.create_task(terminal.publish(ticket, "ok"))
+    await asyncio.wait_for(sink.entered[1].wait(), 2)
+
+    ticket.mark_cancelled(who)
+    ticket.close()
+    sink.gates[1].set()
+    await publishing
+    await terminal.drain()
+
+    assert sink.outcomes == [("ok", None)]
+
+
+@pytest.mark.usefixtures("task_factory")
+@pytest.mark.parametrize("who", [CANCEL_SERVER, CANCEL_CLIENT])
+async def test_a_restoration_failure_whose_write_fails_stays_a_restoration_failure(
+    who: str,
+) -> None:
+    """Probe case 6: ``failed`` + ``E_INTERNAL`` wins whatever happens afterwards."""
+    sink = _Scripted("fail", gated=(1,))
+    terminal, ticket = _bound(sink)
+    publishing = asyncio.create_task(terminal.publish(ticket, "failed", error_code=E_INTERNAL))
+    await asyncio.wait_for(sink.entered[1].wait(), 2)
+
+    ticket.mark_cancelled(who)
+    ticket.close()
+    sink.gates[1].set()
+    await publishing
+    await terminal.drain()
+
+    assert sink.outcomes == [("failed", E_INTERNAL)]
+
+
+@pytest.mark.usefixtures("task_factory")
+async def test_a_cancelled_write_is_retried_by_the_close_with_its_outcome() -> None:
+    """Probe case 7: the request task writing ``ok`` is cancelled mid-write (a server
+    cancel), then the limiter closes the ticket: the close retries ``ok``."""
+    sink = _Scripted("cancel")
+    terminal, ticket = _bound(sink)
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await terminal.publish(ticket, "ok")
+    ticket.mark_cancelled(CANCEL_SERVER)
+    ticket.close()
+    await terminal.drain()
+
+    assert sink.outcomes == [("ok", None)] and sink.shared == [False, True]
+
+
+@pytest.mark.usefixtures("task_factory")
+async def test_drain_waits_for_a_write_in_flight_and_the_retry_it_leaves() -> None:
+    """Probe case 9: ``drain`` does not return while a publish is still writing."""
+    sink = _Scripted("fail", gated=(1,))
+    terminal, ticket = _bound(sink)
+    publishing = asyncio.create_task(terminal.publish(ticket, "ok"))
+    await asyncio.wait_for(sink.entered[1].wait(), 2)
+    ticket.close()
+
+    draining = asyncio.create_task(terminal.drain())
+    await asyncio.sleep(0.02)
+    assert not draining.done() and terminal.pending == 1
+
+    sink.gates[1].set()
+    await asyncio.wait_for(draining, 2)
+    await publishing
+
+    assert sink.outcomes == [("ok", None)] and terminal.pending == 0
+
+
+@pytest.mark.usefixtures("task_factory")
+@pytest.mark.parametrize("then", ["close", "publish_ok", "client_cancel"])
+async def test_a_restoration_failure_decided_before_its_answer_stands(then: str) -> None:
+    """The middleware decides ``failed`` + ``E_INTERNAL`` the moment restoration fails,
+    before it sends anything: if that send fails, whatever publishes or closes next
+    writes the decided outcome."""
+    sink = _Scripted()
+    terminal, ticket = _bound(sink)
+
+    terminal.decide(ticket, "failed", error_code=E_INTERNAL)
+    if then == "publish_ok":
+        await terminal.publish(ticket, "ok")
+    elif then == "client_cancel":
+        ticket.mark_cancelled(CANCEL_CLIENT)
+    ticket.close()
+    await terminal.drain()
+
+    assert sink.outcomes == [("failed", E_INTERNAL)]
+
+
+async def test_decide_never_overrides_an_outcome_already_decided() -> None:
+    terminal, ticket = _bound(_Scripted())
+
+    terminal.decide(ticket, "ok")
+    terminal.decide(ticket, "failed", error_code=E_INTERNAL)
+
+    assert ticket.audit_facts.decided == ("ok", None)

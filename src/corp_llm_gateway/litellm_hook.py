@@ -1,4 +1,4 @@
-"""LiteLLM hook adapter (M1-7 pre_call + M1-8 post_call wiring).
+"""LiteLLM hook adapter (M1-7 pre_call wiring; the M1-8 reversal is the ASGI desanitiser).
 
 This is the integration boundary between LiteLLM's proxy and the
 corp-llm-gateway sanitization pipeline. The pure logic lives in
@@ -8,9 +8,14 @@ into LiteLLM's expected callback shape.
 
 LiteLLM's proxy invokes:
   - async_pre_call_hook(user_api_key_dict, cache, data, call_type)
-  - async_post_call_success_hook(user_api_key_dict, cache, data, response)
-  - async_post_call_streaming_iterator_hook(user_api_key_dict, response, request_data)
-  - async_log_success_event(kwargs, response_obj, start_time, end_time)
+  - async_log_success_event / async_log_failure_event(kwargs, response_obj, start_time, end_time)
+
+No response-side hook: the response is restored outside litellm, by the ASGI
+``DesanitizeMiddleware`` (``route_gate/desanitize_middleware.py``), so nothing inside
+litellm ever sees an original. For a request the route gate admitted, the pre-call hands
+the response mapping and the content-free audit facts to the request's ticket; the
+ticket's terminal record (``route_gate/terminal_audit.py``) is that request's audit
+record, and the log events only add token counts to it.
 
 We register the class via LiteLLM proxy config:
   litellm_settings:
@@ -27,11 +32,12 @@ import json
 import logging
 import time
 import uuid
+import weakref
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from corp_llm_gateway.audit import AuditEvent, AuditLogger, AuditWriteAmbiguousError
 from corp_llm_gateway.audit.event import Provider
@@ -49,16 +55,12 @@ from corp_llm_gateway.payload.size_threshold import OversizeContentError, should
 from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.route_gate.inflight import RequestTicket, bind_call_id, current_ticket
-from corp_llm_gateway.route_gate.terminal_audit import AuditFacts
+from corp_llm_gateway.route_gate.terminal_audit import AuditFacts, deposit_usage
 from corp_llm_gateway.route_gate.terminal_audit import deposit as deposit_audit_facts
 from corp_llm_gateway.sanitizer import (
-    OpenAiToolCallDesanitizer,
-    ResponsesStreamDesanitizer,
     SanitizationOrchestrator,
     SanitizeResult,
-    SseStreamDesanitizer,
     StrategyResult,
-    StreamingDesanitizer,
 )
 from corp_llm_gateway.sanitizer.content_blocks import (
     ContentTooDeepError,
@@ -103,7 +105,6 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     TeamConfigUnavailableError,
     passthrough_resolved,
 )
-from corp_llm_gateway.sanitizer.streaming import _json_string_escape, coerce_tool_index
 from corp_llm_gateway.tokens import (
     AuthError,
     AuthMiddleware,
@@ -111,9 +112,12 @@ from corp_llm_gateway.tokens import (
 )
 from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
 
+if TYPE_CHECKING:
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+
 # litellm v1.85's proxy dispatcher filters callbacks via
 # `isinstance(cb, CustomLogger)` before invoking any hook method.
-# Without the inheritance, our pre_call/post_call hooks are silently
+# Without the inheritance, our pre_call and log hooks are silently
 # skipped for /v1/messages requests. Import optionally so unit tests
 # that don't have litellm installed still work — production always
 # has it.
@@ -273,7 +277,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # PrometheusExporter (config-selected in the composition root) exposes the
         # block/failure/latency series the shipped alerts + runbook reference.
         self._metrics = metrics if metrics is not None else NoopExporter()
-        # Per-request state. Keyed by request_id; cleared in post_call.
+        # Per-request state. Keyed by request_id; handed to the request's ticket at the
+        # end of a ticketed pre-call, else cleared when the record is written.
         self._req_state: dict[str, _RequestState] = {}
         # Idempotency guard for audit(): litellm does NOT fire
         # async_log_failure_event for a pre_call GuardrailHttpException (confirmed
@@ -298,6 +303,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         self._cancel_emitting: dict[str, asyncio.Event] = {}
         # Ids whose audit() record is being written; set once the write resolves.
         self._audit_emitting: dict[str, asyncio.Event] = {}
+        # Where a ticketed pre-call registers its response mapping (the ASGI
+        # desanitiser's store); bound by the entrypoint's lifespan.
+        self._response_mappings: ResponseMappings | None = None
+        # Ids whose audit record is their ticket's terminal record: the log events
+        # add token counts to it and never write one of their own.
+        self._terminal_owned: OrderedDict[str, weakref.ref[RequestTicket]] = OrderedDict()
+
+    def bind_response_mappings(self, mappings: ResponseMappings) -> None:
+        """The store the ASGI desanitiser restores responses from."""
+        self._response_mappings = mappings
 
     @property
     def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
@@ -319,28 +334,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         call_type: str,
     ) -> dict[str, Any]:
         return await self.pre_call(data, call_type=call_type)
-
-    async def async_post_call_streaming_iterator_hook(
-        self,
-        user_api_key_dict: Any,
-        response: AsyncIterator[Any],
-        request_data: dict[str, Any],
-    ) -> AsyncGenerator[Any, None]:
-        async for chunk in self.post_call_stream(request_data, response):
-            yield chunk
-
-    async def async_post_call_success_hook(
-        self,
-        data: dict[str, Any],
-        user_api_key_dict: Any,
-        response: Any,
-    ) -> Any:
-        # NOTE: litellm v1.85 dropped `cache` from this hook's signature
-        # and reordered to (data, user_api_key_dict, response). Earlier
-        # litellm versions had (user_api_key_dict, cache, data, response).
-        # If you upgrade or downgrade litellm and see "missing positional
-        # argument" errors here, that's the signature drift to check.
-        return await self.post_call_unary(data, response)
 
     async def async_log_success_event(
         self,
@@ -1210,10 +1203,26 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.redaction_count,
             len(state.placeholders),
         )
-        # Content-free facts for the terminal-audit contract; today's audit() path is
-        # unchanged and does not read them.
-        deposit_audit_facts(current_ticket(), _audit_facts(state, started=pre_call_started))
+        ticket = current_ticket()
+        if ticket is not None and deposit_audit_facts(
+            ticket, _audit_facts(state, started=pre_call_started)
+        ):
+            self._hand_over(request_id, state, ticket)
         return data
+
+    def _hand_over(self, request_id: str, state: _RequestState, ticket: RequestTicket) -> None:
+        """The request's ticket owns it from here: the response mapping goes to the ASGI
+        desanitiser's store and the audit record is the ticket's terminal record. The
+        guardrail keeps neither the content nor the record."""
+        if self._response_mappings is not None and state.mapping.pairs:
+            self._response_mappings.register(
+                ticket, _response_mapping(state, include_bare_aliases=self._forward_chatgpt_auth)
+            )
+        self._terminal_owned[request_id] = weakref.ref(ticket)
+        self._terminal_owned.move_to_end(request_id)
+        while len(self._terminal_owned) > _AUDIT_DEDUP_CAP:
+            self._terminal_owned.popitem(last=False)
+        self._req_state.pop(request_id, None)
 
     async def _sanitize_prompt_field(
         self,
@@ -1403,199 +1412,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.redaction_count,
         )
 
-    async def post_call_stream(
-        self,
-        request_data: dict[str, Any],
-        response: AsyncIterator[Any],
-    ) -> AsyncIterator[Any]:
-        """Wrap an async iterator of SSE chunks with de-sanitization.
-
-        No safety net here on purpose: `_post_call_stream_impl` guards only
-        its OWN desanitization work, not the upstream provider's stream — an
-        `httpx.RemoteProtocolError` mid-stream is not our bug and must reach
-        litellm's own failure handling untouched, not get relabelled
-        `E_INTERNAL`.
-        """
-        request_id = self._ensure_request_id(request_data)
-        async for chunk in self._post_call_stream_impl(request_id, request_data, response):
-            yield chunk
-
-    async def _post_call_stream_impl(
-        self,
-        request_id: str,
-        request_data: dict[str, Any],
-        response: AsyncIterator[Any],
-    ) -> AsyncIterator[Any]:
-        state = self._req_state.get(request_id)
-        if state is None or not state.mapping.pairs:
-            logger.info(
-                "litellm_post_call_stream_passthrough request_id=%s reason=%s",
-                request_id,
-                "no_state" if state is None else "no_mapping",
-            )
-            async for chunk in response:
-                yield chunk
-            return
-
-        response_mapping = _response_mapping(state, include_bare_aliases=self._forward_chatgpt_auth)
-        logger.info(
-            "litellm_post_call_stream_desanitize_start request_id=%s pairs=%d aliases=%d",
-            request_id,
-            len(state.mapping.pairs),
-            len(response_mapping.pairs) - len(state.mapping.pairs),
-        )
-        # SSE bytes/str path: Anthropic passthrough emits raw SSE events.
-        sse = SseStreamDesanitizer(response_mapping)
-        # Dict path: OpenAI-dict chunks use the classic feed/flush interface.
-        dict_desanitizer = StreamingDesanitizer(response_mapping)
-        # Dict path: OpenAI tool_calls[].function.arguments deltas (F4), per index.
-        dict_tool_calls = OpenAiToolCallDesanitizer(response_mapping)
-        # Dict path: legacy OpenAI function_call.arguments deltas (singular).
-        dict_function_call = StreamingDesanitizer(response_mapping, escape=_json_string_escape)
-        # Responses API path: typed Pydantic ``response.*`` events.
-        responses_desanitizer = ResponsesStreamDesanitizer(response_mapping)
-        chunk_count = 0
-        # Manual `__anext__` loop (instead of `async for`) so fetching the next
-        # chunk from the UPSTREAM iterator is NOT inside the try/except below —
-        # only our own per-chunk desanitization work is guarded (F8: never wrap
-        # the provider's own transport).
-        stream_iter = response.__aiter__()
-        while True:
-            try:
-                chunk = await stream_iter.__anext__()
-            except StopAsyncIteration:
-                break
-            except Exception:
-                # Upstream/transport failure (e.g. httpx.RemoteProtocolError)
-                # fetching the next chunk. Flush any already-buffered
-                # desanitized tail (best effort — already-yielded chunks may
-                # have held content back) then let litellm see the ORIGINAL
-                # exception untouched; it is not ours to reclassify.
-                try:
-                    for tail_chunk in _flush_stream_tails(
-                        sse,
-                        dict_desanitizer,
-                        dict_tool_calls,
-                        dict_function_call,
-                        responses_desanitizer,
-                    ):
-                        yield tail_chunk
-                except Exception:
-                    logger.warning(
-                        "litellm_post_call_stream_flush_after_upstream_error_failed request_id=%s",
-                        request_id,
-                    )
-                raise
-            chunk_count += 1
-            try:
-                if isinstance(chunk, (bytes, str)):
-                    for out_chunk in sse.feed(chunk):
-                        yield out_chunk
-                elif _is_responses_event(chunk):
-                    for out_chunk in responses_desanitizer.feed(chunk):
-                        yield out_chunk
-                elif isinstance(chunk, dict):
-                    chunk, had_tc = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
-                    chunk, had_fc = _desanitize_chunk_function_call(chunk, dict_function_call)
-                    text = _extract_chunk_text(chunk)
-                    if text is None:
-                        yield chunk
-                    else:
-                        out = dict_desanitizer.feed(text)
-                        # Held-back/empty content must not drop a tool_call/function_call
-                        # riding in the same delta (its id/name/args would be lost).
-                        if out or had_tc or had_fc:
-                            yield _replace_chunk_text(chunk, out)
-                else:
-                    yield chunk
-            except GuardrailHttpException:
-                raise
-            except Exception as exc:
-                # Our own desanitization work failed — this runs AFTER
-                # placeholders have been replaced by originals, the one path
-                # most likely to carry real user content in the exception
-                # message (F8).
-                try:
-                    for tail_chunk in _flush_stream_tails(
-                        sse,
-                        dict_desanitizer,
-                        dict_tool_calls,
-                        dict_function_call,
-                        responses_desanitizer,
-                    ):
-                        yield tail_chunk
-                except Exception:
-                    logger.warning(
-                        "litellm_post_call_stream_flush_after_failure_failed request_id=%s",
-                        request_id,
-                    )
-                await self._report_internal_failure(
-                    request_id,
-                    request_data,
-                    exc,
-                    log_event="litellm_post_call_stream_unexpected_error",
-                )
-                # `from None`: `exc` (already-desanitized content) must never
-                # become `__cause__` (M1-14 surface iii/vi).
-                raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
-        for tail_chunk in _flush_stream_tails(
-            sse, dict_desanitizer, dict_tool_calls, dict_function_call, responses_desanitizer
-        ):
-            yield tail_chunk
-        logger.info(
-            "litellm_post_call_stream_desanitize_done request_id=%s chunk_count=%d",
-            request_id,
-            chunk_count,
-        )
-
-    async def post_call_unary(
-        self,
-        request_data: dict[str, Any],
-        response: Any,
-    ) -> Any:
-        """De-sanitize a single (non-streaming) response.
-
-        Thin F8 safety-net wrapper (same shape as `pre_call`): this runs
-        AFTER placeholders have been replaced by originals, so an unexpected
-        exception here is the one place raw content is most likely to ride
-        in an exception message. Never let that reach the client raw.
-        """
-        request_id = self._ensure_request_id(request_data)
-        try:
-            return await self._post_call_unary_impl(request_id, request_data, response)
-        except GuardrailHttpException:
-            raise
-        except Exception as exc:
-            await self._report_internal_failure(
-                request_id, request_data, exc, log_event="litellm_post_call_unary_unexpected_error"
-            )
-            # `from None`: `exc` (already-desanitized content) must never
-            # become `__cause__` (M1-14 surface iii/vi).
-            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
-
-    async def _post_call_unary_impl(
-        self,
-        request_id: str,
-        request_data: dict[str, Any],
-        response: Any,
-    ) -> Any:
-        state = self._req_state.get(request_id)
-        if state is None or not state.mapping.pairs:
-            logger.info(
-                "litellm_post_call_unary_passthrough request_id=%s reason=%s",
-                request_id,
-                "no_state" if state is None else "no_mapping",
-            )
-            return response
-        response_mapping = _response_mapping(state, include_bare_aliases=self._forward_chatgpt_auth)
-        logger.info(
-            "litellm_post_call_unary_desanitize request_id=%s pairs=%d aliases=%d",
-            request_id,
-            len(state.mapping.pairs),
-            len(response_mapping.pairs) - len(state.mapping.pairs),
-        )
-        return _apply_reverse_to_response(response, response_mapping)
-
     async def audit(
         self,
         request_data: dict[str, Any],
@@ -1607,6 +1423,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         error_code: str | None = None,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
+        owner = self._terminal_owned.get(request_id)
+        if owner is not None:
+            # The request's own ticket when the event runs in its context (litellm's
+            # logging worker copies it): a call id two requests share names the last.
+            current = current_ticket()
+            facts = getattr(current, "audit_facts", None)
+            mine = isinstance(facts, AuditFacts) and facts.request_id == request_id
+            ticket = current if mine else owner()
+            self._add_to_terminal_record(request_id, ticket, response, start_time, end_time, status)
+            return
         # A record in flight decides the terminal record: wait for it.
         await self._emits_resolved(request_id)
         if request_id in self._audited_ids:
@@ -1629,13 +1455,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # "unknown"/0/null — popping only happens once emit() has actually
         # succeeded (or the sink tells us the write is ambiguous, below).
         state = self._req_state.get(request_id)
-        # litellm v1.85 passes datetime objects for start_time / end_time
-        # to async_log_*_event; older versions used floats. Handle both.
-        delta = end_time - start_time
-        if hasattr(delta, "total_seconds"):
-            latency_ms = max(0, int(delta.total_seconds() * 1000))
-        else:
-            latency_ms = max(0, int(delta * 1000))
+        latency_ms = _latency_ms(start_time, end_time)
         # Once per REQUEST, not once per audit() call: a failed emit + safety-net
         # retry must not double-observe the same request's latency under two
         # different status labels.
@@ -1703,6 +1523,31 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             completion_tokens,
         )
 
+    def _add_to_terminal_record(
+        self,
+        request_id: str,
+        ticket: RequestTicket | None,
+        response: Any,
+        start_time: Any,
+        end_time: Any,
+        status: str,
+    ) -> None:
+        """A log event for a request whose ticket writes its record: its token counts,
+        while that record is still open, and the latency metric. Never a record."""
+        prompt_tokens, completion_tokens = _extract_token_counts(response)
+        if ticket is not None and (prompt_tokens or completion_tokens):
+            deposit_usage(ticket, prompt_tokens, completion_tokens)
+        if ticket is not None and ticket.cancelled:
+            return
+        if request_id not in self._latency_observed_ids:
+            self._metrics.observe_request_latency(
+                _latency_ms(start_time, end_time) / 1000.0, status=status
+            )
+            self._latency_observed_ids[request_id] = None
+            if len(self._latency_observed_ids) > _AUDIT_DEDUP_CAP:
+                self._latency_observed_ids.popitem(last=False)
+        logger.debug("litellm_audit_on_terminal_record request_id=%s status=%s", request_id, status)
+
     async def on_request_cancelled(self, request_id: str, *, latency_ms: int = 0) -> None:
         """The terminal record of a request the route gate cancelled (client gone).
 
@@ -1716,7 +1561,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         Only the cancelled request's own state is touched: state another request
         registered under the same call id is left alone, and nothing is written.
+
+        A request whose pre-call handed it to its ticket gets nothing here: the ticket's
+        terminal record is its ``cancelled`` record, and its state is already gone.
         """
+        if request_id in self._terminal_owned:
+            self._cancel_pending.pop(request_id, None)
+            return
         state = self._req_state.get(request_id)
         if state is not None and not _cancel_reaches(state.ticket):
             self._metrics.record_failure("route_gate")
@@ -1966,9 +1817,18 @@ def _audit_facts(state: _RequestState, *, started: float) -> AuditFacts:
         block_reason=state.block_reason,
         error_code=state.error_code,
         profile_ids=state.profile_ids,
+        placeholders=tuple(state.placeholders),
         status="ok",
         started=started,
     )
+
+
+def _latency_ms(start_time: Any, end_time: Any) -> int:
+    # litellm passes datetimes to async_log_*_event; older versions used floats.
+    delta = end_time - start_time
+    if hasattr(delta, "total_seconds"):
+        return max(0, int(delta.total_seconds() * 1000))
+    return max(0, int(delta * 1000))
 
 
 def _label_counts(placeholders: list[str]) -> dict[str, int]:
@@ -2380,13 +2240,6 @@ def _refresh_request_body_snapshot(data: dict[str, Any]) -> None:
             body[key] = data[key]
 
 
-def _is_responses_event(chunk: Any) -> bool:
-    if isinstance(chunk, dict):
-        return str(chunk.get("type") or "").startswith("response.")
-    event_type = getattr(chunk, "type", None)
-    return isinstance(event_type, str) and event_type.startswith("response.")
-
-
 @dataclass(frozen=True)
 class _CancelRecord:
     """What a ``cancelled`` record carries: audit-safe identity and counts, no content."""
@@ -2654,149 +2507,6 @@ TEAM_CONFIG_COMPONENT = "team_config"
 
 def _failure_component(error_code: str) -> str:
     return _FAILURE_COMPONENT.get(error_code, "other")
-
-
-def _extract_chunk_text(chunk: Any) -> str | None:
-    """Pull text out of an SSE chunk in a shape-tolerant way."""
-    if isinstance(chunk, str):
-        return chunk
-    if isinstance(chunk, bytes):
-        return chunk.decode("utf-8", errors="replace")
-    if isinstance(chunk, dict):
-        choices = chunk.get("choices") or []
-        if choices and isinstance(choices, list):
-            delta = choices[0].get("delta") or {}
-            content = delta.get("content")
-            if isinstance(content, str):
-                return content
-        delta_top = chunk.get("delta")
-        if isinstance(delta_top, dict):
-            text = delta_top.get("text")
-            if isinstance(text, str):
-                return text
-    return None
-
-
-def _replace_chunk_text(chunk: Any, new_text: str) -> Any:
-    if isinstance(chunk, str):
-        return new_text
-    if isinstance(chunk, bytes):
-        return new_text.encode("utf-8")
-    if isinstance(chunk, dict):
-        out = {**chunk}
-        choices = out.get("choices")
-        if isinstance(choices, list) and choices:
-            new_choices = list(choices)
-            first = {**(new_choices[0] or {})}
-            delta = {**(first.get("delta") or {})}
-            delta["content"] = new_text
-            first["delta"] = delta
-            new_choices[0] = first
-            out["choices"] = new_choices
-            return out
-        delta_top = out.get("delta")
-        if isinstance(delta_top, dict):
-            new_delta = {**delta_top, "text": new_text}
-            out["delta"] = new_delta
-            return out
-        out["content"] = new_text
-        return out
-    return new_text
-
-
-def _make_text_chunk() -> dict[str, Any]:
-    return {"choices": [{"delta": {"content": ""}}]}
-
-
-def _make_tool_call_chunk(index: int, arguments: str) -> dict[str, Any]:
-    return {
-        "choices": [
-            {"delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments}}]}}
-        ]
-    }
-
-
-def _make_function_call_chunk(arguments: str) -> dict[str, Any]:
-    return {"choices": [{"delta": {"function_call": {"arguments": arguments}}}]}
-
-
-def _flush_stream_tails(
-    sse: SseStreamDesanitizer,
-    dict_desanitizer: StreamingDesanitizer,
-    dict_tool_calls: OpenAiToolCallDesanitizer,
-    dict_function_call: StreamingDesanitizer,
-    responses_desanitizer: ResponsesStreamDesanitizer,
-) -> Iterator[Any]:
-    """Flush every stream desanitizer's held-back tail, in the fixed order
-    the normal end-of-stream path uses. Shared with both stream-failure
-    paths so an aborted stream doesn't silently drop already-buffered
-    (partially desanitized) content."""
-    yield from sse.flush()
-    tail = dict_desanitizer.flush()
-    if tail:
-        yield _replace_chunk_text(_make_text_chunk(), tail)
-    for tc_index, tc_tail in dict_tool_calls.flush():
-        yield _make_tool_call_chunk(tc_index, tc_tail)
-    fc_tail = dict_function_call.flush()
-    if fc_tail:
-        yield _make_function_call_chunk(fc_tail)
-    yield from responses_desanitizer.flush()
-
-
-def _desanitize_chunk_tool_calls(
-    chunk: dict[str, Any], desanitizer: OpenAiToolCallDesanitizer
-) -> tuple[dict[str, Any], bool]:
-    """Rewrite placeholders in an OpenAI dict chunk's tool_calls argument deltas.
-
-    Returns ``(chunk, had_tool_calls)`` — ``had_tool_calls`` tells the caller to
-    keep emitting the chunk even when its content is held back. A garbage index is
-    skipped rather than crashing the stream."""
-    choices = chunk.get("choices")
-    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
-        return chunk, False
-    delta = choices[0].get("delta")
-    if not isinstance(delta, dict) or not isinstance(delta.get("tool_calls"), list):
-        return chunk, False
-    new_calls: list[Any] = []
-    changed = False
-    for tc in delta["tool_calls"]:
-        fn = tc.get("function") if isinstance(tc, dict) else None
-        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-            idx = coerce_tool_index(tc.get("index", 0))
-            if idx is None:
-                new_calls.append(tc)
-                continue
-            rewritten = desanitizer.feed(idx, fn["arguments"])
-            new_calls.append({**tc, "function": {**fn, "arguments": rewritten}})
-            changed = True
-        else:
-            new_calls.append(tc)
-    if not changed:
-        return chunk, False
-    new_delta = {**delta, "tool_calls": new_calls}
-    new_first = {**choices[0], "delta": new_delta}
-    return {**chunk, "choices": [new_first, *choices[1:]]}, True
-
-
-def _desanitize_chunk_function_call(
-    chunk: dict[str, Any], desanitizer: StreamingDesanitizer
-) -> tuple[dict[str, Any], bool]:
-    """Rewrite placeholders in an OpenAI dict chunk's legacy function_call args delta.
-
-    Returns ``(chunk, had_function_call)``."""
-    choices = chunk.get("choices")
-    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
-        return chunk, False
-    delta = choices[0].get("delta")
-    if not isinstance(delta, dict):
-        return chunk, False
-    fc = delta.get("function_call")
-    if not isinstance(fc, dict) or not isinstance(fc.get("arguments"), str):
-        return chunk, False
-    rewritten = desanitizer.feed(fc["arguments"])
-    new_delta = {**delta, "function_call": {**fc, "arguments": rewritten}}
-    new_first = {**choices[0], "delta": new_delta}
-    return {**chunk, "choices": [new_first, *choices[1:]]}, True
 
 
 def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:

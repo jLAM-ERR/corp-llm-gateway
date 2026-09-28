@@ -43,16 +43,23 @@ In order —
    routes in front of it, and wrap the app's **lifespan** (not ``on_startup``,
    which Starlette never runs for an app built with an explicit ``lifespan=``) so
    that after litellm's startup has run, a ``CorpLlmGuardrail`` must be in
-   ``litellm.callbacks``, set up so litellm cannot bypass it, and litellm's DEBUG
-   output (which logs the original request) must be off
-   (``route_gate/arm_checks.py``). Otherwise the process exits 70
-   (``EX_SOFTWARE``) rather than serve, one log line per problem;
+   ``litellm.callbacks``, set up so litellm cannot bypass it, litellm's DEBUG
+   output (which logs the original request) must be off, and litellm's app must
+   carry no response compressor (``route_gate/arm_checks.py``). Otherwise the
+   process exits 70 (``EX_SOFTWARE``) rather than serve, one log line per problem.
+   litellm's app is mounted behind ``DesanitizeMiddleware``
+   (``route_gate/desanitize_middleware.py``), the gateway's only reversal: litellm
+   and every callback in it see placeholders, the client gets its originals;
 5. wrap the whole chain in ``RouteGateMiddleware`` — by wrapping, not
    ``add_middleware``, so the gate is outermost. Every middleware litellm adds
    sits inside it and none can answer ahead of the gate. The gate carries the
-   in-flight limiter (``route_gate/inflight.py``); once armed, the lifespan
-   hands it the guardrail's ``on_request_cancelled`` and installs the task
-   factory that tags each request's tasks on uvicorn's own loop.
+   in-flight limiter (``route_gate/inflight.py``), inside which the desanitiser
+   runs (it keys a response by the limiter's ticket); once armed, the lifespan
+   hands the limiter the guardrail's ``on_request_cancelled`` and the terminal
+   audit's ticket binding, hands the guardrail the desanitiser's mapping store,
+   and installs the task factory that tags each request's tasks on uvicorn's own
+   loop. At shutdown the lifespan waits, bounded by the cancel grace, for the
+   terminal records still being written.
 
 What moved here from the ``litellm`` CLI: the config-load check, the Prisma
 sequence, ``WORKER_CONFIG``, and (in ``serve.py``) uvicorn's arguments.
@@ -97,7 +104,10 @@ from corp_llm_gateway import config, litellm_cli, litellm_config, pg_session, se
 from corp_llm_gateway.audit import AuditLogger, get_sink
 from corp_llm_gateway.metrics import get_exporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware, arm_checks
+from corp_llm_gateway.route_gate.desanitize_middleware import DesanitizeMiddleware, ResponseMappings
 from corp_llm_gateway.route_gate.inflight import InflightLimiter, install_task_factory
+from corp_llm_gateway.route_gate.terminal_audit import COMPONENT as TERMINAL_COMPONENT
+from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
 
 # `corp_llm_gateway.bootstrap` is NOT imported here: it reaches
 # `litellm_hook`, which imports litellm itself (the guardrail has to subclass
@@ -380,8 +390,9 @@ def _guardrail_registered() -> bool:
 
 
 def _arm_problems() -> list[str]:
-    """``arm_checks.live_problems``, less the DEBUG ones when the test-only key allows them."""
-    problems = arm_checks.live_problems()
+    """``arm_checks.live_problems`` and the compressor check on litellm's app, less the
+    DEBUG ones when the test-only key allows them."""
+    problems = arm_checks.live_problems() + arm_checks.compressor_problem(_app)
     if ALLOW_LITELLM_DEBUG:
         allowed = [p for p in problems if p in arm_checks.DEBUG_PROBLEMS]
         if allowed:
@@ -480,6 +491,14 @@ class _MetricsRoute:
         await self._fallthrough(scope, receive, send)
 
 
+# The gateway's one response reversal, in front of litellm's app and inside the
+# limiter: it keys each response by the limiter's ticket. Its terminal records go
+# through the gate's audit logger.
+response_mappings = ResponseMappings()
+_audit_logger = AuditLogger(get_sink(), gateway_version=gateway_version())
+terminal = TerminalAudit(emit_to(_audit_logger), metrics=_exporter)
+_desanitized = DesanitizeMiddleware(_app, response_mappings, metrics=_exporter, terminal=terminal)
+
 # The gateway's own routes sit BETWEEN the gate and litellm's app, not on
 # litellm's router. Every middleware litellm adds with `add_middleware` wraps the
 # whole router, and one of them — `PrometheusAuthMiddleware`
@@ -488,9 +507,9 @@ class _MetricsRoute:
 # ServiceMonitor and the kubelet probes carry no litellm credential, so a
 # gateway-owned route mounted inside litellm's router would be unscrapable in
 # Mode A. `HealthRouter` already takes a `fallthrough`, so the chain is:
-# /healthz/* -> /metrics -> litellm.
+# /healthz/* -> /metrics -> desanitiser -> litellm.
 _GATEWAY_ROUTES = build_health_router(
-    fallthrough=_MetricsRoute(_exporter.asgi_app(), _app),
+    fallthrough=_MetricsRoute(_exporter.asgi_app(), _desanitized),
     issuance_schema_verified=ISSUANCE_SCHEMA_VERIFIED,
 )
 log.info(
@@ -511,7 +530,7 @@ limiter = InflightLimiter(
 gate = RouteGateMiddleware(
     _GATEWAY_ROUTES,
     metrics=_exporter,
-    audit_logger=AuditLogger(get_sink(), gateway_version=gateway_version()),
+    audit_logger=_audit_logger,
     extras=ROUTE_GATE_EXTRAS,
     limiter=limiter,
 )
@@ -548,13 +567,29 @@ async def _armed_lifespan(scoped_app: Any) -> AsyncIterator[None]:
             guardrail = _registered_guardrail()
             _start_litellm_logging_worker()
             restore_task_factory = install_task_factory(asyncio.get_running_loop())
+            guardrail.bind_response_mappings(response_mappings)
+            limiter.bind_ticket_hook(terminal.bind)
             limiter.bind_cancel_hook(guardrail.on_request_cancelled)
             gate.arm()
             log.info("CorpLlmGuardrail found in litellm.callbacks; route gate armed")
         try:
             yield
         finally:
-            restore_task_factory()
+            try:
+                await _drain_terminal_records()
+            finally:
+                restore_task_factory()
+
+
+async def _drain_terminal_records() -> None:
+    """Let the terminal records still being written land, bounded by the cancel grace:
+    by now uvicorn has finished (or given up on) every request."""
+    try:
+        async with asyncio.timeout(limiter.cancel_grace_s):
+            await terminal.drain()
+    except TimeoutError:
+        log.error("terminal_audit_drain_incomplete pending=%d", terminal.pending)
+        _exporter.record_failure(TERMINAL_COMPONENT)
 
 
 _app.router.lifespan_context = _armed_lifespan

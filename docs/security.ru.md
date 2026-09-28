@@ -769,12 +769,31 @@ nginx-фронт         compose, COMPOSE_PROFILES=nginx|nginx-ports, по ум�
    ↓
 RouteGateMiddleware классификация (METHOD, path) → PASSTHROUGH / REWRITTEN / REFUSE
    ↓
-лимитер в полёте    только REWRITTEN: тело дочитано, затем слот → 429 E_CAPACITY
+лимитер в полёте    только REWRITTEN: тело дочитано (ключ `policies` верхнего
+                    уровня → 403), затем слот → 429 E_CAPACITY
+   ↓
+десанитайзер        обратная подстановка ответа, на выходе (ниже)
    ↓
 роутер litellm      pre_call_hook → санитизация → провайдер
 ```
 
 Без профиля, как и в Helm, самый внешний слой — route gate.
+
+**Обратная подстановка ответа выполняется здесь, а не в litellm.**
+`DesanitizeMiddleware` (`route_gate/desanitize_middleware.py`) стоит внутри
+лимитера, перед приложением litellm, и это единственная обратная подстановка
+шлюза: pre-call guardrail передаёт маппинг ответа тикету запроса, а middleware
+восстанавливает оригиналы в ответе, который отправляет litellm (unary JSON, SSE
+chat / Anthropic и события Responses), поэтому litellm и все callback-и, хуки и
+логи внутри него видят только плейсхолдеры. Выключателя нет. Сбой восстановления
+даёт 500 `E_INTERNAL` без содержимого (или, если статус уже ушёл, закрывает поток)
+и считается в `gateway_failure{component="desanitize"}`; ответ с
+`Content-Encoding` проходит без восстановления, а шлюз не взводится (exit 70,
+`response_compressor`), если приложение litellm сжимает ответы. События Responses
+перенумеровываются (`sequence_number`), когда удержанный текст добавляет или
+сдвигает событие, — в каждом восстановленном потоке Responses. Единственная
+запись аудита запроса пишется, когда ответ заканчивается
+(`route_gate/terminal_audit.py`), и никогда — callback-ом litellm.
 
 Middleware написан на чистом ASGI, а не на `BaseHTTPMiddleware`, по двум
 причинам, важным для безопасности: он должен видеть scope-ы `websocket` (HTTP
@@ -805,6 +824,7 @@ default-deny. Маршрут `POST`/`PUT`/`PATCH` без хука может б�
 | `route_gate_malformed` | 403 | `E_ROUTE_BLOCKED` | сырой путь содержит `%2f`, `%00`, `%2e%2e` (в любом регистре) или не-ASCII байт, либо декодированный путь содержит `..`, `//` или NUL (`route_gate/classify.py`); с таблицей вообще не сверяется |
 | `route_gate_unarmed` | 503 | `E_ROUTE_GATE_UNARMED` | REWRITTEN-маршрут, пока guardrail-callback не зарегистрирован; никогда не пробрасывается |
 | `route_gate_error` | 500 | `E_ROUTE_GATE_ERROR` | классификация бросила исключение; никогда не пробрасывается |
+| `route_gate_body_policies` | 403 | `E_ROUTE_BLOCKED` | допущенный REWRITTEN-запрос, в JSON-теле которого есть ключ `policies` верхнего уровня (litellm применил бы эти политики к запросу); проверяется, когда лимитер дочитал тело, до слота и до разбора тела litellm |
 
 Последние два также пишут `gateway_failure{component="route_gate"}`. Каждый
 отказ пишет `corp_llm_gateway_blocked_requests_total{block_reason=…}` и эмитит

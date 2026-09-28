@@ -1,6 +1,8 @@
 """What ``asgi.py``'s lifespan refuses to arm with (exit 70), checked after litellm's
-startup: our guardrail absent or set up so litellm bypasses it, or litellm's DEBUG output
-on (it logs the original request before any pre-call hook). ``REASONS`` says why for each."""
+startup: our guardrail absent or set up so litellm bypasses it, litellm's DEBUG output
+on (it logs the original request before any pre-call hook), or a compressor in litellm's
+app (the response desanitiser passes an encoded response through unrestored).
+``REASONS`` says why for each."""
 
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ SCAN_RAW_REQUEST = "scan_raw_request"
 RUN_IN_PARALLEL = "run_in_parallel"
 LITELLM_DEBUG_LOGGING = "litellm_debug_logging"
 LITELLM_SET_VERBOSE = "litellm_set_verbose"
+RESPONSE_COMPRESSOR = "response_compressor"
 
 DEBUG_PROBLEMS = frozenset({LITELLM_DEBUG_LOGGING, LITELLM_SET_VERBOSE})
 
@@ -43,6 +46,11 @@ REASONS: dict[str, str] = {
     LITELLM_SET_VERBOSE: (
         "litellm.set_verbose is on (litellm_settings.set_verbose); litellm prints requests "
         "before any pre-call hook runs. " + _ALLOW_DEBUG_HINT
+    ),
+    RESPONSE_COMPRESSOR: (
+        "litellm's app carries a response-compressing middleware; the gateway's response "
+        "desanitiser passes an encoded response through unrestored, so clients would get "
+        "placeholders instead of their own text"
     ),
 }
 
@@ -91,6 +99,14 @@ def debug_problems(
     if set_verbose:
         problems.append(LITELLM_SET_VERBOSE)
     return problems
+
+
+def compressor_problem(app: Any) -> list[str]:
+    """``RESPONSE_COMPRESSOR`` when ``app`` (litellm's) compresses a response before the
+    desanitiser in front of it sees it."""
+    from corp_llm_gateway.route_gate.desanitize_middleware import compressor_problems
+
+    return [RESPONSE_COMPRESSOR] if compressor_problems(app) else []
 
 
 def live_problems() -> list[str]:

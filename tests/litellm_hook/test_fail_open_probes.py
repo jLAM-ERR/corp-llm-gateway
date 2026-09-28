@@ -488,13 +488,14 @@ async def test_migrated_pipeline_skip_egresses_originals_via_body_version_id(
     (policy_registry.py:676-695); any client then selects it per request with a body
     ``policies: ["policy_<uuid>"]`` (litellm_pre_call_utils.py:3246-3340) and the migrated
     fixture is skipped. The sentinel refuses; the gate-level refusal of a top-level
-    ``policies`` key stops the body before litellm parses it.
+    ``policies`` key stops the body before litellm parses it (lifted below, to show
+    what litellm does with such a body, then live).
     """
     policy_id = await policy_db.insert_policy("db-draft", status="draft")
     extra = {"policies": [f"policy_{policy_id}"]}
     ours, _ = build_ours()
     migrated = UnsafeMigratedGuardrail(ours)
-    harness = DispatchHarness(monkeypatch, upstream, [migrated])
+    harness = DispatchHarness(monkeypatch, upstream, [migrated], body_gate=False)
     await _sync(policy_db)
 
     exchange = await harness.send("chat", stream=False, extra=extra)
@@ -504,7 +505,10 @@ async def test_migrated_pipeline_skip_egresses_originals_via_body_version_id(
 
     sentinel_ours, _ = build_ours()
     guarded = DispatchHarness(
-        monkeypatch, upstream, [UnsafeMigratedGuardrail(sentinel_ours), SentinelCallback()]
+        monkeypatch,
+        upstream,
+        [UnsafeMigratedGuardrail(sentinel_ours), SentinelCallback()],
+        body_gate=False,
     )
     await _sync(policy_db)
     refused = await guarded.send("chat", stream=False, extra=extra)
@@ -513,3 +517,9 @@ async def test_migrated_pipeline_skip_egresses_originals_via_body_version_id(
     body = json.dumps(request_body("chat", stream=False) | extra).encode()
     assert body_names_policies(body)
     assert not body_names_policies(json.dumps(request_body("chat", stream=False)).encode())
+
+    gated_ours, _ = build_ours()
+    gated = DispatchHarness(monkeypatch, upstream, [UnsafeMigratedGuardrail(gated_ours)])
+    blocked = await gated.send("chat", stream=False, extra=extra)
+    assert blocked.status == 403 and "route_gate_body_policies" in blocked.text
+    assert blocked.provider_bodies == []

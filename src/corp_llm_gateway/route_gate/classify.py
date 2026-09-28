@@ -19,6 +19,9 @@ ROUTE_GATE_WEBSOCKET = "route_gate_websocket"
 ROUTE_GATE_MALFORMED = "route_gate_malformed"
 ROUTE_GATE_UNARMED = "route_gate_unarmed"
 ROUTE_GATE_ERROR = "route_gate_error"
+# An admitted rewritten request whose body names litellm policies (top-level
+# ``policies``); decided by the gate after the in-flight limiter read the body.
+ROUTE_GATE_BODY_POLICIES = "route_gate_body_policies"
 
 BLOCK_REASONS: frozenset[str] = frozenset(
     {
@@ -28,6 +31,7 @@ BLOCK_REASONS: frozenset[str] = frozenset(
         ROUTE_GATE_MALFORMED,
         ROUTE_GATE_UNARMED,
         ROUTE_GATE_ERROR,
+        ROUTE_GATE_BODY_POLICIES,
     }
 )
 

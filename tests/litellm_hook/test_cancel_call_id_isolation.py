@@ -3,7 +3,13 @@
 litellm 1.101.0 takes ``litellm_call_id`` from the client's ``x-litellm-call-id``
 header when present (``proxy/common_request_processing.py``), so two HTTP
 requests can carry the same call id; and a litellm event can run outside the
-request's context while its cancel record is still being written."""
+request's context while its cancel record is still being written.
+
+A pre-call that hands its request to the ticket leaves nothing keyed by the call id
+in the guardrail: the mapping and the record belong to the ticket. The guardrail's
+own state, record and cancel path remain for a request its ticket could not take
+(the ticket refused the facts) — ``_pre_call_kept`` — and for a pre-call run outside
+the route gate."""
 
 from __future__ import annotations
 
@@ -30,28 +36,45 @@ async def _pre_call_in(guardrail: Any, ticket: RequestTicket, call_id: str) -> N
         _TICKET.reset(token)
 
 
+async def _pre_call_kept(guardrail: Any, ticket: RequestTicket, call_id: str) -> None:
+    """A pre-call whose ticket refuses its facts (closed): the guardrail keeps the state."""
+    ticket.close()
+    await _pre_call_in(guardrail, ticket, call_id)
+    assert guardrail._req_state[call_id].ticket is ticket
+
+
 async def test_a_disconnect_never_ends_another_request_that_shares_its_call_id() -> None:
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+
     guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
+    mappings = ResponseMappings()
+    guardrail.bind_response_mappings(mappings)
     gone, live = RequestTicket("a" * 32), RequestTicket("b" * 32)
-    await _pre_call_in(guardrail, gone, "client-chosen")
     await _pre_call_in(guardrail, live, "client-chosen")
+    await _pre_call_in(guardrail, gone, "client-chosen")
+    assert guardrail._req_state == {}
+    live_facts = live.audit_facts
 
     # The route gate cancels the first request: its ticket names the shared id.
-    for request_id in gone.request_ids():
-        await guardrail.on_request_cancelled(request_id)
+    await _cancel_in(guardrail, gone, "client-chosen")
 
-    # The second request is still being served: its state must still be there
-    # for post-call, and its own terminal record must still be written.
-    assert "client-chosen" in guardrail._req_state
+    # The second request is still being served: its mapping and its own record are its
+    # ticket's, and a log event in its context adds to that record and writes none.
+    assert live in mappings and gone in mappings
+    assert live.audit_facts is live_facts and not live.cancelled
     token = _TICKET.set(live)
     try:
         now = datetime.now(UTC)
         await guardrail.async_log_success_event(
-            {"litellm_call_id": "client-chosen"}, None, now, now
+            {"litellm_call_id": "client-chosen"},
+            {"usage": {"prompt_tokens": 5, "completion_tokens": 1}},
+            now,
+            now,
         )
     finally:
         _TICKET.reset(token)
-    assert "ok" in [r["status"] for r in sink.records]
+    assert (live.audit_facts.prompt_tokens, gone.audit_facts.prompt_tokens) == (5, 0)
+    assert sink.records == []
 
 
 async def test_a_litellm_event_during_the_cancel_emit_adds_no_second_record() -> None:
@@ -106,8 +129,8 @@ async def test_a_mismatched_cancel_writes_nothing_and_is_logged_with_counts_only
     guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
     guardrail._metrics = metrics = _Failures()
     gone, live = RequestTicket("a" * 32), RequestTicket("b" * 32)
-    await _pre_call_in(guardrail, gone, "client-chosen")
-    await _pre_call_in(guardrail, live, "client-chosen")
+    await _pre_call_kept(guardrail, gone, "client-chosen")
+    await _pre_call_kept(guardrail, live, "client-chosen")
 
     with caplog.at_level(logging.DEBUG):
         await _cancel_in(guardrail, gone, "client-chosen")
@@ -123,8 +146,8 @@ async def test_a_mismatched_cancel_writes_nothing_and_is_logged_with_counts_only
 async def test_when_both_sharers_are_cancelled_each_cancel_ends_only_its_own_state() -> None:
     guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
     gone, also_gone = RequestTicket("a" * 32), RequestTicket("b" * 32)
-    await _pre_call_in(guardrail, gone, "client-chosen")
-    await _pre_call_in(guardrail, also_gone, "client-chosen")
+    await _pre_call_kept(guardrail, gone, "client-chosen")
+    await _pre_call_kept(guardrail, also_gone, "client-chosen")
     also_gone.cancelled = True
 
     await _cancel_in(guardrail, gone, "client-chosen")
@@ -139,12 +162,26 @@ async def test_when_both_sharers_are_cancelled_each_cancel_ends_only_its_own_sta
 async def test_a_cancel_from_its_own_request_ends_its_state() -> None:
     guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
     ticket = RequestTicket("a" * 32)
-    await _pre_call_in(guardrail, ticket, "call-1")
+    await _pre_call_kept(guardrail, ticket, "call-1")
 
     await _cancel_in(guardrail, ticket, "call-1")
 
     assert guardrail._req_state == {}
     assert [(r["status"], r["redaction_count"]) for r in sink.records] == [("cancelled", 1)]
+
+
+async def test_a_cancel_of_a_request_its_ticket_took_writes_nothing() -> None:
+    """The ticket's terminal record is the ``cancelled`` one; the hook only clears."""
+    guardrail, sink = _build_guardrail([(EMAIL, "[EMAIL_1]")])
+    ticket = RequestTicket("a" * 32)
+    await _pre_call_in(guardrail, ticket, "call-1")
+
+    await _cancel_in(guardrail, ticket, "call-1")
+    now = datetime.now(UTC)
+    await guardrail.async_log_failure_event({"litellm_call_id": "call-1"}, None, now, now)
+
+    assert guardrail._req_state == {} and guardrail._cancel_pending == {}
+    assert sink.records == []
 
 
 async def test_a_cancel_outside_any_request_ends_state_that_belongs_to_none() -> None:
@@ -220,7 +257,8 @@ async def _served_with_slow_sink(
     guardrail: Any, sink: Any, *, fail_first: bool = False
 ) -> tuple[RequestTicket, asyncio.Event]:
     ticket = RequestTicket("a" * 32)
-    await _pre_call_in(guardrail, ticket, "call-1")
+    # The guardrail's own emits only race for a request its ticket could not take.
+    await _pre_call_kept(guardrail, ticket, "call-1")
     writing = asyncio.Event()
     write = sink.write
     calls = 0

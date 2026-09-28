@@ -136,25 +136,22 @@ async def test_the_harness_leaves_litellms_globals_as_it_found_them(
 
 
 @pytest.mark.parametrize(("route", "stream"), FLOWS, ids=FLOW_IDS)
-async def test_client_gets_originals_back_except_chat_sse(
+async def test_client_gets_originals_back_on_every_flow(
     monkeypatch: pytest.MonkeyPatch, upstream: StubUpstream, route: str, stream: bool
 ) -> None:
-    """Today's callback reversal, per flow.
+    """The one reversal, the ASGI desanitiser, per flow — chat-completions SSE included.
 
-    Chat-completions SSE is NOT restored: litellm feeds ``ModelResponseStream`` objects to
-    the iterator hook and ``_post_call_stream_impl`` only rewrites bytes/str, dicts and
-    Responses events (litellm_hook.py:1478-1497), so the client keeps the placeholders. A
-    usability defect, not a leak; the ASGI prototype restores it (Option A).
+    Before it was wired the callback reversal left chat SSE unrestored (litellm feeds
+    ``ModelResponseStream`` objects to the iterator hook, which the callback passed
+    through), so OpenAI-chat streaming clients got placeholders.
     """
     ours, _ = build_ours()
     harness = DispatchHarness(monkeypatch, upstream, [ours])
 
     exchange = await harness.send(route, stream=stream)
 
-    if route == "chat" and stream:
-        assert PLACEHOLDER_MARK in exchange.text and ORIGINAL_MARK not in exchange.text
-    else:
-        assert ORIGINAL_MARK in exchange.text and PLACEHOLDER_MARK not in exchange.text
+    assert _egressed_placeholders(exchange.provider_bodies)
+    assert ORIGINAL_MARK in exchange.text and PLACEHOLDER_MARK not in exchange.text
 
 
 # ── Option 0: the plain callback is never skipped ────────────────────────────
@@ -174,7 +171,9 @@ async def test_today_plain_callback_runs_regardless_of_policies(
     """
     ours, _ = build_ours()
     spy = MetadataSpy()
-    harness = DispatchHarness(monkeypatch, upstream, [spy, ours])
+    # The body-name selector never reaches litellm through the gate (below): lifted here
+    # to show what litellm does with it.
+    harness = DispatchHarness(monkeypatch, upstream, [spy, ours], body_gate=False)
     attachment, extra, headers = _selector(selector)
     await load_policies(policy_config(attachment=attachment))
 
@@ -183,6 +182,21 @@ async def test_today_plain_callback_runs_regardless_of_policies(
     assert spy.managed == [frozenset({GUARDRAIL_NAME})]
     assert exchange.status == 200
     assert _egressed_placeholders(exchange.provider_bodies)
+    if selector == "body_name":
+        await _assert_the_gate_refuses_body_policies(monkeypatch, upstream, extra)
+
+
+async def _assert_the_gate_refuses_body_policies(
+    monkeypatch: pytest.MonkeyPatch, upstream: StubUpstream, extra: dict | None
+) -> None:
+    ours, _ = build_ours()
+    spy = MetadataSpy()
+    gated = DispatchHarness(monkeypatch, upstream, [spy, ours])
+
+    refused = await gated.send("chat", stream=False, extra=extra)
+
+    assert refused.status == 403 and "E_ROUTE_BLOCKED" in refused.text
+    assert refused.provider_bodies == [] and spy.managed == []
 
 
 def _selector(selector: str) -> tuple[dict | None, dict | None, dict | None]:
@@ -249,7 +263,7 @@ async def test_migrated_pipeline_skip_egresses_originals(
     """
     ours, _ = build_ours()
     migrated = UnsafeMigratedGuardrail(ours)
-    harness = DispatchHarness(monkeypatch, upstream, [migrated])
+    harness = DispatchHarness(monkeypatch, upstream, [migrated], body_gate=False)
     attachment, extra, headers = _selector(selector)
     await load_policies(policy_config(attachment=attachment))
 
@@ -262,7 +276,10 @@ async def test_migrated_pipeline_skip_egresses_originals(
 
     guarded_ours, _ = build_ours()
     guarded = DispatchHarness(
-        monkeypatch, upstream, [UnsafeMigratedGuardrail(guarded_ours), SentinelCallback()]
+        monkeypatch,
+        upstream,
+        [UnsafeMigratedGuardrail(guarded_ours), SentinelCallback()],
+        body_gate=False,
     )
     await load_policies(policy_config(attachment=attachment))
 
@@ -274,6 +291,9 @@ async def test_migrated_pipeline_skip_egresses_originals(
 
     body = request_body("chat", stream=False) | (extra or {})
     assert body_names_policies(json.dumps(body).encode()) is (selector == "body_name")
+    if selector == "body_name":
+        # The gate's own refusal, live: litellm never parses such a body.
+        await _assert_the_gate_refuses_body_policies(monkeypatch, upstream, extra)
 
 
 async def test_sentinel_passes_a_request_our_pre_call_ran_on(
@@ -350,21 +370,20 @@ def test_a_stand_in_answering_to_our_name_is_not_our_guardrail() -> None:
 
 # ── hazards 10 / 13 / 15 ─────────────────────────────────────────────────────
 
-# Which response-side hooks of each capture hold an original today, with
-# [capture_before, ours, capture_after]. Unary: plain success hooks run in list order
-# (proxy/utils.py:2855-2863), so the one after ours sees the restored response (10);
-# the header hook runs after every success hook and gets the restored response for
-# both captures (15; common_request_processing.py:2715). Streaming: iterator wrappers
-# chain in list order (proxy/utils.py:3189-3226), so the one after ours consumes
-# restored chunks (13); the header hook gets the stream object, before any chunk.
-# Chat SSE is never restored by the callback (see the test above), so nothing holds one.
+# Which response-side hooks of each capture hold an original, with
+# [capture_before, ours, capture_after]. None, on any flow: the reversal runs outside
+# litellm (the ASGI desanitiser) and ours has no response-side hook.
+#
+# Before it was wired, with the reversal in our callback (TODAY_BEFORE_TASK3): unary —
+# plain success hooks run in list order (proxy/utils.py:2855-2863), so the one after
+# ours saw the restored response (10); the header hook runs after every success hook and
+# got it for both captures (15; common_request_processing.py:2715). Streaming — iterator
+# wrappers chain in list order (proxy/utils.py:3189-3226), so the one after ours consumed
+# restored chunks (13) on /v1/messages and /v1/responses.
 TODAY: dict[tuple[str, bool], tuple[set[str], set[str]]] = {
-    ("chat", False): ({"headers"}, {"success", "headers"}),
-    ("chat", True): (set(), set()),
-    ("messages", False): ({"headers"}, {"success", "headers"}),
-    ("messages", True): (set(), {"iterator"}),
-    ("responses", False): ({"headers"}, {"success", "headers"}),
-    ("responses", True): (set(), {"iterator"}),
+    (route, stream): (set(), set())
+    for route in ("chat", "messages", "responses")
+    for stream in (False, True)
 }
 RESPONSE_SIDE = {"success", "headers", "iterator", "per_chunk"}
 
@@ -373,16 +392,17 @@ RESPONSE_SIDE = {"success", "headers", "iterator", "per_chunk"}
 async def test_capture_positions_unary_and_streaming(
     monkeypatch: pytest.MonkeyPatch, upstream: StubUpstream, route: str, stream: bool
 ) -> None:
-    """Hazards 10, 13, 15: where restored originals are visible inside litellm today, and
-    that the ASGI prototype (Option A) leaves placeholders in every capture while the
-    client still gets the originals. On today's callback reversal the assertion that no
-    capture holds an original fails at the positions in ``TODAY``.
+    """Hazards 10, 13, 15: no restored original is visible inside litellm, with our
+    guardrail as the entrypoint wires it and with it wrapped as the Option A glue, while
+    the client gets the originals. With the callback reversal (before Task 3) the
+    assertion failed at the positions ``TODAY``'s comment lists.
     """
     ours, _ = build_ours()
     before, after = Capture("before"), Capture("after")
     harness = DispatchHarness(monkeypatch, upstream, [before, ours, after])
 
-    await harness.send(route, stream=stream)
+    served = await harness.send(route, stream=stream)
+    assert ORIGINAL_MARK in served.text and PLACEHOLDER_MARK not in served.text
 
     expected_before, expected_after = TODAY[(route, stream)]
     assert before.seen.holding(ORIGINAL_MARK) & RESPONSE_SIDE == expected_before
@@ -395,7 +415,7 @@ async def test_capture_positions_unary_and_streaming(
         monkeypatch,
         upstream,
         [before, OptionAPreCall(engine, mappings), after],
-        wrap=lambda app: DesanitizeMiddleware(app, mappings, enabled=True),
+        wrap=lambda app: DesanitizeMiddleware(app, mappings),
     )
 
     exchange = await option_a.send(route, stream=stream)

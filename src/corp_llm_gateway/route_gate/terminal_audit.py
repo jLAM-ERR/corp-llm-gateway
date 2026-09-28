@@ -1,26 +1,30 @@
 """The terminal audit record of a ticketed request: facts in, one record out.
 
-Callbacks deposit content-free facts on the request's ``RequestTicket`` (the guardrail's
-pre-call: identity, counts, the pre-call's own outcome, the latency start; a success log
-may add token counts while the record is still open). The one terminal record is
-published from them by whoever ends the response: the response-restoring middleware at
-its final body or restoration failure, or the ticket's close when the limiter lets go of
-a request that never got that far (cancelled, or ended without a final body). A callback
-awaiting the response never publishes, so litellm running its success log before or
-after ``http.response.start`` cannot decide the record.
+The guardrail's pre-call deposits content-free facts on the request's ``RequestTicket``
+(identity, counts, the pre-call's own outcome, the latency start); token counts are added
+while the record is still open, from the response or from a success log. A callback
+never publishes. The one record is written from the facts by the response-restoring
+middleware (``publish``) or by the ticket's close.
 
-The first outcome decided is the record's, with one exception below; ``ok`` on a ticket
-whose client left is ``cancelled``. A server cancel does not change an ``ok`` published
-before the close (the response completed); it is only the close's own outcome. The close
-decides before it schedules its write, so nothing published after the close changes the
-outcome. A cancelled request is ``cancelled`` with the code of who cancelled it
-(``E_CLIENT_DISCONNECTED``, ``E_SERVER_SHUTDOWN``); ``failed`` + ``E_INTERNAL`` is a
-restoration failure or a request that ended with no final body. A failed write before the
-close keeps the record open and the close writes it once more. The exception: a close that
-lands while a write is in flight decides its own outcome and leaves it with that write. If
-the write lands (or may have), the close writes nothing; if it fails, the close's write
-starts then, with the close's outcome. The close's own write is the last attempt, never
-retried.
+The request decides the outcome, never the sink, in this order:
+
+1. ``failed`` + ``E_INTERNAL`` published for a restoration failure stands, whatever
+   happens afterwards.
+2. An outcome the response path published (``ok`` at the final body; ``failed`` for a
+   non-2xx response or a stream that carried an error event) stands against any later
+   cancel, client or server: the client got the response. One published once the client
+   had left is ``cancelled`` + ``E_CLIENT_DISCONNECTED``: the client got nothing.
+3. Otherwise the close decides: ``cancelled`` + ``E_CLIENT_DISCONNECTED`` or
+   ``E_SERVER_SHUTDOWN`` by who cancelled, ``failed`` + ``E_INTERNAL`` when nothing was
+   published and nobody cancelled.
+
+A publish after the close is refused, so the close's write is the last attempt. A failed
+write never changes the decided outcome; it gets exactly one retry. A write the response
+path started that fails before the close is retried by the close; one still in flight
+when the close lands is retried, if it fails, by a write the close leaves behind for it.
+The close's own write is not retried. A record lost after its last attempt is logged by
+exception type and counted as ``gateway_failure{component="desanitize"}``. A write that
+may have landed (``AuditWriteAmbiguousError``) is never retried.
 """
 
 from __future__ import annotations
@@ -47,7 +51,7 @@ E_INTERNAL = "E_INTERNAL"
 E_CLIENT_DISCONNECTED = "E_CLIENT_DISCONNECTED"
 # The server cancelled the request (shutdown, pod drain): not a restoration failure.
 E_SERVER_SHUTDOWN = "E_SERVER_SHUTDOWN"
-# gateway_failure{component} of a close's record write that raised past its own handling.
+# gateway_failure{component} of a terminal record lost after its last attempt.
 COMPONENT = "desanitize"
 
 
@@ -66,6 +70,8 @@ class AuditFacts:
     block_reason: str | None = None
     error_code: str | None = None
     profile_ids: tuple[str, ...] = ()
+    # The request's placeholder tokens (e.g. ``[EMAIL_1]``), never an original.
+    placeholders: tuple[str, ...] = ()
     status: Outcome = "ok"
     started: float = field(default_factory=time.monotonic)
     prompt_tokens: int = 0
@@ -73,7 +79,9 @@ class AuditFacts:
     decided: tuple[Outcome, str | None] | None = field(default=None, init=False)
     published: bool = field(default=False, init=False)
     publishing: bool = field(default=False, init=False)
-    close_pending: tuple[Outcome, str | None] | None = field(default=None, init=False)
+    attempts: int = field(default=0, init=False)
+    # The close landed while a write was in flight: that write's failure is retried.
+    retry_on_failure: bool = field(default=False, init=False)
 
 
 @dataclass(frozen=True)
@@ -85,6 +93,8 @@ class TerminalRecord:
 
     def event(self) -> AuditEvent:
         facts = self.facts
+        # A cancelled record carries counts only, as the guardrail's own does.
+        placeholders = facts.placeholders if self.outcome != "cancelled" else ()
         return AuditEvent(
             timestamp=datetime.now(UTC),
             request_id=facts.request_id,
@@ -99,6 +109,7 @@ class TerminalRecord:
             finding_label_counts=dict(facts.finding_label_counts),
             cache_a_hit=facts.cache_a_hit,
             status=self.outcome,
+            placeholder_list=tuple(sorted(placeholders)) if placeholders else None,
             error_code=self.error_code,
             block_reason=facts.block_reason,
             profile_ids=facts.profile_ids,
@@ -134,7 +145,8 @@ def deposit(ticket: RequestTicket | None, facts: AuditFacts) -> bool:
 
 
 def deposit_usage(ticket: RequestTicket | None, prompt_tokens: int, completion_tokens: int) -> bool:
-    """Token counts from a success log; kept only while the record is still open."""
+    """Token counts for the record; kept only while it is still open. Each deposit
+    replaces the last: counts are never summed."""
     facts = ticket.audit_facts if ticket is not None else None
     if not isinstance(facts, AuditFacts) or facts.published or facts.publishing:
         return False
@@ -150,69 +162,152 @@ class TerminalAudit:
         self._emit = emit
         self._metrics = metrics
         self._closing: set[asyncio.Task[None]] = set()
+        self._writing: set[asyncio.Event] = set()
+
+    @property
+    def pending(self) -> int:
+        """Writes not finished yet: the response path's, and those the closes started
+        (a retry included)."""
+        return len(self._closing) + len(self._writing)
 
     def bind(self, ticket: RequestTicket) -> None:
         """Publish at the ticket's close whatever the response path did not."""
         ticket.on_close(self._on_close)
 
+    def decide(
+        self, ticket: RequestTicket, outcome: Outcome, *, error_code: str | None = None
+    ) -> None:
+        """Decide the record's outcome now, if nothing has, and leave the write to a
+        ``publish`` or the close: a restoration failure is the outcome even when the
+        answer to it never reaches the client."""
+        facts = ticket.audit_facts
+        if isinstance(facts, AuditFacts) and facts.decided is None and not ticket.closed:
+            facts.decided = (outcome, error_code if error_code is not None else facts.error_code)
+
     async def publish(
         self, ticket: RequestTicket, outcome: Outcome, *, error_code: str | None = None
     ) -> None:
-        """Write the record if still open; the first outcome decided sticks. Never raises
-        an ``Exception``: a failed write is logged by type and left open for a retry."""
+        """Decide the record's outcome if nothing has, then write it; refused once the
+        ticket is closed. Never raises an ``Exception``: a failed write is left for the
+        close to retry."""
         facts = ticket.audit_facts
-        if not isinstance(facts, AuditFacts) or facts.published or facts.publishing:
+        if not isinstance(facts, AuditFacts) or ticket.closed:
             return
         if facts.decided is None:
-            if outcome == "ok" and ticket.cancelled:
+            restoration_failure = outcome == "failed" and error_code == E_INTERNAL
+            if ticket.cancelled and not restoration_failure:
                 outcome, error_code = "cancelled", E_CLIENT_DISCONNECTED
             facts.decided = (outcome, error_code if error_code is not None else facts.error_code)
-        await self._write(ticket, facts)
+        if facts.attempts == 0:
+            await self._write(ticket, facts, last=False)
 
     async def drain(self) -> None:
-        """Wait for the records the ticket closes started."""
-        while self._closing:
-            await asyncio.wait(set(self._closing))
+        """Wait for every write started so far, and the retries they leave behind."""
+        while self._closing or self._writing:
+            if self._closing:
+                await asyncio.wait(set(self._closing))
+            else:
+                await next(iter(self._writing)).wait()
 
-    async def _write(self, ticket: RequestTicket, facts: AuditFacts) -> None:
+    async def _write(self, ticket: RequestTicket, facts: AuditFacts, *, last: bool) -> None:
         if facts.published or facts.publishing or facts.decided is None:
             return
         decided, code = facts.decided
         latency_ms = max(0, int((time.monotonic() - facts.started) * 1000))
         record = TerminalRecord(facts, decided, code, latency_ms)
         facts.publishing = True
+        facts.attempts += 1
+        # A close's write is tracked by its task; the response path's by this event.
+        writing = asyncio.Event()
+        if not last:
+            self._writing.add(writing)
+        failure: type[BaseException] | None = None
         try:
             await self._emit(record)
         except AuditWriteAmbiguousError:
             # It may have landed: a second write could duplicate it.
             facts.published = True
-            self._failed(ticket, decided, AuditWriteAmbiguousError)
+            logger.error(
+                "gateway_terminal_audit_ambiguous request_id=%s outcome=%s",
+                ticket.gateway_id,
+                decided,
+            )
         except Exception as exc:
-            self._failed(ticket, decided, type(exc))
+            failure = type(exc)
+        except BaseException as exc:
+            failure = type(exc)
+            raise
         else:
             facts.published = True
         finally:
             facts.publishing = False
-            pending, facts.close_pending = facts.close_pending, None
-            if pending is not None and not facts.published:
-                facts.decided = pending
-                self._schedule(ticket, facts)
+            retry, facts.retry_on_failure = facts.retry_on_failure, False
+            try:
+                if not facts.published:
+                    self._not_written(ticket, facts, decided, failure, last=last, retry=retry)
+            finally:
+                self._writing.discard(writing)
+                writing.set()
+
+    def _not_written(
+        self,
+        ticket: RequestTicket,
+        facts: AuditFacts,
+        outcome: str,
+        failure: type[BaseException] | None,
+        *,
+        last: bool,
+        retry: bool,
+    ) -> None:
+        error = failure.__name__ if failure is not None else "unknown"
+        if last:
+            if failure is not None and not issubclass(failure, (Exception, asyncio.CancelledError)):
+                # Escapes the task: ``_closed`` logs and counts it.
+                return
+            self._lost(ticket, outcome, error)
+            return
+        # Type only: an exception message can quote request content.
+        logger.error(
+            "gateway_terminal_audit_failed request_id=%s outcome=%s error=%s",
+            ticket.gateway_id,
+            outcome,
+            error,
+        )
+        if retry:
+            # The close already came: the retry cannot wait for it.
+            self._schedule(ticket, facts)
+
+    def _lost(self, ticket: RequestTicket, outcome: str, error: str) -> None:
+        # Type only: an exception message can quote request content.
+        logger.error(
+            "gateway_terminal_audit_lost request_id=%s outcome=%s error=%s",
+            ticket.gateway_id,
+            outcome,
+            error,
+        )
+        self._count_failure()
+
+    def _count_failure(self) -> None:
+        try:
+            (self._metrics or get_exporter()).record_failure(COMPONENT)
+        except Exception as metrics_exc:
+            logger.error("terminal_audit_metrics_error error=%s", type(metrics_exc).__name__)
 
     def _on_close(self, ticket: RequestTicket) -> None:
         facts = ticket.audit_facts
         if not isinstance(facts, AuditFacts) or facts.published:
             return
-        if facts.publishing:
-            # The write in flight may still fail: the close's outcome is its fallback.
-            facts.close_pending = _closing_outcome(ticket)
-            return
         if facts.decided is None:
             facts.decided = _closing_outcome(ticket)
+        if facts.publishing:
+            # The write in flight is the response path's; its failure gets the retry.
+            facts.retry_on_failure = True
+            return
         self._schedule(ticket, facts)
 
     def _schedule(self, ticket: RequestTicket, facts: AuditFacts) -> None:
-        # Owned by no request: the fall-through write starts from the request's own task.
-        task = spawn_shared(self._write(ticket, facts))
+        # Owned by no request: the write starts from the request's own task.
+        task = spawn_shared(self._write(ticket, facts, last=True))
         self._closing.add(task)
         task.add_done_callback(lambda done: self._closed(ticket, done))
 
@@ -221,7 +316,7 @@ class TerminalAudit:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is None:
+        if exc is None or isinstance(exc, Exception):
             return
         # Type only: an exception message can quote request content.
         logger.error(
@@ -229,19 +324,7 @@ class TerminalAudit:
             ticket.gateway_id,
             type(exc).__name__,
         )
-        try:
-            (self._metrics or get_exporter()).record_failure(COMPONENT)
-        except Exception as metrics_exc:
-            logger.error("terminal_audit_metrics_error error=%s", type(metrics_exc).__name__)
-
-    @staticmethod
-    def _failed(ticket: RequestTicket, outcome: str, error: type[BaseException]) -> None:
-        logger.error(
-            "gateway_terminal_audit_failed request_id=%s outcome=%s error=%s",
-            ticket.gateway_id,
-            outcome,
-            error.__name__,
-        )
+        self._count_failure()
 
 
 def _closing_outcome(ticket: RequestTicket) -> tuple[Outcome, str]:

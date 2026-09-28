@@ -62,7 +62,6 @@ from tests.litellm_hook._dispatch_fixtures import (
     OptionAPreCall,
     StubUpstream,
     build_ours,
-    register_response_mapping,
 )
 from tests.test_litellm_hook import _data_with_token
 
@@ -183,7 +182,7 @@ def sse_app(
 
 def mounted(app: ASGIApp, mappings: ResponseMappings, **kwargs: Any) -> ASGIApp:
     """The prototype, with the mapping registered for whichever ticket the request runs in."""
-    middleware = DesanitizeMiddleware(app, mappings, enabled=True, **kwargs)
+    middleware = DesanitizeMiddleware(app, mappings, **kwargs)
 
     async def with_mapping(scope: Any, receive: Any, send: Any) -> None:
         ticket = current_ticket()
@@ -461,7 +460,7 @@ async def test_concurrent_requests_restore_with_their_own_mapping() -> None:
     first, second = RequestTicket("a" * 32), RequestTicket("b" * 32)
     mappings.register(first, MAPPING)
     mappings.register(second, other)
-    middleware = DesanitizeMiddleware(slow, mappings, enabled=True)
+    middleware = DesanitizeMiddleware(slow, mappings)
 
     a, b = await asyncio.gather(drive(middleware, first), drive(middleware, second))
 
@@ -500,35 +499,40 @@ async def test_the_mapping_is_released_on_the_final_body_before_the_app_returns(
 async def test_audit_before_response_start_does_not_lose_the_mapping() -> None:
     """Contract (ii), made deterministic: litellm flushes deferred success logging right
     after ``post_call_success_hook`` (common_request_processing.py:2629-2632), before the
-    header hook and the ASGI send. Here ``audit()`` completes first: ``_mark_audited`` pops
-    ``_req_state``, so today's callback reversal would find no state and return the
-    placeholders; the middleware still restores from the mapping it owns.
+    header hook and the ASGI send. Here ``audit()`` completes first: it neither releases the
+    mapping the pre-call handed the ticket nor writes a record of its own; it only adds the
+    token counts. The middleware restores, and the terminal record is the one record.
     """
     guardrail, sink = build_ours()
     mappings = ResponseMappings()
+    guardrail.bind_response_mappings(mappings)
+    records = Records()
     ticket = RequestTicket("c" * 32)
     token = _TICKET.set(ticket)
     try:
         data = _data_with_token("tok-1", content=f"write to {EMAIL}")
         data["litellm_call_id"] = "call-1"
         await guardrail.pre_call(data)
-        register_response_mapping(guardrail, mappings, data)
     finally:
         _TICKET.reset(token)
-    assert ticket in mappings
+    assert ticket in mappings and "call-1" not in guardrail._req_state
     now = datetime.now(UTC)
+    usage = {"usage": {"prompt_tokens": TOKEN_COUNTS[0], "completion_tokens": TOKEN_COUNTS[1]}}
 
     async def audited_then_answers(scope: Any, receive: Any, send: Any) -> None:
-        await guardrail.audit(data, None, now, now, status="ok")
-        assert "call-1" not in guardrail._req_state
-        unrestored = await guardrail.post_call_unary(data, dict(CHAT))
-        assert unrestored == CHAT
+        await guardrail.audit(data, usage, now, now, status="ok")
+        assert ticket in mappings and sink.records == []
         await json_app(CHAT)(scope, receive, send)
 
-    sent = await drive(DesanitizeMiddleware(audited_then_answers, mappings, enabled=True), ticket)
+    sent = await drive(
+        DesanitizeMiddleware(audited_then_answers, mappings, terminal=TerminalAudit(records)),
+        ticket,
+    )
 
-    assert [r["status"] for r in sink.records] == ["ok"]
     assert EMAIL in body_of(sent).decode()
+    assert sink.records == [] and records.outcomes == [("ok", None)]
+    event = records.records[0].event()
+    assert (event.prompt_token_count, event.completion_token_count) == TOKEN_COUNTS
     assert len(mappings) == 0
 
 
@@ -577,9 +581,9 @@ async def test_stream_abort_releases_the_mapping_and_logs_no_content(
         assert ticket is not None
         registered.append(ticket)
         mappings.register(ticket, MAPPING)
-        await DesanitizeMiddleware(
-            sse_app(_stream_for(kind), after_last=hang.wait), mappings, enabled=True
-        )(scope, receive_, send_)
+        await DesanitizeMiddleware(sse_app(_stream_for(kind), after_last=hang.wait), mappings)(
+            scope, receive_, send_
+        )
 
     limiter = InflightLimiter(0, metrics=NoopExporter(), cancel_grace_s=1.0)
 
@@ -803,13 +807,11 @@ async def test_a_raising_failure_reporter_still_closes_the_stream(
 
 
 def _broken_restore_json(mappings: ResponseMappings) -> ASGIApp:
-    return DesanitizeMiddleware(
-        json_app(CHAT), mappings, enabled=True, restore_json=_raising_restore
-    )
+    return DesanitizeMiddleware(json_app(CHAT), mappings, restore_json=_raising_restore)
 
 
 def _unbuildable_restorer(mappings: ResponseMappings) -> ASGIApp:
-    return DesanitizeMiddleware(sse_app(_anthropic_chunks()), mappings, enabled=True)
+    return DesanitizeMiddleware(sse_app(_anthropic_chunks()), mappings)
 
 
 @pytest.mark.parametrize(
@@ -878,7 +880,7 @@ async def test_restoration_failure_never_reaches_litellms_handler(
         upstream,
         [OptionAPreCall(engine, mappings)],
         wrap=lambda app: DesanitizeMiddleware(
-            app, mappings, enabled=True, restore_json=_raising_restore, metrics=metrics
+            app, mappings, restore_json=_raising_restore, metrics=metrics
         ),
     )
 
@@ -931,7 +933,7 @@ async def test_after_start_failure_tears_the_upstream_down(
             monkeypatch,
             stub,
             [OptionAPreCall(engine, mappings)],
-            wrap=lambda app: DesanitizeMiddleware(app, mappings, enabled=True),
+            wrap=lambda app: DesanitizeMiddleware(app, mappings),
         )
         exchange = await harness.send("messages", stream=True)
         loop = asyncio.get_running_loop()
@@ -945,23 +947,35 @@ async def test_after_start_failure_tears_the_upstream_down(
     assert stub.stream_outcomes == ["broken"]
 
 
-def test_the_prototype_is_not_wired() -> None:
-    """Flagged off by default and imported by nothing under ``src/``."""
-    importers = [
-        path.relative_to(ROOT)
+def test_the_middleware_is_wired_in_the_entrypoint_with_no_off_switch() -> None:
+    """Imported by ``asgi.py`` (and nothing else under ``src/`` builds one), and it takes
+    no flag that would switch restoration off: the security boundary has no off switch."""
+    import inspect
+
+    importers = sorted(
+        str(path.relative_to(ROOT))
         for path in (ROOT / "src").rglob("*.py")
-        if "desanitize_middleware" in path.read_text() and path.name != "desanitize_middleware.py"
-    ]
-    assert importers == []
-    assert DesanitizeMiddleware(json_app(CHAT), ResponseMappings())._enabled is False
+        if "DesanitizeMiddleware(" in path.read_text() and path.name != "desanitize_middleware.py"
+    )
+    assert importers == ["src/corp_llm_gateway/asgi.py"]
+    assert "enabled" not in inspect.signature(DesanitizeMiddleware).parameters
 
 
-async def test_disabled_it_passes_everything_through() -> None:
+async def test_outside_a_ticketed_request_it_passes_everything_through() -> None:
+    """Only the limiter's requests carry a ticket; anything else is not a rewritten route."""
     mappings = ResponseMappings()
     ticket = RequestTicket("d" * 32)
     mappings.register(ticket, MAPPING)
+    middleware = DesanitizeMiddleware(json_app(CHAT), mappings)
+    sent: list[Message] = []
 
-    sent = await drive(DesanitizeMiddleware(json_app(CHAT), mappings), ticket)
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message: Message) -> None:
+        sent.append(dict(message))
+
+    await middleware(_scope(), receive, send)
 
     assert json.loads(body_of(sent)) == CHAT
 
@@ -1207,7 +1221,6 @@ async def test_responses_tails_go_out_before_the_end_never_after(ending: str) ->
         DesanitizeMiddleware(
             with_facts(sse_app(chunks), mappings),
             mappings,
-            enabled=True,
             terminal=TerminalAudit(records),
         )
     )
@@ -1299,7 +1312,6 @@ async def test_a_provider_error_mid_stream_flushes_the_held_tail_first(family: s
         DesanitizeMiddleware(
             with_facts(sse_app(chunks), mappings),
             mappings,
-            enabled=True,
             terminal=TerminalAudit(records),
         )
     )
@@ -1345,7 +1357,6 @@ async def test_an_app_that_raises_mid_stream_still_gets_the_restored_tail_out() 
     middleware = DesanitizeMiddleware(
         with_facts(byte_app([held.encode()], raise_after=boom), mappings),
         mappings,
-        enabled=True,
         terminal=TerminalAudit(records),
     )
 
@@ -1385,9 +1396,9 @@ async def test_the_app_error_stays_the_error_when_the_tail_send_fails_too() -> N
     token = _TICKET.set(ticket)
     try:
         with pytest.raises(RuntimeError) as raised:
-            await DesanitizeMiddleware(
-                byte_app([held.encode()], raise_after=boom), mappings, enabled=True
-            )(_scope(), receive, send)
+            await DesanitizeMiddleware(byte_app([held.encode()], raise_after=boom), mappings)(
+                _scope(), receive, send
+            )
     finally:
         _TICKET.reset(token)
 
@@ -1478,7 +1489,7 @@ async def test_closing_the_ticket_releases_the_mapping_and_the_restorer(
     del mapped
     hang = asyncio.Event()
     middleware = DesanitizeMiddleware(
-        sse_app(_stream_for("responses"), after_last=hang.wait), mappings, enabled=True
+        sse_app(_stream_for("responses"), after_last=hang.wait), mappings
     )
     task = asyncio.create_task(drive(middleware, ticket))
     while not restorers:
@@ -1519,6 +1530,7 @@ async def test_cancellation_resistant_requests_leave_nothing_behind(
     limiter = InflightLimiter(0, metrics=NoopExporter(), cancel_grace_s=0.05)
     limiter.bind_cancel_hook(guardrail.on_request_cancelled)
     mappings = TrackedMappings()
+    guardrail.bind_response_mappings(mappings)
     records = Records()
     terminal = TerminalAudit(records)
     stop = asyncio.Event()
@@ -1535,12 +1547,10 @@ async def test_cancellation_resistant_requests_leave_nothing_behind(
         data = _data_with_token("tok-1", content=f"write to {EMAIL}")
         data["litellm_call_id"] = f"call-{uuid.uuid4().hex}"
         await guardrail.pre_call(data)
-        register_response_mapping(guardrail, mappings, data)
         sizes.append(len(mappings))
         stream = DesanitizeMiddleware(
             sse_app(_stream_for("anthropic"), after_last=resist),
             mappings,
-            enabled=True,
             terminal=terminal,
         )
         await stream(scope, receive, send)
@@ -1562,8 +1572,9 @@ async def test_cancellation_resistant_requests_leave_nothing_behind(
         restore_factory()
 
     assert sizes == [1] * n and len(restorers) == n
+    # One record per request: the ticket's; the guardrail's cancel hook only clears state.
     assert records.outcomes == [("cancelled", "E_CLIENT_DISCONNECTED")] * n
-    assert [r["status"] for r in sink.records] == ["cancelled"] * n
+    assert sink.records == []
     assert ORIGINAL_MARK not in caplog.text
 
 
@@ -1582,9 +1593,7 @@ async def test_a_callback_before_the_response_adds_to_the_one_record() -> None:
         await json_app(CHAT)(scope, receive, send)
 
     sent = await drive(
-        DesanitizeMiddleware(
-            with_facts(app, mappings), mappings, enabled=True, terminal=TerminalAudit(records)
-        )
+        DesanitizeMiddleware(with_facts(app, mappings), mappings, terminal=TerminalAudit(records))
     )
 
     assert EMAIL in body_of(sent).decode()
@@ -1608,7 +1617,7 @@ async def test_a_callback_after_the_response_changes_nothing() -> None:
     ticket = RequestTicket("b1" * 16)
     terminal = TerminalAudit(records)
     await drive(
-        DesanitizeMiddleware(with_facts(app, mappings), mappings, enabled=True, terminal=terminal),
+        DesanitizeMiddleware(with_facts(app, mappings), mappings, terminal=terminal),
         ticket,
     )
     ticket.close()
@@ -1631,7 +1640,6 @@ async def test_a_restoration_failure_is_one_failed_internal_record(
         middleware = DesanitizeMiddleware(
             with_facts(inner, mappings),
             mappings,
-            enabled=True,
             restore_json=_raising_restore,
             terminal=TerminalAudit(records),
         )
@@ -1640,7 +1648,6 @@ async def test_a_restoration_failure_is_one_failed_internal_record(
         middleware = DesanitizeMiddleware(
             with_facts(sse_app(_anthropic_chunks()), mappings),
             mappings,
-            enabled=True,
             terminal=TerminalAudit(records),
         )
     ticket = RequestTicket("c1" * 16)
@@ -1677,7 +1684,6 @@ async def test_a_cancel_before_the_final_body_takes_precedence_over_ok() -> None
         await DesanitizeMiddleware(
             with_facts(sse_app(_stream_for("chat"), after_last=hang.wait), mappings),
             mappings,
-            enabled=True,
             terminal=terminal,
         )(scope, receive_, send_)
 
@@ -1701,9 +1707,7 @@ async def test_a_failed_terminal_write_is_retried_at_close_and_written_once(
 
     with caplog.at_level(logging.DEBUG):
         await drive(
-            DesanitizeMiddleware(
-                with_facts(json_app(CHAT), mappings), mappings, enabled=True, terminal=terminal
-            ),
+            DesanitizeMiddleware(with_facts(json_app(CHAT), mappings), mappings, terminal=terminal),
             ticket,
         )
         assert records.records == []
@@ -1712,6 +1716,16 @@ async def test_a_failed_terminal_write_is_retried_at_close_and_written_once(
 
     assert records.outcomes == [("ok", None)]
     assert CANARY not in caplog.text
+
+
+# The stub's usage (7 in, 2 out) on every flow but chat SSE, which carries no usage
+# chunk unless the client asks for one (see the next test); its counts are whatever
+# litellm's success log deposited if it ran before the final body, else 0.
+STUB_USAGE = {
+    (route, stream): None if (route, stream) == ("chat", True) else (7, 2)
+    for route in ("chat", "messages", "responses")
+    for stream in (False, True)
+}
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
@@ -1729,7 +1743,7 @@ async def test_over_litellms_app_the_terminal_record_keeps_todays_counts(
         monkeypatch,
         upstream,
         [OptionAPreCall(engine, mappings)],
-        wrap=lambda app: DesanitizeMiddleware(app, mappings, enabled=True, terminal=terminal),
+        wrap=lambda app: DesanitizeMiddleware(app, mappings, terminal=terminal),
     )
 
     exchange = await harness.send(route, stream=stream)
@@ -1737,14 +1751,47 @@ async def test_over_litellms_app_the_terminal_record_keeps_todays_counts(
 
     assert exchange.status == 200 and ORIGINAL_MARK in exchange.text
     (record,) = records.records
-    (today,) = [r for r in sink.records if r["status"] == "ok"]
+    # The guardrail writes nothing of its own: exactly one record per request.
+    assert sink.records == []
     event = record.event()
     assert record.outcome == "ok"
-    assert event.request_id == today["request_id"]
-    assert (event.user_id, event.team_id) == (today["user_id"], today["team_id"])
-    assert event.redaction_count == today["redaction_count"] == 1
-    assert event.finding_label_counts == today["finding_label_counts"]
+    assert event.request_id == exchange.ticket.call_ids[0]  # type: ignore[union-attr]
+    assert (event.user_id, event.team_id) == ("alice", "t1")
+    assert event.redaction_count == 1
+    assert event.finding_label_counts == {"EMAIL": 1}
+    assert event.placeholder_list == (PLACEHOLDER,)
+    expected_usage = STUB_USAGE[(route, stream)]
+    if expected_usage is not None:
+        # Read off the response by the middleware, whenever litellm's log runs.
+        assert (event.prompt_token_count, event.completion_token_count) == expected_usage
     assert len(mappings) == 0
+
+
+async def test_chat_sse_usage_reaches_the_record_when_the_client_asks_for_it(
+    monkeypatch: pytest.MonkeyPatch, upstream: StubUpstream
+) -> None:
+    """``stream_options.include_usage``: the provider's usage chunk passes litellm and the
+    middleware reads it; the record carries it (and exactly once: never summed with a
+    success log that might have run first)."""
+    mappings = ResponseMappings()
+    records = Records()
+    engine, sink = build_ours()
+    harness = DispatchHarness(
+        monkeypatch,
+        upstream,
+        [OptionAPreCall(engine, mappings)],
+        wrap=lambda app: DesanitizeMiddleware(app, mappings, terminal=TerminalAudit(records)),
+    )
+
+    exchange = await harness.send(
+        "chat", stream=True, extra={"stream_options": {"include_usage": True}}
+    )
+
+    assert exchange.status == 200 and ORIGINAL_MARK in exchange.text
+    (record,) = records.records
+    event = record.event()
+    assert (event.prompt_token_count, event.completion_token_count) == (7, 2)
+    assert sink.records == []
 
 
 # ── boundaries, across the three families ────────────────────────────────────
@@ -1914,7 +1961,6 @@ async def test_a_client_send_failing_after_an_after_start_failure_chains_no_cont
     middleware = DesanitizeMiddleware(
         sse_app(_family_stream("anthropic")),
         mappings,
-        enabled=True,
         on_failure=reporter if fail_at == "reporter-then-send" else None,
         metrics=_Failures(),
     )
@@ -1951,7 +1997,7 @@ async def test_a_provider_error_after_the_mapping_was_registered_passes_and_rele
         monkeypatch,
         failing_upstream,
         [OptionAPreCall(engine, mappings)],
-        wrap=lambda app: DesanitizeMiddleware(app, mappings, enabled=True, terminal=terminal),
+        wrap=lambda app: DesanitizeMiddleware(app, mappings, terminal=terminal),
     )
 
     exchange = await harness.send(route, stream=stream)
@@ -2093,13 +2139,13 @@ async def test_restoration_does_not_depend_on_cache_b(monkeypatch: pytest.Monkey
 
     guardrail, _ = build_ours()
     mappings = ResponseMappings()
+    guardrail.bind_response_mappings(mappings)
     ticket = RequestTicket("f1" * 16)
     token = _TICKET.set(ticket)
     try:
         data = _data_with_token("tok-1", content=f"write to {EMAIL}")
         data["litellm_call_id"] = "call-cache-b"
         await guardrail.pre_call(data)
-        register_response_mapping(guardrail, mappings, data)
     finally:
         _TICKET.reset(token)
     store = guardrail.orchestrator._mapping_store  # type: ignore[union-attr]
@@ -2111,6 +2157,6 @@ async def test_restoration_does_not_depend_on_cache_b(monkeypatch: pytest.Monkey
         assert await store.get_original(conversation, placeholder) is None
     guardrail._req_state.clear()
 
-    sent = await drive(DesanitizeMiddleware(json_app(CHAT), mappings, enabled=True), ticket)
+    sent = await drive(DesanitizeMiddleware(json_app(CHAT), mappings), ticket)
 
     assert EMAIL in body_of(sent).decode()

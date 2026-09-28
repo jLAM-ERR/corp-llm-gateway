@@ -1,25 +1,29 @@
-"""NOT WIRED: restore originals in the response at the ASGI layer (plan 20260926,
-Option A). ``asgi.py`` does not import it and ``enabled`` defaults to False.
+"""Restore originals in the response at the ASGI layer: the gateway's one reversal.
 
-Sits between the in-flight limiter and litellm's app and wraps ``send`` only (``receive``
-belongs to the limiter). Restoration state is keyed by the gateway ``RequestTicket`` and
-owned here, never by ``audit()``: the mapping is released on the final body in every mode
-(restored, non-2xx, pass-through), when the request unwinds, and at the ticket's close,
-which the limiter reaches after its grace even if the downstream never unwinds; the
-restorer's buffers go with it. A mapping offered for a cancelled or closed ticket is
-refused.
+``asgi.py`` mounts it inside the in-flight limiter (it needs the request's ticket), in
+front of litellm's app, with no off switch. It wraps ``send`` only (``receive`` belongs to
+the limiter), so litellm and every callback in it only ever see placeholders; the client
+gets the originals. Restoration state is keyed by the gateway ``RequestTicket`` (the
+guardrail's pre-call registers the response mapping there) and owned here, never by an
+audit: the mapping is released on the final body in every mode (restored, non-2xx,
+pass-through), when the request unwinds, and at the ticket's close, which the limiter
+reaches after its grace even if the downstream never unwinds; the restorer's buffers go
+with it. A mapping offered for a cancelled or closed ticket is refused.
 
 A restoration failure never raises into litellm's app: before ``http.response.start`` it
 answers a content-free 500, after it the events already restored are sent and the stream
 is closed without a message. Either way it is reported (content-free log line +
-``gateway_failure{component="desanitize"}``). The audit does not learn about it from a
-marker: litellm's success event can be written before the marker is set. The terminal
-record is published once through ``terminal_audit.TerminalAudit``, here at the final body
-or the failure, and at the ticket's close for a request that got neither.
+``gateway_failure{component="desanitize"}``). The terminal record is published once
+through ``terminal_audit.TerminalAudit``, here at the final body or the failure, and at
+the ticket's close for a request that got neither. Token counts for that record are read
+from the 2xx response as it passes (the JSON body's ``usage``; in a stream the chat usage
+chunk, Anthropic's ``message_start`` / ``message_delta`` or Responses'
+``response.completed``), in every mode.
 
 ``Content-Encoding``: a response carrying one passes through untouched (placeholders,
 never originals); ``compressor_problems`` is the arm check that nothing in the served
-stack compresses a response before it reaches this middleware.
+stack compresses a response before it reaches this middleware. Responses events are
+renumbered (``sequence_number``) whenever the restorer changes the event count.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from typing import Any
 
 from corp_llm_gateway.metrics import MetricsExporter, get_exporter
 from corp_llm_gateway.route_gate.inflight import RequestTicket, current_ticket
-from corp_llm_gateway.route_gate.terminal_audit import Outcome, TerminalAudit
+from corp_llm_gateway.route_gate.terminal_audit import Outcome, TerminalAudit, deposit_usage
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
 from corp_llm_gateway.sanitizer.streaming import (
     ResponsesStreamDesanitizer,
@@ -62,6 +66,8 @@ INTERNAL_ERROR_BODY = json.dumps(
 
 _SSE_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
 _COMPRESSORS = ("gzip", "brotli", "zstd", "deflate", "compress")
+# A pass-through JSON body past this is forwarded without reading its usage.
+_USAGE_BODY_CAP = 8 * 1024 * 1024
 
 
 class ResponseMappings:
@@ -139,7 +145,6 @@ class DesanitizeMiddleware:
         app: ASGIApp,
         mappings: ResponseMappings,
         *,
-        enabled: bool = False,
         restore_json: RestoreJson | None = None,
         metrics: MetricsExporter | None = None,
         on_failure: FailureReporter | None = None,
@@ -147,7 +152,6 @@ class DesanitizeMiddleware:
     ) -> None:
         self.app = app
         self._mappings = mappings
-        self._enabled = enabled
         self._restore_json = restore_json or _default_restore_json
         self._metrics = metrics
         self._on_failure = on_failure or self._report_failure
@@ -164,7 +168,7 @@ class DesanitizeMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         ticket = current_ticket() if scope.get("type") == "http" else None
-        if not self._enabled or ticket is None:
+        if ticket is None:
             await self.app(scope, receive, send)
             return
         response = _Response(
@@ -209,6 +213,9 @@ class _Response:
         self._mapping: StrategyResult | None = None
         self._body = bytearray()
         self._sse: _SseRestorer | None = None
+        self._usage = _Usage()
+        # Pass mode: what is read of a 2xx body for its usage, forwarded untouched.
+        self._tap: _UsageTap | None = None
 
     def close(self, _ticket: RequestTicket | None = None) -> None:
         """Drop everything restoration holds; later messages are not sent."""
@@ -217,6 +224,7 @@ class _Response:
         self._mapping = None
         self._start = None
         self._sse = None
+        self._tap = None
         self._body.clear()
 
     async def send(self, message: Message) -> None:
@@ -231,6 +239,9 @@ class _Response:
             return
         more = bool(message.get("more_body", False))
         if self._mode == "pass":
+            tap = self._tap
+            if tap is not None:
+                tap.feed(bytes(message.get("body") or b""), final=not more, usage=self._usage)
             if more:
                 await self._send(message)
                 return
@@ -276,14 +287,12 @@ class _Response:
         self._status = int(message.get("status") or 0)
         content_type = _header(message, b"content-type").lower()
         encoding = _header(message, b"content-encoding").strip().lower()
-        if (
-            mapping is None
-            or not mapping.pairs
-            or not 200 <= self._status < 300
-            or encoding not in ("", "identity")
-        ):
+        identity = encoding in ("", "identity")
+        if mapping is None or not mapping.pairs or not 200 <= self._status < 300 or not identity:
             self._mode = "pass"
             self._mappings.release(self._ticket)
+            if 200 <= self._status < 300 and identity:
+                self._tap = _UsageTap.for_content_type(content_type)
             await self._send(message)
             return
         self._mapping = mapping
@@ -291,6 +300,7 @@ class _Response:
             failure: type[BaseException] | None = None
             try:
                 self._sse = _SseRestorer(mapping)
+                self._usage = self._sse.usage
             except Exception as exc:
                 failure = type(exc)
             # Answered outside the handler, as in _finish_unary.
@@ -316,6 +326,7 @@ class _Response:
         failure: type[BaseException] | None = None
         try:
             payload = json.loads(bytes(self._body))
+            self._usage.observe(payload)
             restored = self._restore_json(payload, mapping)
             body = json.dumps(restored, ensure_ascii=False, separators=(",", ":")).encode()
         except Exception as exc:
@@ -381,12 +392,19 @@ class _Response:
         await self._publish("failed", E_INTERNAL)
 
     async def _publish(self, outcome: Outcome, error_code: str | None = None) -> None:
-        if self._terminal is not None:
-            await self._terminal.publish(self._ticket, outcome, error_code=error_code)
+        if self._terminal is None:
+            return
+        counts = self._usage.counts(self._ticket)
+        if counts is not None:
+            deposit_usage(self._ticket, *counts)
+        await self._terminal.publish(self._ticket, outcome, error_code=error_code)
 
     def _failed(self, phase: str, error_type: type[BaseException]) -> None:
         self._mappings.mark_failed(self._ticket)
         self._mappings.release(self._ticket)
+        if self._terminal is not None:
+            # Decided before anything is sent: a send that fails cannot change it.
+            self._terminal.decide(self._ticket, "failed", error_code=E_INTERNAL)
         try:
             self._on_failure(self._ticket.gateway_id, phase, error_type)
         except Exception as exc:
@@ -412,6 +430,7 @@ class _SseRestorer:
         self._event_lines = False
         # An error event or ``response.failed`` went out: the response did not succeed.
         self.saw_error = False
+        self.usage = _Usage()
 
     def feed(self, chunk: bytes) -> None:
         """Restore every complete event; if one raises, those before it stay in ``take()``."""
@@ -435,6 +454,7 @@ class _SseRestorer:
     def _event(self, event: str) -> list[str]:
         data = _data_field(event)
         payload = _json_or_none(data)
+        self.usage.observe(payload)
         head: list[str] = []
         if data == "[DONE]" or is_stream_error_event(payload):
             self.saw_error = self.saw_error or data != "[DONE]"
@@ -452,6 +472,107 @@ class _SseRestorer:
 
     def _responses_tails(self) -> list[str]:
         return [_frame(json.loads(item), self._event_lines) for item in self._responses.flush()]
+
+
+class _Usage:
+    """Token counts seen in a response; each observation replaces what it names."""
+
+    def __init__(self) -> None:
+        self.prompt: int | None = None
+        self.completion: int | None = None
+
+    def observe(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        for holder in (payload, payload.get("message"), payload.get("response")):
+            usage = holder.get("usage") if isinstance(holder, dict) else None
+            if isinstance(usage, dict):
+                self._take(usage)
+
+    def counts(self, ticket: RequestTicket) -> tuple[int, int] | None:
+        """What to deposit; a side the response never named keeps the facts' value."""
+        if self.prompt is None and self.completion is None:
+            return None
+        facts = ticket.audit_facts
+        prompt = self.prompt if self.prompt is not None else getattr(facts, "prompt_tokens", 0)
+        completion = (
+            self.completion
+            if self.completion is not None
+            else getattr(facts, "completion_tokens", 0)
+        )
+        return prompt, completion
+
+    def _take(self, usage: dict[str, Any]) -> None:
+        prompt = _count(usage, "prompt_tokens", "input_tokens")
+        completion = _count(usage, "completion_tokens", "output_tokens")
+        if prompt is not None:
+            self.prompt = prompt
+        if completion is not None:
+            self.completion = completion
+
+
+def _count(usage: dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        value = usage.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+class _UsageTap:
+    """Reads the usage of a 2xx body it does not restore; the bytes go out untouched."""
+
+    def __init__(self, sse: bool) -> None:
+        self._sse = sse
+        self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+        self._buffer = ""
+        self._body = bytearray()
+        self._over = False
+
+    @classmethod
+    def for_content_type(cls, content_type: str) -> _UsageTap | None:
+        if content_type.startswith("text/event-stream"):
+            return cls(sse=True)
+        if "json" in content_type:
+            return cls(sse=False)
+        return None
+
+    def feed(self, chunk: bytes, *, final: bool, usage: _Usage) -> None:
+        try:
+            if self._sse:
+                self._feed_sse(chunk, final, usage)
+            else:
+                self._feed_json(chunk, final, usage)
+        except Exception as exc:
+            # Counts only: a response it cannot read keeps the counts it has.
+            logger.warning("gateway_desanitize_usage_unread error=%s", type(exc).__name__)
+            self._over = True
+
+    def _feed_json(self, chunk: bytes, final: bool, usage: _Usage) -> None:
+        if self._over:
+            return
+        if len(self._body) + len(chunk) > _USAGE_BODY_CAP:
+            self._over = True
+            self._body.clear()
+            return
+        self._body += chunk
+        if final:
+            usage.observe(_json_or_none(bytes(self._body).decode("utf-8", "replace")))
+            self._body.clear()
+
+    def _feed_sse(self, chunk: bytes, final: bool, usage: _Usage) -> None:
+        if self._over:
+            return
+        self._buffer += self._utf8.decode(chunk, final=final)
+        while (match := _SSE_BOUNDARY.search(self._buffer)) is not None:
+            event, self._buffer = self._buffer[: match.end()], self._buffer[match.end() :]
+            if '"usage"' in event:
+                usage.observe(_json_or_none(_data_field(event)))
+        if final and '"usage"' in self._buffer:
+            usage.observe(_json_or_none(_data_field(self._buffer)))
+        if len(self._buffer) > _USAGE_BODY_CAP:
+            self._over = True
+            self._buffer = ""
 
 
 def _data_field(event: str) -> str | None:

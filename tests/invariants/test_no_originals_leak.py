@@ -2168,14 +2168,57 @@ async def test_double_failure_backend_and_audit_sink_still_returns_opaque_500(
 # originate somewhere other than the token store (e.g. a RulesLoader).
 
 
+async def _restoration_failure_through_the_desanitiser(
+    guardrail: object, data: dict, app: object, *, send_fails: bool
+) -> tuple[list[dict], BaseException | None, ListSink]:
+    """Drive ``app``'s response through the ASGI desanitiser (the gateway's one reversal)
+    for a request whose pre-call handed it to a ticket; optionally the client's ``send``
+    fails too, so whatever escapes is the exception chain to inspect."""
+    from corp_llm_gateway.audit import AuditLogger
+    from corp_llm_gateway.route_gate.desanitize_middleware import DesanitizeMiddleware
+    from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
+    from tests.response_restore import drive, hand_over
+
+    mappings, ticket = hand_over(guardrail, data)  # type: ignore[arg-type]
+    records = ListSink()
+    middleware = DesanitizeMiddleware(
+        app,  # type: ignore[arg-type]
+        mappings,
+        terminal=TerminalAudit(emit_to(AuditLogger(records, gateway_version="0.0.1"))),
+    )
+    sent: list[dict] = []
+    escaped: BaseException | None = None
+    if send_fails:
+
+        async def failing_send(message: dict) -> None:
+            # The client is gone by the time the failure is answered or the stream ends.
+            final = message["type"] == "http.response.body" and not message.get("more_body")
+            if message.get("status") == 500 or final:
+                raise OSError("client connection reset")
+            sent.append(dict(message))
+
+        async def bound(scope: object, receive: object, send: object) -> None:
+            await middleware(scope, receive, failing_send)  # type: ignore[arg-type]
+
+        try:
+            await drive(bound, ticket, sent)
+        except BaseException as exc:
+            escaped = exc
+    else:
+        await drive(middleware, ticket, sent)
+    return sent, escaped, records
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("send_fails", [False, True], ids=["answered", "client-send-fails"])
 async def test_post_call_unary_unexpected_error_log_contains_no_raw_content(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, send_fails: bool
 ) -> None:
-    """(xvii) widened: post_call_unary runs after de-sanitization, so a raw
-    exception there could carry a real original in its message."""
+    """(xvii) widened: restoring a response runs after de-sanitization, so a raw
+    exception there could carry a real original in its message. The reversal (the ASGI
+    desanitiser) answers a content-free 500 ``E_INTERNAL``; no body, log line, record or
+    exception chain — even one a failing client ``send`` raises — carries the original."""
     import corp_llm_gateway.litellm_hook as hook_mod
-    from corp_llm_gateway.litellm_hook import GuardrailHttpException
 
     guardrail, sink = _tool_call_guardrail((("secret-alice", "[N1]"),))
     data = {
@@ -2188,42 +2231,47 @@ async def test_post_call_unary_unexpected_error_log_contains_no_raw_content(
     def _boom(response: object, mapping: object) -> object:
         raise RuntimeError("reconstruct failed for secret-alice")
 
-    original = hook_mod._apply_reverse_to_response
-    hook_mod._apply_reverse_to_response = _boom  # type: ignore[assignment]
-    try:
-        with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
-            await guardrail.post_call_unary(  # type: ignore[attr-defined]
-                data, {"choices": [{"message": {"content": "hello [N1]!"}}]}
-            )
-    finally:
-        hook_mod._apply_reverse_to_response = original
+    monkeypatch.setattr(hook_mod, "_apply_reverse_to_response", _boom)
+    body = json.dumps({"choices": [{"message": {"content": "hello [N1]!"}}]}).encode()
 
-    assert ei.value.status_code == 500
-    assert ei.value.error_code == "E_INTERNAL"
-    exc_text = str(ei.value)
-    assert "secret-alice" not in exc_text
+    async def app(scope: object, receive: object, send: object) -> None:
+        start = {"type": "http.response.start", "status": 200}
+        await send({**start, "headers": [(b"content-type", b"application/json")]})  # type: ignore[operator]
+        await send({"type": "http.response.body", "body": body, "more_body": False})  # type: ignore[operator]
+
+    with caplog.at_level(logging.INFO):
+        sent, escaped, records = await _restoration_failure_through_the_desanitiser(
+            guardrail, data, app, send_fails=send_fails
+        )
+
     assert "secret-alice" not in caplog.text
-    tb_text = _formatted_traceback(ei.value)
-    assert "secret-alice" not in tb_text, (
-        "original leaked via exception chain (__cause__/__context__)"
-    )
-
-    assert len(sink.records) == 1
-    serialized = json.dumps(sink.records[0])
-    assert "secret-alice" not in serialized
+    wire = b"".join(m.get("body", b"") for m in sent)
+    assert b"secret-alice" not in wire
+    if send_fails:
+        assert escaped is not None
+        tb_text = _formatted_traceback(escaped)
+        assert "secret-alice" not in tb_text, (
+            "original leaked via exception chain (__cause__/__context__)"
+        )
+    else:
+        assert escaped is None
+        assert json.loads(wire)["error"]["code"] == "E_INTERNAL"
+    (record,) = records.records
+    assert (record["status"], record["error_code"]) == ("failed", "E_INTERNAL")
+    assert "secret-alice" not in json.dumps(record)
+    assert sink.records == []
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("send_fails", [False, True], ids=["closed", "client-send-fails"])
 async def test_post_call_stream_own_bug_mid_stream_log_contains_no_raw_content(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, send_fails: bool
 ) -> None:
-    """(xvii) widened: a bug in OUR OWN desanitization work mid-stream — as
-    opposed to an upstream transport failure, which now propagates
-    unconverted (Major: the wrapper must not swallow upstream provider
-    errors) — must still be caught before any raw content in its
-    message/exception chain reaches the client/log/audit record."""
-    import corp_llm_gateway.litellm_hook as hook_mod
-    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+    """(xvii) widened: a bug in OUR OWN desanitization work mid-stream — as opposed to
+    an upstream transport failure, which propagates unconverted — is caught at the
+    reversal before any raw content in its message/exception chain reaches the client,
+    a log line, the audit record or an exception a failing client ``send`` raises."""
+    from corp_llm_gateway.route_gate import desanitize_middleware
 
     guardrail, sink = _tool_call_guardrail((("secret-alice", "[N1]"),))
     data = {
@@ -2232,36 +2280,49 @@ async def test_post_call_stream_own_bug_mid_stream_log_contains_no_raw_content(
         "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
     }
     await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    real_feed = desanitize_middleware.SseStreamDesanitizer.feed
+    fed = {"n": 0}
 
-    async def _good_iter():
-        yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
-        yield {"choices": [{"delta": {"content": " again [N1]"}}]}
+    def feed(self: object, event: object) -> object:
+        fed["n"] += 1
+        if fed["n"] > 1:
+            raise RuntimeError("desanitize bug for secret-alice")
+        return real_feed(self, event)  # type: ignore[arg-type]
 
-    def _boom(chunk: object) -> str | None:
-        raise RuntimeError("desanitize bug for secret-alice")
+    monkeypatch.setattr(desanitize_middleware.SseStreamDesanitizer, "feed", feed)
+    events = [
+        {"choices": [{"index": 0, "delta": {"content": "hello [N1] "}}]},
+        {"choices": [{"index": 0, "delta": {"content": " again [N1]"}}]},
+    ]
 
-    original = hook_mod._extract_chunk_text
-    hook_mod._extract_chunk_text = _boom  # type: ignore[assignment]
-    try:
-        with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
-            async for _chunk in guardrail.post_call_stream(data, _good_iter()):  # type: ignore[attr-defined]
-                pass
-    finally:
-        hook_mod._extract_chunk_text = original
+    async def app(scope: object, receive: object, send: object) -> None:
+        headers = [(b"content-type", b"text/event-stream")]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})  # type: ignore[operator]
+        for event in events:
+            chunk = ("data: " + json.dumps(event) + "\n\n").encode()
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})  # type: ignore[operator]
+        await send({"type": "http.response.body", "body": b"", "more_body": False})  # type: ignore[operator]
 
-    assert ei.value.status_code == 500
-    assert ei.value.error_code == "E_INTERNAL"
-    exc_text = str(ei.value)
-    assert "secret-alice" not in exc_text
+    with caplog.at_level(logging.INFO):
+        sent, escaped, records = await _restoration_failure_through_the_desanitiser(
+            guardrail, data, app, send_fails=send_fails
+        )
+
     assert "secret-alice" not in caplog.text
-    tb_text = _formatted_traceback(ei.value)
-    assert "secret-alice" not in tb_text, (
-        "original leaked via exception chain (__cause__/__context__)"
-    )
-
-    assert len(sink.records) == 1
-    serialized = json.dumps(sink.records[0])
-    assert "secret-alice" not in serialized
+    assert "gateway_desanitize_failed" in caplog.text
+    # The event restored before the failure is the client's; the failing one never goes out.
+    wire = b"".join(m.get("body", b"") for m in sent)
+    assert wire.count(b"secret-alice") <= 1 and b"again" not in wire
+    if escaped is not None:
+        tb_text = _formatted_traceback(escaped)
+        assert "secret-alice" not in tb_text, (
+            "original leaked via exception chain (__cause__/__context__)"
+        )
+    assert send_fails or escaped is None
+    (record,) = records.records
+    assert (record["status"], record["error_code"]) == ("failed", "E_INTERNAL")
+    assert "secret-alice" not in json.dumps(record)
+    assert sink.records == []
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,7 @@ def test_every_problem_has_a_log_reason() -> None:
         arm_checks.APPLY_GUARDRAIL,
         arm_checks.SCAN_RAW_REQUEST,
         arm_checks.RUN_IN_PARALLEL,
+        arm_checks.RESPONSE_COMPRESSOR,
         *arm_checks.DEBUG_PROBLEMS,
     }
     assert set(arm_checks.REASONS) == problems
@@ -97,3 +98,17 @@ def test_set_verbose_is_refused() -> None:
 
 def test_no_loggers_and_no_verbose_arms() -> None:
     assert arm_checks.debug_problems() == []
+
+
+def test_a_compressor_on_litellms_app_is_an_arm_problem() -> None:
+    """The desanitiser passes an encoded response through unrestored, so a compressor in
+    front of it would hand clients placeholders: the arm step refuses it (exit 70)."""
+    pytest.importorskip("starlette.middleware.gzip", reason="starlette is the asgi extra's")
+    from starlette.applications import Starlette
+    from starlette.middleware.gzip import GZipMiddleware
+
+    app = Starlette()
+    assert arm_checks.compressor_problem(app) == []
+
+    app.add_middleware(GZipMiddleware)
+    assert arm_checks.compressor_problem(app) == [arm_checks.RESPONSE_COMPRESSOR]

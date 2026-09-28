@@ -1322,7 +1322,15 @@ _IMPORT_SCRIPT = f"""
         "config_file_path": "CONFIG_FILE_PATH" in os.environ,
         "app_is_gate": isinstance(asgi.app, RouteGateMiddleware),
         "gate_wraps_gateway_routes": asgi.app.app is asgi._GATEWAY_ROUTES,
-        "gateway_routes_reach_litellm": metrics_hop._fallthrough is asgi._app,
+        "gateway_routes_reach_litellm": metrics_hop._fallthrough is asgi._desanitized,
+        "desanitiser_fronts_litellm": asgi._desanitized.app is asgi._app,
+        "desanitiser_uses_the_entrypoint_store": (
+            asgi._desanitized._mappings is asgi.response_mappings
+        ),
+        "terminal_through_the_gates_audit_logger": (
+            asgi._desanitized._terminal is asgi.terminal
+            and asgi.gate._audit is asgi._audit_logger
+        ),
         "lifespan_replaced": asgi._app.router.lifespan_context is not proxy_startup_event,
         "lifespan_not_original": (
             asgi._app.router.lifespan_context is not asgi._litellm_lifespan
@@ -1356,6 +1364,13 @@ def test_the_exported_app_is_the_gate_wrapping_litellms_app(imported: dict) -> N
     assert imported["app_is_gate"] is True
     assert imported["gate_wraps_gateway_routes"] is True
     assert imported["gateway_routes_reach_litellm"] is True
+
+
+def test_litellms_app_sits_behind_the_desanitiser(imported: dict) -> None:
+    # The one reversal: inside the limiter (the gate's app chain), in front of litellm.
+    assert imported["desanitiser_fronts_litellm"] is True
+    assert imported["desanitiser_uses_the_entrypoint_store"] is True
+    assert imported["terminal_through_the_gates_audit_logger"] is True
 
 
 def test_the_lifespan_is_wrapped(imported: dict) -> None:
@@ -1501,12 +1516,22 @@ _LIFESPAN_SCRIPT = f"""
         asgi._litellm_lifespan = _no_startup
         litellm.callbacks = [object()] if MODE == "stranger" else []
 
+    wired = {{{{}}}}
+
     async def drive():
         async with asgi._app.router.lifespan_context(asgi._app):
-            pass
+            if MODE == "real":
+                guardrail = asgi._registered_guardrail()
+                wired["mappings"] = guardrail._response_mappings is asgi.response_mappings
+                wired["ticket_hook"] = asgi.limiter._ticket_hook == asgi.terminal.bind
+                wired["cancel_hook"] = (
+                    asgi.limiter._cancel_hook == guardrail.on_request_cancelled
+                )
 
     asyncio.run(drive())
-    print("{SENTINEL}" + json.dumps({{{{"exits": exits, "armed": asgi.gate.armed}}}}))
+    print("{SENTINEL}" + json.dumps({{{{
+        "exits": exits, "armed": asgi.gate.armed, "wired": wired,
+    }}}}))
 """
 
 
@@ -1515,6 +1540,9 @@ def test_the_gate_arms_when_the_guardrail_registered(valid_config: Path) -> None
 
     assert result["exits"] == []
     assert result["armed"] is True
+    # Armed means wired: the guardrail registers mappings where the desanitiser reads
+    # them, and every ticket gets its terminal record and the cancel hook.
+    assert result["wired"] == {"mappings": True, "ticket_hook": True, "cancel_hook": True}
 
 
 @pytest.mark.parametrize("mode", ["stranger", "empty"])
@@ -1583,7 +1611,12 @@ _ARM_REFUSAL_SCRIPT = f"""
             from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
 
             (ours,) = [cb for cb in litellm.callbacks if isinstance(cb, CorpLlmGuardrail)]
-            if TAMPER in ("scan_raw_request", "run_in_parallel"):
+            if TAMPER == "response_compressor":
+                from starlette.middleware import Middleware
+                from starlette.middleware.gzip import GZipMiddleware
+
+                app.user_middleware.insert(0, Middleware(GZipMiddleware))
+            elif TAMPER in ("scan_raw_request", "run_in_parallel"):
                 setattr(ours, TAMPER, True)
             elif TAMPER == "apply_guardrail":
                 async def apply_guardrail(self, inputs, request_data, input_type, **kw):
@@ -1662,6 +1695,18 @@ def test_a_bypassable_guardrail_exits_70_with_its_own_line(valid_config: Path, t
     assert [r.split(":", 1)[0] for r in _arm_refusals(result)] == [f"arm refused ({tamper})"]
 
 
+def test_a_response_compressor_on_litellms_app_exits_70(valid_config: Path) -> None:
+    # The desanitiser passes an encoded response through unrestored: a compressor in front
+    # of it would hand clients placeholders instead of their text.
+    result = _run(_ARM_REFUSAL_SCRIPT, valid_config, env={"ARM_TAMPER": "response_compressor"})
+
+    assert result["exits"] == [70]
+    assert result["armed"] is False
+    assert [r.split(":", 1)[0] for r in _arm_refusals(result)] == [
+        "arm refused (response_compressor)"
+    ]
+
+
 def test_a_clean_boot_arms_and_config_check_raises_no_debug_problem(valid_config: Path) -> None:
     result = _run(_ARM_REFUSAL_SCRIPT, valid_config)
 
@@ -1702,6 +1747,66 @@ def test_the_test_only_key_exits_78_in_prod_before_litellm_is_imported(
     assert result["exit_code"] == 78
     assert result["litellm_imported"] is False
     assert "CORP_LLM_ALLOW_LITELLM_DEBUG=1 is test-only" in result["stdout"]
+
+
+# ── shutdown: the terminal records still being written land, bounded ─────────
+
+_DRAIN_SCRIPT = f"""
+    import asyncio, json, os, time
+    import corp_llm_gateway.asgi as asgi
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+    from corp_llm_gateway.route_gate.terminal_audit import AuditFacts, deposit
+
+    exits = []
+    os._exit = exits.append
+    STUCK = os.environ["DRAIN_SINK"] == "stuck"
+    written = []
+
+    async def emit(record):
+        await asyncio.sleep(3600 if STUCK else 0.3)
+        written.append(record.outcome)
+
+    asgi.terminal._emit = emit
+
+    async def drive():
+        async with asgi._app.router.lifespan_context(asgi._app):
+            # A request the client left: the limiter hands every ticket to the terminal
+            # audit, and its close starts the record's write.
+            ticket = RequestTicket("d" * 32)
+            facts = AuditFacts(
+                request_id="r", user_id="u", team_id="t", provider="anthropic", model="m"
+            )
+            assert deposit(ticket, facts)
+            asgi.limiter._on_ticket(ticket)
+            ticket.mark_cancelled("client")
+            ticket.close()
+            started = time.monotonic()
+        return time.monotonic() - started
+
+    elapsed = asyncio.run(drive())
+    print("{SENTINEL}" + json.dumps({{"exits": exits, "written": written, "elapsed": elapsed}}))
+"""
+
+DRAIN_GRACE_S = 1.0
+
+
+@pytest.mark.parametrize("sink", ["slow", "stuck"])
+def test_shutdown_waits_for_the_terminal_records_bounded_by_the_grace(
+    valid_config: Path, sink: str
+) -> None:
+    env = {"DRAIN_SINK": sink, "CORP_LLM_CANCEL_GRACE_SECONDS": str(DRAIN_GRACE_S)}
+
+    result = _run(_DRAIN_SCRIPT, valid_config, env=env)
+
+    assert result["exits"] == []
+    if sink == "slow":
+        assert result["written"] == ["cancelled"]
+        assert 0.25 <= result["elapsed"] < DRAIN_GRACE_S
+        assert not _log_messages(result, "terminal_audit_drain_incomplete")
+    else:
+        assert result["written"] == []
+        assert DRAIN_GRACE_S <= result["elapsed"] < DRAIN_GRACE_S + 2
+        assert _log_messages(result, "terminal_audit_drain_incomplete pending=1")
 
 
 # ── the gateway-owned routes answer through the gate ─────────────────────────

@@ -39,7 +39,10 @@ from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.metrics import NoopExporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware, arm_checks
+from corp_llm_gateway.route_gate import middleware as gate_middleware
+from corp_llm_gateway.route_gate.desanitize_middleware import DesanitizeMiddleware, ResponseMappings
 from corp_llm_gateway.route_gate.inflight import InflightLimiter, RequestTicket, current_ticket
+from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
 from tests.test_litellm_hook import _build_guardrail
 
 EMAIL = "alice.secret@corp.example"
@@ -54,6 +57,8 @@ GUARDRAIL_NAME = "corp-llm-sanitizer"
 CHAT_MODEL = "corp-chat"
 MESSAGES_MODEL = "corp-claude"
 RESPONSES_MODEL = "corp-responses"
+
+_GATE_BODY_PROBLEM = gate_middleware._body_problem
 
 _PLACEHOLDER_RE = re.compile(r"\[[A-Z]+(?:_[A-Z]+)*_\d+\]")
 
@@ -71,7 +76,7 @@ def _split(text: str) -> tuple[str, str]:
     return text[:cut], text[cut:]
 
 
-def _chat_sse(text: str) -> list[str]:
+def _chat_sse(text: str, *, usage: bool = False) -> list[str]:
     head, tail = _split(text)
 
     def chunk(delta: dict[str, Any], finish: str | None = None) -> str:
@@ -85,12 +90,27 @@ def _chat_sse(text: str) -> list[str]:
             }
         )
 
-    return [
+    events = [
         chunk({"role": "assistant", "content": head}),
         chunk({"content": tail}),
         chunk({}, "stop"),
-        "data: [DONE]",
     ]
+    if usage:
+        # What OpenAI sends last when the request set stream_options.include_usage.
+        events.append(
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-stub",
+                    "object": "chat.completion.chunk",
+                    "created": 1758500000,
+                    "model": "gpt-4o-mini",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
+                }
+            )
+        )
+    return [*events, "data: [DONE]"]
 
 
 def _anthropic_sse(text: str) -> list[str]:
@@ -224,13 +244,13 @@ def _unary(path: str, text: str) -> dict[str, Any]:
     }
 
 
-def _stream(path: str, text: str) -> list[str]:
+def _stream(path: str, text: str, *, usage: bool = False) -> list[str]:
     path = path.split("?", 1)[0]
     if path.endswith("/messages"):
         return _anthropic_sse(text)
     if "/responses" in path:
         return _responses_sse(text)
-    return _chat_sse(text)
+    return _chat_sse(text, usage=usage)
 
 
 def _parsed(raw: bytes) -> Any:
@@ -248,7 +268,9 @@ class StubUpstream:
     every later hop, which is what the capture assertions need to see.
     """
 
-    def __init__(self, *, event_delay: float = 0.0, error_status: int | None = None) -> None:
+    def __init__(
+        self, *, event_delay: float = 0.0, error_status: int | None = None, port: int = 0
+    ) -> None:
         self.bodies: list[str] = []
         # One entry per streamed reply: "completed", or "broken" when the gateway hung up.
         self.stream_outcomes: list[str] = []
@@ -276,7 +298,11 @@ class StubUpstream:
                 if upstream.error_status is not None:
                     self._send_error(upstream.error_status)
                 elif stream:
-                    self._send_stream(_stream(self.path, reply_text(echo)))
+                    options = parsed.get("stream_options") or {}
+                    usage = isinstance(options, dict) and bool(options.get("include_usage"))
+                    # Only when asked: a test may swap `_stream` for one without it.
+                    extra = {"usage": True} if usage else {}
+                    self._send_stream(_stream(self.path, reply_text(echo), **extra))
                 else:
                     payload = json.dumps(_unary(self.path, reply_text(echo))).encode()
                     self.send_response(200)
@@ -335,7 +361,7 @@ class StubUpstream:
             def log_message(self, fmt: str, *args: Any) -> None:
                 return
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         self._server.daemon_threads = True
         self.base = f"http://127.0.0.1:{self._server.server_address[1]}"
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -744,7 +770,15 @@ class _TicketProbe:
 
 
 class DispatchHarness:
-    """litellm's app behind our gate, pointed at a stub upstream; monkeypatch restores globals."""
+    """litellm's app behind our gate, pointed at a stub upstream; monkeypatch restores globals.
+
+    Wired as ``asgi.py`` wires it unless ``wrap`` says otherwise: the desanitiser in
+    front of litellm's app, inside the limiter, with every guardrail of ours in
+    ``callbacks`` (or wrapped by one) registering its response mappings there, and the
+    terminal audit bound to each ticket, writing through that guardrail's own audit
+    logger (so its sink holds the one record of each request). ``body_gate=False``
+    lifts the gate's ``policies`` body refusal, to show what litellm does with such a body.
+    """
 
     def __init__(
         self,
@@ -755,8 +789,15 @@ class DispatchHarness:
         general_settings: dict[str, Any] | None = None,
         guardrail_list: list[dict[str, Any]] | None = None,
         wrap: Callable[[Any], Any] | None = None,
+        body_gate: bool = True,
     ) -> None:
         self.upstream = upstream
+        # Set either way: a harness built earlier in the same test may have lifted it.
+        monkeypatch.setattr(
+            gate_middleware,
+            "_body_problem",
+            _GATE_BODY_PROBLEM if body_gate else (lambda chunks: None),
+        )
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
         monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
         # Router.__init__ and request handling append to these in place: patch them first.
@@ -783,15 +824,35 @@ class DispatchHarness:
         monkeypatch.setattr(IN_MEMORY_GUARDRAIL_HANDLER, "guardrail_id_to_sibling_callbacks", {})
         monkeypatch.setattr(policy_registry, "_policy_registry", None)
         monkeypatch.setattr(attachment_registry, "_attachment_registry", None)
-        inner = wrap(proxy_server.app) if wrap is not None else proxy_server.app
+        limiter = InflightLimiter(0, metrics=NoopExporter())
+        self.terminal: TerminalAudit | None = None
+        if wrap is not None:
+            inner = wrap(proxy_server.app)
+        else:
+            inner = self._desanitized(callbacks, limiter)
         self.probe = _TicketProbe(inner)
         self.gate = RouteGateMiddleware(
             self.probe,
             metrics=NoopExporter(),
             audit_logger=AuditLogger(ListSink(), gateway_version="harness"),
-            limiter=InflightLimiter(0, metrics=NoopExporter()),
+            limiter=limiter,
         )
         self.gate.arm()
+
+    def _desanitized(self, callbacks: list[Any], limiter: InflightLimiter) -> Any:
+        mappings = ResponseMappings()
+        engines = [
+            cb if isinstance(cb, CorpLlmGuardrail) else cb.engine
+            for cb in callbacks
+            if isinstance(cb, CorpLlmGuardrail)
+            or isinstance(getattr(cb, "engine", None), CorpLlmGuardrail)
+        ]
+        for engine in engines:
+            engine.bind_response_mappings(mappings)
+        audit_logger = engines[0]._audit if engines else AuditLogger(ListSink(), "harness")
+        self.terminal = TerminalAudit(emit_to(audit_logger))
+        limiter.bind_ticket_hook(self.terminal.bind)
+        return DesanitizeMiddleware(proxy_server.app, mappings, terminal=self.terminal)
 
     async def send(
         self,
@@ -814,6 +875,8 @@ class DispatchHarness:
                 path or ROUTES[route][0], json=body, headers={**sent, **dict(headers or {})}
             )
         await _drain_logging()
+        if self.terminal is not None:
+            await self.terminal.drain()
         await _close_clients_added_since(known_clients)
         return Exchange(
             status=response.status_code,
@@ -868,7 +931,8 @@ async def _drain_logging() -> None:
 def register_response_mapping(
     engine: CorpLlmGuardrail, mappings: Any, data: dict[str, Any]
 ) -> None:
-    """Hand the response mapping of the request our pre-call just rewrote to the ticket."""
+    """For a pre-call run outside the route gate (no ticket, so the guardrail kept its
+    state): hand the current ticket the mapping a ticketed pre-call registers itself."""
     from corp_llm_gateway.litellm_hook import _response_mapping
 
     ticket = current_ticket()
@@ -880,23 +944,21 @@ def register_response_mapping(
 
 
 class OptionAPreCall(CustomLogger):
-    """Our guardrail with the response reversal moved out (Option A): pre-call and audit only.
-
-    The pre-call hands the response mapping to the middleware's ticket-keyed store — the
-    one line Task 1 adds to ``_pre_call_impl``.
+    """Our guardrail as the entrypoint wires it, pre-call and log events only (no response
+    hook), with its mapping store bound: its pre-call registers the response mapping on
+    the route gate's ticket for the middleware in front of litellm's app.
     """
 
     def __init__(self, engine: CorpLlmGuardrail, mappings: Any) -> None:
         super().__init__()
         self.engine = engine
         self.mappings = mappings
+        engine.bind_response_mappings(mappings)
 
     async def async_pre_call_hook(
         self, user_api_key_dict: Any, cache: Any, data: dict[str, Any], call_type: str
     ) -> Any:
-        out = await self.engine.async_pre_call_hook(user_api_key_dict, cache, data, call_type)
-        register_response_mapping(self.engine, self.mappings, data)
-        return out
+        return await self.engine.async_pre_call_hook(user_api_key_dict, cache, data, call_type)
 
     async def async_log_success_event(
         self, kwargs: dict[str, Any], response_obj: Any, start_time: Any, end_time: Any

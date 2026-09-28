@@ -289,25 +289,28 @@ async def test_debug_chunk_log_and_per_chunk_hooks(
     route: str,
     stream: bool,
 ) -> None:
-    """Hazard 12. With litellm at DEBUG, today:
+    """Hazard 12. With litellm at DEBUG:
 
-    - the chunk log (common_request_processing.py:3630) runs after our iterator hook and
-      prints restored originals on ``/v1/messages`` SSE — removed by Option A;
+    - the chunk log (common_request_processing.py:3630) prints no original: the
+      reversal runs outside litellm. With the callback reversal (before Task 3) it ran
+      after our iterator hook and printed restored originals on ``/v1/messages`` SSE;
     - two request logs print the ORIGINAL request before any pre-call hook runs, on every
-      flow, with or without Option A. Option A cannot make DEBUG safe: the arm step must
-      refuse it (prototype ``arm_problems``);
-    - per-chunk hooks receive what our iterator yielded. They are dispatched only for chat
-      SSE, which today's callback does not restore, so that exposure is latent.
+      flow, whatever reverses the response. DEBUG cannot be made safe: the arm step
+      refuses it (``arm_problems``);
+    - per-chunk hooks receive what litellm streams: placeholders only.
     """
     ours, _ = build_ours()
     capture = Capture("per_chunk")
     harness = DispatchHarness(monkeypatch, upstream, [ours, capture])
 
-    await harness.send(route, stream=stream)
+    served = await harness.send(route, stream=stream)
 
+    assert ORIGINAL_MARK in served.text
     today = litellm_debug.holding(ORIGINAL_MARK)
-    chunk_leak = {_CHUNK_LOG_SITE} if (route, stream) == ("messages", True) else set()
-    assert today == _REQUEST_LOG_SITES | chunk_leak
+    assert today == _REQUEST_LOG_SITES
+    if (route, stream) == ("messages", True):
+        # Not vacuous: the chunk log ran, with placeholders.
+        assert _CHUNK_LOG_SITE in litellm_debug.holding(PLACEHOLDER_MARK)
     assert all(ORIGINAL_MARK not in value for value in capture.seen.per_chunk)
     if route == "chat" and stream:
         assert any(PLACEHOLDER_MARK in value for value in capture.seen.per_chunk)
@@ -319,7 +322,7 @@ async def test_debug_chunk_log_and_per_chunk_hooks(
         monkeypatch,
         upstream,
         [OptionAPreCall(engine, mappings), Capture("per_chunk")],
-        wrap=lambda app: DesanitizeMiddleware(app, mappings, enabled=True),
+        wrap=lambda app: DesanitizeMiddleware(app, mappings),
     )
 
     await option_a.send(route, stream=stream)

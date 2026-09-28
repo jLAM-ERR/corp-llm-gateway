@@ -1,4 +1,5 @@
-"""The shipped litellm configs turn on no request-content logging (plan 20260926 hazard 17).
+"""The shipped litellm configs turn on no request-content logging (plan 20260926 hazard 17)
+and load no policies or guardrails from litellm's database (hazard 14a).
 
 litellm hands every success/failure logger the request its logging object holds, and
 its DEBUG output prints the request before any pre-call hook runs. Our pre-call keeps
@@ -55,6 +56,18 @@ def _assert_logs_no_content(config: dict[str, Any]) -> None:
         assert "store_prompts_in_spend_logs" not in section
 
 
+# litellm loads every DB object type when the key is absent (proxy_server.py
+# should_load_db_object): the pin must be there, and must name neither.
+DB_OBJECTS = ["models"]
+
+
+def _assert_db_objects_pinned(config: dict[str, Any]) -> None:
+    general = config.get("general_settings") or {}
+    objects = general.get("supported_db_objects")
+    assert objects == DB_OBJECTS
+    assert "policies" not in objects and "guardrails" not in objects
+
+
 def _assert_no_debug_env(env: dict[str, Any]) -> None:
     assert "DEBUG" not in str(env.get("LITELLM_LOG") or "").upper()
     for key in DEBUG_ENV_KEYS:
@@ -69,6 +82,37 @@ def test_compose_litellm_config_logs_no_request_content(name: str) -> None:
 @needs_helm
 def test_helm_litellm_config_logs_no_request_content() -> None:
     _assert_logs_no_content(_helm_litellm_config())
+
+
+@pytest.mark.parametrize("name", sorted(LITELLM_CONFIGS))
+def test_compose_litellm_config_loads_no_policies_from_the_db(name: str) -> None:
+    _assert_db_objects_pinned(yaml.safe_load(LITELLM_CONFIGS[name].read_text()))
+
+
+@needs_helm
+def test_helm_litellm_config_loads_no_policies_from_the_db() -> None:
+    _assert_db_objects_pinned(_helm_litellm_config())
+
+
+def test_litellm_reads_the_pin_as_models_only() -> None:
+    """litellm's own reader of the key (what its DB reconcile consults)."""
+    litellm_proxy = pytest.importorskip("litellm.proxy.proxy_server")
+    config = yaml.safe_load(LITELLM_CONFIGS["compose"].read_text())
+    patched = pytest.MonkeyPatch()
+    try:
+        patched.setattr(litellm_proxy, "general_settings", config["general_settings"])
+        loads = {
+            name: litellm_proxy.should_load_db_object(object_type=name)
+            for name in ("models", "policies", "guardrails", "config_overrides")
+        }
+    finally:
+        patched.undo()
+    assert loads == {
+        "models": True,
+        "policies": False,
+        "guardrails": False,
+        "config_overrides": False,
+    }
 
 
 def _compose_env(entries: Any) -> dict[str, Any]:
@@ -128,3 +172,7 @@ def test_the_guard_catches_what_it_guards_against() -> None:
         _assert_no_debug_env(_compose_env(["LITELLM_LOG=${LITELLM_LOG:-DEBUG}"]))
     with pytest.raises(AssertionError):
         _assert_no_debug_env(_compose_env(["DETAILED_DEBUG"]))
+    with pytest.raises(AssertionError):
+        _assert_db_objects_pinned({"general_settings": {}})
+    with pytest.raises(AssertionError):
+        _assert_db_objects_pinned({"general_settings": {"supported_db_objects": ["policies"]}})

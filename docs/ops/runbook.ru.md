@@ -119,12 +119,13 @@ staging-гейта апгрейда (согласно задаче M0-7 в пл�
 500 с `error_code="E_INTERNAL"` и без каких-либо подробностей.
 
 Поведение: fail-closed (по матрице). Это перехватчик для исключения, которого
-шлюз не ожидал (ошибка БД, баг, отказ audit-sink'а): `pre_call`,
-`post_call_unary` и `post_call_stream` сводят его к этому непрозрачному ответу
-и никогда не отдают текст исключения ни клиенту, ни в лог, ни в аудит-запись.
-`litellm_pre_call_unexpected_error` / `litellm_post_call_unary_unexpected_error`
-/ `litellm_post_call_stream_unexpected_error` логируют только ТИП исключения,
-никогда его сообщение.
+шлюз не ожидал (ошибка БД, баг, отказ audit-sink'а): `pre_call` сводит его к
+этому непрозрачному ответу и никогда не отдаёт текст исключения ни клиенту, ни в
+лог, ни в аудит-запись. `litellm_pre_call_unexpected_error` логирует только ТИП
+исключения, никогда его сообщение. Сбой восстановления ответа (ASGI-десанитайзер)
+даёт тот же 500 `E_INTERNAL` (или закрывает уже начатый поток), строку
+`gateway_desanitize_failed request_id=… phase=… error=<тип>` и
+`gateway_failure{component="desanitize"}`.
 
 Действия:
 1. Найдите в логах pod'а шлюза соответствующую строку `*_unexpected_error` и её

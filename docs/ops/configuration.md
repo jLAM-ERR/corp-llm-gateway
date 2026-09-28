@@ -342,6 +342,15 @@ closes. `gateway-admin config check` applies the same content checks, but a
 config file that is simply absent is not a `config check` problem (laptops
 mount none).
 
+The shipped litellm configs (compose `config.yaml` / `config.oauth.yaml`, Helm
+`configmap-litellm.yaml`) pin `general_settings.supported_db_objects: ["models"]`:
+litellm loads only models from its database, never `policies` or `guardrails`
+(without the key it loads every object type). A policy row there could put a
+litellm pipeline around the gateway's guardrail; the route gate already refuses
+every `/policies*` and `/guardrails/*` route and a request body with a top-level
+`policies` key (403 `E_ROUTE_BLOCKED`, `block_reason=route_gate_body_policies`), so
+the pin is defence in depth. Keep it in any config of your own.
+
 **Two DSN sources litellm's CLI reads are deliberately NOT carried over.** The
 entrypoint's Prisma schema step reads `DATABASE_URL` and `DIRECT_URL` from the
 environment only:
@@ -485,6 +494,11 @@ Exit 70 (`EX_SOFTWARE`), after litellm's startup, one log line
   `litellm_settings.set_verbose`). litellm logs the original request before any
   pre-call hook runs. `config check` reports the env vars and `set_verbose` too.
   `CORP_LLM_ALLOW_LITELLM_DEBUG=1` lets these two through outside prod, for tests.
+- `response_compressor`: litellm's app carries a response-compressing middleware
+  (litellm 1.101.0 adds none, and no config key turns one on, so `config check`
+  has nothing to report). The gateway restores the originals in a response at
+  its ASGI layer, in front of litellm's app, and passes an encoded response
+  through unrestored — a compressor would hand clients placeholders.
 
 **Warn and boot:**
 

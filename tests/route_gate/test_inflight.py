@@ -750,6 +750,105 @@ async def test_a_downstream_that_ignores_cancellation_cannot_hold_the_slot() -> 
     await asyncio.sleep(0.05)
 
 
+async def test_a_server_cancel_of_a_stubborn_downstream_is_bounded_by_the_grace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The server cancels (shutdown) a downstream that ignores cancellation: ``run`` ends
+    after the grace, the slot is freed and the ticket closed, and the downstream left
+    running is logged and counted as on the client path."""
+    stop = asyncio.Event()
+    entered = asyncio.Event()
+    tickets: list[RequestTicket] = []
+
+    async def stubborn(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        ticket = current_ticket()
+        assert ticket is not None
+        tickets.append(ticket)
+        entered.set()
+        while not stop.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop.wait()
+
+    gate, limiter, metrics, _ = _stack(stubborn, max_inflight=1, grace=0.2)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    task.cancel()
+    with caplog.at_level(logging.INFO), contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    elapsed = loop.time() - started
+
+    assert 0.2 <= elapsed < 1.0
+    assert limiter.inflight == 0 and tickets[0].closed
+    assert tickets[0].cancel_origin == "server"
+    assert metrics.failures == [COMPONENT]
+    (line,) = [
+        r.getMessage() for r in caplog.records if "route_gate_cancel_incomplete" in r.getMessage()
+    ]
+    assert "downstream_unwound=False" in line and "origin=server" in line
+    stop.set()
+    await asyncio.sleep(0.05)
+
+
+async def test_a_server_cancel_of_a_downstream_that_unwinds_counts_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = _Holding()
+    gate, limiter, metrics, _ = _stack(app, max_inflight=1, grace=0.5)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(app.entered.acquire(), 2)
+
+    task.cancel()
+    with caplog.at_level(logging.INFO), contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert metrics.failures == [] and limiter.inflight == 0
+    assert "route_gate_cancel_incomplete" not in caplog.text
+
+
+async def test_the_ticket_hook_sees_every_ticket_before_the_body_is_read() -> None:
+    seen: list[tuple[RequestTicket, bool]] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await _respond(send)
+
+    gate, limiter, _, _ = _stack(app)
+    limiter.bind_ticket_hook(lambda ticket: seen.append((ticket, ticket.closed)))
+    client = _Client()
+
+    await gate(_scope(), client.receive, client.send)
+
+    ((ticket, closed_then),) = seen
+    assert closed_then is False and ticket.closed and client.status == 200
+
+
+async def test_a_failing_ticket_hook_is_counted_and_the_request_still_served(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await _respond(send)
+
+    gate, limiter, metrics, _ = _stack(app)
+
+    def failing(ticket: RequestTicket) -> None:
+        raise RuntimeError(CANARY)
+
+    limiter.bind_ticket_hook(failing)
+    client = _Client()
+    with caplog.at_level(logging.INFO):
+        await gate(_scope(), client.receive, client.send)
+
+    assert client.status == 200 and metrics.failures == [COMPONENT]
+    assert "route_gate_ticket_hook_failed" in caplog.text and CANARY not in caplog.text
+
+
 async def test_a_failing_cancel_hook_still_releases_the_slot(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -936,8 +1035,21 @@ async def test_a_shared_auth_lookup_survives_the_disconnect_of_the_request_that_
         await guardrail.async_log_success_event({"litellm_call_id": call_id}, None, now, now)
         await _respond(send)
 
-    gate, limiter, metrics, _ = _stack(litellm_like, max_inflight=2)
+    from corp_llm_gateway.route_gate.desanitize_middleware import (
+        DesanitizeMiddleware,
+        ResponseMappings,
+    )
+    from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
+
+    # Wired as the entrypoint wires it: a request the pre-call handed to its ticket is
+    # recorded by the ticket's terminal record, through the same audit logger.
+    mappings = ResponseMappings()
+    guardrail.bind_response_mappings(mappings)
+    terminal = TerminalAudit(emit_to(guardrail._audit))
+    served = DesanitizeMiddleware(litellm_like, mappings, terminal=terminal)
+    gate, limiter, metrics, _ = _stack(served, max_inflight=2)
     limiter.bind_cancel_hook(guardrail.on_request_cancelled)
+    limiter.bind_ticket_hook(terminal.bind)
     first, second = _Client((b'{"id": "call-a"}',)), _Client((b'{"id": "call-b"}',))
     first_task = asyncio.create_task(gate(_scope(), first.receive, first.send))
     await asyncio.wait_for(entered.wait(), 2)
@@ -954,6 +1066,7 @@ async def test_a_shared_auth_lookup_survives_the_disconnect_of_the_request_that_
     assert limiter.inflight == 1
     release.set()
     await asyncio.wait_for(second_task, 2)
+    await terminal.drain()
     assert second.status == 200
     assert {r["request_id"]: r["status"] for r in sink.records} == {
         "call-a": "cancelled",
