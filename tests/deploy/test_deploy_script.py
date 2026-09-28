@@ -28,11 +28,27 @@ BOOTSTRAP = ROOT / "scripts" / "deploy" / "bootstrap-server.sh"
 HOST = "deploy@example.test"
 
 HEALTHY_PS = [
-    {"Service": "litellm", "State": "running", "Health": "healthy"},
-    {"Service": "postgres", "State": "running", "Health": "healthy"},
-    {"Service": "vector", "State": "running", "Health": ""},
+    {
+        "Service": "litellm",
+        "Name": "corp-llm-gateway-litellm-1",
+        "State": "running",
+        "Health": "healthy",
+    },
+    {
+        "Service": "postgres",
+        "Name": "corp-llm-gateway-postgres-1",
+        "State": "running",
+        "Health": "healthy",
+    },
+    {"Service": "vector", "Name": "corp-llm-gateway-vector-1", "State": "running", "Health": ""},
     # A `restart: "no"` one-shot that finished: `ps --all` keeps listing it.
-    {"Service": "minio-init", "State": "exited", "Health": "", "ExitCode": 0},
+    {
+        "Service": "minio-init",
+        "Name": "corp-llm-gateway-minio-init-1",
+        "State": "exited",
+        "Health": "",
+        "ExitCode": 0,
+    },
 ]
 UNHEALTHY_PS = [
     {"Service": "litellm", "State": "restarting", "Health": "unhealthy"},
@@ -1372,6 +1388,154 @@ def test_up_accepts_one_front_door(front_door: str, tmp_path: Path) -> None:
     assert f"compose {BOTH_FILES} up -d" in _log(tmp_path, "docker.log")
 
 
+def _front_door_row(service: str, name: str | None = None) -> dict[str, str]:
+    return {
+        "Service": service,
+        "Name": f"corp-llm-gateway-{service}-1" if name is None else name,
+        "State": "running",
+        "Health": "healthy",
+    }
+
+
+def _docker_lines(tmp_path: Path) -> list[str]:
+    return _log(tmp_path, "docker.log").splitlines()
+
+
+def _index(lines: list[str], needle: str) -> int:
+    return next(i for i, line in enumerate(lines) if needle in line)
+
+
+def test_up_removes_the_front_door_the_env_no_longer_selects(tmp_path: Path) -> None:
+    # Profiles only filter what `up` starts: the old nginx-ports would keep
+    # NGINX_PORT, and the newly selected nginx would fail to bind it.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    ps = [*HEALTHY_PS, _front_door_row("nginx"), _front_door_row("nginx-ports")]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": "litellm\nnginx\npostgres"},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    lines = _docker_lines(tmp_path)
+    removals = [line for line in lines if line.startswith("rm ")]
+    assert removals == ["rm -f corp-llm-gateway-nginx-ports-1"]
+    removed_at = _index(lines, "rm -f corp-llm-gateway-nginx-ports-1")
+    assert removed_at < _index(lines, f"compose {BOTH_FILES} pull")
+    assert removed_at < _index(lines, f"compose {BOTH_FILES} up -d")
+    assert "corp-llm-gateway-nginx-ports-1" in result.stderr  # type: ignore[attr-defined]
+
+
+def test_up_without_a_profile_removes_a_leftover_nginx(tmp_path: Path) -> None:
+    # The leftover would keep serving the public port, and `restart:
+    # unless-stopped` would bring it back after every reboot.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=[*HEALTHY_PS, _front_door_row("nginx")],
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    lines = _docker_lines(tmp_path)
+    assert [line for line in lines if line.startswith("rm ")] == ["rm -f corp-llm-gateway-nginx-1"]
+    assert _index(lines, "rm -f") < _index(lines, f"compose {BOTH_FILES} pull")
+
+
+@pytest.mark.parametrize("front_door", ["nginx", "nginx-ports"])
+def test_up_keeps_the_front_door_the_env_selects(front_door: str, tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=[*HEALTHY_PS, _front_door_row(front_door)],
+        env_extra={"FAKE_SERVICES": f"litellm\n{front_door}\npostgres"},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert not [line for line in _docker_lines(tmp_path) if line.startswith("rm ")]
+
+
+def test_down_removes_every_front_door_container_compose_down_leaves(tmp_path: Path) -> None:
+    # `compose down` only stops the services of the active profiles.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    ps = [*HEALTHY_PS, _front_door_row("nginx"), _front_door_row("nginx-ports")]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "--yes", "down"],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": "litellm\nnginx\npostgres"},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    lines = _docker_lines(tmp_path)
+    removals = [line for line in lines if line.startswith("rm ")]
+    assert sorted(removals) == [
+        "rm -f corp-llm-gateway-nginx-1",
+        "rm -f corp-llm-gateway-nginx-ports-1",
+    ]
+    down_at = _index(lines, f"compose {BOTH_FILES} down")
+    assert all(_index(lines, removal) > down_at for removal in removals)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["corp;id", "-rf", "$(id)", "a b", "", "_leading", "x\ny"],
+    ids=["semicolon", "flag", "subst", "space", "empty", "underscore", "newline"],
+)
+@pytest.mark.parametrize("argv", [["up"], ["--yes", "down"]], ids=["up", "down"])
+def test_a_container_name_outside_the_charset_is_refused(
+    name: str, argv: list[str], tmp_path: Path
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    ps = [*HEALTHY_PS, _front_door_row("nginx-ports"), _front_door_row("nginx", name)]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), *argv],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": "litellm\npostgres"},
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    assert "container name" in result.stderr  # type: ignore[attr-defined]
+    docker_log = _log(tmp_path, "docker.log")
+    assert "rm " not in docker_log, "nothing may be removed once one name is refused"
+    assert "pull" not in docker_log
+    assert not (remote / ".deploy.lock").exists()
+
+
+@pytest.mark.parametrize("argv", [["up"], ["--yes", "down"]], ids=["up", "down"])
+def test_a_dry_run_removes_no_container(argv: list[str], tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "--dry-run", *argv],
+        ps=[*HEALTHY_PS, _front_door_row("nginx"), _front_door_row("nginx-ports")],
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert "rm " not in _log(tmp_path, "docker.log")
+
+
 def test_up_stops_before_the_pull_when_compose_cannot_resolve_the_stack(tmp_path: Path) -> None:
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
@@ -1440,7 +1604,8 @@ def test_up_fails_at_once_on_a_dead_front_door_and_names_it(
     assert f"the nginx front door is down: {service} (state={state}" in stderr
     assert f"scripts/deploy/deploy.sh --host {HOST} --dir {remote} logs {service}\n" in stderr
     # One poll plus the status table: an entrypoint refusal never heals by waiting.
-    assert _log(tmp_path, "docker.log").count("ps --all") == 2
+    after_up = _log(tmp_path, "docker.log").split("up -d", 1)[1]
+    assert after_up.count("ps --all") == 2
     assert not (remote / ".deploy.lock").exists()
 
 

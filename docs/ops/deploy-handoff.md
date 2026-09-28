@@ -229,7 +229,10 @@ reference: `compose/README.md`, "HTTPS front door (nginx)".
    deploy started. `NGINX_BIND_ADDR` defaults to loopback: leave it and nothing
    outside the host reaches nginx. `LANGFUSE_PUBLIC_URL` must be the public
    `https://` origin (`https://<address>:8443` under `nginx-ports`), in
-   `behind-proxy` too.
+   `behind-proxy` too. To switch or drop the profile later, run `deploy.sh up`:
+   it removes the container of the front door the `.env` no longer selects. A
+   bare `docker compose up -d` does NOT, so the old one keeps the port; remove
+   it by hand with `docker rm -f <container>`.
 4. **Install the certificate on the server** (`terminate` only): directly in
    `/opt/corp-llm-gateway/nginx/certs/`, never through the sync (as
    `compose/certs/corp-ca-bundle.pem` in step 6, which the sync also

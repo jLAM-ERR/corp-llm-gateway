@@ -976,18 +976,34 @@ def _every_config_file() -> list[Path]:
     return [NGINX_CONF, *sorted((NGINX_DIR / "templates").rglob("*.template"))]
 
 
+# A quoted string is consumed whole, so a `;` inside one does not end the
+# directive; everything else goes one character at a time (no nested
+# quantifiers, so no backtracking blow-up).
+LOG_FORMAT_RE = re.compile(r"^\s*log_format\s+(\S+)\s+((?:[^;']|'[^']*')*);", re.MULTILINE)
+
+
 def _log_formats() -> dict[str, str]:
     """name -> the whole directive, across nginx.conf and every template."""
     formats: dict[str, str] = {}
     for path in _every_config_file():
-        for match in re.finditer(
-            r"^\s*log_format\s+(\S+)\s+([^;]*(?:'[^']*'[^;]*)*);",
-            _directives(path.read_text()),
-            re.MULTILINE,
-        ):
+        for match in LOG_FORMAT_RE.finditer(_directives(path.read_text())):
             assert match.group(1) not in formats, match.group(1)
             formats[match.group(1)] = match.group(0)
     return formats
+
+
+def test_the_log_format_pattern_spans_a_quoted_semicolon() -> None:
+    text = "log_format f '$remote_addr;x' '$status';\nlog_format g '$uri';\n"
+    found = {m.group(1): m.group(2) for m in LOG_FORMAT_RE.finditer(text)}
+    assert found == {"f": "'$remote_addr;x' '$status'", "g": "'$uri'"}
+
+
+def test_the_log_format_pattern_is_linear_on_an_unterminated_directive() -> None:
+    import time
+
+    started = time.monotonic()
+    assert LOG_FORMAT_RE.search("log_format f " + "'a' b" * 5000) is None
+    assert time.monotonic() - started < 1.0
 
 
 def _log_variables(directive: str) -> set[str]:

@@ -775,7 +775,10 @@ bare `docker compose up -d` that reads the same `.env`: a deploy and a reboot
 start the same services. `deploy.sh up` refuses a `.env` that enables both
 profiles before it pulls anything, and fails at once, naming the service, when
 the front door exits or restarts — `deploy.sh logs nginx` (or `nginx-ports`)
-shows the entrypoint's one-line reason.
+shows the entrypoint's one-line reason. To switch or drop the profile, use
+`deploy.sh up`: it removes the container of the front door the `.env` no
+longer selects. A bare `docker compose up -d` does NOT — it leaves the old one
+running on the port; remove it by hand with `docker rm -f <container>`.
 
 | Profile | Routing | Published (host → container) | Needs |
 |---|---|---|---|

@@ -51,6 +51,11 @@ NGINX_CERTS_README="${NGINX_CERTS_DIR}/README.md"
 # value here would override that file and diverge from what the boot-time
 # unit (a bare `docker compose up -d`) starts.
 NGINX_SERVICES=(nginx nginx-ports)
+# The front doors the current compose files enable, space-separated; set by
+# ensure_one_front_door.
+ENABLED_FRONT_DOORS=""
+# Container names come back from the server and go into a remote `docker rm`.
+CONTAINER_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 # The `restart: "no"` services: the only ones that are done once they exit 0.
 # Compose prints an empty Health for every exited container, so the state alone
 # cannot tell a finished one-shot from a service that stopped.
@@ -460,17 +465,21 @@ sync_compose() {
 # health + status
 # --------------------------------------------------------------------------- #
 
-# One line per service: name, state, health, exit code, separated by FIELD_SEP.
-# Not tabs: `read` collapses a run of whitespace separators, so an empty health
-# would shift the exit code into its place. Compose v2 prints either a JSON
-# array or one object per line depending on the version; both are handled.
+# One line per container: service, state, health, exit code, container name,
+# separated by FIELD_SEP. Not tabs: `read` collapses a run of whitespace
+# separators, so an empty health would shift the exit code into its place.
+# Line breaks and FIELD_SEP inside a value become spaces, so one value cannot
+# forge a second row. Compose v2 prints either a JSON array or one object per
+# line depending on the version; both are handled.
 FIELD_SEP=$'\x1f'
 service_states() {
     ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} ps --all --format json" \
         | jq -s -r '[.[] | if type == "array" then .[] else . end]
                     | .[]
                     | [(.Service // .Name // "?"), (.State // ""), (.Health // ""),
-                       (if .ExitCode == null then "" else (.ExitCode|tostring) end)]
+                       (if .ExitCode == null then "" else (.ExitCode|tostring) end),
+                       (.Name // "")]
+                    | map(gsub("[\n\r\u001f]"; " "))
                     | join("\u001f")'
 }
 
@@ -520,7 +529,7 @@ wait_for_healthcheck() {
             all_healthy=false
             stuck="none reported"
         else
-            while IFS="$FIELD_SEP" read -r service state health exit_code; do
+            while IFS="$FIELD_SEP" read -r service state health exit_code _; do
                 if is_front_door "$service"; then
                     if front_door_is_down "$state" "$health"; then
                         down_service="$service"
@@ -640,12 +649,14 @@ confirm() {
 # server's .env stays unread here too.
 ensure_one_front_door() {
     local services name enabled=()
+    ENABLED_FRONT_DOORS=""
     services="$(ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} config --services")" \
         || fatal "docker compose could not resolve the stack in ${HOST}:${REMOTE_DIR} (its
        error is above); nothing was pulled or started."
     while IFS= read -r name; do
         if is_front_door "$name"; then
             enabled+=("$name")
+            ENABLED_FRONT_DOORS+=" ${name}"
         fi
     done <<< "$services"
     if (( ${#enabled[@]} > 1 )); then
@@ -653,6 +664,33 @@ ensure_one_front_door() {
        Pick ONE: nginx (host routing) or nginx-ports (no DNS). Both publish
        NGINX_PORT, so the second would fail to start. Nothing was pulled or started."
     fi
+}
+
+# Compose profiles only filter what `up` starts: a front-door container an
+# earlier profile created keeps running, and keeps NGINX_PORT. `ps --all` still
+# lists it, so it is removed by name. $1 is the front doors to keep. Every name
+# is checked before the first one is removed.
+remove_front_doors() {
+    local keep=" $1 " states service name stale=()
+    states="$(service_states)" \
+        || fatal "could not list the containers in ${HOST}:${REMOTE_DIR} (the error is above)."
+    while IFS="$FIELD_SEP" read -r service _ _ _ name; do
+        [[ -n "$service" ]] || continue
+        is_front_door "$service" || continue
+        [[ "$keep" == *" ${service} "* ]] && continue
+        [[ "$name" =~ $CONTAINER_NAME_RE ]] \
+            || fatal "refusing to remove the ${service} container: its container name has
+       characters outside letters, digits and . _ - (got: ${name}). Nothing was removed."
+        stale+=("${service}${FIELD_SEP}${name}")
+    done <<< "$states"
+
+    local entry
+    for entry in ${stale+"${stale[@]}"}; do
+        service="${entry%%"${FIELD_SEP}"*}"
+        name="${entry#*"${FIELD_SEP}"}"
+        info "removing the ${service} front-door container ${name}"
+        ssh_run "docker rm -f ${name}"
+    done
 }
 
 cmd_up() {
@@ -666,6 +704,7 @@ cmd_up() {
         return 0
     fi
     ensure_one_front_door
+    remove_front_doors "$ENABLED_FRONT_DOORS"
     ssh_run "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} pull \
 && docker compose ${COMPOSE_FILE_ARGS} up -d"
     wait_for_healthcheck
@@ -679,6 +718,12 @@ cmd_down() {
     acquire_lock
     # Volumes are kept: the token store and audit spool live in them.
     compose_remote down
+    if (( DRY_RUN )); then
+        info "[dry-run] would remove any front-door container compose down leaves"
+        return 0
+    fi
+    # `down` leaves the containers of services outside the active profiles.
+    remove_front_doors ""
     info "stopped ${HOST}:${REMOTE_DIR} (volumes kept)"
 }
 
@@ -686,6 +731,8 @@ cmd_restart() {
     ensure_remote_ready
     confirm "This restarts the gateway on ${HOST} — in-flight requests will fail."
     acquire_lock
+    # Restarts only the active profile's services. A front door an old profile
+    # left behind is not touched here; `up` removes it.
     compose_remote restart ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"}
     if (( DRY_RUN )); then
         return 0
@@ -719,6 +766,7 @@ main() {
             cmd_up
             ;;
         down)
+            require_cmd jq
             cmd_down
             ;;
         restart)
