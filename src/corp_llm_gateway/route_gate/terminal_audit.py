@@ -9,13 +9,18 @@ a request that never got that far (cancelled, or ended without a final body). A 
 awaiting the response never publishes, so litellm running its success log before or
 after ``http.response.start`` cannot decide the record.
 
-The first outcome decided is the record's; ``ok`` on a ticket whose client left is
-``cancelled``. The close decides before it schedules its write, so nothing published after
-the close changes the outcome. A cancelled request is ``cancelled`` with the code of who
-cancelled it (``E_CLIENT_DISCONNECTED``, ``E_SERVER_SHUTDOWN``); ``failed`` + ``E_INTERNAL``
-is a restoration failure or a request that ended with no final body. A failed write before
-the close keeps the record open and the close writes it once more; the close's own write is
-the last attempt, never retried.
+The first outcome decided is the record's, with one exception below; ``ok`` on a ticket
+whose client left is ``cancelled``. A server cancel does not change an ``ok`` published
+before the close (the response completed); it is only the close's own outcome. The close
+decides before it schedules its write, so nothing published after the close changes the
+outcome. A cancelled request is ``cancelled`` with the code of who cancelled it
+(``E_CLIENT_DISCONNECTED``, ``E_SERVER_SHUTDOWN``); ``failed`` + ``E_INTERNAL`` is a
+restoration failure or a request that ended with no final body. A failed write before the
+close keeps the record open and the close writes it once more. The exception: a close that
+lands while a write is in flight decides its own outcome and leaves it with that write. If
+the write lands (or may have), the close writes nothing; if it fails, the close's write
+starts then, with the close's outcome. The close's own write is the last attempt, never
+retried.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from typing import Literal
 from corp_llm_gateway.audit import AuditEvent, AuditLogger, AuditWriteAmbiguousError
 from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.metrics import MetricsExporter, get_exporter
-from corp_llm_gateway.route_gate.inflight import CANCEL_SERVER, RequestTicket
+from corp_llm_gateway.route_gate.inflight import CANCEL_SERVER, RequestTicket, spawn_shared
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +73,7 @@ class AuditFacts:
     decided: tuple[Outcome, str | None] | None = field(default=None, init=False)
     published: bool = field(default=False, init=False)
     publishing: bool = field(default=False, init=False)
+    close_pending: tuple[Outcome, str | None] | None = field(default=None, init=False)
 
 
 @dataclass(frozen=True)
@@ -187,14 +193,26 @@ class TerminalAudit:
             facts.published = True
         finally:
             facts.publishing = False
+            pending, facts.close_pending = facts.close_pending, None
+            if pending is not None and not facts.published:
+                facts.decided = pending
+                self._schedule(ticket, facts)
 
     def _on_close(self, ticket: RequestTicket) -> None:
         facts = ticket.audit_facts
-        if not isinstance(facts, AuditFacts) or facts.published or facts.publishing:
+        if not isinstance(facts, AuditFacts) or facts.published:
+            return
+        if facts.publishing:
+            # The write in flight may still fail: the close's outcome is its fallback.
+            facts.close_pending = _closing_outcome(ticket)
             return
         if facts.decided is None:
             facts.decided = _closing_outcome(ticket)
-        task = asyncio.get_running_loop().create_task(self._write(ticket, facts))
+        self._schedule(ticket, facts)
+
+    def _schedule(self, ticket: RequestTicket, facts: AuditFacts) -> None:
+        # Owned by no request: the fall-through write starts from the request's own task.
+        task = spawn_shared(self._write(ticket, facts))
         self._closing.add(task)
         task.add_done_callback(lambda done: self._closed(ticket, done))
 

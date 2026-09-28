@@ -19,6 +19,8 @@ from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware
 from corp_llm_gateway.route_gate.inflight import (
+    CANCEL_CLIENT,
+    CANCEL_SERVER,
     DEFAULT_MAX_DRAINING_BYTES,
     E_BODY_TIMEOUT,
     E_CAPACITY,
@@ -1811,6 +1813,45 @@ async def test_the_ticket_records_who_cancelled_the_request(
     assert at_close == [expected]
     assert at_cancel == ([] if end == "response" else [expected[0]])
     assert limiter.inflight == 0
+
+
+async def test_a_disconnect_while_the_body_is_read_is_the_clients_cancel() -> None:
+    seen: list[tuple[str | None, bool]] = []
+
+    async def hook(request_id: str, *, latency_ms: int = 0) -> None:
+        ticket = current_ticket()
+        assert ticket is not None
+        seen.append((ticket.cancel_origin, ticket.cancelled))
+
+    app = _Holding()
+    gate, limiter, _, _ = _stack(app)
+    limiter.bind_cancel_hook(hook)
+    client = _stalled_client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.sleep(0.05)
+    assert limiter.draining == 1
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert seen == [(CANCEL_CLIENT, True)]
+    assert app.calls == 0 and limiter.draining == 0
+
+
+@pytest.mark.parametrize(
+    ("first", "then", "expected"),
+    [
+        (CANCEL_CLIENT, CANCEL_SERVER, (CANCEL_CLIENT, True)),
+        (CANCEL_SERVER, CANCEL_CLIENT, (CANCEL_SERVER, False)),
+    ],
+)
+def test_the_first_origin_marked_stays(first: str, then: str, expected: tuple[str, bool]) -> None:
+    ticket = RequestTicket("f" * 32)
+
+    ticket.mark_cancelled(first)
+    ticket.mark_cancelled(then)
+
+    assert (ticket.cancel_origin, ticket.cancelled) == expected
 
 
 async def test_a_hook_offered_to_a_closed_ticket_is_refused_and_never_run() -> None:

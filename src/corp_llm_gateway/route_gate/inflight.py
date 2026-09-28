@@ -429,11 +429,6 @@ class InflightLimiter:
         ticket = RequestTicket(uuid.uuid4().hex)
         try:
             await self._admit_ticket(ticket, started, held, scope, receive, send, app, refuse)
-        except asyncio.CancelledError:
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
-                ticket.mark_cancelled(CANCEL_SERVER)
-            raise
         finally:
             self._close(ticket)
 
@@ -547,27 +542,40 @@ class InflightLimiter:
         try:
             await asyncio.wait({downstream, watcher}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
-            # The server is cancelling the request: before the downstream sees it.
-            ticket.mark_cancelled(CANCEL_SERVER)
-            watcher.cancel()
-            downstream.cancel()
-            try:
-                await asyncio.wait({downstream, watcher}, timeout=self._grace)
-            finally:
-                # Also when a second cancel cuts the grace short.
-                _retrieve_when_done(downstream)
-                _retrieve_when_done(watcher)
+            await self._server_cancelled(ticket, downstream, watcher)
             raise
         if replay.disconnected and not response_complete:
             await self._cancelled(ticket, started, downstream=downstream)
             await _settle(watcher)
             return
         watcher.cancel()
-        await _settle(watcher)
         try:
-            await downstream
+            try:
+                await _settle(watcher)
+                # Not `await downstream`: that would hand the cancel to the downstream
+                # before the ticket says who cancelled it.
+                await asyncio.wait({downstream})
+            except asyncio.CancelledError:
+                await self._server_cancelled(ticket, downstream, watcher)
+                raise
+            downstream.result()
         finally:
             replay.complete()
+
+    async def _server_cancelled(
+        self, ticket: RequestTicket, downstream: asyncio.Task[None], watcher: asyncio.Task[None]
+    ) -> None:
+        """The server is cancelling the request: mark it before the downstream sees it,
+        then give the downstream the grace to unwind."""
+        ticket.mark_cancelled(CANCEL_SERVER)
+        watcher.cancel()
+        downstream.cancel()
+        try:
+            await asyncio.wait({downstream, watcher}, timeout=self._grace)
+        finally:
+            # Also when a second cancel cuts the grace short.
+            _retrieve_when_done(downstream)
+            _retrieve_when_done(watcher)
 
     @staticmethod
     def _start(ticket: RequestTicket, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:

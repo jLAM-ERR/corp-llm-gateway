@@ -13,6 +13,8 @@ import pytest
 from corp_llm_gateway.audit import AuditLogger, AuditWriteAmbiguousError, ListSink
 from corp_llm_gateway.metrics import NoopExporter
 from corp_llm_gateway.route_gate.inflight import (
+    CANCEL_CLIENT,
+    CANCEL_SERVER,
     InflightLimiter,
     RequestTicket,
     current_ticket,
@@ -291,6 +293,118 @@ async def test_a_publish_while_one_is_in_flight_writes_nothing_more() -> None:
     assert [r.outcome for r in records] == ["ok"]
 
 
+class _Gated:
+    """The first write parks until released, then fails or lands; later writes land unless
+    ``later_fail``. ``owned`` says, per write, whether the task writing belongs to ``ticket``."""
+
+    def __init__(
+        self, *, first_fails: bool, later_fail: bool = False, ticket: RequestTicket | None = None
+    ) -> None:
+        self.first_fails = first_fails
+        self.later_fail = later_fail
+        self.ticket = ticket
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.records: list[TerminalRecord] = []
+        self.owned: list[bool] = []
+        self.calls = 0
+
+    async def __call__(self, record: TerminalRecord) -> None:
+        self.calls += 1
+        if self.ticket is not None:
+            self.owned.append(asyncio.current_task() in self.ticket.tasks)
+        if self.calls == 1:
+            self.entered.set()
+            while not self.release.is_set():
+                # Stubborn: cancelling the request does not end this write.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.release.wait()
+            if self.first_fails:
+                raise RuntimeError(CANARY)
+        elif self.later_fail:
+            raise RuntimeError(CANARY)
+        self.records.append(record)
+
+    @property
+    def outcomes(self) -> list[tuple[str, str | None]]:
+        return [(r.outcome, r.error_code) for r in self.records]
+
+
+@pytest.mark.parametrize(
+    ("first_fails", "expected"),
+    [(True, [("cancelled", E_CLIENT_DISCONNECTED)]), (False, [("ok", None)])],
+)
+async def test_a_close_during_an_in_flight_write_writes_only_if_that_write_fails(
+    first_fails: bool, expected: list[tuple[str, str | None]]
+) -> None:
+    """The close is not lost behind a write in flight: a failed write falls through to the
+    close's own record, a landed one leaves the close nothing to write."""
+    sink = _Gated(first_fails=first_fails)
+    terminal = TerminalAudit(sink)
+    ticket = _ticket(_facts())
+    terminal.bind(ticket)
+    publishing = asyncio.create_task(terminal.publish(ticket, "ok"))
+    await asyncio.wait_for(sink.entered.wait(), 2)
+
+    ticket.mark_cancelled(CANCEL_CLIENT)
+    ticket.close()
+    sink.release.set()
+    await publishing
+    await terminal.drain()
+
+    assert sink.outcomes == expected
+    assert sink.calls == len(expected) + int(first_fails)
+    assert ticket.audit_facts.published
+
+
+async def test_the_close_behind_an_in_flight_write_is_the_last_attempt() -> None:
+    sink = _Gated(first_fails=True, later_fail=True)
+    terminal = TerminalAudit(sink)
+    ticket = _ticket(_facts())
+    terminal.bind(ticket)
+    publishing = asyncio.create_task(terminal.publish(ticket, "ok"))
+    await asyncio.wait_for(sink.entered.wait(), 2)
+
+    ticket.close()
+    sink.release.set()
+    await publishing
+    await terminal.drain()
+    await asyncio.sleep(0)
+
+    assert sink.calls == 2 and sink.records == []
+    assert not ticket.audit_facts.published
+
+
+async def test_a_server_cancel_leaves_an_ok_published_before_the_close_ok() -> None:
+    """Unlike a client that left, a server cancel does not turn ``ok`` into ``cancelled``:
+    the response completed."""
+    sink = _Sink()
+    terminal = TerminalAudit(sink)
+    ticket = _ticket(_facts())
+    terminal.bind(ticket)
+    ticket.mark_cancelled(CANCEL_SERVER)
+
+    await terminal.publish(ticket, "ok")
+    ticket.close()
+    await terminal.drain()
+
+    assert sink.outcomes == [("ok", None)]
+
+
+async def test_a_server_cancel_closed_before_any_publish_is_the_servers_cancel() -> None:
+    sink = _Sink()
+    terminal = TerminalAudit(sink)
+    ticket = _ticket(_facts())
+    terminal.bind(ticket)
+    ticket.mark_cancelled(CANCEL_SERVER)
+
+    ticket.close()
+    await terminal.publish(ticket, "ok")
+    await terminal.drain()
+
+    assert sink.outcomes == [("cancelled", E_SERVER_SHUTDOWN)]
+
+
 async def test_without_facts_nothing_is_published() -> None:
     """A request whose pre-call refused it deposits nothing; its inline audit is its record."""
     sink = _Sink()
@@ -471,3 +585,130 @@ async def test_a_cancelled_stream_is_cancelled_with_the_code_of_who_cancelled_it
         restore()
 
     assert sink.outcomes == [expected]
+
+
+@pytest.mark.parametrize("after", ["final_body", "protocol_breach"])
+async def test_a_server_cancel_after_the_watcher_returned_is_the_servers_cancel(
+    after: str,
+) -> None:
+    """The limiter is past watching the client and waits for the downstream to finish (the
+    response went out and the client hung up, or the client broke the protocol): a server
+    cancel there is still marked before the downstream sees it, and before the close."""
+    restore = install_task_factory(asyncio.get_running_loop())
+    sink = _Sink()
+    terminal = TerminalAudit(sink)
+    watcher_done = asyncio.Event()
+    seen_by_downstream: list[str | None] = []
+    served = {"n": 0}
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await receive()
+        ticket = current_ticket()
+        assert deposit(ticket, _facts()) and ticket is not None
+        terminal.bind(ticket)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        more = after != "final_body"
+        await send({"type": "http.response.body", "body": b"data: x\n\n", "more_body": more})
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            seen_by_downstream.append(ticket.cancel_origin)
+            raise
+
+    async def receive() -> dict[str, Any]:
+        served["n"] += 1
+        if served["n"] == 1:
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+        await asyncio.sleep(0.01)
+        watcher_done.set()
+        if after == "final_body":
+            return {"type": "http.disconnect"}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Any) -> None:
+        return None
+
+    async def refuse(reason: str) -> None:
+        raise AssertionError(reason)
+
+    limiter = InflightLimiter(0, metrics=NoopExporter(), cancel_grace_s=0.2)
+    try:
+        task = asyncio.create_task(
+            limiter.run({"type": "http", "headers": []}, receive, send, app, refuse=refuse)
+        )
+        await asyncio.wait_for(watcher_done.wait(), 2)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        await terminal.drain()
+    finally:
+        restore()
+
+    assert sink.outcomes == [("cancelled", E_SERVER_SHUTDOWN)]
+    assert seen_by_downstream == [CANCEL_SERVER]
+
+
+@pytest.mark.parametrize(
+    ("first_fails", "expected"),
+    [(True, [("cancelled", E_CLIENT_DISCONNECTED)]), (False, [("ok", None)])],
+)
+async def test_a_write_still_in_flight_when_the_limiter_lets_go_is_not_lost(
+    first_fails: bool, expected: list[tuple[str, str | None]]
+) -> None:
+    """The client leaves while the response path's write awaits the sink and ignores the
+    cancel; the limiter closes the ticket after the grace. A write that then fails falls
+    through to the close's record, written by a task the request does not own."""
+    restore = install_task_factory(asyncio.get_running_loop())
+    tickets: list[RequestTicket] = []
+    downstreams: list[asyncio.Task[Any]] = []
+    sink = _Gated(first_fails=first_fails)
+    terminal = TerminalAudit(sink)
+    gone = asyncio.Event()
+    served = {"n": 0}
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await receive()
+        ticket = current_ticket()
+        assert deposit(ticket, _facts()) and ticket is not None
+        tickets.append(ticket)
+        sink.ticket = ticket
+        task = asyncio.current_task()
+        assert task is not None
+        downstreams.append(task)
+        terminal.bind(ticket)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"data: x\n\n", "more_body": True})
+        await terminal.publish(ticket, "ok")
+
+    async def receive() -> dict[str, Any]:
+        served["n"] += 1
+        if served["n"] == 1:
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: Any) -> None:
+        return None
+
+    async def refuse(reason: str) -> None:
+        raise AssertionError(reason)
+
+    limiter = InflightLimiter(0, metrics=NoopExporter(), cancel_grace_s=0.1)
+    try:
+        task = asyncio.create_task(
+            limiter.run({"type": "http", "headers": []}, receive, send, app, refuse=refuse)
+        )
+        await asyncio.wait_for(sink.entered.wait(), 2)
+        gone.set()
+        await asyncio.wait_for(task, 2)
+        (ticket,) = tickets
+        assert ticket.closed and ticket.audit_facts.publishing
+        sink.release.set()
+        await asyncio.wait_for(asyncio.wait(downstreams), 2)
+        await terminal.drain()
+    finally:
+        restore()
+
+    assert sink.outcomes == expected
+    assert sink.owned == [True, False] if first_fails else [True]
