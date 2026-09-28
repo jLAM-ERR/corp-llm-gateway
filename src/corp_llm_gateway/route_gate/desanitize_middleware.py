@@ -16,9 +16,11 @@ is closed without a message. Either way it is reported (content-free log line +
 ``gateway_failure{component="desanitize"}``). The terminal record is published once
 through ``terminal_audit.TerminalAudit``, here at the final body or the failure, and at
 the ticket's close for a request that got neither. Token counts for that record are read
-from the 2xx response as it passes (the JSON body's ``usage``; in a stream the chat usage
-chunk, Anthropic's ``message_start`` / ``message_delta`` or Responses'
-``response.completed``), in every mode.
+from the 2xx response as it passes (the JSON body's ``usage``, up to 1 MiB; in a stream the
+chat usage chunk, Anthropic's ``message_start`` / ``message_delta`` or Responses'
+``response.completed``), in every mode. A chat stream always carries its usage chunk here
+(the guardrail's pre-call asks for it); when its client did not ask, the chunk is read and
+dropped, with every other all-empty chunk litellm itself would have stripped.
 
 ``Content-Encoding``: a response carrying one passes through untouched (placeholders,
 never originals); ``compressor_problems`` is the arm check that nothing in the served
@@ -38,7 +40,12 @@ from typing import Any
 
 from corp_llm_gateway.metrics import MetricsExporter, get_exporter
 from corp_llm_gateway.route_gate.inflight import RequestTicket, current_ticket
-from corp_llm_gateway.route_gate.terminal_audit import Outcome, TerminalAudit, deposit_usage
+from corp_llm_gateway.route_gate.terminal_audit import (
+    AuditFacts,
+    Outcome,
+    TerminalAudit,
+    deposit_usage,
+)
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
 from corp_llm_gateway.sanitizer.streaming import (
     ResponsesStreamDesanitizer,
@@ -65,9 +72,12 @@ INTERNAL_ERROR_BODY = json.dumps(
 ).encode()
 
 _SSE_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
+_SSE_BOUNDARY_BYTES = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 _COMPRESSORS = ("gzip", "brotli", "zstd", "deflate", "compress")
 # A pass-through JSON body past this is forwarded without reading its usage.
-_USAGE_BODY_CAP = 8 * 1024 * 1024
+_USAGE_BODY_CAP = 1024 * 1024
+# A pass-through SSE event not complete within this is forwarded unread from there on.
+_USAGE_EVENT_CAP = 8 * 1024 * 1024
 
 
 class ResponseMappings:
@@ -241,7 +251,11 @@ class _Response:
         if self._mode == "pass":
             tap = self._tap
             if tap is not None:
-                tap.feed(bytes(message.get("body") or b""), final=not more, usage=self._usage)
+                body = tap.feed(
+                    bytes(message.get("body") or b""), final=not more, usage=self._usage
+                )
+                if tap.drops:
+                    message = {**message, "body": body}
             if more:
                 await self._send(message)
                 return
@@ -288,11 +302,14 @@ class _Response:
         content_type = _header(message, b"content-type").lower()
         encoding = _header(message, b"content-encoding").strip().lower()
         identity = encoding in ("", "identity")
+        drop_usage = _drops_usage_chunk(self._ticket)
         if mapping is None or not mapping.pairs or not 200 <= self._status < 300 or not identity:
             self._mode = "pass"
             self._mappings.release(self._ticket)
             if 200 <= self._status < 300 and identity:
-                self._tap = _UsageTap.for_content_type(content_type)
+                self._tap = _UsageTap.for_content_type(content_type, drop_usage_chunk=drop_usage)
+            if self._tap is not None and self._tap.drops:
+                message = {**message, "headers": _without(message, b"content-length")}
             await self._send(message)
             return
         self._mapping = mapping
@@ -300,6 +317,7 @@ class _Response:
             failure: type[BaseException] | None = None
             try:
                 self._sse = _SseRestorer(mapping)
+                self._sse.drop_usage_chunk = drop_usage
                 self._usage = self._sse.usage
             except Exception as exc:
                 failure = type(exc)
@@ -422,6 +440,8 @@ class _SseRestorer:
     after; the chat / Anthropic adapter does the same for its own buffers."""
 
     def __init__(self, mapping: StrategyResult) -> None:
+        # Drop the usage chunk (and every all-empty chunk) of a chat stream.
+        self.drop_usage_chunk = False
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
         self._buffer = ""
         self._ready: list[str] = []
@@ -455,6 +475,8 @@ class _SseRestorer:
         data = _data_field(event)
         payload = _json_or_none(data)
         self.usage.observe(payload)
+        if self.drop_usage_chunk and _injected_usage_artifact(payload):
+            return []
         head: list[str] = []
         if data == "[DONE]" or is_stream_error_event(payload):
             self.saw_error = self.saw_error or data != "[DONE]"
@@ -520,59 +542,108 @@ def _count(usage: dict[str, Any], *names: str) -> int | None:
 
 
 class _UsageTap:
-    """Reads the usage of a 2xx body it does not restore; the bytes go out untouched."""
+    """Reads the usage of a 2xx body it does not restore. The bytes go out untouched,
+    except the usage chunk of a chat stream whose client did not ask for it (``drops``)."""
 
-    def __init__(self, sse: bool) -> None:
+    def __init__(self, sse: bool, *, drop_usage_chunk: bool = False) -> None:
         self._sse = sse
-        self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
-        self._buffer = ""
-        self._body = bytearray()
+        self.drops = sse and drop_usage_chunk
+        self._buffer = bytearray()
         self._over = False
 
     @classmethod
-    def for_content_type(cls, content_type: str) -> _UsageTap | None:
+    def for_content_type(
+        cls, content_type: str, *, drop_usage_chunk: bool = False
+    ) -> _UsageTap | None:
         if content_type.startswith("text/event-stream"):
-            return cls(sse=True)
+            return cls(sse=True, drop_usage_chunk=drop_usage_chunk)
         if "json" in content_type:
             return cls(sse=False)
         return None
 
-    def feed(self, chunk: bytes, *, final: bool, usage: _Usage) -> None:
+    def feed(self, chunk: bytes, *, final: bool, usage: _Usage) -> bytes:
+        """What goes out for ``chunk``: the chunk itself, or, when ``drops``, the complete
+        events it ends, minus the usage chunk and any other all-empty chat chunk."""
+        if self._sse:
+            return self._feed_sse(chunk, final, usage)
         try:
-            if self._sse:
-                self._feed_sse(chunk, final, usage)
-            else:
-                self._feed_json(chunk, final, usage)
+            self._feed_json(chunk, final, usage)
         except Exception as exc:
             # Counts only: a response it cannot read keeps the counts it has.
             logger.warning("gateway_desanitize_usage_unread error=%s", type(exc).__name__)
             self._over = True
+            self._buffer.clear()
+        return chunk
 
     def _feed_json(self, chunk: bytes, final: bool, usage: _Usage) -> None:
         if self._over:
             return
-        if len(self._body) + len(chunk) > _USAGE_BODY_CAP:
+        if len(self._buffer) + len(chunk) > _USAGE_BODY_CAP:
             self._over = True
-            self._body.clear()
+            self._buffer.clear()
             return
-        self._body += chunk
+        self._buffer += chunk
         if final:
-            usage.observe(_json_or_none(bytes(self._body).decode("utf-8", "replace")))
-            self._body.clear()
+            usage.observe(_json_or_none(bytes(self._buffer).decode("utf-8", "replace")))
+            self._buffer.clear()
 
-    def _feed_sse(self, chunk: bytes, final: bool, usage: _Usage) -> None:
+    def _feed_sse(self, chunk: bytes, final: bool, usage: _Usage) -> bytes:
         if self._over:
-            return
-        self._buffer += self._utf8.decode(chunk, final=final)
-        while (match := _SSE_BOUNDARY.search(self._buffer)) is not None:
-            event, self._buffer = self._buffer[: match.end()], self._buffer[match.end() :]
-            if '"usage"' in event:
-                usage.observe(_json_or_none(_data_field(event)))
-        if final and '"usage"' in self._buffer:
-            usage.observe(_json_or_none(_data_field(self._buffer)))
-        if len(self._buffer) > _USAGE_BODY_CAP:
+            return chunk
+        self._buffer += chunk
+        out = bytearray()
+        while (match := _SSE_BOUNDARY_BYTES.search(self._buffer)) is not None:
+            event = bytes(self._buffer[: match.end()])
+            del self._buffer[: match.end()]
+            if not self._read(event, usage):
+                out += event
+        if final and self._buffer:
+            if not self._read(bytes(self._buffer), usage):
+                out += self._buffer
+            self._buffer.clear()
+        if len(self._buffer) > _USAGE_EVENT_CAP:
             self._over = True
-            self._buffer = ""
+            out += self._buffer
+            self._buffer.clear()
+        return bytes(out) if self.drops else chunk
+
+    def _read(self, event: bytes, usage: _Usage) -> bool:
+        """Observe one event's usage; True to drop it."""
+        if not self.drops and b'"usage"' not in event:
+            return False
+        try:
+            payload = _json_or_none(_data_field(event.decode("utf-8", "replace")))
+            usage.observe(payload)
+            return self.drops and _injected_usage_artifact(payload)
+        except Exception as exc:
+            logger.warning("gateway_desanitize_usage_unread error=%s", type(exc).__name__)
+            return False
+
+
+def _drops_usage_chunk(ticket: RequestTicket) -> bool:
+    facts = ticket.audit_facts
+    return isinstance(facts, AuditFacts) and not facts.client_asked_usage
+
+
+def _injected_usage_artifact(payload: Any) -> bool:
+    """What litellm strips from a chat stream it asked for usage on the client's behalf
+    (``proxy_server._is_injected_stream_usage_artifact``): a chunk whose every choice is
+    empty, the usage chunk among them."""
+    if not isinstance(payload, dict) or payload.get("provider_specific_fields") is not None:
+        return False
+    choices = payload.get("choices")
+    return isinstance(choices, list) and all(_empty_choice(choice) for choice in choices)
+
+
+def _empty_choice(choice: Any) -> bool:
+    if not isinstance(choice, dict):
+        return False
+    if choice.get("finish_reason") is not None or choice.get("logprobs") is not None:
+        return False
+    delta = choice.get("delta")
+    return delta is None or (
+        isinstance(delta, dict) and all(value is None for value in delta.values())
+    )
 
 
 def _data_field(event: str) -> str | None:

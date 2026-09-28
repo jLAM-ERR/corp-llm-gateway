@@ -11,7 +11,8 @@ Fail-closed: a REFUSE, an unarmed REWRITTEN route and any classifier exception
 all end here, never at litellm. A route refusal never reads the body; the
 limiter's oversize and body-timeout refusals have read (part of) it, and a
 capacity refusal may have. An admitted REWRITTEN body that names litellm policies
-(a top-level ``policies`` key, which litellm would apply to the request) is refused
+(a top-level ``policies`` key, which litellm would apply to the request), or that is
+not JSON (litellm would read a form body, a ``policies`` field included), is refused
 once the limiter has read it, before any slot is taken or litellm parses it. No
 request byte is ever echoed or logged (M1-14); the refusal names only the route
 the caller itself sent.
@@ -30,6 +31,7 @@ from corp_llm_gateway.audit.event import AuditEvent
 from corp_llm_gateway.audit.logger import AuditLogger
 from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.route_gate.classify import (
+    ROUTE_GATE_BODY_NOT_JSON,
     ROUTE_GATE_BODY_POLICIES,
     ROUTE_GATE_ERROR,
     ROUTE_GATE_LISTED,
@@ -69,6 +71,7 @@ CALL_ID_HEADER = b"x-litellm-call-id"
 
 _STATUS: dict[str, int] = {
     ROUTE_GATE_BODY_POLICIES: 403,
+    ROUTE_GATE_BODY_NOT_JSON: 415,
     ROUTE_GATE_UNLISTED: 404,
     ROUTE_GATE_LISTED: 403,
     ROUTE_GATE_WEBSOCKET: 403,
@@ -82,6 +85,7 @@ _STATUS: dict[str, int] = {
 
 _ERROR_CODE: dict[str, str] = {
     ROUTE_GATE_BODY_POLICIES: _BLOCKED,
+    ROUTE_GATE_BODY_NOT_JSON: _BLOCKED,
     ROUTE_GATE_UNLISTED: _BLOCKED,
     ROUTE_GATE_LISTED: _BLOCKED,
     ROUTE_GATE_WEBSOCKET: _BLOCKED,
@@ -95,6 +99,7 @@ _ERROR_CODE: dict[str, str] = {
 
 _ERROR_TYPE: dict[str, str] = {
     ROUTE_GATE_BODY_POLICIES: "route_blocked",
+    ROUTE_GATE_BODY_NOT_JSON: "route_blocked",
     ROUTE_GATE_UNLISTED: "route_blocked",
     ROUTE_GATE_LISTED: "route_blocked",
     ROUTE_GATE_WEBSOCKET: "route_blocked",
@@ -117,8 +122,10 @@ _CAPACITY_WHY = "the gateway's in-flight cap is reached; retry later"
 _OVERSIZE_WHY = "the request body is over the gateway's body cap"
 _BODY_TIMEOUT_WHY = "the request body did not arrive within the gateway's body-read deadline"
 _BODY_POLICIES_WHY = "the request body names litellm policies; the gateway applies its own"
+_BODY_NOT_JSON_WHY = "a rewritten route takes a JSON request body only"
 _WHY: dict[str, str] = {
     ROUTE_GATE_BODY_POLICIES: _BODY_POLICIES_WHY,
+    ROUTE_GATE_BODY_NOT_JSON: _BODY_NOT_JSON_WHY,
     ROUTE_GATE_CAPACITY: _CAPACITY_WHY,
     ROUTE_GATE_BODY_TIMEOUT: _BODY_TIMEOUT_WHY,
     OVERSIZE_BLOCKED: _OVERSIZE_WHY,
@@ -213,7 +220,12 @@ class RouteGateMiddleware:
         async def refuse(reason: str) -> None:
             await self._refuse(scope, receive, send, method, path, reason, _WHY[reason])
 
-        await limiter.run(scope, receive, send, self.app, refuse=refuse, check=_body_problem)
+        content_type = _content_type(scope)
+
+        def check(chunks: list[bytes]) -> str | None:
+            return _body_problem(chunks, content_type)
+
+        await limiter.run(scope, receive, send, self.app, refuse=refuse, check=check)
 
     async def _refuse(
         self,
@@ -306,10 +318,36 @@ class RouteGateMiddleware:
             logger.error("route_gate_audit_failed block_reason=%s", reason)
 
 
-def _body_problem(chunks: list[bytes]) -> str | None:
-    """``ROUTE_GATE_BODY_POLICIES`` for a JSON object body with a top-level ``policies``
-    key, however its key is escaped; anything else is litellm's to parse."""
+_MISSING = object()
+_AMBIGUOUS = object()
+
+
+def _content_type(scope: Scope) -> object:
+    """The request's one ``Content-Type`` value, ``_MISSING`` or ``_AMBIGUOUS``."""
+    values = [
+        bytes(value)
+        for name, value in scope.get("headers") or ()
+        if bytes(name).lower() == b"content-type"
+    ]
+    if not values:
+        return _MISSING
+    return values[0] if len(values) == 1 else _AMBIGUOUS
+
+
+def _is_json(content_type: object) -> bool:
+    if not isinstance(content_type, bytes):
+        return False
+    return content_type.split(b";", 1)[0].strip().lower() == b"application/json"
+
+
+def _body_problem(chunks: list[bytes], content_type: object) -> str | None:
+    """``ROUTE_GATE_BODY_NOT_JSON`` for a ``Content-Type`` other than ``application/json``
+    (none at all is refused only with a body); ``ROUTE_GATE_BODY_POLICIES`` for a JSON
+    object body with a top-level ``policies`` key, however its key is escaped; anything
+    else is litellm's to parse."""
     body = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+    if not _is_json(content_type) and (body or content_type is not _MISSING):
+        return ROUTE_GATE_BODY_NOT_JSON
     # A key can only spell a letter with a ``\\u`` escape; neither form, no such key.
     if b"policies" not in body and b"\\u" not in body:
         return None

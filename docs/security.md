@@ -371,7 +371,7 @@ of truth** — do not add ad-hoc fail-open paths):
 | `providerBlocked` (D4) | **block** (403 `E_PROVIDER_BLOCKED`) — the merged `allowed_providers` policy rejects the upstream target; a clean policy denial before any content processing, no raw body |
 | `spanApplyFailed` | **fail-closed** (500 `E_SPAN_INVALID`) — `apply_spans` rejects a pre-selected replacement span that no longer matches the segment text (e.g. a stale Cache-A/allocator remap); `StaleSpanError` (`sanitizer/placeholder.py`) is mapped to an audit record + `gateway_failure{component="sanitize"}` rather than escaping as a generic, undocumented 500 |
 | `routeGate` | **default-deny, fail-closed.** Every request is classified by `(method, path)` before litellm's router sees it (`route_gate/table.py`, generated from litellm's own source). A route the table marks REFUSE is 403 `E_ROUTE_BLOCKED`; a route with no entry at all is 404, same error code; a websocket handshake is refused before connect; a path is 403 without ever being matched when its raw bytes carry `%2f`, `%00` or `%2e%2e` (any case) or any non-ASCII byte, or its decoded form carries `..`, `//` or NUL. The gate's OWN faults are failures, not refusals: a REWRITTEN route while the guardrail callback is not registered is 503 `E_ROUTE_GATE_UNARMED` and is never forwarded, and any exception in classification is 500 `E_ROUTE_GATE_ERROR` — both also record `gateway_failure{component="route_gate"}`. No off switch: the only widening is `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`, which can add PASSTHROUGH entries and nothing else. The process exits 70 at startup rather than serve with the callback absent |
-| `internalError` (F8) | **fail-closed** (500 `E_INTERNAL`) — an unexpected exception in `pre_call` or while restoring a response (the ASGI desanitiser, counted as `gateway_failure{component="desanitize"}`) (a DB error, a bug, an audit-sink outage) is never echoed to the client, the log, or the audit record: only the opaque error_code + `gateway_failure{component="internal"}`. The safety net that maps this is guarded against re-entrancy — a failure while recording the failure itself (e.g. the audit sink is also down) is caught and logged rather than replacing the client-visible 500. A request that already recorded a component-specific failure (e.g. `dlp`) is not double-counted as `internal` too |
+| `internalError` (F8) | **fail-closed** (500 `E_INTERNAL`) — an unexpected exception in `pre_call` or while restoring a response (a DB error, a bug, an audit-sink outage) is never echoed to the client, the log, or the audit record: only the opaque error_code + one `gateway_failure` count, `component="internal"` for `pre_call` and `component="desanitize"` for the ASGI desanitiser. The safety net that maps this is guarded against re-entrancy — a failure while recording the failure itself (e.g. the audit sink is also down) is caught and logged rather than replacing the client-visible 500. A request that already recorded a component-specific failure (e.g. `dlp`) is not double-counted as `internal` too |
 
 See plan §M4 for the full matrix (Redis transient retry, Cache A/C miss
 fall-through, single-audit-sink-down) and per-team override columns.
@@ -865,8 +865,9 @@ that justification against the `ast`: a handler whose body calls
 | `route_gate_unarmed` | 503 | `E_ROUTE_GATE_UNARMED` | a REWRITTEN route while the guardrail callback is not registered; never forwarded |
 | `route_gate_error` | 500 | `E_ROUTE_GATE_ERROR` | classification raised; never forwarded |
 | `route_gate_body_policies` | 403 | `E_ROUTE_BLOCKED` | an admitted REWRITTEN request whose JSON body has a top-level `policies` key (litellm would apply those policies to it); checked once the limiter has read the body, before any slot is taken or litellm parses it |
+| `route_gate_body_not_json` | 415 | `E_ROUTE_BLOCKED` | an admitted REWRITTEN request whose `Content-Type` is not `application/json` (parameters such as `charset` allowed), or a non-empty body with no `Content-Type`: litellm would read a form body, a `policies` field included; checked with the same drained body |
 
-The last two also record `gateway_failure{component="route_gate"}`. Every one
+`route_gate_unarmed` and `route_gate_error` also record `gateway_failure{component="route_gate"}`. Every one
 records `corp_llm_gateway_blocked_requests_total{block_reason=…}` and emits an
 audit record carrying the reason and the error code — ALWAYS fields only, since
 the gate refuses before any identity is resolved.
@@ -1006,6 +1007,16 @@ policies (`route_gate_body_policies`, above) and a policy row in litellm's
 database (the shipped litellm configs pin `general_settings.supported_db_objects`
 to `["models"]`).
 
+*Footnote — litellm's config table (hazard 14c).* With a database and
+`store_model_in_db` on, litellm re-reads its `LiteLLM_Config` table every 30 s and
+merges a `litellm_settings` row into its config; `supported_db_objects` does not
+gate that. Compose gives litellm both (`DATABASE_URL`, `STORE_MODEL_IN_DB=True`);
+the Helm chart gives it no database. A `callbacks` name in that row is appended to
+`litellm.callbacks` after ours: it runs on the sanitised request, sees placeholders
+in every response, and is not seen by the arm check. A `guardrails` entry starts
+nothing, because litellm starts guardrails only in its boot-time config load, before
+its database client exists. Pinned by `tests/test_litellm_config_guards.py`.
+
 **Health rows, one by one.** Shipped probes use only the gateway's own
 `/healthz/live` and `/healthz/ready`.
 
@@ -1138,6 +1149,10 @@ sanitizer, the DLP guard and the audit, and a refusal here grants nothing.
   with no profiles, and a store that cannot answer within its bound (5 s) is
   503 `E_PROFILE_UNAVAILABLE` with `gateway_failure{component="team_config"}`
   — fail-closed, never an un-profiled pass (`docs/ops/runbook.md`).
+- **Interleaved tool-call fragments come back as placeholders.** A chat stream
+  that interleaves the argument fragments of two tool calls (off-spec for OpenAI;
+  the v1 providers never send one) gets placeholders, never originals, in those
+  arguments, and the stream does not fail.
 - **Background responses are unsupported, not blocked.** `POST /v1/responses`
   with `background: true` is admitted and the upstream body is sanitized, but the
   client then polls `GET /v1/responses/{id}`, which re-runs under a different

@@ -145,10 +145,12 @@ def _body(route: str, *, stream: bool, extra: dict[str, Any] | None = None) -> b
     return json.dumps(body | (extra or {})).encode()
 
 
-async def _post(port: int, path: str, body: bytes) -> tuple[int, dict[str, str], bytes]:
+async def _post(
+    port: int, path: str, body: bytes, *, content_type: str = "application/json"
+) -> tuple[int, dict[str, str], bytes]:
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     head = (
-        f"POST {path} HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n"
+        f"POST {path} HTTP/1.1\r\nHost: gateway\r\nContent-Type: {content_type}\r\n"
         f"Content-Length: {len(body)}\r\nX-Corp-Auth: {TOKEN}\r\nConnection: close\r\n\r\n"
     )
     writer.write(head.encode() + body)
@@ -241,6 +243,7 @@ async def main() -> None:
             "call_id": headers.get("x-litellm-call-id"),
             "client_original": ORIGINAL_MARK in text,
             "client_placeholder": PLACEHOLDER_MARK in text,
+            "usage_on_wire": text.count('"usage"'),
             "provider_bodies": stub.bodies[base_bodies:],
             "captures_holding_original": {
                 capture.name: sorted(capture.seen.holding(ORIGINAL_MARK)) for capture in captures
@@ -265,6 +268,15 @@ async def main() -> None:
         for stream in (False, True):
             await flow(f"{route}-{'sse' if stream else 'unary'}", route, stream=stream)
 
+    # A chat stream whose client asked for the usage chunk itself: it is delivered.
+    await flow(
+        "chat-sse-client-usage",
+        "chat",
+        stream=True,
+        extra={"stream_options": {"include_usage": True}},
+    )
+    results["chat_sse_client_usage"] = results["flows"].pop("chat-sse-client-usage")
+
     # The OpenAI SDK's own chat stream accumulator, over the wire.
     results["sdk_chat_stream"] = await _sdk_chat_stream(port, captures, sink)
     await _settle(guardrail)
@@ -277,6 +289,24 @@ async def main() -> None:
     )
     await _settle(guardrail)
     results["body_policies"] = {
+        "status": status,
+        "code": json.loads(body)["error"]["code"],
+        "reason": json.loads(body)["error"]["reason"],
+        "provider_bodies": stub.bodies[base_bodies:],
+        "records": sink.records[base_records:],
+    }
+
+    # A form body (litellm reads one via request.form(), a `policies` field included).
+    base_bodies = len(stub.bodies)
+    base_records = len(sink.records)
+    status, _, body = await _post(
+        port,
+        "/v1/chat/completions",
+        b"model=corp-chat&policies=p1",
+        content_type="application/x-www-form-urlencoded",
+    )
+    await _settle(guardrail)
+    results["body_not_json"] = {
         "status": status,
         "code": json.loads(body)["error"]["code"],
         "reason": json.loads(body)["error"]["reason"],

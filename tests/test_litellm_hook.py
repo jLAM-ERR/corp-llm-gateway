@@ -3497,6 +3497,31 @@ async def test_post_call_stream_parallel_tool_calls_per_index_reassembly() -> No
     assert json.loads(by_index[1]) == {"b": "bob"}
 
 
+async def test_post_call_stream_interleaved_tool_calls_degrade_to_placeholders() -> None:
+    """Known limitation, accepted: two calls' fragments interleaved (off-spec for OpenAI,
+    never produced by the v1 providers) come back as placeholders, never as originals, and
+    the stream does not fail. The restorer's own pin is
+    ``tests/sanitizer/test_streaming_chat_sse.py::test_interleaved_tool_call_fragments_
+    degrade_to_placeholders_never_originals``."""
+    g, _ = _build_guardrail([("alice", "[N1]"), ("bob", "[N2]")])
+    data = _data_with_token("tok-1", content="hi alice and bob", model="gpt-4o")
+    await g.pre_call(data)
+
+    chunks_in = [
+        _tc_delta_chunk("", index=0, first=True),
+        _tc_delta_chunk("", index=1, first=True),
+        _tc_delta_chunk('{"a": "[N', index=0),
+        _tc_delta_chunk('{"b": "[N', index=1),
+        _tc_delta_chunk('1]"}', index=0),
+        _tc_delta_chunk('2]"}', index=1),
+    ]
+    by_index: dict[int, str] = {}
+    async for out in restore_stream(g, data, _async_iter(chunks_in)):
+        for tc in out["choices"][0]["delta"].get("tool_calls") or []:
+            by_index[tc["index"]] = by_index.get(tc["index"], "") + tc["function"]["arguments"]
+    assert by_index == {0: '{"a": "[N1]"}', 1: '{"b": "[N2]"}'}
+
+
 async def test_post_call_stream_tool_calls_bad_index_does_not_crash() -> None:
     """A3 review: a garbage tool_call index must be skipped, not crash the stream —
     subsequent legit content still desanitizes."""
@@ -6010,3 +6035,197 @@ async def test_an_unticketed_pre_call_keeps_todays_record() -> None:
 
     assert [(r["status"], r["redaction_count"]) for r in sink.records] == [("ok", 1)]
     assert g._req_state == {}
+
+
+async def _ticketed_pre_call(
+    g: CorpLlmGuardrail, data: dict[str, Any], ticket: Any, *, call_type: str | None = None
+) -> None:
+    from corp_llm_gateway.route_gate.inflight import _TICKET
+
+    token = _TICKET.set(ticket)
+    try:
+        await g.pre_call(data, call_type=call_type)
+    finally:
+        _TICKET.reset(token)
+
+
+async def _in_context(ticket: Any, call: Any) -> None:
+    from corp_llm_gateway.route_gate.inflight import _TICKET
+
+    token = _TICKET.set(ticket)
+    try:
+        await call
+    finally:
+        _TICKET.reset(token)
+
+
+async def test_a_log_event_in_its_requests_context_adds_to_the_ticket_past_the_fifo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """litellm's logging worker runs each event in the request's copied context
+    (``logging_worker.py``): the ticket there owns the record, however many requests
+    were handed over since. One record, with the request's identity and the log's counts."""
+    import corp_llm_gateway.litellm_hook as hook_mod
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    monkeypatch.setattr(hook_mod, "_AUDIT_DEDUP_CAP", 1)
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    g.bind_response_mappings(ResponseMappings())
+    terminal = TerminalAudit(emit_to(g._audit))
+    tickets = []
+    for i in range(2):
+        ticket = RequestTicket(f"{i:032x}")
+        terminal.bind(ticket)
+        data = _data_with_token("tok-1", content="hi alice")
+        data["litellm_call_id"] = f"call-{i}"
+        await _ticketed_pre_call(g, data, ticket)
+        tickets.append(ticket)
+    assert "call-0" not in g._terminal_owned
+
+    now = datetime.now(UTC)
+    usage = {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+    await _in_context(
+        tickets[0], g.async_log_success_event({"litellm_call_id": "call-0"}, usage, now, now)
+    )
+    await _in_context(tickets[0], g.on_request_cancelled("call-0"))
+    await terminal.publish(tickets[0], "ok")
+    tickets[0].close()
+    await terminal.drain()
+
+    (record,) = sink.records
+    assert (record["request_id"], record["user_id"], record["team_id"]) == ("call-0", "alice", "t1")
+    assert (record["status"], record["redaction_count"]) == ("ok", 1)
+    assert (record["prompt_token_count"], record["completion_token_count"]) == (3, 1)
+
+
+async def test_a_closed_tickets_id_leaves_the_hand_over_fifo() -> None:
+    """The ticket's close wrote (or lost) its record: its id leaves the FIFO, and a later
+    event for it outside any request writes nothing."""
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    g.bind_response_mappings(ResponseMappings())
+    ticket = RequestTicket("c" * 32)
+    data = _data_with_token("tok-1", content="hi alice")
+    data["litellm_call_id"] = "call-9"
+    await _ticketed_pre_call(g, data, ticket)
+    assert "call-9" in g._terminal_owned
+
+    ticket.close()
+
+    assert "call-9" not in g._terminal_owned
+    now = datetime.now(UTC)
+    await g.async_log_success_event({"litellm_call_id": "call-9"}, None, now, now)
+    await g.on_request_cancelled("call-9")
+    assert sink.records == []
+
+
+# ── chat streams ask the provider for usage; the desanitiser drops what the client
+# did not ask for ──
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (None, {"include_usage": True}),
+        ({"include_usage": False}, {"include_usage": True}),
+        ({"include_obfuscation": False}, {"include_obfuscation": False, "include_usage": True}),
+    ],
+    ids=["absent", "declined", "other-key"],
+)
+async def test_a_ticketed_chat_stream_asks_for_usage_the_client_did_not(
+    options: dict[str, Any] | None, expected: dict[str, Any]
+) -> None:
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    ticket = RequestTicket("a" * 32)
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    data["stream"] = True
+    if options is not None:
+        data["stream_options"] = options
+
+    class _LoggingObj:
+        def __init__(self) -> None:
+            self.stream_options = options
+
+    data["litellm_logging_obj"] = _LoggingObj()
+
+    await _ticketed_pre_call(g, data, ticket, call_type="acompletion")
+
+    assert data["stream_options"] == expected
+    # litellm's stream wrapper reads them off its logging object, set before any pre-call.
+    assert data["litellm_logging_obj"].stream_options == expected
+    assert ticket.audit_facts.client_asked_usage is False
+
+
+async def test_litellms_own_usage_strip_is_handed_to_the_desanitiser() -> None:
+    """litellm 1.101.0 asks a chat stream for usage itself when the client did not, and
+    strips the chunk before the response leaves its app; the desanitiser must see it."""
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    ticket = RequestTicket("e" * 32)
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    data["stream"] = True
+    data["stream_options"] = {"include_usage": True}
+    data["_litellm_strip_stream_usage"] = True
+
+    class _LoggingObj:
+        def __init__(self) -> None:
+            self.stream_options = {"include_usage": True}
+
+    data["litellm_logging_obj"] = _LoggingObj()
+
+    await _ticketed_pre_call(g, data, ticket, call_type="acompletion")
+
+    assert data["_litellm_strip_stream_usage"] is False
+    assert data["stream_options"] == {"include_usage": True}
+    assert data["litellm_logging_obj"].stream_options == {"include_usage": True}
+    assert ticket.audit_facts.client_asked_usage is False
+
+
+async def test_a_chat_stream_whose_client_asked_for_usage_is_left_alone() -> None:
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    ticket = RequestTicket("b" * 32)
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    data["stream"] = True
+    data["stream_options"] = {"include_usage": True}
+
+    await _ticketed_pre_call(g, data, ticket, call_type="acompletion")
+
+    assert data["stream_options"] == {"include_usage": True}
+    assert ticket.audit_facts.client_asked_usage is True
+
+
+@pytest.mark.parametrize(
+    ("call_type", "stream", "ticketed"),
+    [
+        ("acompletion", False, True),
+        ("anthropic_messages", True, True),
+        ("aresponses", True, True),
+        ("acompletion", True, False),
+    ],
+    ids=["chat-unary", "messages-sse", "responses-sse", "no-ticket"],
+)
+async def test_nothing_else_is_asked_for_usage(
+    call_type: str, stream: bool, ticketed: bool
+) -> None:
+    """Only a ticketed chat stream: nothing outside the route gate would drop the chunk."""
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    ticket = RequestTicket("d" * 32)
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    data["stream"] = stream
+
+    if ticketed:
+        await _ticketed_pre_call(g, data, ticket, call_type=call_type)
+        assert ticket.audit_facts.client_asked_usage is True
+    else:
+        await g.pre_call(data, call_type=call_type)
+    assert "stream_options" not in data

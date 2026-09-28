@@ -649,7 +649,7 @@ async def test_the_capacity_refusal_is_counted_on_the_real_series() -> None:
         "method": "POST",
         "path": "/v1/messages",
         "raw_path": b"/v1/messages",
-        "headers": [],
+        "headers": [(b"content-type", b"application/json")],
     }
 
     async def receive() -> dict:

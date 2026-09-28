@@ -50,6 +50,7 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
         "route_gate_unarmed",
         "route_gate_error",
         "route_gate_body_policies",
+        "route_gate_body_not_json",
     ),
     # The route gate's in-flight cap, after the verdict (route_gate/inflight.py):
     # every slot (or body-read place) taken, or a body past its read deadline.

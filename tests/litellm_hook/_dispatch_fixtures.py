@@ -777,7 +777,8 @@ class DispatchHarness:
     ``callbacks`` (or wrapped by one) registering its response mappings there, and the
     terminal audit bound to each ticket, writing through that guardrail's own audit
     logger (so its sink holds the one record of each request). ``body_gate=False``
-    lifts the gate's ``policies`` body refusal, to show what litellm does with such a body.
+    lifts the gate's body refusals (``policies``, not JSON), to show what litellm does
+    with such a body.
     """
 
     def __init__(
@@ -796,7 +797,7 @@ class DispatchHarness:
         monkeypatch.setattr(
             gate_middleware,
             "_body_problem",
-            _GATE_BODY_PROBLEM if body_gate else (lambda chunks: None),
+            _GATE_BODY_PROBLEM if body_gate else (lambda chunks, content_type: None),
         )
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
         monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")

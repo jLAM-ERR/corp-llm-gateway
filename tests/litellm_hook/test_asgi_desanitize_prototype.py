@@ -1718,11 +1718,10 @@ async def test_a_failed_terminal_write_is_retried_at_close_and_written_once(
     assert CANARY not in caplog.text
 
 
-# The stub's usage (7 in, 2 out) on every flow but chat SSE, which carries no usage
-# chunk unless the client asks for one (see the next test); its counts are whatever
-# litellm's success log deposited if it ran before the final body, else 0.
+# The stub's usage (7 in, 2 out) on every flow; on chat SSE from the usage chunk the
+# client did not ask for, which the middleware reads and drops.
 STUB_USAGE = {
-    (route, stream): None if (route, stream) == ("chat", True) else (7, 2)
+    (route, stream): (7, 2)
     for route in ("chat", "messages", "responses")
     for stream in (False, True)
 }
@@ -1760,10 +1759,10 @@ async def test_over_litellms_app_the_terminal_record_keeps_todays_counts(
     assert event.redaction_count == 1
     assert event.finding_label_counts == {"EMAIL": 1}
     assert event.placeholder_list == (PLACEHOLDER,)
-    expected_usage = STUB_USAGE[(route, stream)]
-    if expected_usage is not None:
-        # Read off the response by the middleware, whenever litellm's log runs.
-        assert (event.prompt_token_count, event.completion_token_count) == expected_usage
+    # Read off the response by the middleware, whenever litellm's log runs.
+    assert (event.prompt_token_count, event.completion_token_count) == STUB_USAGE[(route, stream)]
+    if (route, stream) == ("chat", True):
+        assert '"usage"' not in exchange.text
     assert len(mappings) == 0
 
 
@@ -1788,6 +1787,7 @@ async def test_chat_sse_usage_reaches_the_record_when_the_client_asks_for_it(
     )
 
     assert exchange.status == 200 and ORIGINAL_MARK in exchange.text
+    assert exchange.text.count('"usage"') == 1
     (record,) = records.records
     event = record.event()
     assert (event.prompt_token_count, event.completion_token_count) == (7, 2)

@@ -154,13 +154,33 @@ def test_exactly_one_terminal_record_with_todays_fields(served: dict[str, Any], 
     assert (result["mappings_left"], result["req_state"]) == (0, 0)
 
 
-@pytest.mark.parametrize("flow", [f for f in FLOWS if f != "chat-sse"])
+@pytest.mark.parametrize("flow", FLOWS)
 def test_token_counts_reach_the_record_from_the_response(served: dict[str, Any], flow: str) -> None:
     """The stub's usage (7 in, 2 out), read off the response by the desanitiser: the JSON
     body's ``usage``, Anthropic's ``message_start`` / ``message_delta``, Responses'
-    ``response.completed``. Chat SSE carries none unless the client asks for it."""
+    ``response.completed``, and the chat stream's usage chunk, which the pre-call asks
+    the provider for."""
     (record,) = served["flows"][flow]["records"]
 
+    assert (record["prompt_token_count"], record["completion_token_count"]) == (7, 2)
+
+
+def test_a_chat_stream_client_gets_no_usage_chunk_it_did_not_ask_for(
+    served: dict[str, Any],
+) -> None:
+    result = served["flows"]["chat-sse"]
+
+    (body,) = result["provider_bodies"]
+    assert json.loads(body)["stream_options"] == {"include_usage": True}
+    assert result["usage_on_wire"] == 0
+
+
+def test_a_chat_stream_client_that_asked_for_usage_gets_the_chunk(served: dict[str, Any]) -> None:
+    result = served["chat_sse_client_usage"]
+
+    assert result["status"] == 200 and result["client_original"] is True
+    assert result["usage_on_wire"] == 1
+    (record,) = result["records"]
     assert (record["prompt_token_count"], record["completion_token_count"]) == (7, 2)
 
 
@@ -184,6 +204,16 @@ def test_a_body_naming_policies_is_refused_at_the_gate(served: dict[str, Any]) -
     assert result["provider_bodies"] == []
     (record,) = result["records"]
     assert (record["status"], record["block_reason"]) == ("failed", "route_gate_body_policies")
+
+
+def test_a_form_body_is_refused_at_the_gate(served: dict[str, Any]) -> None:
+    result = served["body_not_json"]
+
+    assert (result["status"], result["code"]) == (415, "E_ROUTE_BLOCKED")
+    assert result["reason"] == "route_gate_body_not_json"
+    assert result["provider_bodies"] == []
+    (record,) = result["records"]
+    assert (record["status"], record["block_reason"]) == ("failed", "route_gate_body_not_json")
 
 
 def test_a_client_that_leaves_mid_stream_gets_one_cancelled_record(

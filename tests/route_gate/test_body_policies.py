@@ -1,9 +1,13 @@
-"""The gate refuses an admitted rewritten body that names litellm policies.
+"""The gate refuses an admitted rewritten body that names litellm policies, or that is
+not JSON.
 
 litellm pops a top-level ``policies`` key off the request body and applies those policies
 to the request (``litellm_pre_call_utils.py``, hazard 14b of plan 20260926); the gate
 refuses it once the in-flight limiter has read the body, before any slot is taken and
-before litellm parses it. Content-free: the refusal and its log name no body byte.
+before litellm parses it. litellm also reads a form body (``request.form()``), where a
+``policies`` field reaches the same place: the rewritten routes take JSON only, so any
+other ``Content-Type`` (or none, on a non-empty body) is refused the same way.
+Content-free: the refusal and its log name no body byte.
 """
 
 from __future__ import annotations
@@ -16,7 +20,12 @@ import pytest
 
 from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.metrics import MetricsExporter
-from corp_llm_gateway.route_gate import BLOCK_REASONS, ROUTE_GATE_BODY_POLICIES, RouteGateMiddleware
+from corp_llm_gateway.route_gate import (
+    BLOCK_REASONS,
+    ROUTE_GATE_BODY_NOT_JSON,
+    ROUTE_GATE_BODY_POLICIES,
+    RouteGateMiddleware,
+)
 from corp_llm_gateway.route_gate.inflight import InflightLimiter
 
 CANARY = "corp-policy-7f2a"
@@ -60,8 +69,16 @@ class _Downstream:
         await send({"type": "http.response.body", "body": b"served"})
 
 
+_JSON = b"application/json"
+
+
 async def _post(
-    body_chunks: list[bytes], *, path: str = "/v1/chat/completions"
+    body_chunks: list[bytes],
+    *,
+    path: str = "/v1/chat/completions",
+    content_type: bytes | None = _JSON,
+    method: str = "POST",
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
 ) -> tuple[int, dict[str, Any] | bytes, _Downstream, _Metrics, ListSink, InflightLimiter]:
     downstream = _Downstream()
     metrics = _Metrics()
@@ -85,10 +102,11 @@ async def _post(
 
     scope = {
         "type": "http",
-        "method": "POST",
+        "method": method,
         "path": path,
         "raw_path": path.encode(),
-        "headers": [(b"content-type", b"application/json")],
+        "headers": ([] if content_type is None else [(b"content-type", content_type)])
+        + (extra_headers or []),
     }
     await gate(scope, receive, send)
     status = next(m["status"] for m in sent if m["type"] == "http.response.start")
@@ -169,3 +187,91 @@ async def test_anything_but_a_top_level_key_is_served(body: bytes) -> None:
 
 def test_the_reason_is_one_of_the_gates_own() -> None:
     assert ROUTE_GATE_BODY_POLICIES in BLOCK_REASONS
+
+
+# ── rewritten routes take JSON only ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("content_type", "body"),
+    [
+        (b"application/x-www-form-urlencoded", f"model=corp-chat&policies={CANARY}".encode()),
+        (
+            b"multipart/form-data; boundary=b",
+            b'--b\r\nContent-Disposition: form-data; name="policies"\r\n\r\n'
+            + CANARY.encode()
+            + b"\r\n--b--\r\n",
+        ),
+        (b"text/plain", _body(policies=[CANARY])),
+        (b"application/json-patch+json", _body()),
+        (b"application/jsonx", _body()),
+        (None, _body(policies=[CANARY])),
+        (None, _body()),
+    ],
+    ids=["form", "multipart", "text", "json-patch", "jsonx", "missing-policies", "missing"],
+)
+async def test_a_body_that_is_not_json_is_refused_before_litellm_or_a_slot(
+    content_type: bytes | None, body: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG):
+        status, payload, downstream, metrics, sink, limiter = await _post(
+            [body], content_type=content_type
+        )
+
+    assert status == 415
+    assert isinstance(payload, dict)
+    assert payload["error"]["code"] == "E_ROUTE_BLOCKED"
+    assert payload["error"]["reason"] == ROUTE_GATE_BODY_NOT_JSON
+    assert downstream.bodies == []
+    assert metrics.inflight == [] and limiter.inflight == 0
+    assert limiter.buffered_bytes == 0
+    assert metrics.blocks == [ROUTE_GATE_BODY_NOT_JSON]
+    (record,) = sink.records
+    assert (record["status"], record["block_reason"]) == ("failed", ROUTE_GATE_BODY_NOT_JSON)
+    assert CANARY not in caplog.text and CANARY not in json.dumps(payload)
+    assert CANARY not in json.dumps(record)
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [b"application/json; charset=utf-8", b"Application/JSON", b"application/json ;charset=UTF-8"],
+)
+async def test_json_with_parameters_is_served(content_type: bytes) -> None:
+    body = _body()
+
+    status, payload, downstream, metrics, *_ = await _post([body], content_type=content_type)
+
+    assert status == 200 and payload == b"served"
+    assert downstream.bodies == [body]
+    assert metrics.blocks == []
+
+
+async def test_two_content_types_are_not_json() -> None:
+    """Which one litellm would read is its business; the gate reads neither."""
+    status, payload, downstream, *_ = await _post(
+        [_body()], extra_headers=[(b"Content-Type", b"application/x-www-form-urlencoded")]
+    )
+
+    assert status == 415 and downstream.bodies == []
+    assert isinstance(payload, dict) and payload["error"]["reason"] == ROUTE_GATE_BODY_NOT_JSON
+
+
+async def test_an_empty_body_without_a_content_type_is_litellms_to_answer() -> None:
+    status, _, downstream, metrics, *_ = await _post([b""], content_type=None)
+
+    assert status == 200 and downstream.bodies == [b""]
+    assert metrics.blocks == []
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+async def test_a_passthrough_read_is_not_asked_for_a_content_type(method: str) -> None:
+    status, _, downstream, metrics, *_ = await _post(
+        [b""], path="/v1/models", content_type=None, method=method
+    )
+
+    assert status == 200 and downstream.bodies == [b""]
+    assert metrics.blocks == []
+
+
+def test_the_not_json_reason_is_one_of_the_gates_own() -> None:
+    assert ROUTE_GATE_BODY_NOT_JSON in BLOCK_REASONS

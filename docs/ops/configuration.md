@@ -347,9 +347,9 @@ The shipped litellm configs (compose `config.yaml` / `config.oauth.yaml`, Helm
 litellm loads only models from its database, never `policies` or `guardrails`
 (without the key it loads every object type). A policy row there could put a
 litellm pipeline around the gateway's guardrail; the route gate already refuses
-every `/policies*` and `/guardrails/*` route and a request body with a top-level
-`policies` key (403 `E_ROUTE_BLOCKED`, `block_reason=route_gate_body_policies`), so
-the pin is defence in depth. Keep it in any config of your own.
+every `/policies*` and `/guardrails/*` route, a request body with a top-level
+`policies` key (403 `E_ROUTE_BLOCKED`, `block_reason=route_gate_body_policies`) and a
+body that is not JSON (415, `route_gate_body_not_json`), so the pin is defence in depth. Keep it in any config of your own.
 
 **Two DSN sources litellm's CLI reads are deliberately NOT carried over.** The
 entrypoint's Prisma schema step reads `DATABASE_URL` and `DIRECT_URL` from the

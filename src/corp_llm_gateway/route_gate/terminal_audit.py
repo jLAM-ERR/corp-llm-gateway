@@ -74,6 +74,9 @@ class AuditFacts:
     placeholders: tuple[str, ...] = ()
     status: Outcome = "ok"
     started: float = field(default_factory=time.monotonic)
+    # False: the chat stream carries a usage chunk its client did not ask for; the
+    # desanitiser reads it and drops it.
+    client_asked_usage: bool = True
     prompt_tokens: int = 0
     completion_tokens: int = 0
     decided: tuple[Outcome, str | None] | None = field(default=None, init=False)

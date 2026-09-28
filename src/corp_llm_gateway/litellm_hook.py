@@ -1204,9 +1204,11 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             len(state.placeholders),
         )
         ticket = current_ticket()
-        if ticket is not None and deposit_audit_facts(
-            ticket, _audit_facts(state, started=pre_call_started)
-        ):
+        facts = _audit_facts(state, started=pre_call_started)
+        facts.client_asked_usage = not _asks_for_stream_usage(data, call_type)
+        if ticket is not None and deposit_audit_facts(ticket, facts):
+            if not facts.client_asked_usage:
+                _ask_for_stream_usage(data)
             self._hand_over(request_id, state, ticket)
         return data
 
@@ -1222,7 +1224,34 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         self._terminal_owned.move_to_end(request_id)
         while len(self._terminal_owned) > _AUDIT_DEDUP_CAP:
             self._terminal_owned.popitem(last=False)
+        if not ticket.on_close(self._release_owned):
+            self._release_owned(ticket)
         self._req_state.pop(request_id, None)
+
+    def _release_owned(self, ticket: RequestTicket) -> None:
+        """At its close the ticket's record is written or lost: its ids leave the hand-over
+        FIFO, and a later event for one of them, in no request's context, writes nothing."""
+        for request_id in ticket.request_ids():
+            owner = self._terminal_owned.get(request_id)
+            if owner is None or owner() is not ticket:
+                continue
+            del self._terminal_owned[request_id]
+            self._audited_ids[request_id] = None
+            if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+                self._audited_ids.popitem(last=False)
+
+    def _terminal_owner(self, request_id: str) -> tuple[bool, RequestTicket | None]:
+        """Whether a ticket writes this request's record, and which. The request's own
+        ticket when the call runs in its context (litellm's logging worker and the route
+        gate's cancel hook copy it); else the hand-over FIFO, a bounded fallback."""
+        current = current_ticket()
+        facts = getattr(current, "audit_facts", None)
+        if isinstance(facts, AuditFacts) and facts.request_id == request_id:
+            return True, current
+        owner = self._terminal_owned.get(request_id)
+        if owner is None:
+            return False, None
+        return True, owner()
 
     async def _sanitize_prompt_field(
         self,
@@ -1423,14 +1452,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         error_code: str | None = None,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
-        owner = self._terminal_owned.get(request_id)
-        if owner is not None:
-            # The request's own ticket when the event runs in its context (litellm's
-            # logging worker copies it): a call id two requests share names the last.
-            current = current_ticket()
-            facts = getattr(current, "audit_facts", None)
-            mine = isinstance(facts, AuditFacts) and facts.request_id == request_id
-            ticket = current if mine else owner()
+        owned, ticket = self._terminal_owner(request_id)
+        if owned:
             self._add_to_terminal_record(request_id, ticket, response, start_time, end_time, status)
             return
         # A record in flight decides the terminal record: wait for it.
@@ -1565,7 +1588,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         A request whose pre-call handed it to its ticket gets nothing here: the ticket's
         terminal record is its ``cancelled`` record, and its state is already gone.
         """
-        if request_id in self._terminal_owned:
+        if self._terminal_owner(request_id)[0]:
             self._cancel_pending.pop(request_id, None)
             return
         state = self._req_state.get(request_id)
@@ -1821,6 +1844,39 @@ def _audit_facts(state: _RequestState, *, started: float) -> AuditFacts:
         status="ok",
         started=started,
     )
+
+
+# litellm's call type for the chat-completions routes.
+_CHAT_CALL_TYPES = frozenset({"acompletion", "completion"})
+# litellm 1.101.0 asks a chat stream for usage itself when its client did not, and marks
+# the request with this key to strip the usage chunk (common_request_processing.py).
+_LITELLM_STRIP_STREAM_USAGE = "_litellm_strip_stream_usage"
+
+
+def _asks_for_stream_usage(data: dict[str, Any], call_type: str | None) -> bool:
+    """A chat stream whose client did not ask for the usage chunk: the terminal record
+    needs its counts (litellm's success log comes after the record is written)."""
+    if call_type not in _CHAT_CALL_TYPES or data.get("stream") is not True:
+        return False
+    if data.get(_LITELLM_STRIP_STREAM_USAGE) is True:
+        return True
+    options = data.get("stream_options")
+    if options is None:
+        return True
+    return isinstance(options, dict) and options.get("include_usage") is not True
+
+
+def _ask_for_stream_usage(data: dict[str, Any]) -> None:
+    """The usage chunk reaches the ASGI desanitiser, which reads it and drops it."""
+    if _LITELLM_STRIP_STREAM_USAGE in data:
+        data[_LITELLM_STRIP_STREAM_USAGE] = False
+    options = {**(data.get("stream_options") or {}), "include_usage": True}
+    data["stream_options"] = options
+    # litellm's logging object copied the body's stream_options before any pre-call hook,
+    # and its stream wrapper reads them from there.
+    logging_obj = data.get("litellm_logging_obj")
+    if hasattr(logging_obj, "stream_options"):
+        logging_obj.stream_options = options
 
 
 def _latency_ms(start_time: Any, end_time: Any) -> int:

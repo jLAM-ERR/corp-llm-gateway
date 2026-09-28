@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from corp_llm_gateway.route_gate.classify import (
     BLOCK_REASONS,
+    ROUTE_GATE_BODY_NOT_JSON,
     ROUTE_GATE_BODY_POLICIES,
     ROUTE_GATE_ERROR,
     ROUTE_GATE_LISTED,
@@ -49,6 +50,7 @@ __all__ = [
     "HTTP_METHODS",
     "LITELLM_REGEX_TABLE",
     "LITELLM_ROUTE_TABLE",
+    "ROUTE_GATE_BODY_NOT_JSON",
     "ROUTE_GATE_BODY_POLICIES",
     "ROUTE_GATE_ERROR",
     "ROUTE_GATE_LISTED",

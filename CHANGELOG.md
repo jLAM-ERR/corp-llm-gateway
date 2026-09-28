@@ -20,16 +20,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ok` at the final body, `failed` + `E_INTERNAL` for a restoration failure (plus
   `gateway_failure{component="desanitize"}`), `cancelled` when the client or the server ended it.
   litellm's success/failure log only adds token counts to it; the counts are also read off the
-  response itself (a chat stream carries them only with `stream_options.include_usage`).
+  response itself. A chat stream always carries its usage chunk to the gateway, which drops it
+  when the client did not ask for it (`stream_options.include_usage`).
 - **`/v1/responses` logging payloads** held the original input (litellm snapshots the request
   before any pre-call hook); the pre-call now refreshes that snapshot with the rewritten request.
 - **litellm DEBUG is refused at arm** (exit 70): it prints the original request before any
   pre-call hook. `CORP_LLM_ALLOW_LITELLM_DEBUG=1` allows it outside prod, for tests only. So is a
   response compressor on litellm's app (`response_compressor`).
 - **A request body with a top-level `policies` key is refused** at the route gate (403
-  `E_ROUTE_BLOCKED`, `block_reason=route_gate_body_policies`) before litellm parses it, and the
-  shipped litellm configs pin `general_settings.supported_db_objects: ["models"]`, so no policy or
-  guardrail row is ever loaded from litellm's database.
+  `E_ROUTE_BLOCKED`, `block_reason=route_gate_body_policies`) before litellm parses it, so is a
+  rewritten-route body that is not `application/json` (415, `route_gate_body_not_json`: litellm
+  would read a form body, a `policies` field included), and the shipped litellm configs pin
+  `general_settings.supported_db_objects: ["models"]`, so no policy or guardrail row is ever loaded
+  from litellm's database.
+- **Known limitation — interleaved tool-call fragments.** A chat stream that interleaves the
+  argument fragments of two tool calls (off-spec for OpenAI; the v1 providers never send it) gets
+  the placeholders back in those arguments, never the originals, and the stream does not fail.
 
 ### Added — HTTPS front door for the compose stack (nginx, opt-in)
 

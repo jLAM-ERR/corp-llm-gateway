@@ -825,8 +825,9 @@ default-deny. Маршрут `POST`/`PUT`/`PATCH` без хука может б�
 | `route_gate_unarmed` | 503 | `E_ROUTE_GATE_UNARMED` | REWRITTEN-маршрут, пока guardrail-callback не зарегистрирован; никогда не пробрасывается |
 | `route_gate_error` | 500 | `E_ROUTE_GATE_ERROR` | классификация бросила исключение; никогда не пробрасывается |
 | `route_gate_body_policies` | 403 | `E_ROUTE_BLOCKED` | допущенный REWRITTEN-запрос, в JSON-теле которого есть ключ `policies` верхнего уровня (litellm применил бы эти политики к запросу); проверяется, когда лимитер дочитал тело, до слота и до разбора тела litellm |
+| `route_gate_body_not_json` | 415 | `E_ROUTE_BLOCKED` | допущенный REWRITTEN-запрос, чей `Content-Type` не `application/json` (параметры вроде `charset` допустимы), или непустое тело без `Content-Type`: litellm прочитал бы тело формы, включая поле `policies`; проверяется на том же дочитанном теле |
 
-Последние два также пишут `gateway_failure{component="route_gate"}`. Каждый
+`route_gate_unarmed` и `route_gate_error` также пишут `gateway_failure{component="route_gate"}`. Каждый
 отказ пишет `corp_llm_gateway_blocked_requests_total{block_reason=…}` и эмитит
 аудит-запись с причиной и кодом ошибки — только ALWAYS-поля, потому что гейт
 отклоняет запрос до того, как определена какая-либо идентичность.
@@ -1106,6 +1107,10 @@ corp-токена, санитайзер, DLP-гейт и аудит, а отка
   границу (5 с), даёт 503 `E_PROFILE_UNAVAILABLE` с
   `gateway_failure{component="team_config"}` — fail-closed, никогда не пропуск
   без профиля (`docs/ops/runbook.md`).
+- **Чередующиеся фрагменты вызовов инструментов возвращаются плейсхолдерами.**
+  Chat-поток, в котором фрагменты аргументов двух вызовов инструментов чередуются
+  (вне спецификации OpenAI; провайдеры v1 так не шлют), получает в этих аргументах
+  плейсхолдеры, никогда не оригиналы, и поток не падает.
 - **Фоновые ответы не поддерживаются, но и не блокируются.** `POST /v1/responses`
   с `background: true` допускается, и тело в апстрим санитизируется, но затем
   клиент опрашивает `GET /v1/responses/{id}`, который выполняется под другим

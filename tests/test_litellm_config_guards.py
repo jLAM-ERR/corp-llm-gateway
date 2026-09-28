@@ -1,5 +1,6 @@
 """The shipped litellm configs turn on no request-content logging (plan 20260926 hazard 17)
-and load no policies or guardrails from litellm's database (hazard 14a).
+and load no policies or guardrails from litellm's database (hazard 14a); what litellm's
+config-table overlay can still add (hazard 14c).
 
 litellm hands every success/failure logger the request its logging object holds, and
 its DEBUG output prints the request before any pre-call hook runs. Our pre-call keeps
@@ -113,6 +114,90 @@ def test_litellm_reads_the_pin_as_models_only() -> None:
         "guardrails": False,
         "config_overrides": False,
     }
+
+
+# ── hazard 14c: litellm's config-table overlay ──────────────────────────────
+# With a database and ``store_model_in_db`` (env ``STORE_MODEL_IN_DB``, or a DB
+# ``general_settings`` row saying so), litellm's reconcile job re-reads the
+# ``LiteLLM_Config`` table every 30 s and merges its ``litellm_settings`` into the config
+# (``proxy_server.py`` ``_update_config_fields``); ``supported_db_objects`` does not gate
+# it. Compose gives litellm both; the Helm chart gives it no database.
+
+GUARDRAIL_INITIALISERS = frozenset({"initialize_guardrails", "init_guardrails_v2"})
+
+
+def test_compose_litellm_reads_its_config_table() -> None:
+    services = yaml.safe_load((COMPOSE / "docker-compose.yml").read_text())["services"]
+    env = _compose_env(services["litellm"].get("environment"))
+
+    assert "DATABASE_URL" in env
+    assert env.get("STORE_MODEL_IN_DB") == "True"
+
+
+@needs_helm
+def test_helm_litellm_has_no_database_to_read_a_config_table_from() -> None:
+    docs = _helm_docs()
+    pod = _first_of_kind(docs, "Deployment")["spec"]["template"]["spec"]
+    names = {
+        e["name"]
+        for c in pod["containers"] + pod.get("initContainers", [])
+        for e in c.get("env", [])
+    }
+    secret = set((_first_of_kind(docs, "Secret").get("stringData") or {}).keys())
+
+    for key in ("DATABASE_URL", "DIRECT_URL", "STORE_MODEL_IN_DB"):
+        assert key not in names | secret, key
+
+
+def test_a_db_litellm_settings_row_appends_callbacks_and_starts_no_guardrail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What the reconcile does with a DB ``litellm_settings`` row: each ``callbacks``
+    name is appended to ``litellm.callbacks``, after ours, so its pre-call runs on the
+    sanitised request and every response it sees is placeholders (the served stack's
+    ``after`` capture); the arm check never sees it, and ``guardrails`` starts nothing."""
+    litellm = pytest.importorskip("litellm")
+    proxy = pytest.importorskip("litellm.proxy.proxy_server")
+    from corp_llm_gateway.route_gate.arm_checks import guardrail_problems
+
+    ours = object()
+    monkeypatch.setattr(litellm, "callbacks", [ours])
+    config = yaml.safe_load(LITELLM_CONFIGS["compose"].read_text())
+    row = {
+        "callbacks": ["db-row-callback"],
+        "guardrails": [{"guardrail_name": "db-row", "litellm_params": {"guardrail": "x"}}],
+    }
+
+    merged = proxy.proxy_config._update_config_fields(
+        current_config=config, param_name="litellm_settings", db_param_value=row
+    )
+    proxy.proxy_config._add_callbacks_from_db_config(merged)
+
+    assert merged["litellm_settings"]["callbacks"] == ["db-row-callback"]
+    assert litellm.callbacks == [ours, "db-row-callback"]
+    assert guardrail_problems(litellm.callbacks, is_ours=lambda cb: cb is ours) == []
+
+
+def test_only_litellms_startup_config_load_starts_guardrails() -> None:
+    """``load_config`` runs before litellm has its database client, so a DB
+    ``guardrails`` row is merged into a config nothing starts guardrails from again."""
+    import ast
+    import inspect
+
+    proxy = pytest.importorskip("litellm.proxy.proxy_server")
+    tree = ast.parse(inspect.getsource(proxy))
+    callers = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(call, ast.Call)
+            and getattr(call.func, "id", getattr(call.func, "attr", None)) in GUARDRAIL_INITIALISERS
+            for call in ast.walk(node)
+        )
+    }
+
+    assert callers == {"load_config"}
 
 
 def _compose_env(entries: Any) -> dict[str, Any]:

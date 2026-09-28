@@ -2654,13 +2654,13 @@ class _BodyClient:
         return status, body.decode()
 
 
-def _limited_scope() -> dict:
+def _limited_scope(content_type: bytes = b"application/json") -> dict:
     return {
         "type": "http",
         "method": "POST",
         "path": "/v1/messages",
         "raw_path": b"/v1/messages",
-        "headers": _GATE_HEADERS,
+        "headers": [*_GATE_HEADERS, (b"content-type", content_type)],
     }
 
 
@@ -2713,6 +2713,31 @@ async def test_an_oversize_refusal_after_25_mib_leaks_no_body_byte(
         body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason="oversize:blocked"
     )
     assert metrics.failures == ["oversize"]
+    assert limiter.inflight == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_form_body_refusal_leaks_no_body_byte(caplog: pytest.LogCaptureFixture) -> None:
+    from urllib.parse import urlencode
+
+    gate, limiter, sink, metrics = _limited(_never_forwarded, max_inflight=1)
+    form = urlencode({"model": "claude", "policies": " ".join(ORIGINAL_CORPUS)}).encode()
+    client = _BodyClient(_chunk(form, more=False))
+
+    with caplog.at_level(logging.DEBUG):
+        await gate(  # type: ignore[operator]
+            _limited_scope(b"application/x-www-form-urlencoded"), client.receive, client.send
+        )
+
+    status, body = client.response()
+    assert status == 415
+    _assert_gate_surfaces_are_clean(
+        body=body,
+        log_text=caplog.text,
+        sink=sink,
+        metrics=metrics,
+        reason="route_gate_body_not_json",
+    )
     assert limiter.inflight == 0  # type: ignore[attr-defined]
 
 
