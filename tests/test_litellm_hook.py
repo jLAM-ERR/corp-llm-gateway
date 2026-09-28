@@ -6122,6 +6122,85 @@ async def test_a_closed_tickets_id_leaves_the_hand_over_fifo() -> None:
     assert sink.records == []
 
 
+@pytest.mark.parametrize("event", ["success", "failure"])
+async def test_a_log_event_for_an_evicted_id_outside_its_request_writes_no_record(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, event: str
+) -> None:
+    """A handed-over id pushed out of the FIFO, logged in no request's context: its state
+    went to the ticket, so the guardrail writes no ``unknown`` record. It logs the orphan
+    by type and counts it; the ticket still writes the request's one record."""
+    import corp_llm_gateway.litellm_hook as hook_mod
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    monkeypatch.setattr(hook_mod, "_AUDIT_DEDUP_CAP", 1)
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    metrics = _RecordingMetrics()
+    g._metrics = metrics
+    g.bind_response_mappings(ResponseMappings())
+    terminal = TerminalAudit(emit_to(g._audit))
+    tickets = []
+    for i in range(2):
+        ticket = RequestTicket(f"{i:032x}")
+        terminal.bind(ticket)
+        data = _data_with_token("tok-1", content="hi alice")
+        data["litellm_call_id"] = f"call-{i}"
+        await _ticketed_pre_call(g, data, ticket)
+        tickets.append(ticket)
+    assert "call-0" not in g._terminal_owned
+
+    now = datetime.now(UTC)
+    usage = {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+    log = g.async_log_success_event if event == "success" else g.async_log_failure_event
+    with caplog.at_level(logging.DEBUG):
+        await log({"litellm_call_id": "call-0"}, usage, now, now)
+
+    status = "ok" if event == "success" else "failed"
+    assert sink.records == []
+    assert f"litellm_audit_orphan_event request_id=call-0 status={status}" in caplog.text
+    assert metrics.failures == ["audit"]
+    assert metrics.latencies == []
+    await terminal.publish(tickets[0], "ok")
+    tickets[0].close()
+    await terminal.drain()
+    (record,) = sink.records
+    assert (record["request_id"], record["user_id"], record["team_id"]) == ("call-0", "alice", "t1")
+    assert (record["status"], record["redaction_count"]) == ("ok", 1)
+
+
+@pytest.mark.parametrize("ticketed", [False, True], ids=["unticketed", "ticketed"])
+async def test_a_pre_call_refusal_still_writes_its_record_inline(ticketed: bool) -> None:
+    """Behind the desanitiser too, a refusal before any state exists is not an orphan: its
+    record is the inline one, and litellm's failure log for it is a duplicate."""
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, sink = _build_guardrail()
+    metrics = _RecordingMetrics()
+    g._metrics = metrics
+    g.bind_response_mappings(ResponseMappings())
+    data = {"model": "claude", "messages": [], "headers": {}, "litellm_call_id": "call-r"}
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        if ticketed:
+            await _ticketed_pre_call(g, data, RequestTicket("d" * 32))
+        else:
+            await g.pre_call(data)
+
+    assert ei.value.error_code == "E_MISSING_TOKEN"
+    (record,) = sink.records
+    assert (record["request_id"], record["user_id"], record["status"]) == (
+        "call-r",
+        "unknown",
+        "failed",
+    )
+    assert metrics.failures == ["auth"]
+    now = datetime.now(UTC)
+    await g.async_log_failure_event({"litellm_call_id": "call-r"}, None, now, now)
+    assert len(sink.records) == 1
+    assert metrics.failures == ["auth"]
+
+
 # ── chat streams ask the provider for usage; the desanitiser drops what the client
 # did not ask for ──
 

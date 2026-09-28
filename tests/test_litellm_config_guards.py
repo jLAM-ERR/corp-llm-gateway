@@ -85,6 +85,20 @@ def test_helm_litellm_config_logs_no_request_content() -> None:
     _assert_logs_no_content(_helm_litellm_config())
 
 
+# The pre-call asks every ticketed chat stream for its usage chunk without litellm's
+# per-model `stream_options` check; `drop_params` drops the key where a provider has no
+# such param (without it Anthropic via chat would answer 400).
+@pytest.mark.parametrize("name", sorted(LITELLM_CONFIGS))
+def test_compose_litellm_config_drops_params_a_provider_does_not_take(name: str) -> None:
+    config = yaml.safe_load(LITELLM_CONFIGS[name].read_text())
+    assert config["litellm_settings"]["drop_params"] is True
+
+
+@needs_helm
+def test_helm_litellm_config_drops_params_a_provider_does_not_take() -> None:
+    assert _helm_litellm_config()["litellm_settings"]["drop_params"] is True
+
+
 @pytest.mark.parametrize("name", sorted(LITELLM_CONFIGS))
 def test_compose_litellm_config_loads_no_policies_from_the_db(name: str) -> None:
     _assert_db_objects_pinned(yaml.safe_load(LITELLM_CONFIGS[name].read_text()))
@@ -119,9 +133,12 @@ def test_litellm_reads_the_pin_as_models_only() -> None:
 # ── hazard 14c: litellm's config-table overlay ──────────────────────────────
 # With a database and ``store_model_in_db`` (env ``STORE_MODEL_IN_DB``, or a DB
 # ``general_settings`` row saying so), litellm's reconcile job re-reads the
-# ``LiteLLM_Config`` table every 30 s and merges its ``litellm_settings`` into the config
-# (``proxy_server.py`` ``_update_config_fields``); ``supported_db_objects`` does not gate
-# it. Compose gives litellm both; the Helm chart gives it no database.
+# ``LiteLLM_Config`` table every 30 s and applies two rows: ``litellm_settings``
+# (``_update_config_fields`` + ``_add_callbacks_from_db_config``) and ``general_settings``
+# (``_update_general_settings``); ``supported_db_objects`` gates neither. Compose gives
+# litellm both; the Helm chart gives it no database. The served-stack side (what such a
+# callback sees, the spend-log row, a pass-through route) is
+# ``tests/test_desanitize_served_stack.py``.
 
 GUARDRAIL_INITIALISERS = frozenset({"initialize_guardrails", "init_guardrails_v2"})
 
@@ -152,12 +169,14 @@ def test_helm_litellm_has_no_database_to_read_a_config_table_from() -> None:
 def test_a_db_litellm_settings_row_appends_callbacks_and_starts_no_guardrail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """What the reconcile does with a DB ``litellm_settings`` row: each ``callbacks``
-    name is appended to ``litellm.callbacks``, after ours, so its pre-call runs on the
-    sanitised request and every response it sees is placeholders (the served stack's
-    ``after`` capture); the arm check never sees it, and ``guardrails`` starts nothing."""
+    """What the reconcile does with a DB ``litellm_settings`` row: a ``callbacks`` name
+    litellm does not know is appended to ``litellm.callbacks`` as a string that resolves to
+    nothing (a known integration's name is instantiated into the success/failure lists
+    instead, log events only); the arm check never sees it, and ``guardrails`` starts
+    nothing."""
     litellm = pytest.importorskip("litellm")
     proxy = pytest.importorskip("litellm.proxy.proxy_server")
+    litellm_logging = pytest.importorskip("litellm.litellm_core_utils.litellm_logging")
     from corp_llm_gateway.route_gate.arm_checks import guardrail_problems
 
     ours = object()
@@ -175,7 +194,25 @@ def test_a_db_litellm_settings_row_appends_callbacks_and_starts_no_guardrail(
 
     assert merged["litellm_settings"]["callbacks"] == ["db-row-callback"]
     assert litellm.callbacks == [ours, "db-row-callback"]
+    assert "db-row-callback" not in litellm._known_custom_logger_compatible_callbacks
+    assert litellm_logging.get_custom_logger_compatible_class("db-row-callback") is None
     assert guardrail_problems(litellm.callbacks, is_ours=lambda cb: cb is ours) == []
+
+
+@pytest.mark.parametrize("name", sorted(LITELLM_CONFIGS))
+async def test_a_db_general_settings_row_turns_on_prompts_in_spend_logs(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The shipped configs do not set ``store_prompts_in_spend_logs``, so a DB row's value
+    is the one litellm uses (YAML wins only for a key it sets)."""
+    proxy = pytest.importorskip("litellm.proxy.proxy_server")
+    general = dict(yaml.safe_load(LITELLM_CONFIGS[name].read_text())["general_settings"])
+    monkeypatch.setattr(proxy, "general_settings", general)
+    monkeypatch.setattr(proxy.proxy_config, "_yaml_general_settings_keys", set(general))
+
+    await proxy.proxy_config._update_general_settings({"store_prompts_in_spend_logs": True})
+
+    assert proxy.general_settings["store_prompts_in_spend_logs"] is True
 
 
 def test_only_litellms_startup_config_load_starts_guardrails() -> None:

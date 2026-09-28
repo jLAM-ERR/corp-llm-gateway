@@ -10,6 +10,14 @@ placeholders, no litellm capture (success, header, iterator, per-chunk hooks, th
 log) and no DEBUG chunk log line holds an original, the client gets the originals, and
 the request has exactly one audit record — the ticket's terminal record. Chat SSE is
 driven through the OpenAI SDK's own stream accumulator too.
+
+Hazard 14c: after the boot the script applies a ``LiteLLM_Config`` row through litellm's
+own reconcile functions. Two captures added by name (the unknown-name string in
+``litellm.callbacks``, and a ``_known_custom_logger_compatible_callbacks`` name litellm
+instantiates into its success/failure lists) see placeholders only, in every hook, log
+kwargs and ``StandardLoggingPayload``, success and failure; the spend-log row litellm
+builds with ``store_prompts_in_spend_logs`` on holds placeholders only; a pass-through
+route the row adds to litellm's app is 404 at the gate.
 """
 
 from __future__ import annotations
@@ -238,3 +246,73 @@ def test_a_restoration_failure_is_one_failed_record_and_a_counted_failure(
     (record,) = result["records"]
     assert (record["status"], record["error_code"]) == ("failed", "E_INTERNAL")
     assert 'gateway_failure{component="desanitize"} 1.0' in served["metrics"]
+
+
+# ── hazard 14c: what a LiteLLM_Config row adds after the boot ────────────────
+
+
+def test_the_db_row_adds_both_capture_kinds_prompt_logging_and_a_route(
+    served: dict[str, Any],
+) -> None:
+    assert served["db_overlay"] == {
+        "string_in_callbacks": True,
+        "known_in_success": True,
+        "known_in_failure": True,
+        "known_in_callbacks": False,
+        "store_prompts": True,
+        "pass_through_routed": True,
+    }
+
+
+@pytest.mark.parametrize("flow", FLOWS)
+def test_a_db_added_callback_sees_placeholders_only(served: dict[str, Any], flow: str) -> None:
+    result = served["flows"][flow]
+    db = result["db"]
+
+    assert result["client_original"] is True
+    for name in ("db-string", "db-known"):
+        seen = db[name]
+        assert seen["any_original"] is False, name
+        assert seen["holding_original"] == []
+        assert seen["kwargs"] == seen["kwargs_with_placeholder"] == 1
+        assert "logged" in seen["holding_placeholder"]
+    # The string one gets litellm's proxy hooks too; the known one log events only.
+    assert ("iterator" if flow.endswith("sse") else "success") in db["db-string"]["saw"]
+    assert db["db-known"]["saw"] == ["logged"]
+
+
+@pytest.mark.parametrize("flow", FLOWS)
+def test_a_spend_log_row_with_prompts_on_holds_placeholders_only(
+    served: dict[str, Any], flow: str
+) -> None:
+    for name in ("db-string", "db-known"):
+        (row,) = served["flows"][flow]["db"][name]["spend_logs"]
+        assert "[EM" in row["proxy_server_request"]
+        assert "[EM" in row["response"]
+        assert "alice.secret" not in json.dumps(row)
+
+
+def test_a_db_added_callbacks_failure_log_holds_placeholders_only(
+    served: dict[str, Any],
+) -> None:
+    result = served["provider_error"]
+
+    assert result["status"] == 400
+    (body,) = result["provider_bodies"]
+    assert "[EM" in body and "alice.secret" not in body
+    (record,) = result["records"]
+    assert record["status"] == "failed"
+    for name in ("db-string", "db-known"):
+        seen = result["db"][name]
+        assert seen["any_original"] is False, name
+        assert seen["failed"] >= 1 and seen["failed_with_placeholder"] >= 1
+        assert seen["kwargs"] == seen["kwargs_with_placeholder"] >= 1
+
+
+def test_a_pass_through_route_added_at_runtime_is_404_at_the_gate(
+    served: dict[str, Any],
+) -> None:
+    result = served["pass_through"]
+
+    assert (result["status"], result["code"]) == (404, "E_ROUTE_BLOCKED")
+    assert result["provider_bodies"] == []

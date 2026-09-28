@@ -474,7 +474,11 @@ def test_every_recorded_block_reason_literal_is_enumerated() -> None:
 
 
 def test_the_failure_components_match_the_hooks_own_map() -> None:
-    from corp_llm_gateway.litellm_hook import _FAILURE_COMPONENT, TEAM_CONFIG_COMPONENT
+    from corp_llm_gateway.litellm_hook import (
+        _FAILURE_COMPONENT,
+        AUDIT_COMPONENT,
+        TEAM_CONFIG_COMPONENT,
+    )
     from corp_llm_gateway.route_gate import desanitize_middleware, terminal_audit
     from corp_llm_gateway.route_gate.middleware import COMPONENT
 
@@ -482,6 +486,7 @@ def test_the_failure_components_match_the_hooks_own_map() -> None:
         "other",
         COMPONENT,
         TEAM_CONFIG_COMPONENT,
+        AUDIT_COMPONENT,
         desanitize_middleware.COMPONENT,
         terminal_audit.COMPONENT,
     }

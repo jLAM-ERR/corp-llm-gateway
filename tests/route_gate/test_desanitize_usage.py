@@ -59,15 +59,13 @@ class _Records:
         self.records.append(record)
 
 
-def _sse_app(pieces: list[bytes]) -> Any:
+def _sse_app(pieces: list[bytes], *, content_length: bool = False) -> Any:
+    headers = [(b"content-type", b"text/event-stream")]
+    if content_length:
+        headers.append((b"content-length", str(len(b"".join(pieces))).encode()))
+
     async def app(scope: Any, receive: Any, send: Any) -> None:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [(b"content-type", b"text/event-stream")],
-            }
-        )
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
         for piece in pieces:
             await send({"type": "http.response.body", "body": piece, "more_body": True})
         await send({"type": "http.response.body", "body": b"", "more_body": False})
@@ -214,3 +212,34 @@ async def test_a_pass_mode_json_body_past_the_cap_gets_no_counts(
 
     assert body_of(sent) == body
     assert _counts(record) == expected
+
+
+@pytest.mark.parametrize("asked", [False, True], ids=["dropping", "not-dropping"])
+async def test_a_pass_mode_stream_that_drops_its_usage_chunk_loses_its_content_length(
+    asked: bool,
+) -> None:
+    """The dropped chunk makes the body shorter than the length litellm declared."""
+    sent, _ = await _serve(_sse_app(STREAM, content_length=True), asked=asked, restore=False)
+
+    names = {bytes(name).lower() for name, _ in sent[0]["headers"]}
+    assert (b"content-length" in names) is asked
+    assert b"content-type" in names
+
+
+def test_the_sse_usage_tap_reads_events_of_at_most_eight_mib() -> None:
+    assert desanitize_middleware._USAGE_EVENT_CAP == 8 * 1024 * 1024
+
+
+async def test_a_pass_mode_event_past_the_cap_ends_the_tap() -> None:
+    """Degraded, accepted: from an unfinished event past the cap on, every byte goes out
+    as litellm sent it, the usage chunk the client did not ask for included, and the
+    record gets no counts."""
+    big = b"data: " + b"x" * desanitize_middleware._USAGE_EVENT_CAP
+    stream = [big, b"\n\n", *STREAM]
+
+    sent, record = await _serve(_sse_app(stream), asked=False, restore=False)
+
+    wire = body_of(sent)
+    assert wire == b"".join(stream)
+    assert wire.count(b'"usage"') == 1
+    assert (record.outcome, _counts(record)) == ("ok", (0, 0))

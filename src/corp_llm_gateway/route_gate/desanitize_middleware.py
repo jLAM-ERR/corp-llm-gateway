@@ -20,7 +20,10 @@ from the 2xx response as it passes (the JSON body's ``usage``, up to 1 MiB; in a
 chat usage chunk, Anthropic's ``message_start`` / ``message_delta`` or Responses'
 ``response.completed``), in every mode. A chat stream always carries its usage chunk here
 (the guardrail's pre-call asks for it); when its client did not ask, the chunk is read and
-dropped, with every other all-empty chunk litellm itself would have stripped.
+dropped, with every other all-empty chunk litellm itself would have stripped. In pass
+mode an event still open past ``_USAGE_EVENT_CAP`` ends that reading: from there on every
+byte goes out as litellm sent it, that chunk included, and the record keeps only the
+counts read before it. Accepted as degraded, not wrong: an extra chunk, missing counts.
 
 ``Content-Encoding``: a response carrying one passes through untouched (placeholders,
 never originals); ``compressor_problems`` is the arm check that nothing in the served

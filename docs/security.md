@@ -1008,14 +1008,39 @@ database (the shipped litellm configs pin `general_settings.supported_db_objects
 to `["models"]`).
 
 *Footnote — litellm's config table (hazard 14c).* With a database and
-`store_model_in_db` on, litellm re-reads its `LiteLLM_Config` table every 30 s and
-merges a `litellm_settings` row into its config; `supported_db_objects` does not
-gate that. Compose gives litellm both (`DATABASE_URL`, `STORE_MODEL_IN_DB=True`);
-the Helm chart gives it no database. A `callbacks` name in that row is appended to
-`litellm.callbacks` after ours: it runs on the sanitised request, sees placeholders
-in every response, and is not seen by the arm check. A `guardrails` entry starts
-nothing, because litellm starts guardrails only in its boot-time config load, before
-its database client exists. Pinned by `tests/test_litellm_config_guards.py`.
+`store_model_in_db` on, litellm's reconcile re-reads its `LiteLLM_Config` table every
+30 s and applies two of its rows; `supported_db_objects` gates neither. Compose gives
+litellm both (`DATABASE_URL`, `STORE_MODEL_IN_DB=True`); the Helm chart gives it no
+database.
+
+- The `litellm_settings` row is merged into litellm's config and its `callbacks`,
+  `success_callback` and `failure_callback` names are added. A name litellm knows as an
+  integration (`_known_custom_logger_compatible_callbacks`) is instantiated into its
+  success and failure lists: log events only, no request or response hook. Any other
+  name is appended to `litellm.callbacks` as a string, which litellm resolves per
+  request only to a known integration's instance, so it does nothing. A `guardrails` entry
+  starts nothing, because litellm starts guardrails only in its boot-time config load,
+  before its database client exists.
+- The `general_settings` row can set, among others, `store_prompts_in_spend_logs` (the
+  shipped configs do not set it, so the row decides), `pass_through_endpoints` (new
+  routes in litellm's app), `max_parallel_requests` (litellm's own limits; the gateway's
+  in-flight cap is separate) and `ui_access_mode`.
+
+What still holds. A callback added this way runs after our pre-call, and the reversal
+is the ASGI layer outside litellm, so every hook and log event it gets holds
+placeholders only: log kwargs and `StandardLoggingPayload`, success and failure. This
+holds even if the string resolved to a callback with every hook (the served-stack test
+makes it resolve to one).
+Prompts stored in spend logs are placeholders for the same reason: litellm builds the
+row from the log event's kwargs, whose `proxy_server_request.body` our pre-call points
+at the rewritten request. A pass-through route has no row in the gate's table, so it is
+404 before litellm routes it. `ui_access_mode` governs litellm's UI, which the gate
+refuses. What does not hold: nothing notices such a callback after the arm check, and it
+gets what any callback after ours gets (placeholders, counts, request metadata). Pinned
+by `tests/test_litellm_config_guards.py` (compose reachable, Helm DB-less, each row's
+effect) and `tests/test_desanitize_served_stack.py` (a row applied on the served stack:
+both callback kinds on all six flows and a provider failure, the spend-log row, the
+pass-through route).
 
 **Health rows, one by one.** Shipped probes use only the gateway's own
 `/healthz/live` and `/healthz/ready`.

@@ -343,7 +343,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         end_time: float,
     ) -> None:
         request_data = _resolve_request_data(kwargs)
-        await self.audit(request_data, response_obj, start_time, end_time, status="ok")
+        await self.audit(
+            request_data, response_obj, start_time, end_time, status="ok", log_event=True
+        )
 
     async def async_log_failure_event(
         self,
@@ -353,7 +355,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         end_time: float,
     ) -> None:
         request_data = _resolve_request_data(kwargs)
-        await self.audit(request_data, response_obj, start_time, end_time, status="failed")
+        await self.audit(
+            request_data, response_obj, start_time, end_time, status="failed", log_event=True
+        )
 
     # ---- Pure logic (unit-testable without LiteLLM) -----------------------
 
@@ -1450,6 +1454,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         *,
         status: str,
         error_code: str | None = None,
+        log_event: bool = False,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
         owned, ticket = self._terminal_owner(request_id)
@@ -1478,6 +1483,14 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # "unknown"/0/null — popping only happens once emit() has actually
         # succeeded (or the sink tells us the write is ambiguous, below).
         state = self._req_state.get(request_id)
+        if state is None and log_event and self._response_mappings is not None:
+            # Behind the ASGI desanitiser a pre-call that got this far handed its record to
+            # its ticket (no longer in the FIFO), or no pre-call ran: nothing to write from,
+            # a record here would be an orphan "unknown" one. Without it the log event is
+            # the request's only record path and still writes the content-free record.
+            self._metrics.record_failure(AUDIT_COMPONENT)
+            logger.error("litellm_audit_orphan_event request_id=%s status=%s", request_id, status)
+            return
         latency_ms = _latency_ms(start_time, end_time)
         # Once per REQUEST, not once per audit() call: a failed emit + safety-net
         # retry must not double-observe the same request's latency under two
@@ -1868,6 +1881,10 @@ def _asks_for_stream_usage(data: dict[str, Any], call_type: str | None) -> bool:
 
 def _ask_for_stream_usage(data: dict[str, Any]) -> None:
     """The usage chunk reaches the ASGI desanitiser, which reads it and drops it."""
+    # litellm injects only where `_litellm_model_supports_stream_options` holds; this does
+    # not check. The shipped configs set `drop_params: true`, so a provider without the
+    # param never gets it (else Anthropic via chat would answer 400), and the drop rule
+    # matches litellm's own.
     if _LITELLM_STRIP_STREAM_USAGE in data:
         data[_LITELLM_STRIP_STREAM_USAGE] = False
     options = {**(data.get("stream_options") or {}), "include_usage": True}
@@ -2559,6 +2576,8 @@ _FAILURE_COMPONENT: dict[str, str] = {
 # The component of a failure one error code cannot name alone: a team config that
 # cannot be read answers E_PROFILE_UNAVAILABLE, like a broken profile.
 TEAM_CONFIG_COMPONENT = "team_config"
+# A litellm log event the guardrail has no record to write from.
+AUDIT_COMPONENT = "audit"
 
 
 def _failure_component(error_code: str) -> str:

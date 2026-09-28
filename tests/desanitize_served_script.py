@@ -3,7 +3,9 @@
 armed lifespan and the guardrail ``bootstrap`` builds) served by uvicorn on a real
 socket, in front of the dispatch harness's stub provider on another socket. Two capture
 callbacks sit around ours in ``litellm.callbacks``; litellm runs at DEBUG under the
-test-only allow key so its chunk log can be read. Prints one ``@@RESULT@@`` JSON line.
+test-only allow key so its chunk log can be read. After the boot a ``LiteLLM_Config`` row
+is applied through litellm's own reconcile functions: two more captures by name, prompts
+in spend logs, a pass-through endpoint. Prints one ``@@RESULT@@`` JSON line.
 
 Run as ``python tests/desanitize_served_script.py``; importing ``corp_llm_gateway.asgi``
 IS the boot, so this cannot share the test process.
@@ -102,6 +104,8 @@ from tests.litellm_hook._dispatch_fixtures import (  # noqa: E402
     PLACEHOLDER_MARK,
     StubUpstream,
     _anthropic_sse,
+    _capture_namespace,
+    serialize,
 )
 
 ROUTES = {
@@ -112,6 +116,62 @@ ROUTES = {
 # litellm's DEBUG chunk log (common_request_processing.py): runs on the stream litellm
 # sends, i.e. before the desanitiser.
 CHUNK_LOG_FILE = "common_request_processing.py"
+# Callback names a DB `litellm_settings` row carries. litellm appends a name it does not
+# know to `litellm.callbacks` as a string, resolved per request by
+# `get_custom_logger_compatible_class`; a `_known_custom_logger_compatible_callbacks` name
+# is instantiated into the success and failure lists (`utils.py`
+# `_add_custom_logger_callback_to_specific_event`).
+DB_STRING = "corp_db_string_capture"
+DB_KNOWN = "corp_db_known_capture"
+PASS_THROUGH_PATH = "/corp-db-pass-through"
+
+
+def _db_capture_class(name: str) -> type:
+    """A capture that also keeps every log event's kwargs, failures included, and, on
+    success, the spend-log row litellm's DB writer would build from them."""
+
+    async def async_log_success_event(
+        self: Any, kwargs: dict[str, Any], response_obj: Any, start_time: Any, end_time: Any
+    ) -> None:
+        from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+        self.seen.logged.append(serialize(kwargs.get("standard_logging_object")))
+        self.seen.logged.append(serialize(response_obj))
+        self.kwargs.append(_all_of(kwargs))
+        self.spend_logs.append(
+            serialize(dict(get_logging_payload(kwargs, response_obj, start_time, end_time)))
+        )
+
+    async def async_log_failure_event(
+        self: Any, kwargs: dict[str, Any], response_obj: Any, start_time: Any, end_time: Any
+    ) -> None:
+        self.failed.append(serialize(kwargs.get("standard_logging_object")))
+        self.failed.append(serialize(response_obj))
+        self.kwargs.append(_all_of(kwargs))
+
+    namespace = _capture_namespace(per_chunk=True)
+    base_init = namespace["__init__"]
+
+    def init(self: Any, label: str) -> None:
+        base_init(self, label)
+        self.kwargs = []
+        self.spend_logs = []
+        self.failed = []
+
+    namespace.update(
+        __init__=init,
+        async_log_success_event=async_log_success_event,
+        async_log_failure_event=async_log_failure_event,
+    )
+    return type(name, (_dispatch_fixtures.CustomLogger,), namespace)
+
+
+def _all_of(value: Any) -> str:
+    try:
+        dumped = serialize(value)
+    except (TypeError, ValueError, RecursionError):
+        dumped = ""
+    return dumped + repr(value)
 
 
 class _DebugRecords(logging.Handler):
@@ -226,6 +286,7 @@ async def main() -> None:
     ]
 
     results: dict[str, Any] = {"armed": asgi.gate.armed, "callback_order": order, "flows": {}}
+    db_captures, results["db_overlay"] = await _apply_db_overlay()
 
     async def flow(name: str, route: str, *, stream: bool, extra: dict[str, Any] | None = None):
         for capture in captures:
@@ -262,11 +323,29 @@ async def main() -> None:
             "records": records,
             "mappings_left": len(asgi.response_mappings),
             "req_state": len(guardrail._req_state),
+            "db": {capture.name: _db_seen(capture) for capture in db_captures},
         }
 
     for route in ROUTES:
         for stream in (False, True):
             await flow(f"{route}-{'sse' if stream else 'unary'}", route, stream=stream)
+
+    # The provider refuses: litellm's failure log, to the DB-added captures too.
+    stub.error_status = 400
+    try:
+        await flow("chat-provider-error", "chat", stream=False)
+    finally:
+        stub.error_status = None
+    results["provider_error"] = results["flows"].pop("chat-provider-error")
+
+    # The DB row's pass-through route is in litellm's app; the gate has no row for it.
+    base_bodies = len(stub.bodies)
+    status, _, body = await _post(port, PASS_THROUGH_PATH, _body("chat", stream=False))
+    results["pass_through"] = {
+        "status": status,
+        "code": json.loads(body)["error"]["code"],
+        "provider_bodies": stub.bodies[base_bodies:],
+    }
 
     # A chat stream whose client asked for the usage chunk itself: it is delivered.
     await flow(
@@ -322,6 +401,88 @@ async def main() -> None:
     await serving
     stub.close()
     print(SENTINEL + json.dumps(results, default=str), flush=True)
+
+
+async def _apply_db_overlay() -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """What litellm's reconcile does with a ``LiteLLM_Config`` table: the
+    ``litellm_settings`` row through ``_update_config_fields`` and
+    ``_add_callbacks_from_db_config``, the ``general_settings`` row through
+    ``_update_general_settings``. The two capture names resolve to capture instances."""
+    import litellm
+    import yaml
+    from litellm.litellm_core_utils import litellm_logging
+    from litellm.proxy import proxy_server
+
+    by_string = _db_capture_class("DbStringCapture")("db-string")
+    by_known = _db_capture_class("DbKnownCapture")("db-known")
+    real_get = litellm_logging.get_custom_logger_compatible_class
+    real_init = litellm_logging._init_custom_logger_compatible_class
+
+    def get(name: Any, *args: Any, **kwargs: Any) -> Any:
+        return by_string if name == DB_STRING else real_get(name, *args, **kwargs)
+
+    def init(name: Any, *args: Any, **kwargs: Any) -> Any:
+        found = {DB_STRING: by_string, DB_KNOWN: by_known}.get(name)
+        return found if found is not None else real_init(name, *args, **kwargs)
+
+    litellm_logging.get_custom_logger_compatible_class = get
+    litellm_logging._init_custom_logger_compatible_class = init
+    litellm._known_custom_logger_compatible_callbacks.append(DB_KNOWN)
+
+    proxy_config = proxy_server.proxy_config
+    config = yaml.safe_load((_config_dir / "config.yaml").read_text())
+    merged = proxy_config._update_config_fields(
+        current_config=config,
+        param_name="litellm_settings",
+        db_param_value={"callbacks": [DB_STRING, DB_KNOWN]},
+    )
+    proxy_config._add_callbacks_from_db_config(merged)
+    await proxy_config._update_general_settings(
+        {
+            "store_prompts_in_spend_logs": True,
+            "pass_through_endpoints": [
+                {
+                    "path": PASS_THROUGH_PATH,
+                    "target": f"http://127.0.0.1:{STUB_PORT}/v1/chat/completions",
+                    "headers": {},
+                }
+            ],
+        }
+    )
+    routes = [getattr(route, "path", None) for route in proxy_server.app.routes]
+    return (by_string, by_known), {
+        "string_in_callbacks": DB_STRING in litellm.callbacks,
+        "known_in_success": by_known in litellm._async_success_callback,
+        "known_in_failure": by_known in litellm._async_failure_callback,
+        "known_in_callbacks": by_known in litellm.callbacks,
+        "store_prompts": proxy_server.general_settings.get("store_prompts_in_spend_logs"),
+        "pass_through_routed": PASS_THROUGH_PATH in routes,
+    }
+
+
+def _db_seen(capture: Any) -> dict[str, Any]:
+    everything = [
+        *(value for values in capture.seen.hooks().values() for value in values),
+        *capture.failed,
+        *capture.kwargs,
+        *capture.spend_logs,
+    ]
+    seen = {
+        "saw": sorted(k for k, v in capture.seen.hooks().items() if v),
+        "holding_original": sorted(capture.seen.holding(ORIGINAL_MARK)),
+        "holding_placeholder": sorted(capture.seen.holding(PLACEHOLDER_MARK)),
+        "kwargs": len(capture.kwargs),
+        "kwargs_with_placeholder": sum(PLACEHOLDER_MARK in k for k in capture.kwargs),
+        "failed": len(capture.failed),
+        "failed_with_placeholder": sum(PLACEHOLDER_MARK in f for f in capture.failed),
+        "spend_logs": [json.loads(row) for row in capture.spend_logs],
+        "any_original": any(ORIGINAL_MARK in value for value in everything),
+    }
+    capture.seen.clear()
+    capture.kwargs.clear()
+    capture.spend_logs.clear()
+    capture.failed.clear()
+    return seen
 
 
 async def _sdk_chat_stream(port: int, captures: Any, sink: ListSink) -> dict[str, Any]:
