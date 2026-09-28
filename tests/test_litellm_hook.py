@@ -2439,6 +2439,67 @@ async def test_post_call_stream_anthropic_sse_bare_alias_does_not_corrupt_identi
     assert full_text == "const MY_LOCATION_007 = 1;"
 
 
+_ANTHROPIC_ERROR = (
+    b"event: error\n"
+    b'data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}\n\n'
+)
+
+
+async def _anthropic_stream_through_the_callback(sse_events: list[bytes]) -> list[bytes]:
+    g, _ = _build_guardrail([("user@example.com", "[EMAIL_001]")])
+    data = _data_with_token("tok-1", content="email is user@example.com")
+    await g.pre_call(data)
+    out: list[bytes] = []
+    async for chunk in g.post_call_stream(data, _async_iter(sse_events)):
+        assert isinstance(chunk, bytes)
+        out.append(chunk)
+    return out
+
+
+def _sse_events(out: list[bytes]) -> list[bytes]:
+    wire = b"".join(out)
+    return [event + b"\n\n" for event in wire.split(b"\n\n") if event]
+
+
+def _text_deltas(events: list[bytes]) -> str:
+    text = ""
+    for event in events:
+        for line in event.decode().splitlines():
+            if not line.startswith("data:"):
+                continue
+            obj = json.loads(line[5:].lstrip())
+            if obj.get("type") == "content_block_delta" and obj["delta"]["type"] == "text_delta":
+                text += obj["delta"]["text"]
+    return text
+
+
+async def test_post_call_stream_anthropic_error_event_follows_the_restored_held_tail() -> None:
+    """Live callback path: a mid-stream ``event: error`` ends the stream for the client, so
+    the held tail goes out restored BEFORE it, the error bytes are unchanged, and nothing
+    is sent after it."""
+    out = await _anthropic_stream_through_the_callback(
+        [_MSG_START, _cb_start(0), _delta("to [EMAIL_001]"), _ANTHROPIC_ERROR]
+    )
+
+    events = _sse_events(out)
+    assert events[-1] == _ANTHROPIC_ERROR
+    assert _ANTHROPIC_ERROR not in b"".join(events[:-1])
+    assert _text_deltas(events[:-1]) == "to user@example.com"
+    assert b"[EMAIL_001]" not in b"".join(out)
+
+
+async def test_post_call_stream_anthropic_truncated_stream_still_sends_the_held_tail() -> None:
+    """No ``content_block_stop`` / ``message_stop``: the held tail goes out at the end."""
+    out = await _anthropic_stream_through_the_callback(
+        [_MSG_START, _cb_start(0), _delta("to [EMAIL_001]")]
+    )
+
+    events = _sse_events(out)
+    assert _text_deltas(events) == "to user@example.com"
+    assert _text_deltas(events[-1:]) != ""
+    assert b"[EMAIL_001]" not in b"".join(out)
+
+
 async def test_post_call_stream_anthropic_sse_bytes_placeholder_restored() -> None:
     """Anthropic SSE bytes: placeholder split across deltas is restored, framing intact."""
     g, _ = _build_guardrail([("user@example.com", "[EMAIL_001]")])

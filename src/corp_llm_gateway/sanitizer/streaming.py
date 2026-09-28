@@ -218,6 +218,11 @@ class ResponsesStreamDesanitizer:
     arguments can split a placeholder over several ``*.delta`` events, so each
     logical output field gets its own hold-back buffer. Synthetic tail events
     are emitted as JSON strings; LiteLLM's proxy serializer wraps them in SSE.
+
+    Holding text back and adding tails would leave ``sequence_number`` repeated or
+    with gaps, so every emitted event that carries one is renumbered: the first
+    keeps its own, each next one is the previous plus one. Events without the
+    field are left alone.
     """
 
     def __init__(self, mapping: StrategyResult) -> None:
@@ -225,8 +230,15 @@ class ResponsesStreamDesanitizer:
         self._reverse_fn = build_reverse_substituter(mapping.pairs)
         self._streams: dict[tuple[Any, ...], StreamingDesanitizer] = {}
         self._metadata: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._last_sequence: int | None = None
 
     def feed(self, chunk: Any) -> list[Any]:
+        return self._renumber(self._feed(chunk))
+
+    def flush(self) -> list[str]:
+        return self._renumber(self._flush_where(lambda key: True))
+
+    def _feed(self, chunk: Any) -> list[Any]:
         payload = _responses_event_payload(chunk)
         if payload is None:
             return [chunk]
@@ -282,7 +294,7 @@ class ResponsesStreamDesanitizer:
         # before its ``done``, every tail before the stream's terminal event.
         tails: list[Any] = []
         if event_type in _RESPONSES_TERMINAL_EVENTS:
-            tails = list(self.flush())
+            tails = list(self._flush_where(lambda key: True))
         elif event_type in _RESPONSES_ITEM_DONE_EVENTS:
             tails = list(self._flush_where(_item_matcher(payload)))
 
@@ -294,8 +306,36 @@ class ResponsesStreamDesanitizer:
             return [*tails, _restore_responses_event(chunk, rewritten)]
         return [*tails, chunk]
 
-    def flush(self) -> list[str]:
-        return self._flush_where(lambda key: True)
+    def _renumber[T](self, events: list[T]) -> list[T]:
+        return [self._numbered(event) for event in events]
+
+    def _numbered(self, event: Any) -> Any:
+        if isinstance(event, str):
+            try:
+                payload = json.loads(event)
+            except ValueError:
+                return event
+            current = payload.get("sequence_number") if isinstance(payload, dict) else None
+        elif isinstance(event, dict):
+            payload, current = event, event.get("sequence_number")
+        else:
+            payload, current = None, getattr(event, "sequence_number", None)
+        if not isinstance(current, int) or isinstance(current, bool):
+            return event
+        number = current if self._last_sequence is None else self._last_sequence + 1
+        self._last_sequence = number
+        if number == current:
+            return event
+        if isinstance(event, str):
+            return json.dumps({**payload, "sequence_number": number}, ensure_ascii=False)
+        if isinstance(event, dict):
+            return {**event, "sequence_number": number}
+        copier = getattr(event, "model_copy", None)
+        if callable(copier):
+            return copier(update={"sequence_number": number})
+        # Cannot be renumbered: continue from the number it carries.
+        self._last_sequence = current
+        return event
 
     def _flush_where(self, selected: Callable[[tuple[Any, ...]], bool]) -> list[str]:
         out: list[str] = []
@@ -416,6 +456,11 @@ class SseStreamDesanitizer:
     tool call's tail goes out before the next tool call of its choice starts;
     whatever is still held goes out before ``[DONE]`` or an error event, as a
     full chunk of the stream (its ``id``/``object``/``created``/``model``).
+
+    Limitation: fragments of two tool calls interleaved (off-spec for OpenAI; the SDK
+    reads an index switch as "previous call done", and the v1 providers stream tool
+    calls one after another) flush each call's buffer at every switch, so a placeholder
+    split across a switch reaches the client as the placeholder, never the original.
     """
 
     def __init__(self, mapping: StrategyResult) -> None:

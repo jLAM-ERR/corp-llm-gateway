@@ -1766,6 +1766,53 @@ async def test_the_ticket_closes_when_the_server_cancels_the_request() -> None:
     assert len(closes.calls) == 1 and limiter.inflight == 0
 
 
+@pytest.mark.parametrize(
+    ("end", "expected"),
+    [("response", (None, False)), ("client", ("client", True)), ("server", ("server", False))],
+)
+async def test_the_ticket_records_who_cancelled_the_request(
+    end: str, expected: tuple[str | None, bool]
+) -> None:
+    """``cancel_origin`` is set before the downstream is cancelled. A server cancel leaves
+    ``cancelled`` alone: that flag means a client left and the guardrail writes its record."""
+    at_close: list[tuple[str | None, bool]] = []
+    at_cancel: list[str | None] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        ticket = current_ticket()
+        assert ticket is not None
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            at_cancel.append(ticket.cancel_origin)
+            raise
+        await _respond(send)
+
+    def hook(ticket: RequestTicket) -> None:
+        at_close.append((ticket.cancel_origin, ticket.cancelled))
+
+    gate, limiter, _, _ = _stack(_registering(hook, app), grace=0.2)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    if end == "response":
+        release.set()
+    elif end == "client":
+        client.disconnect()
+    else:
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+
+    assert at_close == [expected]
+    assert at_cancel == ([] if end == "response" else [expected[0]])
+    assert limiter.inflight == 0
+
+
 async def test_a_hook_offered_to_a_closed_ticket_is_refused_and_never_run() -> None:
     ticket = RequestTicket("f" * 32)
     ran: list[RequestTicket] = []

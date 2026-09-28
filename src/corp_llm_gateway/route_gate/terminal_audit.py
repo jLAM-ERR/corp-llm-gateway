@@ -9,8 +9,13 @@ a request that never got that far (cancelled, or ended without a final body). A 
 awaiting the response never publishes, so litellm running its success log before or
 after ``http.response.start`` cannot decide the record.
 
-The first outcome decided is the record's; ``ok`` on a ticket already cancelled is
-``cancelled``. A failed write keeps the record open: the ticket's close retries it once.
+The first outcome decided is the record's; ``ok`` on a ticket whose client left is
+``cancelled``. The close decides before it schedules its write, so nothing published after
+the close changes the outcome. A cancelled request is ``cancelled`` with the code of who
+cancelled it (``E_CLIENT_DISCONNECTED``, ``E_SERVER_SHUTDOWN``); ``failed`` + ``E_INTERNAL``
+is a restoration failure or a request that ended with no final body. A failed write before
+the close keeps the record open and the close writes it once more; the close's own write is
+the last attempt, never retried.
 """
 
 from __future__ import annotations
@@ -25,7 +30,8 @@ from typing import Literal
 
 from corp_llm_gateway.audit import AuditEvent, AuditLogger, AuditWriteAmbiguousError
 from corp_llm_gateway.audit.event import Provider
-from corp_llm_gateway.route_gate.inflight import RequestTicket
+from corp_llm_gateway.metrics import MetricsExporter, get_exporter
+from corp_llm_gateway.route_gate.inflight import CANCEL_SERVER, RequestTicket
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +40,10 @@ Outcome = Literal["ok", "failed", "cancelled"]
 E_INTERNAL = "E_INTERNAL"
 # Same code as the guardrail's own cancelled record (litellm_hook.E_CLIENT_DISCONNECTED).
 E_CLIENT_DISCONNECTED = "E_CLIENT_DISCONNECTED"
+# The server cancelled the request (shutdown, pod drain): not a restoration failure.
+E_SERVER_SHUTDOWN = "E_SERVER_SHUTDOWN"
+# gateway_failure{component} of a close's record write that raised past its own handling.
+COMPONENT = "desanitize"
 
 
 @dataclass
@@ -130,8 +140,9 @@ def deposit_usage(ticket: RequestTicket | None, prompt_tokens: int, completion_t
 class TerminalAudit:
     """Publishes each ticket's terminal record exactly once."""
 
-    def __init__(self, emit: Emit) -> None:
+    def __init__(self, emit: Emit, *, metrics: MetricsExporter | None = None) -> None:
         self._emit = emit
+        self._metrics = metrics
         self._closing: set[asyncio.Task[None]] = set()
 
     def bind(self, ticket: RequestTicket) -> None:
@@ -150,6 +161,16 @@ class TerminalAudit:
             if outcome == "ok" and ticket.cancelled:
                 outcome, error_code = "cancelled", E_CLIENT_DISCONNECTED
             facts.decided = (outcome, error_code if error_code is not None else facts.error_code)
+        await self._write(ticket, facts)
+
+    async def drain(self) -> None:
+        """Wait for the records the ticket closes started."""
+        while self._closing:
+            await asyncio.wait(set(self._closing))
+
+    async def _write(self, ticket: RequestTicket, facts: AuditFacts) -> None:
+        if facts.published or facts.publishing or facts.decided is None:
+            return
         decided, code = facts.decided
         latency_ms = max(0, int((time.monotonic() - facts.started) * 1000))
         record = TerminalRecord(facts, decided, code, latency_ms)
@@ -167,32 +188,33 @@ class TerminalAudit:
         finally:
             facts.publishing = False
 
-    async def drain(self) -> None:
-        """Wait for the records the ticket closes started."""
-        while self._closing:
-            await asyncio.wait(set(self._closing))
-
     def _on_close(self, ticket: RequestTicket) -> None:
         facts = ticket.audit_facts
         if not isinstance(facts, AuditFacts) or facts.published or facts.publishing:
             return
-        if facts.decided is not None:
-            outcome, code = facts.decided
-        elif ticket.cancelled:
-            outcome, code = "cancelled", E_CLIENT_DISCONNECTED
-        else:
-            # The limiter let go before any final body: the response never completed.
-            outcome, code = "failed", E_INTERNAL
-        task = asyncio.get_running_loop().create_task(
-            self.publish(ticket, outcome, error_code=code)
-        )
+        if facts.decided is None:
+            facts.decided = _closing_outcome(ticket)
+        task = asyncio.get_running_loop().create_task(self._write(ticket, facts))
         self._closing.add(task)
-        task.add_done_callback(self._closed)
+        task.add_done_callback(lambda done: self._closed(ticket, done))
 
-    def _closed(self, task: asyncio.Task[None]) -> None:
+    def _closed(self, ticket: RequestTicket, task: asyncio.Task[None]) -> None:
         self._closing.discard(task)
-        if not task.cancelled():
-            task.exception()
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        # Type only: an exception message can quote request content.
+        logger.error(
+            "terminal_audit_publish_failed request_id=%s error=%s",
+            ticket.gateway_id,
+            type(exc).__name__,
+        )
+        try:
+            (self._metrics or get_exporter()).record_failure(COMPONENT)
+        except Exception as metrics_exc:
+            logger.error("terminal_audit_metrics_error error=%s", type(metrics_exc).__name__)
 
     @staticmethod
     def _failed(ticket: RequestTicket, outcome: str, error: type[BaseException]) -> None:
@@ -202,3 +224,13 @@ class TerminalAudit:
             outcome,
             error.__name__,
         )
+
+
+def _closing_outcome(ticket: RequestTicket) -> tuple[Outcome, str]:
+    """The outcome of a request the limiter let go of before any final body was published."""
+    if ticket.cancelled:
+        return "cancelled", E_CLIENT_DISCONNECTED
+    if ticket.cancel_origin == CANCEL_SERVER:
+        return "cancelled", E_SERVER_SHUTDOWN
+    # The response never completed and nobody cancelled it.
+    return "failed", E_INTERNAL

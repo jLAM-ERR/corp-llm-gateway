@@ -219,6 +219,36 @@ def test_a_tool_calls_tail_is_sent_before_the_next_tool_call_starts() -> None:
     assert json.loads(arguments_of(out[:second_starts])[0]) == {"to": EMAIL}
 
 
+def test_interleaved_tool_call_fragments_degrade_to_placeholders_never_originals() -> None:
+    """Off-spec for OpenAI (the SDK reads an index switch as "previous call done"): a
+    placeholder split across interleaved calls is flushed half at each switch, so the
+    client gets the placeholder back, never the original, and the stream does not fail."""
+    events = [
+        chunk(
+            choice(
+                0,
+                role="assistant",
+                tool_calls=[
+                    tool(0, "", call_id="c0", name="f"),
+                    tool(1, "", call_id="c1", name="g"),
+                ],
+            )
+        ),
+        chunk(choice(0, tool_calls=[tool(0, '{"to":"[EM')])),
+        chunk(choice(0, tool_calls=[tool(1, '{"n":"[NA')])),
+        chunk(choice(0, tool_calls=[tool(0, 'AIL_1]"}')])),
+        chunk(choice(0, tool_calls=[tool(1, 'ME_1]"}')])),
+        chunk(choice(0, "tool_calls")),
+        DONE,
+    ]
+
+    out = run(events)
+
+    wire = b"".join(out).decode()
+    assert EMAIL not in wire and NAME not in wire
+    assert arguments_of(events_of(out)) == {0: '{"to":"[EMAIL_1]"}', 1: '{"n":"[NAME_1]"}'}
+
+
 def test_held_content_is_sent_before_the_first_tool_call() -> None:
     out = events_of(
         run(

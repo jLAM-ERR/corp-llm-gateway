@@ -84,6 +84,10 @@ DEFAULT_MAX_DRAINING_BYTES = 512 * 1024 * 1024
 
 _COMPONENT = "route_gate"
 
+# RequestTicket.cancel_origin: who cancelled the request.
+CANCEL_CLIENT = "client"
+CANCEL_SERVER = "server"
+
 
 class CancelHook(Protocol):
     def __call__(self, request_id: str, *, latency_ms: int = ...) -> Awaitable[None]: ...
@@ -95,6 +99,9 @@ class RequestTicket:
     ``cancelled`` is set before the downstream is cancelled, so any audit the
     unwinding request (or a litellm callback run in its context) attempts can
     stand down for the one ``cancelled`` record the guardrail writes after.
+    ``cancel_origin`` says who cancelled it: ``client`` with ``cancelled`` (the
+    client left), ``server`` without it (the server cancelled the request, e.g. at
+    shutdown; the guardrail is not told and writes no ``cancelled`` record).
 
     ``close()`` is the limiter letting go of the request: normally when the
     downstream returns, on a disconnect after the grace even if the downstream
@@ -109,6 +116,7 @@ class RequestTicket:
         "_on_close",
         "audit_facts",
         "call_ids",
+        "cancel_origin",
         "cancelled",
         "closed",
         "gateway_id",
@@ -119,10 +127,18 @@ class RequestTicket:
         self.gateway_id = gateway_id
         self.call_ids: list[str] = []
         self.cancelled = False
+        self.cancel_origin: str | None = None
         self.closed = False
         self.tasks: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
         self.audit_facts: Any = None
         self._on_close: list[Callable[[RequestTicket], None]] = []
+
+    def mark_cancelled(self, origin: str) -> None:
+        """Record who cancelled the request; the first origin stays."""
+        if self.cancel_origin is None:
+            self.cancel_origin = origin
+            if origin == CANCEL_CLIENT:
+                self.cancelled = True
 
     def request_ids(self) -> list[str]:
         return list(self.call_ids) or [self.gateway_id]
@@ -413,6 +429,11 @@ class InflightLimiter:
         ticket = RequestTicket(uuid.uuid4().hex)
         try:
             await self._admit_ticket(ticket, started, held, scope, receive, send, app, refuse)
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                ticket.mark_cancelled(CANCEL_SERVER)
+            raise
         finally:
             self._close(ticket)
 
@@ -519,13 +540,15 @@ class InflightLimiter:
             # Before the replay wakes anything: litellm's own watchers read the
             # replay, and the audits they trigger must already see the flag.
             if not response_complete:
-                ticket.cancelled = True
+                ticket.mark_cancelled(CANCEL_CLIENT)
             replay.disconnect()
 
         watcher = asyncio.create_task(self._watch(receive, client_gone))
         try:
             await asyncio.wait({downstream, watcher}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
+            # The server is cancelling the request: before the downstream sees it.
+            ticket.mark_cancelled(CANCEL_SERVER)
             watcher.cancel()
             downstream.cancel()
             try:
@@ -576,7 +599,7 @@ class InflightLimiter:
     async def _cancelled(
         self, ticket: RequestTicket, started: float, *, downstream: asyncio.Task[None] | None
     ) -> None:
-        ticket.cancelled = True
+        ticket.mark_cancelled(CANCEL_CLIENT)
         loop = asyncio.get_running_loop()
         unwound = True
         if downstream is not None:

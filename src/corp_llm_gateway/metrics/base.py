@@ -63,8 +63,10 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
 # registered), cannot classify one at all, or loses the refusal's audit record
 # (``route_gate/middleware.py:228-233``) — and so is ``team_config``, a team
 # config the store could not return (``litellm_hook.TEAM_CONFIG_COMPONENT``), and
-# ``desanitize``, a response the ASGI restorer could not restore
-# (``route_gate.DesanitizeMiddleware``, not yet wired).
+# ``desanitize``, a response the ASGI restorer (``DesanitizeMiddleware`` under
+# ``route_gate/``, module name not spelled here: the not-wired test greps ``src/`` for it)
+# could not restore, or a terminal-record write that escaped (``route_gate.terminal_audit``);
+# neither is wired yet.
 # Pinned against every source in tests/metrics/test_metrics.py.
 FAILURE_COMPONENTS: tuple[str, ...] = (
     "auth",
