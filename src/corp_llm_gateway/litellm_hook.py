@@ -1142,6 +1142,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             )
 
         _refresh_logging_snapshot(data, request_shape)
+        _refresh_request_body_snapshot(data)
 
         # Stage 5: DLP egress guard — re-scan the SANITIZED outbound request.
         # Defence-in-depth: catches canaries / raw secrets that survived the
@@ -2313,18 +2314,46 @@ def _store_request_items(data: dict[str, Any], items: list[Any], shape: str) -> 
 
 
 def _refresh_logging_snapshot(data: dict[str, Any], shape: str) -> None:
-    """Hand litellm's logging object the rewritten request, as a new list in its snapshot
-    shape: it snapshotted the original before any pre-call hook ran, every success and
-    failure ``StandardLoggingPayload`` reads ``messages`` from it, and the proxy
-    re-points it afterwards for a ``messages`` body only (not a Responses ``input``)."""
-    update = getattr(data.get("litellm_logging_obj"), "update_messages", None)
+    """Hand litellm's logging object the rewritten request, as new lists in its snapshot
+    shapes: it snapshotted the original before any pre-call hook ran, every success and
+    failure ``StandardLoggingPayload`` reads ``messages`` from it, the proxy re-points it
+    afterwards for a ``messages`` body only (not a Responses ``input``), and its
+    ``model_call_details["input"]`` stays the original until the provider's own
+    ``pre_call`` — a failure logged before that hands it to every callback."""
+    logging_obj = data.get("litellm_logging_obj")
+    update = getattr(logging_obj, "update_messages", None)
     if not callable(update) or shape == "unmanaged":
         return
     items = data.get("messages") if shape == "messages" else data.get("input")
     if isinstance(items, str):
         update([{"role": "user", "content": items}])
+        logged_input: str | list[Any] = items
     elif isinstance(items, list):
         update([{"role": "user", "content": i} if isinstance(i, str) else i for i in items])
+        logged_input = list(items)
+    else:
+        return
+    details = getattr(logging_obj, "model_call_details", None)
+    if isinstance(details, dict):
+        details["input"] = logged_input
+
+
+_REWRITTEN_BODY_KEYS = ("messages", "input", "system", "instructions")
+
+
+def _refresh_request_body_snapshot(data: dict[str, Any]) -> None:
+    """Point litellm's ``proxy_server_request.body`` snapshot at the rewritten content:
+    litellm re-takes it only after ``pre_call_hook`` returns, so a rejection raised after
+    the rewrite would hand every ``async_post_call_failure_hook`` the original. Only keys
+    the snapshot already holds are overwritten — nothing a pre-call added (``api_key``,
+    ``extra_headers``) is written into it."""
+    request = data.get("proxy_server_request")
+    body = request.get("body") if isinstance(request, dict) else None
+    if not isinstance(body, dict):
+        return
+    for key in _REWRITTEN_BODY_KEYS:
+        if key in body and key in data:
+            body[key] = data[key]
 
 
 def _is_responses_event(chunk: Any) -> bool:

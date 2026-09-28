@@ -100,13 +100,24 @@ async def _logged(
     return exchange.status, exchange.provider_bodies, kind, kwargs
 
 
+def _kwargs_holding(kwargs: dict[str, Any], needle: str) -> set[str]:
+    """Every top-level kwargs key whose value, walked recursively, holds ``needle``. The
+    logging object is the one live, unserialisable entry; its snapshot is what the other
+    keys were built from."""
+    return {
+        key
+        for key, value in kwargs.items()
+        if key != "litellm_logging_obj" and needle in serialize(value)
+    }
+
+
 def _assert_sanitised(kwargs: dict[str, Any], provider_bodies: list[str]) -> None:
     assert provider_bodies
     assert all(ORIGINAL_MARK not in body for body in provider_bodies)
     payload = kwargs["standard_logging_object"]
     assert _payload_fields_holding(payload, ORIGINAL_MARK) == set()
     assert PLACEHOLDER in json.dumps(payload["messages"], default=str)
-    assert ORIGINAL_MARK not in serialize(kwargs["messages"])
+    assert _kwargs_holding(kwargs, ORIGINAL_MARK) == set()
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
@@ -146,6 +157,7 @@ async def test_chat_and_messages_logging_payload_stays_content_free(
 class _LoggingStub:
     def __init__(self) -> None:
         self.updates: list[Any] = []
+        self.model_call_details: dict[str, Any] = {"input": EMAIL}
 
     def update_messages(self, messages: Any) -> None:
         self.updates.append(messages)
@@ -215,3 +227,88 @@ def test_an_unmanaged_body_is_never_handed_to_the_logging_object() -> None:
     _refresh_logging_snapshot({"input": [EMAIL], "litellm_logging_obj": logging_obj}, "unmanaged")
 
     assert logging_obj.updates == []
+    assert logging_obj.model_call_details == {"input": EMAIL}
+
+
+@pytest.mark.parametrize(
+    ("data", "shape", "expected"),
+    [
+        ({"input": PLACEHOLDER}, "input_string", PLACEHOLDER),
+        ({"input": [PLACEHOLDER]}, "input_list", [PLACEHOLDER]),
+        (
+            {"messages": [{"role": "user", "content": PLACEHOLDER}]},
+            "messages",
+            [{"role": "user", "content": PLACEHOLDER}],
+        ),
+        ({"messages": []}, "messages", []),
+    ],
+    ids=["input-string", "input-list", "messages", "empty-messages"],
+)
+def test_the_logged_input_takes_what_logging_init_stores(
+    data: dict[str, Any], shape: str, expected: Any
+) -> None:
+    """``model_call_details["input"]`` gets the request as ``Logging.__init__`` stored it,
+    unconverted: the raw string, or a copy of the list."""
+    logging_obj = _LoggingStub()
+    data["litellm_logging_obj"] = logging_obj
+
+    _refresh_logging_snapshot(data, shape)
+
+    logged = logging_obj.model_call_details["input"]
+    assert logged == expected
+    if isinstance(expected, list):
+        assert logged is not data["messages" if shape == "messages" else "input"]
+
+
+def test_a_body_with_no_request_list_leaves_the_logged_input_alone() -> None:
+    logging_obj = _LoggingStub()
+
+    _refresh_logging_snapshot({"messages": None, "litellm_logging_obj": logging_obj}, "messages")
+
+    assert logging_obj.updates == []
+    assert logging_obj.model_call_details == {"input": EMAIL}
+
+
+def test_a_logging_object_without_call_details_still_gets_the_messages() -> None:
+    logging_obj = _LoggingStub()
+    del logging_obj.model_call_details
+
+    _refresh_logging_snapshot(
+        {"input": PLACEHOLDER, "litellm_logging_obj": logging_obj}, "input_string"
+    )
+
+    assert logging_obj.updates == [[{"role": "user", "content": PLACEHOLDER}]]
+
+
+@pytest.fixture
+def healthy_upstream() -> Iterator[StubUpstream]:
+    stub = StubUpstream()
+    yield stub
+    stub.close()
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
+@pytest.mark.parametrize("route", ["chat", "messages", "responses"])
+async def test_a_failure_before_the_provider_call_logs_the_sanitised_input(
+    monkeypatch: pytest.MonkeyPatch,
+    healthy_upstream: StubUpstream,
+    route: str,
+    stream: bool,
+) -> None:
+    """A request litellm rejects after our pre-call and before the provider's own
+    ``pre_call`` (here a malformed ``tools``) logs a failure while ``model_call_details``
+    still holds the snapshot ``Logging.__init__`` took: its ``input`` must be ours too.
+    A streamed call may log one failure per retry; every one is checked."""
+    ours, _ = build_ours()
+    capture = LogCapture()
+    harness = DispatchHarness(monkeypatch, healthy_upstream, [ours, capture])
+
+    exchange = await harness.send(route, stream=stream, extra={"tools": "nope"})
+    await until(lambda: len(capture.events) >= 1)
+
+    assert exchange.status != 200
+    assert exchange.provider_bodies == []
+    assert {kind for kind, _ in capture.events} == {"failure"}
+    for _, kwargs in capture.events:
+        assert PLACEHOLDER in serialize(kwargs["input"])
+        assert _kwargs_holding(kwargs, ORIGINAL_MARK) == set()
