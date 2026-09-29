@@ -7,10 +7,14 @@ its DEBUG output prints the request before any pre-call hook runs. Our pre-call 
 the first sanitised and the arm step refuses the second; these configs are the layer
 under both: no extra success/failure logger, no prompts stored in spend logs, no
 ``set_verbose``, no DEBUG switch in the environment the gateway runs with.
+
+They also start none of litellm's own guardrails (plan 20260926 Task 6): no
+``litellm_content_filter``, no ``custom_code``, no ``on_sensitive_data: route``.
 """
 
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 from typing import Any
@@ -237,6 +241,128 @@ def test_only_litellms_startup_config_load_starts_guardrails() -> None:
     assert callers == {"load_config"}
 
 
+# ── plan 20260926 Task 6: litellm's own guardrails stay off ─────────────────
+# litellm starts a guardrail from a top-level ``guardrails:`` list (``init_guardrails_v2``)
+# or from ``litellm_settings.guardrails`` (``initialize_guardrails``), both only in
+# ``load_config`` (pinned above); a DB ``guardrails`` object is not loaded (the
+# ``supported_db_objects`` pin). ``litellm_content_filter`` masks one way and logs what it
+# matched; ``custom_code`` runs config-supplied code inside the proxy; ``on_sensitive_data``
+# / ``sensitive_data_route_to_model`` let a guardrail swap the upstream model.
+
+LITELLM_GUARDRAIL_NAMES = (
+    "litellm_content_filter",
+    "custom_code",
+    "on_sensitive_data",
+    "sensitive_data_route_to_model",
+)
+
+
+def _assert_starts_no_litellm_guardrail(config: dict[str, Any], text: str) -> None:
+    assert "guardrails" not in config
+    assert "guardrails" not in (config.get("litellm_settings") or {})
+    for name in LITELLM_GUARDRAIL_NAMES:
+        assert name not in text, name
+
+
+@pytest.mark.parametrize("name", sorted(LITELLM_CONFIGS))
+def test_compose_litellm_config_starts_no_litellm_guardrail(name: str) -> None:
+    text = LITELLM_CONFIGS[name].read_text()
+    _assert_starts_no_litellm_guardrail(yaml.safe_load(text), text)
+
+
+@needs_helm
+def test_helm_litellm_config_starts_no_litellm_guardrail() -> None:
+    text = _litellm_configmap(_helm_docs())["data"]["config.yaml"]
+    _assert_starts_no_litellm_guardrail(yaml.safe_load(text), text)
+
+
+def test_the_pinned_names_are_litellms_own() -> None:
+    """The names the guard greps for are the ones litellm 1.101.0 reads; a bump that
+    renames one fails here instead of leaving the guard vacuous."""
+    import inspect
+
+    proxy = pytest.importorskip("litellm.proxy.proxy_server")
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+    from litellm.proxy.guardrails.guardrail_hooks.custom_code.custom_code_guardrail import (
+        CustomCodeGuardrail,
+    )
+    from litellm.proxy.guardrails.guardrail_hooks.litellm_content_filter.content_filter import (
+        ContentFilterGuardrail,
+    )
+    from litellm.proxy.guardrails.guardrail_registry import guardrail_initializer_registry
+    from litellm.types.guardrails import LitellmParams
+
+    assert {"litellm_content_filter", "custom_code"} <= set(guardrail_initializer_registry)
+    assert {"on_sensitive_data", "sensitive_data_route_to_model"} <= set(LitellmParams.model_fields)
+    # Both run through litellm's unified_guardrail dispatch (hazards 7, 8, 12).
+    for cls in (ContentFilterGuardrail, CustomCodeGuardrail):
+        assert issubclass(cls, CustomGuardrail)
+        assert "apply_guardrail" in vars(cls)
+    load_config = inspect.getsource(proxy.ProxyConfig.load_config)
+    assert 'config.get("guardrails"' in load_config
+    assert 'key == "guardrails"' in load_config
+
+
+class _LitellmRecords(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.INFO)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+async def test_litellm_content_filter_masks_one_way_and_logs_its_matches() -> None:
+    """Why it is not adopted: two different emails come out as the same tag (no mapping
+    to undo, unlike our placeholders), and a configured term it masks goes to litellm's
+    INFO log and ``guardrail_information`` (every ``StandardLoggingPayload`` sink); a
+    blocked one goes into the 400 body."""
+    pytest.importorskip("litellm.proxy.proxy_server")
+    from fastapi import HTTPException
+    from litellm._logging import verbose_proxy_logger
+    from litellm.proxy.guardrails.guardrail_hooks.litellm_content_filter.content_filter import (
+        ContentFilterGuardrail,
+    )
+
+    term = "falcon-ledger"
+    email = {"pattern_type": "prebuilt", "pattern_name": "email", "action": "MASK"}
+    masking = ContentFilterGuardrail(
+        guardrail_name="content-filter",
+        patterns=[email],
+        blocked_words=[{"keyword": term, "action": "MASK"}],
+    )
+    blocking = ContentFilterGuardrail(
+        guardrail_name="content-filter",
+        blocked_words=[{"keyword": term, "action": "BLOCK"}],
+    )
+    data: dict[str, Any] = {"metadata": {}}
+    records = _LitellmRecords()
+    level = verbose_proxy_logger.level
+    verbose_proxy_logger.addHandler(records)
+    verbose_proxy_logger.setLevel(logging.INFO)
+    try:
+        out = await masking.apply_guardrail(
+            inputs={"texts": [f"ask alice@corp.example and bob@corp.example about {term}"]},
+            request_data=data,
+            input_type="request",
+        )
+        with pytest.raises(HTTPException) as blocked:
+            await blocking.apply_guardrail(
+                inputs={"texts": [f"about {term}"]},
+                request_data={"metadata": {}},
+                input_type="request",
+            )
+    finally:
+        verbose_proxy_logger.removeHandler(records)
+        verbose_proxy_logger.setLevel(level)
+
+    assert out["texts"] == ["ask [EMAIL_REDACTED] and [EMAIL_REDACTED] about [KEYWORD_REDACTED]"]
+    assert any(term in message for message in records.messages)
+    (entry,) = data["metadata"]["standard_logging_guardrail_information"]
+    assert term in str(entry["match_details"])
+    assert term in str(blocked.value.detail)
+
+
 def _compose_env(entries: Any) -> dict[str, Any]:
     if isinstance(entries, dict):
         return dict(entries)
@@ -298,3 +424,13 @@ def test_the_guard_catches_what_it_guards_against() -> None:
         _assert_db_objects_pinned({"general_settings": {}})
     with pytest.raises(AssertionError):
         _assert_db_objects_pinned({"general_settings": {"supported_db_objects": ["policies"]}})
+    content_filter = {"guardrail_name": "cf", "litellm_params": {"guardrail": "x"}}
+    with pytest.raises(AssertionError):
+        _assert_starts_no_litellm_guardrail({"guardrails": [content_filter]}, "")
+    with pytest.raises(AssertionError):
+        _assert_starts_no_litellm_guardrail(
+            {"litellm_settings": {"guardrails": [content_filter]}}, ""
+        )
+    for name in LITELLM_GUARDRAIL_NAMES:
+        with pytest.raises(AssertionError):
+            _assert_starts_no_litellm_guardrail({}, f"# {name}: route")
