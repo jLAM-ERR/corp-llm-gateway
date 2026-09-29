@@ -232,6 +232,24 @@ async def test_the_sanitization_probe_reports_a_failing_round_trip(
     assert "sanitization_error" in status.detail
 
 
+async def test_the_sanitization_probe_is_healthy_with_the_oracle_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", "1")
+
+    def _fail_if_called() -> None:
+        raise AssertionError("build_corp_llm_client must not run when the oracle is disabled")
+
+    monkeypatch.setattr(bootstrap, "build_corp_llm_client", _fail_if_called)
+    monkeypatch.setattr(bootstrap, "_guardrail", None)
+    status = await bootstrap.build_health_router()._checks["/healthz/sanitization"].check()
+
+    assert status.healthy is True, status.detail
+    assert bootstrap._guardrail._orch._core._corp_llm is None
+    assert bootstrap._guardrail._orch._core._oracle_enabled is False
+
+
 # ── D4: profiles activated in the composition root ───────────────────────────
 
 
