@@ -6,7 +6,9 @@ to the request (``litellm_pre_call_utils.py``, hazard 14b of plan 20260926); the
 refuses it once the in-flight limiter has read the body, before any slot is taken and
 before litellm parses it. litellm also reads a form body (``request.form()``), where a
 ``policies`` field reaches the same place: the rewritten routes take JSON only, so any
-other ``Content-Type`` (or none, on a non-empty body) is refused the same way.
+other ``Content-Type`` (or none, on a non-empty body) is refused the same way. The
+``policies`` check reads bytes, which proves a key absent only for UTF-8: a ``charset``
+other than UTF-8, a BOM, UTF-16/32 or bytes that do not decode as UTF-8 are refused too.
 Content-free: the refusal and its log name no body byte.
 """
 
@@ -27,6 +29,7 @@ from corp_llm_gateway.route_gate import (
     RouteGateMiddleware,
 )
 from corp_llm_gateway.route_gate.inflight import InflightLimiter
+from corp_llm_gateway.route_gate.middleware import _body_problem
 
 CANARY = "corp-policy-7f2a"
 
@@ -234,7 +237,16 @@ async def test_a_body_that_is_not_json_is_refused_before_litellm_or_a_slot(
 
 @pytest.mark.parametrize(
     "content_type",
-    [b"application/json; charset=utf-8", b"Application/JSON", b"application/json ;charset=UTF-8"],
+    [
+        b"application/json; charset=utf-8",
+        b"Application/JSON",
+        b"application/json ;charset=UTF-8",
+        b"application/json; charset=UTF-8",
+        b'application/json; charset="utf-8"',
+        b"application/json; charset=utf8",
+        b"application/json; charset=utf-8 ; foo=bar",
+        b"application/json; Charset = utf-8",
+    ],
 )
 async def test_json_with_parameters_is_served(content_type: bytes) -> None:
     body = _body()
@@ -275,3 +287,133 @@ async def test_a_passthrough_read_is_not_asked_for_a_content_type(method: str) -
 
 def test_the_not_json_reason_is_one_of_the_gates_own() -> None:
     assert ROUTE_GATE_BODY_NOT_JSON in BLOCK_REASONS
+
+
+# ── rewritten routes take UTF-8 JSON only ────────────────────────────────────
+
+
+def _assert_not_json_before_litellm_or_a_slot(
+    status: int,
+    payload: dict[str, Any] | bytes,
+    downstream: _Downstream,
+    metrics: _Metrics,
+    sink: ListSink,
+    limiter: InflightLimiter,
+) -> None:
+    assert status == 415
+    assert isinstance(payload, dict)
+    assert payload["error"]["reason"] == ROUTE_GATE_BODY_NOT_JSON
+    assert downstream.bodies == []
+    assert metrics.inflight == [] and limiter.inflight == 0
+    assert limiter.buffered_bytes == 0
+    assert metrics.blocks == [ROUTE_GATE_BODY_NOT_JSON]
+    (record,) = sink.records
+    assert (record["status"], record["block_reason"]) == ("failed", ROUTE_GATE_BODY_NOT_JSON)
+
+
+def _policies_text() -> str:
+    return json.dumps({"model": "corp-chat", "messages": [], "policies": [CANARY]})
+
+
+@pytest.mark.parametrize(
+    "encoding", ["utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-8-sig"]
+)
+async def test_a_body_that_is_not_utf8_is_refused_before_litellm_or_a_slot(
+    encoding: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    body = _policies_text().encode(encoding)
+    assert b"policies" not in body or encoding == "utf-8-sig"
+    assert json.loads(body)["policies"] == [CANARY]
+
+    with caplog.at_level(logging.DEBUG):
+        status, payload, downstream, metrics, sink, limiter = await _post([body])
+
+    _assert_not_json_before_litellm_or_a_slot(status, payload, downstream, metrics, sink, limiter)
+    assert CANARY not in caplog.text and CANARY not in json.dumps(payload)
+
+
+async def test_bytes_that_do_not_decode_as_utf8_are_refused() -> None:
+    body = b'{"model": "corp-chat", "messages": [], "poli\xffcies": ["' + CANARY.encode() + b'"]}'
+    assert json.loads(body.decode("utf-8", errors="ignore"))["policies"] == [CANARY]
+
+    result = await _post([body])
+
+    _assert_not_json_before_litellm_or_a_slot(*result)
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        b"application/json; charset=utf-16",
+        b"application/json; charset=latin-1",
+        b"application/json; charset=utf-7",
+        b"application/json; charset=utf-8; charset=utf-16",
+        b"application/json; charset=utf-8; charset=utf-8",
+        b"application/json; charset",
+        b"application/json; charset=",
+        b'application/json; charset="utf-8',
+        b'application/json; charset=""',
+        b"application/json; charset*=utf-8''",
+        b"application/json; charset=utf-8 x",
+    ],
+    ids=[
+        "utf-16",
+        "latin-1",
+        "utf-7",
+        "repeated-other",
+        "repeated-same",
+        "no-value",
+        "empty",
+        "unbalanced-quote",
+        "empty-quoted",
+        "rfc2231",
+        "trailing-token",
+    ],
+)
+async def test_a_charset_other_than_utf8_is_refused_before_litellm_or_a_slot(
+    content_type: bytes,
+) -> None:
+    result = await _post([_body()], content_type=content_type)
+
+    _assert_not_json_before_litellm_or_a_slot(*result)
+
+
+async def test_a_charset_other_than_utf8_is_refused_without_a_body() -> None:
+    result = await _post([b""], content_type=b"application/json; charset=utf-16")
+
+    _assert_not_json_before_litellm_or_a_slot(*result)
+
+
+_STDLIB_ENCODINGS = [
+    "utf-8",
+    "utf-8-sig",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "utf-32",
+    "utf-32-le",
+    "utf-32-be",
+]
+
+
+@pytest.mark.parametrize("escaped", [False, True], ids=["plain-key", "escaped-key"])
+@pytest.mark.parametrize("declared", [False, True], ids=["no-charset", "charset"])
+@pytest.mark.parametrize("encoding", _STDLIB_ENCODINGS)
+def test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate(
+    encoding: str, declared: bool, escaped: bool
+) -> None:
+    """Whatever parser litellm moves to, the most permissive one (``json.loads(bytes)``)
+    finding a top-level ``policies`` key means the gate refused the body."""
+    text = _policies_text()
+    if escaped:
+        text = text.replace('"policies"', '"\\u0070olicies"')
+    body = text.encode(encoding)
+    assert "policies" in json.loads(body)
+    content_type = b"application/json"
+    if declared:
+        content_type += b"; charset=" + encoding.encode()
+
+    assert _body_problem([body], content_type) in {
+        ROUTE_GATE_BODY_NOT_JSON,
+        ROUTE_GATE_BODY_POLICIES,
+    }

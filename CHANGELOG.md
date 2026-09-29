@@ -44,6 +44,11 @@ none but the gateway's own.
   (`route_gate_body_not_json`: litellm would read a form body, a `policies` field included) — both
   before litellm parses it. litellm applies a body's `policies` to that request with no
   attachment.
+- **The 415 covers any body that is not UTF-8 JSON**: a `charset` other than `utf-8`/`utf8`, a
+  BOM, UTF-16/32, or bytes that do not decode as UTF-8. The `policies` check reads bytes, and a
+  UTF-16 body spells the key in bytes it never matched, so the gate served it. litellm 1.101.0
+  turns such a body into an empty one (with a BOM, or bytes that are not UTF-8) or answers 400,
+  so nothing leaked; stdlib `json.loads(bytes)` would decode every one of them.
 
 ### Fixed — chat-completions streaming came back with placeholders
 

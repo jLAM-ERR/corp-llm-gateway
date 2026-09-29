@@ -340,15 +340,54 @@ def _is_json(content_type: object) -> bool:
     return content_type.split(b";", 1)[0].strip().lower() == b"application/json"
 
 
+_UTF8_CHARSETS = frozenset({b"utf-8", b"utf8"})
+
+
+def _utf8_charset(content_type: bytes) -> bool:
+    """No ``charset`` parameter, or exactly one naming UTF-8; a repeated, malformed or
+    RFC 2231 (``charset*``) one is not UTF-8."""
+    charsets = []
+    for param in content_type.split(b";")[1:]:
+        key, eq, value = param.partition(b"=")
+        if key.strip().lower().split(b"*", 1)[0] != b"charset":
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[:1] == value[-1:] == b'"':
+            value = value[1:-1]
+        if not eq or b'"' in value:
+            return False
+        charsets.append(value.lower())
+    return not charsets or (len(charsets) == 1 and charsets[0] in _UTF8_CHARSETS)
+
+
+def _utf8(body: bytes) -> bool:
+    # ``detect_encoding`` is what ``json.loads(bytes)`` decodes with; a lenient decoder
+    # (``errors="ignore"``) would join ``poli\xffcies`` into a key the bytes never spell.
+    if json.detect_encoding(body) != "utf-8":
+        return False
+    try:
+        body.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def _body_problem(chunks: list[bytes], content_type: object) -> str | None:
-    """``ROUTE_GATE_BODY_NOT_JSON`` for a ``Content-Type`` other than ``application/json``
-    (none at all is refused only with a body); ``ROUTE_GATE_BODY_POLICIES`` for a JSON
-    object body with a top-level ``policies`` key, however its key is escaped; anything
-    else is litellm's to parse."""
+    """``ROUTE_GATE_BODY_NOT_JSON`` for a body that is not UTF-8 JSON: a ``Content-Type``
+    other than ``application/json`` (none at all is refused only with a body), a
+    ``charset`` other than UTF-8, or a body ``json.detect_encoding`` reads as anything but
+    ``utf-8`` (a BOM, UTF-16, UTF-32) or that does not decode as UTF-8;
+    ``ROUTE_GATE_BODY_POLICIES`` for a JSON object body with a top-level ``policies`` key,
+    however its key is escaped; anything else is litellm's to parse."""
     body = chunks[0] if len(chunks) == 1 else b"".join(chunks)
     if not _is_json(content_type) and (body or content_type is not _MISSING):
         return ROUTE_GATE_BODY_NOT_JSON
-    # A key can only spell a letter with a ``\\u`` escape; neither form, no such key.
+    if isinstance(content_type, bytes) and not _utf8_charset(content_type):
+        return ROUTE_GATE_BODY_NOT_JSON
+    if body and not _utf8(body):
+        return ROUTE_GATE_BODY_NOT_JSON
+    # The body is UTF-8, so a key can only spell a letter as itself or with a ``\\u``
+    # escape; neither form, no such key.
     if b"policies" not in body and b"\\u" not in body:
         return None
     try:

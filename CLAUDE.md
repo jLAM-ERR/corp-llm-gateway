@@ -40,7 +40,7 @@ src/corp_llm_gateway/
   providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
   route_gate/   default-deny gate: table.py (hand-classified against litellm's source, guarded by the
                 collector test) + classify.py + middleware.py (also refuses a rewritten-route body that is not
-                JSON (415) or has a top-level `policies` key (403)); litellm's admin/auth/spend/public/UI/non-probe
+                UTF-8 JSON (415) or has a top-level `policies` key (403)); litellm's admin/auth/spend/public/UI/non-probe
                 health surfaces are REFUSE (litellm rows 26 PASSTHROUGH / 879 REFUSE / 8 REWRITTEN + 6 gateway rows)
                 + inflight.py: the gateway-owned in-flight cap (CORP_LLM_MAX_INFLIGHT), single owner of `receive`,
                 disconnect-aware cancellation, spawn_shared for tasks several requests await
@@ -92,7 +92,7 @@ decision `docs/adr/ADR-003-ner-orchestration.md`). Old order was LLM-oracle-firs
 route gate (OUTERMOST, before litellm's router — `route_gate/middleware.py`):
            classify (METHOD, path) against the hand-classified table → PASSTHROUGH / REWRITTEN / REFUSE.
            Unlisted ⇒ 404, listed-REFUSE / websocket / malformed ⇒ 403, both E_ROUTE_BLOCKED;
-           REWRITTEN while unarmed ⇒ 503. The limiter drains the body: not JSON ⇒ 415, a top-level
+           REWRITTEN while unarmed ⇒ 503. The limiter drains the body: not UTF-8 JSON ⇒ 415, a top-level
            `policies` key ⇒ 403. Only then does litellm's router run pre_call_hook.
            ↓
 pre_call:  Stage 0 — payload classifier: config/log shape → refuse before egress (422 + block_reason)
@@ -257,7 +257,7 @@ When adding a new tunable, plumb it through this loader — don't read
    `CorpLlmGuardrail` in `litellm.callbacks` (or with one litellm would
    bypass, litellm DEBUG on, or a response compressor) — `docs/security.md`
    §14/§15, invariant row 7 in §9. An admitted rewritten route also refuses a
-   body that is not JSON or carries a top-level `policies` key, before litellm
+   body that is not UTF-8 JSON (415) or carries a top-level `policies` key, before litellm
    parses it. The compose front door (`compose/nginx/`) mirrors
    the gate at the edge — an exact-path allow-list, 404 before a body byte is
    read — so adding a location there is the same security decision as adding

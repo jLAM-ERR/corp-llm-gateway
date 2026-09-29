@@ -784,7 +784,7 @@ nginx-фронт         compose, COMPOSE_PROFILES=nginx|nginx-ports, по ум�
    ↓
 RouteGateMiddleware классификация (METHOD, path) → PASSTHROUGH / REWRITTEN / REFUSE
    ↓
-лимитер в полёте    только REWRITTEN: тело дочитано (не JSON → 415, ключ
+лимитер в полёте    только REWRITTEN: тело дочитано (не UTF-8 JSON → 415, ключ
                     `policies` верхнего уровня → 403), затем слот → 429 E_CAPACITY
    ↓
 десанитайзер        обратная подстановка ответа, на выходе (ниже)
@@ -834,7 +834,7 @@ default-deny. Маршрут `POST`/`PUT`/`PATCH` без хука может б�
 | `route_gate_unarmed` | 503 | `E_ROUTE_GATE_UNARMED` | REWRITTEN-маршрут, пока guardrail-callback не зарегистрирован; никогда не пробрасывается |
 | `route_gate_error` | 500 | `E_ROUTE_GATE_ERROR` | классификация бросила исключение; никогда не пробрасывается |
 | `route_gate_body_policies` | 403 | `E_ROUTE_BLOCKED` | допущенный REWRITTEN-запрос, в JSON-теле которого есть ключ `policies` верхнего уровня (litellm применил бы эти политики к запросу); проверяется, когда лимитер дочитал тело, до слота и до разбора тела litellm |
-| `route_gate_body_not_json` | 415 | `E_ROUTE_BLOCKED` | допущенный REWRITTEN-запрос, чей `Content-Type` не `application/json` (параметры вроде `charset` допустимы), или непустое тело без `Content-Type`: litellm прочитал бы тело формы, включая поле `policies`; проверяется на том же дочитанном теле |
+| `route_gate_body_not_json` | 415 | `E_ROUTE_BLOCKED` | допущенный REWRITTEN-запрос, чьё тело не UTF-8 JSON: тип носителя не `application/json` (или непустое тело без `Content-Type`), `charset` не `utf-8` (`utf8` — то же самое; повторённый или некорректный отклоняется) или тело, кодировку которого `json.detect_encoding` определяет не как `utf-8` (BOM, UTF-16, UTF-32), либо которое не декодируется как UTF-8. litellm прочитал бы тело формы, включая поле `policies`; а проверка `route_gate_body_policies` читает байты: только для UTF-8 «нет ASCII `policies` и нет `\u`» доказывает отсутствие ключа (тело в UTF-16 записывает его байтами, которые проверка не находит, а стандартный `json.loads(bytes)` его декодирует). Проверяется на том же дочитанном теле; `tests/route_gate/test_body_policies.py::test_a_body_that_is_not_utf8_is_refused_before_litellm_or_a_slot`, `::test_a_charset_other_than_utf8_is_refused_before_litellm_or_a_slot`, `::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate` |
 
 `route_gate_unarmed` и `route_gate_error` также пишут `gateway_failure{component="route_gate"}`. Каждый
 отказ пишет `corp_llm_gateway_blocked_requests_total{block_reason=…}` и эмитит
@@ -991,9 +991,16 @@ litellm. Три точки входа идут мимо маршрутов; у �
   `general_settings.supported_db_objects: ["models"]`, поэтому litellm не
   загружает ни политик, ни guardrail-ов из БД.
 - **14b, тело запроса с политиками.** Допущенный переписываемый запрос, чьё тело
-  не `application/json`, получает 415 `route_gate_body_not_json`, а JSON-тело с
-  ключом `policies` верхнего уровня — 403 `route_gate_body_policies`; оба — когда
-  лимитер дочитал тело и до того, как его разберёт litellm (таблица выше).
+  не UTF-8 JSON (тип носителя не `application/json`, charset не `utf-8` или тело,
+  кодировку которого `json.detect_encoding` определяет не как `utf-8`), получает
+  415 `route_gate_body_not_json`, а JSON-тело с ключом `policies` верхнего
+  уровня — 403 `route_gate_body_policies`; оба — когда лимитер дочитал тело и до
+  того, как его разберёт litellm (таблица выше). Проверка `policies` читает
+  байты, и только для UTF-8 тело без ASCII `policies` и без экранирования `\u`
+  доказывает отсутствие ключа. litellm 1.101.0 превращает тело UTF-16/32 с BOM
+  (или байты не в UTF-8) в пустое тело, а на остальные отвечает 400, так что
+  сегодня утечки там нет; парсер, декодирующий как `json.loads(bytes)`, ключ
+  нашёл бы.
 - **14c, таблица `LiteLLM_Config` litellm — открыто.** В compose (у litellm есть
   БД и `STORE_MODEL_IN_DB=True`; в Helm у litellm БД нет) строка там может
   добавить callback-и логирования или включить промпты в spend-log;
@@ -1243,11 +1250,11 @@ callback `CustomLogger`**: `CorpLlmGuardrail` (`litellm_hook.py`), регист�
 | 13 | Обёртки потокового итератора выстраиваются в порядке callback-ов | `proxy/utils.py` | Обратной подстановки внутри litellm нет | как 10 |
 | 14 | Pipeline политики с нашим guardrail заставляет цикл pre-call его пропустить | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` | Пропускается только `CustomGuardrail`; `/polic*` и `/guardrail*` — REFUSE; 14a-c ниже | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies` |
 | 14a | Строка политики в БД litellm загружается, если `supported_db_objects` не задан | `proxy/proxy_server.py`, `proxy/policy_engine/policy_registry.py` | Поставляемые конфиги: `supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_litellm_reads_the_pin_as_models_only` |
-| 14b | Список `policies` верхнего уровня в теле запроса | `proxy/litellm_pre_call_utils.py` | Гейт: 403 `route_gate_body_policies`, 415 `route_gate_body_not_json` | `tests/route_gate/test_body_policies.py` |
+| 14b | Список `policies` верхнего уровня в теле запроса | `proxy/litellm_pre_call_utils.py` | Гейт: 403 `route_gate_body_policies`, 415 `route_gate_body_not_json` (тело не UTF-8 JSON: тип носителя, charset или `json.detect_encoding` не utf-8) | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`) |
 | 14c | **Открыто.** Строки `litellm_settings` / `general_settings` из `LiteLLM_Config` применяются каждые 30 с | `proxy/proxy_server.py` | Охарактеризовано: добавленный callback видит только плейсхолдеры | `test_litellm_config_guards.py`, `test_desanitize_served_stack.py` |
 | 15 | `post_call_response_headers_hook` получает восстановленный ответ | `proxy/common_request_processing.py`, `proxy/utils.py` | Обратной подстановки внутри litellm нет | как 10 |
 | 15b | Балансировка по имени guardrail запускает чужой callback | `proxy/utils.py` | Обычный callback не балансируется; CRUD guardrail-ов — REFUSE | `test_proxy_dispatch.py::test_duplicate_guardrail_name_substitutes_callback` |
-| 16 | `guardrail_information` без синхронизации в logging object | `integrations/custom_guardrail.py`, `litellm_core_utils/litellm_logging.py` | Не воспроизвелось; синхронизация оставлена как эшелон. Время записи — отдельный вопрос: payload потока Responses litellm отправляет на `response.completed`, до конца потока, если только post_call `CustomGuardrail` не откладывает отправку; запись после конца такого потока в payload не попадает, с синхронизацией или без. Наша запись делается в pre-call | `test_guardrail_information.py::test_the_entry_lands_without_the_sync_too`, `test_logging_surfaces.py::test_a_write_after_a_responses_stream_ended_misses_the_payload` |
+| 16 | `guardrail_information` без синхронизации в logging object | `integrations/custom_guardrail.py`, `litellm_core_utils/litellm_logging.py` | Не воспроизвелось на 1.101.0; синхронизация оставлена как эшелон. Время записи — отдельный вопрос: payload потока Responses litellm отправляет на `response.completed`, до конца потока, если только post_call `CustomGuardrail` не откладывает отправку; запись после конца такого потока в payload не попадает, с синхронизацией или без. Наша запись делается в pre-call | `test_guardrail_information.py::test_the_entry_lands_without_the_sync_too`, `::test_the_payload_carries_exactly_our_entry`, `test_logging_surfaces.py::test_a_write_after_a_responses_stream_ended_misses_the_payload` |
 | 17 | **Исправлено.** Logging payload `/v1/responses` содержал ИСХОДНЫЙ ввод | `litellm_core_utils/litellm_logging.py`, `responses/main.py` | Pre-call передаёт logging object переписанный запрос | `test_hazard17_logging_snapshot.py` |
 | 17b | Отказ pre-call передаёт запрос в `async_post_call_failure_hook` каждого callback | `proxy/utils.py` | Stage 5: снимок тела переписан до скана; Stage 0 — оригинал по построению; наш callback этот хук не переопределяет | `test_hazard17b_failure_hook_request_data.py` |
 | 18 | **Исправлено.** `X-Corp-Auth` в поверхностях логирования litellm | `proxy/litellm_pre_call_utils.py` | Токен срезается первым, из каждой копии и из logging object; две DEBUG-строки до нашего хука закрыты только отказом DEBUG | `test_hazard18_corp_token_snapshot.py` |

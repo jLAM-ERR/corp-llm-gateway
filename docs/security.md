@@ -821,8 +821,8 @@ nginx front door    compose, COMPOSE_PROFILES=nginx|nginx-ports, off by default:
    ↓
 RouteGateMiddleware classify (METHOD, path) → PASSTHROUGH / REWRITTEN / REFUSE
    ↓
-in-flight limiter   REWRITTEN only: body drained (not JSON → 415, a top-level
-                    `policies` key → 403), then a slot → 429 E_CAPACITY
+in-flight limiter   REWRITTEN only: body drained (not UTF-8 JSON → 415, a
+                    top-level `policies` key → 403), then a slot → 429 E_CAPACITY
    ↓
 desanitiser         the response reversal, on the way out (below)
    ↓
@@ -870,7 +870,7 @@ that justification against the `ast`: a handler whose body calls
 | `route_gate_unarmed` | 503 | `E_ROUTE_GATE_UNARMED` | a REWRITTEN route while the guardrail callback is not registered; never forwarded |
 | `route_gate_error` | 500 | `E_ROUTE_GATE_ERROR` | classification raised; never forwarded |
 | `route_gate_body_policies` | 403 | `E_ROUTE_BLOCKED` | an admitted REWRITTEN request whose JSON body has a top-level `policies` key (litellm would apply those policies to it); checked once the limiter has read the body, before any slot is taken or litellm parses it |
-| `route_gate_body_not_json` | 415 | `E_ROUTE_BLOCKED` | an admitted REWRITTEN request whose `Content-Type` is not `application/json` (parameters such as `charset` allowed), or a non-empty body with no `Content-Type`: litellm would read a form body, a `policies` field included; checked with the same drained body |
+| `route_gate_body_not_json` | 415 | `E_ROUTE_BLOCKED` | an admitted REWRITTEN request whose body is not UTF-8 JSON: a media type other than `application/json` (or a non-empty body with no `Content-Type`), a `charset` other than `utf-8` (`utf8` is the same; a repeated or malformed one refuses), or a body whose encoding `json.detect_encoding` reports as anything but `utf-8` (a BOM, UTF-16, UTF-32) or that does not decode as UTF-8. litellm would read a form body, a `policies` field included; and the `route_gate_body_policies` check reads bytes: only for UTF-8 is "no ASCII `policies` and no `\u`" proof that the key is absent (a UTF-16 body spells it in bytes the check never matches, yet stdlib `json.loads(bytes)` decodes it). Checked with the same drained body; `tests/route_gate/test_body_policies.py::test_a_body_that_is_not_utf8_is_refused_before_litellm_or_a_slot`, `::test_a_charset_other_than_utf8_is_refused_before_litellm_or_a_slot`, `::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate` |
 
 `route_gate_unarmed` and `route_gate_error` also record `gateway_failure{component="route_gate"}`. Every one
 records `corp_llm_gateway_blocked_requests_total{block_reason=…}` and emits an
@@ -1020,9 +1020,16 @@ have their own gate, the third is open:
   `general_settings.supported_db_objects: ["models"]`, so litellm loads no policy
   or guardrail row.
 - **14b, a request body naming policies.** An admitted rewritten request whose
-  body is not `application/json` is 415 `route_gate_body_not_json`, and one whose
-  JSON body has a top-level `policies` key is 403 `route_gate_body_policies`, both
+  body is not UTF-8 JSON (media type other than `application/json`, a charset
+  other than `utf-8`, or a body whose encoding `json.detect_encoding` reports as
+  anything but `utf-8`) is 415 `route_gate_body_not_json`, and one whose JSON
+  body has a top-level `policies` key is 403 `route_gate_body_policies`, both
   once the limiter has read the body and before litellm parses it (table above).
+  The `policies` check reads bytes, and only for UTF-8 does a body without an
+  ASCII `policies` and without a `\u` escape prove the key absent. litellm 1.101.0
+  turns a UTF-16/32 body with a BOM (or bytes that are not UTF-8) into an empty
+  body and answers the rest with 400, so nothing leaks there today; a parser
+  that decodes like `json.loads(bytes)` would find the key.
 - **14c, litellm's `LiteLLM_Config` table — open.** On compose (litellm has a
   database and `STORE_MODEL_IN_DB=True`; the Helm chart gives it no database) a
   row there can add log callbacks or turn on prompts in spend logs;
@@ -1281,7 +1288,7 @@ class stays.
 | 13 | Streaming iterator wrappers chain in callback order: a later wrapper consumes restored chunks | `proxy/utils.py` (iterator hook chain) | No reversal inside litellm | as 10 |
 | 14 | A policy pipeline naming the guardrail, in any mode, makes the pre-call loop skip it: zero sanitizer calls, originals egress | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` (pre-call loop) | Only a `CustomGuardrail` is skipped; ours is a plain callback. `/polic*` and `/guardrail*` are REFUSE (§14); 14a-c below | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies`, `::test_migrated_pipeline_skip_egresses_originals` |
 | 14a | A policy row in litellm's database is loaded at boot and at every reconcile when `supported_db_objects` is unset | `proxy/proxy_server.py` (`_init_non_llm_objects_in_db`), `proxy/policy_engine/policy_registry.py` | Shipped configs pin `general_settings.supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_{compose,helm}_litellm_config_loads_no_policies_from_the_db`, `::test_litellm_reads_the_pin_as_models_only` |
-| 14b | A top-level `policies` list in the client body applies those policies with no attachment | `proxy/litellm_pre_call_utils.py` (`add_guardrails_from_policy_engine`) | The gate refuses a JSON body with a top-level `policies` key (403 `route_gate_body_policies`) and any body that is not JSON (415 `route_gate_body_not_json`), before litellm parses it | `tests/route_gate/test_body_policies.py`, served `test_a_body_naming_policies_is_refused_at_the_gate` |
+| 14b | A top-level `policies` list in the client body applies those policies with no attachment | `proxy/litellm_pre_call_utils.py` (`add_guardrails_from_policy_engine`) | The gate refuses a JSON body with a top-level `policies` key (403 `route_gate_body_policies`) and any body that is not UTF-8 JSON (415 `route_gate_body_not_json`: media type, charset, or `json.detect_encoding` other than utf-8), before litellm parses it | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`), served `test_a_body_naming_policies_is_refused_at_the_gate` |
 | 14c | **Open.** With a database and `store_model_in_db`, litellm applies `litellm_settings` and `general_settings` rows from `LiteLLM_Config` every 30 s; `supported_db_objects` gates neither | `proxy/proxy_server.py` (`_add_deployment_locked`, `_update_config_fields`, `_update_general_settings`) | Characterised (below): an added callback gets placeholders only | `test_litellm_config_guards.py` (5 rows), served DB-overlay rows (5) |
 | 15 | `post_call_response_headers_hook` hands every callback the restored response | `proxy/common_request_processing.py`, `proxy/utils.py` | No reversal inside litellm | as 10 |
 | 15b | Guardrail-name load balancing runs another callback under our name | `proxy/utils.py` | A plain callback is not load-balanced; guardrail CRUD is REFUSE; the arm check finds ours by type | `test_proxy_dispatch.py::test_duplicate_guardrail_name_substitutes_callback`, `::test_a_stand_in_answering_to_our_name_is_not_our_guardrail` |
