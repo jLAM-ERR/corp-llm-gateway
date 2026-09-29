@@ -178,8 +178,11 @@ mid-stream — the gateway:
    disconnect. The request's content (its placeholder mapping) is dropped at
    once, whatever the sink does. For a request whose pre-call had finished, that
    record is its terminal record (`route_gate/terminal_audit.py`), written when
-   the limiter lets go of the request; a failed write is retried once, then
-   logged and counted as `gateway_failure{component="desanitize"}`. For a
+   the limiter lets go of the request; a failed write on the response path is
+   retried once, by the close, while a record the close decides (nothing was
+   published, e.g. a cancel mid-stream) has one write and no retry; a lost
+   record is logged and counted as `gateway_failure{component="desanitize"}`.
+   For a
    request cancelled during its pre-call, if the sink fails or runs out of that
    budget, only the record's counts are kept (at most 4096 such requests, oldest
    dropped first) and the next litellm event for the request, or the next

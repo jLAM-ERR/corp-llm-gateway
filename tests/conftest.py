@@ -7,6 +7,7 @@ import pytest
 
 from corp_llm_gateway import config
 from corp_llm_gateway.metrics import reset_exporter
+from tests import logger_state
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +17,19 @@ def _fresh_metrics_exporter() -> Iterator[None]:
     reset_exporter()
     yield
     reset_exporter()
+
+
+@pytest.fixture(autouse=True)
+def _no_logger_state_left_behind() -> Iterator[None]:
+    """Fail a test that leaves a level, handler, ``propagate`` or ``disabled`` on a
+    ``corp_llm_gateway`` logger (and put it back), so no later ``caplog`` depends on
+    the run order."""
+    before = logger_state.snapshot()
+    yield
+    changed = logger_state.changes(before, logger_state.snapshot())
+    if changed:
+        logger_state.restore(before)
+        pytest.fail(f"test left logger state behind on {changed}", pytrace=False)
 
 
 # Every config key the composition root reads, plus decoy aliases a naive

@@ -70,7 +70,9 @@ none but the gateway's own.
   never by a litellm callback: `ok` at the final body; `failed` for a non-2xx response or a
   stream error, and `failed` + `E_INTERNAL` for a restoration failure; `cancelled` +
   `E_CLIENT_DISCONNECTED` when the client left, and the new `E_SERVER_SHUTDOWN` when the server
-  cancelled the request (shutdown, pod drain). A failed write is retried once; a lost one counts
+  cancelled the request (shutdown, pod drain). A failed write on the response path is retried
+  once, by the close; a record the close decides (nothing was published) has one write and no
+  retry; a lost one counts
   as `gateway_failure{component="desanitize"}` (`docs/audit-schema.md`, "The terminal record").
 - **Token counts come from the response itself** (the JSON `usage`, the stream's usage events),
   not only from litellm's success log. A chat stream now always asks for its usage chunk

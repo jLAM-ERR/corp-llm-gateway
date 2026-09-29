@@ -254,10 +254,13 @@ response, because the reversal runs after litellm is done with it. There is no
 hook for the client-side, restored view, and there will not be one: a component
 that sees restored text is a new M1-14 surface. An extension that needs content
 works on placeholders, or is a detector on the way in. Do not add an
-`apply_guardrail` or a litellm `CustomGuardrail` for it: the first stops our
-pre-call from running and refuses to arm (exit 70), the second turns litellm's
-per-chunk hooks on for every callback, and the shipped configs are pinned to
-carry neither (`docs/security.md` §15).
+`apply_guardrail` or a litellm `CustomGuardrail` for it. An `apply_guardrail`
+anywhere in `CorpLlmGuardrail`'s own MRO stops our pre-call from running and
+refuses to arm (exit 70); a separate class of yours with `apply_guardrail` is a
+litellm guardrail, which the arm check does not see: the config guards refuse it
+(`tests/test_litellm_config_guards.py`: the shipped configs start no litellm
+guardrail). A `CustomGuardrail` turns litellm's per-chunk hooks on for every
+callback (`docs/security.md` §15).
 
 ## Tasks several requests await: `inflight.spawn_shared`
 

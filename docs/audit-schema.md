@@ -86,9 +86,11 @@ refusal instead. Security rationale: [`security.md`](security.md) §15.
 Precedence, first match wins: a restoration failure stands whatever happens
 later; an outcome published at the response's end stands against a later
 cancel (the client got the response), except that one published after the client
-left is `cancelled`; otherwise the ticket's close decides. A failed write is
-retried once with the same outcome; a write that may have landed is never
-retried; a record lost after its last attempt is logged
+left is `cancelled`; otherwise the ticket's close decides. A failed write on the
+response path is retried once, by the close, with the same outcome; a record the
+close decides (nothing was published: `cancelled`, or `failed` + `E_INTERNAL`
+with no final body) has one write and no retry; a write that may have landed is
+never retried; a record lost after its last attempt is logged
 (`gateway_terminal_audit_lost request_id=… outcome=… error=<type>`) and counted as
 `gateway_failure{component="desanitize"}`.
 

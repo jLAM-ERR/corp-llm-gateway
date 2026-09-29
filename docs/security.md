@@ -1241,7 +1241,9 @@ any `CustomGuardrail` also turns litellm's per-chunk hooks on for every callback
 `guardrail_information` is written with litellm's own writer from a plain
 callback (hazard 16 did not reproduce). So the switch buys nothing and creates
 three bypasses. `tests/litellm_hook/test_acceptance_matrix.py::test_the_guardrail_stays_a_plain_custom_logger`
-reads the class from source, in both venvs.
+reads the class and its base from source, so it holds in both venvs: the base name
+must be bound exactly once (the `ImportError` fallback to `object` aside), and its
+last binding must import litellm's `CustomLogger`.
 
 **If adoption is ever chosen, the sentinel is not enough.** The plan's design for
 it is a second, plain callback after ours whose pre-call refuses a request our
@@ -1274,7 +1276,7 @@ class stays.
 | 8 | Every `apply_guardrail` is auto-decorated; a raising one writes `str(exc)`, content included, into `guardrail_information` | `integrations/custom_guardrail.py` (`__init_subclass__`) | No `apply_guardrail`. Our entry is written by our pre-call with litellm's writer function and allow-listed; a failing write is logged by exception type only | `test_logging_surfaces.py::test_decorated_apply_guardrail_logs_exception_text`, `test_guardrail_information.py::test_a_raising_writer_is_logged_by_type_and_leaves_no_entry` |
 | 9 | `POST /guardrails/apply_guardrail` logs the original text and swallows post-call exceptions | `proxy/guardrails/guardrail_endpoints.py` | REFUSE, with every `/guardrail*` and `/polic*` route, every method | `test_table.py::test_the_bypass_routes_are_refused`, matrix `test_every_policy_and_guardrail_route_is_refused` |
 | 10 | Unary post-call order: a callback after the reversal sees originals | `proxy/utils.py` (`post_call_success_hook`) | No reversal inside litellm: the ASGI layer restores the response (below) | `test_proxy_dispatch.py::test_capture_positions_unary_and_streaming`, served `test_no_litellm_capture_holds_an_original` |
-| 11 | Presence is not enforcement: `scan_raw_request` discards the rewrite, `run_in_parallel` moves the pre-call after every other one, the registry overrides flags after construction | `proxy/utils.py`, `proxy/guardrails/guardrail_registry.py` | Refused at arm (exit 70 `scan_raw_request`, `run_in_parallel`) — the only check that catches `scan_raw_request` | `test_fail_open_probes.py::test_scan_raw_request_and_run_in_parallel_refused`, `test_arm_checks.py::test_an_unsafe_flag_is_refused` |
+| 11 | Presence is not enforcement: `scan_raw_request` discards the rewrite, `run_in_parallel` moves the pre-call after every other one, the registry overrides flags after construction | `proxy/utils.py`, `proxy/guardrails/guardrail_registry.py` | Refused at arm (exit 70 `scan_raw_request`, `run_in_parallel`) — the only check that catches `scan_raw_request`. `run_in_parallel` re-orders only a `CustomGuardrail`; on our plain `CustomLogger` the flag is inert on 1.101.0, so its refusal is defence in depth | `test_fail_open_probes.py::test_scan_raw_request_and_run_in_parallel_refused`, `test_arm_checks.py::test_an_unsafe_flag_is_refused` |
 | 12 | DEBUG: litellm's request DEBUG lines print the original request before any pre-call hook; the chunk log; per-chunk hooks turned on by any `CustomGuardrail` | `proxy/common_request_processing.py`, `proxy/litellm_pre_call_utils.py` | litellm DEBUG / `set_verbose` refuses to arm (exit 70); the test-only `CORP_LLM_ALLOW_LITELLM_DEBUG` is exit 78 in prod; no `CustomGuardrail` is registered | `test_arm_checks.py::test_a_logger_at_debug_is_refused`, `test_asgi_entrypoint.py::test_litellm_debug_exits_70_and_config_check_reports_it` |
 | 13 | Streaming iterator wrappers chain in callback order: a later wrapper consumes restored chunks | `proxy/utils.py` (iterator hook chain) | No reversal inside litellm | as 10 |
 | 14 | A policy pipeline naming the guardrail, in any mode, makes the pre-call loop skip it: zero sanitizer calls, originals egress | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` (pre-call loop) | Only a `CustomGuardrail` is skipped; ours is a plain callback. `/polic*` and `/guardrail*` are REFUSE (§14); 14a-c below | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies`, `::test_migrated_pipeline_skip_egresses_originals` |
@@ -1384,10 +1386,13 @@ sink, in this order:
    left) or `E_SERVER_SHUTDOWN` (the server cancelled, e.g. at shutdown), and
    `failed` + `E_INTERNAL` when nothing was published and nobody cancelled.
 
-A failed write gets exactly one retry; a write that may have landed is never
-retried; a record lost after its last attempt is logged by exception type and
-counted as `gateway_failure{component="desanitize"}`. At shutdown the lifespan
-waits, bounded by the cancel grace, for the records still being written. A
+A failed write on the response path gets exactly one retry, by the close; a
+record the close decides (nothing was published: `cancelled`, or `failed` +
+`E_INTERNAL` with no final body) has one write and no retry; a write that may
+have landed is never retried; a record lost after its last attempt is logged by
+exception type and counted as `gateway_failure{component="desanitize"}`. At
+shutdown the lifespan waits, bounded by the cancel grace, for the records still
+being written. A
 request the pre-call refused keeps the record the pre-call wrote. A litellm log
 event only adds token counts to the ticket's record while it is open; one with
 no request state left to write from writes nothing and is counted

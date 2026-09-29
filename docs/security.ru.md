@@ -1238,7 +1238,7 @@ callback `CustomLogger`**: `CorpLlmGuardrail` (`litellm_hook.py`), регист�
 | 8 | Авто-декорированный `apply_guardrail` пишет `str(exc)` с контентом в `guardrail_information` | `integrations/custom_guardrail.py` | `apply_guardrail` нет; наша запись по allow-list; сбой логируется только типом | `test_guardrail_information.py::test_a_raising_writer_is_logged_by_type_and_leaves_no_entry` |
 | 9 | `POST /guardrails/apply_guardrail` логирует исходный текст | `proxy/guardrails/guardrail_endpoints.py` | REFUSE вместе со всеми `/guardrail*` и `/polic*` | `test_table.py::test_the_bypass_routes_are_refused` |
 | 10 | Порядок unary post-call: callback после обратной подстановки видит оригиналы | `proxy/utils.py` | Обратной подстановки внутри litellm нет (ASGI) | `test_proxy_dispatch.py::test_capture_positions_unary_and_streaming` |
-| 11 | `scan_raw_request` отбрасывает переписанный запрос, `run_in_parallel` сдвигает pre-call | `proxy/utils.py`, `proxy/guardrails/guardrail_registry.py` | Отказ при взведении — exit 70 | `test_arm_checks.py::test_an_unsafe_flag_is_refused` |
+| 11 | `scan_raw_request` отбрасывает переписанный запрос, `run_in_parallel` сдвигает pre-call | `proxy/utils.py`, `proxy/guardrails/guardrail_registry.py` | Отказ при взведении — exit 70. `run_in_parallel` меняет порядок только у `CustomGuardrail`; на нашем обычном `CustomLogger` флаг на 1.101.0 ни на что не влияет, отказ — эшелонированная защита | `test_arm_checks.py::test_an_unsafe_flag_is_refused` |
 | 12 | DEBUG litellm печатает исходный запрос до любого pre-call хука | `proxy/common_request_processing.py`, `proxy/litellm_pre_call_utils.py` | DEBUG / `set_verbose` — exit 70; `CORP_LLM_ALLOW_LITELLM_DEBUG` в prod — exit 78 | `test_arm_checks.py::test_a_logger_at_debug_is_refused` |
 | 13 | Обёртки потокового итератора выстраиваются в порядке callback-ов | `proxy/utils.py` | Обратной подстановки внутри litellm нет | как 10 |
 | 14 | Pipeline политики с нашим guardrail заставляет цикл pre-call его пропустить | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` | Пропускается только `CustomGuardrail`; `/polic*` и `/guardrail*` — REFUSE; 14a-c ниже | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies` |
@@ -1290,9 +1290,12 @@ chat-потоке приходят клиенту плейсхолдерами, 
 litellm, а `route_gate/terminal_audit.py` — из фактов без контента, которые
 pre-call кладёт на тикет. Порядок решения: `failed` + `E_INTERNAL` за сбой
 восстановления стоит всегда; исход, опубликованный на пути ответа (`ok` или
-`failed`), стоит против более поздней отмены; иначе решает закрытие тикета —
+`failed`), стоит против более поздней отмены, кроме опубликованного после ухода
+клиента — это `cancelled` + `E_CLIENT_DISCONNECTED`; иначе решает закрытие тикета —
 `cancelled` + `E_CLIENT_DISCONNECTED` или `E_SERVER_SHUTDOWN`, либо `failed` +
-`E_INTERNAL`. Неудачная запись повторяется один раз; потерянная считается в
+`E_INTERNAL`. Неудачная запись пути ответа повторяется один раз — закрытием; у
+записи, исход которой решает закрытие (ничего не опубликовано), повтора нет;
+потерянная считается в
 `gateway_failure{component="desanitize"}`. Поля — [`audit-schema.ru.md`](audit-schema.ru.md).
 
 ### Отказы при взведении (exit 70)

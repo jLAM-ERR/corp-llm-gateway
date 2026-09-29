@@ -130,14 +130,14 @@ Action:
 Symptom: `gateway_failure{component="desanitize"}` counts up. The gateway log has one of:
 
 - `gateway_desanitize_failed request_id=… phase=before_start|after_start error=<type>` — a response could not be restored;
-- `gateway_terminal_audit_lost request_id=… outcome=… error=<type>` or `terminal_audit_publish_failed request_id=… error=<type>` — a request's audit record could not be written, retry included;
+- `gateway_terminal_audit_lost request_id=… outcome=… error=<type>` or `terminal_audit_publish_failed request_id=… error=<type>` — a request's audit record could not be written on its last attempt (the response path's write has one retry; a record the close decides, none);
 - `terminal_audit_drain_incomplete pending=<n>` — at shutdown, records were still being written when the cancel grace ran out.
 
 Behavior: fail-closed, content-free. A restoration failure before the response started answers 500 `E_INTERNAL`; after it started, the client gets the events restored so far and the stream is closed, which also closes the upstream. litellm never sees an original either way, and the log lines carry the request id, the phase or outcome and the exception type only. The request's audit record is `failed` + `E_INTERNAL` (`docs/audit-schema.md`, "The terminal record").
 
 Action:
 1. `gateway_desanitize_failed`: a gateway bug or a response shape the restorer does not expect. Note `phase` and `error=`; if it started after a litellm or provider change, compare that route's response shape first. There is no fail-open to fall back on.
-2. `gateway_terminal_audit_lost` / `terminal_audit_publish_failed`: the audit sink failed twice for that request (the first write and its one retry), so the request has no record — treat it as the sink's incident and as an audit-completeness gap (see below).
+2. `gateway_terminal_audit_lost` / `terminal_audit_publish_failed`: the sink failed the record's last write attempt, so the request has no record: for an outcome the response path published, that is the write and its one retry; for a record the close decided (nothing was published: `cancelled`, or `failed` + `E_INTERNAL` with no final body), it is the close's only write, which has no retry — treat it as the sink's incident and as an audit-completeness gap (see below).
 3. `terminal_audit_drain_incomplete`: shutdown cut writes short. Check the sink's latency; `CORP_LLM_CANCEL_GRACE_SECONDS` bounds the wait.
 
 ### `gateway_failure{component="audit"}` rises

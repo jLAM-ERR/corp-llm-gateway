@@ -260,15 +260,26 @@ def _find(tree: ast.Module, names: list[str]) -> ast.AST | None:
 
 
 def _disabling_marks(decorators: list[ast.expr]) -> list[str]:
-    """``pytest.mark.skip`` / ``xfail`` in any spelling; ``skipif`` is a condition, not a
-    disablement (``requires_litellm`` and friends)."""
+    """``pytest.mark.skip`` / ``xfail`` in any spelling, and a ``skipif`` whose condition is
+    a literal or missing; ``skipif(<expression>)`` is a condition, not a disablement
+    (``requires_litellm`` and friends)."""
     marks = []
     for decorator in decorators:
         target = decorator.func if isinstance(decorator, ast.Call) else decorator
         text = ast.unparse(target)
         if re.search(r"\bmark\.(skip|xfail)$", text):
             marks.append(text)
+        elif re.search(r"\bmark\.skipif$", text) and _always_skips(decorator):
+            marks.append(ast.unparse(decorator))
     return marks
+
+
+def _always_skips(skipif: ast.expr) -> bool:
+    # pytest skips unconditionally when a skipif carries no condition at all.
+    if not isinstance(skipif, ast.Call):
+        return True
+    conditions = [*skipif.args, *(kw.value for kw in skipif.keywords if kw.arg == "condition")]
+    return not conditions or any(isinstance(c, ast.Constant) for c in conditions)
 
 
 def _module_marks(tree: ast.Module) -> list[str]:
@@ -296,7 +307,7 @@ def test_every_listed_test_exists_and_runs(node: str) -> None:
     found = _find(tree, names)
     assert isinstance(found, ast.FunctionDef | ast.AsyncFunctionDef), node
     assert found.name.startswith("test_"), node
-    assert not _disabling_marks(found.decorator_list), node
+    assert not _disablements(found), node
     assert not _module_marks(tree), node
 
 
@@ -306,8 +317,60 @@ def test_the_existence_check_catches_a_missing_test() -> None:
     assert _find(tree, ["test_no_such_test"]) is None
     marked = ast.parse("@pytest.mark.xfail(reason='x')\ndef test_a(): pass\n").body[0]
     assert _disabling_marks(marked.decorator_list) == ["pytest.mark.xfail"]
-    conditional = ast.parse("@pytest.mark.skipif(True, reason='x')\ndef test_a(): pass\n").body[0]
-    assert _disabling_marks(conditional.decorator_list) == []
+
+
+def _disablements(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    return _disabling_marks(fn.decorator_list) + _body_skips(fn.body)
+
+
+def _body_skips(body: list[ast.stmt]) -> list[str]:
+    """A bare ``pytest.skip(...)`` / ``pytest.xfail(...)`` statement always runs; one under
+    an ``if`` (or a loop, or a handler) is a condition."""
+    skips = []
+    for stmt in body:
+        if isinstance(stmt, ast.With | ast.AsyncWith):
+            skips += _body_skips(stmt.body)
+        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            text = ast.unparse(stmt.value.func)
+            if re.search(r"(^|\.)(skip|xfail)$", text):
+                skips.append(text)
+    return skips
+
+
+def _test_function(source: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    (found,) = ast.parse(source).body
+    assert isinstance(found, ast.FunctionDef | ast.AsyncFunctionDef)
+    return found
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "@pytest.mark.skipif(True, reason='x')\ndef test_a(): pass\n",
+        "@pytest.mark.skipif(condition=1, reason='x')\ndef test_a(): pass\n",
+        "@pytest.mark.skipif(reason='x')\ndef test_a(): pass\n",
+        "@pytest.mark.skipif\ndef test_a(): pass\n",
+        "def test_a():\n    pytest.skip('x')\n",
+        "async def test_a():\n    'Doc.'\n    pytest.skip('x')\n    assert False\n",
+        "async def test_a():\n    with open('f'):\n        pytest.skip('x')\n",
+        "def test_a():\n    pytest.xfail('x')\n",
+    ],
+)
+def test_an_unconditional_skip_disables_a_listed_test(source: str) -> None:
+    assert _disablements(_test_function(source)) != []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "@pytest.mark.skipif(not HAVE_LITELLM, reason='x')\ndef test_a(): pass\n",
+        "@requires_litellm\ndef test_a(): pass\n",
+        "def test_a():\n    if not HAVE_LITELLM:\n        pytest.skip('x')\n",
+        "def test_a():\n    pytest.importorskip('litellm')\n",
+    ],
+)
+def test_a_conditional_skip_does_not(source: str) -> None:
+    assert _disablements(_test_function(source)) == []
 
 
 def _names(source: str) -> set[str]:
@@ -329,13 +392,104 @@ def test_no_leaking_set_survives_in_the_tests() -> None:
     assert "leaking" not in _names('# leaking == {"messages"}\n"""an original leaking"""\n')
 
 
-def _imported_as(tree: ast.Module, name: str) -> str | None:
+CUSTOM_LOGGER = "litellm.integrations.custom_logger.CustomLogger"
+
+
+def _import_fallback(node: ast.ExceptHandler, name: str) -> ast.Name | None:
+    """``except ImportError: <name> = object``: the venv without litellm."""
+    if not (
+        isinstance(node.type, ast.Name) and node.type.id in {"ImportError", "ModuleNotFoundError"}
+    ):
+        return None
+    for stmt in node.body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == name
+            and isinstance(stmt.value, ast.Name)
+            and stmt.value.id == "object"
+        ):
+            return stmt.targets[0]
+    return None
+
+
+def _bindings(tree: ast.Module, name: str) -> list[tuple[ast.AST, str | None]]:
+    """Every binding of ``name`` anywhere in the module, in source order, with what an
+    import binds it to (None for anything else); the ``ImportError`` fallback excepted."""
+    fallbacks = {
+        id(target)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ExceptHandler) and (target := _import_fallback(node, name))
+    }
+    found: list[tuple[ast.AST, str | None]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if (alias.asname or alias.name) == name:
-                    return f"{node.module}.{alias.name}"
-    return None
+            found += [
+                (node, f"{node.module}.{a.name}")
+                for a in node.names
+                if (a.asname or a.name) == name
+            ]
+        elif isinstance(node, ast.Import):
+            found += [
+                (node, a.name) for a in node.names if (a.asname or a.name.split(".")[0]) == name
+            ]
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name:
+            if id(node) not in fallbacks:
+                found.append((node, None))
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            if node.name == name:
+                found.append((node, None))
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            found.append((node, None))
+    return sorted(found, key=lambda item: (item[0].lineno, item[0].col_offset))
+
+
+def _base_binding(tree: ast.Module) -> tuple[int, str | None]:
+    """How many times ``CorpLlmGuardrail``'s base name is bound, and what its LAST binding
+    imports: a later rebinding is what the class actually derives from."""
+    ours = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CorpLlmGuardrail"
+    )
+    if len(ours.bases) != 1 or not isinstance(ours.bases[0], ast.Name):
+        return 0, None
+    bindings = _bindings(tree, ours.bases[0].id)
+    return len(bindings), bindings[-1][1] if bindings else None
+
+
+_BASE_IMPORT = """\
+try:
+    from litellm.integrations.custom_logger import (
+        CustomLogger as _LitellmCustomLogger,
+    )
+except ImportError:
+    _LitellmCustomLogger = object
+"""
+_OURS = "\n\nclass CorpLlmGuardrail(_LitellmCustomLogger):\n    pass\n"
+
+
+def test_the_base_pin_reads_the_shipped_shape() -> None:
+    assert _base_binding(ast.parse(_BASE_IMPORT + _OURS)) == (1, CUSTOM_LOGGER)
+
+
+@pytest.mark.parametrize(
+    "rebinding",
+    [
+        "from litellm.integrations.custom_guardrail import "
+        "CustomGuardrail as _LitellmCustomLogger\n",
+        "if True:\n"
+        "    from litellm.integrations.custom_guardrail import (\n"
+        "        CustomGuardrail as _LitellmCustomLogger,\n"
+        "    )\n",
+        "from litellm.integrations.custom_guardrail import CustomGuardrail\n"
+        "_LitellmCustomLogger = CustomGuardrail\n",
+        "try:\n    pass\nexcept ImportError:\n    _LitellmCustomLogger = CustomGuardrail\n",
+    ],
+)
+def test_a_later_rebinding_of_the_base_fails_the_pin(rebinding: str) -> None:
+    assert _base_binding(ast.parse(_BASE_IMPORT + rebinding + _OURS)) != (1, CUSTOM_LOGGER)
 
 
 def test_the_guardrail_stays_a_plain_custom_logger() -> None:
@@ -348,9 +502,7 @@ def test_the_guardrail_stays_a_plain_custom_logger() -> None:
         for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "CorpLlmGuardrail"
     )
-    bases = [base.id for base in ours.bases if isinstance(base, ast.Name)]
-    assert len(bases) == len(ours.bases) == 1
-    assert _imported_as(tree, bases[0]) == "litellm.integrations.custom_logger.CustomLogger"
+    assert _base_binding(tree) == (1, CUSTOM_LOGGER)
     assert "apply_guardrail" not in {
         node.name for node in ours.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
     }

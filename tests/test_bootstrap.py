@@ -944,11 +944,12 @@ def test_backends_resolve_from_config_file_without_env(
 
 @pytest.fixture
 def _restore_pkg_logger() -> None:
-    # Importing the demo module sets propagate=False + adds a handler on the
-    # package logger; restore so caplog in other tests is unaffected.
+    # Importing the demo module sets the level and propagate=False and adds a
+    # handler on the package logger; restore so caplog in other tests is unaffected.
     pkg = logging.getLogger("corp_llm_gateway")
-    propagate, handlers = pkg.propagate, list(pkg.handlers)
+    level, propagate, handlers = pkg.level, pkg.propagate, list(pkg.handlers)
     yield
+    pkg.setLevel(level)
     pkg.propagate = propagate
     pkg.handlers = handlers
 
