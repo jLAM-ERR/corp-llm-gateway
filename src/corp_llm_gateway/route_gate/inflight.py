@@ -603,7 +603,8 @@ class InflightLimiter:
                 await _settle(watcher)
                 # Not `await downstream`: that would hand the cancel to the downstream
                 # before the ticket says who cancelled it.
-                await asyncio.wait({downstream})
+                if not downstream.done():
+                    await asyncio.wait({downstream})
             except asyncio.CancelledError:
                 await self._server_cancelled(ticket, downstream, watcher)
                 raise

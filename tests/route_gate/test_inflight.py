@@ -11,6 +11,7 @@ import json
 import logging
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
+from importlib.util import find_spec
 from typing import Any
 
 import pytest
@@ -266,6 +267,47 @@ async def test_the_slot_is_held_past_the_final_body_until_the_downstream_returns
     third = _Client()
     await gate(_scope(), third.receive, third.send)
     assert third.status == 200
+
+
+# The loop uvicorn serves on in production, when installed.
+LOOPS = ["asyncio"] + (["uvloop"] if find_spec("uvloop") is not None else [])
+# From the app's return: 2 hops for the first wait to see it, 3 to cancel and settle
+# the idle watcher. A finished downstream must cost nothing more.
+RELEASE_HOPS = 5
+
+
+@pytest.mark.parametrize("loop", LOOPS)
+def test_a_finished_downstream_frees_the_slot_without_extra_loop_hops(loop: str) -> None:
+    async def run() -> int:
+        responded = asyncio.Event()
+
+        async def app(scope: Any, receive: Any, send: Any) -> None:
+            await _read_body(receive)
+            await _respond(send)
+            responded.set()
+
+        gate, limiter, _, _ = _stack(app, max_inflight=1)
+        client = _Client()
+        running = asyncio.create_task(gate(_scope(), client.receive, client.send))
+        await asyncio.wait_for(responded.wait(), 2)
+        hops = 0
+        while limiter.inflight and hops < 100:
+            await asyncio.sleep(0)
+            hops += 1
+        await running
+        assert client.status == 200
+        return hops
+
+    factory = None
+    if loop == "uvloop":
+        import uvloop
+
+        factory = uvloop.new_event_loop
+    with asyncio.Runner(loop_factory=factory) as runner:
+        hops = runner.run(run())
+
+    # Each extra hop is a window in which a sequential client at the cap gets 429.
+    assert hops <= RELEASE_HOPS
 
 
 async def test_passthrough_routes_never_count() -> None:

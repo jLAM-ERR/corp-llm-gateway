@@ -7,7 +7,9 @@ Each loop flavour runs ``tests/inflight_served_script.py`` once in a subprocess
 its JSON. The six cases, per plan 20260927 Task 3: the client closes (a) before
 response headers while litellm awaits the stalled upstream, (b) mid-SSE, (c)
 during a non-streaming call, (d) inside our pre-call hook, (e) on a zero-chunk
-stream, (f) while an audit emit is in flight.
+stream, (f) while an audit emit is in flight. Before them, one client at the cap of 1
+sends 200 requests back to back: none may get 429, since the slot frees within two
+loop hops of the response's end.
 
 A second run (scenario ``isolation``, the default cap of 64) proves what the
 disconnect cases cannot: a token lookup shared by two requests survives the
@@ -106,6 +108,19 @@ def test_the_stack_served_a_normal_request_first(served: dict[str, Any]) -> None
     assert served["warmup"] == 200
     assert served["max_inflight"] == 1
     assert set(served["cases"]) == set(CASES)
+
+
+def test_a_sequential_client_at_the_cap_is_never_refused(served: dict[str, Any]) -> None:
+    result = served["sequential"]
+
+    # The client reads EOF inside uvicorn's final send, while the app still unwinds;
+    # its next request must not find the slot still held.
+    assert result["statuses"] == {"200": 200}
+
+
+def test_the_slot_frees_within_two_loop_hops_of_the_response_end(served: dict[str, Any]) -> None:
+    # asyncio needs 1, uvloop 2; each hop more is a window for a spurious 429.
+    assert max(served["sequential"]["release_hops"]) <= 2
 
 
 @pytest.mark.parametrize("case", CASES)

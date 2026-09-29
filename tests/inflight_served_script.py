@@ -1,10 +1,10 @@
 """Child process for ``tests/test_inflight_served_stack.py``: the real entrypoint
 (route gate + in-flight limiter + litellm + the guardrail) served by uvicorn on a
-real socket, in front of an upstream stub on another real socket. Runs every
-disconnect case (scenario ``disconnects``), the isolation cases (scenario
-``isolation``: a shared auth lookup across a disconnect, idle bodies against the
-slots) or the body byte budget (scenario ``budget``), prints one ``@@RESULT@@``
-JSON line.
+real socket, in front of an upstream stub on another real socket. Runs a cap-1
+sequential client and every disconnect case (scenario ``disconnects``), the
+isolation cases (scenario ``isolation``: a shared auth lookup across a disconnect,
+idle bodies against the slots) or the body byte budget (scenario ``budget``),
+prints one ``@@RESULT@@`` JSON line.
 
 Run as ``python tests/inflight_served_script.py <asyncio|uvloop> [scenario]``;
 importing ``corp_llm_gateway.asgi`` IS the boot, so this cannot share the test
@@ -269,6 +269,7 @@ async def main() -> None:
         results["idle_bodies"] = await _idle_bodies(port, stub, limiter)
         await _finish(results, port, limiter, server, serving, stub_server)
         return
+    results["sequential"] = await _sequential(port, stub, limiter)
 
     async def case(
         name: str,
@@ -373,6 +374,34 @@ async def _finish(
     await serving
     stub_server.close()
     print(SENTINEL + json.dumps(results), flush=True)
+
+
+SEQUENTIAL_REQUESTS = 200
+HOP_SAMPLES = 20
+HOP_BOUND = 1000
+
+
+async def _sequential(port: int, stub: Stub, limiter: Any) -> Any:
+    """One client at cap 1 sends its next request as soon as it has read the last."""
+    statuses: dict[str, int] = {}
+    started = time.monotonic()
+    for _ in range(SEQUENTIAL_REQUESTS):
+        status, _ = await _complete(port, stub, stream=False)
+        statuses[str(status)] = statuses.get(str(status), 0) + 1
+        if status != 200:
+            # Keep the samples independent: a refusal means the slot was still held.
+            await _until(lambda: limiter.inflight <= 0)
+    elapsed_s = time.monotonic() - started
+    hops: list[int] = []
+    for _ in range(HOP_SAMPLES):
+        await _complete(port, stub, stream=False)
+        count = 0
+        while limiter.inflight > 0 and count < HOP_BOUND:
+            await asyncio.sleep(0)
+            count += 1
+        hops.append(count)
+        await _until(lambda: limiter.inflight <= 0)
+    return {"statuses": statuses, "elapsed_s": elapsed_s, "release_hops": hops}
 
 
 async def _shared_lookup(port: int, stub: Stub, guardrail: Any, sink: Any, limiter: Any) -> Any:
