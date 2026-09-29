@@ -66,6 +66,45 @@ Present only under the conditions noted; absent otherwise.
 | `pre_pass_latency_ms` | pre-pass path was taken | Sub-stage latency |
 | `audit_buffer_full` | Vector buffer at ≥50% | Operational signal |
 
+## litellm's `guardrail_information` (not a field of this record)
+
+The record above is the request's terminal audit record and does not carry
+`guardrail_information`. That field belongs to litellm's own
+`StandardLoggingPayload`, which every `litellm.callbacks` logger (Langfuse, S3, OTEL,
+…) receives. The guardrail's pre-call writes one entry there with litellm's own writer
+and syncs it into litellm's logging object. The entry is allow-listed
+(`audit/invariants.py`, `assert_guardrail_information_allowed`): a NEVER key or any
+free text is refused before litellm sees it, and an entry litellm builds differently
+is taken back out. Either way the request goes on; the gateway logs
+`litellm_guardrail_information_failed request_id=… error=<type>` and counts
+`gateway_failure{component="audit"}`.
+
+| Key | Value |
+|---|---|
+| `guardrail_name` | `corp-llm-sanitizer` |
+| `guardrail_mode` | `pre_call` |
+| `guardrail_status` | derived from `block_reason`, table below |
+| `start_time` / `end_time` / `duration` | the pre-call's start and end (epoch seconds) and its length in seconds |
+| `guardrail_response` | `redaction_count` and `finding_label_counts` (as in this record), plus `block_reason` when one is set |
+| `guardrail_provider` / `masked_entity_count` | always `null` (litellm writes both keys) |
+
+`block_reason` → `guardrail_status`. Our reason codes are the source; litellm's status
+is derived from them, never the other way round:
+
+| `block_reason` | `guardrail_status` |
+|---|---|
+| none | `success` |
+| `oversize:delivered` | `guardrail_flagged` |
+| every Stage 0, Stage 5 and content-size / request-policy reason | `guardrail_intervened` |
+
+The route gate and the in-flight cap refuse before litellm runs: no entry.
+
+Where the entry shows: in the success and failure payloads of a request the pre-call
+passed (status `success`). For a request the pre-call refuses, litellm builds no
+payload; the entry then reaches only the request litellm hands each
+`async_post_call_failure_hook`, and litellm's OTEL guardrail span when OTEL is
+configured. It is never part of the provider-bound body.
+
 ## Invariants
 
 These are tested in code:
@@ -74,6 +113,7 @@ These are tested in code:
 2. **No credentials (M2-7)**: the BYOK Authorization header value must not appear in any audit record.
 3. **Vector drops on NEVER (M3-10)**: an injected record containing a NEVER key must not reach Langfuse, S3, or SIEM.
 4. **Audit completeness (acceptance criteria)**: 100% of non-failed requests appear in S3 within 24h; measured monthly.
+5. **Content-free `guardrail_information`**: litellm's payload, its failure hooks and its OTEL span carry our entry with exactly the keys above and no original, placeholder or exception text (`tests/litellm_hook/test_guardrail_information.py`, `tests/audit/test_guardrail_information_gate.py`).
 
 ## Schema versioning
 

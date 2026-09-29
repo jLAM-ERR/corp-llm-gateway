@@ -140,14 +140,18 @@ async def test_standard_logging_payload_is_content_free(
     # before the pre-call hook rewrites it, and nothing refreshed it on that route.
     assert _payload_fields_holding(payload, ORIGINAL_MARK) == set()
     assert ORIGINAL_MARK not in response_obj
+    entries = payload["guardrail_information"] or ()
+    # The writer's entry is the post_call one; our pre-call writes its own (Task 5,
+    # test_guardrail_information.py), which must not hide a later unsynced write.
     ours_entries = [
         entry
-        for entry in payload["guardrail_information"] or ()
-        if entry["guardrail_name"] == GUARDRAIL_NAME
+        for entry in entries
+        if entry["guardrail_name"] == GUARDRAIL_NAME and entry["guardrail_mode"] == "post_call"
     ]
     assert len(ours_entries) == 1
     assert ours_entries[0]["guardrail_response"] == ALLOWED_RESPONSE
     assert ours_entries[0]["guardrail_status"] == "success"
+    assert [entry["guardrail_mode"] for entry in entries] == ["pre_call", "post_call"]
 
 
 RESPONSES_LIST_INPUTS: dict[str, list[dict[str, Any]]] = {

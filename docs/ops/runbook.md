@@ -133,6 +133,8 @@ Behavior: not an incident on its own. A litellm log event arrived for a request 
 
 Action: none for a flat or occasional count. If it grows steadily with traffic, compare the `request_id`s against the audit records: each should already have exactly one terminal record. A request with no record at all is an audit-completeness incident (see below).
 
+Second source, `litellm_guardrail_information_failed request_id=… error=<type>`: the guardrail could not write its content-free entry into litellm's `guardrail_information` (`docs/audit-schema.md`). The request and its audit record are not affected; litellm's payload and OTEL span for that request lack the entry. `error=GuardrailInformationShapeError` after a litellm upgrade means litellm's writer builds a different entry shape: re-check it against the allow-list before anything else.
+
 ### A client gets 403 / 404 `E_ROUTE_BLOCKED`
 
 Symptom: a request answers `{"error": {"type": "route_blocked", "code":

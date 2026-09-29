@@ -160,6 +160,13 @@ staging-гейта апгрейда (согласно задаче M0-7 в пл�
 быть ровно одна итоговая запись. Запрос без записи вовсе — это инцидент полноты
 аудита (см. ниже).
 
+Второй источник — `litellm_guardrail_information_failed request_id=… error=<type>`:
+guardrail не смог записать свою запись без контента в `guardrail_information`
+litellm (`docs/audit-schema.ru.md`). Запрос и его аудит-запись не затронуты; в
+payload и OTEL span litellm для этого запроса записи нет.
+`error=GuardrailInformationShapeError` после обновления litellm означает, что
+writer litellm собирает запись другой формы: прежде всего сверьте её с allow-list.
+
 ### 429 `E_CAPACITY` / 408 `E_BODY_TIMEOUT`
 
 Симптом: клиенты получают 429 с `Retry-After: 1` или 408; растёт

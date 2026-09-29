@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import time
@@ -39,7 +40,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from corp_llm_gateway.audit import AuditEvent, AuditLogger, AuditWriteAmbiguousError
+from corp_llm_gateway.audit import (
+    GUARDRAIL_INFORMATION_KEYS,
+    AuditEvent,
+    AuditLogger,
+    AuditWriteAmbiguousError,
+    assert_guardrail_information_allowed,
+)
 from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
@@ -49,7 +56,7 @@ from corp_llm_gateway.corp_ner.errors import (
     ner_error_code,
 )
 from corp_llm_gateway.detectors import NerUnavailableError
-from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
+from corp_llm_gateway.metrics import BLOCK_REASONS, MetricsExporter, NoopExporter
 from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.payload.size_threshold import OversizeContentError, should_skip_sanitization
 from corp_llm_gateway.pg_session import store_unavailable
@@ -85,6 +92,7 @@ from corp_llm_gateway.sanitizer.identity_preamble import (
     leading_identity_block_index,
 )
 from corp_llm_gateway.sanitizer.local_pass import DetectorContractError
+from corp_llm_gateway.sanitizer.orchestrator import OVERSIZE_DELIVERED_REASON
 from corp_llm_gateway.sanitizer.placeholder import (
     StaleSpanError,
     add_unwrapped_response_aliases,
@@ -444,6 +452,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         """
         request_id = self._ensure_request_id(data)
         pre_call_started = time.monotonic()
+        pre_call_wall = time.time()
         # Read for auth, then stripped before anything can refuse: litellm hands a
         # refused request, as it stands, to every failure hook (invariant 4).
         inbound_headers = _extract_auth_headers(data)
@@ -734,6 +743,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             cache_a_hit=False,
             mapping=StrategyResult(pairs=()),
         )
+        state.started_at = pre_call_wall
         self._req_state[request_id] = state
 
         # A client fully controls the request body: {"messages": [], "input": [...]}
@@ -744,6 +754,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.block_reason = "request:ambiguous_shape"
             self._record_failure(request_id, error_code="E_POLICY_BLOCKED")
             self._metrics.record_block(state.block_reason)
+            self._note_guardrail_information(data, state)
             logger.info(
                 "litellm_pre_call_blocked request_id=%s block_reason=%s",
                 request_id,
@@ -793,6 +804,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.block_reason = "provider:not_allowed"
             self._record_failure(request_id, error_code="E_PROVIDER_BLOCKED")
             self._metrics.record_block("provider:not_allowed")
+            self._note_guardrail_information(data, state)
             logger.info(
                 "litellm_pre_call_provider_blocked request_id=%s provider=%s",
                 request_id,
@@ -870,6 +882,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 state.block_reason = _s0_reason
                 self._record_failure(request_id, error_code="E_POLICY_BLOCKED")
                 self._metrics.record_block(_s0_reason)
+                self._note_guardrail_information(data, state)
                 logger.info(
                     "litellm_pre_call_blocked request_id=%s block_reason=%s",
                     request_id,
@@ -1021,6 +1034,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 state.block_reason = "oversize:blocked"
                 self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
                 self._metrics.record_block("oversize:blocked")
+                self._note_guardrail_information(data, state)
                 logger.info(
                     "litellm_pre_call_oversize_blocked request_id=%s message_index=%d "
                     "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
@@ -1186,6 +1200,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 state.block_reason = _s5_reason
                 self._record_failure(request_id, error_code="E_DLP_BLOCKED")
                 self._metrics.record_block(_s5_reason)
+                self._note_guardrail_information(data, state)
                 logger.info(
                     "litellm_egress_blocked request_id=%s block_reason=%s",
                     request_id,
@@ -1199,6 +1214,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "request blocked by DLP egress policy",
                 )
 
+        self._note_guardrail_information(data, state)
         logger.info(
             "litellm_pre_call_complete request_id=%s team_id=%s provider=%s "
             "model=%s total_redactions=%d placeholder_count=%d",
@@ -1357,6 +1373,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.block_reason = "oversize:blocked"
             self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
             self._metrics.record_block("oversize:blocked")
+            self._note_guardrail_information(data, state)
             logger.info(
                 "litellm_pre_call_oversize_blocked request_id=%s field=%s "
                 "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
@@ -1814,6 +1831,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         state.block_reason = "oversize:blocked"
         self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
         self._metrics.record_block("oversize:blocked")
+        self._note_guardrail_information(data, state)
         logger.info(
             "litellm_pre_call_oversize_blocked request_id=%s field=unmanaged_input "
             "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
@@ -1828,6 +1846,27 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             "E_OVERSIZE_BLOCKED",
             "request blocked: oversize content",
         )
+
+    def _note_guardrail_information(self, data: dict[str, Any], state: _RequestState) -> None:
+        """This pre-call's content-free entry in litellm's logging payload. Never raises:
+        a failed write loses an annotation, never the request or its audit record."""
+        try:
+            _write_guardrail_information(
+                data,
+                block_reason=state.block_reason,
+                redaction_count=state.redaction_count,
+                finding_label_counts=_label_counts(state.placeholders),
+                start_time=state.started_at,
+                end_time=time.time(),
+            )
+        except Exception as exc:
+            # Type only: an exception message can quote request content.
+            logger.error(
+                "litellm_guardrail_information_failed request_id=%s error=%s",
+                state.request_id,
+                type(exc).__name__,
+            )
+            self._metrics.record_failure(AUDIT_COMPONENT)
 
     async def _resolve_profile(self, team_id: str) -> ResolvedProfile:
         """Resolve the team's merged profile (policy + inner orchestrator + D3
@@ -1859,6 +1898,155 @@ def _audit_facts(state: _RequestState, *, started: float) -> AuditFacts:
         status="ok",
         started=started,
     )
+
+
+# Our name in litellm's `guardrail_information` (and its OTEL guardrail span).
+GUARDRAIL_NAME = "corp-llm-sanitizer"
+# litellm's metadata key for guardrail entries (custom_guardrail.py).
+_GUARDRAIL_INFORMATION_KEY = "standard_logging_guardrail_information"
+
+# block_reason → litellm's `guardrail_status`. Our reason codes (the
+# `blocked_requests_total{block_reason}` labels) are the source; litellm's status is
+# derived from them, never the other way round. Only pre-call reasons: the route gate
+# and the in-flight cap refuse before litellm runs.
+GUARDRAIL_STATUS_BY_BLOCK_REASON: dict[str | None, str] = {
+    None: "success",
+    OVERSIZE_DELIVERED_REASON: "guardrail_flagged",
+    **{
+        reason: "guardrail_intervened"
+        for site in ("stage0", "stage5", "policy")
+        for reason in BLOCK_REASONS[site]
+    },
+}
+
+
+class UnknownBlockReasonError(Exception):
+    """A block_reason with no litellm status in the table: nothing is written."""
+
+
+class GuardrailInformationShapeError(Exception):
+    """litellm's writer built something other than the allow-listed entry: removed."""
+
+
+_WRITER: Any = None
+_NO_WRITER = object()
+
+
+def _guardrail_information_writer() -> Any:
+    """litellm's own writer, on a CustomGuardrail that is never registered: not a
+    callback, so litellm never dispatches to it. None without litellm."""
+    global _WRITER
+    if _WRITER is None:
+        try:
+            from litellm.integrations.custom_guardrail import CustomGuardrail
+            from litellm.types.guardrails import GuardrailEventHooks
+        except ImportError:
+            _WRITER = _NO_WRITER
+        else:
+            _WRITER = CustomGuardrail(
+                guardrail_name=GUARDRAIL_NAME, event_hook=GuardrailEventHooks.pre_call
+            )
+    return None if _WRITER is _NO_WRITER else _WRITER
+
+
+def _write_guardrail_information(
+    data: dict[str, Any],
+    *,
+    block_reason: str | None,
+    redaction_count: int,
+    finding_label_counts: dict[str, int],
+    start_time: float,
+    end_time: float,
+) -> None:
+    """Write our entry into the request metadata with litellm's writer (it also emits
+    the OTEL guardrail span), then sync it into the logging object the
+    ``StandardLoggingPayload`` is built from (hazard 16). The entry is checked against
+    the allow-list before litellm sees it, and litellm's copy after."""
+    writer = _guardrail_information_writer()
+    if writer is None:
+        return
+    if block_reason not in GUARDRAIL_STATUS_BY_BLOCK_REASON:
+        raise UnknownBlockReasonError
+    from litellm.litellm_core_utils.core_helpers import get_or_create_metadata_bucket
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    status = GUARDRAIL_STATUS_BY_BLOCK_REASON[block_reason]
+    response: dict[str, Any] = {
+        "redaction_count": redaction_count,
+        "finding_label_counts": dict(finding_label_counts),
+    }
+    if block_reason is not None:
+        response["block_reason"] = block_reason
+    end_time = max(end_time, start_time)
+    expected = {
+        "guardrail_name": GUARDRAIL_NAME,
+        "guardrail_provider": None,
+        "guardrail_mode": GuardrailEventHooks.pre_call,
+        "guardrail_response": response,
+        "guardrail_status": status,
+        "start_time": start_time,
+        "end_time": end_time,
+        "duration": end_time - start_time,
+        "masked_entity_count": None,
+    }
+    assert_guardrail_information_allowed(expected)
+    _, bucket = get_or_create_metadata_bucket(data)
+    earlier = bucket.get(_GUARDRAIL_INFORMATION_KEY)
+    known = len(earlier) if isinstance(earlier, list) else int(earlier is not None)
+    # A copied context: the writer sets litellm's "guardrail self-recorded" contextvar,
+    # which must not stay set in the request's own context.
+    contextvars.copy_context().run(
+        writer.add_standard_logging_guardrail_information_to_request_data,
+        guardrail_json_response=dict(response),
+        request_data=data,
+        guardrail_status=status,
+        start_time=start_time,
+        end_time=end_time,
+        duration=end_time - start_time,
+        event_type=GuardrailEventHooks.pre_call,
+    )
+    entries = bucket.get(_GUARDRAIL_INFORMATION_KEY)
+    added = entries[known:] if isinstance(entries, list) else []
+    if added != [expected]:
+        # Only what this call added goes: another guardrail's entry stays.
+        if isinstance(entries, list):
+            del entries[known:]
+        raise GuardrailInformationShapeError
+    _sync_guardrail_information(data.get("litellm_logging_obj"), expected, entries)
+
+
+def _sync_guardrail_information(
+    logging_obj: Any, entry: dict[str, Any], request_entries: list[Any]
+) -> None:
+    """Our entry into the logging object's ``litellm_params["metadata"]`` (both of its
+    copies): the payload reads that, not the request (hazard 16).
+
+    Where that metadata holds no entry list yet, it shares the request's list — the
+    one litellm itself carries into the payload — so an entry another callback writes
+    later still lands; a list of its own gets a copy of our entry, allow-listed keys
+    only; no metadata at all gets none. Never litellm's
+    ``_sync_guardrail_info_to_logging_obj``: it copies every entry of the request,
+    other guardrails' included."""
+    if logging_obj is None:
+        return
+    details = getattr(logging_obj, "model_call_details", None)
+    targets = (
+        getattr(logging_obj, "litellm_params", None),
+        details.get("litellm_params") if isinstance(details, dict) else None,
+    )
+    for params in targets:
+        if not isinstance(params, dict):
+            continue
+        metadata = params.get("metadata")
+        if not isinstance(metadata, dict):
+            # Never re-created: the auth bridges scrub it (``_scrub_retained_request_metadata``).
+            continue
+        existing = metadata.get(_GUARDRAIL_INFORMATION_KEY)
+        copy = {key: entry[key] for key in GUARDRAIL_INFORMATION_KEYS}
+        if existing is None:
+            metadata[_GUARDRAIL_INFORMATION_KEY] = request_entries
+        elif isinstance(existing, list) and copy not in existing:
+            existing.append(copy)
 
 
 # litellm's call type for the chat-completions routes.
@@ -2413,6 +2601,7 @@ class _RequestState:
         "redaction_count",
         "request_id",
         "response_alias_exclusions",
+        "started_at",
         "team_id",
         "ticket",
         "user_id",
@@ -2448,6 +2637,8 @@ class _RequestState:
         # Resolved profile layer-key (D4) — metadata for the audit trail; set
         # after profile resolution in pre_call. Empty == no profile applied.
         self.profile_ids: tuple[str, ...] = ()
+        # Wall clock (epoch seconds) the pre-call started: litellm's guardrail timing.
+        self.started_at: float = time.time()
 
 
 @contextlib.contextmanager

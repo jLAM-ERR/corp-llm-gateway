@@ -67,6 +67,46 @@ NEVER — это предохранитель эшелонированной з�
 | `pre_pass_latency_ms` | Был выбран путь pre-pass | Латентность под-стадии |
 | `audit_buffer_full` | Буфер Vector на ≥50% | Эксплуатационный сигнал |
 
+## `guardrail_information` litellm (не поле этой записи)
+
+Запись выше — терминальная аудит-запись запроса; поля `guardrail_information` в ней
+нет. Это поле собственного `StandardLoggingPayload` litellm, который получает любой
+логгер из `litellm.callbacks` (Langfuse, S3, OTEL, …). Pre-call guardrail пишет туда
+одну запись собственным writer'ом litellm и синхронизирует её в logging-объект litellm.
+Запись проходит allow-list (`audit/invariants.py`,
+`assert_guardrail_information_allowed`): ключ NEVER или любой свободный текст
+отклоняются до того, как litellm их увидит, а запись, которую litellm собрал иначе,
+удаляется. В обоих случаях запрос продолжается; шлюз пишет в лог
+`litellm_guardrail_information_failed request_id=… error=<type>` и считает
+`gateway_failure{component="audit"}`.
+
+| Ключ | Значение |
+|---|---|
+| `guardrail_name` | `corp-llm-sanitizer` |
+| `guardrail_mode` | `pre_call` |
+| `guardrail_status` | выводится из `block_reason`, таблица ниже |
+| `start_time` / `end_time` / `duration` | начало и конец pre-call (секунды epoch) и его длительность в секундах |
+| `guardrail_response` | `redaction_count` и `finding_label_counts` (как в этой записи), плюс `block_reason`, если он задан |
+| `guardrail_provider` / `masked_entity_count` | всегда `null` (litellm пишет оба ключа) |
+
+`block_reason` → `guardrail_status`. Источник — наши коды причин; статус litellm
+выводится из них, никогда не наоборот:
+
+| `block_reason` | `guardrail_status` |
+|---|---|
+| нет | `success` |
+| `oversize:delivered` | `guardrail_flagged` |
+| любая причина Stage 0, Stage 5 и политики размера / запроса | `guardrail_intervened` |
+
+Route gate и лимит одновременных запросов отказывают до того, как запускается litellm:
+записи нет.
+
+Где видна запись: в success- и failure-payload запроса, который pre-call
+пропустил (статус `success`). Для запроса, который pre-call отклонил, litellm payload
+не строит; тогда запись попадает только в запрос, который litellm передаёт каждому
+`async_post_call_failure_hook`, и в OTEL guardrail span litellm, если OTEL настроен.
+В тело запроса к провайдеру она не попадает никогда.
+
 ## Инварианты
 
 Проверяются в коде:
@@ -75,6 +115,7 @@ NEVER — это предохранитель эшелонированной з�
 2. **Нет учётных данных (M2-7)**: значение заголовка BYOK Authorization не должно появляться ни в одной записи аудита.
 3. **Vector отбрасывает по NEVER (M3-10)**: подсунутая запись с ключом NEVER не должна достичь Langfuse, S3 или SIEM.
 4. **Полнота аудита (критерий приёмки)**: 100% неупавших запросов появляются в S3 в течение 24 ч; измеряется ежемесячно.
+5. **`guardrail_information` без контента**: payload litellm, его failure-хуки и его OTEL span несут нашу запись ровно с ключами выше и без оригинала, placeholder или текста исключения (`tests/litellm_hook/test_guardrail_information.py`, `tests/audit/test_guardrail_information_gate.py`).
 
 ## Версионирование схемы
 

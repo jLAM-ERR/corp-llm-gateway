@@ -64,8 +64,9 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
 # registered), cannot classify one at all, or loses the refusal's audit record
 # (``route_gate/middleware.py``) — and so is ``team_config``, a team config the
 # store could not return (``litellm_hook.TEAM_CONFIG_COMPONENT``), ``audit``: a
-# litellm log event the guardrail has nothing to write a record from
-# (``litellm_hook.AUDIT_COMPONENT``), and ``desanitize``: a response the ASGI desanitiser
+# litellm log event the guardrail has nothing to write a record from, or its
+# ``guardrail_information`` entry not written (``litellm_hook.AUDIT_COMPONENT``), and
+# ``desanitize``: a response the ASGI desanitiser
 # (``route_gate/desanitize_middleware.py``) could not restore, or a terminal audit
 # record lost after its last write (``route_gate/terminal_audit.py``).
 # The metrics tests pin this against every source.
