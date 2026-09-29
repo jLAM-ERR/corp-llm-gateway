@@ -1033,9 +1033,7 @@ holds even if the string resolved to a callback with every hook (the served-stac
 makes it resolve to one).
 Prompts stored in spend logs are placeholders for the same reason: litellm builds the
 row from the log event's kwargs, whose `proxy_server_request.body` our pre-call points
-at the rewritten request. Neither holds the `X-Corp-Auth` value (hazard 18): the pre-call
-drops it first, before anything can refuse the request, from every header copy litellm
-keeps — the chat `requester_metadata` copy and litellm's logging object included. A pass-through route has no row in the gate's table, so it is
+at the rewritten request. A pass-through route has no row in the gate's table, so it is
 404 before litellm routes it. `ui_access_mode` governs litellm's UI, which the gate
 refuses. What does not hold: nothing notices such a callback after the arm check, and it
 gets what any callback after ours gets (placeholders, counts, request metadata). Pinned
@@ -1043,6 +1041,16 @@ by `tests/test_litellm_config_guards.py` (compose reachable, Helm DB-less, each 
 effect) and `tests/test_desanitize_served_stack.py` (a row applied on the served stack:
 both callback kinds on all six flows and a provider failure, the spend-log row, the
 pass-through route).
+
+**The `X-Corp-Auth` value in litellm's logging surfaces (hazard 18).** No log kwargs,
+`StandardLoggingPayload`, spend-log row or failure-hook `request_data` holds the corp token:
+the pre-call drops it first, before anything can refuse the request, from every header copy
+litellm keeps — the chat `requester_metadata` copy and litellm's logging object included.
+What it cannot reach: two litellm DEBUG lines that run **before** our hook print the raw
+value — `litellm_pre_call_utils.py:1987` ("Request Headers") and `:2438` ("[PROXY] returned
+data from litellm_pre_call_utils"). The only guard for those is the arm-time DEBUG refusal:
+litellm DEBUG / `set_verbose` blocks arming (exit 70), and the test-only allowance
+`CORP_LLM_ALLOW_LITELLM_DEBUG` is refused in prod (`asgi._check_litellm_debug`, exit 78).
 
 **Health rows, one by one.** Shipped probes use only the gateway's own
 `/healthz/live` and `/healthz/ready`.

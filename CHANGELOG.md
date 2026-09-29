@@ -111,6 +111,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   litellm DEBUG line carried the token. And on every route a request refused with 401 handed the
   token to every callback's failure hook, because the strip ran after authentication. The
   pre-call now strips the token first, from that copy and from litellm's logging object too.
+  Not covered: two litellm DEBUG lines that run before the pre-call ("Request Headers",
+  `litellm_pre_call_utils.py:1987`, and "[PROXY] returned data from litellm_pre_call_utils",
+  `:2438`) still print the raw token. The only guard is the arm-time DEBUG refusal
+  (`CORP_LLM_ALLOW_LITELLM_DEBUG` is refused in prod).
 
 ### Added — production compose deploy target (`compose/`)
 

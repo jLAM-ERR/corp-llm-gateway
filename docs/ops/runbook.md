@@ -125,6 +125,14 @@ Action:
 3. A request already blocked/failed by a specific component (e.g. `E_DLP_BLOCKED`) does NOT also count as `internal` — the wrapper skips the internal counter when a component-specific failure was already recorded for that request.
 4. An upstream provider/transport failure mid-stream (e.g. `httpx.RemoteProtocolError`) also does NOT count as `internal` — `post_call_stream` only wraps its own desanitization work; fetching the next chunk from the upstream iterator is deliberately outside that guard, so a provider failure propagates to litellm's own failure handling untouched. `internal` rising means a bug in the gateway's own pre/post-call code, not a downstream provider outage and not a duplicate of a component-specific block.
 
+### `gateway_failure{component="audit"}` rises
+
+Symptom: `gateway_failure{component="audit"}` counts up; the gateway log has `litellm_audit_orphan_event request_id=… status=…`.
+
+Behavior: not an incident on its own. A litellm log event arrived for a request the guardrail holds no state for — the request's terminal audit record was already written through its ticket (or no pre-call ran), so the event is dropped instead of writing a second, "unknown" record. Nothing is lost and no request is affected.
+
+Action: none for a flat or occasional count. If it grows steadily with traffic, compare the `request_id`s against the audit records: each should already have exactly one terminal record. A request with no record at all is an audit-completeness incident (see below).
+
 ### A client gets 403 / 404 `E_ROUTE_BLOCKED`
 
 Symptom: a request answers `{"error": {"type": "route_blocked", "code":

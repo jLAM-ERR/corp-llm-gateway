@@ -52,6 +52,9 @@ OUTCOMES: dict[str, tuple[int | None, dict[str, Any]]] = {
 }
 
 
+MAX_WALK_DEPTH = 40
+
+
 def token_sites(
     obj: Any, needle: str, path: str = "", seen: frozenset[int] = frozenset()
 ) -> list[str]:
@@ -60,8 +63,10 @@ def token_sites(
     if isinstance(obj, (str, bytes)):
         text = obj.decode("utf-8", "replace") if isinstance(obj, bytes) else obj
         return [path] if needle in text else []
-    if id(obj) in seen or len(seen) > 40:
+    if id(obj) in seen:
         return []
+    if len(seen) >= MAX_WALK_DEPTH:
+        raise AssertionError(f"token_sites: depth cap {MAX_WALK_DEPTH} hit at {path!r}")
     seen = seen | {id(obj)}
     found: list[str] = []
     if isinstance(obj, dict):
@@ -83,6 +88,15 @@ def token_sites(
     elif type(obj).__module__.startswith("litellm") and hasattr(obj, "__dict__"):
         found += token_sites(vars(obj), needle, f"{path}<{type(obj).__name__}>", seen)
     return found
+
+
+def _captured_sites(obj: Any) -> list[str]:
+    """``token_sites`` inside a litellm callback, where a raise would be swallowed: a hit
+    cap comes back as a site, so the empty-list assertions fail on it."""
+    try:
+        return token_sites(obj, CORP_TOKEN)
+    except AssertionError as exc:
+        return [f"<walker failed: {exc}>"]
 
 
 class TokenCapture(CustomLogger):
@@ -109,8 +123,8 @@ class TokenCapture(CustomLogger):
         self.events.append(
             (
                 kind,
-                token_sites(kwargs, CORP_TOKEN),
-                token_sites(spend, CORP_TOKEN),
+                _captured_sites(kwargs),
+                _captured_sites(spend),
                 str(spend.get("proxy_server_request")),
             )
         )
@@ -132,7 +146,7 @@ class TokenCapture(CustomLogger):
         user_api_key_dict: Any,
         traceback_str: str | None = None,
     ) -> None:
-        self.failure_hook_sites.append(token_sites(request_data, CORP_TOKEN))
+        self.failure_hook_sites.append(_captured_sites(request_data))
 
 
 class _Lines(logging.Handler):
@@ -310,3 +324,14 @@ def test_the_walker_finds_a_token_in_every_shape_it_reads() -> None:
     for shape in shapes:
         assert token_sites(shape, CORP_TOKEN), shape
     assert token_sites({"a": "clean"}, CORP_TOKEN) == []
+
+
+def test_the_walker_fails_loudly_at_its_depth_cap() -> None:
+    deep: Any = "clean"
+    for _ in range(MAX_WALK_DEPTH + 1):
+        deep = {"n": deep}
+
+    with pytest.raises(AssertionError, match="depth cap"):
+        token_sites(deep, CORP_TOKEN)
+    (site,) = _captured_sites(deep)
+    assert site.startswith("<walker failed")
