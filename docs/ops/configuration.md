@@ -43,7 +43,13 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 > `/metrics` for the `ServiceMonitor` to scrape, and it needs the `metrics`
 > extra (`prometheus-client`). One process-wide exporter is shared by the
 > guardrail, the route gate and the `/metrics` endpoint (`get_exporter()`), so
-> a block counted anywhere is visible on the same scrape.
+> a block counted anywhere is visible on the same scrape. `gateway_failure`'s
+> `component` label takes only the values in `FAILURE_COMPONENTS`
+> (`metrics/base.py`); write alerts against those. Two of them concern the
+> response boundary and the audit record: `desanitize` (a response that could not be restored,
+> or a terminal audit record lost after its retry) and `audit` (a litellm log
+> event with no request to write it for, or the `guardrail_information` entry not
+> written). Both are explained in `runbook.md`.
 
 ## Full key list
 

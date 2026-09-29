@@ -138,11 +138,43 @@ staging-гейта апгрейда (согласно задаче M0-7 в пл�
    счётчик, если по этому запросу уже зафиксирован отказ конкретного
    компонента.
 4. Отказ провайдера/транспорта посреди стрима (например,
-   `httpx.RemoteProtocolError`) тоже **не** считается `internal` —
-   `post_call_stream` оборачивает только свою десанитизацию, а получение
-   следующего чанка из upstream-итератора намеренно вынесено за эту защиту.
-   Рост `internal` означает баг в собственном pre/post-call коде шлюза, а не
-   отказ провайдера и не дубль блокировки конкретного компонента.
+   `httpx.RemoteProtocolError`) не считается ни `internal`, ни `desanitize`:
+   ASGI-десанитайзер отправляет уже восстановленные хвосты, пробрасывает
+   исключение самого litellm без изменений, а аудит-запись запроса — `failed`.
+   Рост `internal` означает баг в собственном pre-call коде шлюза, а не отказ
+   провайдера и не дубль блокировки конкретного компонента; сбой восстановления —
+   это `desanitize` (следующий раздел).
+
+### Растёт `gateway_failure{component="desanitize"}`
+
+Симптом: растёт `gateway_failure{component="desanitize"}`. В логе шлюза одна из
+строк:
+
+- `gateway_desanitize_failed request_id=… phase=before_start|after_start error=<тип>` —
+  ответ не удалось восстановить;
+- `gateway_terminal_audit_lost request_id=… outcome=… error=<тип>` или
+  `terminal_audit_publish_failed request_id=… error=<тип>` — аудит-запись запроса
+  не записалась, включая повтор;
+- `terminal_audit_drain_incomplete pending=<n>` — при остановке записи ещё
+  писались, когда истекло окно отмены.
+
+Поведение: fail-closed, без контента. Сбой восстановления до начала ответа даёт
+500 `E_INTERNAL`; после начала клиент получает уже восстановленные события, а
+поток закрывается, что закрывает и апстрим. litellm оригинала не видит ни в том,
+ни в другом случае, а строки лога несут только request id, фазу или исход и тип
+исключения. Аудит-запись запроса — `failed` + `E_INTERNAL`
+(`docs/audit-schema.ru.md`, «Итоговая запись»).
+
+Действия:
+1. `gateway_desanitize_failed`: баг шлюза или форма ответа, которой
+   восстановитель не ждёт. Запишите `phase` и `error=`; если началось после
+   изменения litellm или провайдера, сначала сравните форму ответа этого
+   маршрута. Fail-open-запасного пути нет.
+2. `gateway_terminal_audit_lost` / `terminal_audit_publish_failed`: аудит-sink
+   отказал дважды для этого запроса (первая запись и её единственный повтор),
+   записи у запроса нет — это инцидент sink-а и дыра в полноте аудита (см. ниже).
+3. `terminal_audit_drain_incomplete`: остановка оборвала записи. Проверьте
+   задержку sink-а; ожидание ограничено `CORP_LLM_CANCEL_GRACE_SECONDS`.
 
 ### Растёт `gateway_failure{component="audit"}`
 
@@ -171,6 +203,20 @@ payload litellm для этого запроса записи нет. В OTEL gu
 запись из allow-list плюс ключи, которые сгенерировал writer litellm.
 `error=GuardrailInformationShapeError` после обновления litellm означает, что
 writer litellm собирает запись другой формы: прежде всего сверьте её с allow-list.
+
+### Под шлюза завершается при старте
+
+Симптом: контейнер так и не слушает порт 4000; процесс завершается с
+фиксированным кодом и одной строкой лога. `python -m corp_llm_gateway.serve`
+отказывается работать в полусконфигурированном виде, а не запускает litellm без
+guardrail.
+
+| Код | Значение | Что проверить |
+|---|---|---|
+| **78** (`EX_CONFIG`) | конфиг litellm или шлюза непригоден | `CORP_LLM_LITELLM_CONFIG` (по умолчанию `/etc/litellm/config.yaml`): файл есть, называется `.yaml`/`.yml`, читается, это непустой YAML-словарь; в нём нет `general_settings.pass_through_endpoints` и `general_settings.database_url`. Тот же код — при некорректных `CORP_LLM_SERVE_PORT`, ключах лимита одновременных запросов, `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH`, при неработоспособной выдаче токенов и при `CORP_LLM_ALLOW_LITELLM_DEBUG=1` с `CORP_ENV` prod/production. Полный список — `configuration.md` |
+| **70** (`EX_SOFTWARE`) | litellm стартовал, но шлюз отказывается взводиться; по строке `arm refused (<problem>)` на каждую проблему | `guardrail_absent`: в `litellm.callbacks` нет `CorpLlmGuardrail` — строка `litellm_settings.callbacks` в конфиге должна называть `corp_llm_gateway.bootstrap.guardrail`. `apply_guardrail`, `scan_raw_request`, `run_in_parallel`: guardrail настроен так, что litellm пропустил бы его pre-call или отбросил бы переписанный запрос. `litellm_debug_logging`, `litellm_set_verbose`: включён DEBUG litellm (`LITELLM_LOG=DEBUG`, `DETAILED_DEBUG`, `--detailed_debug`, `litellm_settings.set_verbose`); litellm печатает исходный запрос до любого pre-call хука. `CORP_LLM_ALLOW_LITELLM_DEBUG=1` пропускает эти две вне prod, только для тестов. `response_compressor`: приложение litellm сжимает ответы, а десанитайзер ответов шлюза пропустил бы их без восстановления |
+| **2** | миграция схемы Prisma не может продолжиться | Доступны ли `DATABASE_URL` / `DIRECT_URL`? Строка лога несёт текст RuntimeError от `PrismaManager` litellm |
+| **1** | настройка схемы Prisma не удалась после повторов при заданном `ENFORCE_PRISMA_MIGRATION_CHECK` | База данных. Снимите эту переменную, чтобы понизить отказ до предупреждения, — только если вы согласны стартовать на немигрированной схеме |
 
 ### 429 `E_CAPACITY` / 408 `E_BODY_TIMEOUT`
 

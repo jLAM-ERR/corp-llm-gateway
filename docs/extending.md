@@ -242,6 +242,23 @@ Every seam above is built to fail safe:
   fail-closed at load.
 - **No third-party runtime code** on the egress path — algorithms are in-tree and named.
 
+## The response boundary: what an extension sees
+
+Originals exist in two places only: in the pre-call while it rewrites the
+request, and in the ASGI desanitiser (`route_gate/desanitize_middleware.py`)
+while it restores the response on its way to the client. Every seam in this
+guide sits outside both. An audit sink or a metrics exporter gets content-free
+records and label values; a callback registered in litellm (a logger, a
+guardrail, an OTEL exporter) sees placeholders in the request and in the
+response, because the reversal runs after litellm is done with it. There is no
+hook for the client-side, restored view, and there will not be one: a component
+that sees restored text is a new M1-14 surface. An extension that needs content
+works on placeholders, or is a detector on the way in. Do not add an
+`apply_guardrail` or a litellm `CustomGuardrail` for it: the first stops our
+pre-call from running and refuses to arm (exit 70), the second turns litellm's
+per-chunk hooks on for every callback, and the shipped configs are pinned to
+carry neither (`docs/security.md` §15).
+
 ## Tasks several requests await: `inflight.spawn_shared`
 
 The route gate's in-flight limiter (`route_gate/inflight.py`) owns every task a

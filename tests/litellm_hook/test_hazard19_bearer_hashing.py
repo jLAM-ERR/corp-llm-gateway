@@ -205,8 +205,8 @@ def provider_key_sites(route: str, stream: bool, anthropic_header: str = "x-api-
 
 
 def _assert_only_in_log_kwargs(capture: KwargsCapture, secret: str, expected: list[str]) -> None:
-    assert sorted(token_sites(capture.kwargs[0], secret)) == expected
     for needle in _needles(secret):
+        assert sorted(token_sites(capture.kwargs[0], needle)) == expected, needle
         assert token_sites(capture.kwargs[0]["standard_logging_object"], needle) == []
         assert token_sites(capture.spend_rows, needle) == []
 

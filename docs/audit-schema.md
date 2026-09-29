@@ -4,7 +4,8 @@ Source of truth for what the gateway emits to its audit pipeline.
 Plan ref: M3-0. Read-with: `docs/plans/20260507-external-sanitizer-gateway-v1.md`
 and `docs/security.md` (pipeline flow, Langfuse/SIEM/S3 sinks, invariants).
 
-The custom logger (M3-1) emits one JSON record per gateway request.
+The gateway emits one JSON record per request (M3-1). For a request the
+pre-call passed, that is the request's terminal record (below).
 Vector (M3-3) parses each record and asserts the `NEVER` rules — any record
 containing a `NEVER` field is dropped, and the `audit_drop` metric increments
 (SIEM alert wired in M3-9).
@@ -16,20 +17,20 @@ and Vector drops it.
 
 | Field | Type | Description |
 |---|---|---|
-| `timestamp` | string (RFC3339, UTC) | When the gateway received the request |
+| `timestamp` | string (RFC3339, UTC) | When the record was written |
 | `request_id` | string (uuidv7) | Stable per-request id; survives streaming |
 | `user_id` | string | Resolved from `X-Corp-Auth` token (M2-2) |
 | `team_id` | string | Resolved from token; gates per-team rules + retention |
 | `provider` | string | `anthropic` or `openai` |
 | `model` | string | Resolved from upstream request body |
-| `latency_ms` | int | Wall-clock from receive to last byte upstream |
-| `prompt_token_count` | int | From upstream response |
-| `completion_token_count` | int | From upstream response |
+| `latency_ms` | int | Wall-clock milliseconds; for a terminal record, from the pre-call's start to the moment the record's outcome was written (the response's end, or the ticket's close) |
+| `prompt_token_count` | int | From the provider's response `usage` (read by the ASGI desanitiser as the response passes, or added by litellm's success log while the record is open); `0` when neither reported one |
+| `completion_token_count` | int | Same source as `prompt_token_count` |
 | `redaction_count` | int | Number of DISTINCT secrets redacted in the request (one per distinct original — NOT an occurrence count) |
 | `finding_label_counts` | object\<string, int\> | `{"EMAIL": 2, "PERSON": 1}` style; label histogram only — no text; always populated; `sum(values) == redaction_count` |
 | `cache_a_hit` | bool | Whether this request hit the dedup cache |
 | `gateway_version` | string | App version that handled the request |
-| `status` | string | `ok` / `failed` / `degraded` / `cancelled` (the client disconnected before the response completed and the gateway cancelled the request — `error_code` `E_CLIENT_DISCONNECTED`, counts only, no `placeholder_list`; from the ASGI restorer's terminal record, not yet wired, also `E_SERVER_SHUTDOWN` — the server cancelled the request, e.g. at shutdown) |
+| `status` | string | `ok` / `failed` / `degraded` / `cancelled`. `cancelled`: the request ended before its response completed — `error_code` `E_CLIENT_DISCONNECTED` (the client left) or `E_SERVER_SHUTDOWN` (the server cancelled it, e.g. at shutdown); counts only, no `placeholder_list`. How a terminal record's status is decided: below |
 
 ## NEVER fields
 
@@ -65,6 +66,31 @@ Present only under the conditions noted; absent otherwise.
 | `corp_llm_latency_ms` | corp-LLM path was taken | Sub-stage latency for capacity tuning |
 | `pre_pass_latency_ms` | pre-pass path was taken | Sub-stage latency |
 | `audit_buffer_full` | Vector buffer at ≥50% | Operational signal |
+
+## The terminal record
+
+A request the pre-call passed gets exactly one record, written by
+`route_gate/terminal_audit.py` from content-free facts the pre-call leaves on the
+request's ticket — never by a litellm callback. A request the route gate, the
+in-flight limiter or the pre-call refused keeps the record written at the
+refusal instead. Security rationale: [`security.md`](security.md) §15.
+
+| `status` | `error_code` | When |
+|---|---|---|
+| `ok` | — | the final body of a 2xx response went out (restored, when the request had placeholders to restore) |
+| `failed` | the pre-call's code, or none | a non-2xx response, a stream that carried an error event, or litellm's app raising mid-response |
+| `failed` | `E_INTERNAL` | the ASGI desanitiser could not restore the response (also `gateway_failure{component="desanitize"}`), or the request ended with no final body and nobody cancelled it |
+| `cancelled` | `E_CLIENT_DISCONNECTED` | the client left before the response completed |
+| `cancelled` | `E_SERVER_SHUTDOWN` | the server cancelled the request (shutdown, pod drain) |
+
+Precedence, first match wins: a restoration failure stands whatever happens
+later; an outcome published at the response's end stands against a later
+cancel (the client got the response), except that one published after the client
+left is `cancelled`; otherwise the ticket's close decides. A failed write is
+retried once with the same outcome; a write that may have landed is never
+retried; a record lost after its last attempt is logged
+(`gateway_terminal_audit_lost request_id=… outcome=… error=<type>`) and counted as
+`gateway_failure{component="desanitize"}`.
 
 ## litellm's `guardrail_information` (not a field of this record)
 

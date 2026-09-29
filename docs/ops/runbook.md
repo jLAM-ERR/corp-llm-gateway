@@ -123,7 +123,22 @@ Action:
 1. Check the gateway pod logs for the matching `*_unexpected_error` line and its `exc_type=` — that names the exception class without leaking its message.
 2. If `exc_type` points at a known dependency (Postgres, Redis, the audit sink), treat it as that component's own incident instead — this path is the safety net, not the root cause.
 3. A request already blocked/failed by a specific component (e.g. `E_DLP_BLOCKED`) does NOT also count as `internal` — the wrapper skips the internal counter when a component-specific failure was already recorded for that request.
-4. An upstream provider/transport failure mid-stream (e.g. `httpx.RemoteProtocolError`) also does NOT count as `internal` — `post_call_stream` only wraps its own desanitization work; fetching the next chunk from the upstream iterator is deliberately outside that guard, so a provider failure propagates to litellm's own failure handling untouched. `internal` rising means a bug in the gateway's own pre/post-call code, not a downstream provider outage and not a duplicate of a component-specific block.
+4. An upstream provider/transport failure mid-stream (e.g. `httpx.RemoteProtocolError`) counts as neither `internal` nor `desanitize`: the ASGI desanitiser sends the tails it restored so far, re-raises litellm's own exception unchanged, and the request's audit record is `failed`. `internal` rising means a bug in the gateway's own pre-call code, not a downstream provider outage and not a duplicate of a component-specific block; a restoration failure is `desanitize` (next section).
+
+### `gateway_failure{component="desanitize"}` rises
+
+Symptom: `gateway_failure{component="desanitize"}` counts up. The gateway log has one of:
+
+- `gateway_desanitize_failed request_id=… phase=before_start|after_start error=<type>` — a response could not be restored;
+- `gateway_terminal_audit_lost request_id=… outcome=… error=<type>` or `terminal_audit_publish_failed request_id=… error=<type>` — a request's audit record could not be written, retry included;
+- `terminal_audit_drain_incomplete pending=<n>` — at shutdown, records were still being written when the cancel grace ran out.
+
+Behavior: fail-closed, content-free. A restoration failure before the response started answers 500 `E_INTERNAL`; after it started, the client gets the events restored so far and the stream is closed, which also closes the upstream. litellm never sees an original either way, and the log lines carry the request id, the phase or outcome and the exception type only. The request's audit record is `failed` + `E_INTERNAL` (`docs/audit-schema.md`, "The terminal record").
+
+Action:
+1. `gateway_desanitize_failed`: a gateway bug or a response shape the restorer does not expect. Note `phase` and `error=`; if it started after a litellm or provider change, compare that route's response shape first. There is no fail-open to fall back on.
+2. `gateway_terminal_audit_lost` / `terminal_audit_publish_failed`: the audit sink failed twice for that request (the first write and its one retry), so the request has no record — treat it as the sink's incident and as an audit-completeness gap (see below).
+3. `terminal_audit_drain_incomplete`: shutdown cut writes short. Check the sink's latency; `CORP_LLM_CANCEL_GRACE_SECONDS` bounds the wait.
 
 ### `gateway_failure{component="audit"}` rises
 

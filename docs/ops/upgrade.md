@@ -5,7 +5,8 @@ the `team_config` schema change, the issuance columns on `corp_tokens` (before
 enabling developer token issuance), the RS256 operator-token breaking change,
 the new launch command (`python -m corp_llm_gateway.serve`) that the route gate
 requires, the refused litellm management surface, the in-flight cap now on by
-default, and `deploy.sh` defaulting to subscription mode.
+default, `deploy.sh` defaulting to subscription mode, and litellm DEBUG output
+now refusing to boot.
 
 ## Database schema
 
@@ -447,6 +448,38 @@ Redis (`REDIS_URL=redis://redis:6379/0`). Dropping the `conv:*` keys destroys th
 per-conversation mappings that `post_call` desanitization requires, and every
 in-flight conversation then returns `[LABEL_NNN]` placeholders to the developer
 instead of the original text.
+
+## Responses are restored outside litellm; litellm DEBUG refuses to boot
+
+The response reversal moved from the guardrail callback into the gateway's ASGI
+layer, so nothing inside litellm sees an original (`../security.md` §15).
+What changes for operators:
+
+- **litellm DEBUG output exits 70 at boot** (`arm refused (litellm_debug_logging)`
+  or `(litellm_set_verbose)`): `LITELLM_LOG=DEBUG`, `DETAILED_DEBUG`,
+  `--detailed_debug` or `litellm_settings.set_verbose`. litellm prints the
+  original request, the corp token and the BYOK `Authorization` before any
+  pre-call hook. Remove the setting before rolling out. For a test environment
+  only, `CORP_LLM_ALLOW_LITELLM_DEBUG=1` lets it through; under
+  `CORP_ENV=prod|production` that key itself is exit 78.
+- **A rewritten route refuses a body that is not `application/json`** (415
+  `E_ROUTE_BLOCKED`, `route_gate_body_not_json`) or a JSON body with a top-level
+  `policies` key (403, `route_gate_body_policies`). A custom client that posts a
+  form body breaks.
+- **Keep `general_settings.supported_db_objects: ["models"]`** in any litellm
+  config of your own (the shipped ones carry it; `configuration.md`).
+- **Audit:** one terminal record per request, written when the response ends.
+  A new `error_code`, `E_SERVER_SHUTDOWN` (`status` `cancelled`), marks requests
+  the server cancelled at shutdown or pod drain; dashboards that count
+  `cancelled` as client disconnects should split on `error_code`
+  (`../audit-schema.md`). `gateway_failure{component="desanitize"}` is a new
+  label value (`runbook.md`).
+- **OpenAI chat-completions streaming now gets its originals back**; it used to
+  get placeholders.
+
+No data migration. Rollback is a redeploy of the previous image tag, which
+brings back the chat-streaming placeholders and the logging-snapshot and corp
+token exposures fixed here (`../../CHANGELOG.md`, Security).
 
 ## Rolling deploy
 

@@ -7,35 +7,95 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed — responses are restored outside litellm; chat-completions streaming restored
+### Security — litellm's logging surfaces, DEBUG and policy bodies
+
+Found by the litellm guardrail adoption plan (`docs/security.md` §15, hazards 1-19). Hazards 17,
+17b and 18 are **pre-existing on `release/1.0.x`** (same litellm 1.101.0). They are config-gated:
+only a callback registered in litellm receives these surfaces, and the shipped configs register
+none but the gateway's own.
+
+- **`/v1/responses` logging payloads held the original input** (hazard 17). litellm snapshots the
+  request into its logging object before any pre-call hook, so the log kwargs and every
+  `StandardLoggingPayload`, success and failure, carried the text the gateway had just rewritten.
+  The pre-call now hands the logging object the rewritten request, for every `input` shape.
+- **A Stage 5 (DLP) refusal handed every callback's failure hook the original request** (hazard
+  17b). The body snapshot's content keys are now rewritten before the scan. A Stage 0 refusal
+  still hands over the original — it refuses before anything is rewritten; no callback of ours
+  overrides that hook.
+- **The `X-Corp-Auth` value reached litellm's logging surfaces** (hazard 18, invariant 4). On
+  `/v1/chat/completions` litellm copies the request headers into `metadata.requester_metadata`,
+  which the strip never visited: the log kwargs, every `StandardLoggingPayload`, the spend-log
+  request (with `store_prompts_in_spend_logs`) and a litellm DEBUG line carried the token. And on
+  every route a request refused with 401 handed the token to every callback's failure hook,
+  because the strip ran after authentication. The pre-call now strips the token first, from that
+  copy and from litellm's logging object too.
+- **litellm DEBUG refuses to arm** (exit 70, `litellm_debug_logging` / `litellm_set_verbose`).
+  litellm's DEBUG lines print the original request before any pre-call hook, and two of them
+  ("Request Headers" and "[PROXY] returned data from litellm_pre_call_utils") print the raw corp
+  token; the second prints the whole request, so the developer's BYOK `Authorization` too (a
+  subscription OAuth token, invariant 3). The arm check is their only guard.
+  `CORP_LLM_ALLOW_LITELLM_DEBUG=1` allows DEBUG outside prod, for tests only; in prod it is exit 78.
+- **Also refused at arm:** an `apply_guardrail` anywhere in the guardrail's MRO (litellm would
+  never run its pre-call), `scan_raw_request` / `run_in_parallel` (litellm would discard its
+  rewrite), and a response compressor on litellm's app (`response_compressor`).
+- **Request bodies naming policies are refused at the route gate.** An admitted rewritten request
+  whose JSON body has a top-level `policies` key is 403 `E_ROUTE_BLOCKED`
+  (`block_reason=route_gate_body_policies`), and one whose body is not `application/json` is 415
+  (`route_gate_body_not_json`: litellm would read a form body, a `policies` field included) — both
+  before litellm parses it. litellm applies a body's `policies` to that request with no
+  attachment.
+
+### Fixed — chat-completions streaming came back with placeholders
+
+- **OpenAI chat-completions streaming is restored.** The callback reversal passed litellm's
+  `ModelResponseStream` chunks through untouched, so OpenAI-SDK streaming clients got the
+  placeholders. Live on `release/1.0.x`. Tail chunks now carry the stream's `id` / `object` /
+  `created` / `model` and `choices[].index`, and each choice's held text rides in the chunk with
+  its `finish_reason` — pinned against the installed OpenAI SDK's stream accumulator.
+
+### Changed — responses are restored outside litellm
 
 - **The gateway's one response reversal is now an ASGI middleware** in front of litellm's app,
   inside the in-flight limiter (`route_gate/desanitize_middleware.py`). The guardrail callback no
-  longer restores anything: litellm, and every callback or log inside it, sees placeholders only;
-  the client gets its originals.
-- **OpenAI chat-completions streaming is restored.** The callback reversal passed litellm's
-  `ModelResponseStream` chunks through untouched, so OpenAI-SDK streaming clients got the
-  placeholders.
-- **One audit record per request, written when the response ends** (`route_gate/terminal_audit.py`):
-  `ok` at the final body, `failed` + `E_INTERNAL` for a restoration failure (plus
-  `gateway_failure{component="desanitize"}`), `cancelled` when the client or the server ended it.
-  litellm's success/failure log only adds token counts to it; the counts are also read off the
-  response itself. A chat stream always carries its usage chunk to the gateway, which drops it
-  when the client did not ask for it (`stream_options.include_usage`).
-- **`/v1/responses` logging payloads** held the original input (litellm snapshots the request
-  before any pre-call hook); the pre-call now refreshes that snapshot with the rewritten request.
-- **litellm DEBUG is refused at arm** (exit 70): it prints the original request before any
-  pre-call hook. `CORP_LLM_ALLOW_LITELLM_DEBUG=1` allows it outside prod, for tests only. So is a
-  response compressor on litellm's app (`response_compressor`).
-- **A request body with a top-level `policies` key is refused** at the route gate (403
-  `E_ROUTE_BLOCKED`, `block_reason=route_gate_body_policies`) before litellm parses it, so is a
-  rewritten-route body that is not `application/json` (415, `route_gate_body_not_json`: litellm
-  would read a form body, a `policies` field included), and the shipped litellm configs pin
-  `general_settings.supported_db_objects: ["models"]`, so no policy or guardrail row is ever loaded
-  from litellm's database.
-- **Known limitation — interleaved tool-call fragments.** A chat stream that interleaves the
-  argument fragments of two tool calls (off-spec for OpenAI; the v1 providers never send it) gets
-  the placeholders back in those arguments, never the originals, and the stream does not fail.
+  longer restores anything, so litellm and every callback, hook or log inside it sees placeholders
+  only; the client gets its originals. It is keyed by the gateway's request ticket and holds its
+  own mapping snapshot (released at the end of the response), so it no longer depends on Cache B.
+  A restoration failure is a content-free 500 `E_INTERNAL` (or, once the stream started, a closed
+  stream) plus `gateway_failure{component="desanitize"}`. A response with a `Content-Encoding`
+  passes through unrestored. Measured overhead on the served stack (stub provider, p50 per
+  flow, against 37c21f9): under 0.75 ms on every flow; within +10% on every SSE flow and every
+  unary flow except chat unary (+13.4% in one of two batches, +6.4% in the other); run-to-run
+  spread on the base alone was up to 1.2 ms.
+- **One audit record per request, written when the response ends** (`route_gate/terminal_audit.py`),
+  never by a litellm callback: `ok` at the final body; `failed` for a non-2xx response or a
+  stream error, and `failed` + `E_INTERNAL` for a restoration failure; `cancelled` +
+  `E_CLIENT_DISCONNECTED` when the client left, and the new `E_SERVER_SHUTDOWN` when the server
+  cancelled the request (shutdown, pod drain). A failed write is retried once; a lost one counts
+  as `gateway_failure{component="desanitize"}` (`docs/audit-schema.md`, "The terminal record").
+- **Token counts come from the response itself** (the JSON `usage`, the stream's usage events),
+  not only from litellm's success log. A chat stream now always asks for its usage chunk
+  (`stream_options.include_usage`); when the client did not ask, the gateway reads it and drops it.
+- **The shipped litellm configs pin `general_settings.supported_db_objects: ["models"]`**
+  (compose and Helm), so litellm never loads a policy or guardrail row from its database. Keep the
+  pin in any config of your own (`docs/ops/configuration.md`).
+- **`enforces_request_content = True`** on the guardrail, so litellm's `guardrails_only` pre-call
+  walk cannot skip it. The guardrail stays a plain `CustomLogger`: litellm's `CustomGuardrail`
+  base would re-open the policy-pipeline skip and the guardrail-name substitution
+  (`docs/security.md` §15).
+
+### Known limitations — the response boundary
+
+- **Interleaved tool-call fragments.** A chat stream that interleaves the argument fragments of
+  two tool calls (off-spec for OpenAI; the v1 providers stream calls in sequence) gets the
+  placeholders back in those arguments, never the originals, and the stream does not fail.
+- **Responses `sequence_number` is renumbered** on a restored `/v1/responses` stream (held text
+  and tails would otherwise repeat or skip numbers), so the numbers a client sees can differ from
+  the provider's.
+- **Free-text fields not yet covered** — chat `messages[].name` and `prediction.content`,
+  Responses `prompt.variables` and Anthropic `citations[]` egress unrewritten (citations also come
+  back with placeholders): the open rows in `docs/security.md` §2, "Not sanitized / deferred".
+- **litellm's config table (hazard 14c) and the provider key in its log kwargs (hazard 19b)**
+  are characterised, not closed (`docs/security.md` §11 (j), §15).
 
 ### Added — content-free `guardrail_information` in litellm's logging payload
 
@@ -118,18 +178,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (the cap is not authorization). Properties the cap guarantees: tasks shared between requests
   survive a client disconnect; no slot is held before the request body is complete; a cancelled
   request never retains user content.
-- **The `X-Corp-Auth` value reached litellm's logging surfaces** (invariant 4; also on
-  `release/1.0.x`). On `/v1/chat/completions` litellm copies the request headers into
-  `metadata.requester_metadata`, which the strip never visited: the log kwargs, every
-  `StandardLoggingPayload`, the spend-log request (with `store_prompts_in_spend_logs`) and a
-  litellm DEBUG line carried the token. And on every route a request refused with 401 handed the
-  token to every callback's failure hook, because the strip ran after authentication. The
-  pre-call now strips the token first, from that copy and from litellm's logging object too.
-  Not covered: two litellm DEBUG lines that run before the pre-call ("Request Headers",
-  `litellm_pre_call_utils.py:1987`, and "[PROXY] returned data from litellm_pre_call_utils",
-  `:2438`) still print the raw token; `:2438` prints the whole request, so it also carries the
-  developer's BYOK `Authorization` raw (a subscription OAuth token, invariant 3). The only guard
-  is the arm-time DEBUG refusal (`CORP_LLM_ALLOW_LITELLM_DEBUG` is refused in prod).
 
 ### Added — production compose deploy target (`compose/`)
 

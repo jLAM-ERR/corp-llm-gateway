@@ -8,7 +8,8 @@ callback; everything else (audit pipeline, auth, observability, serving) is prov
 operated open-source components rather than built in-house.
 
 Every request is sanitized in `pre_call`, forwarded to Anthropic / OpenAI with the developer's
-BYOK key intact, de-sanitized in `post_call`, and audited.
+BYOK key intact, de-sanitized on the way back by the gateway's own ASGI layer (outside LiteLLM),
+and audited.
 
 ## Request data flow
 
@@ -37,7 +38,7 @@ flowchart TD
     end
 
     DLP -->|clean| UP["Anthropic / OpenAI  (Authorization:Bearer untouched)"]
-    UP --> DS["post_call · StreamingDesanitizer  (placeholders longest-first)"]
+    UP --> DS["ASGI desanitiser, outside LiteLLM · route_gate/desanitize_middleware.py  (placeholders longest-first)"]
     DS --> AUD["audit · Vector → Langfuse + S3 + SIEM  (NEVER-fields gate)"]
     DS -->|"originals restored"| Dev
 ```
@@ -58,17 +59,21 @@ flowchart TD
    is an optional extra).
 4. **Stage 5 — DLP egress guard**: independent second-layer re-scan of the sanitized outbound
    payload for canary strings and high-confidence secrets; blocks any survivor.
-5. **post_call**: `StreamingDesanitizer` rebuilds originals from the per-conversation mapping
-   (placeholders sorted longest-first — invariant #5).
-6. **audit**: Vector → Langfuse + S3 + SIEM with the NEVER-fields gate.
+5. **Response restoration** — not in the LiteLLM callback: `route_gate/desanitize_middleware.py`,
+   inside the in-flight limiter and in front of LiteLLM's app, rebuilds originals in the response
+   from the mapping the pre-call handed the request's ticket (placeholders sorted longest-first —
+   invariant #5), so LiteLLM and its callbacks only ever see placeholders
+   ([security.md](security.md) §15).
+6. **audit**: one terminal record per request, written when the response ends
+   (`route_gate/terminal_audit.py`) → Vector → Langfuse + S3 + SIEM with the NEVER-fields gate.
 
 ## Caches
 
 Two caches back the request path:
 
 - **Cache A** — content-keyed dedup, shared across conversations, TTL ~10 h.
-- **Cache B** — per-conversation mapping store (Redis or in-memory), sliding TTL ~1 h;
-  **required** by `post_call` to reverse redactions. Today `conversation_id == request_id`,
+- **Cache B** — per-conversation mapping store (Redis or in-memory), sliding TTL ~1 h; the
+  response restoration does not read it (it uses the ticket's snapshot). Today `conversation_id == request_id`,
   so Cache B is not yet reused across sibling requests — see [conversation-id.md](conversation-id.md).
 
 ## See also
