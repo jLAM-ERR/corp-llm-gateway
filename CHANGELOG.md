@@ -104,6 +104,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (the cap is not authorization). Properties the cap guarantees: tasks shared between requests
   survive a client disconnect; no slot is held before the request body is complete; a cancelled
   request never retains user content.
+- **The `X-Corp-Auth` value reached litellm's logging surfaces** (invariant 4; also on
+  `release/1.0.x`). On `/v1/chat/completions` litellm copies the request headers into
+  `metadata.requester_metadata`, which the strip never visited: the log kwargs, every
+  `StandardLoggingPayload`, the spend-log request (with `store_prompts_in_spend_logs`) and a
+  litellm DEBUG line carried the token. And on every route a request refused with 401 handed the
+  token to every callback's failure hook, because the strip ran after authentication. The
+  pre-call now strips the token first, from that copy and from litellm's logging object too.
 
 ### Added — production compose deploy target (`compose/`)
 

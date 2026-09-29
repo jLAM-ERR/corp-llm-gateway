@@ -124,6 +124,8 @@ CHUNK_LOG_FILE = "common_request_processing.py"
 DB_STRING = "corp_db_string_capture"
 DB_KNOWN = "corp_db_known_capture"
 PASS_THROUGH_PATH = "/corp-db-pass-through"
+# Our pre-call's line once the corp token is out of the request and litellm's snapshot.
+STRIPPED_MARKER = "litellm_pre_call_corp_token_stripped"
 
 
 def _db_capture_class(name: str) -> type:
@@ -190,6 +192,13 @@ class _DebugRecords(logging.Handler):
 
     def holding(self, needle: str) -> list[tuple[str, int]]:
         return sorted({(f, n) for f, n, m in self.records if needle in m})
+
+    def holding_after(self, marker: str, needle: str) -> list[tuple[str, int]] | None:
+        """The sites holding ``needle`` after the first ``marker`` line; None without one."""
+        starts = [i for i, (_, _, m) in enumerate(self.records) if m.startswith(marker)]
+        if not starts:
+            return None
+        return sorted({(f, n) for f, n, m in self.records[starts[0] + 1 :] if needle in m})
 
 
 def _body(route: str, *, stream: bool, extra: dict[str, Any] | None = None) -> bytes:
@@ -258,6 +267,9 @@ async def main() -> None:
 
     for lg in (verbose_logger, verbose_proxy_logger, verbose_router_logger):
         lg.addHandler(debug)
+    hook_logger = logging.getLogger("corp_llm_gateway.litellm_hook")
+    hook_logger.addHandler(debug)
+    hook_logger.setLevel(logging.INFO)
 
     gw_sock = _listening_socket()
     port = gw_sock.getsockname()[1]
@@ -323,6 +335,12 @@ async def main() -> None:
             "records": records,
             "mappings_left": len(asgi.response_mappings),
             "req_state": len(guardrail._req_state),
+            "corp_token": {
+                "captures": {
+                    capture.name: sorted(capture.seen.holding(TOKEN)) for capture in captures
+                },
+                "debug_after_pre_call": debug.holding_after(STRIPPED_MARKER, TOKEN),
+            },
             "db": {capture.name: _db_seen(capture) for capture in db_captures},
         }
 
@@ -477,6 +495,7 @@ def _db_seen(capture: Any) -> dict[str, Any]:
         "failed_with_placeholder": sum(PLACEHOLDER_MARK in f for f in capture.failed),
         "spend_logs": [json.loads(row) for row in capture.spend_logs],
         "any_original": any(ORIGINAL_MARK in value for value in everything),
+        "holding_corp_token": any(TOKEN in value for value in everything),
     }
     capture.seen.clear()
     capture.kwargs.clear()

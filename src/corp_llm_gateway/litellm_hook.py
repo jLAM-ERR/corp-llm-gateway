@@ -429,7 +429,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         Claude-Code-style requests with a huge default output budget
         from overshooting the upstream model's context window.
 
-        Order: auth → strip corp token → sanitize messages → return.
+        Order: strip corp token → auth → sanitize messages → return.
         Failures are mapped to GuardrailHttpException with stable
         error_code so post-call audit can attribute the failure.
 
@@ -444,6 +444,19 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         """
         request_id = self._ensure_request_id(data)
         pre_call_started = time.monotonic()
+        # Read for auth, then stripped before anything can refuse: litellm hands a
+        # refused request, as it stands, to every failure hook (invariant 4).
+        inbound_headers = _extract_auth_headers(data)
+        data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
+        # The corp token arrives duplicated across every header-bearing location
+        # and some providers forward proxy_server_request.headers upstream, so
+        # strip it from ALL of them, not just data["headers"] (invariant 4).
+        _strip_corp_token_everywhere(data)
+        _strip_corp_token_from_logging_obj(data)
+        logger.info(
+            "litellm_pre_call_corp_token_stripped request_id=%s",
+            request_id,
+        )
         ticket = current_ticket()
         if ticket is not None and ticket.cancelled:
             # The route gate already wrote this request's `cancelled` record; a
@@ -481,7 +494,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 )
                 data["max_tokens"] = self._max_output_tokens_cap
 
-        inbound_headers = _extract_auth_headers(data)
         try:
             async with asyncio.timeout(AUTH_LOOKUP_BOUND_S):
                 ctx = await self._auth.authenticate_headers(inbound_headers)
@@ -534,16 +546,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             request_id,
             ctx.team_id,
             ctx.user_id,
-        )
-
-        data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
-        # The corp token arrives duplicated across every header-bearing location
-        # and some providers forward proxy_server_request.headers upstream, so
-        # strip it from ALL of them, not just data["headers"] (invariant 4).
-        _strip_corp_token_everywhere(data)
-        logger.info(
-            "litellm_pre_call_corp_token_stripped request_id=%s",
-            request_id,
         )
 
         # Optional: strip inbound HTTP wire headers from data so litellm
@@ -2053,26 +2055,58 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
     litellm's logging-metadata dict — the same dict ``_scatter`` threads the
     request id through and litellm hands to log callbacks — so a corp token
     mirrored there would reach the audit/logging pipeline, which invariant 4
-    forbids. The rule: every bucket ``_extract_auth_headers`` reads for auth must
-    be strippable here too. ``_drop_corp_token`` only removes ``x-corp-auth``;
-    the developer's BYOK ``Authorization`` header is left untouched (invariant 3).
+    forbids. Each metadata bucket's ``requester_metadata`` copy and the body
+    snapshot's metadata are covered too. The rule: every bucket
+    ``_extract_auth_headers`` reads for auth must be strippable here too.
+    ``_drop_corp_token`` only removes ``x-corp-auth``; the developer's BYOK
+    ``Authorization`` header is left untouched (invariant 3).
     """
     _drop_corp_token(data.get("headers"))
-    for bucket_key in ("proxy_server_request", "metadata", "litellm_metadata"):
-        bucket = data.get(bucket_key)
-        if isinstance(bucket, dict):
-            _drop_corp_token(bucket.get("headers"))
+    _drop_corp_token_from_request(data)
     lparams = data.get("litellm_params")
     if isinstance(lparams, dict):
-        meta = lparams.get("metadata")
-        if isinstance(meta, dict):
-            _drop_corp_token(meta.get("headers"))
-        proxy_request = lparams.get("proxy_server_request")
-        if isinstance(proxy_request, dict):
-            _drop_corp_token(proxy_request.get("headers"))
+        _drop_corp_token_from_request(lparams)
     secret_fields = data.get("secret_fields")
     if isinstance(secret_fields, dict):
         _drop_corp_token(secret_fields.get("raw_headers"))
+
+
+def _drop_corp_token_from_request(holder: dict[str, Any]) -> None:
+    """The metadata buckets and ``proxy_server_request`` of *holder*, and the metadata
+    buckets of its request-body snapshot. On chat litellm deep-copies the metadata,
+    headers included, into ``requester_metadata`` (hazard 18): a copy, not the dict the
+    other buckets share."""
+    _drop_corp_token_from_metadata(holder)
+    proxy_request = holder.get("proxy_server_request")
+    if isinstance(proxy_request, dict):
+        _drop_corp_token(proxy_request.get("headers"))
+        body = proxy_request.get("body")
+        if isinstance(body, dict):
+            _drop_corp_token_from_metadata(body)
+
+
+def _drop_corp_token_from_metadata(holder: dict[str, Any]) -> None:
+    for bucket_key in ("metadata", "litellm_metadata"):
+        bucket = holder.get(bucket_key)
+        if not isinstance(bucket, dict):
+            continue
+        _drop_corp_token(bucket.get("headers"))
+        requester = bucket.get("requester_metadata")
+        if isinstance(requester, dict):
+            _drop_corp_token(requester.get("headers"))
+
+
+def _strip_corp_token_from_logging_obj(data: dict[str, Any]) -> None:
+    """The same strip on litellm's logging object, built before any pre-call hook ran:
+    its ``model_call_details`` and ``litellm_params`` are what every success and failure
+    log event, ``StandardLoggingPayload`` and spend-log row are read from."""
+    logging_obj = data.get("litellm_logging_obj")
+    details = getattr(logging_obj, "model_call_details", None)
+    if isinstance(details, dict):
+        _strip_corp_token_everywhere(details)
+    lparams = getattr(logging_obj, "litellm_params", None)
+    if isinstance(lparams, dict):
+        _strip_corp_token_everywhere({"litellm_params": lparams})
 
 
 def _scrub_retained_request_metadata(data: dict[str, Any]) -> None:

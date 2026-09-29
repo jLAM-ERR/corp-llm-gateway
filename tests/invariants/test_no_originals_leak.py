@@ -8,7 +8,8 @@ and assert that the originals do NOT appear in any of:
   (iii) exception traces propagated out of guardrail components
   (iv)  Prometheus metric labels (proxy: any string-typed metric value
         we emit during the run)
-  (v)   forwarded HTTP headers (proxy: header dicts after strip)
+  (v)   forwarded HTTP headers (proxy: header dicts after strip; + litellm's
+        logging snapshot, hazard 18)
   (vi)  pod stdout/stderr from unhandled exceptions
 
 This file does NOT cover the pre_call / post_call wiring (M1-7 / M1-8 are
@@ -1132,6 +1133,95 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
         assert byok in serialized, "BYOK Authorization dropped (invariant 3 violation)"
 
     assert _CORP_TOKEN not in caplog.text, "corp token leaked into a log line (invariant 4)"
+
+
+# (v-ter) hazard 18: litellm's logging snapshot. On chat litellm deep-copies the request
+# metadata, headers included, into metadata["requester_metadata"] before any pre-call
+# hook runs, and its logging object (built before the hook too) holds the metadata and
+# the body snapshot every success/failure log event, StandardLoggingPayload and spend-log
+# row is read from. A request our pre-call refuses is handed, as it stands, to every
+# failure hook. Each dict below is its own copy, so a strip that misses one shows. ------
+
+
+def _litellm_request(hdrs: dict[str, str]) -> tuple[dict, object]:
+    def meta() -> dict:
+        return {"headers": dict(hdrs), "requester_metadata": {"headers": dict(hdrs)}}
+
+    def request_side() -> dict:
+        return {
+            "metadata": meta(),
+            "litellm_metadata": meta(),
+            "proxy_server_request": {
+                "headers": dict(hdrs),
+                "body": {"metadata": meta(), "litellm_metadata": meta()},
+            },
+        }
+
+    class _LoggingObj:
+        def __init__(self) -> None:
+            self.model_call_details = {"litellm_params": request_side()}
+            self.litellm_params = request_side()
+
+    logging_obj = _LoggingObj()
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": dict(hdrs),
+        **request_side(),
+        "litellm_params": request_side(),
+        "secret_fields": {"raw_headers": dict(hdrs)},
+        "litellm_logging_obj": logging_obj,
+    }
+    return data, logging_obj
+
+
+def _logged_views(data: dict, logging_obj: object) -> list[str]:
+    return [
+        json.dumps({k: v for k, v in data.items() if k != "litellm_logging_obj"}),
+        json.dumps(logging_obj.model_call_details),  # type: ignore[attr-defined]
+        json.dumps(logging_obj.litellm_params),  # type: ignore[attr-defined]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_corp_token_never_reaches_litellms_logging_snapshot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    guardrail, _ = _header_strip_guardrail()
+    byok = "Bearer byok-developer-key"
+    data, logging_obj = _litellm_request({"X-Corp-Auth": _CORP_TOKEN, "Authorization": byok})
+
+    with caplog.at_level(logging.DEBUG):
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    views = _logged_views(data, logging_obj)
+    for view in views:
+        assert _CORP_TOKEN not in view, "corp token left in litellm's logging snapshot"
+        assert "x-corp-auth" not in view.lower()
+    # Invariant 3: only the corp token goes; each of the 20 / 9 / 9 header dicts keeps BYOK.
+    assert [view.count(byok) for view in views] == [20, 9, 9]
+    assert _CORP_TOKEN not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_refused_corp_token_is_stripped_before_the_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unknown (revoked, expired, mistyped) token: the 401 leaves nothing behind."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, _ = _header_strip_guardrail()
+    refused = "refused-corp-tok-v-ter"
+    data, logging_obj = _litellm_request({"X-Corp-Auth": refused})
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    assert ei.value.status_code == 401
+    for view in _logged_views(data, logging_obj):
+        assert refused not in view
+    assert refused not in caplog.text
+    assert refused not in "".join(traceback.format_exception(ei.value))
 
 
 # (xiii) system-field coverage (M1-14 gap): pre_call's data["system"] branches

@@ -18,6 +18,9 @@ instantiates into its success/failure lists) see placeholders only, in every hoo
 kwargs and ``StandardLoggingPayload``, success and failure; the spend-log row litellm
 builds with ``store_prompts_in_spend_logs`` on holds placeholders only; a pass-through
 route the row adds to litellm's app is 404 at the gate.
+
+Hazard 18: no capture, DB-added callback, spend-log row or litellm DEBUG line after our
+strip holds the ``X-Corp-Auth`` value.
 """
 
 from __future__ import annotations
@@ -307,6 +310,37 @@ def test_a_db_added_callbacks_failure_log_holds_placeholders_only(
         assert seen["any_original"] is False, name
         assert seen["failed"] >= 1 and seen["failed_with_placeholder"] >= 1
         assert seen["kwargs"] == seen["kwargs_with_placeholder"] >= 1
+
+
+# ── hazard 18: the corp token on litellm's logging surfaces ───────────────────
+
+
+def _corp_token_sites(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "captures": result["corp_token"]["captures"],
+        "db": {name: seen["holding_corp_token"] for name, seen in result["db"].items()},
+        "debug_after_pre_call": result["corp_token"]["debug_after_pre_call"],
+    }
+
+
+NO_CORP_TOKEN = {
+    "captures": {"before": [], "after": []},
+    "db": {"db-string": False, "db-known": False},
+    "debug_after_pre_call": [],
+}
+
+
+@pytest.mark.parametrize("flow", FLOWS)
+def test_no_logging_surface_holds_the_corp_token(served: dict[str, Any], flow: str) -> None:
+    """The ``X-Corp-Auth`` value: in no capture hook or ``StandardLoggingPayload``, no
+    DB-added callback's log kwargs or spend-log row, no litellm DEBUG line after our strip
+    (``[]``, not ``None``: the strip line was seen). Chat carried it in litellm's
+    ``requester_metadata`` copy of the request headers."""
+    assert _corp_token_sites(served["flows"][flow]) == NO_CORP_TOKEN
+
+
+def test_a_provider_error_log_holds_no_corp_token(served: dict[str, Any]) -> None:
+    assert _corp_token_sites(served["provider_error"]) == NO_CORP_TOKEN
 
 
 def test_a_pass_through_route_added_at_runtime_is_404_at_the_gate(

@@ -1033,7 +1033,9 @@ holds even if the string resolved to a callback with every hook (the served-stac
 makes it resolve to one).
 Prompts stored in spend logs are placeholders for the same reason: litellm builds the
 row from the log event's kwargs, whose `proxy_server_request.body` our pre-call points
-at the rewritten request. A pass-through route has no row in the gate's table, so it is
+at the rewritten request. Neither holds the `X-Corp-Auth` value (hazard 18): the pre-call
+drops it first, before anything can refuse the request, from every header copy litellm
+keeps — the chat `requester_metadata` copy and litellm's logging object included. A pass-through route has no row in the gate's table, so it is
 404 before litellm routes it. `ui_access_mode` governs litellm's UI, which the gate
 refuses. What does not hold: nothing notices such a callback after the arm check, and it
 gets what any callback after ours gets (placeholders, counts, request metadata). Pinned
