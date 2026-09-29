@@ -406,6 +406,33 @@ def test_the_route_gate_reasons_match_the_gate_itself() -> None:
     assert set(BLOCK_REASONS["route_gate"]) == set(GATE_REASONS)
 
 
+# Refuse before litellm runs: no pre-call, so no litellm guardrail status.
+BEFORE_LITELLM_SITES = ("route_gate", "capacity")
+
+
+def test_the_block_sites_are_pinned() -> None:
+    # A new site is a new family of alert labels, and a pre-call one also needs a
+    # litellm guardrail status: add it here only with its row in the status table.
+    assert set(BLOCK_REASONS) == {"stage0", "stage5", "policy", "route_gate", "capacity"}
+
+
+def test_every_pre_call_block_reason_has_a_litellm_guardrail_status() -> None:
+    # Read off BLOCK_REASONS by exclusion, not by the site names the table itself
+    # lists: a reason the table misses would otherwise surface only at runtime, as
+    # an unwritten guardrail_information entry (UnknownBlockReasonError).
+    from corp_llm_gateway.litellm_hook import GUARDRAIL_STATUS_BY_BLOCK_REASON
+
+    pre_call = [
+        reason
+        for site, reasons in BLOCK_REASONS.items()
+        if site not in BEFORE_LITELLM_SITES
+        for reason in reasons
+    ]
+
+    assert pre_call
+    assert [r for r in pre_call if r not in GUARDRAIL_STATUS_BY_BLOCK_REASON] == []
+
+
 def _returned_string_literals(module: object) -> set[str]:
     """Every `return "literal"` in a module — the reason codes it can produce.
 

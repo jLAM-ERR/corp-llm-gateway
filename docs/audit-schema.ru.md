@@ -76,7 +76,11 @@ NEVER — это предохранитель эшелонированной з�
 Запись проходит allow-list (`audit/invariants.py`,
 `assert_guardrail_information_allowed`): ключ NEVER или любой свободный текст
 отклоняются до того, как litellm их увидит, а запись, которую litellm собрал иначе,
-удаляется. В обоих случаях запрос продолжается; шлюз пишет в лог
+удаляется из метаданных запроса. До OTEL guardrail span litellm это удаление не
+доходит: writer litellm уже отправил его (`emit_guardrail_span`, litellm 1.101.0
+`custom_guardrail.py:1209-1217`) до того, как шлюз проверил собранную им запись, так
+что этот span может нести ключи, которые litellm сгенерировал вокруг нашей записи из
+allow-list. В обоих случаях запрос продолжается; шлюз пишет в лог
 `litellm_guardrail_information_failed request_id=… error=<type>` и считает
 `gateway_failure{component="audit"}`.
 
@@ -101,11 +105,17 @@ NEVER — это предохранитель эшелонированной з�
 Route gate и лимит одновременных запросов отказывают до того, как запускается litellm:
 записи нет.
 
-Где видна запись: в success- и failure-payload запроса, который pre-call
-пропустил (статус `success`). Для запроса, который pre-call отклонил, litellm payload
-не строит; тогда запись попадает только в запрос, который litellm передаёт каждому
-`async_post_call_failure_hook`, и в OTEL guardrail span litellm, если OTEL настроен.
-В тело запроса к провайдеру она не попадает никогда.
+Где видна запись: в success- и failure-payload запроса, который pre-call пропустил
+(статус `success` или `guardrail_flagged` для `oversize:delivered`). Для запроса,
+который pre-call отклонил, litellm payload не строит; тогда запись попадает только в
+запрос, который litellm передаёт каждому `async_post_call_failure_hook`, и в OTEL
+guardrail span litellm, если OTEL настроен. В тело запроса к провайдеру она не попадает
+никогда.
+
+Pre-call, который падает, а не отклоняет запрос, — 401 `E_PROVIDER_AUTH`, 503
+`E_NER_UNAVAILABLE`, `E_STORE_UNAVAILABLE` или `E_PROFILE_UNAVAILABLE`, `E_BAD_REQUEST`
+— выбрасывает исключение до записи: записи нет, и статус litellm
+`guardrail_failed_to_respond` не используется.
 
 ## Инварианты
 

@@ -355,8 +355,12 @@ def test_the_harness_fixtures_reserve_our_name() -> None:
 # ── the status table ─────────────────────────────────────────────────────────
 
 
+# By exclusion: listing the pre-call sites here would restate the table's own source.
 PRE_CALL_BLOCK_REASONS = {
-    reason for site in ("stage0", "stage5", "policy") for reason in BLOCK_REASONS[site]
+    reason
+    for site, reasons in BLOCK_REASONS.items()
+    if site not in ("route_gate", "capacity")
+    for reason in reasons
 }
 
 

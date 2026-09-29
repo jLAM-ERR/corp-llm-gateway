@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### Добавлено — `guardrail_information` без контента в logging payload litellm
+
+- **Pre-call пишет одну запись `guardrail_information`** (`corp-llm-sanitizer`, `pre_call`) в
+  `StandardLoggingPayload` litellm собственным writer'ом litellm, так что каждый логгер из
+  `litellm.callbacks` видит результат guardrail: `guardrail_status`, выведенный из
+  `block_reason`, время, `redaction_count`, `finding_label_counts` и `block_reason`, если он
+  задан. Без контента и по allow-list (`assert_guardrail_information_allowed`); гейт NEVER-полей
+  теперь проверяет такие записи везде, где запись их несёт (`docs/audit-schema.ru.md`).
+- **Новое событие лога `litellm_guardrail_information_failed request_id=… error=<type>`**, когда
+  запись не записана; запрос и его аудит-запись продолжаются (`docs/security.ru.md` §8,
+  `guardrailInformationWriteFailed`).
+- **`gateway_failure{component="audit"}` расширен**: он считает и это событие, наряду с
+  событием лога litellm без состояния запроса (`docs/ops/runbook.ru.md`).
+
 ### Добавлено — HTTPS-фронт для compose-стека (nginx, опционально)
 
 - **Профили `nginx` / `nginx-ports`** в `compose/docker-compose.yml`, выключены, пока `.env`

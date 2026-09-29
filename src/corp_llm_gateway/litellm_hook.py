@@ -1960,7 +1960,7 @@ def _write_guardrail_information(
 ) -> None:
     """Write our entry into the request metadata with litellm's writer (it also emits
     the OTEL guardrail span), then sync it into the logging object the
-    ``StandardLoggingPayload`` is built from (hazard 16). The entry is checked against
+    ``StandardLoggingPayload`` is built from. The entry is checked against
     the allow-list before litellm sees it, and litellm's copy after."""
     writer = _guardrail_information_writer()
     if writer is None:
@@ -2019,7 +2019,7 @@ def _sync_guardrail_information(
     logging_obj: Any, entry: dict[str, Any], request_entries: list[Any]
 ) -> None:
     """Our entry into the logging object's ``litellm_params["metadata"]`` (both of its
-    copies): the payload reads that, not the request (hazard 16).
+    copies): the payload reads that, not the request.
 
     Where that metadata holds no entry list yet, it shares the request's list — the
     one litellm itself carries into the payload — so an entry another callback writes

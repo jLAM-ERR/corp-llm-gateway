@@ -11,6 +11,10 @@ into the spend-log row. Every
 shipped client sends a hashed shape (``sk-ant-oat01-…``, ``sk-ant-api03-…``, ``sk-…``, a
 ChatGPT JWT), so the BYOK credential (invariant 3) reaches no logging surface raw. This
 pins that precondition. A litellm bump must re-check ``check_api_key``.
+
+Hazard 19b is the one exception, characterised here and not fixed: litellm's log kwargs
+carry the provider credential of the call raw (``PROVIDER_KEY_SITES``), and with a
+subscription bridge on, that credential is the developer's own bearer.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy._types import hash_token
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 
+from corp_llm_gateway import litellm_hook
 from tests.litellm_hook._dispatch_fixtures import DispatchHarness, StubUpstream, until
 from tests.litellm_hook.test_hazard18_corp_token_snapshot import (
     CORP_TOKEN,
@@ -96,7 +101,12 @@ def _needles(secret: str) -> list[str]:
 
 
 async def _send(
-    monkeypatch: pytest.MonkeyPatch, route: str, headers: dict[str, str]
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    headers: dict[str, str],
+    *,
+    stream: bool = False,
+    ours: Any = None,
 ) -> KwargsCapture:
     upstream = StubUpstream()
     try:
@@ -104,10 +114,10 @@ async def _send(
         harness = DispatchHarness(
             monkeypatch,
             upstream,
-            [_guardrail(), capture],
+            [ours if ours is not None else _guardrail(), capture],
             general_settings={"store_prompts_in_spend_logs": True},
         )
-        exchange = await harness.send(route, stream=False, token=CORP_TOKEN, headers=headers)
+        exchange = await harness.send(route, stream=stream, token=CORP_TOKEN, headers=headers)
         await until(lambda: len(capture.kwargs) >= 1)
     finally:
         upstream.close()
@@ -172,3 +182,86 @@ async def test_a_bearer_of_any_other_shape_is_logged_raw(
     assert _logged_key(capture) == PLAIN_BEARER
     assert token_sites(capture.spend_rows[0], PLAIN_BEARER) == [".proxy_server_request"]
     assert capture.spend_rows[0]["api_key"] == hash_token(PLAIN_BEARER)
+
+
+# ── hazard 19b: the provider credential in litellm's log kwargs ──────────────
+
+# The deployment key every harness deployment carries (``_dispatch_fixtures._deployment``).
+DEPLOYMENT_KEY = "sk-stub-key"
+
+
+def provider_key_sites(route: str, stream: bool, anthropic_header: str = "x-api-key") -> list[str]:
+    """Measured on litellm 1.101.0: where the success log kwargs hold the provider
+    credential of the call, raw, in the upstream header litellm sent it in
+    (``Authorization`` to OpenAI; ``x-api-key``, or ``authorization`` for an OAuth
+    token, to Anthropic). Never the ``StandardLoggingPayload``, never the spend-log row."""
+    if route == "chat":
+        return [".api_key", ".litellm_params.api_key"]
+    header = anthropic_header if route == "messages" else "Authorization"
+    sites = [f".httpx_response.request.headers.{header}"] if route == "messages" else []
+    if stream:
+        sites.insert(0, f".additional_args.headers.{header}")
+    return sites
+
+
+def _assert_only_in_log_kwargs(capture: KwargsCapture, secret: str, expected: list[str]) -> None:
+    assert sorted(token_sites(capture.kwargs[0], secret)) == expected
+    for needle in _needles(secret):
+        assert token_sites(capture.kwargs[0]["standard_logging_object"], needle) == []
+        assert token_sites(capture.spend_rows, needle) == []
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_the_chatgpt_bridge_bearer_sits_raw_in_litellms_log_kwargs(
+    monkeypatch: pytest.MonkeyPatch, route: str, stream: bool
+) -> None:
+    """Hazard 19b, characterised, not fixed. The ChatGPT bridge hands litellm the
+    developer's JWT as the call's ``api_key``; litellm keeps it raw where it keeps any
+    provider key. Chat: ``.api_key`` and ``.litellm_params.api_key``, unary and SSE.
+    ``/v1/responses``: none unary, the upstream ``Authorization`` header in
+    ``additional_args`` on SSE. Only a callback registered in litellm sees log kwargs
+    (config-gated, like hazards 17 and 18)."""
+    ours = _guardrail()
+    ours._forward_chatgpt_auth = True
+    capture = await _send(
+        monkeypatch, route, {"Authorization": f"Bearer {JWT}"}, stream=stream, ours=ours
+    )
+
+    _assert_only_in_log_kwargs(capture, JWT, provider_key_sites(route, stream))
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
+async def test_the_anthropic_bridge_token_sits_raw_in_litellms_log_kwargs(
+    monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    """Hazard 19b on the Anthropic subscription bridge (``/v1/messages``): the
+    developer's ``sk-ant-oat01-…`` token is the provider credential, so it sits raw in
+    the upstream ``authorization`` header litellm keeps in ``httpx_response`` (and
+    ``additional_args`` on SSE)."""
+    secret = SHIPPED_BEARERS["claude-oauth"]
+    ours = _guardrail()
+    ours._forward_anthropic_auth = True
+    # The bridge gates on the client's model alias; the harness alias names no provider.
+    monkeypatch.setattr(litellm_hook, "_detect_provider", lambda data: "anthropic")
+    capture = await _send(
+        monkeypatch, "messages", {"Authorization": f"Bearer {secret}"}, stream=stream, ours=ours
+    )
+
+    _assert_only_in_log_kwargs(
+        capture, secret, provider_key_sites("messages", stream, "authorization")
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
+@pytest.mark.parametrize("route", ROUTES)
+async def test_the_sites_are_where_litellm_keeps_any_provider_key(
+    monkeypatch: pytest.MonkeyPatch, route: str, stream: bool
+) -> None:
+    """Without a bridge the deployment's own key sits at the same sites: litellm's
+    behaviour, which the bridges inherit, not a copy the gateway makes."""
+    capture = await _send(
+        monkeypatch, route, {"Authorization": "Bearer sk-proj-H19B-DEV"}, stream=stream
+    )
+
+    _assert_only_in_log_kwargs(capture, DEPLOYMENT_KEY, provider_key_sites(route, stream))

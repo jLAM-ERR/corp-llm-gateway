@@ -37,6 +37,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   argument fragments of two tool calls (off-spec for OpenAI; the v1 providers never send it) gets
   the placeholders back in those arguments, never the originals, and the stream does not fail.
 
+### Added — content-free `guardrail_information` in litellm's logging payload
+
+- **The pre-call writes one `guardrail_information` entry** (`corp-llm-sanitizer`, `pre_call`)
+  into litellm's `StandardLoggingPayload` with litellm's own writer, so every `litellm.callbacks`
+  logger sees the guardrail's outcome: `guardrail_status` derived from `block_reason`, timing,
+  `redaction_count`, `finding_label_counts` and `block_reason` when set. Content-free and
+  allow-listed (`assert_guardrail_information_allowed`); the NEVER-fields gate now checks such
+  entries wherever a record carries them (`docs/audit-schema.md`).
+- **New log event `litellm_guardrail_information_failed request_id=… error=<type>`** when the
+  entry is not written; the request and its audit record go on (`docs/security.md` §8,
+  `guardrailInformationWriteFailed`).
+- **`gateway_failure{component="audit"}` widened**: it also counts that event, next to a litellm
+  log event with no request state (`docs/ops/runbook.md`).
+
 ### Added — HTTPS front door for the compose stack (nginx, opt-in)
 
 - **`nginx` / `nginx-ports` profiles** in `compose/docker-compose.yml`, off unless the server's

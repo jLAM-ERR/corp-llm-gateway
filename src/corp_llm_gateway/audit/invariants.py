@@ -147,12 +147,15 @@ def _walk_values_only(node: Any) -> None:
 
 
 def assert_guardrail_information_allowed(value: Any) -> None:
-    """Raise unless *value* is one allow-listed entry or a list of them.
+    """Raise unless *value* is None (litellm's "no guardrail ran"), one allow-listed
+    entry or a list of them.
 
     The NEVER walk runs first (a NEVER key raises `NeverFieldPresentError` naming it);
     then every key must be on the list and every value a label of its pattern, a
     non-negative count, a time or None. Free text of any kind is refused.
     """
+    if value is None:
+        return
     entries = value if isinstance(value, list) else [value]
     for entry in entries:
         if not isinstance(entry, Mapping):

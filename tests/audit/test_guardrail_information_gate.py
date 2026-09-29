@@ -172,6 +172,13 @@ def test_an_empty_list_passes() -> None:
     assert_guardrail_information_allowed([])
 
 
+def test_none_passes_as_no_guardrail_ran() -> None:
+    # litellm's own value in a StandardLoggingPayload when no guardrail wrote an entry.
+    assert_guardrail_information_allowed(None)
+    assert_no_never_fields({"request_id": "r1", "guardrail_information": None})
+    assert_no_never_fields({"metadata": {"standard_logging_guardrail_information": None}})
+
+
 def test_an_unknown_key_name_is_not_quoted_either() -> None:
     with pytest.raises(GuardrailInformationRejectedError) as raised:
         assert_guardrail_information_allowed(_entry(**{ORIGINAL: 1}))

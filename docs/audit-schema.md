@@ -75,7 +75,11 @@ The record above is the request's terminal audit record and does not carry
 and syncs it into litellm's logging object. The entry is allow-listed
 (`audit/invariants.py`, `assert_guardrail_information_allowed`): a NEVER key or any
 free text is refused before litellm sees it, and an entry litellm builds differently
-is taken back out. Either way the request goes on; the gateway logs
+is taken back out of the request metadata. That removal does not reach litellm's OTEL
+guardrail span: litellm's writer has already emitted it (`emit_guardrail_span`, litellm
+1.101.0 `custom_guardrail.py:1209-1217`) before the gateway checks what the writer
+built, so that span can carry the keys litellm generated around our allow-listed
+entry. Either way the request goes on; the gateway logs
 `litellm_guardrail_information_failed request_id=… error=<type>` and counts
 `gateway_failure{component="audit"}`.
 
@@ -100,10 +104,15 @@ is derived from them, never the other way round:
 The route gate and the in-flight cap refuse before litellm runs: no entry.
 
 Where the entry shows: in the success and failure payloads of a request the pre-call
-passed (status `success`). For a request the pre-call refuses, litellm builds no
-payload; the entry then reaches only the request litellm hands each
-`async_post_call_failure_hook`, and litellm's OTEL guardrail span when OTEL is
-configured. It is never part of the provider-bound body.
+passed (status `success`, or `guardrail_flagged` for `oversize:delivered`). For a
+request the pre-call refuses, litellm builds no payload; the entry then reaches only
+the request litellm hands each `async_post_call_failure_hook`, and litellm's OTEL
+guardrail span when OTEL is configured. It is never part of the provider-bound body.
+
+A pre-call that fails rather than refuses — 401 `E_PROVIDER_AUTH`, 503
+`E_NER_UNAVAILABLE`, `E_STORE_UNAVAILABLE` or `E_PROFILE_UNAVAILABLE`, `E_BAD_REQUEST`
+— raises before the entry is written: no entry, and litellm's
+`guardrail_failed_to_respond` status is never used.
 
 ## Invariants
 

@@ -353,6 +353,7 @@ GLACIER после `retention_hot_days` и истекающее через `+ re
 | `postgresDown` | **fail-closed** (503) |
 | `vectorBufferFull` | **fail-closed** (503) по умолчанию; команда может выбрать `audit_buffer_full=continue` |
 | `s3SinkDown` | **fail-closed** (503) — S3 это долговременный sink |
+| `guardrailInformationWriteFailed` | **продолжить** — запись pre-call без контента в `guardrail_information` litellm ([`audit-schema.ru.md`](audit-schema.ru.md)) не записана, или writer litellm собрал запись другой формы и она убрана из метаданных запроса. Запрос продолжается; шлюз считает `gateway_failure{component="audit"}` и пишет в лог `litellm_guardrail_information_failed request_id=… error=<type>` — только класс исключения. Терминальная аудит-запись запроса не затронута: запись — это аннотация логирования, а не часть полноты аудита |
 
 См. §M4 плана для полной матрицы (ретрай при транзиентном сбое Redis,
 проваливание при промахе Cache A/C, отказ одного аудит-sink) и колонок per-team
