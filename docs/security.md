@@ -96,7 +96,11 @@ count; Claude Code falls back to its own estimate for the indicator.
 | `encrypted_content` (any key inside a JSON tree we scan, e.g. `web_search_result.encrypted_content`) | Same signed-content reasoning as `thinking`; excluded from `_sanitize_json`/`_desanitize_json`/`_collect_json_text` by key name |
 | `computer_call_output.output` | A base64 screenshot; scanning it would trip the oversize policy on ordinary screenshots, so `output` is only scanned for `function_call_output`/`custom_tool_call_output` items |
 | A genuinely unrecognized block `type` | **Fails safe**: `_sanitize_block` scans it as a generic JSON value tree (the same recursion `_sanitize_json` applies to an arbitrary blob) instead of hard-rejecting the request. `"type"` and the opaque-key set (`_BLOCK_FALLBACK_OPAQUE_KEYS`, e.g. `signature`) are preserved verbatim; every other key's string leaves are sanitized, so nothing egresses unscanned — a new provider block shape (`web_fetch_tool_result`, `bash_code_execution_tool_result`, …) no longer 400s real traffic or poisons a multi-turn conversation that replays it. `UnsanitizableContentBlockError` still exists, but now only for a genuinely unscannable *value* under a *known* text field name (a bare scalar where str/dict/list was expected), not for an unrecognized block type. |
-| Responses `input` item structural fields (`_RESPONSES_STRUCTURAL_FIELDS`: `type`, `id`, `call_id`, `status`, `role`, `container_id`, `name`, `server_label`) and `data["tools"]` | **Deliberately excluded from both rewriting and the Stage-0/Stage-5 scan.** `name`/`server_label` on an `input` item (e.g. `function_call`, `mcp_call`) must correlate by exact value to its own declaration in the untouched `data["tools"]` array; rewriting only the `input`-side occurrence desyncs the two and the provider rejects the request. The remaining fields in the set are routing/status enums, never free text. This is the one real, currently-undocumented-elsewhere blind spot in Responses coverage. |
+| Responses `input` item structural fields (`_RESPONSES_STRUCTURAL_FIELDS`: `type`, `id`, `call_id`, `status`, `role`, `container_id`, `name`, `server_label`) and `data["tools"]` | **Deliberately excluded from both rewriting and the Stage-0/Stage-5 scan.** `name`/`server_label` on an `input` item (e.g. `function_call`, `mcp_call`) must correlate by exact value to its own declaration in the untouched `data["tools"]` array; rewriting only the `input`-side occurrence desyncs the two and the provider rejects the request. The remaining fields in the set are routing/status enums, never free text. This is the one real, currently-undocumented-elsewhere blind spot in Responses coverage. `data["tools"]` is untouched on all three routes — `/v1/chat/completions` (`tools` and legacy `functions`), `/v1/messages` and `/v1/responses` — so tool `description`s, parameter schemas and Anthropic `input_examples` egress as the client sent them. |
+| Chat `messages[].name` (any role) | Participant name, free text; not rewritten and not in the Stage-5 scan, so it reaches the provider as sent. **Open — follow-up.** |
+| Chat `prediction.content` (Predicted Outputs) | Free text; not rewritten and not in the Stage-5 scan, so it reaches the provider as sent. **Open — follow-up.** |
+| Responses `prompt.variables` (stored-prompt template values) | Free text; not rewritten and not in the Stage-5 scan, so it reaches the provider as sent. **Open — follow-up.** |
+| Anthropic text-block `citations[]` (`cited_text`, `document_title`) | Not rewritten and not in the Stage-5 scan on the request side (a client-built citation egresses raw); not restored on the response side (a provider-built citation reaches the client with placeholders). **Open — follow-up.** |
 
 Response-side de-sanitization (the reverse path) restores originals in streamed
 and unary **text**, **`tool_use` input** (`input_json_delta`, JSON-escaped so the
@@ -1048,7 +1052,10 @@ the pre-call drops it first, before anything can refuse the request, from every 
 litellm keeps — the chat `requester_metadata` copy and litellm's logging object included.
 What it cannot reach: two litellm DEBUG lines that run **before** our hook print the raw
 value — `litellm_pre_call_utils.py:1987` ("Request Headers") and `:2438` ("[PROXY] returned
-data from litellm_pre_call_utils"). The only guard for those is the arm-time DEBUG refusal:
+data from litellm_pre_call_utils"). `:2438` prints the whole request `data`, so it also carries
+the developer's BYOK `Authorization` raw (invariant 3): a subscription OAuth token sits in
+`provider_specific_header` (`add_provider_specific_headers_to_request`, `:2088`). The only guard
+for those is the arm-time DEBUG refusal:
 litellm DEBUG / `set_verbose` blocks arming (exit 70), and the test-only allowance
 `CORP_LLM_ALLOW_LITELLM_DEBUG` is refused in prod (`asgi._check_litellm_debug`, exit 78).
 

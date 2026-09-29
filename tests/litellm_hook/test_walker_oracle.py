@@ -10,10 +10,15 @@ Each fixture carries a distinct canary in every text-capable position, so the se
 computed by canary membership, not by path guessing:
 
 - litellm, rewrite tier: canaries in ``texts`` (and chat ``tool_calls``), the leaves the
-  handler maps back one by one. Must be a subset of ours, no exceptions.
+  handler maps back one by one. Pinned exactly per fixture and a subset of ours, no
+  exceptions.
 - litellm, handed tier: canaries anywhere in what ``apply_guardrail`` receives
-  (``structured_messages``, ``tools``, ``images`` too). Must be a subset of ours except
-  the carve-outs in ``CARVE_OUTS``, each a documented decision.
+  (``structured_messages``, ``tools``, ``images`` too). ``structured_messages`` and
+  ``tools`` are not only read: when a guardrail returns them the handler writes them back
+  over the request wholesale (chat ``handler.py:165-190``, anthropic ``:480-520``,
+  responses ``:382-391``), so every leaf in them is one a guardrail on that path could
+  rewrite. Must be a subset of ours except the carve-outs in ``CARVE_OUTS``, each a
+  documented row.
 - ours: canaries gone from the request after ``_pre_call_impl``, with a placeholder in
   their place.
 
@@ -34,6 +39,7 @@ import pytest
 
 pytest.importorskip("litellm.proxy.proxy_server", reason="litellm proxy not installed")
 
+import litellm
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.llms import load_guardrail_translation_mappings
 from litellm.types.utils import CallTypes
@@ -45,21 +51,28 @@ CANARY = re.compile(r"CNRY_[A-Za-z0-9_]+")
 PLACEHOLDER = re.compile(r"\[CANARY_\d{3}\]")
 TOKEN = "tok-oracle"
 
-# Leaves litellm hands a guardrail that we deliberately do not rewrite. Each is a row of
+# Leaves litellm hands a guardrail that we do not rewrite. Each is a row of
 # docs/security.md §"Not sanitized / deferred".
-_TOOLS = '`data["tools"]` row: declarations stay untouched, items correlate to them by name'
+_TOOLS = '`data["tools"]` row: declarations untouched on all three routes, matched by name'
 _IMAGE = "`image` / `image_url` / `input_image` row: binary payload or a low-risk URL"
 _FILE = "`input_file` / `file` row: attachment reference, filenames are not scanned"
+_AUDIO = "`input_audio` / `output_audio` row: base64 audio"
 _THINKING = "`thinking` row: Anthropic signs the block, it must replay byte-identical"
+_NAME = "`messages[].name` row: participant name, not rewritten — open, follow-up"
 CARVE_OUTS: dict[str, str] = {
     "CNRY_a_tool_desc": _TOOLS,
     "CNRY_a_tool_schema": _TOOLS,
+    "CNRY_a_tool_input_example": _TOOLS,
     "CNRY_a_image_url": _IMAGE,
+    "CNRY_a_tool_result_image": _IMAGE,
     "CNRY_a_thinking": _THINKING,
     "CNRY_c_tool_desc": _TOOLS,
     "CNRY_c_tool_schema": _TOOLS,
     "CNRY_c_image_url": _IMAGE,
     "CNRY_c_file_name": _FILE,
+    "CNRY_c_input_audio": _AUDIO,
+    "CNRY_c_user_name": _NAME,
+    "CNRY_c_assistant_name": _NAME,
     "CNRY_r_tool_desc": _TOOLS,
     "CNRY_r_image_url": _IMAGE,
     "CNRY_r_file_name": _FILE,
@@ -142,6 +155,13 @@ ANTHROPIC: dict[str, Any] = {
                     "input": {"query": "CNRY_a_server_tool_query"},
                 },
                 {
+                    "type": "mcp_tool_use",
+                    "id": "mcptoolu_1",
+                    "name": "fetch",
+                    "server_name": "srv",
+                    "input": {"q": "CNRY_a_mcp_tool_input"},
+                },
+                {
                     "type": "web_search_tool_result",
                     "tool_use_id": "srvtoolu_1",
                     "content": [
@@ -163,7 +183,18 @@ ANTHROPIC: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": "tu_1",
                     "is_error": True,
-                    "content": [{"type": "text", "text": "CNRY_a_tool_result_block"}],
+                    "content": [
+                        {"type": "text", "text": "CNRY_a_tool_result_block"},
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": "https://x/CNRY_a_tool_result_image"},
+                        },
+                    ],
+                },
+                {
+                    "type": "mcp_tool_result",
+                    "tool_use_id": "mcptoolu_1",
+                    "content": [{"type": "text", "text": "CNRY_a_mcp_tool_result"}],
                 },
             ],
         },
@@ -177,6 +208,7 @@ ANTHROPIC: dict[str, Any] = {
                 "type": "object",
                 "properties": {"q": {"type": "string", "description": "CNRY_a_tool_schema"}},
             },
+            "input_examples": [{"q": "CNRY_a_tool_input_example"}],
         }
     ],
 }
@@ -194,17 +226,22 @@ CHAT: dict[str, Any] = {
         {"role": "system", "content": "CNRY_c_system_str"},
         {"role": "system", "content": [{"type": "text", "text": "CNRY_c_system_part"}]},
         {"role": "developer", "content": "CNRY_c_developer_str"},
-        {"role": "user", "content": "CNRY_c_user_str"},
+        {"role": "user", "name": "CNRY_c_user_name", "content": "CNRY_c_user_str"},
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": "CNRY_c_user_part"},
                 {"type": "image_url", "image_url": {"url": "https://x/CNRY_c_image_url"}},
                 {"type": "file", "file": {"filename": "CNRY_c_file_name", "file_id": "file_1"}},
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "CNRY_c_input_audio", "format": "wav"},
+                },
             ],
         },
         {
             "role": "assistant",
+            "name": "CNRY_c_assistant_name",
             "content": "CNRY_c_assistant_str",
             "tool_calls": [
                 {
@@ -245,6 +282,7 @@ CHAT: dict[str, Any] = {
         }
     ],
     "functions": [{"name": "lookup", "description": "CNRY_c_legacy_fn_desc"}],
+    "prediction": {"type": "content", "content": "CNRY_c_prediction"},
 }
 
 # The stream flag changes nothing on the request side: same leaves as the unary twin.
@@ -268,6 +306,7 @@ CHAT_UNARY_TWIN: dict[str, Any] = {
 RESPONSES: dict[str, Any] = {
     "model": "gpt-4o-mini",
     "instructions": "CNRY_r_instructions",
+    "prompt": {"id": "pmpt_1", "variables": {"city": "CNRY_r_prompt_variable"}},
     "input": [
         {"role": "user", "content": "CNRY_r_message_str"},
         {
@@ -350,25 +389,78 @@ FIXTURES: dict[str, tuple[CallTypes, str, dict[str, Any]]] = {
     "responses-input-str": (CallTypes.aresponses, "aresponses", RESPONSES_INPUT_STR),
 }
 
-# Measured on litellm 1.101.0. Every entry is a CARVE_OUTS key.
+# Measured on litellm 1.101.0: the leaves each handler maps back one by one.
+EXPECTED_REWRITE: dict[str, set[str]] = {
+    "anthropic": {
+        "CNRY_a_assistant_str",
+        "CNRY_a_assistant_text",
+        "CNRY_a_cited_text",
+        "CNRY_a_tool_result_block",
+        "CNRY_a_tool_result_str",
+        "CNRY_a_user_str",
+        "CNRY_a_user_text",
+    },
+    "anthropic-system-str": {"CNRY_as_user_str"},
+    "chat": {
+        "CNRY_c_assistant_part",
+        "CNRY_c_assistant_str",
+        "CNRY_c_developer_str",
+        "CNRY_c_legacy_fn_result",
+        "CNRY_c_system_part",
+        "CNRY_c_system_str",
+        "CNRY_c_tool_call_args",
+        "CNRY_c_tool_part",
+        "CNRY_c_tool_str",
+        "CNRY_c_user_part",
+        "CNRY_c_user_str",
+    },
+    "chat-stream-control": {"CNRY_cs_system_str", "CNRY_cs_user_part"},
+    "chat-unary-twin": {"CNRY_cu_system_str", "CNRY_cu_user_part"},
+    "responses": {
+        "CNRY_r_assistant_output_text",
+        "CNRY_r_developer",
+        "CNRY_r_input_text",
+        "CNRY_r_message_str",
+        "CNRY_r_reasoning_text",
+    },
+    "responses-input-str": {"CNRY_rs_input_str"},
+}
+# Every entry is a CARVE_OUTS key.
 EXPECTED_LITELLM_ONLY: dict[str, set[str]] = {
-    "anthropic": {"CNRY_a_image_url", "CNRY_a_thinking", "CNRY_a_tool_desc", "CNRY_a_tool_schema"},
+    "anthropic": {
+        "CNRY_a_image_url",
+        "CNRY_a_thinking",
+        "CNRY_a_tool_desc",
+        "CNRY_a_tool_input_example",
+        "CNRY_a_tool_result_image",
+        "CNRY_a_tool_schema",
+    },
     "anthropic-system-str": set(),
-    "chat": {"CNRY_c_file_name", "CNRY_c_image_url", "CNRY_c_tool_desc", "CNRY_c_tool_schema"},
+    "chat": {
+        "CNRY_c_assistant_name",
+        "CNRY_c_file_name",
+        "CNRY_c_image_url",
+        "CNRY_c_input_audio",
+        "CNRY_c_tool_desc",
+        "CNRY_c_tool_schema",
+        "CNRY_c_user_name",
+    },
     "chat-stream-control": set(),
     "chat-unary-twin": set(),
     "responses": {"CNRY_r_file_name", "CNRY_r_image_url", "CNRY_r_tool_desc"},
     "responses-input-str": set(),
 }
 # Leaves litellm's handlers drop on the floor (not even in `structured_messages`) and we
-# rewrite: document blocks, search results, server tool input and results, MCP calls,
-# reasoning summaries.
+# rewrite: document blocks, search results, server and MCP tool input and results, MCP
+# calls, reasoning summaries.
 EXPECTED_OURS_ONLY: dict[str, set[str]] = {
     "anthropic": {
         "CNRY_a_document_content",
         "CNRY_a_document_context",
         "CNRY_a_document_text",
         "CNRY_a_document_title",
+        "CNRY_a_mcp_tool_input",
+        "CNRY_a_mcp_tool_result",
         "CNRY_a_search_content",
         "CNRY_a_search_title",
         "CNRY_a_server_tool_query",
@@ -381,12 +473,18 @@ EXPECTED_OURS_ONLY: dict[str, set[str]] = {
     "responses": {"CNRY_r_mcp_args", "CNRY_r_mcp_output", "CNRY_r_reasoning_summary"},
     "responses-input-str": set(),
 }
-# In neither walker. Legacy chat `functions` are tool declarations (the `data["tools"]` row).
-# A text block's `citations` are not rewritten by ours and not exposed by litellm: an open
-# finding, not a carve-out — they reach the provider as the client sent them.
+# In neither walker. Legacy chat `functions` are tool declarations (the `data["tools"]`
+# row). The rest are open findings, not carve-outs — free text that reaches the provider
+# as the client sent it, each an "open — follow-up" row in docs/security.md: a text
+# block's `citations`, chat `prediction.content` and Responses `prompt.variables`.
 EXPECTED_NEITHER: dict[str, set[str]] = {
     "anthropic": {"CNRY_a_citation_cited", "CNRY_a_citation_title"},
-    "chat": {"CNRY_c_legacy_fn_desc"},
+    "anthropic-system-str": set(),
+    "chat": {"CNRY_c_legacy_fn_desc", "CNRY_c_prediction"},
+    "chat-stream-control": set(),
+    "chat-unary-twin": set(),
+    "responses": {"CNRY_r_prompt_variable"},
+    "responses-input-str": set(),
 }
 
 
@@ -417,6 +515,7 @@ async def litellm_leaves(call_type: CallTypes, body: dict[str, Any]) -> tuple[se
     recorder = OracleRecorder()
     handler = load_guardrail_translation_mappings()[call_type]()
     await handler.process_input_messages(data=copy.deepcopy(body), guardrail_to_apply=recorder)
+    assert recorder not in litellm.callbacks
     assert len(recorder.calls) == 1
     (inputs,) = recorder.calls
     rewrite = canaries(inputs.get("texts")) | canaries(inputs.get("tool_calls"))
@@ -438,6 +537,11 @@ async def our_leaves(call_type: str, body: dict[str, Any]) -> set[str]:
     rewritten = set(present) - left
     assert len(PLACEHOLDER.findall(json.dumps(sent))) >= len(rewritten)
     return rewritten
+
+
+def test_every_expectation_names_exactly_the_fixtures() -> None:
+    for expected in (EXPECTED_REWRITE, EXPECTED_LITELLM_ONLY, EXPECTED_OURS_ONLY, EXPECTED_NEITHER):
+        assert set(expected) == set(FIXTURES)
 
 
 def test_the_recorder_is_not_our_guardrail() -> None:
@@ -463,11 +567,12 @@ async def test_every_leaf_litellm_exposes_is_one_we_rewrite(name: str) -> None:
     )
 
     assert rewrite, "vacuous: litellm exposed nothing to rewrite"
+    assert rewrite == EXPECTED_REWRITE[name]
     assert rewrite <= ours
     assert litellm_only <= set(CARVE_OUTS), sorted(litellm_only - set(CARVE_OUTS))
     assert litellm_only == EXPECTED_LITELLM_ONLY[name]
     assert ours_only == EXPECTED_OURS_ONLY[name]
-    assert neither == EXPECTED_NEITHER.get(name, set())
+    assert neither == EXPECTED_NEITHER[name]
 
 
 async def test_the_stream_flag_changes_no_leaf() -> None:
