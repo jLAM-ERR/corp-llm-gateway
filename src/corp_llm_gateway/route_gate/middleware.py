@@ -344,13 +344,17 @@ _UTF8_CHARSETS = frozenset({b"utf-8", b"utf8"})
 
 
 def _utf8_charset(content_type: bytes) -> bool:
-    """No ``charset`` parameter, or exactly one naming UTF-8; a repeated, malformed or
-    RFC 2231 (``charset*``) one is not UTF-8."""
+    """No ``charset`` parameter, or exactly one naming UTF-8; a repeated or malformed
+    one, or any other key starting ``charset`` (RFC 2231 ``charset*``, ``charset*0``),
+    is not UTF-8."""
     charsets = []
     for param in content_type.split(b";")[1:]:
         key, eq, value = param.partition(b"=")
-        if key.strip().lower().split(b"*", 1)[0] != b"charset":
+        key = key.strip().lower()
+        if not key.startswith(b"charset"):
             continue
+        if key != b"charset":
+            return False
         value = value.strip()
         if len(value) >= 2 and value[:1] == value[-1:] == b'"':
             value = value[1:-1]

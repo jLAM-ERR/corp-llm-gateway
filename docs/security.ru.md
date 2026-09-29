@@ -991,8 +991,9 @@ litellm. Три точки входа идут мимо маршрутов; у �
   `general_settings.supported_db_objects: ["models"]`, поэтому litellm не
   загружает ни политик, ни guardrail-ов из БД.
 - **14b, тело запроса с политиками.** Допущенный переписываемый запрос, чьё тело
-  не UTF-8 JSON (тип носителя не `application/json`, charset не `utf-8` или тело,
-  кодировку которого `json.detect_encoding` определяет не как `utf-8`), получает
+  не UTF-8 JSON (тип носителя не `application/json`, charset не `utf-8`, тело,
+  кодировку которого `json.detect_encoding` определяет не как `utf-8`, или байты,
+  которые не декодируются как UTF-8), получает
   415 `route_gate_body_not_json`, а JSON-тело с ключом `policies` верхнего
   уровня — 403 `route_gate_body_policies`; оба — когда лимитер дочитал тело и до
   того, как его разберёт litellm (таблица выше). Проверка `policies` читает
@@ -1250,7 +1251,7 @@ callback `CustomLogger`**: `CorpLlmGuardrail` (`litellm_hook.py`), регист�
 | 13 | Обёртки потокового итератора выстраиваются в порядке callback-ов | `proxy/utils.py` | Обратной подстановки внутри litellm нет | как 10 |
 | 14 | Pipeline политики с нашим guardrail заставляет цикл pre-call его пропустить | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` | Пропускается только `CustomGuardrail`; `/polic*` и `/guardrail*` — REFUSE; 14a-c ниже | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies` |
 | 14a | Строка политики в БД litellm загружается, если `supported_db_objects` не задан | `proxy/proxy_server.py`, `proxy/policy_engine/policy_registry.py` | Поставляемые конфиги: `supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_litellm_reads_the_pin_as_models_only` |
-| 14b | Список `policies` верхнего уровня в теле запроса | `proxy/litellm_pre_call_utils.py` | Гейт: 403 `route_gate_body_policies`, 415 `route_gate_body_not_json` (тело не UTF-8 JSON: тип носителя, charset или `json.detect_encoding` не utf-8) | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`) |
+| 14b | Список `policies` верхнего уровня в теле запроса | `proxy/litellm_pre_call_utils.py` | Гейт: 403 `route_gate_body_policies`, 415 `route_gate_body_not_json` (тело не UTF-8 JSON: тип носителя, charset или `json.detect_encoding` не utf-8, либо байты, которые не декодируются как UTF-8) | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`) |
 | 14c | **Открыто.** Строки `litellm_settings` / `general_settings` из `LiteLLM_Config` применяются каждые 30 с | `proxy/proxy_server.py` | Охарактеризовано: добавленный callback видит только плейсхолдеры | `test_litellm_config_guards.py`, `test_desanitize_served_stack.py` |
 | 15 | `post_call_response_headers_hook` получает восстановленный ответ | `proxy/common_request_processing.py`, `proxy/utils.py` | Обратной подстановки внутри litellm нет | как 10 |
 | 15b | Балансировка по имени guardrail запускает чужой callback | `proxy/utils.py` | Обычный callback не балансируется; CRUD guardrail-ов — REFUSE | `test_proxy_dispatch.py::test_duplicate_guardrail_name_substitutes_callback` |

@@ -1021,8 +1021,9 @@ have their own gate, the third is open:
   or guardrail row.
 - **14b, a request body naming policies.** An admitted rewritten request whose
   body is not UTF-8 JSON (media type other than `application/json`, a charset
-  other than `utf-8`, or a body whose encoding `json.detect_encoding` reports as
-  anything but `utf-8`) is 415 `route_gate_body_not_json`, and one whose JSON
+  other than `utf-8`, a body whose encoding `json.detect_encoding` reports as
+  anything but `utf-8`, or bytes that do not decode as UTF-8) is 415
+  `route_gate_body_not_json`, and one whose JSON
   body has a top-level `policies` key is 403 `route_gate_body_policies`, both
   once the limiter has read the body and before litellm parses it (table above).
   The `policies` check reads bytes, and only for UTF-8 does a body without an
@@ -1288,7 +1289,7 @@ class stays.
 | 13 | Streaming iterator wrappers chain in callback order: a later wrapper consumes restored chunks | `proxy/utils.py` (iterator hook chain) | No reversal inside litellm | as 10 |
 | 14 | A policy pipeline naming the guardrail, in any mode, makes the pre-call loop skip it: zero sanitizer calls, originals egress | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` (pre-call loop) | Only a `CustomGuardrail` is skipped; ours is a plain callback. `/polic*` and `/guardrail*` are REFUSE (§14); 14a-c below | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies`, `::test_migrated_pipeline_skip_egresses_originals` |
 | 14a | A policy row in litellm's database is loaded at boot and at every reconcile when `supported_db_objects` is unset | `proxy/proxy_server.py` (`_init_non_llm_objects_in_db`), `proxy/policy_engine/policy_registry.py` | Shipped configs pin `general_settings.supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_{compose,helm}_litellm_config_loads_no_policies_from_the_db`, `::test_litellm_reads_the_pin_as_models_only` |
-| 14b | A top-level `policies` list in the client body applies those policies with no attachment | `proxy/litellm_pre_call_utils.py` (`add_guardrails_from_policy_engine`) | The gate refuses a JSON body with a top-level `policies` key (403 `route_gate_body_policies`) and any body that is not UTF-8 JSON (415 `route_gate_body_not_json`: media type, charset, or `json.detect_encoding` other than utf-8), before litellm parses it | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`), served `test_a_body_naming_policies_is_refused_at_the_gate` |
+| 14b | A top-level `policies` list in the client body applies those policies with no attachment | `proxy/litellm_pre_call_utils.py` (`add_guardrails_from_policy_engine`) | The gate refuses a JSON body with a top-level `policies` key (403 `route_gate_body_policies`) and any body that is not UTF-8 JSON (415 `route_gate_body_not_json`: media type, charset, or `json.detect_encoding` other than utf-8, or bytes that do not decode as UTF-8), before litellm parses it | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`), served `test_a_body_naming_policies_is_refused_at_the_gate` |
 | 14c | **Open.** With a database and `store_model_in_db`, litellm applies `litellm_settings` and `general_settings` rows from `LiteLLM_Config` every 30 s; `supported_db_objects` gates neither | `proxy/proxy_server.py` (`_add_deployment_locked`, `_update_config_fields`, `_update_general_settings`) | Characterised (below): an added callback gets placeholders only | `test_litellm_config_guards.py` (5 rows), served DB-overlay rows (5) |
 | 15 | `post_call_response_headers_hook` hands every callback the restored response | `proxy/common_request_processing.py`, `proxy/utils.py` | No reversal inside litellm | as 10 |
 | 15b | Guardrail-name load balancing runs another callback under our name | `proxy/utils.py` | A plain callback is not load-balanced; guardrail CRUD is REFUSE; the arm check finds ours by type | `test_proxy_dispatch.py::test_duplicate_guardrail_name_substitutes_callback`, `::test_a_stand_in_answering_to_our_name_is_not_our_guardrail` |

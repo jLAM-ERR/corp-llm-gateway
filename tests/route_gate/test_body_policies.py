@@ -14,8 +14,10 @@ Content-free: the refusal and its log name no body byte.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import re
 from typing import Any
 
 import pytest
@@ -302,6 +304,7 @@ def _assert_not_json_before_litellm_or_a_slot(
 ) -> None:
     assert status == 415
     assert isinstance(payload, dict)
+    assert payload["error"]["code"] == "E_ROUTE_BLOCKED"
     assert payload["error"]["reason"] == ROUTE_GATE_BODY_NOT_JSON
     assert downstream.bodies == []
     assert metrics.inflight == [] and limiter.inflight == 0
@@ -309,6 +312,7 @@ def _assert_not_json_before_litellm_or_a_slot(
     assert metrics.blocks == [ROUTE_GATE_BODY_NOT_JSON]
     (record,) = sink.records
     assert (record["status"], record["block_reason"]) == ("failed", ROUTE_GATE_BODY_NOT_JSON)
+    assert CANARY not in json.dumps(payload) and CANARY not in json.dumps(record)
 
 
 def _policies_text() -> str:
@@ -332,13 +336,17 @@ async def test_a_body_that_is_not_utf8_is_refused_before_litellm_or_a_slot(
     assert CANARY not in caplog.text and CANARY not in json.dumps(payload)
 
 
-async def test_bytes_that_do_not_decode_as_utf8_are_refused() -> None:
+async def test_bytes_that_do_not_decode_as_utf8_are_refused(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     body = b'{"model": "corp-chat", "messages": [], "poli\xffcies": ["' + CANARY.encode() + b'"]}'
     assert json.loads(body.decode("utf-8", errors="ignore"))["policies"] == [CANARY]
 
-    result = await _post([body])
+    with caplog.at_level(logging.DEBUG):
+        result = await _post([body])
 
     _assert_not_json_before_litellm_or_a_slot(*result)
+    assert CANARY not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -354,6 +362,11 @@ async def test_bytes_that_do_not_decode_as_utf8_are_refused() -> None:
         b'application/json; charset="utf-8',
         b'application/json; charset=""',
         b"application/json; charset*=utf-8''",
+        b"application/json; charset*=utf-8",
+        b"application/json; charset*0=utf-8",
+        b"application/json; charset*=utf-8''utf-8",
+        b"application/json; charset*0*=utf-8''utf-8",
+        b"application/json; charsetx=utf-8",
         b"application/json; charset=utf-8 x",
     ],
     ids=[
@@ -367,15 +380,22 @@ async def test_bytes_that_do_not_decode_as_utf8_are_refused() -> None:
         "unbalanced-quote",
         "empty-quoted",
         "rfc2231",
+        "rfc2231-plain",
+        "rfc2231-section",
+        "rfc2231-extended",
+        "rfc2231-section-extended",
+        "charset-prefixed-key",
         "trailing-token",
     ],
 )
 async def test_a_charset_other_than_utf8_is_refused_before_litellm_or_a_slot(
-    content_type: bytes,
+    content_type: bytes, caplog: pytest.LogCaptureFixture
 ) -> None:
-    result = await _post([_body()], content_type=content_type)
+    with caplog.at_level(logging.DEBUG):
+        result = await _post([_body(policies=[CANARY])], content_type=content_type)
 
     _assert_not_json_before_litellm_or_a_slot(*result)
+    assert CANARY not in caplog.text
 
 
 async def test_a_charset_other_than_utf8_is_refused_without_a_body() -> None:
@@ -394,6 +414,21 @@ _STDLIB_ENCODINGS = [
     "utf-32-le",
     "utf-32-be",
 ]
+
+
+_ENCODING_NAME = re.compile(r"utf-8-sig|utf-(?:8|16|32)(?:-(?:le|be))?", re.IGNORECASE)
+
+
+@pytest.mark.parametrize("encoding", _STDLIB_ENCODINGS)
+def test_each_listed_encoding_is_one_json_detect_encoding_returns(encoding: str) -> None:
+    assert json.detect_encoding(_policies_text().encode(encoding)) == encoding
+
+
+def test_json_detect_encoding_names_no_encoding_outside_the_list() -> None:
+    """Fails when stdlib's detector learns an encoding the parametrisation below lacks."""
+    named = {m.lower() for m in _ENCODING_NAME.findall(inspect.getsource(json.detect_encoding))}
+
+    assert named and named <= set(_STDLIB_ENCODINGS)
 
 
 @pytest.mark.parametrize("escaped", [False, True], ids=["plain-key", "escaped-key"])

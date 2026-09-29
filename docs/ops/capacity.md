@@ -122,11 +122,14 @@ The route gate caps concurrent LLM requests per pod. The cap is
   6.4 GB, 512 MiB) = 512 MiB. Size the pod against the byte budget, not the
   draining count: set `CORP_LLM_MAX_DRAINING_BYTES` to what the pod's memory
   limit can spare for request bodies (leave room for the NER models, the
-  sanitizer's copies of each body and litellm). Measured on a real socket
-  (loopback, budget 25 MiB): two admitted 10 MiB bodies held 20971520 bytes
-  (`gateway_draining_bytes` read the same); a third declaring 10 MiB got 429
-  unread; once the two finished (200 each) the same request got 200, and the
-  gauge read 0.
+  sanitizer's copies of each body and litellm). The route gate's UTF-8 check
+  on a rewritten body decodes it once, outside this budget: with any character
+  outside the Basic Multilingual Plane (an emoji, say) that is a transient
+  `str` of up to 4× the body's bytes, about 100 MiB at the 25 MiB cap.
+  Measured on a real socket (loopback, budget 25 MiB): two admitted 10 MiB
+  bodies held 20971520 bytes (`gateway_draining_bytes` read the same); a third
+  declaring 10 MiB got 429 unread; once the two finished (200 each) the same
+  request got 200, and the gauge read 0.
 - **Off.** `0` turns the cap off. The entrypoint refuses it (exit 78) when
   `CORP_ENV` is `prod`/`production`, and so does `gateway-admin config check`;
   so do a negative value, a non-integer and anything above 10000.

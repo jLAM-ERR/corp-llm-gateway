@@ -464,9 +464,10 @@ What changes for operators:
   `CORP_ENV=prod|production` that key itself is exit 78.
 - **A rewritten route refuses a body that is not UTF-8 JSON** (415
   `E_ROUTE_BLOCKED`, `route_gate_body_not_json`: not `application/json`, a
-  `charset` other than `utf-8`, a BOM, UTF-16/32) or a JSON body with a top-level
-  `policies` key (403, `route_gate_body_policies`). A custom client that posts a
-  form body, or JSON in another encoding, breaks.
+  `charset` other than `utf-8`, a BOM, UTF-16/32, bytes that do not decode as
+  UTF-8) or a JSON body with a top-level `policies` key (403,
+  `route_gate_body_policies`). A custom client that posts a form body, or JSON
+  in another encoding, breaks.
 - **Keep `general_settings.supported_db_objects: ["models"]`** in any litellm
   config of your own (the shipped ones carry it; `configuration.md`).
 - **Audit:** one terminal record per request, written when the response ends.
