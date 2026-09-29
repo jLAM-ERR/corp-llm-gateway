@@ -7,8 +7,10 @@ the same object Langfuse / S3 / SIEM callbacks read.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 from collections.abc import Iterator
 from typing import Any
 
@@ -31,6 +33,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy import proxy_server
 from litellm.proxy.utils import ProxyLogging
 from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.llms.openai import ResponsesAPIStreamEvents
 
 from corp_llm_gateway.route_gate import Verdict, classify
 from corp_llm_gateway.route_gate.desanitize_middleware import (
@@ -71,13 +74,22 @@ def upstream() -> Iterator[StubUpstream]:
 
 
 class _GuardrailInfoWriter(CustomLogger):
-    """A plain callback writing our entry the way Task 3's helper would, at post-call."""
+    """A plain callback writing our entry the way Task 3's helper would, at post-call.
 
-    def __init__(self, *, sync: bool) -> None:
+    On a stream it writes at the last point before litellm dispatches the success log:
+    the end of the stream for chat and messages, the ``response.completed`` event for
+    Responses (``test_a_write_after_a_responses_stream_ended_misses_the_payload``).
+    ``after_stream_end`` moves every stream's write past the end.
+    """
+
+    def __init__(self, *, sync: bool, after_stream_end: bool = False) -> None:
         super().__init__()
         self.sync = sync
+        self.after_stream_end = after_stream_end
+        self.writes = 0
 
     def _write(self, data: dict[str, Any]) -> None:
+        self.writes += 1
         # _RECORDER is never registered: litellm's writer, not a CustomGuardrail callback.
         _RECORDER.add_standard_logging_guardrail_information_to_request_data(
             guardrail_json_response=dict(ALLOWED_RESPONSE),
@@ -96,9 +108,16 @@ class _GuardrailInfoWriter(CustomLogger):
     async def async_post_call_streaming_iterator_hook(
         self, user_api_key_dict: Any, response: Any, request_data: dict[str, Any]
     ) -> Any:
+        written = False
         async for chunk in response:
+            completed = getattr(chunk, "type", None) == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+            if completed and not self.after_stream_end:
+                # litellm has scheduled the success log for this event, not yet run it.
+                self._write(request_data)
+                written = True
             yield chunk
-        self._write(request_data)
+        if not written:
+            self._write(request_data)
 
 
 def _payload_fields_holding(payload: dict[str, Any], needle: str) -> set[str]:
@@ -120,7 +139,8 @@ async def test_standard_logging_payload_is_content_free(
     ``add_standard_logging_guardrail_information_to_request_data`` (from a never-registered
     ``CustomGuardrail`` used only as the writer); the payload carries exactly that entry.
     On 1.101.0 it lands with and without ``_sync_guardrail_info_to_logging_obj`` on all six
-    flows, so the sync is defence in depth here, not the fix the plan expected. The OTEL
+    flows when written before litellm dispatches the success log (the writer's docstring),
+    so the sync is defence in depth here, not the fix the plan expected. The OTEL
     guardrail span is emitted from this same entry object (custom_guardrail.py:1197-1217),
     so the entry being content-free is the span being content-free.
     """
@@ -152,6 +172,41 @@ async def test_standard_logging_payload_is_content_free(
     assert ours_entries[0]["guardrail_response"] == ALLOWED_RESPONSE
     assert ours_entries[0]["guardrail_status"] == "success"
     assert [entry["guardrail_mode"] for entry in entries] == ["pre_call", "post_call"]
+
+
+@pytest.mark.parametrize("sync", [True, False], ids=["synced", "unsynced"])
+async def test_a_write_after_a_responses_stream_ended_misses_the_payload(
+    monkeypatch: pytest.MonkeyPatch, upstream: StubUpstream, sync: bool
+) -> None:
+    """litellm dispatches a Responses stream's success log at ``response.completed``
+    (``responses/streaming_iterator.py:405-419,457-470``), before the stream ends; only a
+    registered post_call ``CustomGuardrail`` defers it to the end
+    (``proxy/common_request_processing.py:2337,2455,2952-2965``). Chat and messages dispatch
+    at the end. So a plain callback's write after a Responses stream ended misses the
+    payload, synced or not; unheld, it races the payload build and wins only on some hosts.
+    Ours writes at pre-call.
+    """
+    ours, _ = build_ours()
+    sink = Capture("sink")
+    writer = _GuardrailInfoWriter(sync=sync, after_stream_end=True)
+    harness = DispatchHarness(monkeypatch, upstream, [ours, writer, sink])
+    upstream.hold_stream_end = threading.Event()
+
+    sending = asyncio.create_task(harness.send("responses", stream=True))
+    try:
+        await until(lambda: len(sink.seen.logged) >= 2)
+        # The payload is built while the stream is still open.
+        assert writer.writes == 0
+    finally:
+        upstream.hold_stream_end.set()
+    exchange = await sending
+
+    assert exchange.status == 200
+    assert writer.writes == 1
+    assert len(sink.seen.logged) == 2, sink.seen.logged
+    payload = json.loads(sink.seen.logged[0])
+    entries = payload["guardrail_information"] or ()
+    assert [entry["guardrail_mode"] for entry in entries] == ["pre_call"]
 
 
 RESPONSES_LIST_INPUTS: dict[str, list[dict[str, Any]]] = {

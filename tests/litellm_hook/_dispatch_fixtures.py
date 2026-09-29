@@ -260,6 +260,9 @@ def _parsed(raw: bytes) -> Any:
         return None
 
 
+STREAM_END_HOLD_S = 10.0
+
+
 class StubUpstream:
     """A provider on a local socket: records each body, replies naming what it received.
 
@@ -277,6 +280,8 @@ class StubUpstream:
         self.event_delay = event_delay
         # Answer every request with this status and a provider-style error body.
         self.error_status = error_status
+        # Not None: a stream holds its terminating chunk until this is set (bounded).
+        self.hold_stream_end: threading.Event | None = None
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -350,6 +355,8 @@ class StubUpstream:
                         self.wfile.flush()
                         if upstream.event_delay:
                             time.sleep(upstream.event_delay)
+                    if upstream.hold_stream_end is not None:
+                        upstream.hold_stream_end.wait(STREAM_END_HOLD_S)
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
                 except OSError:

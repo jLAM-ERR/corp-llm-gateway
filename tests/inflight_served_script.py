@@ -255,6 +255,9 @@ async def main() -> None:
     crp._wait_for_http_disconnect = first_chunk_wait
 
     warm = await _complete(port, stub, stream=False)
+    # The client reads the whole response before the slot frees: uvicorn ends the
+    # connection inside the final send, and the slot is held until the app returns.
+    await _until(lambda: limiter.inflight <= 0)
     results: dict[str, Any] = {"warmup": warm[0], "cases": {}}
     if SCENARIO == "budget":
         results["byte_budget"] = await _byte_budget(port, stub, limiter)

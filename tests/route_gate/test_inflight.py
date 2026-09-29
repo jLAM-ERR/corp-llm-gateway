@@ -237,6 +237,37 @@ async def test_a_released_slot_admits_the_next_request() -> None:
     assert app.calls == 3
 
 
+async def test_the_slot_is_held_past_the_final_body_until_the_downstream_returns() -> None:
+    # uvicorn closes a Connection: close socket inside the final send, so a client can
+    # read the whole response while the app is still unwinding (the served stack).
+    responded = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await _respond(send)
+        responded.set()
+        await finish.wait()
+
+    gate, limiter, metrics, _ = _stack(app, max_inflight=1)
+    first, second = _Client(), _Client()
+    running = asyncio.create_task(gate(_scope(), first.receive, first.send))
+    await asyncio.wait_for(responded.wait(), 2)
+
+    assert first.status == 200
+    assert limiter.inflight == 1
+    await gate(_scope(), second.receive, second.send)
+    assert second.status == 429
+    assert metrics.blocks == [ROUTE_GATE_CAPACITY]
+
+    finish.set()
+    await running
+    assert limiter.inflight == 0
+    third = _Client()
+    await gate(_scope(), third.receive, third.send)
+    assert third.status == 200
+
+
 async def test_passthrough_routes_never_count() -> None:
     app = _Holding()
     gate, limiter, metrics, _ = _stack(app, max_inflight=1)
