@@ -8,7 +8,8 @@ LiteLLM как callback; всё остальное (конвейер аудит�
 на эксплуатируемом open-source, а не написано внутри.
 
 Каждый запрос санитизируется в `pre_call`, форвардится в Anthropic / OpenAI с сохранённым
-BYOK-ключом разработчика, де-санитизируется в `post_call` и аудируется.
+BYOK-ключом разработчика, де-санитизируется на обратном пути собственным ASGI-слоем шлюза (вне
+LiteLLM) и аудируется.
 
 ## Поток данных запроса
 
@@ -37,7 +38,7 @@ flowchart TD
     end
 
     DLP -->|clean| UP["Anthropic / OpenAI  (Authorization:Bearer untouched)"]
-    UP --> DS["post_call · StreamingDesanitizer  (placeholders longest-first)"]
+    UP --> DS["ASGI desanitiser, outside LiteLLM · route_gate/desanitize_middleware.py  (placeholders longest-first)"]
     DS --> AUD["audit · Vector → Langfuse + S3 + SIEM  (NEVER-fields gate)"]
     DS -->|"originals restored"| Dev
 ```
@@ -58,9 +59,13 @@ flowchart TD
    грациозная деградация (импорты NER ленивые, `[ner]` — опциональный extra).
 4. **Stage 5 — DLP egress guard**: независимый пере-скан вторым слоем санитизированного
    исходящего payload на canary-строки и высоконадёжные секреты; блокирует всё, что уцелело.
-5. **post_call**: `StreamingDesanitizer` восстанавливает оригиналы из per-conversation
-   маппинга (плейсхолдеры отсортированы длиннейшими вперёд — инвариант #5).
-6. **аудит**: Vector → Langfuse + S3 + SIEM с гейтом NEVER-полей.
+5. **Восстановление ответа** — не в callback LiteLLM: `route_gate/desanitize_middleware.py`,
+   внутри лимитера и перед приложением LiteLLM, восстанавливает оригиналы в ответе по маппингу,
+   который pre-call передал тикету запроса (плейсхолдеры отсортированы длиннейшими вперёд —
+   инвариант #5), поэтому LiteLLM и его callback-и видят только плейсхолдеры
+   ([security.ru.md](security.ru.md) §15).
+6. **аудит**: одна итоговая запись на запрос, когда ответ заканчивается
+   (`route_gate/terminal_audit.py`) → Vector → Langfuse + S3 + SIEM с гейтом NEVER-полей.
 
 ## Кэши
 
@@ -68,7 +73,7 @@ flowchart TD
 
 - **Cache A** — дедуп по содержимому, общий для всех диалогов, TTL ~10 ч.
 - **Cache B** — per-conversation хранилище маппинга (Redis или in-memory), скользящий TTL ~1 ч;
-  **обязателен** для `post_call`, чтобы обратить редактирование. Сегодня
+  восстановление ответа его не читает (оно использует снимок на тикете). Сегодня
   `conversation_id == request_id`, поэтому Cache B пока не переиспользуется между родственными
   запросами — см. [conversation-id.ru.md](conversation-id.ru.md).
 

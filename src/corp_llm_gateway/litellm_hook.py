@@ -1,4 +1,4 @@
-"""LiteLLM hook adapter (M1-7 pre_call + M1-8 post_call wiring).
+"""LiteLLM hook adapter (M1-7 pre_call wiring; the M1-8 reversal is the ASGI desanitiser).
 
 This is the integration boundary between LiteLLM's proxy and the
 corp-llm-gateway sanitization pipeline. The pure logic lives in
@@ -8,9 +8,14 @@ into LiteLLM's expected callback shape.
 
 LiteLLM's proxy invokes:
   - async_pre_call_hook(user_api_key_dict, cache, data, call_type)
-  - async_post_call_success_hook(user_api_key_dict, cache, data, response)
-  - async_post_call_streaming_iterator_hook(user_api_key_dict, response, request_data)
-  - async_log_success_event(kwargs, response_obj, start_time, end_time)
+  - async_log_success_event / async_log_failure_event(kwargs, response_obj, start_time, end_time)
+
+No response-side hook: the response is restored outside litellm, by the ASGI
+``DesanitizeMiddleware`` (``route_gate/desanitize_middleware.py``), so nothing inside
+litellm ever sees an original. For a request the route gate admitted, the pre-call hands
+the response mapping and the content-free audit facts to the request's ticket; the
+ticket's terminal record (``route_gate/terminal_audit.py``) is that request's audit
+record, and the log events only add token counts to it.
 
 We register the class via LiteLLM proxy config:
   litellm_settings:
@@ -23,17 +28,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import time
 import uuid
+import weakref
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from corp_llm_gateway.audit import AuditEvent, AuditLogger, AuditWriteAmbiguousError
+from corp_llm_gateway.audit import (
+    GUARDRAIL_INFORMATION_KEYS,
+    AuditEvent,
+    AuditLogger,
+    AuditWriteAmbiguousError,
+    assert_guardrail_information_allowed,
+)
 from corp_llm_gateway.audit.event import Provider
 from corp_llm_gateway.config import get as _config_get
 from corp_llm_gateway.corp_llm import CorpLlmHttpError
@@ -43,20 +56,18 @@ from corp_llm_gateway.corp_ner.errors import (
     ner_error_code,
 )
 from corp_llm_gateway.detectors import NerUnavailableError
-from corp_llm_gateway.metrics import MetricsExporter, NoopExporter
+from corp_llm_gateway.metrics import BLOCK_REASONS, MetricsExporter, NoopExporter
 from corp_llm_gateway.payload.classifier import classify_block
 from corp_llm_gateway.payload.size_threshold import OversizeContentError, should_skip_sanitization
 from corp_llm_gateway.pg_session import store_unavailable
 from corp_llm_gateway.providers import detect_provider
 from corp_llm_gateway.route_gate.inflight import RequestTicket, bind_call_id, current_ticket
+from corp_llm_gateway.route_gate.terminal_audit import AuditFacts, deposit_usage
+from corp_llm_gateway.route_gate.terminal_audit import deposit as deposit_audit_facts
 from corp_llm_gateway.sanitizer import (
-    OpenAiToolCallDesanitizer,
-    ResponsesStreamDesanitizer,
     SanitizationOrchestrator,
     SanitizeResult,
-    SseStreamDesanitizer,
     StrategyResult,
-    StreamingDesanitizer,
 )
 from corp_llm_gateway.sanitizer.content_blocks import (
     ContentTooDeepError,
@@ -81,6 +92,7 @@ from corp_llm_gateway.sanitizer.identity_preamble import (
     leading_identity_block_index,
 )
 from corp_llm_gateway.sanitizer.local_pass import DetectorContractError
+from corp_llm_gateway.sanitizer.orchestrator import OVERSIZE_DELIVERED_REASON
 from corp_llm_gateway.sanitizer.placeholder import (
     StaleSpanError,
     add_unwrapped_response_aliases,
@@ -101,7 +113,6 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     TeamConfigUnavailableError,
     passthrough_resolved,
 )
-from corp_llm_gateway.sanitizer.streaming import _json_string_escape, coerce_tool_index
 from corp_llm_gateway.tokens import (
     AuthError,
     AuthMiddleware,
@@ -109,9 +120,12 @@ from corp_llm_gateway.tokens import (
 )
 from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
 
+if TYPE_CHECKING:
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+
 # litellm v1.85's proxy dispatcher filters callbacks via
 # `isinstance(cb, CustomLogger)` before invoking any hook method.
-# Without the inheritance, our pre_call/post_call hooks are silently
+# Without the inheritance, our pre_call and log hooks are silently
 # skipped for /v1/messages requests. Import optionally so unit tests
 # that don't have litellm installed still work — production always
 # has it.
@@ -217,6 +231,10 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     silently dropped.
     """
 
+    # litellm's guardrails_only pre-call walk (one record of a batch input file)
+    # skips a plain CustomLogger's pre-call hook unless this is set.
+    enforces_request_content = True
+
     def __init__(
         self,
         orchestrator: SanitizationOrchestrator | ProfileAwareOrchestrator,
@@ -267,7 +285,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # PrometheusExporter (config-selected in the composition root) exposes the
         # block/failure/latency series the shipped alerts + runbook reference.
         self._metrics = metrics if metrics is not None else NoopExporter()
-        # Per-request state. Keyed by request_id; cleared in post_call.
+        # Per-request state. Keyed by request_id; handed to the request's ticket at the
+        # end of a ticketed pre-call, else cleared when the record is written.
         self._req_state: dict[str, _RequestState] = {}
         # Idempotency guard for audit(): litellm does NOT fire
         # async_log_failure_event for a pre_call GuardrailHttpException (confirmed
@@ -292,6 +311,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         self._cancel_emitting: dict[str, asyncio.Event] = {}
         # Ids whose audit() record is being written; set once the write resolves.
         self._audit_emitting: dict[str, asyncio.Event] = {}
+        # Where a ticketed pre-call registers its response mapping (the ASGI
+        # desanitiser's store); bound by the entrypoint's lifespan.
+        self._response_mappings: ResponseMappings | None = None
+        # Ids whose audit record is their ticket's terminal record: the log events
+        # add token counts to it and never write one of their own.
+        self._terminal_owned: OrderedDict[str, weakref.ref[RequestTicket]] = OrderedDict()
+
+    def bind_response_mappings(self, mappings: ResponseMappings) -> None:
+        """The store the ASGI desanitiser restores responses from."""
+        self._response_mappings = mappings
 
     @property
     def orchestrator(self) -> SanitizationOrchestrator | ProfileAwareOrchestrator:
@@ -314,28 +343,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
     ) -> dict[str, Any]:
         return await self.pre_call(data, call_type=call_type)
 
-    async def async_post_call_streaming_iterator_hook(
-        self,
-        user_api_key_dict: Any,
-        response: AsyncIterator[Any],
-        request_data: dict[str, Any],
-    ) -> AsyncGenerator[Any, None]:
-        async for chunk in self.post_call_stream(request_data, response):
-            yield chunk
-
-    async def async_post_call_success_hook(
-        self,
-        data: dict[str, Any],
-        user_api_key_dict: Any,
-        response: Any,
-    ) -> Any:
-        # NOTE: litellm v1.85 dropped `cache` from this hook's signature
-        # and reordered to (data, user_api_key_dict, response). Earlier
-        # litellm versions had (user_api_key_dict, cache, data, response).
-        # If you upgrade or downgrade litellm and see "missing positional
-        # argument" errors here, that's the signature drift to check.
-        return await self.post_call_unary(data, response)
-
     async def async_log_success_event(
         self,
         kwargs: dict[str, Any],
@@ -344,7 +351,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         end_time: float,
     ) -> None:
         request_data = _resolve_request_data(kwargs)
-        await self.audit(request_data, response_obj, start_time, end_time, status="ok")
+        await self.audit(
+            request_data, response_obj, start_time, end_time, status="ok", log_event=True
+        )
 
     async def async_log_failure_event(
         self,
@@ -354,7 +363,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         end_time: float,
     ) -> None:
         request_data = _resolve_request_data(kwargs)
-        await self.audit(request_data, response_obj, start_time, end_time, status="failed")
+        await self.audit(
+            request_data, response_obj, start_time, end_time, status="failed", log_event=True
+        )
 
     # ---- Pure logic (unit-testable without LiteLLM) -----------------------
 
@@ -426,7 +437,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         Claude-Code-style requests with a huge default output budget
         from overshooting the upstream model's context window.
 
-        Order: auth → strip corp token → sanitize messages → return.
+        Order: strip corp token → auth → sanitize messages → return.
         Failures are mapped to GuardrailHttpException with stable
         error_code so post-call audit can attribute the failure.
 
@@ -440,6 +451,21 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         `async_pre_call_hook` wiring supplies a call_type.
         """
         request_id = self._ensure_request_id(data)
+        pre_call_started = time.monotonic()
+        pre_call_wall = time.time()
+        # Read for auth, then stripped before anything can refuse: litellm hands a
+        # refused request, as it stands, to every failure hook (invariant 4).
+        inbound_headers = _extract_auth_headers(data)
+        data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
+        # The corp token arrives duplicated across every header-bearing location
+        # and some providers forward proxy_server_request.headers upstream, so
+        # strip it from ALL of them, not just data["headers"] (invariant 4).
+        _strip_corp_token_everywhere(data)
+        _strip_corp_token_from_logging_obj(data)
+        logger.info(
+            "litellm_pre_call_corp_token_stripped request_id=%s",
+            request_id,
+        )
         ticket = current_ticket()
         if ticket is not None and ticket.cancelled:
             # The route gate already wrote this request's `cancelled` record; a
@@ -477,7 +503,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 )
                 data["max_tokens"] = self._max_output_tokens_cap
 
-        inbound_headers = _extract_auth_headers(data)
         try:
             async with asyncio.timeout(AUTH_LOOKUP_BOUND_S):
                 ctx = await self._auth.authenticate_headers(inbound_headers)
@@ -530,16 +555,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             request_id,
             ctx.team_id,
             ctx.user_id,
-        )
-
-        data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
-        # The corp token arrives duplicated across every header-bearing location
-        # and some providers forward proxy_server_request.headers upstream, so
-        # strip it from ALL of them, not just data["headers"] (invariant 4).
-        _strip_corp_token_everywhere(data)
-        logger.info(
-            "litellm_pre_call_corp_token_stripped request_id=%s",
-            request_id,
         )
 
         # Optional: strip inbound HTTP wire headers from data so litellm
@@ -728,6 +743,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             cache_a_hit=False,
             mapping=StrategyResult(pairs=()),
         )
+        state.started_at = pre_call_wall
         self._req_state[request_id] = state
 
         # A client fully controls the request body: {"messages": [], "input": [...]}
@@ -738,6 +754,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.block_reason = "request:ambiguous_shape"
             self._record_failure(request_id, error_code="E_POLICY_BLOCKED")
             self._metrics.record_block(state.block_reason)
+            self._note_guardrail_information(data, state)
             logger.info(
                 "litellm_pre_call_blocked request_id=%s block_reason=%s",
                 request_id,
@@ -787,6 +804,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.block_reason = "provider:not_allowed"
             self._record_failure(request_id, error_code="E_PROVIDER_BLOCKED")
             self._metrics.record_block("provider:not_allowed")
+            self._note_guardrail_information(data, state)
             logger.info(
                 "litellm_pre_call_provider_blocked request_id=%s provider=%s",
                 request_id,
@@ -864,6 +882,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 state.block_reason = _s0_reason
                 self._record_failure(request_id, error_code="E_POLICY_BLOCKED")
                 self._metrics.record_block(_s0_reason)
+                self._note_guardrail_information(data, state)
                 logger.info(
                     "litellm_pre_call_blocked request_id=%s block_reason=%s",
                     request_id,
@@ -1015,6 +1034,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 state.block_reason = "oversize:blocked"
                 self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
                 self._metrics.record_block("oversize:blocked")
+                self._note_guardrail_information(data, state)
                 logger.info(
                     "litellm_pre_call_oversize_blocked request_id=%s message_index=%d "
                     "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
@@ -1137,6 +1157,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 identity_exempt=identity_exempt,
             )
 
+        _refresh_logging_snapshot(data, request_shape)
+        _refresh_request_body_snapshot(data)
+
         # Stage 5: DLP egress guard — re-scan the SANITIZED outbound request.
         # Defence-in-depth: catches canaries / raw secrets that survived the
         # primary sanitizer. Audit the block INLINE (idempotent) — litellm does
@@ -1177,6 +1200,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                 state.block_reason = _s5_reason
                 self._record_failure(request_id, error_code="E_DLP_BLOCKED")
                 self._metrics.record_block(_s5_reason)
+                self._note_guardrail_information(data, state)
                 logger.info(
                     "litellm_egress_blocked request_id=%s block_reason=%s",
                     request_id,
@@ -1190,6 +1214,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
                     "request blocked by DLP egress policy",
                 )
 
+        self._note_guardrail_information(data, state)
         logger.info(
             "litellm_pre_call_complete request_id=%s team_id=%s provider=%s "
             "model=%s total_redactions=%d placeholder_count=%d",
@@ -1200,7 +1225,55 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.redaction_count,
             len(state.placeholders),
         )
+        ticket = current_ticket()
+        facts = _audit_facts(state, started=pre_call_started)
+        facts.client_asked_usage = not _asks_for_stream_usage(data, call_type)
+        if ticket is not None and deposit_audit_facts(ticket, facts):
+            if not facts.client_asked_usage:
+                _ask_for_stream_usage(data)
+            self._hand_over(request_id, state, ticket)
         return data
+
+    def _hand_over(self, request_id: str, state: _RequestState, ticket: RequestTicket) -> None:
+        """The request's ticket owns it from here: the response mapping goes to the ASGI
+        desanitiser's store and the audit record is the ticket's terminal record. The
+        guardrail keeps neither the content nor the record."""
+        if self._response_mappings is not None and state.mapping.pairs:
+            self._response_mappings.register(
+                ticket, _response_mapping(state, include_bare_aliases=self._forward_chatgpt_auth)
+            )
+        self._terminal_owned[request_id] = weakref.ref(ticket)
+        self._terminal_owned.move_to_end(request_id)
+        while len(self._terminal_owned) > _AUDIT_DEDUP_CAP:
+            self._terminal_owned.popitem(last=False)
+        if not ticket.on_close(self._release_owned):
+            self._release_owned(ticket)
+        self._req_state.pop(request_id, None)
+
+    def _release_owned(self, ticket: RequestTicket) -> None:
+        """At its close the ticket's record is written or lost: its ids leave the hand-over
+        FIFO, and a later event for one of them, in no request's context, writes nothing."""
+        for request_id in ticket.request_ids():
+            owner = self._terminal_owned.get(request_id)
+            if owner is None or owner() is not ticket:
+                continue
+            del self._terminal_owned[request_id]
+            self._audited_ids[request_id] = None
+            if len(self._audited_ids) > _AUDIT_DEDUP_CAP:
+                self._audited_ids.popitem(last=False)
+
+    def _terminal_owner(self, request_id: str) -> tuple[bool, RequestTicket | None]:
+        """Whether a ticket writes this request's record, and which. The request's own
+        ticket when the call runs in its context (litellm's logging worker and the route
+        gate's cancel hook copy it); else the hand-over FIFO, a bounded fallback."""
+        current = current_ticket()
+        facts = getattr(current, "audit_facts", None)
+        if isinstance(facts, AuditFacts) and facts.request_id == request_id:
+            return True, current
+        owner = self._terminal_owned.get(request_id)
+        if owner is None:
+            return False, None
+        return True, owner()
 
     async def _sanitize_prompt_field(
         self,
@@ -1300,6 +1373,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.block_reason = "oversize:blocked"
             self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
             self._metrics.record_block("oversize:blocked")
+            self._note_guardrail_information(data, state)
             logger.info(
                 "litellm_pre_call_oversize_blocked request_id=%s field=%s "
                 "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
@@ -1390,199 +1464,6 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             state.redaction_count,
         )
 
-    async def post_call_stream(
-        self,
-        request_data: dict[str, Any],
-        response: AsyncIterator[Any],
-    ) -> AsyncIterator[Any]:
-        """Wrap an async iterator of SSE chunks with de-sanitization.
-
-        No safety net here on purpose: `_post_call_stream_impl` guards only
-        its OWN desanitization work, not the upstream provider's stream — an
-        `httpx.RemoteProtocolError` mid-stream is not our bug and must reach
-        litellm's own failure handling untouched, not get relabelled
-        `E_INTERNAL`.
-        """
-        request_id = self._ensure_request_id(request_data)
-        async for chunk in self._post_call_stream_impl(request_id, request_data, response):
-            yield chunk
-
-    async def _post_call_stream_impl(
-        self,
-        request_id: str,
-        request_data: dict[str, Any],
-        response: AsyncIterator[Any],
-    ) -> AsyncIterator[Any]:
-        state = self._req_state.get(request_id)
-        if state is None or not state.mapping.pairs:
-            logger.info(
-                "litellm_post_call_stream_passthrough request_id=%s reason=%s",
-                request_id,
-                "no_state" if state is None else "no_mapping",
-            )
-            async for chunk in response:
-                yield chunk
-            return
-
-        response_mapping = _response_mapping(state, include_bare_aliases=self._forward_chatgpt_auth)
-        logger.info(
-            "litellm_post_call_stream_desanitize_start request_id=%s pairs=%d aliases=%d",
-            request_id,
-            len(state.mapping.pairs),
-            len(response_mapping.pairs) - len(state.mapping.pairs),
-        )
-        # SSE bytes/str path: Anthropic passthrough emits raw SSE events.
-        sse = SseStreamDesanitizer(response_mapping)
-        # Dict path: OpenAI-dict chunks use the classic feed/flush interface.
-        dict_desanitizer = StreamingDesanitizer(response_mapping)
-        # Dict path: OpenAI tool_calls[].function.arguments deltas (F4), per index.
-        dict_tool_calls = OpenAiToolCallDesanitizer(response_mapping)
-        # Dict path: legacy OpenAI function_call.arguments deltas (singular).
-        dict_function_call = StreamingDesanitizer(response_mapping, escape=_json_string_escape)
-        # Responses API path: typed Pydantic ``response.*`` events.
-        responses_desanitizer = ResponsesStreamDesanitizer(response_mapping)
-        chunk_count = 0
-        # Manual `__anext__` loop (instead of `async for`) so fetching the next
-        # chunk from the UPSTREAM iterator is NOT inside the try/except below —
-        # only our own per-chunk desanitization work is guarded (F8: never wrap
-        # the provider's own transport).
-        stream_iter = response.__aiter__()
-        while True:
-            try:
-                chunk = await stream_iter.__anext__()
-            except StopAsyncIteration:
-                break
-            except Exception:
-                # Upstream/transport failure (e.g. httpx.RemoteProtocolError)
-                # fetching the next chunk. Flush any already-buffered
-                # desanitized tail (best effort — already-yielded chunks may
-                # have held content back) then let litellm see the ORIGINAL
-                # exception untouched; it is not ours to reclassify.
-                try:
-                    for tail_chunk in _flush_stream_tails(
-                        sse,
-                        dict_desanitizer,
-                        dict_tool_calls,
-                        dict_function_call,
-                        responses_desanitizer,
-                    ):
-                        yield tail_chunk
-                except Exception:
-                    logger.warning(
-                        "litellm_post_call_stream_flush_after_upstream_error_failed request_id=%s",
-                        request_id,
-                    )
-                raise
-            chunk_count += 1
-            try:
-                if isinstance(chunk, (bytes, str)):
-                    for out_chunk in sse.feed(chunk):
-                        yield out_chunk
-                elif _is_responses_event(chunk):
-                    for out_chunk in responses_desanitizer.feed(chunk):
-                        yield out_chunk
-                elif isinstance(chunk, dict):
-                    chunk, had_tc = _desanitize_chunk_tool_calls(chunk, dict_tool_calls)
-                    chunk, had_fc = _desanitize_chunk_function_call(chunk, dict_function_call)
-                    text = _extract_chunk_text(chunk)
-                    if text is None:
-                        yield chunk
-                    else:
-                        out = dict_desanitizer.feed(text)
-                        # Held-back/empty content must not drop a tool_call/function_call
-                        # riding in the same delta (its id/name/args would be lost).
-                        if out or had_tc or had_fc:
-                            yield _replace_chunk_text(chunk, out)
-                else:
-                    yield chunk
-            except GuardrailHttpException:
-                raise
-            except Exception as exc:
-                # Our own desanitization work failed — this runs AFTER
-                # placeholders have been replaced by originals, the one path
-                # most likely to carry real user content in the exception
-                # message (F8).
-                try:
-                    for tail_chunk in _flush_stream_tails(
-                        sse,
-                        dict_desanitizer,
-                        dict_tool_calls,
-                        dict_function_call,
-                        responses_desanitizer,
-                    ):
-                        yield tail_chunk
-                except Exception:
-                    logger.warning(
-                        "litellm_post_call_stream_flush_after_failure_failed request_id=%s",
-                        request_id,
-                    )
-                await self._report_internal_failure(
-                    request_id,
-                    request_data,
-                    exc,
-                    log_event="litellm_post_call_stream_unexpected_error",
-                )
-                # `from None`: `exc` (already-desanitized content) must never
-                # become `__cause__` (M1-14 surface iii/vi).
-                raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
-        for tail_chunk in _flush_stream_tails(
-            sse, dict_desanitizer, dict_tool_calls, dict_function_call, responses_desanitizer
-        ):
-            yield tail_chunk
-        logger.info(
-            "litellm_post_call_stream_desanitize_done request_id=%s chunk_count=%d",
-            request_id,
-            chunk_count,
-        )
-
-    async def post_call_unary(
-        self,
-        request_data: dict[str, Any],
-        response: Any,
-    ) -> Any:
-        """De-sanitize a single (non-streaming) response.
-
-        Thin F8 safety-net wrapper (same shape as `pre_call`): this runs
-        AFTER placeholders have been replaced by originals, so an unexpected
-        exception here is the one place raw content is most likely to ride
-        in an exception message. Never let that reach the client raw.
-        """
-        request_id = self._ensure_request_id(request_data)
-        try:
-            return await self._post_call_unary_impl(request_id, request_data, response)
-        except GuardrailHttpException:
-            raise
-        except Exception as exc:
-            await self._report_internal_failure(
-                request_id, request_data, exc, log_event="litellm_post_call_unary_unexpected_error"
-            )
-            # `from None`: `exc` (already-desanitized content) must never
-            # become `__cause__` (M1-14 surface iii/vi).
-            raise GuardrailHttpException(500, "E_INTERNAL", "internal error") from None
-
-    async def _post_call_unary_impl(
-        self,
-        request_id: str,
-        request_data: dict[str, Any],
-        response: Any,
-    ) -> Any:
-        state = self._req_state.get(request_id)
-        if state is None or not state.mapping.pairs:
-            logger.info(
-                "litellm_post_call_unary_passthrough request_id=%s reason=%s",
-                request_id,
-                "no_state" if state is None else "no_mapping",
-            )
-            return response
-        response_mapping = _response_mapping(state, include_bare_aliases=self._forward_chatgpt_auth)
-        logger.info(
-            "litellm_post_call_unary_desanitize request_id=%s pairs=%d aliases=%d",
-            request_id,
-            len(state.mapping.pairs),
-            len(response_mapping.pairs) - len(state.mapping.pairs),
-        )
-        return _apply_reverse_to_response(response, response_mapping)
-
     async def audit(
         self,
         request_data: dict[str, Any],
@@ -1592,8 +1473,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         *,
         status: str,
         error_code: str | None = None,
+        log_event: bool = False,
     ) -> None:
         request_id = self._ensure_request_id(request_data)
+        owned, ticket = self._terminal_owner(request_id)
+        if owned:
+            self._add_to_terminal_record(request_id, ticket, response, start_time, end_time, status)
+            return
         # A record in flight decides the terminal record: wait for it.
         await self._emits_resolved(request_id)
         if request_id in self._audited_ids:
@@ -1616,13 +1502,15 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # "unknown"/0/null — popping only happens once emit() has actually
         # succeeded (or the sink tells us the write is ambiguous, below).
         state = self._req_state.get(request_id)
-        # litellm v1.85 passes datetime objects for start_time / end_time
-        # to async_log_*_event; older versions used floats. Handle both.
-        delta = end_time - start_time
-        if hasattr(delta, "total_seconds"):
-            latency_ms = max(0, int(delta.total_seconds() * 1000))
-        else:
-            latency_ms = max(0, int(delta * 1000))
+        if state is None and log_event and self._response_mappings is not None:
+            # Behind the ASGI desanitiser a pre-call that got this far handed its record to
+            # its ticket (no longer in the FIFO), or no pre-call ran: nothing to write from,
+            # a record here would be an orphan "unknown" one. Without it the log event is
+            # the request's only record path and still writes the content-free record.
+            self._metrics.record_failure(AUDIT_COMPONENT)
+            logger.error("litellm_audit_orphan_event request_id=%s status=%s", request_id, status)
+            return
+        latency_ms = _latency_ms(start_time, end_time)
         # Once per REQUEST, not once per audit() call: a failed emit + safety-net
         # retry must not double-observe the same request's latency under two
         # different status labels.
@@ -1690,6 +1578,31 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             completion_tokens,
         )
 
+    def _add_to_terminal_record(
+        self,
+        request_id: str,
+        ticket: RequestTicket | None,
+        response: Any,
+        start_time: Any,
+        end_time: Any,
+        status: str,
+    ) -> None:
+        """A log event for a request whose ticket writes its record: its token counts,
+        while that record is still open, and the latency metric. Never a record."""
+        prompt_tokens, completion_tokens = _extract_token_counts(response)
+        if ticket is not None and (prompt_tokens or completion_tokens):
+            deposit_usage(ticket, prompt_tokens, completion_tokens)
+        if ticket is not None and ticket.cancelled:
+            return
+        if request_id not in self._latency_observed_ids:
+            self._metrics.observe_request_latency(
+                _latency_ms(start_time, end_time) / 1000.0, status=status
+            )
+            self._latency_observed_ids[request_id] = None
+            if len(self._latency_observed_ids) > _AUDIT_DEDUP_CAP:
+                self._latency_observed_ids.popitem(last=False)
+        logger.debug("litellm_audit_on_terminal_record request_id=%s status=%s", request_id, status)
+
     async def on_request_cancelled(self, request_id: str, *, latency_ms: int = 0) -> None:
         """The terminal record of a request the route gate cancelled (client gone).
 
@@ -1703,7 +1616,13 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
         Only the cancelled request's own state is touched: state another request
         registered under the same call id is left alone, and nothing is written.
+
+        A request whose pre-call handed it to its ticket gets nothing here: the ticket's
+        terminal record is its ``cancelled`` record, and its state is already gone.
         """
+        if self._terminal_owner(request_id)[0]:
+            self._cancel_pending.pop(request_id, None)
+            return
         state = self._req_state.get(request_id)
         if state is not None and not _cancel_reaches(state.ticket):
             self._metrics.record_failure("route_gate")
@@ -1912,6 +1831,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         state.block_reason = "oversize:blocked"
         self._record_failure(request_id, error_code="E_OVERSIZE_BLOCKED")
         self._metrics.record_block("oversize:blocked")
+        self._note_guardrail_information(data, state)
         logger.info(
             "litellm_pre_call_oversize_blocked request_id=%s field=unmanaged_input "
             "error_code=E_OVERSIZE_BLOCKED content_bytes=%d threshold_bytes=%d",
@@ -1927,6 +1847,27 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             "request blocked: oversize content",
         )
 
+    def _note_guardrail_information(self, data: dict[str, Any], state: _RequestState) -> None:
+        """This pre-call's content-free entry in litellm's logging payload. Never raises:
+        a failed write loses an annotation, never the request or its audit record."""
+        try:
+            _write_guardrail_information(
+                data,
+                block_reason=state.block_reason,
+                redaction_count=state.redaction_count,
+                finding_label_counts=_label_counts(state.placeholders),
+                start_time=state.started_at,
+                end_time=time.time(),
+            )
+        except Exception as exc:
+            # Type only: an exception message can quote request content.
+            logger.error(
+                "litellm_guardrail_information_failed request_id=%s error=%s",
+                state.request_id,
+                type(exc).__name__,
+            )
+            self._metrics.record_failure(AUDIT_COMPONENT)
+
     async def _resolve_profile(self, team_id: str) -> ResolvedProfile:
         """Resolve the team's merged profile (policy + inner orchestrator + D3
         fingerprint). A plain orchestrator has no profiles → the passthrough
@@ -1938,6 +1879,219 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
 
 
 # ---- helpers --------------------------------------------------------------
+
+
+def _audit_facts(state: _RequestState, *, started: float) -> AuditFacts:
+    return AuditFacts(
+        request_id=state.request_id,
+        user_id=state.user_id,
+        team_id=state.team_id,
+        provider=state.provider,
+        model=state.model,
+        redaction_count=state.redaction_count,
+        finding_label_counts=_label_counts(state.placeholders),
+        cache_a_hit=state.cache_a_hit,
+        block_reason=state.block_reason,
+        error_code=state.error_code,
+        profile_ids=state.profile_ids,
+        placeholders=tuple(state.placeholders),
+        status="ok",
+        started=started,
+    )
+
+
+# Our name in litellm's `guardrail_information` (and its OTEL guardrail span).
+GUARDRAIL_NAME = "corp-llm-sanitizer"
+# litellm's metadata key for guardrail entries (custom_guardrail.py).
+_GUARDRAIL_INFORMATION_KEY = "standard_logging_guardrail_information"
+
+# block_reason → litellm's `guardrail_status`. Our reason codes (the
+# `blocked_requests_total{block_reason}` labels) are the source; litellm's status is
+# derived from them, never the other way round. Only pre-call reasons: the route gate
+# and the in-flight cap refuse before litellm runs.
+GUARDRAIL_STATUS_BY_BLOCK_REASON: dict[str | None, str] = {
+    None: "success",
+    OVERSIZE_DELIVERED_REASON: "guardrail_flagged",
+    **{
+        reason: "guardrail_intervened"
+        for site in ("stage0", "stage5", "policy")
+        for reason in BLOCK_REASONS[site]
+    },
+}
+
+
+class UnknownBlockReasonError(Exception):
+    """A block_reason with no litellm status in the table: nothing is written."""
+
+
+class GuardrailInformationShapeError(Exception):
+    """litellm's writer built something other than the allow-listed entry: removed."""
+
+
+_WRITER: Any = None
+_NO_WRITER = object()
+
+
+def _guardrail_information_writer() -> Any:
+    """litellm's own writer, on a CustomGuardrail that is never registered: not a
+    callback, so litellm never dispatches to it. None without litellm."""
+    global _WRITER
+    if _WRITER is None:
+        try:
+            from litellm.integrations.custom_guardrail import CustomGuardrail
+            from litellm.types.guardrails import GuardrailEventHooks
+        except ImportError:
+            _WRITER = _NO_WRITER
+        else:
+            _WRITER = CustomGuardrail(
+                guardrail_name=GUARDRAIL_NAME, event_hook=GuardrailEventHooks.pre_call
+            )
+    return None if _WRITER is _NO_WRITER else _WRITER
+
+
+def _write_guardrail_information(
+    data: dict[str, Any],
+    *,
+    block_reason: str | None,
+    redaction_count: int,
+    finding_label_counts: dict[str, int],
+    start_time: float,
+    end_time: float,
+) -> None:
+    """Write our entry into the request metadata with litellm's writer (it also emits
+    the OTEL guardrail span), then sync it into the logging object the
+    ``StandardLoggingPayload`` is built from. The entry is checked against
+    the allow-list before litellm sees it, and litellm's copy after."""
+    writer = _guardrail_information_writer()
+    if writer is None:
+        return
+    if block_reason not in GUARDRAIL_STATUS_BY_BLOCK_REASON:
+        raise UnknownBlockReasonError
+    from litellm.litellm_core_utils.core_helpers import get_or_create_metadata_bucket
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    status = GUARDRAIL_STATUS_BY_BLOCK_REASON[block_reason]
+    response: dict[str, Any] = {
+        "redaction_count": redaction_count,
+        "finding_label_counts": dict(finding_label_counts),
+    }
+    if block_reason is not None:
+        response["block_reason"] = block_reason
+    end_time = max(end_time, start_time)
+    expected = {
+        "guardrail_name": GUARDRAIL_NAME,
+        "guardrail_provider": None,
+        "guardrail_mode": GuardrailEventHooks.pre_call,
+        "guardrail_response": response,
+        "guardrail_status": status,
+        "start_time": start_time,
+        "end_time": end_time,
+        "duration": end_time - start_time,
+        "masked_entity_count": None,
+    }
+    assert_guardrail_information_allowed(expected)
+    _, bucket = get_or_create_metadata_bucket(data)
+    earlier = bucket.get(_GUARDRAIL_INFORMATION_KEY)
+    known = len(earlier) if isinstance(earlier, list) else int(earlier is not None)
+    # A copied context: the writer sets litellm's "guardrail self-recorded" contextvar,
+    # which must not stay set in the request's own context.
+    contextvars.copy_context().run(
+        writer.add_standard_logging_guardrail_information_to_request_data,
+        guardrail_json_response=dict(response),
+        request_data=data,
+        guardrail_status=status,
+        start_time=start_time,
+        end_time=end_time,
+        duration=end_time - start_time,
+        event_type=GuardrailEventHooks.pre_call,
+    )
+    entries = bucket.get(_GUARDRAIL_INFORMATION_KEY)
+    added = entries[known:] if isinstance(entries, list) else []
+    if added != [expected]:
+        # Only what this call added goes: another guardrail's entry stays.
+        if isinstance(entries, list):
+            del entries[known:]
+        raise GuardrailInformationShapeError
+    _sync_guardrail_information(data.get("litellm_logging_obj"), expected, entries)
+
+
+def _sync_guardrail_information(
+    logging_obj: Any, entry: dict[str, Any], request_entries: list[Any]
+) -> None:
+    """Our entry into the logging object's ``litellm_params["metadata"]`` (both of its
+    copies): the payload reads that, not the request.
+
+    Where that metadata holds no entry list yet, it shares the request's list — the
+    one litellm itself carries into the payload — so an entry another callback writes
+    later still lands; a list of its own gets a copy of our entry, allow-listed keys
+    only; no metadata at all gets none. Never litellm's
+    ``_sync_guardrail_info_to_logging_obj``: it copies every entry of the request,
+    other guardrails' included."""
+    if logging_obj is None:
+        return
+    details = getattr(logging_obj, "model_call_details", None)
+    targets = (
+        getattr(logging_obj, "litellm_params", None),
+        details.get("litellm_params") if isinstance(details, dict) else None,
+    )
+    for params in targets:
+        if not isinstance(params, dict):
+            continue
+        metadata = params.get("metadata")
+        if not isinstance(metadata, dict):
+            # Never re-created: the auth bridges scrub it (``_scrub_retained_request_metadata``).
+            continue
+        existing = metadata.get(_GUARDRAIL_INFORMATION_KEY)
+        copy = {key: entry[key] for key in GUARDRAIL_INFORMATION_KEYS}
+        if existing is None:
+            metadata[_GUARDRAIL_INFORMATION_KEY] = request_entries
+        elif isinstance(existing, list) and copy not in existing:
+            existing.append(copy)
+
+
+# litellm's call type for the chat-completions routes.
+_CHAT_CALL_TYPES = frozenset({"acompletion", "completion"})
+# litellm 1.101.0 asks a chat stream for usage itself when its client did not, and marks
+# the request with this key to strip the usage chunk (common_request_processing.py).
+_LITELLM_STRIP_STREAM_USAGE = "_litellm_strip_stream_usage"
+
+
+def _asks_for_stream_usage(data: dict[str, Any], call_type: str | None) -> bool:
+    """A chat stream whose client did not ask for the usage chunk: the terminal record
+    needs its counts (litellm's success log comes after the record is written)."""
+    if call_type not in _CHAT_CALL_TYPES or data.get("stream") is not True:
+        return False
+    if data.get(_LITELLM_STRIP_STREAM_USAGE) is True:
+        return True
+    options = data.get("stream_options")
+    if options is None:
+        return True
+    return isinstance(options, dict) and options.get("include_usage") is not True
+
+
+def _ask_for_stream_usage(data: dict[str, Any]) -> None:
+    """The usage chunk reaches the ASGI desanitiser, which reads it and drops it."""
+    # litellm injects only where `_litellm_model_supports_stream_options` holds; this does
+    # not check. The shipped configs set `drop_params: true`, so a provider without the
+    # param never gets it (else Anthropic via chat would answer 400), and the drop rule
+    # matches litellm's own.
+    if _LITELLM_STRIP_STREAM_USAGE in data:
+        data[_LITELLM_STRIP_STREAM_USAGE] = False
+    options = {**(data.get("stream_options") or {}), "include_usage": True}
+    data["stream_options"] = options
+    # litellm's logging object copied the body's stream_options before any pre-call hook,
+    # and its stream wrapper reads them from there.
+    logging_obj = data.get("litellm_logging_obj")
+    if hasattr(logging_obj, "stream_options"):
+        logging_obj.stream_options = options
+
+
+def _latency_ms(start_time: Any, end_time: Any) -> int:
+    # litellm passes datetimes to async_log_*_event; older versions used floats.
+    delta = end_time - start_time
+    if hasattr(delta, "total_seconds"):
+        return max(0, int(delta.total_seconds() * 1000))
+    return max(0, int(delta * 1000))
 
 
 def _label_counts(placeholders: list[str]) -> dict[str, int]:
@@ -2089,26 +2243,58 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
     litellm's logging-metadata dict — the same dict ``_scatter`` threads the
     request id through and litellm hands to log callbacks — so a corp token
     mirrored there would reach the audit/logging pipeline, which invariant 4
-    forbids. The rule: every bucket ``_extract_auth_headers`` reads for auth must
-    be strippable here too. ``_drop_corp_token`` only removes ``x-corp-auth``;
-    the developer's BYOK ``Authorization`` header is left untouched (invariant 3).
+    forbids. Each metadata bucket's ``requester_metadata`` copy and the body
+    snapshot's metadata are covered too. The rule: every bucket
+    ``_extract_auth_headers`` reads for auth must be strippable here too.
+    ``_drop_corp_token`` only removes ``x-corp-auth``; the developer's BYOK
+    ``Authorization`` header is left untouched (invariant 3).
     """
     _drop_corp_token(data.get("headers"))
-    for bucket_key in ("proxy_server_request", "metadata", "litellm_metadata"):
-        bucket = data.get(bucket_key)
-        if isinstance(bucket, dict):
-            _drop_corp_token(bucket.get("headers"))
+    _drop_corp_token_from_request(data)
     lparams = data.get("litellm_params")
     if isinstance(lparams, dict):
-        meta = lparams.get("metadata")
-        if isinstance(meta, dict):
-            _drop_corp_token(meta.get("headers"))
-        proxy_request = lparams.get("proxy_server_request")
-        if isinstance(proxy_request, dict):
-            _drop_corp_token(proxy_request.get("headers"))
+        _drop_corp_token_from_request(lparams)
     secret_fields = data.get("secret_fields")
     if isinstance(secret_fields, dict):
         _drop_corp_token(secret_fields.get("raw_headers"))
+
+
+def _drop_corp_token_from_request(holder: dict[str, Any]) -> None:
+    """The metadata buckets and ``proxy_server_request`` of *holder*, and the metadata
+    buckets of its request-body snapshot. On chat litellm deep-copies the metadata,
+    headers included, into ``requester_metadata`` (hazard 18): a copy, not the dict the
+    other buckets share."""
+    _drop_corp_token_from_metadata(holder)
+    proxy_request = holder.get("proxy_server_request")
+    if isinstance(proxy_request, dict):
+        _drop_corp_token(proxy_request.get("headers"))
+        body = proxy_request.get("body")
+        if isinstance(body, dict):
+            _drop_corp_token_from_metadata(body)
+
+
+def _drop_corp_token_from_metadata(holder: dict[str, Any]) -> None:
+    for bucket_key in ("metadata", "litellm_metadata"):
+        bucket = holder.get(bucket_key)
+        if not isinstance(bucket, dict):
+            continue
+        _drop_corp_token(bucket.get("headers"))
+        requester = bucket.get("requester_metadata")
+        if isinstance(requester, dict):
+            _drop_corp_token(requester.get("headers"))
+
+
+def _strip_corp_token_from_logging_obj(data: dict[str, Any]) -> None:
+    """The same strip on litellm's logging object, built before any pre-call hook ran:
+    its ``model_call_details`` and ``litellm_params`` are what every success and failure
+    log event, ``StandardLoggingPayload`` and spend-log row are read from."""
+    logging_obj = data.get("litellm_logging_obj")
+    details = getattr(logging_obj, "model_call_details", None)
+    if isinstance(details, dict):
+        _strip_corp_token_everywhere(details)
+    lparams = getattr(logging_obj, "litellm_params", None)
+    if isinstance(lparams, dict):
+        _strip_corp_token_everywhere({"litellm_params": lparams})
 
 
 def _scrub_retained_request_metadata(data: dict[str, Any]) -> None:
@@ -2306,11 +2492,47 @@ def _store_request_items(data: dict[str, Any], items: list[Any], shape: str) -> 
         data["input"] = items
 
 
-def _is_responses_event(chunk: Any) -> bool:
-    if isinstance(chunk, dict):
-        return str(chunk.get("type") or "").startswith("response.")
-    event_type = getattr(chunk, "type", None)
-    return isinstance(event_type, str) and event_type.startswith("response.")
+def _refresh_logging_snapshot(data: dict[str, Any], shape: str) -> None:
+    """Hand litellm's logging object the rewritten request, as new lists in its snapshot
+    shapes: it snapshotted the original before any pre-call hook ran, every success and
+    failure ``StandardLoggingPayload`` reads ``messages`` from it, the proxy re-points it
+    afterwards for a ``messages`` body only (not a Responses ``input``), and its
+    ``model_call_details["input"]`` stays the original until the provider's own
+    ``pre_call`` — a failure logged before that hands it to every callback."""
+    logging_obj = data.get("litellm_logging_obj")
+    update = getattr(logging_obj, "update_messages", None)
+    if not callable(update) or shape == "unmanaged":
+        return
+    items = data.get("messages") if shape == "messages" else data.get("input")
+    if isinstance(items, str):
+        update([{"role": "user", "content": items}])
+        logged_input: str | list[Any] = items
+    elif isinstance(items, list):
+        update([{"role": "user", "content": i} if isinstance(i, str) else i for i in items])
+        logged_input = list(items)
+    else:
+        return
+    details = getattr(logging_obj, "model_call_details", None)
+    if isinstance(details, dict):
+        details["input"] = logged_input
+
+
+_REWRITTEN_BODY_KEYS = ("messages", "input", "system", "instructions")
+
+
+def _refresh_request_body_snapshot(data: dict[str, Any]) -> None:
+    """Point litellm's ``proxy_server_request.body`` snapshot at the rewritten content:
+    litellm re-takes it only after ``pre_call_hook`` returns, so a rejection raised after
+    the rewrite would hand every ``async_post_call_failure_hook`` the original. Only keys
+    the snapshot already holds are overwritten — nothing a pre-call added (``api_key``,
+    ``extra_headers``) is written into it."""
+    request = data.get("proxy_server_request")
+    body = request.get("body") if isinstance(request, dict) else None
+    if not isinstance(body, dict):
+        return
+    for key in _REWRITTEN_BODY_KEYS:
+        if key in body and key in data:
+            body[key] = data[key]
 
 
 @dataclass(frozen=True)
@@ -2379,6 +2601,7 @@ class _RequestState:
         "redaction_count",
         "request_id",
         "response_alias_exclusions",
+        "started_at",
         "team_id",
         "ticket",
         "user_id",
@@ -2414,6 +2637,8 @@ class _RequestState:
         # Resolved profile layer-key (D4) — metadata for the audit trail; set
         # after profile resolution in pre_call. Empty == no profile applied.
         self.profile_ids: tuple[str, ...] = ()
+        # Wall clock (epoch seconds) the pre-call started: litellm's guardrail timing.
+        self.started_at: float = time.time()
 
 
 @contextlib.contextmanager
@@ -2576,153 +2801,12 @@ _FAILURE_COMPONENT: dict[str, str] = {
 # The component of a failure one error code cannot name alone: a team config that
 # cannot be read answers E_PROFILE_UNAVAILABLE, like a broken profile.
 TEAM_CONFIG_COMPONENT = "team_config"
+# A litellm log event the guardrail has no record to write from.
+AUDIT_COMPONENT = "audit"
 
 
 def _failure_component(error_code: str) -> str:
     return _FAILURE_COMPONENT.get(error_code, "other")
-
-
-def _extract_chunk_text(chunk: Any) -> str | None:
-    """Pull text out of an SSE chunk in a shape-tolerant way."""
-    if isinstance(chunk, str):
-        return chunk
-    if isinstance(chunk, bytes):
-        return chunk.decode("utf-8", errors="replace")
-    if isinstance(chunk, dict):
-        choices = chunk.get("choices") or []
-        if choices and isinstance(choices, list):
-            delta = choices[0].get("delta") or {}
-            content = delta.get("content")
-            if isinstance(content, str):
-                return content
-        delta_top = chunk.get("delta")
-        if isinstance(delta_top, dict):
-            text = delta_top.get("text")
-            if isinstance(text, str):
-                return text
-    return None
-
-
-def _replace_chunk_text(chunk: Any, new_text: str) -> Any:
-    if isinstance(chunk, str):
-        return new_text
-    if isinstance(chunk, bytes):
-        return new_text.encode("utf-8")
-    if isinstance(chunk, dict):
-        out = {**chunk}
-        choices = out.get("choices")
-        if isinstance(choices, list) and choices:
-            new_choices = list(choices)
-            first = {**(new_choices[0] or {})}
-            delta = {**(first.get("delta") or {})}
-            delta["content"] = new_text
-            first["delta"] = delta
-            new_choices[0] = first
-            out["choices"] = new_choices
-            return out
-        delta_top = out.get("delta")
-        if isinstance(delta_top, dict):
-            new_delta = {**delta_top, "text": new_text}
-            out["delta"] = new_delta
-            return out
-        out["content"] = new_text
-        return out
-    return new_text
-
-
-def _make_text_chunk() -> dict[str, Any]:
-    return {"choices": [{"delta": {"content": ""}}]}
-
-
-def _make_tool_call_chunk(index: int, arguments: str) -> dict[str, Any]:
-    return {
-        "choices": [
-            {"delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments}}]}}
-        ]
-    }
-
-
-def _make_function_call_chunk(arguments: str) -> dict[str, Any]:
-    return {"choices": [{"delta": {"function_call": {"arguments": arguments}}}]}
-
-
-def _flush_stream_tails(
-    sse: SseStreamDesanitizer,
-    dict_desanitizer: StreamingDesanitizer,
-    dict_tool_calls: OpenAiToolCallDesanitizer,
-    dict_function_call: StreamingDesanitizer,
-    responses_desanitizer: ResponsesStreamDesanitizer,
-) -> Iterator[Any]:
-    """Flush every stream desanitizer's held-back tail, in the fixed order
-    the normal end-of-stream path uses. Shared with both stream-failure
-    paths so an aborted stream doesn't silently drop already-buffered
-    (partially desanitized) content."""
-    yield from sse.flush()
-    tail = dict_desanitizer.flush()
-    if tail:
-        yield _replace_chunk_text(_make_text_chunk(), tail)
-    for tc_index, tc_tail in dict_tool_calls.flush():
-        yield _make_tool_call_chunk(tc_index, tc_tail)
-    fc_tail = dict_function_call.flush()
-    if fc_tail:
-        yield _make_function_call_chunk(fc_tail)
-    yield from responses_desanitizer.flush()
-
-
-def _desanitize_chunk_tool_calls(
-    chunk: dict[str, Any], desanitizer: OpenAiToolCallDesanitizer
-) -> tuple[dict[str, Any], bool]:
-    """Rewrite placeholders in an OpenAI dict chunk's tool_calls argument deltas.
-
-    Returns ``(chunk, had_tool_calls)`` — ``had_tool_calls`` tells the caller to
-    keep emitting the chunk even when its content is held back. A garbage index is
-    skipped rather than crashing the stream."""
-    choices = chunk.get("choices")
-    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
-        return chunk, False
-    delta = choices[0].get("delta")
-    if not isinstance(delta, dict) or not isinstance(delta.get("tool_calls"), list):
-        return chunk, False
-    new_calls: list[Any] = []
-    changed = False
-    for tc in delta["tool_calls"]:
-        fn = tc.get("function") if isinstance(tc, dict) else None
-        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-            idx = coerce_tool_index(tc.get("index", 0))
-            if idx is None:
-                new_calls.append(tc)
-                continue
-            rewritten = desanitizer.feed(idx, fn["arguments"])
-            new_calls.append({**tc, "function": {**fn, "arguments": rewritten}})
-            changed = True
-        else:
-            new_calls.append(tc)
-    if not changed:
-        return chunk, False
-    new_delta = {**delta, "tool_calls": new_calls}
-    new_first = {**choices[0], "delta": new_delta}
-    return {**chunk, "choices": [new_first, *choices[1:]]}, True
-
-
-def _desanitize_chunk_function_call(
-    chunk: dict[str, Any], desanitizer: StreamingDesanitizer
-) -> tuple[dict[str, Any], bool]:
-    """Rewrite placeholders in an OpenAI dict chunk's legacy function_call args delta.
-
-    Returns ``(chunk, had_function_call)``."""
-    choices = chunk.get("choices")
-    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
-        return chunk, False
-    delta = choices[0].get("delta")
-    if not isinstance(delta, dict):
-        return chunk, False
-    fc = delta.get("function_call")
-    if not isinstance(fc, dict) or not isinstance(fc.get("arguments"), str):
-        return chunk, False
-    rewritten = desanitizer.feed(fc["arguments"])
-    new_delta = {**delta, "function_call": {**fc, "arguments": rewritten}}
-    new_first = {**choices[0], "delta": new_delta}
-    return {**chunk, "choices": [new_first, *choices[1:]]}, True
 
 
 def _apply_reverse_to_response(response: Any, mapping: StrategyResult) -> Any:

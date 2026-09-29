@@ -32,9 +32,8 @@ _DEFAULT_CONTENT_TYPE = "text/plain; charset=utf-8"
 # is silently always-zero — this is the list to write them against.
 #
 # The `route_gate` row is `route_gate.classify.BLOCK_REASONS`, restated rather
-# than imported (that module imports this one). tests/metrics/test_metrics.py
-# pins the two equal and fails on a literal passed to `record_block` that is
-# absent here.
+# than imported (that module imports this one). The metrics tests pin the two
+# equal and fail on a literal passed to `record_block` that is absent here.
 BLOCK_REASONS: dict[str, tuple[str, ...]] = {
     # Stage 0 — payload classifier, refuse before egress.
     "stage0": ("config:env", "config:kube", "config:nginx", "config:ini", "log:dump"),
@@ -50,6 +49,8 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
         "route_gate_malformed",
         "route_gate_unarmed",
         "route_gate_error",
+        "route_gate_body_policies",
+        "route_gate_body_not_json",
     ),
     # The route gate's in-flight cap, after the verdict (route_gate/inflight.py):
     # every slot (or body-read place) taken, or a body past its read deadline.
@@ -61,13 +62,20 @@ BLOCK_REASONS: dict[str, tuple[str, ...]] = {
 # unmapped); ``route_gate`` is recorded outside that map — the gate
 # refuses a route it should have forwarded (the guardrail callback never
 # registered), cannot classify one at all, or loses the refusal's audit record
-# (``route_gate/middleware.py:228-233``) — and so is ``team_config``, a team
-# config the store could not return (``litellm_hook.TEAM_CONFIG_COMPONENT``).
-# Pinned against every source in tests/metrics/test_metrics.py.
+# (``route_gate/middleware.py``) — and so is ``team_config``, a team config the
+# store could not return (``litellm_hook.TEAM_CONFIG_COMPONENT``), ``audit``: a
+# litellm log event the guardrail has nothing to write a record from, or its
+# ``guardrail_information`` entry not written (``litellm_hook.AUDIT_COMPONENT``), and
+# ``desanitize``: a response the ASGI desanitiser
+# (``route_gate/desanitize_middleware.py``) could not restore, or a terminal audit
+# record lost after its last write (``route_gate/terminal_audit.py``).
+# The metrics tests pin this against every source.
 FAILURE_COMPONENTS: tuple[str, ...] = (
+    "audit",
     "auth",
     "corp_llm",
     "corp_ner",
+    "desanitize",
     "dlp",
     "internal",
     "ner",

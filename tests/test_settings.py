@@ -1335,3 +1335,97 @@ def test_validate_passes_the_default_capacity(
     monkeypatch.setenv("CORP_ENV", "production")
 
     settings.validate()
+
+
+# ── litellm DEBUG (route_gate/arm_checks.py; refused at arm) ─────────────────
+
+
+@pytest.fixture
+def no_litellm_debug(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://corp-llm.corp.lan/v1")
+    for name in ("LITELLM_LOG", "DETAILED_DEBUG"):
+        monkeypatch.delenv(name, raising=False)
+    litellm_config = hermetic.parent / "litellm.yaml"
+    litellm_config.write_text('litellm_settings:\n  callbacks: ["x.guardrail"]\n')
+    monkeypatch.setenv("CORP_LLM_LITELLM_CONFIG", str(litellm_config))
+    return litellm_config
+
+
+def _debug_problems() -> list[str]:
+    try:
+        config.validate()
+    except ConfigError as exc:
+        return [p for p in exc.problems if p.startswith("litellm_") or "LITELLM_DEBUG" in p]
+    return []
+
+
+def test_the_allow_key_is_off_by_default(no_litellm_debug: Path) -> None:
+    assert settings.litellm_debug_allowed() is False
+    assert _debug_problems() == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("LITELLM_LOG", "DEBUG"), ("LITELLM_LOG", "debug"), ("DETAILED_DEBUG", "True")],
+)
+def test_config_check_reports_a_litellm_debug_env_var(
+    no_litellm_debug: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    (problem,) = _debug_problems()
+
+    assert problem.startswith(f"litellm_debug_logging: {name}")
+    assert "exit 70" in problem
+
+
+@pytest.mark.parametrize(("name", "value"), [("LITELLM_LOG", "INFO"), ("DETAILED_DEBUG", "0")])
+def test_config_check_accepts_litellm_below_debug(
+    no_litellm_debug: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    assert _debug_problems() == []
+
+
+def test_config_check_reports_set_verbose_in_litellms_config(no_litellm_debug: Path) -> None:
+    no_litellm_debug.write_text("litellm_settings:\n  set_verbose: true\n")
+
+    (problem,) = _debug_problems()
+
+    assert problem.startswith("litellm_set_verbose: ")
+
+
+def test_config_check_accepts_set_verbose_false(no_litellm_debug: Path) -> None:
+    no_litellm_debug.write_text("litellm_settings:\n  set_verbose: false\n")
+
+    assert _debug_problems() == []
+
+
+def test_the_allow_key_silences_the_debug_problems_outside_prod(
+    no_litellm_debug: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LITELLM_LOG", "DEBUG")
+    monkeypatch.setenv("CORP_LLM_ALLOW_LITELLM_DEBUG", "1")
+
+    assert settings.litellm_debug_allowed() is True
+    assert _debug_problems() == []
+
+
+@pytest.mark.parametrize("env_name", ["prod", "production", " PROD "])
+def test_the_allow_key_is_refused_in_prod(
+    no_litellm_debug: Path, monkeypatch: pytest.MonkeyPatch, env_name: str
+) -> None:
+    monkeypatch.setenv("CORP_ENV", env_name)
+    monkeypatch.setenv("CORP_LLM_ALLOW_LITELLM_DEBUG", "1")
+    monkeypatch.setenv("LITELLM_LOG", "DEBUG")
+
+    with pytest.raises(ConfigError) as exc:
+        settings.litellm_debug_allowed()
+
+    assert exc.value.problems == [settings.ALLOW_LITELLM_DEBUG_IN_PROD]
+    # In prod the allowance counts for nothing: the DEBUG problem is reported too.
+    assert sorted(p.split(":", 1)[0] for p in _debug_problems()) == [
+        "CORP_LLM_ALLOW_LITELLM_DEBUG=1 is test-only",
+        "litellm_debug_logging",
+    ]

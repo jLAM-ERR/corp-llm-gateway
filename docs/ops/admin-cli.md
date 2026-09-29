@@ -155,7 +155,12 @@ It runs the same resolvers the entrypoint's boot check runs, so it also reports:
   `CORP_LLM_CA_BUNDLE`;
 - **the in-flight cap** — any of the five `CORP_LLM_*` capacity keys out of
   range, and `CORP_LLM_MAX_INFLIGHT=0` under `CORP_ENV=prod`;
-- **route-gate extras** — see `--routes` below.
+- **route-gate extras** — see `--routes` below;
+- **litellm DEBUG** — `LITELLM_LOG=DEBUG`, `DETAILED_DEBUG` or
+  `litellm_settings.set_verbose` in litellm's config (litellm logs the original
+  request before any pre-call hook; the boot refuses to arm, exit 70), unless
+  `CORP_LLM_ALLOW_LITELLM_DEBUG=1`, which is itself a problem under
+  `CORP_ENV=prod`.
 
 It does not check the `corp_tokens` schema; the boot does, and exits 78 on it
 (`upgrade.md`).

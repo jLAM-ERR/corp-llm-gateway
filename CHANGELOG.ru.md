@@ -7,6 +7,86 @@
 
 ## [Unreleased]
 
+### Безопасность — поверхности логирования litellm, DEBUG и тела с политиками
+
+Найдено планом перехода на guardrail API litellm (`docs/security.ru.md` §15, hazards 1-19).
+Hazards 17, 17b и 18 **существовали и на `release/1.0.x`** (тот же litellm 1.101.0). Они зависят
+от конфигурации: эти поверхности получает только callback, зарегистрированный в litellm, а
+поставляемые конфиги регистрируют лишь собственный callback шлюза.
+
+- **Logging payload `/v1/responses` содержал исходный ввод** (hazard 17): litellm снимает копию
+  запроса в свой logging object до любого pre-call хука. Теперь pre-call передаёт logging
+  object переписанный запрос, для любой формы `input`.
+- **Отказ Stage 5 (DLP) передавал failure-хуку каждого callback исходный запрос** (hazard 17b).
+  Теперь content-ключи снимка тела переписываются до скана. Отказ Stage 0 по-прежнему передаёт
+  оригинал — он отказывает до любой перезаписи; наш callback этот хук не переопределяет.
+- **Значение `X-Corp-Auth` попадало в поверхности логирования litellm** (hazard 18, инвариант 4):
+  копия заголовков в `metadata.requester_metadata` на `/v1/chat/completions` и failure-хуки при
+  401. Теперь pre-call срезает токен первым, из этой копии и из logging object litellm.
+- **DEBUG litellm не даёт взвести шлюз** (exit 70, `litellm_debug_logging` /
+  `litellm_set_verbose`): DEBUG-строки litellm печатают исходный запрос до любого pre-call хука,
+  а две из них — ещё и сырой корп-токен и BYOK `Authorization`. `CORP_LLM_ALLOW_LITELLM_DEBUG=1`
+  разрешает DEBUG вне prod, только для тестов; в prod это exit 78. При взведении также
+  отклоняются `apply_guardrail` в MRO guardrail, `scan_raw_request` / `run_in_parallel` и
+  компрессор ответов в приложении litellm (`response_compressor`).
+- **Тела запросов с политиками отклоняются на route gate**: JSON-тело с ключом `policies`
+  верхнего уровня — 403 `E_ROUTE_BLOCKED` (`route_gate_body_policies`), тело не
+  `application/json` — 415 (`route_gate_body_not_json`), оба до разбора тела litellm.
+- **415 получает любое тело не в UTF-8 JSON**: `charset` не `utf-8`/`utf8`, BOM, UTF-16/32 или
+  байты, которые не декодируются как UTF-8. Проверка `policies` читает байты, а тело в UTF-16
+  записывает ключ байтами, которые она не находила, и гейт его пропускал. litellm 1.101.0
+  превращает такое тело в пустое (с BOM или байты не в UTF-8) или отвечает 400, так что утечки не
+  было; стандартный `json.loads(bytes)` декодировал бы каждое из них.
+
+### Исправлено — стриминг chat-completions возвращал плейсхолдеры
+
+- **Стриминг OpenAI chat-completions восстанавливается.** Обратная подстановка в callback
+  пропускала чанки `ModelResponseStream` litellm без изменений, и клиенты OpenAI SDK получали
+  плейсхолдеры. Дефект есть на `release/1.0.x`.
+
+### Изменено — ответы восстанавливаются вне litellm
+
+- **Единственная обратная подстановка ответа шлюза — теперь ASGI middleware** перед приложением
+  litellm, внутри лимитера (`route_gate/desanitize_middleware.py`); litellm и все callback-и
+  внутри него видят только плейсхолдеры, клиент получает оригиналы. Сбой восстановления — 500
+  `E_INTERNAL` без содержимого (или закрытый поток) и `gateway_failure{component="desanitize"}`.
+  Замеренные накладные расходы: меньше 0.75 мс на каждом потоке (p50); в пределах +10 % на
+  каждом SSE-потоке и каждом unary-потоке, кроме chat unary (+13.4 % в одном из двух прогонов,
+  +6.4 % в другом); разброс между прогонами на одной базе — до 1.2 мс.
+- **Одна аудит-запись на запрос, когда ответ заканчивается** (`route_gate/terminal_audit.py`),
+  никогда не callback-ом litellm; новый код `E_SERVER_SHUTDOWN` — запрос отменил сервер
+  (`docs/audit-schema.ru.md`, «Итоговая запись»).
+- **Счётчики токенов берутся из самого ответа**; chat-поток всегда запрашивает usage-чанк и
+  отбрасывает его, если клиент его не просил.
+- **Поставляемые конфиги litellm закрепляют `general_settings.supported_db_objects: ["models"]`**
+  (compose и Helm). `enforces_request_content = True` на guardrail; он остаётся обычным
+  `CustomLogger` (`docs/security.ru.md` §15).
+
+### Известные ограничения — граница ответа
+
+- Чередующиеся фрагменты двух вызовов инструментов в chat-потоке возвращаются плейсхолдерами,
+  никогда не оригиналами.
+- `sequence_number` в восстановленном потоке `/v1/responses` перенумеровывается и может
+  отличаться от номеров провайдера.
+- Chat `messages[].name` и `prediction.content`, Responses `prompt.variables` и `citations[]`
+  Anthropic ещё не покрыты (`docs/security.ru.md` §2, «Не санитизируется / отложено»).
+- Таблица конфигурации litellm (hazard 14c) и ключ провайдера в kwargs логирования (hazard 19b)
+  охарактеризованы, но не закрыты (`docs/security.ru.md` §11 (j), §15).
+
+### Добавлено — `guardrail_information` без контента в logging payload litellm
+
+- **Pre-call пишет одну запись `guardrail_information`** (`corp-llm-sanitizer`, `pre_call`) в
+  `StandardLoggingPayload` litellm собственным writer'ом litellm, так что каждый логгер из
+  `litellm.callbacks` видит результат guardrail: `guardrail_status`, выведенный из
+  `block_reason`, время, `redaction_count`, `finding_label_counts` и `block_reason`, если он
+  задан. Без контента и по allow-list (`assert_guardrail_information_allowed`); гейт NEVER-полей
+  теперь проверяет такие записи везде, где запись их несёт (`docs/audit-schema.ru.md`).
+- **Новое событие лога `litellm_guardrail_information_failed request_id=… error=<type>`**, когда
+  запись не записана; запрос и его аудит-запись продолжаются (`docs/security.ru.md` §8,
+  `guardrailInformationWriteFailed`).
+- **`gateway_failure{component="audit"}` расширен**: он считает и это событие, наряду с
+  событием лога litellm без состояния запроса (`docs/ops/runbook.ru.md`).
+
 ### Добавлено — HTTPS-фронт для compose-стека (nginx, опционально)
 
 - **Профили `nginx` / `nginx-ports`** в `compose/docker-compose.yml`, выключены, пока `.env`

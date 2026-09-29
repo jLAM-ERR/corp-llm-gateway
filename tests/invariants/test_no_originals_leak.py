@@ -8,7 +8,8 @@ and assert that the originals do NOT appear in any of:
   (iii) exception traces propagated out of guardrail components
   (iv)  Prometheus metric labels (proxy: any string-typed metric value
         we emit during the run)
-  (v)   forwarded HTTP headers (proxy: header dicts after strip)
+  (v)   forwarded HTTP headers (proxy: header dicts after strip; + litellm's
+        logging snapshot, hazard 18)
   (vi)  pod stdout/stderr from unhandled exceptions
 
 This file does NOT cover the pre_call / post_call wiring (M1-7 / M1-8 are
@@ -1134,6 +1135,95 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
     assert _CORP_TOKEN not in caplog.text, "corp token leaked into a log line (invariant 4)"
 
 
+# (v-ter) hazard 18: litellm's logging snapshot. On chat litellm deep-copies the request
+# metadata, headers included, into metadata["requester_metadata"] before any pre-call
+# hook runs, and its logging object (built before the hook too) holds the metadata and
+# the body snapshot every success/failure log event, StandardLoggingPayload and spend-log
+# row is read from. A request our pre-call refuses is handed, as it stands, to every
+# failure hook. Each dict below is its own copy, so a strip that misses one shows. ------
+
+
+def _litellm_request(hdrs: dict[str, str]) -> tuple[dict, object]:
+    def meta() -> dict:
+        return {"headers": dict(hdrs), "requester_metadata": {"headers": dict(hdrs)}}
+
+    def request_side() -> dict:
+        return {
+            "metadata": meta(),
+            "litellm_metadata": meta(),
+            "proxy_server_request": {
+                "headers": dict(hdrs),
+                "body": {"metadata": meta(), "litellm_metadata": meta()},
+            },
+        }
+
+    class _LoggingObj:
+        def __init__(self) -> None:
+            self.model_call_details = {"litellm_params": request_side()}
+            self.litellm_params = request_side()
+
+    logging_obj = _LoggingObj()
+    data = {
+        "model": "claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": dict(hdrs),
+        **request_side(),
+        "litellm_params": request_side(),
+        "secret_fields": {"raw_headers": dict(hdrs)},
+        "litellm_logging_obj": logging_obj,
+    }
+    return data, logging_obj
+
+
+def _logged_views(data: dict, logging_obj: object) -> list[str]:
+    return [
+        json.dumps({k: v for k, v in data.items() if k != "litellm_logging_obj"}),
+        json.dumps(logging_obj.model_call_details),  # type: ignore[attr-defined]
+        json.dumps(logging_obj.litellm_params),  # type: ignore[attr-defined]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_corp_token_never_reaches_litellms_logging_snapshot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    guardrail, _ = _header_strip_guardrail()
+    byok = "Bearer byok-developer-key"
+    data, logging_obj = _litellm_request({"X-Corp-Auth": _CORP_TOKEN, "Authorization": byok})
+
+    with caplog.at_level(logging.DEBUG):
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    views = _logged_views(data, logging_obj)
+    for view in views:
+        assert _CORP_TOKEN not in view, "corp token left in litellm's logging snapshot"
+        assert "x-corp-auth" not in view.lower()
+    # Invariant 3: only the corp token goes; each of the 20 / 9 / 9 header dicts keeps BYOK.
+    assert [view.count(byok) for view in views] == [20, 9, 9]
+    assert _CORP_TOKEN not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_refused_corp_token_is_stripped_before_the_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unknown (revoked, expired, mistyped) token: the 401 leaves nothing behind."""
+    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+
+    guardrail, _ = _header_strip_guardrail()
+    refused = "refused-corp-tok-v-ter"
+    data, logging_obj = _litellm_request({"X-Corp-Auth": refused})
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(GuardrailHttpException) as ei:
+        await guardrail.pre_call(data)  # type: ignore[attr-defined]
+
+    assert ei.value.status_code == 401
+    for view in _logged_views(data, logging_obj):
+        assert refused not in view
+    assert refused not in caplog.text
+    assert refused not in "".join(traceback.format_exception(ei.value))
+
+
 # (xiii) system-field coverage (M1-14 gap): pre_call's data["system"] branches
 # (litellm_hook.py:616-708 — sanitize start/done + oversize fail-closed) were not
 # exercised by any test in this file; only the messages branches were pinned. -------
@@ -2168,14 +2258,57 @@ async def test_double_failure_backend_and_audit_sink_still_returns_opaque_500(
 # originate somewhere other than the token store (e.g. a RulesLoader).
 
 
+async def _restoration_failure_through_the_desanitiser(
+    guardrail: object, data: dict, app: object, *, send_fails: bool
+) -> tuple[list[dict], BaseException | None, ListSink]:
+    """Drive ``app``'s response through the ASGI desanitiser (the gateway's one reversal)
+    for a request whose pre-call handed it to a ticket; optionally the client's ``send``
+    fails too, so whatever escapes is the exception chain to inspect."""
+    from corp_llm_gateway.audit import AuditLogger
+    from corp_llm_gateway.route_gate.desanitize_middleware import DesanitizeMiddleware
+    from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
+    from tests.response_restore import drive, hand_over
+
+    mappings, ticket = hand_over(guardrail, data)  # type: ignore[arg-type]
+    records = ListSink()
+    middleware = DesanitizeMiddleware(
+        app,  # type: ignore[arg-type]
+        mappings,
+        terminal=TerminalAudit(emit_to(AuditLogger(records, gateway_version="0.0.1"))),
+    )
+    sent: list[dict] = []
+    escaped: BaseException | None = None
+    if send_fails:
+
+        async def failing_send(message: dict) -> None:
+            # The client is gone by the time the failure is answered or the stream ends.
+            final = message["type"] == "http.response.body" and not message.get("more_body")
+            if message.get("status") == 500 or final:
+                raise OSError("client connection reset")
+            sent.append(dict(message))
+
+        async def bound(scope: object, receive: object, send: object) -> None:
+            await middleware(scope, receive, failing_send)  # type: ignore[arg-type]
+
+        try:
+            await drive(bound, ticket, sent)
+        except BaseException as exc:
+            escaped = exc
+    else:
+        await drive(middleware, ticket, sent)
+    return sent, escaped, records
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("send_fails", [False, True], ids=["answered", "client-send-fails"])
 async def test_post_call_unary_unexpected_error_log_contains_no_raw_content(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, send_fails: bool
 ) -> None:
-    """(xvii) widened: post_call_unary runs after de-sanitization, so a raw
-    exception there could carry a real original in its message."""
+    """(xvii) widened: restoring a response runs after de-sanitization, so a raw
+    exception there could carry a real original in its message. The reversal (the ASGI
+    desanitiser) answers a content-free 500 ``E_INTERNAL``; no body, log line, record or
+    exception chain — even one a failing client ``send`` raises — carries the original."""
     import corp_llm_gateway.litellm_hook as hook_mod
-    from corp_llm_gateway.litellm_hook import GuardrailHttpException
 
     guardrail, sink = _tool_call_guardrail((("secret-alice", "[N1]"),))
     data = {
@@ -2188,42 +2321,47 @@ async def test_post_call_unary_unexpected_error_log_contains_no_raw_content(
     def _boom(response: object, mapping: object) -> object:
         raise RuntimeError("reconstruct failed for secret-alice")
 
-    original = hook_mod._apply_reverse_to_response
-    hook_mod._apply_reverse_to_response = _boom  # type: ignore[assignment]
-    try:
-        with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
-            await guardrail.post_call_unary(  # type: ignore[attr-defined]
-                data, {"choices": [{"message": {"content": "hello [N1]!"}}]}
-            )
-    finally:
-        hook_mod._apply_reverse_to_response = original
+    monkeypatch.setattr(hook_mod, "_apply_reverse_to_response", _boom)
+    body = json.dumps({"choices": [{"message": {"content": "hello [N1]!"}}]}).encode()
 
-    assert ei.value.status_code == 500
-    assert ei.value.error_code == "E_INTERNAL"
-    exc_text = str(ei.value)
-    assert "secret-alice" not in exc_text
+    async def app(scope: object, receive: object, send: object) -> None:
+        start = {"type": "http.response.start", "status": 200}
+        await send({**start, "headers": [(b"content-type", b"application/json")]})  # type: ignore[operator]
+        await send({"type": "http.response.body", "body": body, "more_body": False})  # type: ignore[operator]
+
+    with caplog.at_level(logging.INFO):
+        sent, escaped, records = await _restoration_failure_through_the_desanitiser(
+            guardrail, data, app, send_fails=send_fails
+        )
+
     assert "secret-alice" not in caplog.text
-    tb_text = _formatted_traceback(ei.value)
-    assert "secret-alice" not in tb_text, (
-        "original leaked via exception chain (__cause__/__context__)"
-    )
-
-    assert len(sink.records) == 1
-    serialized = json.dumps(sink.records[0])
-    assert "secret-alice" not in serialized
+    wire = b"".join(m.get("body", b"") for m in sent)
+    assert b"secret-alice" not in wire
+    if send_fails:
+        assert escaped is not None
+        tb_text = _formatted_traceback(escaped)
+        assert "secret-alice" not in tb_text, (
+            "original leaked via exception chain (__cause__/__context__)"
+        )
+    else:
+        assert escaped is None
+        assert json.loads(wire)["error"]["code"] == "E_INTERNAL"
+    (record,) = records.records
+    assert (record["status"], record["error_code"]) == ("failed", "E_INTERNAL")
+    assert "secret-alice" not in json.dumps(record)
+    assert sink.records == []
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("send_fails", [False, True], ids=["closed", "client-send-fails"])
 async def test_post_call_stream_own_bug_mid_stream_log_contains_no_raw_content(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, send_fails: bool
 ) -> None:
-    """(xvii) widened: a bug in OUR OWN desanitization work mid-stream — as
-    opposed to an upstream transport failure, which now propagates
-    unconverted (Major: the wrapper must not swallow upstream provider
-    errors) — must still be caught before any raw content in its
-    message/exception chain reaches the client/log/audit record."""
-    import corp_llm_gateway.litellm_hook as hook_mod
-    from corp_llm_gateway.litellm_hook import GuardrailHttpException
+    """(xvii) widened: a bug in OUR OWN desanitization work mid-stream — as opposed to
+    an upstream transport failure, which propagates unconverted — is caught at the
+    reversal before any raw content in its message/exception chain reaches the client,
+    a log line, the audit record or an exception a failing client ``send`` raises."""
+    from corp_llm_gateway.route_gate import desanitize_middleware
 
     guardrail, sink = _tool_call_guardrail((("secret-alice", "[N1]"),))
     data = {
@@ -2232,36 +2370,49 @@ async def test_post_call_stream_own_bug_mid_stream_log_contains_no_raw_content(
         "headers": {"X-Corp-Auth": "tok-inv", "Authorization": "Bearer byok"},
     }
     await guardrail.pre_call(data)  # type: ignore[attr-defined]
+    real_feed = desanitize_middleware.SseStreamDesanitizer.feed
+    fed = {"n": 0}
 
-    async def _good_iter():
-        yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
-        yield {"choices": [{"delta": {"content": " again [N1]"}}]}
+    def feed(self: object, event: object) -> object:
+        fed["n"] += 1
+        if fed["n"] > 1:
+            raise RuntimeError("desanitize bug for secret-alice")
+        return real_feed(self, event)  # type: ignore[arg-type]
 
-    def _boom(chunk: object) -> str | None:
-        raise RuntimeError("desanitize bug for secret-alice")
+    monkeypatch.setattr(desanitize_middleware.SseStreamDesanitizer, "feed", feed)
+    events = [
+        {"choices": [{"index": 0, "delta": {"content": "hello [N1] "}}]},
+        {"choices": [{"index": 0, "delta": {"content": " again [N1]"}}]},
+    ]
 
-    original = hook_mod._extract_chunk_text
-    hook_mod._extract_chunk_text = _boom  # type: ignore[assignment]
-    try:
-        with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
-            async for _chunk in guardrail.post_call_stream(data, _good_iter()):  # type: ignore[attr-defined]
-                pass
-    finally:
-        hook_mod._extract_chunk_text = original
+    async def app(scope: object, receive: object, send: object) -> None:
+        headers = [(b"content-type", b"text/event-stream")]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})  # type: ignore[operator]
+        for event in events:
+            chunk = ("data: " + json.dumps(event) + "\n\n").encode()
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})  # type: ignore[operator]
+        await send({"type": "http.response.body", "body": b"", "more_body": False})  # type: ignore[operator]
 
-    assert ei.value.status_code == 500
-    assert ei.value.error_code == "E_INTERNAL"
-    exc_text = str(ei.value)
-    assert "secret-alice" not in exc_text
+    with caplog.at_level(logging.INFO):
+        sent, escaped, records = await _restoration_failure_through_the_desanitiser(
+            guardrail, data, app, send_fails=send_fails
+        )
+
     assert "secret-alice" not in caplog.text
-    tb_text = _formatted_traceback(ei.value)
-    assert "secret-alice" not in tb_text, (
-        "original leaked via exception chain (__cause__/__context__)"
-    )
-
-    assert len(sink.records) == 1
-    serialized = json.dumps(sink.records[0])
-    assert "secret-alice" not in serialized
+    assert "gateway_desanitize_failed" in caplog.text
+    # The event restored before the failure is the client's; the failing one never goes out.
+    wire = b"".join(m.get("body", b"") for m in sent)
+    assert wire.count(b"secret-alice") <= 1 and b"again" not in wire
+    if escaped is not None:
+        tb_text = _formatted_traceback(escaped)
+        assert "secret-alice" not in tb_text, (
+            "original leaked via exception chain (__cause__/__context__)"
+        )
+    assert send_fails or escaped is None
+    (record,) = records.records
+    assert (record["status"], record["error_code"]) == ("failed", "E_INTERNAL")
+    assert "secret-alice" not in json.dumps(record)
+    assert sink.records == []
 
 
 @pytest.mark.asyncio
@@ -2593,13 +2744,13 @@ class _BodyClient:
         return status, body.decode()
 
 
-def _limited_scope() -> dict:
+def _limited_scope(content_type: bytes = b"application/json") -> dict:
     return {
         "type": "http",
         "method": "POST",
         "path": "/v1/messages",
         "raw_path": b"/v1/messages",
-        "headers": _GATE_HEADERS,
+        "headers": [*_GATE_HEADERS, (b"content-type", content_type)],
     }
 
 
@@ -2652,6 +2803,31 @@ async def test_an_oversize_refusal_after_25_mib_leaks_no_body_byte(
         body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason="oversize:blocked"
     )
     assert metrics.failures == ["oversize"]
+    assert limiter.inflight == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_form_body_refusal_leaks_no_body_byte(caplog: pytest.LogCaptureFixture) -> None:
+    from urllib.parse import urlencode
+
+    gate, limiter, sink, metrics = _limited(_never_forwarded, max_inflight=1)
+    form = urlencode({"model": "claude", "policies": " ".join(ORIGINAL_CORPUS)}).encode()
+    client = _BodyClient(_chunk(form, more=False))
+
+    with caplog.at_level(logging.DEBUG):
+        await gate(  # type: ignore[operator]
+            _limited_scope(b"application/x-www-form-urlencoded"), client.receive, client.send
+        )
+
+    status, body = client.response()
+    assert status == 415
+    _assert_gate_surfaces_are_clean(
+        body=body,
+        log_text=caplog.text,
+        sink=sink,
+        metrics=metrics,
+        reason="route_gate_body_not_json",
+    )
     assert limiter.inflight == 0  # type: ignore[attr-defined]
 
 

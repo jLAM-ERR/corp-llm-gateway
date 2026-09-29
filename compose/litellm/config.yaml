@@ -55,3 +55,6 @@ general_settings:
   # cap is the gateway's CORP_LLM_MAX_INFLIGHT; litellm's own parallel-request
   # setting is not honoured by its default limiter — do not add it here.
   cancel_on_disconnect: true
+  # What litellm loads from its database: models only. Never `policies` or
+  # `guardrails` — a DB row there could put a pipeline around our guardrail.
+  supported_db_objects: ["models"]

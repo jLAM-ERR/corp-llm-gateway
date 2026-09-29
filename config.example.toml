@@ -280,6 +280,13 @@
 # CORP_LLM_LITELLM_CONFIG   = "/etc/litellm/config.yaml"
 # CORP_LLM_SERVE_HOST       = "0.0.0.0"
 # CORP_LLM_SERVE_PORT       = "4000"
+#
+# litellm's DEBUG output (LITELLM_LOG=DEBUG, DETAILED_DEBUG, --detailed_debug,
+# litellm_settings.set_verbose) logs the original request before the guardrail
+# sanitizes it, so the entrypoint refuses to arm with it (exit 70) and
+# `gateway-admin config check` reports it. CORP_LLM_ALLOW_LITELLM_DEBUG = "1" lets
+# it through for tests only; it is refused (exit 78) when CORP_ENV is prod.
+# CORP_LLM_ALLOW_LITELLM_DEBUG = "0"
 
 # ── Route gate (route_gate/) ─────────────────────────────────────────────────
 #

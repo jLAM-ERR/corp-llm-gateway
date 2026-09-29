@@ -18,7 +18,8 @@ in the 90 days post-GA.
 ```
 src/corp_llm_gateway/
   asgi.py       THE serve target: checks litellm's config (exit 78), runs its Prisma sequence, sets WORKER_CONFIG,
-                imports litellm's app, wraps its lifespan (arm the gate or exit 70), wraps it in RouteGateMiddleware
+                imports litellm's app, mounts it behind DesanitizeMiddleware, wraps its lifespan (arm the gate or
+                exit 70, route_gate/arm_checks.py), wraps it all in RouteGateMiddleware
   serve.py      `python -m corp_llm_gateway.serve` — uvicorn.run(asgi:app), workers=1; the image/compose/Helm ENTRYPOINT
   auth/         CorpLlmAuthProvider (Noop default; Bearer/mTLS/OIDC) + get_auth_provider factory
   audit/        AuditEvent + Logger + Sinks + get_sink factory + retention generator + NEVER-fields gate
@@ -38,10 +39,14 @@ src/corp_llm_gateway/
   profiles/     plugin bundles — ProfileBundle/PolicyKnobs(merge) + loaders/resolver + DETECTOR_REGISTRY + manifest (hash-integrity) + defaults/
   providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
   route_gate/   default-deny gate: table.py (hand-classified against litellm's source, guarded by the
-                collector test) + classify.py + middleware.py; litellm's admin/auth/spend/public/UI/non-probe
+                collector test) + classify.py + middleware.py (also refuses a rewritten-route body that is not
+                UTF-8 JSON (415) or has a top-level `policies` key (403)); litellm's admin/auth/spend/public/UI/non-probe
                 health surfaces are REFUSE (litellm rows 26 PASSTHROUGH / 879 REFUSE / 8 REWRITTEN + 6 gateway rows)
                 + inflight.py: the gateway-owned in-flight cap (CORP_LLM_MAX_INFLIGHT), single owner of `receive`,
                 disconnect-aware cancellation, spawn_shared for tasks several requests await
+                + desanitize_middleware.py: THE response reversal (unary JSON, chat/Anthropic SSE, Responses
+                events), keyed by the limiter's RequestTicket, send-side only; terminal_audit.py: the one audit
+                record per ticketed request; arm_checks.py: what refuses to arm (exit 70)
   rules/        replace.md parser + gazetteer + cached file loader
   sanitizer/    local-first engine + segmenter + StreamingDesanitizer + DLP guard + orchestrator + ProfileAwareOrchestrator (live profiles)
                 + identity_preamble (rewrite-vs-scan carve-out, see below)
@@ -53,7 +58,9 @@ src/corp_llm_gateway/
   team_config/  TeamConfig (+ profile_ids) + store (in-memory + Postgres) + schema.sql
   tokens/       schema.sql (+ oidc columns) + AuthMiddleware (single-flight lookup) + TokenIssuer + stores
                 + oidc_verifier (Keycloak RS256) + per-(iss, sub) issuance policy
-  litellm_hook.py  CorpLlmGuardrail — LiteLLM callback adapter (sanitize/desanitize incl. OpenAI tool_calls + streaming)
+  litellm_hook.py  CorpLlmGuardrail — a plain litellm CustomLogger (never CustomGuardrail, never apply_guardrail):
+                pre-call sanitize, then hands the response mapping + content-free audit facts to the request's
+                ticket; no response hook (docs/security.md §15)
 helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret + HPA/PDB/SA + ServiceMonitor + config-check
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
 compose/                 production compose stack for non-k8s hosts (data plane + Langfuse + Vector audit);
@@ -65,7 +72,7 @@ compose/                 production compose stack for non-k8s hosts (data plane 
                          tests/compose/test_nginx_{profile,runtime,allowlist_routes}.py
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto (4139 passed / 382 skipped on .venv; 4829 / 16 on .venv-bench with
+tests/                   pytest, pytest-asyncio mode=auto (4573 passed / 426 skipped on .venv; 5791 / 16 on .venv-bench with
                          Postgres, where NER, RS256 crypto, the Postgres contracts and the entrypoint/route-gate suites run)
 ```
 
@@ -85,7 +92,8 @@ decision `docs/adr/ADR-003-ner-orchestration.md`). Old order was LLM-oracle-firs
 route gate (OUTERMOST, before litellm's router — `route_gate/middleware.py`):
            classify (METHOD, path) against the hand-classified table → PASSTHROUGH / REWRITTEN / REFUSE.
            Unlisted ⇒ 404, listed-REFUSE / websocket / malformed ⇒ 403, both E_ROUTE_BLOCKED;
-           REWRITTEN while unarmed ⇒ 503. Only then does litellm's router run pre_call_hook.
+           REWRITTEN while unarmed ⇒ 503. The limiter drains the body: not UTF-8 JSON ⇒ 415, a top-level
+           `policies` key ⇒ 403. Only then does litellm's router run pre_call_hook.
            ↓
 pre_call:  Stage 0 — payload classifier: config/log shape → refuse before egress (422 + block_reason)
            ↓
@@ -102,10 +110,19 @@ pre_call:  Stage 0 — payload classifier: config/log shape → refuse before eg
            ↓
            upstream (api.anthropic.com / api.openai.com) with BYOK Authorization
            ↓
-post_call: StreamingDesanitizer rebuilds originals using the per-conversation mapping
+post_call: NOT in the callback. route_gate/desanitize_middleware.py, inside the in-flight limiter and in
+           front of litellm's app, restores originals in the response litellm sends (keyed by the
+           request's RequestTicket), so litellm and every callback in it only see placeholders
            ↓
-           audit: Vector → Langfuse + S3 + SIEM (NEVER-fields gate; + block_reason)
+           audit: the callback only deposits content-free facts on the ticket; the terminal record is
+           published at the final body (route_gate/terminal_audit.py) → Vector → Langfuse + S3 + SIEM
+           (NEVER-fields gate; + block_reason)
 ```
+
+The guardrail is a plain `CustomLogger` (`enforces_request_content = True`), registered through
+`litellm_settings.callbacks: ["corp_llm_gateway.bootstrap.guardrail"]` — unchanged. Do not move it to
+litellm's `CustomGuardrail` or give it an `apply_guardrail`: both re-open bypasses the adoption plan
+proved (docs/security.md §15, hazards 1-19).
 
 The process that serves this is **ours**: `python -m corp_llm_gateway.serve` → `asgi.py`, which
 checks litellm's config, then imports litellm at step 3 (`save_worker_config`) and its app + our
@@ -124,19 +141,20 @@ Two caches:
 
 - **Cache A** — content-keyed dedup, shared across conversations, TTL ~10h.
 - **Cache B** — per-conversation mapping store (Redis or in-memory),
-  sliding TTL ~1h, **required** for `post_call` to undo redactions.
-  Today `conversation_id == request_id`, so Cache B doesn't reuse across
-  sibling requests; see `docs/conversation-id.md`.
+  sliding TTL ~1h, still written by the pre-call. The response reversal no
+  longer reads it: it uses the mapping snapshot the pre-call hands the
+  request's ticket. Today `conversation_id == request_id`, so Cache B doesn't
+  reuse across sibling requests; see `docs/conversation-id.md`.
 
 ## Running tests
 
 ```
 # Full unit suite. Local .venv is Python 3.14 with no extras and no litellm (graceful
-# NER degradation): measured 4139 passed + 382 skipped, ~8.5min. The authoritative
+# NER degradation): measured 4573 passed + 426 skipped, ~9min. The authoritative
 # local run is .venv-bench = Python 3.14.7 with every extra (`ner` incl. pymorphy3,
-# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: measured 4829 passed + 16 skipped
-# with Postgres and CI=true, ~13min — the entrypoint, route-guard, served-stack, container and
-# nginx route cross-check suites only RUN there. CI runs the same suite on Python
+# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: measured 5791 passed + 16 skipped
+# with Postgres and CI=true, ~19min — the entrypoint, route-guard, served-stack and nginx route
+# cross-check suites only RUN there (the docker container suites run in both). CI runs the same suite on Python
 # 3.14 only — the same interpreter line as .venv-bench; nothing exercises 3.12 any
 # more. Always run both before committing.
 PYTHONPATH=src .venv/bin/pytest tests/ -q
@@ -236,8 +254,11 @@ When adding a new tunable, plumb it through this loader — don't read
    table is a security decision, not a config change; there is no off
    switch (`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` adds PASSTHROUGH rows
    only). Startup exits 78 without litellm's config and 70 without a
-   `CorpLlmGuardrail` in `litellm.callbacks` — `docs/security.md` §14,
-   invariant row 7 in §9. The compose front door (`compose/nginx/`) mirrors
+   `CorpLlmGuardrail` in `litellm.callbacks` (or with one litellm would
+   bypass, litellm DEBUG on, or a response compressor) — `docs/security.md`
+   §14/§15, invariant row 7 in §9. An admitted rewritten route also refuses a
+   body that is not UTF-8 JSON (415) or carries a top-level `policies` key, before litellm
+   parses it. The compose front door (`compose/nginx/`) mirrors
    the gate at the edge — an exact-path allow-list, 404 before a body byte is
    read — so adding a location there is the same security decision as adding
    a table row. Two rules under it (rows 7a/7b):

@@ -43,7 +43,13 @@ templated by the Helm chart yet (inject via the Secret map or a mounted
 > `/metrics` for the `ServiceMonitor` to scrape, and it needs the `metrics`
 > extra (`prometheus-client`). One process-wide exporter is shared by the
 > guardrail, the route gate and the `/metrics` endpoint (`get_exporter()`), so
-> a block counted anywhere is visible on the same scrape.
+> a block counted anywhere is visible on the same scrape. `gateway_failure`'s
+> `component` label takes only the values in `FAILURE_COMPONENTS`
+> (`metrics/base.py`); write alerts against those. Two of them concern the
+> response boundary and the audit record: `desanitize` (a response that could not be restored,
+> or a terminal audit record lost after its retry) and `audit` (a litellm log
+> event with no request to write it for, or the `guardrail_information` entry not
+> written). Both are explained in `runbook.md`.
 
 ## Full key list
 
@@ -330,6 +336,7 @@ serve litellm's routers with no route gate in front. See
 | `CORP_LLM_LITELLM_CONFIG` | path to litellm's proxy config YAML | `/etc/litellm/config.yaml` | no |
 | `CORP_LLM_SERVE_HOST` | address uvicorn binds | `0.0.0.0` | no |
 | `CORP_LLM_SERVE_PORT` | port uvicorn binds | `4000` | no |
+| `CORP_LLM_ALLOW_LITELLM_DEBUG` | **test-only**: arm even with litellm's DEBUG output on (see below); refused when `CORP_ENV` is prod/production | `0` | no |
 
 The entrypoint refuses to start (**exit 78**, `EX_CONFIG`) when
 `CORP_LLM_LITELLM_CONFIG` is missing, not a file, not named `.yaml`/`.yml`,
@@ -340,6 +347,15 @@ proxy with no guardrail callback at all — that is the fail-open this check
 closes. `gateway-admin config check` applies the same content checks, but a
 config file that is simply absent is not a `config check` problem (laptops
 mount none).
+
+The shipped litellm configs (compose `config.yaml` / `config.oauth.yaml`, Helm
+`configmap-litellm.yaml`) pin `general_settings.supported_db_objects: ["models"]`:
+litellm loads only models from its database, never `policies` or `guardrails`
+(without the key it loads every object type). A policy row there could put a
+litellm pipeline around the gateway's guardrail; the route gate already refuses
+every `/policies*` and `/guardrails/*` route, a request body with a top-level
+`policies` key (403 `E_ROUTE_BLOCKED`, `block_reason=route_gate_body_policies`) and a
+body that is not UTF-8 JSON (415, `route_gate_body_not_json`), so the pin is defence in depth. Keep it in any config of your own.
 
 **Two DSN sources litellm's CLI reads are deliberately NOT carried over.** The
 entrypoint's Prisma schema step reads `DATABASE_URL` and `DIRECT_URL` from the
@@ -471,7 +487,24 @@ boot does).
 - any in-flight key out of range, or `CORP_LLM_MAX_INFLIGHT=0` in prod;
 - `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` malformed or naming a refused route.
 
-Exit 70 (`EX_SOFTWARE`): litellm started without a `CorpLlmGuardrail` callback.
+- `CORP_LLM_ALLOW_LITELLM_DEBUG=1` with `CORP_ENV` prod/production.
+
+Exit 70 (`EX_SOFTWARE`), after litellm's startup, one log line
+`arm refused (<problem>)` per problem (`route_gate/arm_checks.py`):
+
+- `guardrail_absent`: litellm started without a `CorpLlmGuardrail` callback;
+- `apply_guardrail`, `scan_raw_request`, `run_in_parallel`: the guardrail is set
+  up so litellm would skip its pre-call hook or discard its rewrite;
+- `litellm_debug_logging`, `litellm_set_verbose`: litellm's DEBUG output is on
+  (`LITELLM_LOG=DEBUG`, `DETAILED_DEBUG`, `--detailed_debug`,
+  `litellm_settings.set_verbose`). litellm logs the original request before any
+  pre-call hook runs. `config check` reports the env vars and `set_verbose` too.
+  `CORP_LLM_ALLOW_LITELLM_DEBUG=1` lets these two through outside prod, for tests.
+- `response_compressor`: litellm's app carries a response-compressing middleware
+  (litellm 1.101.0 adds none, and no config key turns one on, so `config check`
+  has nothing to report). The gateway restores the originals in a response at
+  its ASGI layer, in front of litellm's app, and passes an encoded response
+  through unrestored — a compressor would hand clients placeholders.
 
 **Warn and boot:**
 

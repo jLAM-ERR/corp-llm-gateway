@@ -11,6 +11,7 @@ import json
 import logging
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
+from importlib.util import find_spec
 from typing import Any
 
 import pytest
@@ -19,6 +20,8 @@ from corp_llm_gateway.audit import AuditLogger, ListSink
 from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.route_gate import RouteGateMiddleware
 from corp_llm_gateway.route_gate.inflight import (
+    CANCEL_CLIENT,
+    CANCEL_SERVER,
     DEFAULT_MAX_DRAINING_BYTES,
     E_BODY_TIMEOUT,
     E_CAPACITY,
@@ -26,6 +29,7 @@ from corp_llm_gateway.route_gate.inflight import (
     ROUTE_GATE_BODY_TIMEOUT,
     ROUTE_GATE_CAPACITY,
     InflightLimiter,
+    RequestTicket,
     bind_call_id,
     current_ticket,
     install_task_factory,
@@ -232,6 +236,78 @@ async def test_a_released_slot_admits_the_next_request() -> None:
 
     assert limiter.inflight == 0
     assert app.calls == 3
+
+
+async def test_the_slot_is_held_past_the_final_body_until_the_downstream_returns() -> None:
+    # uvicorn closes a Connection: close socket inside the final send, so a client can
+    # read the whole response while the app is still unwinding (the served stack).
+    responded = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await _respond(send)
+        responded.set()
+        await finish.wait()
+
+    gate, limiter, metrics, _ = _stack(app, max_inflight=1)
+    first, second = _Client(), _Client()
+    running = asyncio.create_task(gate(_scope(), first.receive, first.send))
+    await asyncio.wait_for(responded.wait(), 2)
+
+    assert first.status == 200
+    assert limiter.inflight == 1
+    await gate(_scope(), second.receive, second.send)
+    assert second.status == 429
+    assert metrics.blocks == [ROUTE_GATE_CAPACITY]
+
+    finish.set()
+    await running
+    assert limiter.inflight == 0
+    third = _Client()
+    await gate(_scope(), third.receive, third.send)
+    assert third.status == 200
+
+
+# The loop uvicorn serves on in production, when installed.
+LOOPS = ["asyncio"] + (["uvloop"] if find_spec("uvloop") is not None else [])
+# From the app's return: 2 hops for the first wait to see it, 3 to cancel and settle
+# the idle watcher. A finished downstream must cost nothing more.
+RELEASE_HOPS = 5
+
+
+@pytest.mark.parametrize("loop", LOOPS)
+def test_a_finished_downstream_frees_the_slot_without_extra_loop_hops(loop: str) -> None:
+    async def run() -> int:
+        responded = asyncio.Event()
+
+        async def app(scope: Any, receive: Any, send: Any) -> None:
+            await _read_body(receive)
+            await _respond(send)
+            responded.set()
+
+        gate, limiter, _, _ = _stack(app, max_inflight=1)
+        client = _Client()
+        running = asyncio.create_task(gate(_scope(), client.receive, client.send))
+        await asyncio.wait_for(responded.wait(), 2)
+        hops = 0
+        while limiter.inflight and hops < 100:
+            await asyncio.sleep(0)
+            hops += 1
+        await running
+        assert client.status == 200
+        return hops
+
+    factory = None
+    if loop == "uvloop":
+        import uvloop
+
+        factory = uvloop.new_event_loop
+    with asyncio.Runner(loop_factory=factory) as runner:
+        hops = runner.run(run())
+
+    # Each extra hop is a window in which a sequential client at the cap gets 429.
+    assert hops <= RELEASE_HOPS
 
 
 async def test_passthrough_routes_never_count() -> None:
@@ -747,6 +823,105 @@ async def test_a_downstream_that_ignores_cancellation_cannot_hold_the_slot() -> 
     await asyncio.sleep(0.05)
 
 
+async def test_a_server_cancel_of_a_stubborn_downstream_is_bounded_by_the_grace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The server cancels (shutdown) a downstream that ignores cancellation: ``run`` ends
+    after the grace, the slot is freed and the ticket closed, and the downstream left
+    running is logged and counted as on the client path."""
+    stop = asyncio.Event()
+    entered = asyncio.Event()
+    tickets: list[RequestTicket] = []
+
+    async def stubborn(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        ticket = current_ticket()
+        assert ticket is not None
+        tickets.append(ticket)
+        entered.set()
+        while not stop.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop.wait()
+
+    gate, limiter, metrics, _ = _stack(stubborn, max_inflight=1, grace=0.2)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    task.cancel()
+    with caplog.at_level(logging.INFO), contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    elapsed = loop.time() - started
+
+    assert 0.2 <= elapsed < 1.0
+    assert limiter.inflight == 0 and tickets[0].closed
+    assert tickets[0].cancel_origin == "server"
+    assert metrics.failures == [COMPONENT]
+    (line,) = [
+        r.getMessage() for r in caplog.records if "route_gate_cancel_incomplete" in r.getMessage()
+    ]
+    assert "downstream_unwound=False" in line and "origin=server" in line
+    stop.set()
+    await asyncio.sleep(0.05)
+
+
+async def test_a_server_cancel_of_a_downstream_that_unwinds_counts_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = _Holding()
+    gate, limiter, metrics, _ = _stack(app, max_inflight=1, grace=0.5)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(app.entered.acquire(), 2)
+
+    task.cancel()
+    with caplog.at_level(logging.INFO), contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert metrics.failures == [] and limiter.inflight == 0
+    assert "route_gate_cancel_incomplete" not in caplog.text
+
+
+async def test_the_ticket_hook_sees_every_ticket_before_the_body_is_read() -> None:
+    seen: list[tuple[RequestTicket, bool]] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await _respond(send)
+
+    gate, limiter, _, _ = _stack(app)
+    limiter.bind_ticket_hook(lambda ticket: seen.append((ticket, ticket.closed)))
+    client = _Client()
+
+    await gate(_scope(), client.receive, client.send)
+
+    ((ticket, closed_then),) = seen
+    assert closed_then is False and ticket.closed and client.status == 200
+
+
+async def test_a_failing_ticket_hook_is_counted_and_the_request_still_served(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await _respond(send)
+
+    gate, limiter, metrics, _ = _stack(app)
+
+    def failing(ticket: RequestTicket) -> None:
+        raise RuntimeError(CANARY)
+
+    limiter.bind_ticket_hook(failing)
+    client = _Client()
+    with caplog.at_level(logging.INFO):
+        await gate(_scope(), client.receive, client.send)
+
+    assert client.status == 200 and metrics.failures == [COMPONENT]
+    assert "route_gate_ticket_hook_failed" in caplog.text and CANARY not in caplog.text
+
+
 async def test_a_failing_cancel_hook_still_releases_the_slot(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -933,8 +1108,21 @@ async def test_a_shared_auth_lookup_survives_the_disconnect_of_the_request_that_
         await guardrail.async_log_success_event({"litellm_call_id": call_id}, None, now, now)
         await _respond(send)
 
-    gate, limiter, metrics, _ = _stack(litellm_like, max_inflight=2)
+    from corp_llm_gateway.route_gate.desanitize_middleware import (
+        DesanitizeMiddleware,
+        ResponseMappings,
+    )
+    from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
+
+    # Wired as the entrypoint wires it: a request the pre-call handed to its ticket is
+    # recorded by the ticket's terminal record, through the same audit logger.
+    mappings = ResponseMappings()
+    guardrail.bind_response_mappings(mappings)
+    terminal = TerminalAudit(emit_to(guardrail._audit))
+    served = DesanitizeMiddleware(litellm_like, mappings, terminal=terminal)
+    gate, limiter, metrics, _ = _stack(served, max_inflight=2)
     limiter.bind_cancel_hook(guardrail.on_request_cancelled)
+    limiter.bind_ticket_hook(terminal.bind)
     first, second = _Client((b'{"id": "call-a"}',)), _Client((b'{"id": "call-b"}',))
     first_task = asyncio.create_task(gate(_scope(), first.receive, first.send))
     await asyncio.wait_for(entered.wait(), 2)
@@ -951,6 +1139,7 @@ async def test_a_shared_auth_lookup_survives_the_disconnect_of_the_request_that_
     assert limiter.inflight == 1
     release.set()
     await asyncio.wait_for(second_task, 2)
+    await terminal.drain()
     assert second.status == 200
     assert {r["request_id"]: r["status"] for r in sink.records} == {
         "call-a": "cancelled",
@@ -1670,3 +1859,231 @@ async def test_a_server_cancel_during_the_disconnect_grace_leaves_nothing_unretr
     assert straggler[0]() is None
     assert seen == [], describe(seen)
     assert limiter.inflight == 0
+
+
+# ── the ticket's end ─────────────────────────────────────────────────────────
+
+
+class _Closes:
+    """A close hook that records the ticket state it saw."""
+
+    def __init__(self, limiter: InflightLimiter | None = None) -> None:
+        self.limiter = limiter
+        self.calls: list[tuple[str, bool, int | None]] = []
+
+    def __call__(self, ticket: RequestTicket) -> None:
+        inflight = self.limiter.inflight if self.limiter is not None else None
+        self.calls.append((ticket.gateway_id, ticket.cancelled, inflight))
+
+
+def _registering(hook: Callable[[RequestTicket], None], app: Any) -> Any:
+    async def registered(scope: Any, receive: Any, send: Any) -> None:
+        ticket = current_ticket()
+        assert ticket is not None and ticket.on_close(hook)
+        await app(scope, receive, send)
+
+    return registered
+
+
+async def test_the_ticket_closes_once_when_the_request_ends_while_it_holds_the_slot() -> None:
+    closes = _Closes()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        await _respond(send)
+
+    gate, limiter, _, _ = _stack(_registering(closes, app))
+    closes.limiter = limiter
+    client = _Client()
+
+    await gate(_scope(), client.receive, client.send)
+
+    assert client.status == 200
+    assert [(cancelled, inflight) for _, cancelled, inflight in closes.calls] == [(False, 1)]
+    assert limiter.inflight == 0
+
+
+async def test_a_downstream_that_ignores_cancellation_still_closes_its_ticket() -> None:
+    """The grace-release path: the limiter lets go of a downstream that never unwinds, and
+    closing the ticket is what frees what the request left behind."""
+    stop = asyncio.Event()
+    entered = asyncio.Event()
+    closes = _Closes()
+    tickets: list[RequestTicket] = []
+
+    async def stubborn(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        ticket = current_ticket()
+        assert ticket is not None
+        tickets.append(ticket)
+        ticket.on_close(closes)
+        entered.set()
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    gate, limiter, _, _ = _stack(stubborn, grace=0.1)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert [cancelled for _, cancelled, _ in closes.calls] == [True]
+    assert tickets[0].closed and limiter.inflight == 0
+    stop.set()
+    await asyncio.sleep(0.05)
+    assert len(closes.calls) == 1
+
+
+async def test_the_ticket_closes_when_the_server_cancels_the_request() -> None:
+    closes = _Closes()
+    app = _Holding()
+    gate, limiter, _, _ = _stack(_registering(closes, app))
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(app.entered.acquire(), 2)
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert len(closes.calls) == 1 and limiter.inflight == 0
+
+
+@pytest.mark.parametrize(
+    ("end", "expected"),
+    [("response", (None, False)), ("client", ("client", True)), ("server", ("server", False))],
+)
+async def test_the_ticket_records_who_cancelled_the_request(
+    end: str, expected: tuple[str | None, bool]
+) -> None:
+    """``cancel_origin`` is set before the downstream is cancelled. A server cancel leaves
+    ``cancelled`` alone: that flag means a client left and the guardrail writes its record."""
+    at_close: list[tuple[str | None, bool]] = []
+    at_cancel: list[str | None] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await _read_body(receive)
+        ticket = current_ticket()
+        assert ticket is not None
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            at_cancel.append(ticket.cancel_origin)
+            raise
+        await _respond(send)
+
+    def hook(ticket: RequestTicket) -> None:
+        at_close.append((ticket.cancel_origin, ticket.cancelled))
+
+    gate, limiter, _, _ = _stack(_registering(hook, app), grace=0.2)
+    client = _Client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.wait_for(entered.wait(), 2)
+
+    if end == "response":
+        release.set()
+    elif end == "client":
+        client.disconnect()
+    else:
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+
+    assert at_close == [expected]
+    assert at_cancel == ([] if end == "response" else [expected[0]])
+    assert limiter.inflight == 0
+
+
+async def test_a_disconnect_while_the_body_is_read_is_the_clients_cancel() -> None:
+    seen: list[tuple[str | None, bool]] = []
+
+    async def hook(request_id: str, *, latency_ms: int = 0) -> None:
+        ticket = current_ticket()
+        assert ticket is not None
+        seen.append((ticket.cancel_origin, ticket.cancelled))
+
+    app = _Holding()
+    gate, limiter, _, _ = _stack(app)
+    limiter.bind_cancel_hook(hook)
+    client = _stalled_client()
+    task = asyncio.create_task(gate(_scope(), client.receive, client.send))
+    await asyncio.sleep(0.05)
+    assert limiter.draining == 1
+
+    client.disconnect()
+    await asyncio.wait_for(task, 2)
+
+    assert seen == [(CANCEL_CLIENT, True)]
+    assert app.calls == 0 and limiter.draining == 0
+
+
+@pytest.mark.parametrize(
+    ("first", "then", "expected"),
+    [
+        (CANCEL_CLIENT, CANCEL_SERVER, (CANCEL_CLIENT, True)),
+        (CANCEL_SERVER, CANCEL_CLIENT, (CANCEL_SERVER, False)),
+    ],
+)
+def test_the_first_origin_marked_stays(first: str, then: str, expected: tuple[str, bool]) -> None:
+    ticket = RequestTicket("f" * 32)
+
+    ticket.mark_cancelled(first)
+    ticket.mark_cancelled(then)
+
+    assert (ticket.cancel_origin, ticket.cancelled) == expected
+
+
+async def test_a_hook_offered_to_a_closed_ticket_is_refused_and_never_run() -> None:
+    ticket = RequestTicket("f" * 32)
+    ran: list[RequestTicket] = []
+
+    assert ticket.close() == 0
+    assert ticket.on_close(ran.append) is False
+    assert ticket.close() == 0
+    assert ran == []
+
+
+def test_a_hook_is_registered_once_and_run_once() -> None:
+    ticket = RequestTicket("f" * 32)
+    ran: list[RequestTicket] = []
+
+    assert ticket.on_close(ran.append) and ticket.on_close(ran.append)
+    ticket.close()
+    ticket.close()
+
+    assert ran == [ticket]
+
+
+async def test_a_failing_close_hook_is_counted_content_free_and_the_rest_still_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    after = _Closes()
+
+    def failing(ticket: RequestTicket) -> None:
+        raise RuntimeError(CANARY)
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        ticket = current_ticket()
+        assert ticket is not None
+        ticket.on_close(failing)
+        ticket.on_close(after)
+        await _read_body(receive)
+        await _respond(send)
+
+    gate, limiter, metrics, _ = _stack(app)
+    client = _Client()
+
+    with caplog.at_level(logging.DEBUG):
+        await gate(_scope(), client.receive, client.send)
+
+    assert len(after.calls) == 1 and limiter.inflight == 0
+    assert metrics.failures == [COMPONENT]
+    assert "route_gate_ticket_close_hook_failed" in caplog.text and "RuntimeError" in caplog.text
+    assert CANARY not in caplog.text

@@ -125,6 +125,10 @@ class OpenAiToolCallDesanitizer:
             self._by_index[index] = ds
         return ds.feed(fragment)
 
+    def flush_index(self, index: int) -> str:
+        ds = self._by_index.pop(index, None)
+        return ds.flush() if ds is not None else ""
+
     def flush(self) -> list[tuple[int, str]]:
         out: list[tuple[int, str]] = []
         for idx, ds in self._by_index.items():
@@ -171,6 +175,40 @@ _RESPONSES_EVENT_ID_FIELDS = (
     "summary_index",
     "sequence_number",
 )
+_RESPONSES_TERMINAL_EVENTS = frozenset(
+    {"response.completed", "response.failed", "response.incomplete", "error"}
+)
+_RESPONSES_ITEM_DONE_EVENTS = frozenset({"response.output_item.done", "response.content_part.done"})
+_RESPONSES_DUPLICATE_EVENTS = frozenset(
+    {
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.content_part.added",
+        "response.content_part.done",
+    }
+)
+
+
+def _item_matcher(payload: dict[str, Any]) -> Callable[[tuple[Any, ...]], bool]:
+    """The held streams of the item (or content part) a ``done`` event closes."""
+    item = payload.get("item")
+    item_id = item.get("id") if isinstance(item, dict) else None
+    output_index = payload.get("output_index")
+    content_index = payload.get("content_index")
+
+    def selected(key: tuple[Any, ...]) -> bool:
+        _, key_item, key_output, key_content, _summary = key
+        same_item = (item_id is not None and key_item == item_id) or (
+            output_index is not None and key_output == output_index
+        )
+        if content_index is None:
+            return same_item
+        return same_item and key_content == content_index
+
+    return selected
 
 
 class ResponsesStreamDesanitizer:
@@ -180,6 +218,11 @@ class ResponsesStreamDesanitizer:
     arguments can split a placeholder over several ``*.delta`` events, so each
     logical output field gets its own hold-back buffer. Synthetic tail events
     are emitted as JSON strings; LiteLLM's proxy serializer wraps them in SSE.
+
+    Holding text back and adding tails would leave ``sequence_number`` repeated or
+    with gaps, so every emitted event that carries one is renumbered: the first
+    keeps its own, each next one is the previous plus one. Events without the
+    field are left alone.
     """
 
     def __init__(self, mapping: StrategyResult) -> None:
@@ -187,8 +230,15 @@ class ResponsesStreamDesanitizer:
         self._reverse_fn = build_reverse_substituter(mapping.pairs)
         self._streams: dict[tuple[Any, ...], StreamingDesanitizer] = {}
         self._metadata: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._last_sequence: int | None = None
 
     def feed(self, chunk: Any) -> list[Any]:
+        return self._renumber(self._feed(chunk))
+
+    def flush(self) -> list[str]:
+        return self._renumber(self._flush_where(lambda key: True))
+
+    def _feed(self, chunk: Any) -> list[Any]:
         payload = _responses_event_payload(chunk)
         if payload is None:
             return [chunk]
@@ -240,39 +290,69 @@ class ResponsesStreamDesanitizer:
             out.append(_restore_responses_event(chunk, rewritten))
             return out
 
+        # Held text never trails the event that ends it: an item's tails go out
+        # before its ``done``, every tail before the stream's terminal event.
+        tails: list[Any] = []
+        if event_type in _RESPONSES_TERMINAL_EVENTS:
+            tails = list(self._flush_where(lambda key: True))
+        elif event_type in _RESPONSES_ITEM_DONE_EVENTS:
+            tails = list(self._flush_where(_item_matcher(payload)))
+
         # ``response.completed`` and ``response.output_item.done`` duplicate the
         # assembled output. Rewrite their nested text too so clients that consume
         # only terminal events never see placeholders.
-        if event_type in {
-            "response.completed",
-            "response.incomplete",
-            "response.output_item.added",
-            "response.output_item.done",
-            "response.content_part.added",
-            "response.content_part.done",
-        }:
+        if event_type in _RESPONSES_DUPLICATE_EVENTS:
             rewritten = desanitize_responses_payload(payload, self._reverse)
-            return [_restore_responses_event(chunk, rewritten)]
-        return [chunk]
+            return [*tails, _restore_responses_event(chunk, rewritten)]
+        return [*tails, chunk]
 
-    def flush(self) -> list[str]:
+    def _renumber[T](self, events: list[T]) -> list[T]:
+        return [self._numbered(event) for event in events]
+
+    def _numbered(self, event: Any) -> Any:
+        if isinstance(event, str):
+            try:
+                payload = json.loads(event)
+            except ValueError:
+                return event
+            current = payload.get("sequence_number") if isinstance(payload, dict) else None
+        elif isinstance(event, dict):
+            payload, current = event, event.get("sequence_number")
+        else:
+            payload, current = None, getattr(event, "sequence_number", None)
+        if not isinstance(current, int) or isinstance(current, bool):
+            return event
+        number = current if self._last_sequence is None else self._last_sequence + 1
+        self._last_sequence = number
+        if number == current:
+            return event
+        if isinstance(event, str):
+            return json.dumps({**payload, "sequence_number": number}, ensure_ascii=False)
+        if isinstance(event, dict):
+            return {**event, "sequence_number": number}
+        copier = getattr(event, "model_copy", None)
+        if callable(copier):
+            return copier(update={"sequence_number": number})
+        # Cannot be renumbered: continue from the number it carries.
+        self._last_sequence = current
+        return event
+
+    def _flush_where(self, selected: Callable[[tuple[Any, ...]], bool]) -> list[str]:
         out: list[str] = []
         for key, stream in list(self._streams.items()):
+            if not selected(key):
+                continue
+            del self._streams[key]
+            metadata = self._metadata.pop(key, {})
             tail = stream.flush()
             if tail:
                 event_type = str(key[0])
                 out.append(
                     json.dumps(
-                        {
-                            "type": event_type,
-                            **self._metadata.get(key, {}),
-                            "delta": tail,
-                        },
+                        {"type": event_type, **metadata, "delta": tail},
                         ensure_ascii=False,
                     )
                 )
-        self._streams.clear()
-        self._metadata.clear()
         return out
 
     def _reverse(self, text: str) -> str:
@@ -370,6 +450,17 @@ class SseStreamDesanitizer:
     Placeholder assembly across delta boundaries uses one
     ``StreamingDesanitizer`` per Anthropic text content block (flushed at
     ``content_block_stop``), preserving the M1-9 length-descending rule.
+
+    OpenAI chat chunks get one buffer per ``choices[].index`` and per tool call.
+    A choice's held text rides in the chunk carrying its ``finish_reason``; a
+    tool call's tail goes out before the next tool call of its choice starts;
+    whatever is still held goes out before ``[DONE]`` or an error event, as a
+    full chunk of the stream (its ``id``/``object``/``created``/``model``).
+
+    Limitation: fragments of two tool calls interleaved (off-spec for OpenAI; the SDK
+    reads an index switch as "previous call done", and the v1 providers stream tool
+    calls one after another) flush each call's buffer at every switch, so a placeholder
+    split across a switch reaches the client as the placeholder, never the original.
     """
 
     def __init__(self, mapping: StrategyResult) -> None:
@@ -384,12 +475,9 @@ class SseStreamDesanitizer:
         self._block_desanitizers: dict[int, StreamingDesanitizer] = {}
         # Tracks block type ("text" or "tool_use") per index for correct flush delta type.
         self._block_types: dict[int, str] = {}
-        # Single desanitizer for OpenAI streams (one content stream total).
-        self._openai_desanitizer: StreamingDesanitizer | None = None
-        # OpenAI tool_calls arguments stream, keyed by tool_calls[].index.
-        self._openai_tool_calls = OpenAiToolCallDesanitizer(mapping)
-        # Legacy OpenAI function_call arguments stream (singular, no index).
-        self._openai_function_call: StreamingDesanitizer | None = None
+        # OpenAI chat: buffers per choices[].index, and the stream's chunk envelope.
+        self._chat: dict[int, _ChatChoice] = {}
+        self._chat_meta: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ public
 
@@ -410,6 +498,19 @@ class SseStreamDesanitizer:
         out.extend(self._drain())
         # Flush any still-active block desanitizers (defensive: truncated stream
         # with no content_block_stop, or placeholders held in their buffer).
+        out.extend(self._held_tails())
+        # Emit whatever partial (incomplete) SSE event remains in the buffer.
+        if self._buf:
+            partial = self._buf
+            self._buf = b""
+            out.append(self._encode(partial.decode("utf-8", errors="replace")))
+        return out
+
+    # ----------------------------------------------------------------- private
+
+    def _held_tails(self) -> list[bytes | str]:
+        """Every held tail, as events of the stream; the buffers are emptied."""
+        out: list[bytes | str] = []
         for idx, ds in list(self._block_desanitizers.items()):
             tail = ds.flush()
             if tail:
@@ -421,26 +522,18 @@ class SseStreamDesanitizer:
                 out.append(self._encode(ev + "\n\n"))
             del self._block_desanitizers[idx]
         self._block_types.clear()
-        if self._openai_desanitizer is not None:
-            oi_tail = self._openai_desanitizer.flush()
-            if oi_tail:
-                out.append(self._encode(_make_openai_delta_event(oi_tail)))
-            self._openai_desanitizer = None
-        if self._openai_function_call is not None:
-            fc_tail = self._openai_function_call.flush()
-            if fc_tail:
-                out.append(self._encode(_make_openai_function_call_delta_event(fc_tail)))
-            self._openai_function_call = None
-        for tc_idx, tc_tail in self._openai_tool_calls.flush():
-            out.append(self._encode(_make_openai_tool_call_delta_event(tc_idx, tc_tail)))
-        # Emit whatever partial (incomplete) SSE event remains in the buffer.
-        if self._buf:
-            partial = self._buf
-            self._buf = b""
-            out.append(self._encode(partial.decode("utf-8", errors="replace")))
+        for idx in sorted(self._chat):
+            delta = self._chat.pop(idx).flush()
+            if delta:
+                out.append(self._chat_tail(idx, delta))
         return out
 
-    # ----------------------------------------------------------------- private
+    def _chat_tail(self, index: int, delta: dict[str, Any]) -> bytes | str:
+        obj = {
+            **self._chat_meta,
+            "choices": [{"index": index, "delta": delta, "finish_reason": None}],
+        }
+        return self._encode("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n")
 
     def _drain(self) -> list[bytes | str]:
         """Split accumulated buffer into complete SSE events and process each."""
@@ -462,28 +555,18 @@ class SseStreamDesanitizer:
             # No data line at all (e.g. bare ping line) — pass through.
             return [self._encode(event_text)]
         if data_str == "[DONE]":
-            # End-of-stream sentinel (OpenAI) — flush OpenAI desanitizer first.
-            result: list[bytes | str] = []
-            if self._openai_desanitizer is not None:
-                oi_tail = self._openai_desanitizer.flush()
-                if oi_tail:
-                    result.append(self._encode(_make_openai_delta_event(oi_tail)))
-                self._openai_desanitizer = None
-            if self._openai_function_call is not None:
-                fc_tail = self._openai_function_call.flush()
-                if fc_tail:
-                    result.append(self._encode(_make_openai_function_call_delta_event(fc_tail)))
-                self._openai_function_call = None
-            for tc_idx, tc_tail in self._openai_tool_calls.flush():
-                result.append(self._encode(_make_openai_tool_call_delta_event(tc_idx, tc_tail)))
-            result.append(self._encode(event_text))
-            return result
+            # End-of-stream sentinel (OpenAI): a client stops reading here.
+            return [*self._held_tails(), self._encode(event_text)]
         try:
             obj = json.loads(data_str)
         except json.JSONDecodeError:
             return [self._encode(event_text)]
 
         ev_type = obj.get("type") if isinstance(obj, dict) else None
+
+        # An error ends the stream for the client: nothing held may follow it.
+        if is_stream_error_event(obj):
+            return [*self._held_tails(), self._encode(event_text)]
 
         # Anthropic: content_block_start — fresh desanitizer for text and tool_use blocks.
         if ev_type == "content_block_start":
@@ -557,69 +640,98 @@ class SseStreamDesanitizer:
             result.append(self._encode(event_text))
             return result
 
-        # OpenAI: choices[N].delta — desanitize content, tool_calls, and legacy
-        # function_call in the SAME delta. A held-back/empty content must NOT drop a
-        # tool_call/function_call riding in the same event (id/name/args would be lost).
-        # n>1 choices: only choices[0].delta is rewritten (parity with the content path).
-        if isinstance(obj, dict) and "choices" in obj:
-            choices = obj.get("choices")
-            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                first_choice = choices[0]
-                delta = first_choice.get("delta")
-                if isinstance(delta, dict) and (
-                    isinstance(delta.get("content"), str)
-                    or isinstance(delta.get("tool_calls"), list)
-                    or isinstance(delta.get("function_call"), dict)
-                ):
-                    new_delta = dict(delta)
-                    content_present = isinstance(delta.get("content"), str)
-                    tool_or_fn = False
-
-                    if content_present:
-                        if self._openai_desanitizer is None:
-                            self._openai_desanitizer = StreamingDesanitizer(self._mapping)
-                        new_delta["content"] = self._openai_desanitizer.feed(delta["content"])
-
-                    if isinstance(delta.get("tool_calls"), list):
-                        new_calls: list[object] = []
-                        for tc in delta["tool_calls"]:
-                            fn = tc.get("function") if isinstance(tc, dict) else None
-                            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
-                                tool_idx = coerce_tool_index(tc.get("index", 0))
-                                if tool_idx is None:
-                                    new_calls.append(tc)
-                                    continue
-                                rewritten = self._openai_tool_calls.feed(tool_idx, fn["arguments"])
-                                new_calls.append({**tc, "function": {**fn, "arguments": rewritten}})
-                            else:
-                                new_calls.append(tc)
-                        new_delta["tool_calls"] = new_calls
-                        tool_or_fn = True
-
-                    fc = delta.get("function_call")
-                    if isinstance(fc, dict) and isinstance(fc.get("arguments"), str):
-                        if self._openai_function_call is None:
-                            self._openai_function_call = StreamingDesanitizer(
-                                self._mapping, escape=_json_string_escape
-                            )
-                        new_delta["function_call"] = {
-                            **fc,
-                            "arguments": self._openai_function_call.feed(fc["arguments"]),
-                        }
-                        tool_or_fn = True
-
-                    # Drop only a content-ONLY delta whose content is fully held back.
-                    if content_present and not tool_or_fn and not new_delta.get("content"):
-                        return []
-                    new_first = {**first_choice, "delta": new_delta}
-                    new_choices = [new_first, *list(choices[1:])]
-                    new_obj = {**obj, "choices": new_choices}
-                    boundary = _boundary_from(event_text)
-                    return [self._encode(_rebuild_event(event_text, new_obj, boundary))]
+        if isinstance(obj, dict) and isinstance(obj.get("choices"), list):
+            return self._process_chat(event_text, obj)
 
         # Everything else (message_start, ping, message_delta, message_stop,
         # error, non-text blocks) — byte-identical pass-through.
         return [self._encode(event_text)]
+
+    def _process_chat(self, event_text: str, obj: dict[str, Any]) -> list[bytes | str]:
+        """Rewrite every choice's content, tool_calls and legacy function_call.
+
+        A held-back/empty content must NOT drop a tool_call/function_call riding in
+        the same delta (its id/name/args would be lost)."""
+        self._chat_meta.update({key: obj[key] for key in _CHAT_META_KEYS if key in obj})
+        before: list[bytes | str] = []
+        new_choices: list[Any] = []
+        changed = False
+        for choice in obj["choices"]:
+            rewritten = self._rewrite_choice(choice, before)
+            if rewritten is not choice:
+                changed = True
+            if rewritten is not None:
+                new_choices.append(rewritten)
+        if not changed:
+            return [*before, self._encode(event_text)]
+        if obj["choices"] and not new_choices and obj.get("usage") is None:
+            return before
+        new_obj = {**obj, "choices": new_choices}
+        boundary = _boundary_from(event_text)
+        return [*before, self._encode(_rebuild_event(event_text, new_obj, boundary))]
+
+    def _rewrite_choice(self, choice: Any, before: list[bytes | str]) -> Any:
+        """The choice as it goes out: itself, a rewritten copy, or None when all it
+        carried was content now held back. Tails due before it go to ``before``."""
+        if not isinstance(choice, dict) or not isinstance(choice.get("delta"), dict):
+            return choice
+        idx = coerce_tool_index(choice.get("index", 0))
+        if idx is None:
+            return choice
+        delta: dict[str, Any] = choice["delta"]
+        finishing = choice.get("finish_reason") is not None
+        state = self._chat.get(idx)
+        has_content = isinstance(delta.get("content"), str)
+        has_calls = isinstance(delta.get("tool_calls"), list)
+        has_function = isinstance(delta.get("function_call"), dict) and isinstance(
+            delta["function_call"].get("arguments"), str
+        )
+        if not (has_content or has_calls or has_function) and not (finishing and state):
+            return choice
+        if state is None:
+            state = self._chat[idx] = _ChatChoice(self._mapping)
+        new_delta = dict(delta)
+        if has_calls:
+            first = next(
+                (
+                    i
+                    for tc in delta["tool_calls"]
+                    if isinstance(tc, dict)
+                    and (i := coerce_tool_index(tc.get("index", 0))) is not None
+                ),
+                None,
+            )
+            if first is not None and first != state.tool_index:
+                # A client closes the content and the previous tool call here.
+                pending = state.flush_before_tool_call()
+                if pending:
+                    before.append(self._chat_tail(idx, pending))
+        if has_content:
+            if state.content is None:
+                state.content = StreamingDesanitizer(self._mapping)
+            new_delta["content"] = state.content.feed(delta["content"])
+        if has_calls:
+            new_delta["tool_calls"] = [state.feed_tool_call(tc) for tc in delta["tool_calls"]]
+        if has_function:
+            if state.function_call is None:
+                state.function_call = StreamingDesanitizer(
+                    self._mapping, escape=_json_string_escape
+                )
+            fc = delta["function_call"]
+            new_delta["function_call"] = {
+                **fc,
+                "arguments": state.function_call.feed(fc["arguments"]),
+            }
+        if finishing:
+            _merge_tail(new_delta, self._chat.pop(idx).flush())
+        elif (
+            has_content
+            and set(new_delta) == {"content"}
+            and not new_delta["content"]
+            and choice.get("logprobs") is None
+        ):
+            return None
+        return {**choice, "delta": new_delta}
 
     def _encode(self, text: str | bytes) -> bytes | str:
         """Re-emit in the same type (bytes vs str) as the source stream."""
@@ -708,23 +820,88 @@ def _make_input_json_delta_event(index: int, partial_json: str) -> str:
     return "event: content_block_delta\ndata: " + json.dumps(obj, ensure_ascii=False)
 
 
-def _make_openai_delta_event(content: str) -> str:
-    """Build a complete OpenAI-format SSE event for a choices delta tail."""
-    obj = {"choices": [{"delta": {"content": content}}]}
-    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+_CHAT_META_KEYS = ("id", "object", "created", "model", "system_fingerprint", "service_tier")
 
 
-def _make_openai_tool_call_delta_event(index: int, arguments: str) -> str:
-    """Build a complete OpenAI-format SSE event for a tool_calls arguments tail."""
-    obj = {
-        "choices": [
-            {"delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments}}]}}
+class _ChatChoice:
+    """Held text of one OpenAI chat choice: content, tool calls, legacy function_call."""
+
+    __slots__ = ("content", "function_call", "tool_index", "tools")
+
+    def __init__(self, mapping: StrategyResult) -> None:
+        self.content: StreamingDesanitizer | None = None
+        self.function_call: StreamingDesanitizer | None = None
+        self.tools = OpenAiToolCallDesanitizer(mapping)
+        self.tool_index: int | None = None
+
+    def feed_tool_call(self, tc: Any) -> Any:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("arguments"), str):
+            return tc
+        idx = coerce_tool_index(tc.get("index", 0))
+        if idx is None:
+            return tc
+        self.tool_index = idx
+        return {**tc, "function": {**fn, "arguments": self.tools.feed(idx, fn["arguments"])}}
+
+    def flush_before_tool_call(self) -> dict[str, Any]:
+        delta: dict[str, Any] = {}
+        if self.content is not None:
+            tail, self.content = self.content.flush(), None
+            if tail:
+                delta["content"] = tail
+        if self.tool_index is not None:
+            tail = self.tools.flush_index(self.tool_index)
+            if tail:
+                delta["tool_calls"] = [{"index": self.tool_index, "function": {"arguments": tail}}]
+        return delta
+
+    def flush(self) -> dict[str, Any]:
+        """Every held tail as one delta; empty when nothing was held."""
+        delta = self.flush_before_tool_call()
+        if self.function_call is not None:
+            tail, self.function_call = self.function_call.flush(), None
+            if tail:
+                delta["function_call"] = {"arguments": tail}
+        calls = [
+            {"index": idx, "function": {"arguments": tail}} for idx, tail in self.tools.flush()
         ]
-    }
-    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+        if calls:
+            delta["tool_calls"] = [*delta.get("tool_calls", []), *calls]
+        return delta
 
 
-def _make_openai_function_call_delta_event(arguments: str) -> str:
-    """Build a complete OpenAI-format SSE event for a legacy function_call args tail."""
-    obj = {"choices": [{"delta": {"function_call": {"arguments": arguments}}}]}
-    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+def _merge_tail(delta: dict[str, Any], tail: dict[str, Any]) -> None:
+    """Append held tails to a choice's last delta, field by field."""
+    if "content" in tail:
+        delta["content"] = (delta.get("content") or "") + tail["content"]
+    if "function_call" in tail:
+        fc = delta.get("function_call")
+        fc = dict(fc) if isinstance(fc, dict) else {}
+        fc["arguments"] = str(fc.get("arguments") or "") + tail["function_call"]["arguments"]
+        delta["function_call"] = fc
+    calls = list(delta.get("tool_calls") or [])
+    for call in tail.get("tool_calls", []):
+        for pos in range(len(calls) - 1, -1, -1):
+            existing = calls[pos]
+            fn = existing.get("function") if isinstance(existing, dict) else None
+            if (
+                isinstance(fn, dict)
+                and isinstance(fn.get("arguments"), str)
+                and coerce_tool_index(existing.get("index", 0)) == call["index"]
+            ):
+                arguments = fn["arguments"] + call["function"]["arguments"]
+                calls[pos] = {**existing, "function": {**fn, "arguments": arguments}}
+                break
+        else:
+            calls.append(call)
+    if calls:
+        delta["tool_calls"] = calls
+
+
+def is_stream_error_event(obj: Any) -> bool:
+    """A ``type: error`` event (Anthropic, Responses), or the ``{"error": ...}`` chunk
+    litellm and OpenAI send when a chat stream fails."""
+    if not isinstance(obj, dict):
+        return False
+    return obj.get("type") == "error" or (bool(obj.get("error")) and "choices" not in obj)

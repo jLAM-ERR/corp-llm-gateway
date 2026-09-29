@@ -220,6 +220,29 @@ def test_the_invariant_table_has_the_same_rows_in_both_languages() -> None:
     assert ids(SECURITY_EN) == ids(SECURITY_RU)
 
 
+def _row_ids(path: Path, heading: str, pattern: str) -> list[str]:
+    section = _section(path.read_text(), heading)
+    cells = [line.split("|")[1].strip() for line in section.splitlines() if line.startswith("| ")]
+    return [cell for cell in cells if re.fullmatch(pattern, cell)]
+
+
+def test_the_known_gaps_table_has_the_same_rows_in_both_languages() -> None:
+    en = _row_ids(SECURITY_EN, "## 11.", r"\([a-z]\)")
+
+    assert en == _row_ids(SECURITY_RU, "## 11.", r"\([a-z]\)")
+    assert en == sorted(en)
+
+
+@pytest.mark.parametrize("doc", [SECURITY_EN, SECURITY_RU], ids=lambda p: p.name)
+def test_the_litellm_section_has_one_row_per_hazard_of_the_acceptance_matrix(doc: Path) -> None:
+    from tests.litellm_hook.test_acceptance_matrix import HAZARD_IDS
+
+    rows = _row_ids(doc, "## 15.", r"\d+[a-z]?")
+
+    assert sorted(rows) == sorted(HAZARD_IDS)
+    assert rows == _row_ids(SECURITY_EN, "## 15.", r"\d+[a-z]?")
+
+
 # The docs call the nginx `crit` level load-bearing for the corp token and name
 # the test that pins it; a renamed test would leave them citing nothing.
 CRIT_PIN = (

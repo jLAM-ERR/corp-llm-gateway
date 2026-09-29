@@ -31,13 +31,14 @@ def _clean_config(hermetic_gateway_config: None):
 
 @pytest.fixture
 def _restore_pkg_logger():
-    # Importing the demo module mutates the package logger (adds a handler,
-    # sets propagate=False). Restore so other tests' caplog is unaffected.
+    # Importing the demo module mutates the package logger (sets the level,
+    # adds a handler, sets propagate=False). Restore so other tests' caplog is unaffected.
     import logging
 
     pkg = logging.getLogger("corp_llm_gateway")
-    propagate, handlers = pkg.propagate, list(pkg.handlers)
+    level, propagate, handlers = pkg.level, pkg.propagate, list(pkg.handlers)
     yield
+    pkg.setLevel(level)
     pkg.propagate = propagate
     pkg.handlers = handlers
 

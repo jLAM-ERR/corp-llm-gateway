@@ -59,6 +59,8 @@ Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 Refuse = Callable[[str], Awaitable[None]]
+# The block_reason to refuse a complete body with, or None to serve it.
+BodyCheck = Callable[[list[bytes]], str | None]
 
 # block_reason / error code of the capacity refusal.
 ROUTE_GATE_CAPACITY = "capacity"
@@ -84,6 +86,10 @@ DEFAULT_MAX_DRAINING_BYTES = 512 * 1024 * 1024
 
 _COMPONENT = "route_gate"
 
+# RequestTicket.cancel_origin: who cancelled the request.
+CANCEL_CLIENT = "client"
+CANCEL_SERVER = "server"
+
 
 class CancelHook(Protocol):
     def __call__(self, request_id: str, *, latency_ms: int = ...) -> Awaitable[None]: ...
@@ -94,22 +100,82 @@ class RequestTicket:
 
     ``cancelled`` is set before the downstream is cancelled, so any audit the
     unwinding request (or a litellm callback run in its context) attempts can
-    stand down for the one ``cancelled`` record the guardrail writes after.
+    stand down for the one ``cancelled`` record written after (by the ticket's
+    terminal record once the pre-call deposited its facts, by the guardrail's
+    cancel hook before that). ``cancel_origin`` says who cancelled it: ``client``
+    with ``cancelled`` (the client left), ``server`` without it (the server
+    cancelled the request, e.g. at shutdown; the guardrail is not told).
+
+    ``close()`` is the limiter letting go of the request: normally when the
+    downstream returns, on a disconnect after the grace even if the downstream
+    never unwound. State a request leaves outside its own frames (a response
+    mapping, a restorer) is dropped by a hook registered with ``on_close``.
+    ``audit_facts`` holds the content-free facts its terminal audit record is
+    written from.
     """
 
-    __slots__ = ("__weakref__", "call_ids", "cancelled", "gateway_id", "tasks")
+    __slots__ = (
+        "__weakref__",
+        "_on_close",
+        "audit_facts",
+        "call_ids",
+        "cancel_origin",
+        "cancelled",
+        "closed",
+        "gateway_id",
+        "tasks",
+    )
 
     def __init__(self, gateway_id: str) -> None:
         self.gateway_id = gateway_id
         self.call_ids: list[str] = []
         self.cancelled = False
+        self.cancel_origin: str | None = None
+        self.closed = False
         self.tasks: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
+        self.audit_facts: Any = None
+        self._on_close: list[Callable[[RequestTicket], None]] = []
+
+    def mark_cancelled(self, origin: str) -> None:
+        """Record who cancelled the request; the first origin stays."""
+        if self.cancel_origin is None:
+            self.cancel_origin = origin
+            if origin == CANCEL_CLIENT:
+                self.cancelled = True
 
     def request_ids(self) -> list[str]:
         return list(self.call_ids) or [self.gateway_id]
 
     def pending(self) -> list[asyncio.Task[Any]]:
         return [task for task in list(self.tasks) if not task.done()]
+
+    def on_close(self, hook: Callable[[RequestTicket], None]) -> bool:
+        """Run ``hook(ticket)`` once, at ``close()``; refused (False) once closed."""
+        if self.closed:
+            return False
+        if hook not in self._on_close:
+            self._on_close.append(hook)
+        return True
+
+    def close(self) -> int:
+        """Run every hook once, each guarded; the number that raised."""
+        if self.closed:
+            return 0
+        self.closed = True
+        hooks, self._on_close = self._on_close, []
+        failed = 0
+        for hook in hooks:
+            try:
+                hook(self)
+            except Exception as exc:
+                failed += 1
+                # Type only: a hook's message can quote request content.
+                logger.error(
+                    "route_gate_ticket_close_hook_failed request_id=%s error=%s",
+                    self.gateway_id,
+                    type(exc).__name__,
+                )
+        return failed
 
 
 _TICKET: ContextVar[RequestTicket | None] = ContextVar("corp_llm_gateway_request", default=None)
@@ -269,6 +335,7 @@ class InflightLimiter:
         self._max_bytes = max_draining_bytes
         self._buffered = 0
         self._cancel_hook: CancelHook | None = None
+        self._ticket_hook: Callable[[RequestTicket], None] | None = None
 
     @property
     def max_inflight(self) -> int:
@@ -304,6 +371,11 @@ class InflightLimiter:
 
     def bind_cancel_hook(self, hook: CancelHook | None) -> None:
         self._cancel_hook = hook
+
+    def bind_ticket_hook(self, hook: Callable[[RequestTicket], None] | None) -> None:
+        """Run ``hook(ticket)`` on every ticket as it is made (the terminal audit binds
+        its close-time record there)."""
+        self._ticket_hook = hook
 
     def try_acquire(self) -> bool:
         if self._max and self._inflight >= self._max:
@@ -342,21 +414,37 @@ class InflightLimiter:
             self._metric("set_draining_bytes", self._buffered)
 
     async def run(
-        self, scope: Scope, receive: Receive, send: Send, app: ASGIApp, *, refuse: Refuse
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        app: ASGIApp,
+        *,
+        refuse: Refuse,
+        check: BodyCheck | None = None,
     ) -> None:
-        """Admit one request: read its body, then take a slot and free it exactly once."""
+        """Admit one request: read its body, then take a slot and free it exactly once.
+        ``check`` sees the complete body before any slot is taken; a reason it returns
+        is refused, and the downstream never runs."""
         full = bool(self._max) and self._inflight >= self._max
         if full or (self._max_draining and self._draining >= self._max_draining):
             await refuse(ROUTE_GATE_CAPACITY)
             return
         held = _Held()
         try:
-            await self._admit(held, scope, receive, send, app, refuse)
+            await self._admit(held, scope, receive, send, app, refuse, check)
         finally:
             self._give_back(held)
 
     async def _admit(
-        self, held: _Held, scope: Scope, receive: Receive, send: Send, app: ASGIApp, refuse: Refuse
+        self,
+        held: _Held,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        app: ASGIApp,
+        refuse: Refuse,
+        check: BodyCheck | None,
     ) -> None:
         declared = _declared_length(scope)
         if declared is not None and not self._hold(held, min(declared, self._max_body)):
@@ -364,6 +452,26 @@ class InflightLimiter:
             return
         started = time.monotonic()
         ticket = RequestTicket(uuid.uuid4().hex)
+        self._on_ticket(ticket)
+        try:
+            await self._admit_ticket(
+                ticket, started, held, scope, receive, send, app, refuse, check
+            )
+        finally:
+            self._close(ticket)
+
+    async def _admit_ticket(
+        self,
+        ticket: RequestTicket,
+        started: float,
+        held: _Held,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        app: ASGIApp,
+        refuse: Refuse,
+        check: BodyCheck | None,
+    ) -> None:
         self._draining += 1
         try:
             try:
@@ -389,6 +497,12 @@ class InflightLimiter:
             await self._cancelled(ticket, started, downstream=None)
             return
         assert isinstance(drained, list)
+        reason = check(drained) if check is not None else None
+        if reason is not None:
+            drained.clear()
+            self._give_back(held)
+            await refuse(reason)
+            return
         if not self.try_acquire():
             drained.clear()
             self._give_back(held)
@@ -397,7 +511,29 @@ class InflightLimiter:
         try:
             await self._serve(ticket, started, scope, receive, send, app, drained)
         finally:
-            self._release()
+            try:
+                # Before the slot frees: what the request left behind goes first.
+                self._close(ticket)
+            finally:
+                self._release()
+
+    def _on_ticket(self, ticket: RequestTicket) -> None:
+        hook = self._ticket_hook
+        if hook is None:
+            return
+        try:
+            hook(ticket)
+        except Exception as exc:
+            self._metric("record_failure", _COMPONENT)
+            logger.error(
+                "route_gate_ticket_hook_failed request_id=%s error=%s",
+                ticket.gateway_id,
+                type(exc).__name__,
+            )
+
+    def _close(self, ticket: RequestTicket) -> None:
+        for _ in range(ticket.close()):
+            self._metric("record_failure", _COMPONENT)
 
     async def _drain(self, receive: Receive, held: _Held) -> object:
         chunks: list[bytes] = []
@@ -448,32 +584,58 @@ class InflightLimiter:
             # Before the replay wakes anything: litellm's own watchers read the
             # replay, and the audits they trigger must already see the flag.
             if not response_complete:
-                ticket.cancelled = True
+                ticket.mark_cancelled(CANCEL_CLIENT)
             replay.disconnect()
 
         watcher = asyncio.create_task(self._watch(receive, client_gone))
         try:
             await asyncio.wait({downstream, watcher}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
-            watcher.cancel()
-            downstream.cancel()
-            try:
-                await asyncio.wait({downstream, watcher}, timeout=self._grace)
-            finally:
-                # Also when a second cancel cuts the grace short.
-                _retrieve_when_done(downstream)
-                _retrieve_when_done(watcher)
+            await self._server_cancelled(ticket, downstream, watcher)
             raise
         if replay.disconnected and not response_complete:
             await self._cancelled(ticket, started, downstream=downstream)
             await _settle(watcher)
             return
         watcher.cancel()
-        await _settle(watcher)
         try:
-            await downstream
+            try:
+                await _settle(watcher)
+                # Not `await downstream`: that would hand the cancel to the downstream
+                # before the ticket says who cancelled it.
+                if not downstream.done():
+                    await asyncio.wait({downstream})
+            except asyncio.CancelledError:
+                await self._server_cancelled(ticket, downstream, watcher)
+                raise
+            downstream.result()
         finally:
             replay.complete()
+
+    async def _server_cancelled(
+        self, ticket: RequestTicket, downstream: asyncio.Task[None], watcher: asyncio.Task[None]
+    ) -> None:
+        """The server is cancelling the request: mark it before the downstream sees it,
+        then give the downstream the grace to unwind."""
+        ticket.mark_cancelled(CANCEL_SERVER)
+        watcher.cancel()
+        downstream.cancel()
+        try:
+            await asyncio.wait({downstream, watcher}, timeout=self._grace)
+        finally:
+            # Also when a second cancel cuts the grace short.
+            _retrieve_when_done(downstream)
+            _retrieve_when_done(watcher)
+        if not downstream.done():
+            # The slot is freed anyway, as on the client path; say so the same way.
+            logger.error(
+                "route_gate_cancel_incomplete request_id=%s downstream_unwound=%s "
+                "pending_tasks=%d origin=server",
+                ticket.gateway_id,
+                False,
+                len(_stragglers(ticket, downstream)),
+            )
+            self._metric("record_failure", _COMPONENT)
 
     @staticmethod
     def _start(ticket: RequestTicket, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
@@ -505,7 +667,7 @@ class InflightLimiter:
     async def _cancelled(
         self, ticket: RequestTicket, started: float, *, downstream: asyncio.Task[None] | None
     ) -> None:
-        ticket.cancelled = True
+        ticket.mark_cancelled(CANCEL_CLIENT)
         loop = asyncio.get_running_loop()
         unwound = True
         if downstream is not None:

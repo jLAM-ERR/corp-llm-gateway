@@ -1,5 +1,5 @@
-"""Adversarial / edge-case tests for CorpLlmGuardrail.post_call_stream
-with Anthropic SSE bytes.
+"""Adversarial / edge-case tests for the response reversal (the ASGI desanitiser,
+driven through ``tests/response_restore.py``) with Anthropic SSE bytes.
 
 Focus: the SSE bytes path (bytes|str chunks), split placeholders across
 deltas, framing integrity, and passthrough correctness.  Dict-chunk path
@@ -27,6 +27,7 @@ from corp_llm_gateway.tokens import (
     InMemoryTokenStore,
     TokenInfo,
 )
+from tests.response_restore import restore_stream
 from tests.sanitizer.test_streaming import (
     _MSG_DELTA,
     _MSG_START,
@@ -123,7 +124,7 @@ async def _iter(items: list[Any]) -> AsyncIterator[Any]:
 
 async def _collect(g: CorpLlmGuardrail, data: dict, chunks: list[Any]) -> list[Any]:
     out: list[Any] = []
-    async for chunk in g.post_call_stream(data, _iter(chunks)):
+    async for chunk in restore_stream(g, data, _iter(chunks)):
         out.append(chunk)
     return out
 
@@ -334,14 +335,16 @@ async def test_post_call_stream_mixed_bytes_and_dict_chunks() -> None:
 
 
 async def test_post_call_stream_unknown_type_chunk_passes_through() -> None:
-    """Chunks of an unknown type (not bytes, str, or dict) pass through unchanged."""
+    """A stream event the restorer cannot read (not JSON, no ``data:``) passes through
+    unchanged. On the wire every chunk is bytes; what was an unknown Python type in the
+    callback is an unreadable event here."""
     g = _build([("alice", "[N1]")])
     data = _request(content="hi alice")
     await g.pre_call(data)
 
-    sentinel = object()
-    out = await _collect(g, data, [sentinel])
-    assert sentinel in out
+    unreadable = b": keep-alive \x01\n\n"
+    out = await _collect(g, data, [unreadable])
+    assert b"".join(out) == unreadable
 
 
 async def test_post_call_stream_no_pre_call_passthrough() -> None:

@@ -158,6 +158,44 @@ def json_logs(path: Path) -> bool:
     return isinstance(settings, dict) and settings.get("json_logs") is True
 
 
+# What click's BoolParamType reads as true; litellm's CLI parses DETAILED_DEBUG with it.
+_CLICK_TRUE = frozenset({"1", "true", "t", "yes", "y", "on"})
+
+_REFUSED_AT_ARM = (
+    "the gateway refuses to arm with it (exit 70); CORP_LLM_ALLOW_LITELLM_DEBUG=1 allows "
+    "it outside prod, for tests only"
+)
+
+
+def debug_problems(path: Path) -> list[str]:
+    """The litellm DEBUG switches ``config check`` can see (litellm's own env vars, read
+    as litellm reads them, and ``set_verbose`` in its YAML); the arm step refuses their
+    live effect."""
+    from corp_llm_gateway.route_gate.arm_checks import (
+        LITELLM_DEBUG_LOGGING,
+        LITELLM_SET_VERBOSE,
+    )
+
+    problems: list[str] = []
+    if (os.getenv("LITELLM_LOG") or "").upper() == "DEBUG":
+        problems.append(
+            f"{LITELLM_DEBUG_LOGGING}: LITELLM_LOG=DEBUG puts litellm's loggers at DEBUG, "
+            f"which log the original request; {_REFUSED_AT_ARM}"
+        )
+    if (os.getenv("DETAILED_DEBUG") or "").strip().lower() in _CLICK_TRUE:
+        problems.append(
+            f"{LITELLM_DEBUG_LOGGING}: DETAILED_DEBUG puts litellm's loggers at DEBUG, "
+            f"which log the original request; {_REFUSED_AT_ARM}"
+        )
+    settings = _document(path).get("litellm_settings") or {}
+    if isinstance(settings, dict) and settings.get("set_verbose"):
+        problems.append(
+            f"{LITELLM_SET_VERBOSE}: {CONFIG_PATH_KEY}={path}: litellm_settings.set_verbose "
+            f"makes litellm print requests before they are sanitized; {_REFUSED_AT_ARM}"
+        )
+    return problems
+
+
 def _document(path: Path) -> dict[str, Any]:
     try:
         import yaml

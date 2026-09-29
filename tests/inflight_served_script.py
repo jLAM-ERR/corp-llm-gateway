@@ -1,10 +1,10 @@
 """Child process for ``tests/test_inflight_served_stack.py``: the real entrypoint
 (route gate + in-flight limiter + litellm + the guardrail) served by uvicorn on a
-real socket, in front of an upstream stub on another real socket. Runs every
-disconnect case (scenario ``disconnects``), the isolation cases (scenario
-``isolation``: a shared auth lookup across a disconnect, idle bodies against the
-slots) or the body byte budget (scenario ``budget``), prints one ``@@RESULT@@``
-JSON line.
+real socket, in front of an upstream stub on another real socket. Runs a cap-1
+sequential client and every disconnect case (scenario ``disconnects``), the
+isolation cases (scenario ``isolation``: a shared auth lookup across a disconnect,
+idle bodies against the slots) or the body byte budget (scenario ``budget``),
+prints one ``@@RESULT@@`` JSON line.
 
 Run as ``python tests/inflight_served_script.py <asyncio|uvloop> [scenario]``;
 importing ``corp_llm_gateway.asgi`` IS the boot, so this cannot share the test
@@ -61,6 +61,7 @@ import uvicorn  # noqa: E402
 import corp_llm_gateway.asgi as asgi  # noqa: E402
 from corp_llm_gateway.audit import AuditLogger, ListSink  # noqa: E402
 from corp_llm_gateway.route_gate import inflight  # noqa: E402
+from corp_llm_gateway.route_gate.terminal_audit import emit_to  # noqa: E402
 
 _CHUNK = {
     "id": "c1",
@@ -231,6 +232,8 @@ async def main() -> None:
     guardrail = next(cb for cb in litellm.callbacks if type(cb).__name__ == "CorpLlmGuardrail")
     sink = StallOnceSink()
     guardrail._audit = AuditLogger(sink, gateway_version="served")
+    # A request the pre-call handed to its ticket is recorded by the terminal record.
+    asgi.terminal._emit = emit_to(AuditLogger(sink, gateway_version="served"))
     limiter = asgi.limiter
 
     # Which of litellm's own disconnect watchers saw the disconnect through the
@@ -252,6 +255,9 @@ async def main() -> None:
     crp._wait_for_http_disconnect = first_chunk_wait
 
     warm = await _complete(port, stub, stream=False)
+    # The client reads the whole response before the slot frees: uvicorn ends the
+    # connection inside the final send, and the slot is held until the app returns.
+    await _until(lambda: limiter.inflight <= 0)
     results: dict[str, Any] = {"warmup": warm[0], "cases": {}}
     if SCENARIO == "budget":
         results["byte_budget"] = await _byte_budget(port, stub, limiter)
@@ -263,6 +269,7 @@ async def main() -> None:
         results["idle_bodies"] = await _idle_bodies(port, stub, limiter)
         await _finish(results, port, limiter, server, serving, stub_server)
         return
+    results["sequential"] = await _sequential(port, stub, limiter)
 
     async def case(
         name: str,
@@ -300,6 +307,7 @@ async def main() -> None:
             await asyncio.wait_for(stub.closed.wait(), BOUND_S)
             upstream_closed_s = stub.closed_at - started if stub.closed_at else None
         await asyncio.sleep(0.5)  # late litellm callbacks, if any, land now
+        await asgi.terminal.drain()
         records = sink.records[base_records:]
         pending = inflight.pending_request_tasks()
         inflight_after = limiter.inflight
@@ -368,6 +376,34 @@ async def _finish(
     print(SENTINEL + json.dumps(results), flush=True)
 
 
+SEQUENTIAL_REQUESTS = 200
+HOP_SAMPLES = 20
+HOP_BOUND = 1000
+
+
+async def _sequential(port: int, stub: Stub, limiter: Any) -> Any:
+    """One client at cap 1 sends its next request as soon as it has read the last."""
+    statuses: dict[str, int] = {}
+    started = time.monotonic()
+    for _ in range(SEQUENTIAL_REQUESTS):
+        status, _ = await _complete(port, stub, stream=False)
+        statuses[str(status)] = statuses.get(str(status), 0) + 1
+        if status != 200:
+            # Keep the samples independent: a refusal means the slot was still held.
+            await _until(lambda: limiter.inflight <= 0)
+    elapsed_s = time.monotonic() - started
+    hops: list[int] = []
+    for _ in range(HOP_SAMPLES):
+        await _complete(port, stub, stream=False)
+        count = 0
+        while limiter.inflight > 0 and count < HOP_BOUND:
+            await asyncio.sleep(0)
+            count += 1
+        hops.append(count)
+        await _until(lambda: limiter.inflight <= 0)
+    return {"statuses": statuses, "elapsed_s": elapsed_s, "release_hops": hops}
+
+
 async def _shared_lookup(port: int, stub: Stub, guardrail: Any, sink: Any, limiter: Any) -> Any:
     """A and B share one token lookup, started by A; A's client leaves mid-lookup."""
     auth = guardrail._auth
@@ -409,6 +445,7 @@ async def _shared_lookup(port: int, stub: Stub, guardrail: Any, sink: Any, limit
         del store.lookup
     await _until(lambda: limiter.inflight <= 0)
     await asyncio.sleep(0.5)
+    await asgi.terminal.drain()
     records = sink.records[base_records:]
     return {
         "lookups_in_flight": lookups_in_flight,
@@ -453,6 +490,7 @@ async def _shared_call_id(port: int, stub: Stub, guardrail: Any, sink: Any, limi
     stub.reset("ok")
     await _until(lambda: limiter.inflight <= 0)
     await asyncio.sleep(0.5)
+    await asgi.terminal.drain()
     records = sink.records[base_records:]
     head = b_rest.split(b"\r\n\r\n", 1)[0].decode("latin-1").lower()
     return {

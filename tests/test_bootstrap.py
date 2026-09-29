@@ -232,6 +232,24 @@ async def test_the_sanitization_probe_reports_a_failing_round_trip(
     assert "sanitization_error" in status.detail
 
 
+async def test_the_sanitization_probe_is_healthy_with_the_oracle_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
+    monkeypatch.setenv("CORP_LLM_LOCAL_FIRST", "1")
+
+    def _fail_if_called() -> None:
+        raise AssertionError("build_corp_llm_client must not run when the oracle is disabled")
+
+    monkeypatch.setattr(bootstrap, "build_corp_llm_client", _fail_if_called)
+    monkeypatch.setattr(bootstrap, "_guardrail", None)
+    status = await bootstrap.build_health_router()._checks["/healthz/sanitization"].check()
+
+    assert status.healthy is True, status.detail
+    assert bootstrap._guardrail._orch._core._corp_llm is None
+    assert bootstrap._guardrail._orch._core._oracle_enabled is False
+
+
 # ── D4: profiles activated in the composition root ───────────────────────────
 
 
@@ -926,11 +944,12 @@ def test_backends_resolve_from_config_file_without_env(
 
 @pytest.fixture
 def _restore_pkg_logger() -> None:
-    # Importing the demo module sets propagate=False + adds a handler on the
-    # package logger; restore so caplog in other tests is unaffected.
+    # Importing the demo module sets the level and propagate=False and adds a
+    # handler on the package logger; restore so caplog in other tests is unaffected.
     pkg = logging.getLogger("corp_llm_gateway")
-    propagate, handlers = pkg.propagate, list(pkg.handlers)
+    level, propagate, handlers = pkg.level, pkg.propagate, list(pkg.handlers)
     yield
+    pkg.setLevel(level)
     pkg.propagate = propagate
     pkg.handlers = handlers
 

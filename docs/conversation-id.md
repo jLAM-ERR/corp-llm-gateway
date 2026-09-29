@@ -51,8 +51,8 @@ LiteLLM's `litellm_session_id`.
 | **A — dedup** | `sha256(team_id + rules + text)` | reuse a mapping when the same text recurs across requests | ✅ working — content-derived, not conversation-derived |
 | **B — per-conv** | `(conversation_id, original) ↔ placeholder` | keep `[EMAIL_001]` stable for the same original across all turns of one conversation | ⚠️ inert — every request gets a fresh `conversation_id`, so writes are never read by sibling requests |
 
-Post-call desanitization currently relies on the in-process
-`_RequestState.mapping`, not on Cache B, so the inertness is invisible
+Response desanitization (the ASGI desanitiser) relies on the mapping
+snapshot the pre-call hands the request's ticket, not on Cache B, so the inertness is invisible
 *within* a single request. It only matters across requests in one
 session.
 

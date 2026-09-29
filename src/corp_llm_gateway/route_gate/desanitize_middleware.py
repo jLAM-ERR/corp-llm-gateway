@@ -1,0 +1,688 @@
+"""Restore originals in the response at the ASGI layer: the gateway's one reversal.
+
+``asgi.py`` mounts it inside the in-flight limiter (it needs the request's ticket), in
+front of litellm's app, with no off switch. It wraps ``send`` only (``receive`` belongs to
+the limiter), so litellm and every callback in it only ever see placeholders; the client
+gets the originals. Restoration state is keyed by the gateway ``RequestTicket`` (the
+guardrail's pre-call registers the response mapping there) and owned here, never by an
+audit: the mapping is released on the final body in every mode (restored, non-2xx,
+pass-through), when the request unwinds, and at the ticket's close, which the limiter
+reaches after its grace even if the downstream never unwinds; the restorer's buffers go
+with it. A mapping offered for a cancelled or closed ticket is refused.
+
+A restoration failure never raises into litellm's app: before ``http.response.start`` it
+answers a content-free 500, after it the events already restored are sent and the stream
+is closed without a message. Either way it is reported (content-free log line +
+``gateway_failure{component="desanitize"}``). The terminal record is published once
+through ``terminal_audit.TerminalAudit``, here at the final body or the failure, and at
+the ticket's close for a request that got neither. Token counts for that record are read
+from the 2xx response as it passes (the JSON body's ``usage``, up to 1 MiB; in a stream the
+chat usage chunk, Anthropic's ``message_start`` / ``message_delta`` or Responses'
+``response.completed``), in every mode. A chat stream always carries its usage chunk here
+(the guardrail's pre-call asks for it); when its client did not ask, the chunk is read and
+dropped, with every other all-empty chunk litellm itself would have stripped. In pass
+mode an event still open past ``_USAGE_EVENT_CAP`` ends that reading: from there on every
+byte goes out as litellm sent it, that chunk included, and the record keeps only the
+counts read before it. Accepted as degraded, not wrong: an extra chunk, missing counts.
+
+``Content-Encoding``: a response carrying one passes through untouched (placeholders,
+never originals); ``compressor_problems`` is the arm check that nothing in the served
+stack compresses a response before it reaches this middleware. Responses events are
+renumbered (``sequence_number``) whenever the restorer changes the event count.
+"""
+
+from __future__ import annotations
+
+import codecs
+import json
+import logging
+import re
+import weakref
+from collections.abc import Awaitable, Callable, MutableMapping
+from typing import Any
+
+from corp_llm_gateway.metrics import MetricsExporter, get_exporter
+from corp_llm_gateway.route_gate.inflight import RequestTicket, current_ticket
+from corp_llm_gateway.route_gate.terminal_audit import (
+    AuditFacts,
+    Outcome,
+    TerminalAudit,
+    deposit_usage,
+)
+from corp_llm_gateway.sanitizer.strategies import StrategyResult
+from corp_llm_gateway.sanitizer.streaming import (
+    ResponsesStreamDesanitizer,
+    SseStreamDesanitizer,
+    is_stream_error_event,
+)
+
+logger = logging.getLogger(__name__)
+
+Scope = MutableMapping[str, Any]
+Message = MutableMapping[str, Any]
+Receive = Callable[[], Awaitable[Message]]
+Send = Callable[[Message], Awaitable[None]]
+ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
+RestoreJson = Callable[[Any, StrategyResult], Any]
+# (gateway request id, phase, exception type): never the exception itself, it can quote content.
+FailureReporter = Callable[[str, str, type[BaseException]], None]
+
+COMPONENT = "desanitize"
+E_INTERNAL = "E_INTERNAL"
+INTERNAL_ERROR_BODY = json.dumps(
+    {"error": {"type": "internal_error", "code": E_INTERNAL, "message": "internal error"}},
+    separators=(",", ":"),
+).encode()
+
+_SSE_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
+_SSE_BOUNDARY_BYTES = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+_COMPRESSORS = ("gzip", "brotli", "zstd", "deflate", "compress")
+# A pass-through JSON body past this is forwarded without reading its usage.
+_USAGE_BODY_CAP = 1024 * 1024
+# A pass-through SSE event not complete within this is forwarded unread from there on.
+_USAGE_EVENT_CAP = 8 * 1024 * 1024
+
+
+class ResponseMappings:
+    """Response-restoration mappings keyed by the gateway ticket."""
+
+    def __init__(self) -> None:
+        self._by_ticket: weakref.WeakKeyDictionary[RequestTicket, StrategyResult] = (
+            weakref.WeakKeyDictionary()
+        )
+        # Diagnostic only; the terminal audit record is what reports the failure.
+        self._failed: weakref.WeakSet[RequestTicket] = weakref.WeakSet()
+
+    def register(self, ticket: RequestTicket, mapping: StrategyResult) -> bool:
+        """Hold ``mapping`` until the ticket's final body, unwind or close; False, with a
+        content-free log line, for a ticket already cancelled or closed. Never raises."""
+        try:
+            refused = "cancelled" if ticket.cancelled else "closed" if ticket.closed else None
+            if refused is None and not ticket.on_close(self.release):
+                refused = "closed"
+            if refused is not None:
+                logger.warning(
+                    "gateway_desanitize_register_refused request_id=%s reason=%s",
+                    ticket.gateway_id,
+                    refused,
+                )
+                return False
+            self._by_ticket[ticket] = mapping
+            return True
+        except Exception as exc:
+            logger.error("gateway_desanitize_register_failed error=%s", type(exc).__name__)
+            return False
+
+    def get(self, ticket: RequestTicket) -> StrategyResult | None:
+        return self._by_ticket.get(ticket)
+
+    def release(self, ticket: RequestTicket) -> None:
+        self._by_ticket.pop(ticket, None)
+
+    def mark_failed(self, ticket: RequestTicket) -> None:
+        self._failed.add(ticket)
+
+    def failed(self, ticket: RequestTicket) -> bool:
+        return ticket in self._failed
+
+    def __contains__(self, ticket: object) -> bool:
+        return ticket in self._by_ticket
+
+    def __len__(self) -> int:
+        return len(self._by_ticket)
+
+
+def compressor_problems(app: Any) -> list[str]:
+    """Middleware on ``app`` (a Starlette/FastAPI app) that would compress a response
+    before this middleware sees it; the arm check for the Content-Encoding pass-through."""
+    found: list[str] = []
+    for entry in getattr(app, "user_middleware", None) or ():
+        cls = getattr(entry, "cls", entry)
+        name = getattr(cls, "__name__", type(cls).__name__)
+        if any(word in name.lower() for word in _COMPRESSORS):
+            found.append(name)
+    return found
+
+
+def _default_restore_json(payload: Any, mapping: StrategyResult) -> Any:
+    from corp_llm_gateway.litellm_hook import _apply_reverse_to_response
+
+    return _apply_reverse_to_response(payload, mapping)
+
+
+class DesanitizeMiddleware:
+    """Restores placeholders in 2xx JSON and SSE responses of a ticketed request."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        mappings: ResponseMappings,
+        *,
+        restore_json: RestoreJson | None = None,
+        metrics: MetricsExporter | None = None,
+        on_failure: FailureReporter | None = None,
+        terminal: TerminalAudit | None = None,
+    ) -> None:
+        self.app = app
+        self._mappings = mappings
+        self._restore_json = restore_json or _default_restore_json
+        self._metrics = metrics
+        self._on_failure = on_failure or self._report_failure
+        self._terminal = terminal
+
+    def _report_failure(self, request_id: str, phase: str, error_type: type[BaseException]) -> None:
+        logger.error(
+            "gateway_desanitize_failed request_id=%s phase=%s error=%s",
+            request_id,
+            phase,
+            error_type.__name__,
+        )
+        (self._metrics or get_exporter()).record_failure(COMPONENT)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        ticket = current_ticket() if scope.get("type") == "http" else None
+        if ticket is None:
+            await self.app(scope, receive, send)
+            return
+        response = _Response(
+            ticket, self._mappings, send, self._restore_json, self._on_failure, self._terminal
+        )
+        ticket.on_close(response.close)
+        if self._terminal is not None:
+            self._terminal.bind(ticket)
+        raised: Exception | None = None
+        try:
+            try:
+                await self.app(scope, receive, response.send)
+            except Exception as exc:
+                raised = exc
+            if raised is not None:
+                # Outside the handler: the tails' send must not chain the app's error.
+                await response.app_failed()
+                raise raised
+        finally:
+            response.close()
+
+
+class _Response:
+    def __init__(
+        self,
+        ticket: RequestTicket,
+        mappings: ResponseMappings,
+        send: Send,
+        restore_json: RestoreJson,
+        on_failure: FailureReporter,
+        terminal: TerminalAudit | None,
+    ) -> None:
+        self._ticket = ticket
+        self._mappings = mappings
+        self._send = send
+        self._restore_json = restore_json
+        self._on_failure = on_failure
+        self._terminal = terminal
+        self._mode = "unstarted"
+        self._status = 0
+        self._start: Message | None = None
+        self._mapping: StrategyResult | None = None
+        self._body = bytearray()
+        self._sse: _SseRestorer | None = None
+        self._usage = _Usage()
+        # Pass mode: what is read of a 2xx body for its usage, forwarded untouched.
+        self._tap: _UsageTap | None = None
+
+    def close(self, _ticket: RequestTicket | None = None) -> None:
+        """Drop everything restoration holds; later messages are not sent."""
+        self._mode = "closed"
+        self._mappings.release(self._ticket)
+        self._mapping = None
+        self._start = None
+        self._sse = None
+        self._tap = None
+        self._body.clear()
+
+    async def send(self, message: Message) -> None:
+        if self._mode == "closed":
+            return
+        kind = message.get("type")
+        if kind == "http.response.start":
+            await self._on_start(message)
+            return
+        if kind != "http.response.body" or self._mode == "unstarted":
+            await self._send(message)
+            return
+        more = bool(message.get("more_body", False))
+        if self._mode == "pass":
+            tap = self._tap
+            if tap is not None:
+                body = tap.feed(
+                    bytes(message.get("body") or b""), final=not more, usage=self._usage
+                )
+                if tap.drops:
+                    message = {**message, "body": body}
+            if more:
+                await self._send(message)
+                return
+            self.close()
+            await self._send(message)
+            await self._publish("ok" if 200 <= self._status < 300 else "failed")
+            return
+        chunk = bytes(message.get("body") or b"")
+        if self._mode == "unary":
+            self._body += chunk
+            if not more:
+                await self._finish_unary()
+            return
+        await self._on_sse(chunk, more)
+
+    async def app_failed(self) -> None:
+        """The app raised: restored tails of a stream still go out, then the record."""
+        sse = self._sse if self._mode == "sse" else None
+        self.close()
+        if sse is not None:
+            out = b""
+            failure: type[BaseException] | None = None
+            try:
+                sse.flush()
+            except Exception as exc:
+                failure = type(exc)
+            out = sse.take()
+            if failure is not None:
+                self._failed("after_start", failure)
+            if out:
+                try:
+                    await self._send({"type": "http.response.body", "body": out, "more_body": True})
+                except Exception as exc:
+                    logger.warning(
+                        "gateway_desanitize_tail_send_failed request_id=%s error=%s",
+                        self._ticket.gateway_id,
+                        type(exc).__name__,
+                    )
+        await self._publish("failed")
+
+    async def _on_start(self, message: Message) -> None:
+        mapping = self._mappings.get(self._ticket)
+        self._status = int(message.get("status") or 0)
+        content_type = _header(message, b"content-type").lower()
+        encoding = _header(message, b"content-encoding").strip().lower()
+        identity = encoding in ("", "identity")
+        drop_usage = _drops_usage_chunk(self._ticket)
+        if mapping is None or not mapping.pairs or not 200 <= self._status < 300 or not identity:
+            self._mode = "pass"
+            self._mappings.release(self._ticket)
+            if 200 <= self._status < 300 and identity:
+                self._tap = _UsageTap.for_content_type(content_type, drop_usage_chunk=drop_usage)
+            if self._tap is not None and self._tap.drops:
+                message = {**message, "headers": _without(message, b"content-length")}
+            await self._send(message)
+            return
+        self._mapping = mapping
+        if content_type.startswith("text/event-stream"):
+            failure: type[BaseException] | None = None
+            try:
+                self._sse = _SseRestorer(mapping)
+                self._sse.drop_usage_chunk = drop_usage
+                self._usage = self._sse.usage
+            except Exception as exc:
+                failure = type(exc)
+            # Answered outside the handler, as in _finish_unary.
+            if failure is not None:
+                self._failed("before_start", failure)
+                await self._internal_error()
+                return
+            self._mode = "sse"
+            await self._send({**message, "headers": _without(message, b"content-length")})
+            return
+        if "json" in content_type:
+            self._mode = "unary"
+            self._start = message
+            return
+        self._mode = "pass"
+        self._mappings.release(self._ticket)
+        await self._send(message)
+
+    async def _finish_unary(self) -> None:
+        start, mapping = self._start, self._mapping
+        assert start is not None and mapping is not None
+        body = b""
+        failure: type[BaseException] | None = None
+        try:
+            payload = json.loads(bytes(self._body))
+            self._usage.observe(payload)
+            restored = self._restore_json(payload, mapping)
+            body = json.dumps(restored, ensure_ascii=False, separators=(",", ":")).encode()
+        except Exception as exc:
+            failure = type(exc)
+        finally:
+            self.close()
+        # Sent outside the handler: a failing send must not carry the failure as __context__.
+        if failure is not None:
+            self._failed("before_start", failure)
+            await self._internal_error()
+            return
+        headers = [
+            *_without(start, b"content-length"),
+            (b"content-length", str(len(body)).encode()),
+        ]
+        await self._send({**start, "headers": headers})
+        await self._send({"type": "http.response.body", "body": body, "more_body": False})
+        await self._publish("ok")
+
+    async def _on_sse(self, chunk: bytes, more: bool) -> None:
+        sse = self._sse
+        if sse is None:
+            return
+        failure: type[BaseException] | None = None
+        try:
+            sse.feed(chunk)
+            if not more:
+                sse.flush()
+        except Exception as exc:
+            failure = type(exc)
+        # Whole events restored before a failure; the failing one is dropped.
+        out = sse.take()
+        if failure is not None:
+            self.close()
+            self._failed("after_start", failure)
+            if out:
+                await self._send({"type": "http.response.body", "body": out, "more_body": True})
+            await self._send({"type": "http.response.body", "body": b"", "more_body": False})
+            await self._publish("failed", E_INTERNAL)
+            return
+        if not more:
+            self.close()
+            await self._send({"type": "http.response.body", "body": out, "more_body": False})
+            await self._publish("failed" if sse.saw_error else "ok")
+            return
+        await self._send({"type": "http.response.body", "body": out, "more_body": True})
+
+    async def _internal_error(self) -> None:
+        self.close()
+        await self._send(
+            {
+                "type": "http.response.start",
+                "status": 500,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(INTERNAL_ERROR_BODY)).encode()),
+                ],
+            }
+        )
+        await self._send(
+            {"type": "http.response.body", "body": INTERNAL_ERROR_BODY, "more_body": False}
+        )
+        await self._publish("failed", E_INTERNAL)
+
+    async def _publish(self, outcome: Outcome, error_code: str | None = None) -> None:
+        if self._terminal is None:
+            return
+        counts = self._usage.counts(self._ticket)
+        if counts is not None:
+            deposit_usage(self._ticket, *counts)
+        await self._terminal.publish(self._ticket, outcome, error_code=error_code)
+
+    def _failed(self, phase: str, error_type: type[BaseException]) -> None:
+        self._mappings.mark_failed(self._ticket)
+        self._mappings.release(self._ticket)
+        if self._terminal is not None:
+            # Decided before anything is sent: a send that fails cannot change it.
+            self._terminal.decide(self._ticket, "failed", error_code=E_INTERNAL)
+        try:
+            self._on_failure(self._ticket.gateway_id, phase, error_type)
+        except Exception as exc:
+            logger.error(
+                "gateway_desanitize_report_failed request_id=%s error=%s",
+                self._ticket.gateway_id,
+                type(exc).__name__,
+            )
+
+
+class _SseRestorer:
+    """Complete SSE events in, restored events out; Responses events by their own adapter.
+
+    Held Responses text goes out before ``[DONE]`` and before an error event, never
+    after; the chat / Anthropic adapter does the same for its own buffers."""
+
+    def __init__(self, mapping: StrategyResult) -> None:
+        # Drop the usage chunk (and every all-empty chunk) of a chat stream.
+        self.drop_usage_chunk = False
+        self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+        self._buffer = ""
+        self._ready: list[str] = []
+        self._events = SseStreamDesanitizer(mapping)
+        self._responses = ResponsesStreamDesanitizer(mapping)
+        self._event_lines = False
+        # An error event or ``response.failed`` went out: the response did not succeed.
+        self.saw_error = False
+        self.usage = _Usage()
+
+    def feed(self, chunk: bytes) -> None:
+        """Restore every complete event; if one raises, those before it stay in ``take()``."""
+        self._buffer += self._utf8.decode(chunk, final=False)
+        while (match := _SSE_BOUNDARY.search(self._buffer)) is not None:
+            event, self._buffer = self._buffer[: match.end()], self._buffer[match.end() :]
+            self._ready.extend(self._event(event))
+
+    def flush(self) -> None:
+        self._buffer += self._utf8.decode(b"", final=True)
+        if self._buffer:
+            event, self._buffer = self._buffer, ""
+            self._ready.extend(self._event(event))
+        self._ready.extend(self._responses_tails())
+        self._ready.extend(_text(item) for item in self._events.flush())
+
+    def take(self) -> bytes:
+        out, self._ready = "".join(self._ready), []
+        return out.encode()
+
+    def _event(self, event: str) -> list[str]:
+        data = _data_field(event)
+        payload = _json_or_none(data)
+        self.usage.observe(payload)
+        if self.drop_usage_chunk and _injected_usage_artifact(payload):
+            return []
+        head: list[str] = []
+        if data == "[DONE]" or is_stream_error_event(payload):
+            self.saw_error = self.saw_error or data != "[DONE]"
+            head = self._responses_tails()
+        event_type = str(payload.get("type") or "") if isinstance(payload, dict) else ""
+        if event_type.startswith("response."):
+            with_event_line = any(line.startswith("event:") for line in event.splitlines())
+            self._event_lines = self._event_lines or with_event_line
+            self.saw_error = self.saw_error or event_type == "response.failed"
+            return head + [
+                _frame(item if isinstance(item, dict) else json.loads(item), with_event_line)
+                for item in self._responses.feed(payload)
+            ]
+        return head + [_text(item) for item in self._events.feed(event)]
+
+    def _responses_tails(self) -> list[str]:
+        return [_frame(json.loads(item), self._event_lines) for item in self._responses.flush()]
+
+
+class _Usage:
+    """Token counts seen in a response; each observation replaces what it names."""
+
+    def __init__(self) -> None:
+        self.prompt: int | None = None
+        self.completion: int | None = None
+
+    def observe(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        for holder in (payload, payload.get("message"), payload.get("response")):
+            usage = holder.get("usage") if isinstance(holder, dict) else None
+            if isinstance(usage, dict):
+                self._take(usage)
+
+    def counts(self, ticket: RequestTicket) -> tuple[int, int] | None:
+        """What to deposit; a side the response never named keeps the facts' value."""
+        if self.prompt is None and self.completion is None:
+            return None
+        facts = ticket.audit_facts
+        prompt = self.prompt if self.prompt is not None else getattr(facts, "prompt_tokens", 0)
+        completion = (
+            self.completion
+            if self.completion is not None
+            else getattr(facts, "completion_tokens", 0)
+        )
+        return prompt, completion
+
+    def _take(self, usage: dict[str, Any]) -> None:
+        prompt = _count(usage, "prompt_tokens", "input_tokens")
+        completion = _count(usage, "completion_tokens", "output_tokens")
+        if prompt is not None:
+            self.prompt = prompt
+        if completion is not None:
+            self.completion = completion
+
+
+def _count(usage: dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        value = usage.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+class _UsageTap:
+    """Reads the usage of a 2xx body it does not restore. The bytes go out untouched,
+    except the usage chunk of a chat stream whose client did not ask for it (``drops``)."""
+
+    def __init__(self, sse: bool, *, drop_usage_chunk: bool = False) -> None:
+        self._sse = sse
+        self.drops = sse and drop_usage_chunk
+        self._buffer = bytearray()
+        self._over = False
+
+    @classmethod
+    def for_content_type(
+        cls, content_type: str, *, drop_usage_chunk: bool = False
+    ) -> _UsageTap | None:
+        if content_type.startswith("text/event-stream"):
+            return cls(sse=True, drop_usage_chunk=drop_usage_chunk)
+        if "json" in content_type:
+            return cls(sse=False)
+        return None
+
+    def feed(self, chunk: bytes, *, final: bool, usage: _Usage) -> bytes:
+        """What goes out for ``chunk``: the chunk itself, or, when ``drops``, the complete
+        events it ends, minus the usage chunk and any other all-empty chat chunk."""
+        if self._sse:
+            return self._feed_sse(chunk, final, usage)
+        try:
+            self._feed_json(chunk, final, usage)
+        except Exception as exc:
+            # Counts only: a response it cannot read keeps the counts it has.
+            logger.warning("gateway_desanitize_usage_unread error=%s", type(exc).__name__)
+            self._over = True
+            self._buffer.clear()
+        return chunk
+
+    def _feed_json(self, chunk: bytes, final: bool, usage: _Usage) -> None:
+        if self._over:
+            return
+        if len(self._buffer) + len(chunk) > _USAGE_BODY_CAP:
+            self._over = True
+            self._buffer.clear()
+            return
+        self._buffer += chunk
+        if final:
+            usage.observe(_json_or_none(bytes(self._buffer).decode("utf-8", "replace")))
+            self._buffer.clear()
+
+    def _feed_sse(self, chunk: bytes, final: bool, usage: _Usage) -> bytes:
+        if self._over:
+            return chunk
+        self._buffer += chunk
+        out = bytearray()
+        while (match := _SSE_BOUNDARY_BYTES.search(self._buffer)) is not None:
+            event = bytes(self._buffer[: match.end()])
+            del self._buffer[: match.end()]
+            if not self._read(event, usage):
+                out += event
+        if final and self._buffer:
+            if not self._read(bytes(self._buffer), usage):
+                out += self._buffer
+            self._buffer.clear()
+        if len(self._buffer) > _USAGE_EVENT_CAP:
+            self._over = True
+            out += self._buffer
+            self._buffer.clear()
+        return bytes(out) if self.drops else chunk
+
+    def _read(self, event: bytes, usage: _Usage) -> bool:
+        """Observe one event's usage; True to drop it."""
+        if not self.drops and b'"usage"' not in event:
+            return False
+        try:
+            payload = _json_or_none(_data_field(event.decode("utf-8", "replace")))
+            usage.observe(payload)
+            return self.drops and _injected_usage_artifact(payload)
+        except Exception as exc:
+            logger.warning("gateway_desanitize_usage_unread error=%s", type(exc).__name__)
+            return False
+
+
+def _drops_usage_chunk(ticket: RequestTicket) -> bool:
+    facts = ticket.audit_facts
+    return isinstance(facts, AuditFacts) and not facts.client_asked_usage
+
+
+def _injected_usage_artifact(payload: Any) -> bool:
+    """What litellm strips from a chat stream it asked for usage on the client's behalf
+    (``proxy_server._is_injected_stream_usage_artifact``): a chunk whose every choice is
+    empty, the usage chunk among them."""
+    if not isinstance(payload, dict) or payload.get("provider_specific_fields") is not None:
+        return False
+    choices = payload.get("choices")
+    return isinstance(choices, list) and all(_empty_choice(choice) for choice in choices)
+
+
+def _empty_choice(choice: Any) -> bool:
+    if not isinstance(choice, dict):
+        return False
+    if choice.get("finish_reason") is not None or choice.get("logprobs") is not None:
+        return False
+    delta = choice.get("delta")
+    return delta is None or (
+        isinstance(delta, dict) and all(value is None for value in delta.values())
+    )
+
+
+def _data_field(event: str) -> str | None:
+    data = [line[5:].lstrip() for line in event.splitlines() if line.startswith("data:")]
+    return "\n".join(data) if data else None
+
+
+def _json_or_none(data: str | None) -> Any:
+    if data is None:
+        return None
+    try:
+        return json.loads(data)
+    except ValueError:
+        return None
+
+
+def _frame(payload: dict[str, Any], with_event_line: bool) -> str:
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    prefix = f"event: {payload.get('type')}\n" if with_event_line else ""
+    return f"{prefix}data: {data}\n\n"
+
+
+def _text(item: bytes | str) -> str:
+    return item.decode("utf-8", "replace") if isinstance(item, bytes) else item
+
+
+def _header(message: Message, name: bytes) -> str:
+    for key, value in message.get("headers") or ():
+        if bytes(key).lower() == name:
+            return bytes(value).decode("latin-1")
+    return ""
+
+
+def _without(message: Message, name: bytes) -> list[tuple[bytes, bytes]]:
+    return [
+        (bytes(key), bytes(value))
+        for key, value in message.get("headers") or ()
+        if bytes(key).lower() != name
+    ]

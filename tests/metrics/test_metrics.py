@@ -13,6 +13,7 @@ import importlib.util
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -405,6 +406,33 @@ def test_the_route_gate_reasons_match_the_gate_itself() -> None:
     assert set(BLOCK_REASONS["route_gate"]) == set(GATE_REASONS)
 
 
+# Refuse before litellm runs: no pre-call, so no litellm guardrail status.
+BEFORE_LITELLM_SITES = ("route_gate", "capacity")
+
+
+def test_the_block_sites_are_pinned() -> None:
+    # A new site is a new family of alert labels, and a pre-call one also needs a
+    # litellm guardrail status: add it here only with its row in the status table.
+    assert set(BLOCK_REASONS) == {"stage0", "stage5", "policy", "route_gate", "capacity"}
+
+
+def test_every_pre_call_block_reason_has_a_litellm_guardrail_status() -> None:
+    # Read off BLOCK_REASONS by exclusion, not by the site names the table itself
+    # lists: a reason the table misses would otherwise surface only at runtime, as
+    # an unwritten guardrail_information entry (UnknownBlockReasonError).
+    from corp_llm_gateway.litellm_hook import GUARDRAIL_STATUS_BY_BLOCK_REASON
+
+    pre_call = [
+        reason
+        for site, reasons in BLOCK_REASONS.items()
+        if site not in BEFORE_LITELLM_SITES
+        for reason in reasons
+    ]
+
+    assert pre_call
+    assert [r for r in pre_call if r not in GUARDRAIL_STATUS_BY_BLOCK_REASON] == []
+
+
 def _returned_string_literals(module: object) -> set[str]:
     """Every `return "literal"` in a module — the reason codes it can produce.
 
@@ -473,13 +501,21 @@ def test_every_recorded_block_reason_literal_is_enumerated() -> None:
 
 
 def test_the_failure_components_match_the_hooks_own_map() -> None:
-    from corp_llm_gateway.litellm_hook import _FAILURE_COMPONENT, TEAM_CONFIG_COMPONENT
+    from corp_llm_gateway.litellm_hook import (
+        _FAILURE_COMPONENT,
+        AUDIT_COMPONENT,
+        TEAM_CONFIG_COMPONENT,
+    )
+    from corp_llm_gateway.route_gate import desanitize_middleware, terminal_audit
     from corp_llm_gateway.route_gate.middleware import COMPONENT
 
     assert set(FAILURE_COMPONENTS) == set(_FAILURE_COMPONENT.values()) | {
         "other",
         COMPONENT,
         TEAM_CONFIG_COMPONENT,
+        AUDIT_COMPONENT,
+        desanitize_middleware.COMPONENT,
+        terminal_audit.COMPONENT,
     }
 
 
@@ -645,7 +681,7 @@ async def test_the_capacity_refusal_is_counted_on_the_real_series() -> None:
         "method": "POST",
         "path": "/v1/messages",
         "raw_path": b"/v1/messages",
-        "headers": [],
+        "headers": [(b"content-type", b"application/json")],
     }
 
     async def receive() -> dict:
@@ -664,3 +700,57 @@ async def test_the_capacity_refusal_is_counted_on_the_real_series() -> None:
     assert 'corp_llm_gateway_blocked_requests_total{block_reason="capacity"} 1.0' in held_text
     assert "gateway_inflight_requests 1.0" in held_text
     assert "gateway_inflight_requests 0.0" in exporter.render().decode()
+
+
+async def test_a_restoration_failure_counts_on_the_shared_exporter_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No exporter and no reporter injected: the response restorer reports through the
+    process-wide ``get_exporter()`` and the real ``record_failure``."""
+    pytest.importorskip("prometheus_client")
+    from corp_llm_gateway.route_gate.desanitize_middleware import (
+        DesanitizeMiddleware,
+        ResponseMappings,
+    )
+    from corp_llm_gateway.route_gate.inflight import _TICKET, RequestTicket
+    from corp_llm_gateway.sanitizer.strategies import StrategyResult
+
+    monkeypatch.setenv("CORP_METRICS_EXPORTER", "prometheus")
+    monkeypatch.setattr(metrics_module, "_shared", None)
+
+    def broken(payload: object, mapping: StrategyResult) -> object:
+        raise ValueError("restore failed")
+
+    async def app(scope: object, receive: object, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"{}", "more_body": False})
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    mappings = ResponseMappings()
+    ticket = RequestTicket("e" * 32)
+    mappings.register(ticket, StrategyResult(pairs=(("a@b.c", "[EMAIL_1]"),)))
+    token = _TICKET.set(ticket)
+    try:
+        await DesanitizeMiddleware(app, mappings, restore_json=broken)(
+            {"type": "http"}, receive, send
+        )
+    finally:
+        _TICKET.reset(token)
+
+    exporter = get_exporter()
+    assert isinstance(exporter, PrometheusExporter)
+    assert 'gateway_failure{component="desanitize"} 1.0' in exporter.render().decode()
+    assert sent[0]["status"] == 500

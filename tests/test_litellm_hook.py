@@ -16,6 +16,7 @@ from corp_llm_gateway.detectors import DualNerDetector, RegexChecksumDetector
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
 from corp_llm_gateway.metrics import MetricsExporter
+from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
 from corp_llm_gateway.rules import Gazetteer, Rule, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.placeholder import StaleSpanError
@@ -27,6 +28,7 @@ from corp_llm_gateway.tokens import (
     TokenInfo,
     TokenStore,
 )
+from tests.response_restore import respond_unary, restore_stream, restore_unary
 from tests.sanitizer.test_streaming import (
     _MSG_DELTA,
     _MSG_START,
@@ -410,10 +412,18 @@ class _RaisingSink(Sink):
         raise RuntimeError("sink transport down")
 
 
-async def test_post_call_unary_unexpected_error_returns_opaque_500() -> None:
-    """Major: post_call_unary runs AFTER placeholders are replaced by
-    originals, so an unexpected exception there is the one place raw content
-    could plausibly leak. It must get the same F8 safety net as pre_call."""
+def _terminal() -> tuple[TerminalAudit, ListSink]:
+    records = ListSink()
+    return TerminalAudit(emit_to(AuditLogger(records, gateway_version="0.0.1"))), records
+
+
+async def test_post_call_unary_unexpected_error_returns_opaque_500(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Major: restoring a response runs AFTER placeholders are replaced by originals, so
+    an unexpected exception there is the one place raw content could plausibly leak. The
+    reversal (the ASGI desanitiser) answers a content-free 500 ``E_INTERNAL`` and writes
+    one ``failed`` record with that code."""
     g, sink = _build_guardrail([("alice", "[N1]")])
     data = _data_with_token("tok-1", content="hi alice")
     await g.pre_call(data)
@@ -423,19 +433,20 @@ async def test_post_call_unary_unexpected_error_returns_opaque_500() -> None:
 
     import corp_llm_gateway.litellm_hook as hook_mod
 
-    original = hook_mod._apply_reverse_to_response
-    hook_mod._apply_reverse_to_response = _boom  # type: ignore[assignment]
-    try:
-        with pytest.raises(GuardrailHttpException) as ei:
-            await g.post_call_unary(data, {"choices": [{"message": {"content": "hello [N1]!"}}]})
-    finally:
-        hook_mod._apply_reverse_to_response = original
+    monkeypatch.setattr(hook_mod, "_apply_reverse_to_response", _boom)
+    terminal, records = _terminal()
+    caplog.clear()  # the pre-call's own lines name the user, who is also "alice"
+    with caplog.at_level(logging.DEBUG):
+        status, body = await respond_unary(
+            g, data, {"choices": [{"message": {"content": "hello [N1]!"}}]}, terminal=terminal
+        )
 
-    assert ei.value.status_code == 500
-    assert ei.value.error_code == "E_INTERNAL"
-    assert "alice" not in str(ei.value)
-    assert len(sink.records) == 1
-    assert sink.records[0]["error_code"] == "E_INTERNAL"
+    assert status == 500
+    assert body["error"]["code"] == "E_INTERNAL"
+    assert "alice" not in json.dumps(body) and "alice" not in caplog.text
+    assert sink.records == []
+    (record,) = records.records
+    assert (record["status"], record["error_code"]) == ("failed", "E_INTERNAL")
 
 
 async def test_post_call_stream_upstream_error_propagates_unconverted() -> None:
@@ -453,17 +464,23 @@ async def test_post_call_stream_upstream_error_propagates_unconverted() -> None:
 
     chunks = []
     with pytest.raises(httpx.RemoteProtocolError):
-        async for chunk in g.post_call_stream(data, _raising_iter()):
+        async for chunk in restore_stream(g, data, _raising_iter()):
             chunks.append(chunk)
 
     # No fabricated E_INTERNAL for a real provider failure — litellm owns it.
     assert sink.records == []
 
 
-async def test_post_call_stream_own_bug_mid_stream_returns_opaque_500() -> None:
-    """Major: a bug in OUR OWN desanitization work mid-stream (as opposed to
-    an upstream transport failure) must still be caught and mapped to an
-    opaque 500 — this runs after placeholders were replaced by originals."""
+async def test_post_call_stream_own_bug_mid_stream_returns_opaque_500(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Major: a bug in OUR OWN desanitization work mid-stream (as opposed to an upstream
+    transport failure) is caught at the reversal and never reaches the client or a log
+    with content — this runs after placeholders were replaced by originals. The status
+    already went out, so the stream is closed and the record is ``failed`` +
+    ``E_INTERNAL``."""
+    from corp_llm_gateway.route_gate import desanitize_middleware
+
     g, sink = _build_guardrail([("alice", "[N1]")])
     data = _data_with_token("tok-1", content="hi alice")
     await g.pre_call(data)
@@ -472,25 +489,20 @@ async def test_post_call_stream_own_bug_mid_stream_returns_opaque_500() -> None:
         yield {"choices": [{"delta": {"content": "hello [N1]"}}]}
         yield {"choices": [{"delta": {"content": " again [N1]"}}]}
 
-    import corp_llm_gateway.litellm_hook as hook_mod
-
-    def _boom(chunk: Any) -> str | None:
+    def _boom(self: Any, event: Any) -> Any:
         raise RuntimeError("desanitize bug for alice")
 
-    original = hook_mod._extract_chunk_text
-    hook_mod._extract_chunk_text = _boom  # type: ignore[assignment]
-    try:
-        with pytest.raises(GuardrailHttpException) as ei:
-            async for _chunk in g.post_call_stream(data, _good_iter()):
-                pass
-    finally:
-        hook_mod._extract_chunk_text = original
+    monkeypatch.setattr(desanitize_middleware.SseStreamDesanitizer, "feed", _boom)
+    terminal, records = _terminal()
+    caplog.clear()  # the pre-call's own lines name the user, who is also "alice"
+    with caplog.at_level(logging.DEBUG):
+        out = [chunk async for chunk in restore_stream(g, data, _good_iter(), terminal=terminal)]
 
-    assert ei.value.status_code == 500
-    assert ei.value.error_code == "E_INTERNAL"
-    assert "alice" not in str(ei.value)
-    assert len(sink.records) == 1
-    assert sink.records[0]["error_code"] == "E_INTERNAL"
+    assert "alice" not in json.dumps(out) and "alice" not in caplog.text
+    assert "gateway_desanitize_failed" in caplog.text
+    assert sink.records == []
+    (record,) = records.records
+    assert (record["status"], record["error_code"]) == ("failed", "E_INTERNAL")
 
 
 async def test_reentrant_audit_failure_does_not_double_count_component_failure() -> None:
@@ -786,7 +798,7 @@ async def test_pre_call_responses_custom_tool_call_input_replay_does_not_leak() 
             }
         ]
     }
-    restored = await g.post_call_unary(turn1_data, turn1_response)
+    restored = await restore_unary(g, turn1_data, turn1_response)
     assert restored["output"][0]["input"] == f"*** Add File: config.py\n+API_KEY = {original}"
 
     turn2_data = {
@@ -825,7 +837,7 @@ async def test_pre_call_responses_reasoning_summary_replay_does_not_leak() -> No
             }
         ]
     }
-    restored = await g.post_call_unary(turn1_data, turn1_response)
+    restored = await restore_unary(g, turn1_data, turn1_response)
     assert restored["output"][0]["summary"][0]["text"] == f"Working on {original} rollout"
 
     turn2_data = {
@@ -1583,7 +1595,7 @@ async def test_pre_call_cross_segment_email_collision_split_and_restored() -> No
     # The reverse path restores EACH token to its own original.
     chunks_in = [{"choices": [{"delta": {"content": f"msg={msg_ph} sys={sys_ph}"}}]}]
     out_text = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
     assert out_text == "msg=b@corp.example sys=a@corp.example"
 
@@ -1721,7 +1733,7 @@ async def test_post_call_stream_unmapped_placeholder_passes_through() -> None:
         {"choices": [{"delta": {"content": "known [EMAIL_001] hallucinated [EMAIL_999]"}}]}
     ]
     out_text = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
     assert out_text == "known a@x hallucinated [EMAIL_999]"
 
@@ -1958,7 +1970,7 @@ async def test_post_call_stream_desanitizes_chunks() -> None:
         {"choices": [{"delta": {"content": "1] world"}}]},
     ]
     out_text = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         text = chunk["choices"][0]["delta"]["content"]
         out_text += text
     assert out_text == "hello alice world"
@@ -1970,7 +1982,7 @@ async def test_post_call_stream_no_mapping_passes_through() -> None:
     await g.pre_call(data)
     chunks_in = [{"choices": [{"delta": {"content": "boring text"}}]}]
     out = []
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out.append(chunk)
     assert out == chunks_in
 
@@ -1980,7 +1992,7 @@ async def test_post_call_stream_unknown_request_passes_through() -> None:
     data = {"model": "claude", "_corp_gateway_request_id": "never-seen"}
     chunks_in = [{"choices": [{"delta": {"content": "x"}}]}]
     out = []
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out.append(chunk)
     assert out == chunks_in
 
@@ -1996,7 +2008,7 @@ async def test_post_call_stream_openai_dict_gpt4o_contract() -> None:
         {"choices": [{"delta": {"content": "1] world"}}]},
     ]
     out_text = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
     assert out_text == "hello alice world"
 
@@ -2041,22 +2053,21 @@ async def test_post_call_stream_responses_events_restore_split_placeholder() -> 
     ]
 
     out: list[Any] = []
-    async for chunk in g.post_call_stream(data, _async_iter(events)):
+    async for chunk in restore_stream(g, data, _async_iter(events)):
         out.append(chunk)
 
     deltas: list[str] = []
     done_text = ""
     for chunk in out:
-        payload = json.loads(chunk) if isinstance(chunk, str) else chunk.model_dump()
+        # The client reads each typed event as the JSON litellm put on the wire.
+        payload = chunk
         if payload["type"] == "response.output_text.delta":
             deltas.append(payload["delta"])
         elif payload["type"] == "response.output_text.done":
             done_text = payload["text"]
     assert "".join(deltas) == "Result KdirService"
     assert done_text == "Result KdirService"
-    assert "[ORG_001]" not in json.dumps(
-        [json.loads(item) if isinstance(item, str) else item.model_dump() for item in out]
-    )
+    assert "[ORG_001]" not in json.dumps(out)
 
 
 async def test_post_call_stream_responses_restores_bracket_stripped_identifier() -> None:
@@ -2116,7 +2127,7 @@ async def test_post_call_stream_responses_restores_bracket_stripped_identifier()
     ]
 
     out: list[Any] = []
-    async for chunk in g.post_call_stream(data, _async_iter(events)):
+    async for chunk in restore_stream(g, data, _async_iter(events)):
         out.append(json.loads(chunk) if isinstance(chunk, str) else chunk)
 
     text_deltas = "".join(
@@ -2173,7 +2184,7 @@ async def test_post_call_stream_custom_tool_input_delta_and_done_agree_on_specia
     ]
 
     out: list[Any] = []
-    async for chunk in g.post_call_stream(data, _async_iter(events)):
+    async for chunk in restore_stream(g, data, _async_iter(events)):
         out.append(json.loads(chunk) if isinstance(chunk, str) else chunk)
 
     tool_deltas = "".join(
@@ -2211,7 +2222,7 @@ async def test_post_call_unary_restores_bracket_stripped_identifier() -> None:
         ]
     }
 
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["output"][0]["content"][0]["text"] == f"Created {original}"
     assert out["output"][1]["input"] == f"*** Add File: {original}.cs"
@@ -2227,7 +2238,8 @@ async def test_post_call_does_not_restore_user_supplied_bare_placeholder() -> No
     }
     await g.pre_call(data)
 
-    out = await g.post_call_unary(
+    out = await restore_unary(
+        g,
         data,
         {"output": [{"type": "message", "content": [{"text": "LOCATION_007"}]}]},
     )
@@ -2252,7 +2264,7 @@ async def test_post_call_unary_bare_alias_does_not_corrupt_containing_identifier
     text = "const MY_PROJECT_001 = 1; // see PROJECT_001"
     response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
 
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert (
         out["output"][0]["content"][0]["text"] == "const MY_PROJECT_001 = 1; // see Zephyr Ledger"
@@ -2271,7 +2283,7 @@ async def test_post_call_unary_bare_alias_relocation_repro() -> None:
     text = "RELOCATION_0071 and PICKUP_LOCATION_007X"
     response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
 
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["output"][0]["content"][0]["text"] == text
 
@@ -2290,7 +2302,8 @@ async def test_post_call_unary_bracket_stripped_identifier_not_restored_when_cod
     }
     await g.pre_call(data)
 
-    out = await g.post_call_unary(
+    out = await restore_unary(
+        g,
         data,
         {"output": [{"type": "message", "content": [{"text": "LOCATION_007"}]}]},
     )
@@ -2387,7 +2400,7 @@ async def test_post_call_stream_responses_bare_alias_does_not_corrupt_containing
     ]
 
     out: list[Any] = []
-    async for chunk in g.post_call_stream(data, _async_iter(events)):
+    async for chunk in restore_stream(g, data, _async_iter(events)):
         out.append(json.loads(chunk) if isinstance(chunk, str) else chunk)
 
     text_deltas = "".join(
@@ -2419,7 +2432,7 @@ async def test_post_call_stream_anthropic_sse_bare_alias_does_not_corrupt_identi
     ]
 
     out_chunks: list[bytes] = []
-    async for chunk in g.post_call_stream(data, _async_iter(sse_events)):
+    async for chunk in restore_stream(g, data, _async_iter(sse_events)):
         out_chunks.append(chunk)
 
     text_parts: list[str] = []
@@ -2437,6 +2450,67 @@ async def test_post_call_stream_anthropic_sse_bare_alias_does_not_corrupt_identi
 
     full_text = "".join(text_parts)
     assert full_text == "const MY_LOCATION_007 = 1;"
+
+
+_ANTHROPIC_ERROR = (
+    b"event: error\n"
+    b'data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}\n\n'
+)
+
+
+async def _anthropic_stream_through_the_callback(sse_events: list[bytes]) -> list[bytes]:
+    g, _ = _build_guardrail([("user@example.com", "[EMAIL_001]")])
+    data = _data_with_token("tok-1", content="email is user@example.com")
+    await g.pre_call(data)
+    out: list[bytes] = []
+    async for chunk in restore_stream(g, data, _async_iter(sse_events)):
+        assert isinstance(chunk, bytes)
+        out.append(chunk)
+    return out
+
+
+def _sse_events(out: list[bytes]) -> list[bytes]:
+    wire = b"".join(out)
+    return [event + b"\n\n" for event in wire.split(b"\n\n") if event]
+
+
+def _text_deltas(events: list[bytes]) -> str:
+    text = ""
+    for event in events:
+        for line in event.decode().splitlines():
+            if not line.startswith("data:"):
+                continue
+            obj = json.loads(line[5:].lstrip())
+            if obj.get("type") == "content_block_delta" and obj["delta"]["type"] == "text_delta":
+                text += obj["delta"]["text"]
+    return text
+
+
+async def test_post_call_stream_anthropic_error_event_follows_the_restored_held_tail() -> None:
+    """Live callback path: a mid-stream ``event: error`` ends the stream for the client, so
+    the held tail goes out restored BEFORE it, the error bytes are unchanged, and nothing
+    is sent after it."""
+    out = await _anthropic_stream_through_the_callback(
+        [_MSG_START, _cb_start(0), _delta("to [EMAIL_001]"), _ANTHROPIC_ERROR]
+    )
+
+    events = _sse_events(out)
+    assert events[-1] == _ANTHROPIC_ERROR
+    assert _ANTHROPIC_ERROR not in b"".join(events[:-1])
+    assert _text_deltas(events[:-1]) == "to user@example.com"
+    assert b"[EMAIL_001]" not in b"".join(out)
+
+
+async def test_post_call_stream_anthropic_truncated_stream_still_sends_the_held_tail() -> None:
+    """No ``content_block_stop`` / ``message_stop``: the held tail goes out at the end."""
+    out = await _anthropic_stream_through_the_callback(
+        [_MSG_START, _cb_start(0), _delta("to [EMAIL_001]")]
+    )
+
+    events = _sse_events(out)
+    assert _text_deltas(events) == "to user@example.com"
+    assert _text_deltas(events[-1:]) != ""
+    assert b"[EMAIL_001]" not in b"".join(out)
 
 
 async def test_post_call_stream_anthropic_sse_bytes_placeholder_restored() -> None:
@@ -2462,7 +2536,7 @@ async def test_post_call_stream_anthropic_sse_bytes_placeholder_restored() -> No
     ]
 
     out_chunks: list[bytes] = []
-    async for chunk in g.post_call_stream(data, _async_iter(sse_events)):
+    async for chunk in restore_stream(g, data, _async_iter(sse_events)):
         assert isinstance(chunk, bytes), f"expected bytes, got {type(chunk)}"
         out_chunks.append(chunk)
 
@@ -2507,7 +2581,7 @@ async def test_post_call_unary_reverses_placeholder() -> None:
     await g.pre_call(data)
 
     response = {"choices": [{"message": {"role": "assistant", "content": "hello [N1]!"}}]}
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
     assert out["choices"][0]["message"]["content"] == "hello alice!"
 
 
@@ -2535,7 +2609,7 @@ async def test_post_call_unary_reverses_responses_output_and_preserves_encrypted
         ],
     }
 
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["output"][0]["content"][0]["text"] == "Created KdirService"
     assert json.loads(out["output"][1]["arguments"])["path"] == "KdirService.cs"
@@ -2545,11 +2619,23 @@ async def test_post_call_unary_reverses_responses_output_and_preserves_encrypted
 async def test_post_call_unary_no_state_returns_unchanged() -> None:
     g, _ = _build_guardrail()
     response = {"choices": [{"message": {"content": "no map"}}]}
-    out = await g.post_call_unary({"_corp_gateway_request_id": "missing"}, response)
+    out = await restore_unary(g, {"_corp_gateway_request_id": "missing"}, response)
     assert out == response
 
 
 # ---- Task 12: _apply_reverse_to_response model_dump/validate/copy broadening
+
+
+def _restore_object(g: CorpLlmGuardrail, data: dict[str, Any], response: Any) -> Any:
+    """``_apply_reverse_to_response`` on an in-process response object, with the mapping
+    the pre-call hands a ticketed request. The ASGI desanitiser only ever passes it the
+    JSON a response became on the wire; these object shapes pin the function itself."""
+    from corp_llm_gateway.litellm_hook import _apply_reverse_to_response, _response_mapping
+
+    state = g._req_state[CorpLlmGuardrail._ensure_request_id(data)]
+    return _apply_reverse_to_response(
+        response, _response_mapping(state, include_bare_aliases=g._forward_chatgpt_auth)
+    )
 
 
 class _FakeChatModelResponse:
@@ -2600,7 +2686,7 @@ async def test_post_call_unary_non_model_response_passes_through_unchanged_like_
     await g.pre_call(data)
 
     response = 12345
-    out = await g.post_call_unary(data, response)
+    out = _restore_object(g, data, response)
     assert out is response
 
 
@@ -2618,7 +2704,7 @@ async def test_post_call_unary_reverses_chat_completions_model_response_object()
     response = _FakeChatModelResponse(
         [{"message": {"role": "assistant", "content": "hello [N1]!"}}]
     )
-    out = await g.post_call_unary(data, response)
+    out = _restore_object(g, data, response)
 
     assert isinstance(out, _FakeChatModelResponse)
     assert out.choices[0]["message"]["content"] == "hello alice!"
@@ -2651,7 +2737,7 @@ async def test_post_call_unary_real_litellm_model_response_preserves_hidden_para
     )
     response._hidden_params = {"x-litellm-key": "team-a-key-hash"}
 
-    out = await g.post_call_unary(data, response)
+    out = _restore_object(g, data, response)
 
     assert isinstance(out, litellm.ModelResponse)
     assert out.choices[0].message.content == "hello alice!"
@@ -2693,7 +2779,7 @@ async def test_post_call_unary_hidden_params_restore_failure_keeps_desanitized_r
     )
     response._hidden_params = {"x-litellm-key": "abc"}
 
-    out = await g.post_call_unary(data, response)
+    out = _restore_object(g, data, response)
 
     assert isinstance(out, _RestoredWithReadOnlyHiddenParams)
     assert out.choices[0]["message"]["content"] == "hello alice!"
@@ -2718,7 +2804,7 @@ async def test_post_call_unary_hidden_params_restore_failure_logs_warning(
     response._hidden_params = {"x-litellm-key": "abc"}
 
     with caplog.at_level(logging.WARNING):
-        out = await g.post_call_unary(data, response)
+        out = _restore_object(g, data, response)
 
     assert isinstance(out, _RestoredWithReadOnlyHiddenParams)
     assert out.choices[0]["message"]["content"] == "hello alice!"
@@ -2741,7 +2827,7 @@ async def test_post_call_unary_response_reconstruct_failure_does_not_bypass_vali
     )
 
     with caplog.at_level(logging.WARNING):
-        out = await g.post_call_unary(data, response)
+        out = _restore_object(g, data, response)
 
     assert out is response
     assert "litellm_post_call_response_reconstruct_failed" in caplog.text
@@ -2765,7 +2851,7 @@ async def test_post_call_unary_reconstruct_failure_log_has_no_original(
     )
 
     with caplog.at_level(logging.WARNING):
-        out = await g.post_call_unary(data, response)
+        out = _restore_object(g, data, response)
 
     assert out is response
     assert "alice" not in caplog.text
@@ -2903,7 +2989,7 @@ async def test_post_call_unary_anthropic_native_block_response() -> None:
             {"type": "image_url", "image_url": {"url": "https://..."}},
         ],
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["content"][0]["type"] == "text"
     assert out["content"][0]["text"] == "hello alice!"
@@ -2929,7 +3015,7 @@ async def test_post_call_unary_choices_list_content() -> None:
             }
         ]
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["choices"][0]["message"]["content"][0]["type"] == "text"
     assert out["choices"][0]["message"]["content"][0]["text"] == "response alice text"
@@ -2944,7 +3030,7 @@ async def test_post_call_unary_choices_str_content_regression() -> None:
     await g.pre_call(data)
 
     response = {"choices": [{"message": {"content": "hello [N1]!"}}]}
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["choices"][0]["message"]["content"] == "hello alice!"
 
@@ -2974,7 +3060,7 @@ async def test_post_call_unary_gpt4o_multimodal_content_parts() -> None:
             }
         ]
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     # Text part reversed, image part untouched.
     assert out["choices"][0]["message"]["content"][0]["text"] == "Email is user@example.com"
@@ -3088,7 +3174,7 @@ async def test_post_call_unary_tool_calls_arguments_desanitized() -> None:
             }
         ]
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     new_args = json.loads(out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
     assert new_args == {"who": "alice"}
@@ -3103,7 +3189,7 @@ async def test_post_call_unary_legacy_function_call_desanitized() -> None:
     response = {
         "choices": [{"message": {"function_call": {"name": "f", "arguments": '{"who": "[N1]"}'}}}]
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     new_args = json.loads(out["choices"][0]["message"]["function_call"]["arguments"])
     assert new_args == {"who": "alice"}
@@ -3133,7 +3219,7 @@ async def test_post_call_stream_openai_tool_calls_arguments_desanitized() -> Non
         _tc_delta_chunk('1]"}'),
     ]
     args_out = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         for tc in chunk["choices"][0]["delta"].get("tool_calls") or []:
             args_out += tc["function"]["arguments"]
     assert json.loads(args_out) == {"who": "alice"}
@@ -3155,7 +3241,7 @@ async def test_post_call_stream_openai_tool_calls_sse_desanitized() -> None:
         b"data: [DONE]\n\n",
     ]
     args_out = ""
-    async for chunk in g.post_call_stream(data, _async_iter(sse_in)):
+    async for chunk in restore_stream(g, data, _async_iter(sse_in)):
         for line in chunk.decode().splitlines():
             if not line.startswith("data:"):
                 continue
@@ -3235,7 +3321,7 @@ async def test_post_call_unary_dict_arguments_desanitized() -> None:
             }
         ]
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     new_args = out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
     assert new_args == {"who": "alice"}
@@ -3288,7 +3374,7 @@ async def test_post_call_stream_mixed_content_and_tool_calls_dict() -> None:
     }
     ids: list[str] = []
     args_out = ""
-    async for out in g.post_call_stream(data, _async_iter([chunk])):
+    async for out in restore_stream(g, data, _async_iter([chunk])):
         for tc in out["choices"][0]["delta"].get("tool_calls") or []:
             if tc.get("id"):
                 ids.append(tc["id"])
@@ -3321,7 +3407,7 @@ async def test_post_call_stream_mixed_content_and_tool_calls_sse() -> None:
     ]
     ids: list[str] = []
     args_out = ""
-    async for chunk in g.post_call_stream(data, _async_iter(sse_in)):
+    async for chunk in restore_stream(g, data, _async_iter(sse_in)):
         for line in chunk.decode().splitlines():
             if not line.startswith("data:"):
                 continue
@@ -3349,7 +3435,7 @@ async def test_post_call_stream_legacy_function_call_desanitized_dict() -> None:
         {"choices": [{"delta": {"function_call": {"arguments": '1]"}'}}}]},
     ]
     args_out = ""
-    async for out in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for out in restore_stream(g, data, _async_iter(chunks_in)):
         fc = out["choices"][0]["delta"].get("function_call") or {}
         args_out += fc.get("arguments", "")
     assert json.loads(args_out) == {"who": "alice"}
@@ -3373,7 +3459,7 @@ async def test_post_call_stream_legacy_function_call_desanitized_sse() -> None:
         b"data: [DONE]\n\n",
     ]
     args_out = ""
-    async for chunk in g.post_call_stream(data, _async_iter(sse_in)):
+    async for chunk in restore_stream(g, data, _async_iter(sse_in)):
         for line in chunk.decode().splitlines():
             if not line.startswith("data:"):
                 continue
@@ -3386,8 +3472,37 @@ async def test_post_call_stream_legacy_function_call_desanitized_sse() -> None:
 
 
 async def test_post_call_stream_parallel_tool_calls_per_index_reassembly() -> None:
-    """A3 review: interleaved tool_calls (index 0 and 1), each with a split
-    placeholder, reassemble per index (state machine keyed by tool_calls[].index)."""
+    """A3 review: parallel tool_calls (index 0 and 1), each with a split placeholder,
+    reassemble per index. They arrive one call after the other, as OpenAI streams them;
+    fragments of two calls interleaved (off-spec) degrade to placeholders, never to a
+    wrong original (``test_interleaved_tool_call_fragments_degrade_to_placeholders_never_
+    originals``)."""
+    g, _ = _build_guardrail([("alice", "[N1]"), ("bob", "[N2]")])
+    data = _data_with_token("tok-1", content="hi alice and bob", model="gpt-4o")
+    await g.pre_call(data)
+
+    chunks_in = [
+        _tc_delta_chunk("", index=0, first=True),
+        _tc_delta_chunk('{"a": "[N', index=0),
+        _tc_delta_chunk('1]"}', index=0),
+        _tc_delta_chunk("", index=1, first=True),
+        _tc_delta_chunk('{"b": "[N', index=1),
+        _tc_delta_chunk('2]"}', index=1),
+    ]
+    by_index: dict[int, str] = {}
+    async for out in restore_stream(g, data, _async_iter(chunks_in)):
+        for tc in out["choices"][0]["delta"].get("tool_calls") or []:
+            by_index[tc["index"]] = by_index.get(tc["index"], "") + tc["function"]["arguments"]
+    assert json.loads(by_index[0]) == {"a": "alice"}
+    assert json.loads(by_index[1]) == {"b": "bob"}
+
+
+async def test_post_call_stream_interleaved_tool_calls_degrade_to_placeholders() -> None:
+    """Known limitation, accepted: two calls' fragments interleaved (off-spec for OpenAI,
+    never produced by the v1 providers) come back as placeholders, never as originals, and
+    the stream does not fail. The restorer's own pin is
+    ``tests/sanitizer/test_streaming_chat_sse.py::test_interleaved_tool_call_fragments_
+    degrade_to_placeholders_never_originals``."""
     g, _ = _build_guardrail([("alice", "[N1]"), ("bob", "[N2]")])
     data = _data_with_token("tok-1", content="hi alice and bob", model="gpt-4o")
     await g.pre_call(data)
@@ -3401,11 +3516,10 @@ async def test_post_call_stream_parallel_tool_calls_per_index_reassembly() -> No
         _tc_delta_chunk('2]"}', index=1),
     ]
     by_index: dict[int, str] = {}
-    async for out in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for out in restore_stream(g, data, _async_iter(chunks_in)):
         for tc in out["choices"][0]["delta"].get("tool_calls") or []:
             by_index[tc["index"]] = by_index.get(tc["index"], "") + tc["function"]["arguments"]
-    assert json.loads(by_index[0]) == {"a": "alice"}
-    assert json.loads(by_index[1]) == {"b": "bob"}
+    assert by_index == {0: '{"a": "[N1]"}', 1: '{"b": "[N2]"}'}
 
 
 async def test_post_call_stream_tool_calls_bad_index_does_not_crash() -> None:
@@ -3420,7 +3534,7 @@ async def test_post_call_stream_tool_calls_bad_index_does_not_crash() -> None:
         {"choices": [{"delta": {"content": "hi [N1]"}}]},
     ]
     content_out = ""
-    async for out in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for out in restore_stream(g, data, _async_iter(chunks_in)):
         delta = out["choices"][0]["delta"]
         if isinstance(delta.get("content"), str):
             content_out += delta["content"]
@@ -4047,7 +4161,7 @@ async def test_post_call_unary_both_choices_and_content_ignores_content() -> Non
         "choices": [{"message": {"content": [{"type": "text", "text": "from choices [N1]"}]}}],
         "content": [{"type": "text", "text": "from top-level [N1]"}],
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     # Only choices path is executed (per the if/elif in code).
     assert out["choices"][0]["message"]["content"][0]["text"] == "from choices alice"
@@ -4083,7 +4197,7 @@ async def test_post_call_unary_non_text_blocks_byte_identical() -> None:
             }
         ]
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     # Non-text blocks must be dict-equal (byte-identical).
     assert out["choices"][0]["message"]["content"][1] == image_block
@@ -4108,7 +4222,7 @@ async def test_post_call_unary_placeholder_in_one_block_not_another() -> None:
             }
         ]
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["choices"][0]["message"]["content"][0]["text"] == "first block: alice"
     assert out["choices"][0]["message"]["content"][1]["text"] == "second block: no placeholder"
@@ -4147,7 +4261,7 @@ async def test_round_trip_list_content_preserves_structure(
         ]
     }
 
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     # Verify round-trip: structure preserved, originals restored.
     out_content = out["choices"][0]["message"]["content"]
@@ -4188,7 +4302,7 @@ async def test_length_descending_placeholder_substitution_prevents_shadowing() -
             }
         ]
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     # Verify BOTH are reversed correctly (not one shadows the other).
     result_text = out["choices"][0]["message"]["content"]
@@ -4230,7 +4344,7 @@ async def test_post_call_unary_anthropic_native_with_multiple_content_types() ->
             {"type": "text", "text": "footer [N1]"},
         ],
     }
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["content"][0]["text"] == "hello alice"
     assert out["content"][1] == response["content"][1]
@@ -4273,7 +4387,7 @@ async def test_post_call_unary_anthropic_native_top_level_content_str_reversed()
 
     # Anthropic-native shape with str content (edge case but valid).
     response = {"type": "message", "content": "Hello [N1], your request was processed."}
-    out = await g.post_call_unary(data, response)
+    out = await restore_unary(g, data, response)
 
     assert out["content"] == "Hello alice, your request was processed."
     assert "[N1]" not in out["content"]
@@ -4324,7 +4438,7 @@ async def test_cache_a_hit_segment_plus_fresh_segment_no_collision() -> None:
     # Round-trip: post_call_stream must restore EACH placeholder to its own original.
     chunks_in = [{"choices": [{"delta": {"content": f"msg={msg_ph} sys={sys_ph}"}}]}]
     out_text = ""
-    async for chunk in g.post_call_stream(data2, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data2, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
     assert out_text == "msg=b@corp.example sys=a@corp.example", f"round-trip failed: {out_text!r}"
 
@@ -4569,7 +4683,7 @@ async def test_nested_tool_result_list_collision_split_and_restored() -> None:
     # post_call_stream must restore both.
     chunks_in = [{"choices": [{"delta": {"content": f"first={ph0} second={ph1}"}}]}]
     out_text = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
     assert out_text == "first=a@corp.example second=b@corp.example", (
         f"round-trip failed: {out_text!r}"
@@ -4604,7 +4718,7 @@ async def test_openai_gpt4o_multimodal_text_parts_collision_split_image_passthro
     # Both emails must restore via post_call_stream.
     chunks_in = [{"choices": [{"delta": {"content": f"{ph0} / {ph1}"}}]}]
     out_text = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
     assert out_text == "a@corp.example / b@corp.example", f"round-trip failed: {out_text!r}"
 
@@ -4631,7 +4745,7 @@ async def test_substring_originals_longer_replaced_first_no_corruption() -> None
     # Reverse: post_call_stream must restore both without one shadowing the other.
     chunks_in = [{"choices": [{"delta": {"content": "[EMAIL_001] / [NAME_001]"}}]}]
     out_text = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
     assert out_text == "john.doe@corp.example / john", (
         f"reverse substitution corrupted: {out_text!r}"
@@ -4680,7 +4794,7 @@ async def test_rule_overlap_round_trip_survives_placeholder_canonicalization() -
         }
     ]
     restored = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         restored += chunk["choices"][0]["delta"]["content"]
 
     assert restored == "Alice Smith met Alice and Bob; marker [PERSON_001]"
@@ -4705,7 +4819,7 @@ async def test_case_insensitive_rule_matches_collapse_to_one_configured_token() 
     # not a leak either way.
     restored = ""
     chunks_in = [{"choices": [{"delta": {"content": sanitized}}]}]
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         restored += chunk["choices"][0]["delta"]["content"]
     assert restored == "acme and acme and acme"
 
@@ -4746,7 +4860,7 @@ async def test_user_typed_placeholder_literal_preserved_not_collided(
     # On post_call_stream: a response with both tokens restores correctly.
     chunks_in = [{"choices": [{"delta": {"content": f"{real_token} and [EMAIL_001]"}}]}]
     out_text = ""
-    async for chunk in g.post_call_stream(data, _async_iter(chunks_in)):
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
         out_text += chunk["choices"][0]["delta"]["content"]
     # The real token is restored; the user's literal is unchanged (not in mapping).
     assert "a@corp.example" in out_text, f"real email not restored: {out_text!r}"
@@ -4913,7 +5027,7 @@ async def test_tool_use_input_round_trip_distinct_emails_restored() -> None:
             }
         ]
     }
-    result = await g.post_call_unary(data, response)
+    result = await restore_unary(g, data, response)
     restored = result["choices"][0]["message"]["content"][0]["input"]
     assert restored["to"] == "a@corp.example", f"to not restored: {restored['to']!r}"
     assert restored["cc"] == ["b@corp.example"], f"cc not restored: {restored['cc']!r}"
@@ -5856,3 +5970,341 @@ async def test_a_token_store_stalled_mid_query_is_503_and_its_connection_is_drop
         finally:
             await store.close()
             await proxy.close()
+
+
+# ── no reversal in the callback: the pre-call hands the request to its ticket ──
+
+_RESPONSE_SIDE_HOOKS = (
+    "async_post_call_success_hook",
+    "async_post_call_streaming_iterator_hook",
+    "async_post_call_streaming_hook",
+    "async_post_call_response_headers_hook",
+    "post_call_unary",
+    "post_call_stream",
+)
+
+
+@pytest.mark.parametrize("name", _RESPONSE_SIDE_HOOKS)
+def test_the_guardrail_defines_no_response_side_hook(name: str) -> None:
+    """litellm dispatches a hook when the leaf class defines it (proxy/utils.py); ours
+    defines none, so nothing of ours touches a response inside litellm. The reversal is
+    the ASGI desanitiser, the one place a response is restored."""
+    assert name not in vars(CorpLlmGuardrail)
+
+
+async def test_a_ticketed_pre_call_hands_the_mapping_and_the_record_to_the_ticket() -> None:
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import _TICKET, RequestTicket
+    from corp_llm_gateway.route_gate.terminal_audit import AuditFacts
+
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    mappings = ResponseMappings()
+    g.bind_response_mappings(mappings)
+    ticket = RequestTicket("e" * 32)
+    data = _data_with_token("tok-1", content="hi alice")
+    data["litellm_call_id"] = "call-7"
+    token = _TICKET.set(ticket)
+    try:
+        await g.pre_call(data)
+    finally:
+        _TICKET.reset(token)
+
+    mapping = mappings.get(ticket)
+    assert mapping is not None and mapping.pairs == (("alice", "[N1]"),)
+    assert isinstance(ticket.audit_facts, AuditFacts)
+    assert ticket.audit_facts.request_id == "call-7"
+    # The guardrail keeps neither the content nor the record.
+    assert g._req_state == {}
+    now = datetime.now(UTC)
+    await g.async_log_success_event({"litellm_call_id": "call-7"}, None, now, now)
+    await g.async_log_failure_event({"litellm_call_id": "call-7"}, None, now, now)
+    await g.on_request_cancelled("call-7")
+    assert sink.records == []
+
+
+async def test_an_unticketed_pre_call_keeps_todays_record() -> None:
+    """Outside the route gate (no ticket) nothing restores the response and the
+    guardrail still writes the request's record from its log event."""
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    data = _data_with_token("tok-1", content="hi alice")
+    data["litellm_call_id"] = "call-8"
+
+    await g.pre_call(data)
+    now = datetime.now(UTC)
+    await g.async_log_success_event({"litellm_call_id": "call-8"}, None, now, now)
+
+    assert [(r["status"], r["redaction_count"]) for r in sink.records] == [("ok", 1)]
+    assert g._req_state == {}
+
+
+async def _ticketed_pre_call(
+    g: CorpLlmGuardrail, data: dict[str, Any], ticket: Any, *, call_type: str | None = None
+) -> None:
+    from corp_llm_gateway.route_gate.inflight import _TICKET
+
+    token = _TICKET.set(ticket)
+    try:
+        await g.pre_call(data, call_type=call_type)
+    finally:
+        _TICKET.reset(token)
+
+
+async def _in_context(ticket: Any, call: Any) -> None:
+    from corp_llm_gateway.route_gate.inflight import _TICKET
+
+    token = _TICKET.set(ticket)
+    try:
+        await call
+    finally:
+        _TICKET.reset(token)
+
+
+async def test_a_log_event_in_its_requests_context_adds_to_the_ticket_past_the_fifo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """litellm's logging worker runs each event in the request's copied context
+    (``logging_worker.py``): the ticket there owns the record, however many requests
+    were handed over since. One record, with the request's identity and the log's counts."""
+    import corp_llm_gateway.litellm_hook as hook_mod
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    monkeypatch.setattr(hook_mod, "_AUDIT_DEDUP_CAP", 1)
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    g.bind_response_mappings(ResponseMappings())
+    terminal = TerminalAudit(emit_to(g._audit))
+    tickets = []
+    for i in range(2):
+        ticket = RequestTicket(f"{i:032x}")
+        terminal.bind(ticket)
+        data = _data_with_token("tok-1", content="hi alice")
+        data["litellm_call_id"] = f"call-{i}"
+        await _ticketed_pre_call(g, data, ticket)
+        tickets.append(ticket)
+    assert "call-0" not in g._terminal_owned
+
+    now = datetime.now(UTC)
+    usage = {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+    await _in_context(
+        tickets[0], g.async_log_success_event({"litellm_call_id": "call-0"}, usage, now, now)
+    )
+    await _in_context(tickets[0], g.on_request_cancelled("call-0"))
+    await terminal.publish(tickets[0], "ok")
+    tickets[0].close()
+    await terminal.drain()
+
+    (record,) = sink.records
+    assert (record["request_id"], record["user_id"], record["team_id"]) == ("call-0", "alice", "t1")
+    assert (record["status"], record["redaction_count"]) == ("ok", 1)
+    assert (record["prompt_token_count"], record["completion_token_count"]) == (3, 1)
+
+
+async def test_a_closed_tickets_id_leaves_the_hand_over_fifo() -> None:
+    """The ticket's close wrote (or lost) its record: its id leaves the FIFO, and a later
+    event for it outside any request writes nothing."""
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    g.bind_response_mappings(ResponseMappings())
+    ticket = RequestTicket("c" * 32)
+    data = _data_with_token("tok-1", content="hi alice")
+    data["litellm_call_id"] = "call-9"
+    await _ticketed_pre_call(g, data, ticket)
+    assert "call-9" in g._terminal_owned
+
+    ticket.close()
+
+    assert "call-9" not in g._terminal_owned
+    now = datetime.now(UTC)
+    await g.async_log_success_event({"litellm_call_id": "call-9"}, None, now, now)
+    await g.on_request_cancelled("call-9")
+    assert sink.records == []
+
+
+@pytest.mark.parametrize("event", ["success", "failure"])
+async def test_a_log_event_for_an_evicted_id_outside_its_request_writes_no_record(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, event: str
+) -> None:
+    """A handed-over id pushed out of the FIFO, logged in no request's context: its state
+    went to the ticket, so the guardrail writes no ``unknown`` record. It logs the orphan
+    by type and counts it; the ticket still writes the request's one record."""
+    import corp_llm_gateway.litellm_hook as hook_mod
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    monkeypatch.setattr(hook_mod, "_AUDIT_DEDUP_CAP", 1)
+    g, sink = _build_guardrail([("alice", "[N1]")])
+    metrics = _RecordingMetrics()
+    g._metrics = metrics
+    g.bind_response_mappings(ResponseMappings())
+    terminal = TerminalAudit(emit_to(g._audit))
+    tickets = []
+    for i in range(2):
+        ticket = RequestTicket(f"{i:032x}")
+        terminal.bind(ticket)
+        data = _data_with_token("tok-1", content="hi alice")
+        data["litellm_call_id"] = f"call-{i}"
+        await _ticketed_pre_call(g, data, ticket)
+        tickets.append(ticket)
+    assert "call-0" not in g._terminal_owned
+
+    now = datetime.now(UTC)
+    usage = {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+    log = g.async_log_success_event if event == "success" else g.async_log_failure_event
+    with caplog.at_level(logging.DEBUG):
+        await log({"litellm_call_id": "call-0"}, usage, now, now)
+
+    status = "ok" if event == "success" else "failed"
+    assert sink.records == []
+    assert f"litellm_audit_orphan_event request_id=call-0 status={status}" in caplog.text
+    assert metrics.failures == ["audit"]
+    assert metrics.latencies == []
+    await terminal.publish(tickets[0], "ok")
+    tickets[0].close()
+    await terminal.drain()
+    (record,) = sink.records
+    assert (record["request_id"], record["user_id"], record["team_id"]) == ("call-0", "alice", "t1")
+    assert (record["status"], record["redaction_count"]) == ("ok", 1)
+
+
+@pytest.mark.parametrize("ticketed", [False, True], ids=["unticketed", "ticketed"])
+async def test_a_pre_call_refusal_still_writes_its_record_inline(ticketed: bool) -> None:
+    """Behind the desanitiser too, a refusal before any state exists is not an orphan: its
+    record is the inline one, and litellm's failure log for it is a duplicate."""
+    from corp_llm_gateway.route_gate.desanitize_middleware import ResponseMappings
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, sink = _build_guardrail()
+    metrics = _RecordingMetrics()
+    g._metrics = metrics
+    g.bind_response_mappings(ResponseMappings())
+    data = {"model": "claude", "messages": [], "headers": {}, "litellm_call_id": "call-r"}
+
+    with pytest.raises(GuardrailHttpException) as ei:
+        if ticketed:
+            await _ticketed_pre_call(g, data, RequestTicket("d" * 32))
+        else:
+            await g.pre_call(data)
+
+    assert ei.value.error_code == "E_MISSING_TOKEN"
+    (record,) = sink.records
+    assert (record["request_id"], record["user_id"], record["status"]) == (
+        "call-r",
+        "unknown",
+        "failed",
+    )
+    assert metrics.failures == ["auth"]
+    now = datetime.now(UTC)
+    await g.async_log_failure_event({"litellm_call_id": "call-r"}, None, now, now)
+    assert len(sink.records) == 1
+    assert metrics.failures == ["auth"]
+
+
+# ── chat streams ask the provider for usage; the desanitiser drops what the client
+# did not ask for ──
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (None, {"include_usage": True}),
+        ({"include_usage": False}, {"include_usage": True}),
+        ({"include_obfuscation": False}, {"include_obfuscation": False, "include_usage": True}),
+    ],
+    ids=["absent", "declined", "other-key"],
+)
+async def test_a_ticketed_chat_stream_asks_for_usage_the_client_did_not(
+    options: dict[str, Any] | None, expected: dict[str, Any]
+) -> None:
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    ticket = RequestTicket("a" * 32)
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    data["stream"] = True
+    if options is not None:
+        data["stream_options"] = options
+
+    class _LoggingObj:
+        def __init__(self) -> None:
+            self.stream_options = options
+
+    data["litellm_logging_obj"] = _LoggingObj()
+
+    await _ticketed_pre_call(g, data, ticket, call_type="acompletion")
+
+    assert data["stream_options"] == expected
+    # litellm's stream wrapper reads them off its logging object, set before any pre-call.
+    assert data["litellm_logging_obj"].stream_options == expected
+    assert ticket.audit_facts.client_asked_usage is False
+
+
+async def test_litellms_own_usage_strip_is_handed_to_the_desanitiser() -> None:
+    """litellm 1.101.0 asks a chat stream for usage itself when the client did not, and
+    strips the chunk before the response leaves its app; the desanitiser must see it."""
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    ticket = RequestTicket("e" * 32)
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    data["stream"] = True
+    data["stream_options"] = {"include_usage": True}
+    data["_litellm_strip_stream_usage"] = True
+
+    class _LoggingObj:
+        def __init__(self) -> None:
+            self.stream_options = {"include_usage": True}
+
+    data["litellm_logging_obj"] = _LoggingObj()
+
+    await _ticketed_pre_call(g, data, ticket, call_type="acompletion")
+
+    assert data["_litellm_strip_stream_usage"] is False
+    assert data["stream_options"] == {"include_usage": True}
+    assert data["litellm_logging_obj"].stream_options == {"include_usage": True}
+    assert ticket.audit_facts.client_asked_usage is False
+
+
+async def test_a_chat_stream_whose_client_asked_for_usage_is_left_alone() -> None:
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    ticket = RequestTicket("b" * 32)
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    data["stream"] = True
+    data["stream_options"] = {"include_usage": True}
+
+    await _ticketed_pre_call(g, data, ticket, call_type="acompletion")
+
+    assert data["stream_options"] == {"include_usage": True}
+    assert ticket.audit_facts.client_asked_usage is True
+
+
+@pytest.mark.parametrize(
+    ("call_type", "stream", "ticketed"),
+    [
+        ("acompletion", False, True),
+        ("anthropic_messages", True, True),
+        ("aresponses", True, True),
+        ("acompletion", True, False),
+    ],
+    ids=["chat-unary", "messages-sse", "responses-sse", "no-ticket"],
+)
+async def test_nothing_else_is_asked_for_usage(
+    call_type: str, stream: bool, ticketed: bool
+) -> None:
+    """Only a ticketed chat stream: nothing outside the route gate would drop the chunk."""
+    from corp_llm_gateway.route_gate.inflight import RequestTicket
+
+    g, _ = _build_guardrail([("alice", "[N1]")])
+    ticket = RequestTicket("d" * 32)
+    data = _data_with_token("tok-1", content="hi alice", model="gpt-4o")
+    data["stream"] = stream
+
+    if ticketed:
+        await _ticketed_pre_call(g, data, ticket, call_type=call_type)
+        assert ticket.audit_facts.client_asked_usage is True
+    else:
+        await g.pre_call(data, call_type=call_type)
+    assert "stream_options" not in data

@@ -117,13 +117,38 @@ Action:
 
 Symptom: `gateway_failure{component="internal"}` rises; requests return 500 with `error_code="E_INTERNAL"` and no other detail.
 
-Behavior: fail-closed (per matrix). This is the catch-all for an exception the gateway didn't anticipate (a DB error, a bug, an audit-sink outage) — `pre_call`, `post_call_unary`, and `post_call_stream` all map it to this opaque response rather than ever echoing the exception text to the client, the log, or the audit record. `litellm_pre_call_unexpected_error` / `litellm_post_call_unary_unexpected_error` / `litellm_post_call_stream_unexpected_error` log the exception TYPE only, never its message.
+Behavior: fail-closed (per matrix). This is the catch-all for an exception the gateway didn't anticipate (a DB error, a bug, an audit-sink outage) — `pre_call` maps it to this opaque response rather than ever echoing the exception text to the client, the log, or the audit record; `litellm_pre_call_unexpected_error` logs the exception TYPE only, never its message. A failure restoring a response (the ASGI desanitiser) answers the same 500 `E_INTERNAL` (or closes a stream already under way) and logs `gateway_desanitize_failed request_id=… phase=… error=<type>`, counted as `gateway_failure{component="desanitize"}`.
 
 Action:
 1. Check the gateway pod logs for the matching `*_unexpected_error` line and its `exc_type=` — that names the exception class without leaking its message.
 2. If `exc_type` points at a known dependency (Postgres, Redis, the audit sink), treat it as that component's own incident instead — this path is the safety net, not the root cause.
 3. A request already blocked/failed by a specific component (e.g. `E_DLP_BLOCKED`) does NOT also count as `internal` — the wrapper skips the internal counter when a component-specific failure was already recorded for that request.
-4. An upstream provider/transport failure mid-stream (e.g. `httpx.RemoteProtocolError`) also does NOT count as `internal` — `post_call_stream` only wraps its own desanitization work; fetching the next chunk from the upstream iterator is deliberately outside that guard, so a provider failure propagates to litellm's own failure handling untouched. `internal` rising means a bug in the gateway's own pre/post-call code, not a downstream provider outage and not a duplicate of a component-specific block.
+4. An upstream provider/transport failure mid-stream (e.g. `httpx.RemoteProtocolError`) counts as neither `internal` nor `desanitize`: the ASGI desanitiser sends the tails it restored so far, re-raises litellm's own exception unchanged, and the request's audit record is `failed`. `internal` rising means a bug in the gateway's own pre-call code, not a downstream provider outage and not a duplicate of a component-specific block; a restoration failure is `desanitize` (next section).
+
+### `gateway_failure{component="desanitize"}` rises
+
+Symptom: `gateway_failure{component="desanitize"}` counts up. The gateway log has one of:
+
+- `gateway_desanitize_failed request_id=… phase=before_start|after_start error=<type>` — a response could not be restored;
+- `gateway_terminal_audit_lost request_id=… outcome=… error=<type>` or `terminal_audit_publish_failed request_id=… error=<type>` — a request's audit record could not be written on its last attempt (the response path's write has one retry; a record the close decides, none);
+- `terminal_audit_drain_incomplete pending=<n>` — at shutdown, records were still being written when the cancel grace ran out.
+
+Behavior: fail-closed, content-free. A restoration failure before the response started answers 500 `E_INTERNAL`; after it started, the client gets the events restored so far and the stream is closed, which also closes the upstream. litellm never sees an original either way, and the log lines carry the request id, the phase or outcome and the exception type only. The request's audit record is `failed` + `E_INTERNAL` (`docs/audit-schema.md`, "The terminal record").
+
+Action:
+1. `gateway_desanitize_failed`: a gateway bug or a response shape the restorer does not expect. Note `phase` and `error=`; if it started after a litellm or provider change, compare that route's response shape first. There is no fail-open to fall back on.
+2. `gateway_terminal_audit_lost` / `terminal_audit_publish_failed`: the sink failed the record's last write attempt, so the request has no record: for an outcome the response path published, that is the write and its one retry; for a record the close decided (nothing was published: `cancelled`, or `failed` + `E_INTERNAL` with no final body), it is the close's only write, which has no retry — treat it as the sink's incident and as an audit-completeness gap (see below).
+3. `terminal_audit_drain_incomplete`: shutdown cut writes short. Check the sink's latency; `CORP_LLM_CANCEL_GRACE_SECONDS` bounds the wait.
+
+### `gateway_failure{component="audit"}` rises
+
+Symptom: `gateway_failure{component="audit"}` counts up; the gateway log has `litellm_audit_orphan_event request_id=… status=…`.
+
+Behavior: not an incident on its own. A litellm log event arrived for a request the guardrail holds no state for — the request's terminal audit record was already written through its ticket (or no pre-call ran), so the event is dropped instead of writing a second, "unknown" record. Nothing is lost and no request is affected.
+
+Action: none for a flat or occasional count. If it grows steadily with traffic, compare the `request_id`s against the audit records: each should already have exactly one terminal record. A request with no record at all is an audit-completeness incident (see below).
+
+Second source, `litellm_guardrail_information_failed request_id=… error=<type>`: the guardrail could not write its content-free entry into litellm's `guardrail_information` (`docs/audit-schema.md`). The request and its audit record are not affected; litellm's payload for that request lacks the entry. So does litellm's OTEL guardrail span, except after `error=GuardrailInformationShapeError`: litellm's writer emits that span itself (`emit_guardrail_span`, litellm 1.101.0 `custom_guardrail.py:1209-1217`) before the gateway checks what the writer built, and taking the entry back out reaches the request metadata copy only. That span holds our allow-listed entry plus the keys litellm's writer generated. `error=GuardrailInformationShapeError` after a litellm upgrade means litellm's writer builds a different entry shape: re-check it against the allow-list before anything else.
 
 ### A client gets 403 / 404 `E_ROUTE_BLOCKED`
 
@@ -183,7 +208,7 @@ half-configured rather than start litellm with no guardrail.
 | Exit | Meaning | What to check |
 |---|---|---|
 | **78** (`EX_CONFIG`) | litellm's config is unusable | `CORP_LLM_LITELLM_CONFIG` (default `/etc/litellm/config.yaml`): file present, named `.yaml`/`.yml`, readable, a non-empty YAML mapping. Also refused: `general_settings.pass_through_endpoints` (registered at runtime, so the gate cannot classify them) and `general_settings.database_url` (the Prisma step reads `DATABASE_URL`/`DIRECT_URL` only). Same code when `CORP_LLM_SERVE_PORT` is not a port number, when a `CORP_LLM_*` in-flight key is out of range (or `CORP_LLM_MAX_INFLIGHT=0` in prod), when `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` is malformed or names a refused route, and when issuance is on but cannot be served: partial config, no `CORP_LLM_PG_DSN`, missing extras, a bad CA bundle, Postgres refusing the DSN, TLS or `SELECT`, or a `corp_tokens` without the issuance columns / a valid `corp_tokens_oidc_jti_key` (`upgrade.md`). The log line names the key or the fix; `configuration.md` lists every case. |
-| **70** (`EX_SOFTWARE`) | litellm started, but no `CorpLlmGuardrail` in `litellm.callbacks` | The `litellm_settings.callbacks` line in the config — it must name `corp_llm_gateway.bootstrap.guardrail`. This is the fail-open that used to start a proxy with no sanitization at all. |
+| **70** (`EX_SOFTWARE`) | litellm started, but the gateway refuses to arm; one `arm refused (<problem>)` line per problem | `guardrail_absent`: no `CorpLlmGuardrail` in `litellm.callbacks` — the `litellm_settings.callbacks` line in the config must name `corp_llm_gateway.bootstrap.guardrail` (the fail-open that used to start a proxy with no sanitization at all). `apply_guardrail`, `scan_raw_request`, `run_in_parallel`: the guardrail is set up so litellm would skip its pre-call hook or discard its rewrite. `litellm_debug_logging`, `litellm_set_verbose`: litellm's DEBUG output is on (`LITELLM_LOG=DEBUG`, `DETAILED_DEBUG`, `--detailed_debug`, `litellm_settings.set_verbose`); litellm logs the original request before any pre-call hook runs. `CORP_LLM_ALLOW_LITELLM_DEBUG=1` lets these two through outside prod, for tests. `response_compressor`: litellm's app compresses responses, which the gateway's response desanitiser would pass through unrestored. `configuration.md` lists every case. |
 | **2** | Prisma schema migration cannot proceed | `DATABASE_URL` / `DIRECT_URL` reachable? The log line carries the RuntimeError text from litellm's `PrismaManager`. Same condition litellm's own CLI exits on. |
 | **1** | Prisma schema setup failed after retries, with `ENFORCE_PRISMA_MIGRATION_CHECK` set | The database. Unset that variable to downgrade it to a warning — only if you accept booting against an unmigrated schema. |
 

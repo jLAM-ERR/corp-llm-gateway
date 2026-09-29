@@ -81,6 +81,9 @@ litellm_settings:
   callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
   drop_params: true
   json_logs: true
+general_settings:
+  # As the shipped configs pin it: litellm loads models, never policies/guardrails.
+  supported_db_objects: ["models"]
 """
 
 # The shape compose/litellm/config.oauth.yaml ships: one native anthropic route,
@@ -96,6 +99,8 @@ litellm_settings:
   callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
   drop_params: true
   json_logs: true
+general_settings:
+  supported_db_objects: ["models"]
 """
 
 NO_CALLBACK_CONFIG = f"""

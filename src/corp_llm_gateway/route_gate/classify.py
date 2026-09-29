@@ -19,6 +19,12 @@ ROUTE_GATE_WEBSOCKET = "route_gate_websocket"
 ROUTE_GATE_MALFORMED = "route_gate_malformed"
 ROUTE_GATE_UNARMED = "route_gate_unarmed"
 ROUTE_GATE_ERROR = "route_gate_error"
+# An admitted rewritten request whose body names litellm policies (top-level
+# ``policies``); decided by the gate after the in-flight limiter read the body.
+ROUTE_GATE_BODY_POLICIES = "route_gate_body_policies"
+# An admitted rewritten request whose body is not JSON (litellm would read a form body,
+# ``policies`` field included); decided with the same drained body.
+ROUTE_GATE_BODY_NOT_JSON = "route_gate_body_not_json"
 
 BLOCK_REASONS: frozenset[str] = frozenset(
     {
@@ -28,6 +34,8 @@ BLOCK_REASONS: frozenset[str] = frozenset(
         ROUTE_GATE_MALFORMED,
         ROUTE_GATE_UNARMED,
         ROUTE_GATE_ERROR,
+        ROUTE_GATE_BODY_POLICIES,
+        ROUTE_GATE_BODY_NOT_JSON,
     }
 )
 

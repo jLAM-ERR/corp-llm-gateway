@@ -10,8 +10,12 @@ each message and forwards it unbuffered.
 Fail-closed: a REFUSE, an unarmed REWRITTEN route and any classifier exception
 all end here, never at litellm. A route refusal never reads the body; the
 limiter's oversize and body-timeout refusals have read (part of) it, and a
-capacity refusal may have. No request byte is ever echoed or logged (M1-14); the
-refusal names only the route the caller itself sent.
+capacity refusal may have. An admitted REWRITTEN body that names litellm policies
+(a top-level ``policies`` key, which litellm would apply to the request), or that is
+not JSON (litellm would read a form body, a ``policies`` field included), is refused
+once the limiter has read it, before any slot is taken or litellm parses it. No
+request byte is ever echoed or logged (M1-14); the refusal names only the route
+the caller itself sent.
 """
 
 from __future__ import annotations
@@ -27,6 +31,8 @@ from corp_llm_gateway.audit.event import AuditEvent
 from corp_llm_gateway.audit.logger import AuditLogger
 from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.route_gate.classify import (
+    ROUTE_GATE_BODY_NOT_JSON,
+    ROUTE_GATE_BODY_POLICIES,
     ROUTE_GATE_ERROR,
     ROUTE_GATE_LISTED,
     ROUTE_GATE_MALFORMED,
@@ -64,6 +70,8 @@ _BLOCKED = "E_ROUTE_BLOCKED"
 CALL_ID_HEADER = b"x-litellm-call-id"
 
 _STATUS: dict[str, int] = {
+    ROUTE_GATE_BODY_POLICIES: 403,
+    ROUTE_GATE_BODY_NOT_JSON: 415,
     ROUTE_GATE_UNLISTED: 404,
     ROUTE_GATE_LISTED: 403,
     ROUTE_GATE_WEBSOCKET: 403,
@@ -76,6 +84,8 @@ _STATUS: dict[str, int] = {
 }
 
 _ERROR_CODE: dict[str, str] = {
+    ROUTE_GATE_BODY_POLICIES: _BLOCKED,
+    ROUTE_GATE_BODY_NOT_JSON: _BLOCKED,
     ROUTE_GATE_UNLISTED: _BLOCKED,
     ROUTE_GATE_LISTED: _BLOCKED,
     ROUTE_GATE_WEBSOCKET: _BLOCKED,
@@ -88,6 +98,8 @@ _ERROR_CODE: dict[str, str] = {
 }
 
 _ERROR_TYPE: dict[str, str] = {
+    ROUTE_GATE_BODY_POLICIES: "route_blocked",
+    ROUTE_GATE_BODY_NOT_JSON: "route_blocked",
     ROUTE_GATE_UNLISTED: "route_blocked",
     ROUTE_GATE_LISTED: "route_blocked",
     ROUTE_GATE_WEBSOCKET: "route_blocked",
@@ -109,7 +121,11 @@ _FAILURE_COMPONENT: dict[str, str] = {
 _CAPACITY_WHY = "the gateway's in-flight cap is reached; retry later"
 _OVERSIZE_WHY = "the request body is over the gateway's body cap"
 _BODY_TIMEOUT_WHY = "the request body did not arrive within the gateway's body-read deadline"
+_BODY_POLICIES_WHY = "the request body names litellm policies; the gateway applies its own"
+_BODY_NOT_JSON_WHY = "a rewritten route takes a JSON request body only"
 _WHY: dict[str, str] = {
+    ROUTE_GATE_BODY_POLICIES: _BODY_POLICIES_WHY,
+    ROUTE_GATE_BODY_NOT_JSON: _BODY_NOT_JSON_WHY,
     ROUTE_GATE_CAPACITY: _CAPACITY_WHY,
     ROUTE_GATE_BODY_TIMEOUT: _BODY_TIMEOUT_WHY,
     OVERSIZE_BLOCKED: _OVERSIZE_WHY,
@@ -204,7 +220,12 @@ class RouteGateMiddleware:
         async def refuse(reason: str) -> None:
             await self._refuse(scope, receive, send, method, path, reason, _WHY[reason])
 
-        await limiter.run(scope, receive, send, self.app, refuse=refuse)
+        content_type = _content_type(scope)
+
+        def check(chunks: list[bytes]) -> str | None:
+            return _body_problem(chunks, content_type)
+
+        await limiter.run(scope, receive, send, self.app, refuse=refuse, check=check)
 
     async def _refuse(
         self,
@@ -295,6 +316,91 @@ class RouteGateMiddleware:
             # The refusal stands either way; a lost audit record is a gate failure.
             self._metrics.record_failure(COMPONENT)
             logger.error("route_gate_audit_failed block_reason=%s", reason)
+
+
+_MISSING = object()
+_AMBIGUOUS = object()
+
+
+def _content_type(scope: Scope) -> object:
+    """The request's one ``Content-Type`` value, ``_MISSING`` or ``_AMBIGUOUS``."""
+    values = [
+        bytes(value)
+        for name, value in scope.get("headers") or ()
+        if bytes(name).lower() == b"content-type"
+    ]
+    if not values:
+        return _MISSING
+    return values[0] if len(values) == 1 else _AMBIGUOUS
+
+
+def _is_json(content_type: object) -> bool:
+    if not isinstance(content_type, bytes):
+        return False
+    return content_type.split(b";", 1)[0].strip().lower() == b"application/json"
+
+
+_UTF8_CHARSETS = frozenset({b"utf-8", b"utf8"})
+
+
+def _utf8_charset(content_type: bytes) -> bool:
+    """No ``charset`` parameter, or exactly one naming UTF-8; a repeated or malformed
+    one, or any other key starting ``charset`` (RFC 2231 ``charset*``, ``charset*0``),
+    is not UTF-8."""
+    charsets = []
+    for param in content_type.split(b";")[1:]:
+        key, eq, value = param.partition(b"=")
+        key = key.strip().lower()
+        if not key.startswith(b"charset"):
+            continue
+        if key != b"charset":
+            return False
+        value = value.strip()
+        if len(value) >= 2 and value[:1] == value[-1:] == b'"':
+            value = value[1:-1]
+        if not eq or b'"' in value:
+            return False
+        charsets.append(value.lower())
+    return not charsets or (len(charsets) == 1 and charsets[0] in _UTF8_CHARSETS)
+
+
+def _utf8(body: bytes) -> bool:
+    # ``detect_encoding`` is what ``json.loads(bytes)`` decodes with; a lenient decoder
+    # (``errors="ignore"``) would join ``poli\xffcies`` into a key the bytes never spell.
+    if json.detect_encoding(body) != "utf-8":
+        return False
+    try:
+        body.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _body_problem(chunks: list[bytes], content_type: object) -> str | None:
+    """``ROUTE_GATE_BODY_NOT_JSON`` for a body that is not UTF-8 JSON: a ``Content-Type``
+    other than ``application/json`` (none at all is refused only with a body), a
+    ``charset`` other than UTF-8, or a body ``json.detect_encoding`` reads as anything but
+    ``utf-8`` (a BOM, UTF-16, UTF-32) or that does not decode as UTF-8;
+    ``ROUTE_GATE_BODY_POLICIES`` for a JSON object body with a top-level ``policies`` key,
+    however its key is escaped; anything else is litellm's to parse."""
+    body = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+    if not _is_json(content_type) and (body or content_type is not _MISSING):
+        return ROUTE_GATE_BODY_NOT_JSON
+    if isinstance(content_type, bytes) and not _utf8_charset(content_type):
+        return ROUTE_GATE_BODY_NOT_JSON
+    if body and not _utf8(body):
+        return ROUTE_GATE_BODY_NOT_JSON
+    # The body is UTF-8, so a key can only spell a letter as itself or with a ``\\u``
+    # escape; neither form, no such key.
+    if b"policies" not in body and b"\\u" not in body:
+        return None
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    if isinstance(parsed, dict) and "policies" in parsed:
+        return ROUTE_GATE_BODY_POLICIES
+    return None
 
 
 def _payload(method: str, path: str, reason: str) -> dict[str, Any]:
