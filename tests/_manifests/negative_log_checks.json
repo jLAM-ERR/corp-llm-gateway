@@ -1,0 +1,1194 @@
+{
+ "about": "Hand-reviewed inventory of negative log checks (plan 20260926 Task 0). Discovery: python -m tests._gates.negative_logs; class is the reviewer's: security (into must-keep), behaviour, not-a-log-check.",
+ "sites": [
+  {
+   "site": "tests/corp_ner/test_client.py:540",
+   "owner": "tests/corp_ner/test_client.py::test_never_logs_request_or_response_text",
+   "check": "canary not in emitted",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/detectors/test_corp_ner.py:380",
+   "owner": "tests/detectors/test_corp_ner.py::test_never_logs_request_or_response_text",
+   "check": "'Корол' not in record.getMessage()",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/detectors/test_corp_ner.py:379",
+   "owner": "tests/detectors/test_corp_ner.py::test_never_logs_request_or_response_text",
+   "check": "secret not in record.getMessage()",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/detectors/test_shadow.py:57",
+   "owner": "tests/detectors/test_shadow.py::test_shadow_agreement_does_not_log",
+   "check": "'detector_disagreement' not in caplog.text",
+   "class": "behaviour",
+   "note": "agreement emits no disagreement line: log volume, not content"
+  },
+  {
+   "site": "tests/detectors/test_shadow.py:73",
+   "owner": "tests/detectors/test_shadow.py::test_shadow_disagreement_is_logged_but_originals_are_not",
+   "check": "'alice@corp.lan' not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/detectors/test_shadow.py:74",
+   "owner": "tests/detectors/test_shadow.py::test_shadow_disagreement_is_logged_but_originals_are_not",
+   "check": "'bob' not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/detectors/test_shadow.py:47",
+   "owner": "tests/detectors/test_shadow.py::test_shadow_exception_does_not_break_canonical",
+   "check": "'secret-content-here' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/extensions/test_corp_ner_hook_codes.py:183",
+   "owner": "tests/extensions/test_corp_ner_hook_codes.py::test_corp_ner_failure_logs_and_audit_carry_no_originals",
+   "check": "_SECRET not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/healthz/test_issue_token_route.py:868",
+   "owner": "tests/healthz/test_issue_token_route.py::test_a_connection_class_store_failure_is_503_not_500",
+   "check": "BEARER not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/healthz/test_issue_token_route.py:908",
+   "owner": "tests/healthz/test_issue_token_route.py::test_an_asyncpg_store_failure_that_is_no_oserror_is_503_by_its_class",
+   "check": "BEARER not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/healthz/test_issue_token_route.py:593",
+   "owner": "tests/healthz/test_issue_token_route.py::test_an_exception_that_does_not_carry_a_code_gets_the_default",
+   "check": "BEARER not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/healthz/test_issue_token_route.py:289",
+   "owner": "tests/healthz/test_issue_token_route.py::test_an_internal_failure_logs_the_class_name_only",
+   "check": "'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no exception trace in a log line (M1-14 exception-trace surface)"
+  },
+  {
+   "site": "tests/healthz/test_issue_token_route.py:288",
+   "owner": "tests/healthz/test_issue_token_route.py::test_an_internal_failure_logs_the_class_name_only",
+   "check": "'collision' not in caplog.text",
+   "class": "security",
+   "note": "no backend or exception detail in a log line (M1-14 error surface)"
+  },
+  {
+   "site": "tests/healthz/test_issue_token_route.py:287",
+   "owner": "tests/healthz/test_issue_token_route.py::test_an_internal_failure_logs_the_class_name_only",
+   "check": "BEARER not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/healthz/test_ready_probe_postgres.py:78",
+   "owner": "tests/healthz/test_ready_probe_postgres.py::test_readiness_fails_behind_a_pgbouncer_that_rejects_the_keepalive_parameters",
+   "check": "PASSWORD not in surface",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/healthz/test_ready_probe_postgres.py:79",
+   "owner": "tests/healthz/test_ready_probe_postgres.py::test_readiness_fails_behind_a_pgbouncer_that_rejects_the_keepalive_parameters",
+   "check": "f'127.0.0.1:{bouncer.port}' not in surface",
+   "class": "security",
+   "note": "no backend or exception detail in a log line (M1-14 error surface)"
+  },
+  {
+   "site": "tests/healthz/test_server.py:392",
+   "owner": "tests/healthz/test_server.py::test_a_failing_closer_is_logged_by_class_and_never_raised",
+   "check": "'secret detail' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_issuance_no_leak.py:155",
+   "owner": "tests/invariants/test_issuance_no_leak.py::_assert_clean",
+   "check": "'Traceback' not in log_text",
+   "class": "security",
+   "note": "no exception trace in a log line (M1-14 exception-trace surface)"
+  },
+  {
+   "site": "tests/invariants/test_issuance_no_leak.py:151",
+   "owner": "tests/invariants/test_issuance_no_leak.py::_assert_clean",
+   "check": "secret not in log_text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_issuance_no_leak.py:398",
+   "owner": "tests/invariants/test_issuance_no_leak.py::test_the_real_verifier_leaks_nothing_on_any_path",
+   "check": "secret not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2591",
+   "owner": "tests/invariants/test_no_originals_leak.py::_assert_gate_surfaces_are_clean",
+   "check": "_CORP_TOKEN not in log_text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2590",
+   "owner": "tests/invariants/test_no_originals_leak.py::_assert_gate_surfaces_are_clean",
+   "check": "_haystack_contains_any_original(log_text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2692",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_a_classifier_exception_leaks_neither_its_message_nor_a_trace",
+   "check": "'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no exception trace in a log line (M1-14 exception-trace surface)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2691",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_a_classifier_exception_leaks_neither_its_message_nor_a_trace",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1223",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_a_refused_corp_token_is_stripped_before_the_refusal",
+   "check": "refused not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1860",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_ambiguous_shape_blocked_log_contains_no_raw_content",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2801",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_an_oversize_refusal_after_25_mib_leaks_no_body_byte",
+   "check": "'x' * 64 not in body + caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1587",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_anthropic_oauth_rejection_never_leaks_the_offered_credential",
+   "check": "'tok-inv' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1586",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_anthropic_oauth_rejection_never_leaks_the_offered_credential",
+   "check": "_ANTHROPIC_REJECTED_KEY not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1557",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_anthropic_oauth_token_never_leaves_its_authorized_destination",
+   "check": "_ANTHROPIC_OAUTH_TOKEN not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1404",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_chatgpt_oauth_token_never_reaches_audit_record_or_log_line",
+   "check": "_CHATGPT_OAUTH_TOKEN not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1969",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_corp_llm_failed_prompt_field_log_contains_no_raw_content",
+   "check": "message_original not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1970",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_corp_llm_failed_prompt_field_log_contains_no_raw_content",
+   "check": "system_original not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1135",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_corp_token_never_egresses_from_any_forwarded_header",
+   "check": "_CORP_TOKEN not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1203",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_corp_token_never_reaches_litellms_logging_snapshot",
+   "check": "_CORP_TOKEN not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2250",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_double_failure_backend_and_audit_sink_still_returns_opaque_500",
+   "check": "'corp_tokens' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2251",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_double_failure_backend_and_audit_sink_still_returns_opaque_500",
+   "check": "'ingestion failed' not in caplog.text",
+   "class": "security",
+   "note": "no backend or exception detail in a log line (M1-14 error surface)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2252",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_double_failure_backend_and_audit_sink_still_returns_opaque_500",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1015",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_fence_lang_tag_value_redacted_before_egress",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2083",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_instructions_field_block_list_sanitized_no_leak",
+   "check": "'tok-inv' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2082",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_instructions_field_block_list_sanitized_no_leak",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2111",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_instructions_field_oversize_blocks_and_never_leaks_original",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2057",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_instructions_field_sanitized_and_never_leaks_original",
+   "check": "'tok-inv' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2056",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_instructions_field_sanitized_and_never_leaks_original",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1998",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_ner_unavailable_prompt_field_log_contains_no_raw_content",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2473",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_non_token_store_exception_origin_returns_opaque_500",
+   "check": "'team_rules' not in caplog.text",
+   "class": "security",
+   "note": "no backend or exception detail in a log line (M1-14 error surface)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2474",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_non_token_store_exception_origin_returns_opaque_500",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:793",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_arguments_sanitized_never_leaks_original",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:874",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_dict_arguments_sanitized_never_leaks_original",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:835",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_raw_secret_in_arguments_blocked_and_no_leak",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:836",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_raw_secret_in_arguments_blocked_and_no_leak",
+   "check": "secret not in serialized and secret not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:916",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_raw_secret_in_dict_arguments_blocked_and_no_leak",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:917",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_raw_secret_in_dict_arguments_blocked_and_no_leak",
+   "check": "secret not in serialized and secret not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:687",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_oversize_document_leaf_blocks_and_never_leaks_original",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:663",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_oversize_message_leaf_blocks_and_never_leaks_original",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2025",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_oversize_unmanaged_input_log_contains_no_raw_content",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2401",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_post_call_stream_own_bug_mid_stream_log_contains_no_raw_content",
+   "check": "'secret-alice' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2337",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_post_call_unary_unexpected_error_log_contains_no_raw_content",
+   "check": "'secret-alice' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1830",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_provider_auth_failed_log_contains_no_raw_content",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:200",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_sanitizer_failure_log_does_not_carry_raw_output",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:281",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_segmenter_split_identifier_is_pure_slices",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:263",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_segmenter_split_segments_is_pure_slices",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:177",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_shadow_detector_swallows_exception_text",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:443",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_stage5_dlp_log_contains_no_raw_canary",
+   "check": "original not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1901",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_stale_span_message_loop_log_contains_no_raw_content",
+   "check": "first not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1902",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_stale_span_message_loop_log_contains_no_raw_content",
+   "check": "second not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1938",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_stale_span_prompt_field_log_contains_no_raw_content",
+   "check": "first not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1939",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_stale_span_prompt_field_log_contains_no_raw_content",
+   "check": "second not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1275",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_system_field_block_list_sanitized_no_leak",
+   "check": "'tok-inv' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1274",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_system_field_block_list_sanitized_no_leak",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1306",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_system_field_oversize_blocks_and_never_leaks_original",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1251",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_system_field_sanitized_and_never_leaks_original",
+   "check": "'tok-inv' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:1250",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_system_field_sanitized_and_never_leaks_original",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2181",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_unexpected_backend_exception_body_contains_no_backend_detail",
+   "check": "'corp_tokens' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/invariants/test_no_originals_leak.py:2182",
+   "owner": "tests/invariants/test_no_originals_leak.py::test_unexpected_backend_exception_body_contains_no_backend_detail",
+   "check": "_haystack_contains_any_original(caplog.text) is None",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:1718",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_failed_terminal_write_is_retried_at_close_and_written_once",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:1922",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_flush_failure_delivers_what_was_restored_and_closes",
+   "check": "'phase=after_start' in caplog.text and CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:1468",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_mapping_is_refused_for_a_cancelled_or_closed_ticket",
+   "check": "ORIGINAL_MARK not in caplog.text and QUOTED not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:806",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_raising_failure_reporter_still_closes_the_stream",
+   "check": "'gateway_desanitize_report_failed' in caplog.text and 'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no exception trace in a log line (M1-14 exception-trace surface)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:686",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_restorer_that_cannot_be_built_is_a_content_free_500",
+   "check": "'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no exception trace in a log line (M1-14 exception-trace surface)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:685",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_restorer_that_cannot_be_built_is_a_content_free_500",
+   "check": "CANARY not in caplog.text and EMAIL not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:757",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_after_start_failure_delivers_what_was_restored_then_closes",
+   "check": "'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no exception trace in a log line (M1-14 exception-trace surface)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:756",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_after_start_failure_delivers_what_was_restored_then_closes",
+   "check": "CANARY not in caplog.text and EMAIL not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:1902",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_an_adapter_that_cannot_be_built_is_a_content_free_500_for_every_family",
+   "check": "CANARY not in caplog.text and 'phase=before_start' in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:1578",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_cancellation_resistant_requests_leave_nothing_behind",
+   "check": "ORIGINAL_MARK not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:721",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_after_start_closes_the_stream_silently",
+   "check": "'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no exception trace in a log line (M1-14 exception-trace surface)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:720",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_after_start_closes_the_stream_silently",
+   "check": "CANARY not in caplog.text and EMAIL not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:657",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_before_start_is_a_content_free_500",
+   "check": "'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no exception trace in a log line (M1-14 exception-trace surface)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:656",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_before_start_is_a_content_free_500",
+   "check": "CANARY not in caplog.text and EMAIL not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:899",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_never_reaches_litellms_handler",
+   "check": "'Unhandled exception in request' not in caplog.text",
+   "class": "security",
+   "note": "no backend or exception detail in a log line (M1-14 error surface)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:900",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_never_reaches_litellms_handler",
+   "check": "CANARY not in caplog.text and 'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:1881",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restored_text_reaches_the_client_before_a_later_failure",
+   "check": "CANARY not in caplog.text and 'Traceback' not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_asgi_desanitize_prototype.py:598",
+   "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_stream_abort_releases_the_mapping_and_logs_no_content",
+   "check": "ORIGINAL_MARK not in caplog.text and QUOTED not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_cancel_call_id_isolation.py:143",
+   "owner": "tests/litellm_hook/test_cancel_call_id_isolation.py::test_a_mismatched_cancel_writes_nothing_and_is_logged_with_counts_only",
+   "check": "'b' * 32 not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_cancel_call_id_isolation.py:142",
+   "owner": "tests/litellm_hook/test_cancel_call_id_isolation.py::test_a_mismatched_cancel_writes_nothing_and_is_logged_with_counts_only",
+   "check": "EMAIL not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_guardrail_information.py:496",
+   "owner": "tests/litellm_hook/test_guardrail_information.py::test_a_raising_writer_is_logged_by_type_and_leaves_no_entry",
+   "check": "ORIGINAL_MARK not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_on_request_cancelled.py:125",
+   "owner": "tests/litellm_hook/test_on_request_cancelled.py::test_a_failed_cancel_emit_keeps_counts_only_for_a_later_terminal_record",
+   "check": "EMAIL not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/litellm_hook/test_on_request_cancelled.py:296",
+   "owner": "tests/litellm_hook/test_on_request_cancelled.py::test_a_pre_call_reached_after_the_request_was_cancelled_is_refused_without_state",
+   "check": "EMAIL not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_body_policies.py:236",
+   "owner": "tests/route_gate/test_body_policies.py::test_a_body_that_is_not_json_is_refused_before_litellm_or_a_slot",
+   "check": "CANARY not in caplog.text and CANARY not in json.dumps(payload)",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_body_policies.py:336",
+   "owner": "tests/route_gate/test_body_policies.py::test_a_body_that_is_not_utf8_is_refused_before_litellm_or_a_slot",
+   "check": "CANARY not in caplog.text and CANARY not in json.dumps(payload)",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_body_policies.py:398",
+   "owner": "tests/route_gate/test_body_policies.py::test_a_charset_other_than_utf8_is_refused_before_litellm_or_a_slot",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_body_policies.py:151",
+   "owner": "tests/route_gate/test_body_policies.py::test_a_top_level_policies_key_is_refused_before_litellm_or_a_slot",
+   "check": "CANARY not in caplog.text and CANARY not in json.dumps(payload)",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_body_policies.py:349",
+   "owner": "tests/route_gate/test_body_policies.py::test_bytes_that_do_not_decode_as_utf8_are_refused",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_inflight.py:945",
+   "owner": "tests/route_gate/test_inflight.py::test_a_failing_cancel_hook_still_releases_the_slot",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_inflight.py:2089",
+   "owner": "tests/route_gate/test_inflight.py::test_a_failing_close_hook_is_counted_content_free_and_the_rest_still_run",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_inflight.py:922",
+   "owner": "tests/route_gate/test_inflight.py::test_a_failing_ticket_hook_is_counted_and_the_request_still_served",
+   "check": "'route_gate_ticket_hook_failed' in caplog.text and CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_inflight.py:884",
+   "owner": "tests/route_gate/test_inflight.py::test_a_server_cancel_of_a_downstream_that_unwinds_counts_nothing",
+   "check": "'route_gate_cancel_incomplete' not in caplog.text",
+   "class": "behaviour",
+   "note": "no incomplete-cancel line when the downstream unwinds: counting behaviour"
+  },
+  {
+   "site": "tests/route_gate/test_inflight.py:1782",
+   "owner": "tests/route_gate/test_inflight.py::test_a_straggler_that_fails_while_cancelled_leaves_nothing_unretrieved",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_inflight.py:987",
+   "owner": "tests/route_gate/test_inflight.py::test_no_body_byte_reaches_the_log_on_any_limiter_path",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_inflight_boundaries.py:296",
+   "owner": "tests/route_gate/test_inflight_boundaries.py::test_a_downstream_that_fails_while_cancelled_logs_the_class_only",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_inflight_boundaries.py:265",
+   "owner": "tests/route_gate/test_inflight_boundaries.py::test_a_receive_that_fails_after_the_body_cancels_and_logs_the_class_only",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_inflight_faults.py:164",
+   "owner": "tests/route_gate/test_inflight_faults.py::test_a_dead_exporter_never_fails_a_request_or_holds_its_budget",
+   "check": "'secret-9c1d' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/route_gate/test_middleware.py:445",
+   "owner": "tests/route_gate/test_middleware.py::test_a_classifier_failure_logs_neither_path_nor_exception_message",
+   "check": "CANARY not in text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_middleware.py:430",
+   "owner": "tests/route_gate/test_middleware.py::test_a_malformed_refusal_logs_no_path",
+   "check": "CANARY not in text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_middleware.py:454",
+   "owner": "tests/route_gate/test_middleware.py::test_a_refusal_logs_only_a_known_method",
+   "check": "CANARY not in text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_middleware.py:418",
+   "owner": "tests/route_gate/test_middleware.py::test_an_unlisted_refusal_logs_no_path",
+   "check": "CANARY not in text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_terminal_audit.py:249",
+   "owner": "tests/route_gate/test_terminal_audit.py::test_a_close_write_that_escapes_is_logged_by_type_and_counted",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_terminal_audit.py:289",
+   "owner": "tests/route_gate/test_terminal_audit.py::test_a_failed_write_is_retried_once_at_close_with_the_same_outcome",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_terminal_audit.py:270",
+   "owner": "tests/route_gate/test_terminal_audit.py::test_the_close_write_has_no_retry_of_its_own",
+   "check": "'error=RuntimeError' in caplog.text and CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/route_gate/test_terminal_audit.py:878",
+   "owner": "tests/route_gate/test_terminal_audit.py::test_the_retry_behind_a_failed_in_flight_write_keeps_its_outcome",
+   "check": "CANARY not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/sanitizer/test_orchestrator.py:1302",
+   "owner": "tests/sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed",
+   "check": "not any((_R9_TERM in m for m in warnings))",
+   "class": "behaviour",
+   "note": "no fingerprint warning text: warning wording, not content"
+  },
+  {
+   "site": "tests/sanitizer/test_profile_orchestrator.py:781",
+   "owner": "tests/sanitizer/test_profile_orchestrator.py::test_an_unreachable_team_config_store_is_503_profile_unavailable",
+   "check": "_STORE_CANARY not in caplog.text",
+   "class": "security",
+   "note": "no backend or exception detail in a log line (M1-14 error surface)"
+  },
+  {
+   "site": "tests/sanitizer/test_streaming.py:715",
+   "owner": "tests/sanitizer/test_streaming.py::test_responses_stream_event_reconstruct_failure_log_has_no_original",
+   "check": "'Ivanov' not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/test_bootstrap.py:889",
+   "owner": "tests/test_bootstrap.py::test_dev_team_token_ignored_when_corp_env_prod",
+   "check": "'solo-dev-token' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_bootstrap.py:875",
+   "owner": "tests/test_bootstrap.py::test_dev_team_token_ignored_when_pg_dsn_set",
+   "check": "'solo-dev-token' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_bootstrap.py:665",
+   "owner": "tests/test_bootstrap.py::test_no_disarm_warning_when_the_env_pair_is_already_legal",
+   "check": "not [r for r in caplog.records if 'mutually exclusive' in r.getMessage()]",
+   "class": "behaviour",
+   "note": "no 'mutually exclusive' warning for a legal env pair: config warning behaviour"
+  },
+  {
+   "site": "tests/test_bootstrap_edges.py:344",
+   "owner": "tests/test_bootstrap_edges.py::test_endpoint_set_does_not_warn",
+   "check": "not any(('CORP_LLM_ENDPOINT' in r.getMessage() for r in caplog.records))",
+   "class": "behaviour",
+   "note": "no endpoint warning when the endpoint is set: config warning behaviour"
+  },
+  {
+   "site": "tests/test_issue_token_composition.py:340",
+   "owner": "tests/test_issue_token_composition.py::test_a_team_store_outage_is_a_503_that_stores_nothing_and_burns_nothing",
+   "check": "'team store unreachable' not in caplog.text",
+   "class": "security",
+   "note": "no backend or exception detail in a log line (M1-14 error surface)"
+  },
+  {
+   "site": "tests/test_issue_token_composition.py:341",
+   "owner": "tests/test_issue_token_composition.py::test_a_team_store_outage_is_a_503_that_stores_nothing_and_burns_nothing",
+   "check": "bearer not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_litellm_config_guards.py:264",
+   "owner": "tests/test_litellm_config_guards.py::_assert_starts_no_litellm_guardrail",
+   "check": "name not in text",
+   "class": "not-a-log-check",
+   "note": "searches a config file's text, not log output"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:5821",
+   "owner": "tests/test_litellm_hook.py::test_an_unavailable_token_store_is_503_not_500",
+   "check": "'tok-secret-7c1f' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:5820",
+   "owner": "tests/test_litellm_hook.py::test_an_unavailable_token_store_is_503_not_500",
+   "check": "_STORE_DETAIL not in caplog.text",
+   "class": "security",
+   "note": "no backend or exception detail in a log line (M1-14 error surface)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:501",
+   "owner": "tests/test_litellm_hook.py::test_post_call_stream_own_bug_mid_stream_returns_opaque_500",
+   "check": "'alice' not in json.dumps(out) and 'alice' not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:2857",
+   "owner": "tests/test_litellm_hook.py::test_post_call_unary_reconstruct_failure_log_has_no_original",
+   "check": "'alice' not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:446",
+   "owner": "tests/test_litellm_hook.py::test_post_call_unary_unexpected_error_returns_opaque_500",
+   "check": "'alice' not in json.dumps(body) and 'alice' not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:348",
+   "owner": "tests/test_litellm_hook.py::test_pre_call_backend_db_error_returns_opaque_500",
+   "check": "'corp_tokens' not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:4008",
+   "owner": "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_logs",
+   "check": "'[EMAIL_001]' not in log_text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:4003",
+   "owner": "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_logs",
+   "check": "secret not in msg_text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:4023",
+   "owner": "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_system_logs",
+   "check": "'hunter2secret' not in msg",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:4022",
+   "owner": "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_system_logs",
+   "check": "secret_env not in msg",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:5701",
+   "owner": "tests/test_litellm_hook.py::test_pre_call_unknown_role_logs_invalid_not_verbatim",
+   "check": "injected not in caplog.text",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:5166",
+   "owner": "tests/test_litellm_hook.py::test_tool_use_input_no_leak_in_logs",
+   "check": "secret not in msg",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:4878",
+   "owner": "tests/test_litellm_hook.py::test_user_typed_placeholder_literal_preserved_not_collided",
+   "check": "'[EMAIL_001]' not in breadcrumb_lines[0]",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/test_litellm_hook.py:4877",
+   "owner": "tests/test_litellm_hook.py::test_user_typed_placeholder_literal_preserved_not_collided",
+   "check": "'a@corp.example' not in breadcrumb_lines[0]",
+   "class": "security",
+   "note": "no original request/response content in a log line (M1-14)"
+  },
+  {
+   "site": "tests/tokens/test_oidc_verifier.py:169",
+   "owner": "tests/tokens/test_oidc_verifier.py::_assert_no_leak",
+   "check": "secret not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/tokens/test_oidc_verifier.py:961",
+   "owner": "tests/tokens/test_oidc_verifier.py::test_a_mapped_group_does_not_excuse_a_non_string_sibling",
+   "check": "not isinstance(exc, OidcTeamMappingError)",
+   "class": "not-a-log-check",
+   "note": "asserts an exception type; the log check is the _assert_no_leak helper"
+  },
+  {
+   "site": "tests/tokens/test_oidc_verifier.py:922",
+   "owner": "tests/tokens/test_oidc_verifier.py::test_azp_must_be_exactly_the_client_id_string",
+   "check": "not isinstance(exc, OidcTeamMappingError)",
+   "class": "not-a-log-check",
+   "note": "asserts an exception type; the log check is the _assert_no_leak helper"
+  },
+  {
+   "site": "tests/tokens/test_oidc_verifier.py:429",
+   "owner": "tests/tokens/test_oidc_verifier.py::test_team_claim_must_be_a_list_of_strings",
+   "check": "not isinstance(exc, OidcTeamMappingError)",
+   "class": "not-a-log-check",
+   "note": "asserts an exception type; the log check is the _assert_no_leak helper"
+  }
+ ],
+ "security_node_ids": [
+  "tests/corp_ner/test_client.py::test_never_logs_request_or_response_text",
+  "tests/detectors/test_corp_ner.py::test_never_logs_request_or_response_text",
+  "tests/detectors/test_shadow.py::test_shadow_disagreement_is_logged_but_originals_are_not",
+  "tests/detectors/test_shadow.py::test_shadow_exception_does_not_break_canonical",
+  "tests/extensions/test_corp_ner_hook_codes.py::test_corp_ner_failure_logs_and_audit_carry_no_originals",
+  "tests/healthz/test_issue_token_route.py::test_a_connection_class_store_failure_is_503_not_500",
+  "tests/healthz/test_issue_token_route.py::test_an_asyncpg_store_failure_that_is_no_oserror_is_503_by_its_class",
+  "tests/healthz/test_issue_token_route.py::test_an_exception_that_does_not_carry_a_code_gets_the_default",
+  "tests/healthz/test_issue_token_route.py::test_an_internal_failure_logs_the_class_name_only",
+  "tests/healthz/test_ready_probe_postgres.py::test_readiness_fails_behind_a_pgbouncer_that_rejects_the_keepalive_parameters",
+  "tests/healthz/test_server.py::test_a_failing_closer_is_logged_by_class_and_never_raised",
+  "tests/invariants/test_issuance_no_leak.py::test_disabled_issuance_leaks_nothing",
+  "tests/invariants/test_issuance_no_leak.py::test_no_issuance_path_leaks_a_credential_or_an_identity",
+  "tests/invariants/test_issuance_no_leak.py::test_the_429_bounds_leak_nothing",
+  "tests/invariants/test_issuance_no_leak.py::test_the_bounded_refusals_leak_nothing",
+  "tests/invariants/test_issuance_no_leak.py::test_the_real_verifier_leaks_nothing_on_any_path",
+  "tests/invariants/test_no_originals_leak.py::test_a_body_timeout_refusal_leaks_no_body_byte",
+  "tests/invariants/test_no_originals_leak.py::test_a_byte_budget_refusal_mid_body_leaks_no_body_byte",
+  "tests/invariants/test_no_originals_leak.py::test_a_capacity_refusal_after_its_body_was_read_leaks_no_body_byte",
+  "tests/invariants/test_no_originals_leak.py::test_a_capacity_refusal_before_the_body_leaks_no_body_byte",
+  "tests/invariants/test_no_originals_leak.py::test_a_classifier_exception_leaks_neither_its_message_nor_a_trace",
+  "tests/invariants/test_no_originals_leak.py::test_a_form_body_refusal_leaks_no_body_byte",
+  "tests/invariants/test_no_originals_leak.py::test_a_refused_corp_token_is_stripped_before_the_refusal",
+  "tests/invariants/test_no_originals_leak.py::test_a_refused_handshake_leaks_no_original_on_any_of_the_six_surfaces",
+  "tests/invariants/test_no_originals_leak.py::test_a_refused_route_leaks_no_original_on_any_of_the_six_surfaces",
+  "tests/invariants/test_no_originals_leak.py::test_ambiguous_shape_blocked_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_an_oversize_refusal_after_25_mib_leaks_no_body_byte",
+  "tests/invariants/test_no_originals_leak.py::test_anthropic_oauth_rejection_never_leaks_the_offered_credential",
+  "tests/invariants/test_no_originals_leak.py::test_anthropic_oauth_token_never_leaves_its_authorized_destination",
+  "tests/invariants/test_no_originals_leak.py::test_chatgpt_oauth_token_never_reaches_audit_record_or_log_line",
+  "tests/invariants/test_no_originals_leak.py::test_corp_llm_failed_prompt_field_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_corp_token_never_egresses_from_any_forwarded_header",
+  "tests/invariants/test_no_originals_leak.py::test_corp_token_never_reaches_litellms_logging_snapshot",
+  "tests/invariants/test_no_originals_leak.py::test_double_failure_backend_and_audit_sink_still_returns_opaque_500",
+  "tests/invariants/test_no_originals_leak.py::test_fence_lang_tag_value_redacted_before_egress",
+  "tests/invariants/test_no_originals_leak.py::test_instructions_field_block_list_sanitized_no_leak",
+  "tests/invariants/test_no_originals_leak.py::test_instructions_field_oversize_blocks_and_never_leaks_original",
+  "tests/invariants/test_no_originals_leak.py::test_instructions_field_sanitized_and_never_leaks_original",
+  "tests/invariants/test_no_originals_leak.py::test_ner_unavailable_prompt_field_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_non_token_store_exception_origin_returns_opaque_500",
+  "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_arguments_sanitized_never_leaks_original",
+  "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_dict_arguments_sanitized_never_leaks_original",
+  "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_raw_secret_in_arguments_blocked_and_no_leak",
+  "tests/invariants/test_no_originals_leak.py::test_openai_tool_call_raw_secret_in_dict_arguments_blocked_and_no_leak",
+  "tests/invariants/test_no_originals_leak.py::test_oversize_document_leaf_blocks_and_never_leaks_original",
+  "tests/invariants/test_no_originals_leak.py::test_oversize_message_leaf_blocks_and_never_leaks_original",
+  "tests/invariants/test_no_originals_leak.py::test_oversize_unmanaged_input_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_post_call_stream_own_bug_mid_stream_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_post_call_unary_unexpected_error_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_provider_auth_failed_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_sanitizer_failure_log_does_not_carry_raw_output",
+  "tests/invariants/test_no_originals_leak.py::test_segmenter_split_identifier_is_pure_slices",
+  "tests/invariants/test_no_originals_leak.py::test_segmenter_split_segments_is_pure_slices",
+  "tests/invariants/test_no_originals_leak.py::test_shadow_detector_swallows_exception_text",
+  "tests/invariants/test_no_originals_leak.py::test_stage5_dlp_log_contains_no_raw_canary",
+  "tests/invariants/test_no_originals_leak.py::test_stale_span_message_loop_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_stale_span_prompt_field_log_contains_no_raw_content",
+  "tests/invariants/test_no_originals_leak.py::test_system_field_block_list_sanitized_no_leak",
+  "tests/invariants/test_no_originals_leak.py::test_system_field_oversize_blocks_and_never_leaks_original",
+  "tests/invariants/test_no_originals_leak.py::test_system_field_sanitized_and_never_leaks_original",
+  "tests/invariants/test_no_originals_leak.py::test_unexpected_backend_exception_body_contains_no_backend_detail",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_failed_terminal_write_is_retried_at_close_and_written_once",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_flush_failure_delivers_what_was_restored_and_closes",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_mapping_is_refused_for_a_cancelled_or_closed_ticket",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_raising_failure_reporter_still_closes_the_stream",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_restorer_that_cannot_be_built_is_a_content_free_500",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_after_start_failure_delivers_what_was_restored_then_closes",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_an_adapter_that_cannot_be_built_is_a_content_free_500_for_every_family",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_cancellation_resistant_requests_leave_nothing_behind",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_after_start_closes_the_stream_silently",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_before_start_is_a_content_free_500",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_never_reaches_litellms_handler",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restored_text_reaches_the_client_before_a_later_failure",
+  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_stream_abort_releases_the_mapping_and_logs_no_content",
+  "tests/litellm_hook/test_cancel_call_id_isolation.py::test_a_mismatched_cancel_writes_nothing_and_is_logged_with_counts_only",
+  "tests/litellm_hook/test_guardrail_information.py::test_a_raising_writer_is_logged_by_type_and_leaves_no_entry",
+  "tests/litellm_hook/test_on_request_cancelled.py::test_a_failed_cancel_emit_keeps_counts_only_for_a_later_terminal_record",
+  "tests/litellm_hook/test_on_request_cancelled.py::test_a_pre_call_reached_after_the_request_was_cancelled_is_refused_without_state",
+  "tests/route_gate/test_body_policies.py::test_a_body_that_is_not_json_is_refused_before_litellm_or_a_slot",
+  "tests/route_gate/test_body_policies.py::test_a_body_that_is_not_utf8_is_refused_before_litellm_or_a_slot",
+  "tests/route_gate/test_body_policies.py::test_a_charset_other_than_utf8_is_refused_before_litellm_or_a_slot",
+  "tests/route_gate/test_body_policies.py::test_a_top_level_policies_key_is_refused_before_litellm_or_a_slot",
+  "tests/route_gate/test_body_policies.py::test_bytes_that_do_not_decode_as_utf8_are_refused",
+  "tests/route_gate/test_inflight.py::test_a_failing_cancel_hook_still_releases_the_slot",
+  "tests/route_gate/test_inflight.py::test_a_failing_close_hook_is_counted_content_free_and_the_rest_still_run",
+  "tests/route_gate/test_inflight.py::test_a_failing_ticket_hook_is_counted_and_the_request_still_served",
+  "tests/route_gate/test_inflight.py::test_a_straggler_that_fails_while_cancelled_leaves_nothing_unretrieved",
+  "tests/route_gate/test_inflight.py::test_no_body_byte_reaches_the_log_on_any_limiter_path",
+  "tests/route_gate/test_inflight_boundaries.py::test_a_downstream_that_fails_while_cancelled_logs_the_class_only",
+  "tests/route_gate/test_inflight_boundaries.py::test_a_receive_that_fails_after_the_body_cancels_and_logs_the_class_only",
+  "tests/route_gate/test_inflight_faults.py::test_a_dead_exporter_never_fails_a_request_or_holds_its_budget",
+  "tests/route_gate/test_middleware.py::test_a_classifier_failure_logs_neither_path_nor_exception_message",
+  "tests/route_gate/test_middleware.py::test_a_malformed_refusal_logs_no_path",
+  "tests/route_gate/test_middleware.py::test_a_refusal_logs_only_a_known_method",
+  "tests/route_gate/test_middleware.py::test_an_unlisted_refusal_logs_no_path",
+  "tests/route_gate/test_terminal_audit.py::test_a_close_write_that_escapes_is_logged_by_type_and_counted",
+  "tests/route_gate/test_terminal_audit.py::test_a_failed_write_is_retried_once_at_close_with_the_same_outcome",
+  "tests/route_gate/test_terminal_audit.py::test_the_close_write_has_no_retry_of_its_own",
+  "tests/route_gate/test_terminal_audit.py::test_the_retry_behind_a_failed_in_flight_write_keeps_its_outcome",
+  "tests/sanitizer/test_profile_orchestrator.py::test_an_unreachable_team_config_store_is_503_profile_unavailable",
+  "tests/sanitizer/test_streaming.py::test_responses_stream_event_reconstruct_failure_log_has_no_original",
+  "tests/test_bootstrap.py::test_dev_team_token_ignored_when_corp_env_prod",
+  "tests/test_bootstrap.py::test_dev_team_token_ignored_when_pg_dsn_set",
+  "tests/test_issue_token_composition.py::test_a_team_store_outage_is_a_503_that_stores_nothing_and_burns_nothing",
+  "tests/test_litellm_hook.py::test_an_unavailable_token_store_is_503_not_500",
+  "tests/test_litellm_hook.py::test_post_call_stream_own_bug_mid_stream_returns_opaque_500",
+  "tests/test_litellm_hook.py::test_post_call_unary_reconstruct_failure_log_has_no_original",
+  "tests/test_litellm_hook.py::test_post_call_unary_unexpected_error_returns_opaque_500",
+  "tests/test_litellm_hook.py::test_pre_call_backend_db_error_returns_opaque_500",
+  "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_logs",
+  "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_system_logs",
+  "tests/test_litellm_hook.py::test_pre_call_unknown_role_logs_invalid_not_verbatim",
+  "tests/test_litellm_hook.py::test_tool_use_input_no_leak_in_logs",
+  "tests/test_litellm_hook.py::test_user_typed_placeholder_literal_preserved_not_collided",
+  "tests/tokens/test_oidc_verifier.py::test_a_jwks_whose_every_entry_is_garbage_is_unavailable_not_unknown_kid",
+  "tests/tokens/test_oidc_verifier.py::test_a_mapped_group_does_not_excuse_a_non_string_sibling",
+  "tests/tokens/test_oidc_verifier.py::test_a_token_over_the_length_cap_is_malformed",
+  "tests/tokens/test_oidc_verifier.py::test_alg_none_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_an_audience_that_is_not_exactly_ours_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_an_expiry_just_beyond_the_leeway_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_an_invalid_jwks_url_is_unavailable",
+  "tests/tokens/test_oidc_verifier.py::test_an_unknown_kid_of_any_shape_is_rejected_without_a_crash",
+  "tests/tokens/test_oidc_verifier.py::test_azp_must_be_exactly_the_client_id_string",
+  "tests/tokens/test_oidc_verifier.py::test_dual_audience_token_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_empty_groups_raise_a_team_mapping_error",
+  "tests/tokens/test_oidc_verifier.py::test_expired_token_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_forged_signature_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_hs256_signed_with_the_jwks_key_material_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_iat_in_the_future_beyond_the_leeway_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_jwks_body_over_the_cap_is_unavailable",
+  "tests/tokens/test_oidc_verifier.py::test_jwks_entries_that_are_not_rs256_signing_keys_are_ignored",
+  "tests/tokens/test_oidc_verifier.py::test_jwks_error_status_is_unavailable",
+  "tests/tokens/test_oidc_verifier.py::test_jwks_hang_is_bounded_by_the_timeout",
+  "tests/tokens/test_oidc_verifier.py::test_jwks_malformed_document_is_unavailable",
+  "tests/tokens/test_oidc_verifier.py::test_jwks_redirect_is_unavailable_and_not_followed",
+  "tests/tokens/test_oidc_verifier.py::test_jwks_transport_timeout_is_unavailable",
+  "tests/tokens/test_oidc_verifier.py::test_missing_azp_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_missing_kid_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_missing_required_claim_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_missing_team_claim_raises_a_team_mapping_error",
+  "tests/tokens/test_oidc_verifier.py::test_nbf_in_the_future_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_only_a_single_trailing_slash_is_tolerated_on_the_token_issuer",
+  "tests/tokens/test_oidc_verifier.py::test_operator_rbac_jwt_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_rotated_out_keys_are_dropped_on_refresh",
+  "tests/tokens/test_oidc_verifier.py::test_sub_and_jti_must_be_non_empty_strings",
+  "tests/tokens/test_oidc_verifier.py::test_team_claim_must_be_a_list_of_strings",
+  "tests/tokens/test_oidc_verifier.py::test_unexpected_typ_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_unknown_kid_within_cooldown_does_not_refetch",
+  "tests/tokens/test_oidc_verifier.py::test_unmapped_groups_raise_a_team_mapping_error",
+  "tests/tokens/test_oidc_verifier.py::test_wrong_azp_is_rejected",
+  "tests/tokens/test_oidc_verifier.py::test_wrong_iss_aud_azp_is_rejected"
+ ]
+}
