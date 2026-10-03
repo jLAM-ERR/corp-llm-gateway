@@ -64,3 +64,8 @@ connect-corp-ner.pdf
 # revmux review archive — per-round agent transcripts, local only. The project
 # profile (.revmux/profile.md) IS tracked; only the task archive is ignored.
 .revmux/tasks/
+
+# Test-gate environments and run outputs (scripts/test-env.sh, scripts/test-gates.sh)
+.venv-test-minimal/
+.venv-test-full/
+.test-gates/
