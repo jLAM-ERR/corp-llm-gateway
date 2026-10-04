@@ -73,6 +73,36 @@ def test_a_reparsed_module_never_reads_a_stale_cache_entry() -> None:
     assert rejected, evidence
 
 
+def test_a_helper_reached_by_a_function_local_import_is_in_the_closure() -> None:
+    rejected, evidence = selftest.local_import()
+
+    assert rejected, evidence
+
+
+def test_a_nested_scope_import_never_hides_a_module_level_helper() -> None:
+    rejected, evidence = selftest.nested_scope_import()
+
+    assert rejected, evidence
+
+
+def test_a_name_imported_twice_in_one_scope_reaches_both_helpers() -> None:
+    rejected, evidence = selftest.rebound_import()
+
+    assert rejected, evidence
+
+
+def test_an_unaliased_tests_import_is_refused() -> None:
+    rejected, evidence = selftest.unaliased_tests_import()
+
+    assert rejected, evidence
+
+
+def test_a_global_declaration_reaches_the_module_level_helper() -> None:
+    rejected, evidence = selftest.global_in_nested_scope()
+
+    assert rejected, evidence
+
+
 def test_a_rename_leaves_a_name_the_function_binds_itself(monkeypatch: pytest.MonkeyPatch) -> None:
     source = (
         "def helper():\n    return 1\n"

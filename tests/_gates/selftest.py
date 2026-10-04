@@ -4,9 +4,17 @@ the gate must reject it. The working tree is restored after every mutation.
 Inventory gate (run in any venv): (a) a delegated helper check removed, (b) a
 ``pytest.fail`` path removed, (c) the production-detector builder swapped for a static
 one, (d) an assert made unreachable by a changed selector, (e) a predicate changed inside
-a script a test runs by ``subprocess``, (f) a parametrize table shrunk; and (g) the same
+a script a test runs by ``subprocess``, (f) a parametrize table shrunk; (g) the same
 synthetic module re-parsed with another body hashes differently every time (no stale
-cache entry survives a re-parse).
+cache entry survives a re-parse); and (h) a synthetic helper reached only through a
+function-local ``from tests.… import`` loses its assert (a sibling test that names it
+without the import must not move); (i) an import in a nested def, or in another method of
+a class, binds in that scope only, so the module-level helper the test calls stays reached;
+(j) a name one scope imports from two modules reaches both helpers, so weakening either
+moves the test; (k) an unaliased ``import tests[.x]``, dotted or bare, is refused with an
+error; and (l) a nested def or class body that declares ``global helper`` past an
+enclosing local import still reaches the module-level ``helper``, and an import
+under ``global`` / ``nonlocal`` is refused.
 
 Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
 stops being collected, a lost parametrize case, a setup-time skip, a changed
@@ -17,14 +25,16 @@ collection-skip reason.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from tests._gates import inventory
 
@@ -145,6 +155,266 @@ def cache_reparse(rounds: int = 200) -> tuple[bool, str]:
         del module, checks
     ok = len(hashes[0]) == len(hashes[1]) == 1 and hashes[0] != hashes[1]
     return ok, f"{rounds} re-parses, distinct hashes per body: {len(hashes[0])}/{len(hashes[1])}"
+
+
+LOCAL_HELPER = (
+    "def helper(value):\n    assert value\n    return value\n",
+    "def helper(value):\n    return value\n",
+)
+LOCAL_SUITE = (
+    "def test_imports_it_inside():\n"
+    "    if True:\n"
+    "        from tests._gates.selftest_local_helper import helper\n"
+    "    helper(1)\n"
+    "def test_sibling_without_the_import():\n"
+    "    helper(1)\n"
+)
+
+
+@contextlib.contextmanager
+def _only_modules(*extra: inventory.Module) -> Iterator[None]:
+    real = inventory.modules
+    mods = {module.name: module for module in extra}
+    inventory.modules = lambda: mods
+    try:
+        yield
+    finally:
+        inventory.modules = real
+
+
+def _synthetic_checks(suite: inventory.Module, *others: inventory.Module) -> dict[str, Any]:
+    with _only_modules(suite, *others):
+        checks, _ = inventory.collect(
+            (suite, qual, node, cls) for qual, node, cls in inventory._tests_in(suite)
+        )
+    return checks
+
+
+def _synthetic(name: str, text: str) -> inventory.Module:
+    return inventory._index(f"tests._gates.{name}", ROOT / f"tests/_gates/{name}.py", text)
+
+
+def local_import() -> tuple[bool, str]:
+    """A helper reached only through a function-local import loses its assert: the
+    importing test's ``delegated`` and ``body_hash`` must move, its sibling's must not."""
+    suite = _synthetic("selftest_local_suite", LOCAL_SUITE)
+    before, after = (
+        _synthetic_checks(suite, _synthetic("selftest_local_helper", body)) for body in LOCAL_HELPER
+    )
+    problems = inventory.diff_checks(before, after)
+    test = f"{suite.rel}::test_imports_it_inside"
+    sibling = f"{suite.rel}::test_sibling_without_the_import"
+    expect = (f"{test}: delegated ", f"{test}: body_hash ")
+    unmet = [e for e in expect if not any(p.startswith(e) for p in problems)]
+    reached = before[test]["helpers"] == ["helper"]
+    unbound = before[sibling]["helpers"] == [] and not any(sibling in p for p in problems)
+    ok = not unmet and reached and unbound
+    evidence = f"not reported: {unmet}; reached {reached}; sibling unbound {unbound}"
+    if ok:
+        evidence = f"{len(expect)} expected line(s), e.g. {problems[0]}"
+    return ok, evidence[:240]
+
+
+SCOPE_SUITE = (
+    "def helper(value):\n    assert value\n    return value\n"
+    "def test_a_nested_import_leaves_the_module_helper():\n"
+    "    def inner():\n"
+    "        from tests._gates.selftest_scope_other import helper\n"
+    "        return helper(2)\n"
+    "    helper(1)\n"
+    "    inner()\n"
+    "class Thing:\n"
+    "    def a(self):\n"
+    "        from tests._gates.selftest_scope_other import helper\n"
+    "        return helper(2)\n"
+    "    def b(self):\n"
+    "        return helper(1)\n"
+    "def test_a_method_import_leaves_the_module_helper():\n"
+    "    Thing().b()\n"
+)
+SCOPE_OTHER = "def helper(value):\n    assert value > 1\n    return value\n"
+
+
+def nested_scope_import() -> tuple[bool, str]:
+    """An import in a nested def, or in another method of a class, binds there only: the
+    test still reaches the module-level ``helper`` it calls, and the imported one too, so
+    dropping either one's assert moves both tests' ``delegated`` and ``body_hash``."""
+    base = _synthetic_checks(
+        _synthetic("selftest_scope_suite", SCOPE_SUITE),
+        _synthetic("selftest_scope_other", SCOPE_OTHER),
+    )
+    module_helper_weakened = _synthetic_checks(
+        _synthetic("selftest_scope_suite", SCOPE_SUITE.replace("    assert value\n", "", 1)),
+        _synthetic("selftest_scope_other", SCOPE_OTHER),
+    )
+    imported_helper_weakened = _synthetic_checks(
+        _synthetic("selftest_scope_suite", SCOPE_SUITE),
+        _synthetic("selftest_scope_other", SCOPE_OTHER.replace("    assert value > 1\n", "")),
+    )
+    unmet = []
+    for label, after in (
+        ("module-level", module_helper_weakened),
+        ("imported", imported_helper_weakened),
+    ):
+        problems = inventory.diff_checks(base, after)
+        for node_id in base:
+            for column in ("delegated", "body_hash"):
+                if not any(p.startswith(f"{node_id}: {column} ") for p in problems):
+                    unmet.append(f"{label} helper: {node_id.split('::')[1]} {column}")
+    if unmet:
+        return False, f"not reported: {unmet}"[:240]
+    first = inventory.diff_checks(base, module_helper_weakened)[0]
+    return True, f"{2 * 2 * len(base)} expected line(s), e.g. {first}"[:240]
+
+
+REBOUND_SUITE = (
+    "def test_imports_helper_twice():\n"
+    "    from tests._gates.selftest_rebound_a import helper\n"
+    "    from tests._gates.selftest_rebound_b import helper\n"
+    "    helper(1)\n"
+)
+REBOUND_HELPER = "def helper(value):\n    assert value\n    return value\n"
+
+
+def rebound_import() -> tuple[bool, str]:
+    """One scope imports ``helper`` from two modules: which binding is live depends on
+    control flow, so dropping either helper's assert must move ``delegated`` and
+    ``body_hash``."""
+    weakened = REBOUND_HELPER.replace("    assert value\n", "")
+    suite = _synthetic("selftest_rebound_suite", REBOUND_SUITE)
+
+    def checks(a: str, b: str) -> dict[str, Any]:
+        return _synthetic_checks(
+            suite, _synthetic("selftest_rebound_a", a), _synthetic("selftest_rebound_b", b)
+        )
+
+    base = checks(REBOUND_HELPER, REBOUND_HELPER)
+    test = f"{suite.rel}::test_imports_helper_twice"
+    unmet = []
+    lines = 0
+    for label, after in (
+        ("first", checks(weakened, REBOUND_HELPER)),
+        ("second", checks(REBOUND_HELPER, weakened)),
+    ):
+        problems = inventory.diff_checks(base, after)
+        lines += len(problems)
+        for column in ("delegated", "body_hash"):
+            if not any(p.startswith(f"{test}: {column} ") for p in problems):
+                unmet.append(f"{label} helper: {column}")
+    if unmet:
+        return False, f"not reported: {unmet}"[:240]
+    return True, f"{lines} line(s) across both weakenings, delegated and body_hash each time"
+
+
+UNALIASED_SUITES = {
+    "tests.pkg.other": (
+        "def test_x():\n    import tests.pkg.other\n\n    tests.pkg.other.helper()\n"
+    ),
+    "tests": "def test_x():\n    import tests\n\n    tests.pkg.other.helper()\n",
+}
+
+
+def unaliased_tests_import() -> tuple[bool, str]:
+    """An unaliased ``import tests[.x]`` binds only ``tests``, so the inventory refuses it
+    outright, dotted or bare."""
+    texts = []
+    for imported, source in UNALIASED_SUITES.items():
+        try:
+            _synthetic_checks(_synthetic("selftest_unaliased_suite", source))
+        except inventory.UnaliasedTestsImportError as exc:
+            texts.append(str(exc))
+            expect = (
+                "tests/_gates/selftest_unaliased_suite.py:2:",
+                f"an unaliased `import {imported}`",
+                "`from tests.x import name`",
+                "`import tests.x as alias`",
+            )
+            unmet = [e for e in expect if e not in texts[-1]]
+            if unmet:
+                return False, f"not in the error: {unmet}"[:240]
+        else:
+            return False, f"accepted `import {imported}`: no error raised"
+    return True, f"{len(texts)} refused, e.g. {texts[-1]}"[:240]
+
+
+GLOBAL_SUITE = (
+    "def helper(value):\n    assert value\n    return value\n"
+    "def test_a_global_in_a_nested_def_reaches_the_module_helper():\n"
+    "    from tests._gates.selftest_global_other import helper\n"
+    "    def inner():\n"
+    "        global helper\n"
+    "        return helper(1)\n"
+    "    helper(2)\n"
+    "    inner()\n"
+    "def test_a_global_in_a_class_body_reaches_the_module_helper():\n"
+    "    from tests._gates.selftest_global_other import helper\n"
+    "    class C:\n"
+    "        global helper\n"
+    "        made = helper(1)\n"
+    "    helper(2)\n"
+)
+GLOBAL_OTHER = "def helper(value):\n    assert value > 1\n    return value\n"
+REBINDING_SUITES = {
+    "global": (
+        "def helper():\n    pass\n"
+        "def test_x():\n"
+        "    def inner():\n"
+        "        global helper\n"
+        "        from tests._gates.selftest_global_other import helper\n"
+        "    inner()\n"
+        "    helper()\n"
+    ),
+    "nonlocal": (
+        "def test_x():\n"
+        "    from tests._gates.selftest_global_other import helper\n"
+        "    def inner():\n"
+        "        nonlocal helper\n"
+        "        from tests._gates.selftest_rebound_a import helper\n"
+        "    inner()\n"
+        "    helper(1)\n"
+    ),
+}
+
+
+def global_in_nested_scope() -> tuple[bool, str]:
+    """A nested def or class body declares ``global helper`` inside a test that imports
+    another ``helper``: it calls the module-level one, so dropping that one's assert (or the
+    imported one's) moves both tests' ``delegated`` and ``body_hash``. A scope that imports a
+    ``tests`` name it declares ``global`` / ``nonlocal`` is refused."""
+
+    def checks(suite: str, other: str) -> dict[str, Any]:
+        return _synthetic_checks(
+            _synthetic("selftest_global_suite", suite),
+            _synthetic("selftest_global_other", other),
+        )
+
+    base = checks(GLOBAL_SUITE, GLOBAL_OTHER)
+    unmet = []
+    lines = 0
+    for label, after in (
+        ("module-level", checks(GLOBAL_SUITE.replace("    assert value\n", "", 1), GLOBAL_OTHER)),
+        ("imported", checks(GLOBAL_SUITE, GLOBAL_OTHER.replace("    assert value > 1\n", ""))),
+    ):
+        problems = inventory.diff_checks(base, after)
+        lines += len(problems)
+        for node_id in base:
+            for column in ("delegated", "body_hash"):
+                if not any(p.startswith(f"{node_id}: {column} ") for p in problems):
+                    unmet.append(f"{label} helper: {node_id.split('::')[1]} {column}")
+    if unmet:
+        return False, f"not reported: {unmet}"[:240]
+    for kind, source in REBINDING_SUITES.items():
+        try:
+            _synthetic("selftest_rebinding_suite", source)
+        except inventory.RebindingImportError as exc:
+            if f"`{kind} helper`" not in str(exc):
+                return False, f"{kind}: not named in the error: {exc}"[:240]
+        else:
+            return False, f"accepted an import under `{kind} helper`"
+    return True, (
+        f"{lines} line(s) across both weakenings, delegated and body_hash for each test; "
+        f"an import under global / nonlocal refused"
+    )
 
 
 def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool, str]:
@@ -298,6 +568,22 @@ def main(argv: list[str] | None = None) -> int:
             results.append((mutation.name, rejected, evidence))
         rejected, evidence = cache_reparse()
         results.append(("g: synthetic module re-parsed with another body", rejected, evidence))
+        rejected, evidence = local_import()
+        results.append(
+            ("h: helper reached by a function-local import, its assert dropped", rejected, evidence)
+        )
+        rejected, evidence = nested_scope_import()
+        results.append(
+            ("i: a nested-scope import never hides a module-level helper", rejected, evidence)
+        )
+        rejected, evidence = rebound_import()
+        results.append(
+            ("j: a name imported twice in one scope, either helper weakened", rejected, evidence)
+        )
+        rejected, evidence = unaliased_tests_import()
+        results.append(("k: an unaliased import tests[.x], dotted or bare", rejected, evidence))
+        rejected, evidence = global_in_nested_scope()
+        results.append(("l: global / nonlocal past or under a local import", rejected, evidence))
     else:
         rejected, evidence = missing_module()
         results.append(("newly missing module", rejected, evidence))

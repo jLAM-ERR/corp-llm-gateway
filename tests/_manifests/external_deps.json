@@ -6,7 +6,37 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_a_global_declaration_reaches_the_module_level_helper": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_helper_reached_by_a_function_local_import_is_in_the_closure": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_name_imported_twice_in_one_scope_reaches_both_helpers": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_nested_scope_import_never_hides_a_module_level_helper": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_a_reparsed_module_never_reads_a_stale_cache_entry": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_an_unaliased_tests_import_is_refused": {
    "files": {},
    "programs": [
     "git"
@@ -2649,7 +2679,11 @@
   },
   "tests/deploy/test_deploy_script.py::test_the_reboot_path_starts_what_the_env_file_selects": {
    "files": {
-    "compose": "dir:e003d20c321395d847c566f3d04a"
+    "compose": "dir:e003d20c321395d847c566f3d04a",
+    "compose/docker-compose.issuance.yml": "50fc9f61f162630594434d74168cd00d",
+    "compose/docker-compose.oauth.yml": "e5ef7b85b4af05ad08ff9d9308d867bf",
+    "compose/docker-compose.yml": "d57340d03100dc0eace377f28cbf97ca",
+    "compose/gateway/config.toml.example": "31cc3b5092bbdbde0d0227d61a07df89"
    },
    "programs": [
     "docker"

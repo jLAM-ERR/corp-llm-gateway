@@ -31,7 +31,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ROOT / "tests"
@@ -103,11 +103,50 @@ def _targets(node: ast.AST) -> Iterator[str]:
             yield from _targets(elt)
 
 
+def _package(name: str, path: Path) -> str:
+    return name.rsplit(".", 1)[0] if path.name != "__init__.py" else name
+
+
+class UnaliasedTestsImportError(ValueError):
+    pass
+
+
+class RebindingImportError(ValueError):
+    pass
+
+
+def _import_bindings(
+    stmt: ast.Import | ast.ImportFrom, package: str, path: Path
+) -> Iterator[tuple[str, tuple[str, str | None]]]:
+    """The names ``stmt`` binds, each as ``(name, (source module, attribute or None))``."""
+    if isinstance(stmt, ast.Import):
+        for alias in stmt.names:
+            if alias.asname:
+                yield alias.asname, (alias.name, None)
+                continue
+            if alias.name == "tests" or alias.name.startswith("tests."):
+                where = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+                raise UnaliasedTestsImportError(
+                    f"{where}:{stmt.lineno}: an unaliased `import {alias.name}` binds only "
+                    "`tests`, which the check inventory cannot follow; write "
+                    "`from tests.x import name` or `import tests.x as alias`"
+                )
+            top = alias.name.split(".", 1)[0]
+            yield top, (top, None)
+        return
+    source = stmt.module or ""
+    if stmt.level:
+        base = package.rsplit(".", stmt.level - 1)[0] if stmt.level > 1 else package
+        source = f"{base}.{source}" if source else base
+    for alias in stmt.names:
+        yield alias.asname or alias.name, (source, alias.name)
+
+
 def _index(name: str, path: Path, text: str | None = None) -> Module:
     source = path.read_text() if text is None else text
     tree = ast.parse(source, filename=str(path))
     module = Module(name, path, tree)
-    package = name.rsplit(".", 1)[0] if path.name != "__init__.py" else name
+    package = _package(name, path)
     for stmt in _top_level(tree.body):
         if isinstance(stmt, DEFS):
             module.defs[stmt.name] = stmt
@@ -117,21 +156,31 @@ def _index(name: str, path: Path, text: str | None = None) -> Module:
                     module.consts[target_name] = stmt
         elif isinstance(stmt, ast.AnnAssign | ast.AugAssign) and isinstance(stmt.target, ast.Name):
             module.consts.setdefault(stmt.target.id, stmt)
-        elif isinstance(stmt, ast.Import):
-            for alias in stmt.names:
-                if alias.asname:
-                    module.imports[alias.asname] = (alias.name, None)
-                else:
-                    top = alias.name.split(".", 1)[0]
-                    module.imports[top] = (top, None)
-        elif isinstance(stmt, ast.ImportFrom):
-            source = stmt.module or ""
-            if stmt.level:
-                base = package.rsplit(".", stmt.level - 1)[0] if stmt.level > 1 else package
-                source = f"{base}.{source}" if source else base
-            for alias in stmt.names:
-                module.imports[alias.asname or alias.name] = (source, alias.name)
+        elif isinstance(stmt, ast.Import | ast.ImportFrom):
+            module.imports.update(_import_bindings(stmt, package, path))
+    _refuse_rebinding_imports(tree, package, path)
     return module
+
+
+def _refuse_rebinding_imports(tree: ast.Module, package: str, path: Path) -> None:
+    """A scope that imports a ``tests`` name it declares ``global`` / ``nonlocal`` rebinds it
+    for code the walker resolves elsewhere; refuse it rather than miss the helper."""
+    for scope in ast.walk(tree):
+        if not isinstance(scope, DEFS):
+            continue
+        globals_, nonlocals = _declarations(scope)
+        if not globals_ | nonlocals:
+            continue
+        for name, bindings in _own_imports(scope, package, path).items():
+            tests_bound = any(s == "tests" or s.startswith("tests.") for s, _ in bindings)
+            if tests_bound and name in globals_ | nonlocals:
+                where = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+                kind = "global" if name in globals_ else "nonlocal"
+                raise RebindingImportError(
+                    f"{where}:{scope.lineno}: `{scope.name}` declares `{kind} {name}` and "
+                    f"imports `{name}` from tests, rebinding it where the check inventory "
+                    "cannot follow; import it in the scope that uses it"
+                )
 
 
 def suite_files() -> list[Path]:
@@ -269,22 +318,67 @@ def _resolve_name(module: Module, name: str, seen: frozenset[str] = frozenset())
     if name in module.consts:
         return ("const", module, module.consts[name], name)
     if name in module.imports:
-        source, attr = module.imports[name]
-        key = f"{source}:{attr}"
-        if key in seen:
-            return None
-        mods = modules()
-        if attr is None:
-            if source in mods:
-                return ("module", mods[source], None, source)
-            return None
-        if source in mods:
-            found = _resolve_name(mods[source], attr, seen | {key})
-            if found is not None:
-                return found
-        if f"{source}.{attr}" in mods:
-            return ("module", mods[f"{source}.{attr}"], None, f"{source}.{attr}")
+        return _resolve_import(*module.imports[name], seen)
     return None
+
+
+def _resolve_import(source: str, attr: str | None, seen: frozenset[str] = frozenset()):
+    key = f"{source}:{attr}"
+    if key in seen:
+        return None
+    mods = modules()
+    if attr is None:
+        if source in mods:
+            return ("module", mods[source], None, source)
+        return None
+    if source in mods:
+        found = _resolve_name(mods[source], attr, seen | {key})
+        if found is not None:
+            return found
+    if f"{source}.{attr}" in mods:
+        return ("module", mods[f"{source}.{attr}"], None, f"{source}.{attr}")
+    return None
+
+
+# Every import a scope binds a name with: which one is live depends on control flow, so
+# all of them are followed.
+ImportTable = dict[str, list[tuple[str, str | None]]]
+
+
+class Scope(NamedTuple):
+    is_class: bool
+    imports: ImportTable
+    globals: set[str]
+    nonlocals: set[str]
+
+
+# Innermost last.
+ScopeChain = tuple[Scope, ...]
+
+
+def _resolve_scoped(module: Module, chain: ScopeChain, name: str) -> list[Any]:
+    """Like ``_resolve_name``, but an import of an enclosing scope shadows the module's own
+    name; a class body's imports are visible in that body only, not in its methods. Fails
+    closed on ``global`` / ``nonlocal``: a ``global`` declaration on the way to the matching
+    scope adds the module-level target, and a ``nonlocal`` scope's imports are kept while
+    the search goes on outward."""
+    found: list[Any] = []
+    global_seen = False
+    for depth, scope in enumerate(reversed(chain)):
+        if scope.is_class and depth:
+            continue
+        global_seen |= name in scope.globals
+        if name in scope.imports:
+            found += [t for b in scope.imports[name] if (t := _resolve_import(*b)) is not None]
+            if name not in scope.nonlocals:
+                break
+    else:
+        global_seen = True
+    if global_seen:
+        target = _resolve_name(module, name)
+        if target is not None:
+            found.append(target)
+    return found
 
 
 def _decorator_names(node: ast.AST) -> list[str]:
@@ -417,6 +511,98 @@ def renames() -> dict[str, str]:
 
 
 COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+SCOPES = (*DEFS, ast.Lambda, *COMPREHENSIONS)
+
+
+def _enclosing_parts(scope: ast.AST) -> list[ast.AST]:
+    """The parts of a def, class, lambda or comprehension evaluated in the scope around it."""
+    if isinstance(scope, COMPREHENSIONS):
+        return [scope.generators[0].iter]
+    if isinstance(scope, ast.ClassDef):
+        return [
+            *scope.decorator_list,
+            *scope.bases,
+            *(k.value for k in scope.keywords),
+            *getattr(scope, "type_params", []),
+        ]
+    a = scope.args
+    parts: list[ast.AST] = [*a.defaults, *filter(None, a.kw_defaults)]
+    if isinstance(scope, FUNCS):
+        for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg]:
+            if arg is not None and arg.annotation is not None:
+                parts.append(arg.annotation)
+        parts += [*scope.decorator_list, *getattr(scope, "type_params", [])]
+        if scope.returns is not None:
+            parts.append(scope.returns)
+    return parts
+
+
+def _scope_parts(scope: ast.AST) -> list[ast.AST]:
+    """The parts of a scope evaluated in that scope itself."""
+    if isinstance(scope, COMPREHENSIONS):
+        first, *rest = scope.generators
+        parts: list[ast.AST] = [first.target, *first.ifs]
+        for gen in rest:
+            parts += [gen.target, gen.iter, *gen.ifs]
+        return parts + [getattr(scope, f) for f in ("elt", "key", "value") if hasattr(scope, f)]
+    return list(scope.body) if isinstance(scope.body, list) else [scope.body]
+
+
+def _own_nodes(scope: ast.AST) -> Iterator[ast.AST]:
+    """Every node whose nearest enclosing scope is ``scope``: a nested scope is yielded
+    itself, with its enclosing parts, but nothing inside it."""
+    stack = _scope_parts(scope)
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, SCOPES):
+            stack += _enclosing_parts(node)
+        else:
+            stack += ast.iter_child_nodes(node)
+
+
+def _declarations(scope: ast.AST) -> tuple[set[str], set[str]]:
+    """(``global`` names, ``nonlocal`` names) ``scope`` declares itself."""
+    globals_: set[str] = set()
+    nonlocals: set[str] = set()
+    if not isinstance(scope, COMPREHENSIONS):
+        for node in _own_nodes(scope):
+            if isinstance(node, ast.Global):
+                globals_ |= set(node.names)
+            elif isinstance(node, ast.Nonlocal):
+                nonlocals |= set(node.names)
+    return globals_, nonlocals
+
+
+def _own_imports(scope: ast.AST, package: str, path: Path) -> ImportTable:
+    imports: ImportTable = {}
+    if isinstance(scope, DEFS):
+        for node in _own_nodes(scope):
+            if isinstance(node, ast.Import | ast.ImportFrom):
+                for name, binding in _import_bindings(node, package, path):
+                    imports.setdefault(name, []).append(binding)
+    return imports
+
+
+def _scoped_walk(module: Module, root: ast.AST) -> Iterator[tuple[ast.AST, ScopeChain]]:
+    """Every node under ``root`` (itself included) with the import tables of the scopes it is
+    evaluated in; ``root``'s enclosing parts are evaluated at module level."""
+    package = _package(module.name, module.path)
+    stack: list[tuple[ast.AST, ScopeChain]] = [(root, ())]
+    while stack:
+        node, chain = stack.pop()
+        yield node, chain
+        if isinstance(node, SCOPES):
+            scope = Scope(
+                isinstance(node, ast.ClassDef),
+                _own_imports(node, package, module.path),
+                *_declarations(node),
+            )
+            inner = (*chain, scope)
+            stack += [(part, chain) for part in _enclosing_parts(node)]
+            stack += [(part, inner) for part in _scope_parts(node)]
+        else:
+            stack += [(child, chain) for child in ast.iter_child_nodes(node)]
 
 
 def _scope_bindings(scope: ast.AST) -> set[str]:
@@ -429,25 +615,16 @@ def _scope_bindings(scope: ast.AST) -> set[str]:
             if isinstance(n, ast.Name)
         }
     bound: set[str] = set()
-    declared: set[str] = set()
     if isinstance(scope, (*FUNCS, ast.Lambda)):
         a = scope.args
         for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg]:
             if arg is not None:
                 bound.add(arg.arg)
-    stack: list[ast.AST] = list(scope.body) if isinstance(scope.body, list) else [scope.body]
-    while stack:
-        node = stack.pop()
+    for node in _own_nodes(scope):
         if isinstance(node, DEFS):
             bound.add(node.name)
-            stack += node.decorator_list
-            if isinstance(node, ast.ClassDef):
-                stack += [*node.bases, *(k.value for k in node.keywords)]
-            else:
-                stack += [*node.args.defaults, *filter(None, node.args.kw_defaults)]
             continue
         if isinstance(node, ast.Lambda):
-            stack += [*node.args.defaults, *filter(None, node.args.kw_defaults)]
             continue
         if isinstance(node, COMPREHENSIONS):
             # A walrus inside a comprehension binds in the enclosing function.
@@ -456,7 +633,6 @@ def _scope_bindings(scope: ast.AST) -> set[str]:
                 for n in ast.walk(node)
                 if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name)
             }
-            stack.append(node.generators[0].iter)
             continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
             bound.add(node.id)
@@ -466,10 +642,8 @@ def _scope_bindings(scope: ast.AST) -> set[str]:
             bound.add(node.name)
         elif isinstance(node, ast.MatchMapping) and node.rest:
             bound.add(node.rest)
-        elif isinstance(node, ast.Global | ast.Nonlocal):
-            declared |= set(node.names)
-        stack += ast.iter_child_nodes(node)
-    return bound - declared
+    globals_, nonlocals = _declarations(scope)
+    return bound - globals_ - nonlocals
 
 
 class _Normaliser(ast.NodeTransformer):
@@ -701,7 +875,7 @@ def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -
                     queue.append((found[0], found[1], f"fixture:{arg.arg}", "fixture"))
                 else:
                     closure.external_fixtures.add(arg.arg)
-        for sub in ast.walk(node):
+        for sub, chain in _scoped_walk(module, node):
             if (
                 isinstance(sub, ast.Call)
                 and ast.unparse(sub.func).endswith("getfixturevalue")
@@ -713,19 +887,16 @@ def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -
                 if found:
                     queue.append((found[0], found[1], f"fixture:{name}", "fixture"))
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                target = _resolve_name(module, sub.id)
-                if target is None:
-                    continue
-                kind_, owner, target_node, name = target
-                if kind_ == "module":
-                    closure.module_refs.add(owner.name)
-                    continue
-                queue.append((owner, target_node, name, "def" if kind_ == "def" else "const"))
+                for kind_, owner, target_node, name in _resolve_scoped(module, chain, sub.id):
+                    if kind_ == "module":
+                        closure.module_refs.add(owner.name)
+                        continue
+                    queue.append((owner, target_node, name, "def" if kind_ == "def" else "const"))
             elif isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
-                target = _resolve_name(module, sub.value.id)
-                if target and target[0] == "module":
-                    owner = target[1]
-                    inner = _resolve_name(owner, sub.attr)
+                for target in _resolve_scoped(module, chain, sub.value.id):
+                    if target[0] != "module":
+                        continue
+                    inner = _resolve_name(target[1], sub.attr)
                     if inner and inner[0] != "module":
                         queue.append(
                             (inner[1], inner[2], inner[3], "def" if inner[0] == "def" else "const")
