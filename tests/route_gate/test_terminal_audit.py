@@ -520,7 +520,7 @@ async def test_the_terminal_record_carries_every_field_todays_record_carried() -
     timestamp and the latency, which are present in both."""
     from datetime import UTC, datetime, timedelta
 
-    from tests.test_litellm_hook import _build_guardrail, _data_with_token
+    from tests.hook_fixtures import _build_guardrail, _data_with_token
 
     pairs = [("alice@corp.example", "[EMAIL_1]"), ("Bob", "[NAME_1]")]
     # Two guardrails built alike: one Cache A would make the second request a hit.
@@ -564,7 +564,7 @@ async def test_the_terminal_record_carries_every_field_todays_record_carried() -
 
 async def test_a_refused_pre_call_deposits_nothing() -> None:
     from corp_llm_gateway.litellm_hook import GuardrailHttpException
-    from tests.test_litellm_hook import _build_guardrail
+    from tests.hook_fixtures import _build_guardrail
 
     guardrail, _ = _build_guardrail()
     ticket = RequestTicket("d" * 32)

@@ -1084,7 +1084,7 @@ async def test_a_shared_auth_lookup_survives_the_disconnect_of_the_request_that_
 ) -> None:
     from datetime import UTC, datetime
 
-    from tests.test_litellm_hook import _build_guardrail, _data_with_token
+    from tests.hook_fixtures import _build_guardrail, _data_with_token
 
     guardrail, sink = _build_guardrail()
     store = guardrail._auth._store

@@ -47,8 +47,8 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
 from corp_llm_gateway.storage import InMemoryMappingStore, MappingStore
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
+from tests.hook_fixtures import _corp_llm_returning, _RecordingMetrics
 from tests.sanitizer.test_orchestrator import _client_returning_pairs
-from tests.test_litellm_hook import _corp_llm_returning, _RecordingMetrics
 
 _CONFIG_PAYLOAD = (
     "DATABASE_URL=postgres://admin:pass@db/prod\n"

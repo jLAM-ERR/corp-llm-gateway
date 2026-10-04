@@ -65,7 +65,7 @@ def test_apply_guardrail_anywhere_in_the_mro_is_refused() -> None:
 
 
 def test_the_real_guardrail_class_is_recognised_by_type() -> None:
-    from tests.test_litellm_hook import _build_guardrail
+    from tests.hook_fixtures import _build_guardrail
 
     guardrail, _ = _build_guardrail([])
 

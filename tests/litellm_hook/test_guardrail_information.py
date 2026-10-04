@@ -47,6 +47,7 @@ from corp_llm_gateway.litellm_hook import (
 from corp_llm_gateway.metrics import BLOCK_REASONS
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.orchestrator import OVERSIZE_DELIVERED_REASON
+from tests.hook_fixtures import _build_guardrail, _build_guardrail_oversize
 from tests.litellm_hook import _dispatch_fixtures
 from tests.litellm_hook._dispatch_fixtures import (
     EMAIL,
@@ -60,7 +61,6 @@ from tests.litellm_hook._dispatch_fixtures import (
     until,
 )
 from tests.litellm_hook.test_hazard18_corp_token_snapshot import token_sites
-from tests.test_litellm_hook import _build_guardrail, _build_guardrail_oversize
 
 ROUTES = ["chat", "messages", "responses"]
 # How a request that passed our pre-call ends (as in test_hazard18_corp_token_snapshot).

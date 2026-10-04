@@ -13,7 +13,7 @@ from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
-from tests.test_litellm_hook import _corp_llm_returning, _StaticRules
+from tests.hook_fixtures import _corp_llm_returning, _StaticRules
 
 _OAUTH_TOKEN = "sk-ant-oat01-abcdef"
 _ANTHROPIC_MODEL = "claude-sonnet-4-5"

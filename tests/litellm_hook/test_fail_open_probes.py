@@ -29,6 +29,11 @@ from litellm.proxy.policy_engine.policy_registry import get_policy_registry
 from litellm.types.guardrails import LitellmParams
 
 from corp_llm_gateway.tokens import AuthMiddleware
+from tests.hook_fixtures import (
+    _build_guardrail,
+    _corp_llm_unreachable,
+    _RaisingTokenStore,
+)
 from tests.litellm_hook._dispatch_fixtures import (
     E_SANITIZER_SKIPPED,
     EMAIL,
@@ -47,11 +52,6 @@ from tests.litellm_hook._dispatch_fixtures import (
     use_engine,
 )
 from tests.postgres_support import pg_dsn, require_asyncpg, skip_or_fail
-from tests.test_litellm_hook import (
-    _build_guardrail,
-    _corp_llm_unreachable,
-    _RaisingTokenStore,
-)
 
 
 @pytest.fixture

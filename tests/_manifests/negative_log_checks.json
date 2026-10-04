@@ -912,98 +912,98 @@
    "note": "searches a config file's text, not log output"
   },
   {
-   "site": "tests/test_litellm_hook.py:5821",
+   "site": "tests/test_litellm_hook.py:5263",
    "owner": "tests/test_litellm_hook.py::test_an_unavailable_token_store_is_503_not_500",
    "check": "'tok-secret-7c1f' not in caplog.text",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_litellm_hook.py:5820",
+   "site": "tests/test_litellm_hook.py:5262",
    "owner": "tests/test_litellm_hook.py::test_an_unavailable_token_store_is_503_not_500",
    "check": "_STORE_DETAIL not in caplog.text",
    "class": "security",
    "note": "no backend or exception detail in a log line (M1-14 error surface)"
   },
   {
-   "site": "tests/test_litellm_hook.py:501",
+   "site": "tests/test_litellm_hook.py:257",
    "owner": "tests/test_litellm_hook.py::test_post_call_stream_own_bug_mid_stream_returns_opaque_500",
    "check": "'alice' not in json.dumps(out) and 'alice' not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/test_litellm_hook.py:2857",
+   "site": "tests/test_litellm_hook.py:2429",
    "owner": "tests/test_litellm_hook.py::test_post_call_unary_reconstruct_failure_log_has_no_original",
    "check": "'alice' not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/test_litellm_hook.py:446",
+   "site": "tests/test_litellm_hook.py:202",
    "owner": "tests/test_litellm_hook.py::test_post_call_unary_unexpected_error_returns_opaque_500",
    "check": "'alice' not in json.dumps(body) and 'alice' not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/test_litellm_hook.py:348",
+   "site": "tests/test_litellm_hook.py:116",
    "owner": "tests/test_litellm_hook.py::test_pre_call_backend_db_error_returns_opaque_500",
    "check": "'corp_tokens' not in caplog.text",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_litellm_hook.py:4008",
+   "site": "tests/test_litellm_hook.py:3541",
    "owner": "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_logs",
    "check": "'[EMAIL_001]' not in log_text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/test_litellm_hook.py:4003",
+   "site": "tests/test_litellm_hook.py:3536",
    "owner": "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_logs",
    "check": "secret not in msg_text",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_litellm_hook.py:4023",
+   "site": "tests/test_litellm_hook.py:3556",
    "owner": "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_system_logs",
    "check": "'hunter2secret' not in msg",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_litellm_hook.py:4022",
+   "site": "tests/test_litellm_hook.py:3555",
    "owner": "tests/test_litellm_hook.py::test_pre_call_no_leak_original_in_system_logs",
    "check": "secret_env not in msg",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_litellm_hook.py:5701",
+   "site": "tests/test_litellm_hook.py:5164",
    "owner": "tests/test_litellm_hook.py::test_pre_call_unknown_role_logs_invalid_not_verbatim",
    "check": "injected not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/test_litellm_hook.py:5166",
+   "site": "tests/test_litellm_hook.py:4699",
    "owner": "tests/test_litellm_hook.py::test_tool_use_input_no_leak_in_logs",
    "check": "secret not in msg",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_litellm_hook.py:4878",
+   "site": "tests/test_litellm_hook.py:4411",
    "owner": "tests/test_litellm_hook.py::test_user_typed_placeholder_literal_preserved_not_collided",
    "check": "'[EMAIL_001]' not in breadcrumb_lines[0]",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/test_litellm_hook.py:4877",
+   "site": "tests/test_litellm_hook.py:4410",
    "owner": "tests/test_litellm_hook.py::test_user_typed_placeholder_literal_preserved_not_collided",
    "check": "'a@corp.example' not in breadcrumb_lines[0]",
    "class": "security",

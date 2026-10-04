@@ -43,7 +43,7 @@ from corp_llm_gateway.route_gate import middleware as gate_middleware
 from corp_llm_gateway.route_gate.desanitize_middleware import DesanitizeMiddleware, ResponseMappings
 from corp_llm_gateway.route_gate.inflight import InflightLimiter, RequestTicket, current_ticket
 from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
-from tests.test_litellm_hook import _build_guardrail
+from tests.hook_fixtures import _build_guardrail
 
 EMAIL = "alice.secret@corp.example"
 PLACEHOLDER = "[EMAIL_1]"
