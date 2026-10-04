@@ -80,6 +80,8 @@ comprehension or class body binds itself (an argument, an assignment, a loop / `
 The walker resolves a function-local import of a `tests.` module like a module-level one, so
 the helper it binds joins the test's closure; by the rule above the rename is not applied to
 that name, so renaming a helper reached only that way changes the test's `body_hash`.
+An unaliased dotted `import tests.x` binds only `tests`, so the inventory refuses it; write
+`from tests.x import name` or `import tests.x as alias`.
 `delegated` is keyed by the helper's bare name, so a move keeps it; two reached helpers that
 share a name in different modules are both kept, as a list of their counts.
 

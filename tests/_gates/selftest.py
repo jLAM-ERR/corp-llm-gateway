@@ -9,7 +9,9 @@ synthetic module re-parsed with another body hashes differently every time (no s
 cache entry survives a re-parse); and (h) a synthetic helper reached only through a
 function-local ``from tests.… import`` loses its assert (a sibling test that names it
 without the import must not move); (i) an import in a nested def, or in another method of
-a class, binds in that scope only, so the module-level helper the test calls stays reached.
+a class, binds in that scope only, so the module-level helper the test calls stays reached;
+(j) a name one scope imports from two modules reaches both helpers, so weakening either
+moves the test; and (k) an unaliased ``import tests.x.y`` is refused with an error.
 
 Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
 stops being collected, a lost parametrize case, a setup-time skip, a changed
@@ -262,6 +264,65 @@ def nested_scope_import() -> tuple[bool, str]:
     return True, f"{2 * 2 * len(base)} expected line(s), e.g. {first}"[:240]
 
 
+REBOUND_SUITE = (
+    "def test_imports_helper_twice():\n"
+    "    from tests._gates.selftest_rebound_a import helper\n"
+    "    from tests._gates.selftest_rebound_b import helper\n"
+    "    helper(1)\n"
+)
+REBOUND_HELPER = "def helper(value):\n    assert value\n    return value\n"
+
+
+def rebound_import() -> tuple[bool, str]:
+    """One scope imports ``helper`` from two modules: which binding is live depends on
+    control flow, so dropping either helper's assert must move ``delegated`` and
+    ``body_hash``."""
+    weakened = REBOUND_HELPER.replace("    assert value\n", "")
+    suite = _synthetic("selftest_rebound_suite", REBOUND_SUITE)
+
+    def checks(a: str, b: str) -> dict[str, Any]:
+        return _synthetic_checks(
+            suite, _synthetic("selftest_rebound_a", a), _synthetic("selftest_rebound_b", b)
+        )
+
+    base = checks(REBOUND_HELPER, REBOUND_HELPER)
+    test = f"{suite.rel}::test_imports_helper_twice"
+    unmet = []
+    lines = 0
+    for label, after in (
+        ("first", checks(weakened, REBOUND_HELPER)),
+        ("second", checks(REBOUND_HELPER, weakened)),
+    ):
+        problems = inventory.diff_checks(base, after)
+        lines += len(problems)
+        for column in ("delegated", "body_hash"):
+            if not any(p.startswith(f"{test}: {column} ") for p in problems):
+                unmet.append(f"{label} helper: {column}")
+    if unmet:
+        return False, f"not reported: {unmet}"[:240]
+    return True, f"{lines} line(s) across both weakenings, delegated and body_hash each time"
+
+
+UNALIASED_SUITE = "def test_x():\n    import tests.pkg.other\n\n    tests.pkg.other.helper()\n"
+
+
+def unaliased_dotted_import() -> tuple[bool, str]:
+    """``import tests.x.y`` binds only ``tests``, so the inventory refuses it outright."""
+    try:
+        _synthetic_checks(_synthetic("selftest_unaliased_suite", UNALIASED_SUITE))
+    except inventory.UnaliasedTestsImportError as exc:
+        text = str(exc)
+        expect = (
+            "tests/_gates/selftest_unaliased_suite.py:2:",
+            "`import tests.pkg.other`",
+            "`from tests.x import name`",
+            "`import tests.x as alias`",
+        )
+        unmet = [e for e in expect if e not in text]
+        return not unmet, (f"not in the error: {unmet}" if unmet else text)[:240]
+    return False, "accepted: no error raised"
+
+
 def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool, str]:
     path = ROOT / mutation.path
     original = path.read_text()
@@ -421,6 +482,12 @@ def main(argv: list[str] | None = None) -> int:
         results.append(
             ("i: a nested-scope import never hides a module-level helper", rejected, evidence)
         )
+        rejected, evidence = rebound_import()
+        results.append(
+            ("j: a name imported twice in one scope, either helper weakened", rejected, evidence)
+        )
+        rejected, evidence = unaliased_dotted_import()
+        results.append(("k: an unaliased dotted tests.* import", rejected, evidence))
     else:
         rejected, evidence = missing_module()
         results.append(("newly missing module", rejected, evidence))

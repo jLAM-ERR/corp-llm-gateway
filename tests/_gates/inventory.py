@@ -107,24 +107,35 @@ def _package(name: str, path: Path) -> str:
     return name.rsplit(".", 1)[0] if path.name != "__init__.py" else name
 
 
-def _bind_import(
-    imports: dict[str, tuple[str, str | None]], stmt: ast.Import | ast.ImportFrom, package: str
-) -> None:
-    """Record the names ``stmt`` binds as ``name -> (source module, attribute or None)``."""
+class UnaliasedTestsImportError(ValueError):
+    pass
+
+
+def _import_bindings(
+    stmt: ast.Import | ast.ImportFrom, package: str, path: Path
+) -> Iterator[tuple[str, tuple[str, str | None]]]:
+    """The names ``stmt`` binds, each as ``(name, (source module, attribute or None))``."""
     if isinstance(stmt, ast.Import):
         for alias in stmt.names:
             if alias.asname:
-                imports[alias.asname] = (alias.name, None)
-            else:
-                top = alias.name.split(".", 1)[0]
-                imports[top] = (top, None)
+                yield alias.asname, (alias.name, None)
+                continue
+            if alias.name.startswith("tests."):
+                where = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+                raise UnaliasedTestsImportError(
+                    f"{where}:{stmt.lineno}: `import {alias.name}` binds only `tests`, which "
+                    "the check inventory cannot follow; write `from tests.x import name` or "
+                    "`import tests.x as alias`"
+                )
+            top = alias.name.split(".", 1)[0]
+            yield top, (top, None)
         return
     source = stmt.module or ""
     if stmt.level:
         base = package.rsplit(".", stmt.level - 1)[0] if stmt.level > 1 else package
         source = f"{base}.{source}" if source else base
     for alias in stmt.names:
-        imports[alias.asname or alias.name] = (source, alias.name)
+        yield alias.asname or alias.name, (source, alias.name)
 
 
 def _index(name: str, path: Path, text: str | None = None) -> Module:
@@ -142,7 +153,7 @@ def _index(name: str, path: Path, text: str | None = None) -> Module:
         elif isinstance(stmt, ast.AnnAssign | ast.AugAssign) and isinstance(stmt.target, ast.Name):
             module.consts.setdefault(stmt.target.id, stmt)
         elif isinstance(stmt, ast.Import | ast.ImportFrom):
-            _bind_import(module.imports, stmt, package)
+            module.imports.update(_import_bindings(stmt, package, path))
     return module
 
 
@@ -303,20 +314,23 @@ def _resolve_import(source: str, attr: str | None, seen: frozenset[str] = frozen
     return None
 
 
-ImportTable = dict[str, tuple[str, str | None]]
+# Every import a scope binds a name with: which one is live depends on control flow, so
+# all of them are followed.
+ImportTable = dict[str, list[tuple[str, str | None]]]
 # (is a class body, the imports that scope binds itself), innermost last.
 ScopeChain = tuple[tuple[bool, ImportTable], ...]
 
 
-def _resolve_scoped(module: Module, chain: ScopeChain, name: str):
+def _resolve_scoped(module: Module, chain: ScopeChain, name: str) -> list[Any]:
     """Like ``_resolve_name``, but an import of an enclosing scope shadows the module's own
     name; a class body's imports are visible in that body only, not in its methods."""
     for depth, (is_class, table) in enumerate(reversed(chain)):
         if is_class and depth:
             continue
         if name in table:
-            return _resolve_import(*table[name])
-    return _resolve_name(module, name)
+            return [t for t in (_resolve_import(*b) for b in table[name]) if t is not None]
+    target = _resolve_name(module, name)
+    return [] if target is None else [target]
 
 
 def _decorator_names(node: ast.AST) -> list[str]:
@@ -499,24 +513,27 @@ def _own_nodes(scope: ast.AST) -> Iterator[ast.AST]:
             stack += ast.iter_child_nodes(node)
 
 
-def _own_imports(scope: ast.AST, package: str) -> ImportTable:
+def _own_imports(scope: ast.AST, package: str, path: Path) -> ImportTable:
     imports: ImportTable = {}
     if isinstance(scope, DEFS):
         for node in _own_nodes(scope):
             if isinstance(node, ast.Import | ast.ImportFrom):
-                _bind_import(imports, node, package)
+                for name, binding in _import_bindings(node, package, path):
+                    imports.setdefault(name, []).append(binding)
     return imports
 
 
-def _scoped_walk(root: ast.AST, package: str) -> Iterator[tuple[ast.AST, ScopeChain]]:
+def _scoped_walk(module: Module, root: ast.AST) -> Iterator[tuple[ast.AST, ScopeChain]]:
     """Every node under ``root`` (itself included) with the import tables of the scopes it is
     evaluated in; ``root``'s enclosing parts are evaluated at module level."""
+    package = _package(module.name, module.path)
     stack: list[tuple[ast.AST, ScopeChain]] = [(root, ())]
     while stack:
         node, chain = stack.pop()
         yield node, chain
         if isinstance(node, SCOPES):
-            inner = (*chain, (isinstance(node, ast.ClassDef), _own_imports(node, package)))
+            table = _own_imports(node, package, module.path)
+            inner = (*chain, (isinstance(node, ast.ClassDef), table))
             stack += [(part, chain) for part in _enclosing_parts(node)]
             stack += [(part, inner) for part in _scope_parts(node)]
         else:
@@ -795,7 +812,7 @@ def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -
                     queue.append((found[0], found[1], f"fixture:{arg.arg}", "fixture"))
                 else:
                     closure.external_fixtures.add(arg.arg)
-        for sub, chain in _scoped_walk(node, _package(module.name, module.path)):
+        for sub, chain in _scoped_walk(module, node):
             if (
                 isinstance(sub, ast.Call)
                 and ast.unparse(sub.func).endswith("getfixturevalue")
@@ -807,19 +824,16 @@ def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -
                 if found:
                     queue.append((found[0], found[1], f"fixture:{name}", "fixture"))
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                target = _resolve_scoped(module, chain, sub.id)
-                if target is None:
-                    continue
-                kind_, owner, target_node, name = target
-                if kind_ == "module":
-                    closure.module_refs.add(owner.name)
-                    continue
-                queue.append((owner, target_node, name, "def" if kind_ == "def" else "const"))
+                for kind_, owner, target_node, name in _resolve_scoped(module, chain, sub.id):
+                    if kind_ == "module":
+                        closure.module_refs.add(owner.name)
+                        continue
+                    queue.append((owner, target_node, name, "def" if kind_ == "def" else "const"))
             elif isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
-                target = _resolve_scoped(module, chain, sub.value.id)
-                if target and target[0] == "module":
-                    owner = target[1]
-                    inner = _resolve_name(owner, sub.attr)
+                for target in _resolve_scoped(module, chain, sub.value.id):
+                    if target[0] != "module":
+                        continue
+                    inner = _resolve_name(target[1], sub.attr)
                     if inner and inner[0] != "module":
                         queue.append(
                             (inner[1], inner[2], inner[3], "def" if inner[0] == "def" else "const")

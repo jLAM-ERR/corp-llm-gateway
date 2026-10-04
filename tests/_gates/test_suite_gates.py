@@ -85,6 +85,18 @@ def test_a_nested_scope_import_never_hides_a_module_level_helper() -> None:
     assert rejected, evidence
 
 
+def test_a_name_imported_twice_in_one_scope_reaches_both_helpers() -> None:
+    rejected, evidence = selftest.rebound_import()
+
+    assert rejected, evidence
+
+
+def test_an_unaliased_dotted_tests_import_is_refused() -> None:
+    rejected, evidence = selftest.unaliased_dotted_import()
+
+    assert rejected, evidence
+
+
 def test_a_rename_leaves_a_name_the_function_binds_itself(monkeypatch: pytest.MonkeyPatch) -> None:
     source = (
         "def helper():\n    return 1\n"
