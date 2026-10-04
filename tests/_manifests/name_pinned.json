@@ -442,7 +442,7 @@
    "CLAUDE.md:72"
   ],
   "tests/integration/test_anthropic_oauth_outbound.py": [
-   "docs/ops/upgrade.md:193",
+   "docs/ops/upgrade.md:194",
    "docs/security.md:650",
    "docs/security.ru.md:604"
   ],
@@ -533,7 +533,7 @@
    "docs/security.ru.md:1263"
   ],
   "tests/litellm_hook/test_litellm_route_assumptions.py": [
-   "docs/ops/upgrade.md:190",
+   "docs/ops/upgrade.md:191",
    "docs/security.md:690",
    "docs/security.ru.md:645"
   ],
@@ -654,8 +654,8 @@
   ],
   "tests/test_litellm_pin.py": [
    "docs/extending.md:149",
-   "docs/ops/upgrade.md:150",
-   "docs/ops/upgrade.md:184"
+   "docs/ops/upgrade.md:151",
+   "docs/ops/upgrade.md:185"
   ]
  }
 }

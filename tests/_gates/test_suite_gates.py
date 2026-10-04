@@ -11,6 +11,9 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+import yaml
+
 from tests._gates import fingerprint, inventory, ledger, must_keep, name_pinned, negative_logs
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +36,29 @@ def test_every_external_dependency_resolves_and_matches_the_baseline() -> None:
     assert inventory.diff_external(recorded, external) == []
 
 
+def test_each_test_in_a_module_keeps_its_own_external_files() -> None:
+    source = (
+        "from pathlib import Path\n"
+        "ROOT = Path(__file__).resolve().parents[2]\n"
+        "def test_reads_pyproject():\n"
+        "    assert (ROOT / 'pyproject.toml').read_text()\n"
+        "def test_reads_readme():\n"
+        "    assert (ROOT / 'README.md').read_text()\n"
+    )
+    path = ROOT / "tests" / "_gates" / "two_external_readers.py"
+    module = inventory._index("tests._gates.two_external_readers", path, source)
+
+    _, external = inventory.collect(
+        (module, qual, node, cls) for qual, node, cls in inventory._tests_in(module)
+    )
+
+    files = {node_id.split("::")[1]: entry["files"] for node_id, entry in external["tests"].items()}
+    assert files == {
+        "test_reads_pyproject": {"pyproject.toml": inventory.file_hash("pyproject.toml")},
+        "test_reads_readme": {"README.md": inventory.file_hash("README.md")},
+    }
+
+
 def test_every_override_names_a_live_site_and_says_why() -> None:
     sites = json.loads(inventory.OVERRIDES_PATH.read_text())["sites"]
     files = {site.split("::", 1)[0] for site in sites}
@@ -47,9 +73,39 @@ def test_the_name_pinned_index_is_consistent() -> None:
     assert name_pinned.problems(recorded, name_pinned.build()) == []
 
 
+def test_git_and_the_tree_resolve_the_same_citation_sources() -> None:
+    tracked = set(inventory.tracked_files())
+    from_tree = set(name_pinned.tree_doc_files())
+    from_git = set(name_pinned.git_doc_files())
+
+    # A clean checkout has no ignored files, so there the two sets are equal.
+    assert from_tree & tracked == from_git
+    assert from_git <= from_tree
+    assert not any(path.startswith("docs/testing/") for path in from_git)
+
+
 def test_every_must_keep_id_is_present_with_an_expected_outcome() -> None:
     assert must_keep.read()
     assert must_keep.problems() == []
+
+
+def test_dropping_a_must_keep_id_needs_a_rule_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    committed = must_keep.read()
+    dropped = "tests/test_serve.py::test_one_worker_only"
+    monkeypatch.setattr(must_keep, "read", lambda: [i for i in committed if i != dropped])
+
+    assert f"the rules select a test missing from must_keep.txt: {dropped}" in must_keep.problems()
+
+
+def test_the_test_job_checks_out_the_history_the_must_keep_rule_reads() -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    checkout = next(
+        step
+        for step in workflow["jobs"]["test"]["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+
+    assert checkout.get("with", {}).get("fetch-depth") == 0
 
 
 def test_every_negative_log_check_is_reviewed() -> None:

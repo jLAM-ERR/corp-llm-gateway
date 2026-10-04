@@ -6,13 +6,13 @@ baseline commit **`807831a`** (release/1.0.x). Task 0 built them and changed no 
 
 | Gate | What it compares | Where |
 |---|---|---|
-| 1. Check inventory | per test function: asserts, `pytest.raises` / `pytest.fail` sites, helpers it reaches that check something, parametrize tables and loop iterables, fixtures, helpers, constants, and one hash over the normalised body of the test plus everything it reaches | `tests/_manifests/baseline_checks/<dir>.json` |
+| 1. Check inventory | per test function: asserts, `pytest.raises` / `pytest.fail` sites, helpers it reaches that check something, parametrize tables and loop iterables, fixtures, helpers, constants, and one hash over the normalised body of the test plus everything it reaches | `tests/_manifests/baseline_checks/<dir>.json`, one per module for `tests/*.py` (`_root__<module>.json`) |
 | 1. External dependencies | every repo file a test reaches outside the Python call graph (scripts run by `subprocess`, templates, configs it reads), hashed whole; a launch the walker cannot resolve fails until reviewed | `tests/_manifests/external_deps.json`, `external_deps_overrides.json` |
 | 2. Must-keep | node ids no PR may delete, re-split or reduce | `tests/_manifests/must_keep.txt` |
 | 3. Coverage | per source file: executed lines and branch arcs; any drop fails (a second clean run per environment covered every recorded line and arc) | `tests/_manifests/coverage.{minimal,full}.json` |
 | 4. Expected outcomes | per node id and environment: `passed`, `skipped:<reason>`, `collection-skipped:<reason>`, `not-applicable:<note>` | `tests/_manifests/expected_outcomes.{minimal,full}.json`, `not_applicable.json` |
 | 4. Environments | the two venv recipes and their fingerprints | `scripts/test-env.sh`, `scripts/test-env.{minimal,full}.txt`, `tests/_manifests/env_fingerprint.{minimal,full}.json` |
-| Name-pinned index | every test the acceptance matrix or a doc cites by name, with its citing sites | `tests/_manifests/name_pinned.json` |
+| Name-pinned index | every test the acceptance matrix or a doc (`CLAUDE.md`, `README.md`, `docs/*.md`, `docs/ops/*.md`) cites by name, with its citing sites | `tests/_manifests/name_pinned.json` |
 | Negative-log review | every assertion that a log line does *not* hold something, reviewed by hand | `tests/_manifests/negative_log_checks.json` |
 
 The static half runs in every pytest run (`tests/_gates/test_suite_gates.py`). The
@@ -53,6 +53,12 @@ never goes away, and coverage may only grow. Both change only on a re-baseline (
 production change under `litellm_hook.py`, `route_gate/` or `sanitizer/streaming.py`, or a
 dependency bump), with the manifest diff reviewed.
 
+A move PR that renames a module-level helper, fixture, class or constant records it in
+`tests/_manifests/renames.json` as `{"names": {"<new name>": "<old name>"}}`. The inventory
+applies it to the current tree, new → old, so the moved code hashes as the baseline did.
+Only module-level names are rewritten (the `def` / `class` statement and loads of a name the
+module defines or imports), never locals, attributes or arguments that share the name.
+
 ## The two environments
 
 | | minimal | full |
@@ -61,7 +67,7 @@ dependency bump), with the manifest diff reviewed.
 | constraints | `scripts/test-env.minimal.txt` | `scripts/test-env.full.txt` (`.venv-bench`'s versions) |
 | litellm, prometheus_client, asyncpg, natasha, spacy, cryptography | all absent | all present, litellm 1.101.0 |
 | invocation | `CORP_REQUIRE_PROXY_CAPTURE=1`, no `CI`, no `CORP_TEST_PG_DSN` | `CI=true`, `CORP_REQUIRE_PROXY_CAPTURE=1`, `CORP_TEST_PG_DSN`, Postgres reachable |
-| baseline run | 4,683 passed, 390 skipped, 20 modules collection-skipped (834 ids), 15 not-applicable | 5,906 passed, 2 skipped, 14 not-applicable |
+| baseline run | 4,688 passed, 394 skipped, 20 modules collection-skipped (834 ids), 11 not-applicable | 5,911 passed, 6 skipped, 10 not-applicable |
 
 The fingerprint (the six markers + a sorted `name==version` list, the editable checkout
 normalised, `pip`/`setuptools`/`wheel` left out) is asserted before collection. Both
@@ -77,18 +83,14 @@ Why minimal has no `CI`: under `CI=true`, `tests/postgres_support.py` turns "asy
 installed" into a failure, where the minimal ledger expects the skip. GitHub sets `CI` on
 every step, so `scripts/test-gates.sh` unsets it for minimal.
 
-The union of the two ledgers is the baseline collection: 5,922 ids. Every test function the
+The union of the two ledgers is the baseline collection: 5,927 ids. Every test function the
 inventory finds has at least one of them.
 
 ### Not-applicable cases (`not_applicable.json`)
 
-- 14 `tests/e2e/` cases skip in both environments: they need the e2e compose stack
-  (`LANGFUSE_URL`, `REDIS_URL` + `CORP_LLM_ENDPOINT`, `RUN_PROXY_E2E`). ⚠️ **Finding:** no CI
-  job runs them, and four of them are security checks —
-  `test_langfuse_pipeline.py::test_no_originals_in_batch_payload`,
-  `test_proxy_pipeline.py::test_proxy_forwards_authorization_untouched`,
-  `::test_proxy_injects_x_corp_auth`, `::test_proxy_401_when_token_missing`. None is
-  must-keep; the DRI decides whether a CI job runs them before Task 1.
+- 10 `tests/e2e/` cases skip in both environments: they need the e2e compose stack
+  (`LANGFUSE_URL`, `REDIS_URL` + `CORP_LLM_ENDPOINT`, `RUN_PROXY_E2E`), which no CI job
+  runs. None of the ten is a security check.
 - `tests/route_gate/test_inflight.py::test_a_finished_downstream_frees_the_slot_without_extra_loop_hops[uvloop]`
   exists only where `uvloop` is importable (full).
 - The plan expected the service-less overlay cases of
@@ -96,13 +98,30 @@ inventory finds has at least one of them.
   On `807831a` every compose file defines the gateway service, so they all pass in both
   environments and nothing is recorded for them.
 
-No must-keep id is skipped or collection-skipped in both environments.
+### ⚠️ Open finding: four must-keep security checks skip in both environments
+
+`tests/e2e/test_langfuse_pipeline.py::test_no_originals_in_batch_payload`,
+`tests/e2e/test_proxy_pipeline.py::test_proxy_forwards_authorization_untouched`,
+`::test_proxy_injects_x_corp_auth` and `::test_proxy_401_when_token_missing` need the same
+e2e stack. They are security checks, so they are **not** in the not-applicable class: both
+ledgers record them as plain `skipped:<reason>`, and they are must-keep, so no prune can
+touch them while the DRI decides whether a CI job runs them (the ⚠️ in the plan's Task 0).
+
+Apart from these four (`SKIPPED_IN_BOTH_OPEN` in `tests/_gates/must_keep.py`), no
+must-keep id is skipped or collection-skipped in both environments, and the must-keep gate
+fails if one becomes so.
 
 ## Must-keep (`must_keep.txt`)
 
-4,297 node ids (1,830 test functions, every parametrised case listed) in 104 files.
+4,402 node ids (1,923 test functions, every parametrised case listed) in 110 files.
 `python -m tests._gates.must_keep --write` rebuilds the list from the rules in
-`tests/_gates/must_keep.py`:
+`tests/_gates/must_keep.py`. `--check` (and the guard test) rebuilds it too and fails when
+the rules select an id the committed list lacks, so dropping a must-keep id means editing
+the rules, in review. The step-1 rule for modified files reads `git diff e9e877f..807831a`
+against `807831a`'s own copy of each file, so later moves inside a file do not shift it. A
+clone without those two commits falls back, with a warning, to the ids already committed
+for those files; CI's `test` job checks out with `fetch-depth: 0` so it never does
+(`tests/_gates/test_suite_gates.py` pins that).
 
 **Step 1 — the whole test diff of PR #16-#18** (`git diff --name-status e9e877f..807831a -- tests/`:
 75 added, 25 modified).
@@ -127,13 +146,13 @@ No must-keep id is skipped or collection-skipped in both environments.
 
   | file | must-keep tests | note |
   |---|---|---|
-  | `test_litellm_hook.py` | 21 | the plan names the ticket / terminal-audit section: every test from `:5975` to the end (the no-response-side-hook, ticket hand-over and usage sections). Its other changed lines are PR #18's swap of the response tests onto `tests/response_restore.py`; those are reviewed per case in Tasks 2 / 3b |
+  | `test_litellm_hook.py` | 85 | the same rule as the other files: the 80 tests the diff added or changed, which include the ticket / terminal-audit section the plan names (`:5975` to the end), the token-store bound tests (`:5829-5914`), the held-tail and tool-call stream tests (`:2489`, `:2504`, `:3500`) and PR #18's swap of the response tests onto `tests/response_restore.py`; + 5 security negative-log checks |
   | `test_settings.py` | 72 | the capacity and issuance keys PR #16 added (70 tests) + two policy defaults |
   | `test_bootstrap.py` | 9 | 6 changed by the diff + negative-log checks |
   | `test_bootstrap_edges.py` | 0 | the diff changed a helper, no test |
   | `test_litellm_config.py` | 3 | |
   | `test_litellm_hook_adversarial.py` | 1 | the harness swap touched one test |
-  | `deploy/test_deploy_script.py` | 43 | the deploy flow PR #17 added |
+  | `deploy/test_deploy_script.py` | 44 | the deploy flow PR #17 added (43) + the `$ENV_FILE` never-read check (step 2) |
   | `tokens/test_token_store_contract.py` | 29 | the issuance races and the jti contract |
   | `tokens/test_postgres_store.py` | 7 | the Postgres races |
   | `team_config/test_postgres_store.py` | 2 | |
@@ -146,9 +165,15 @@ No must-keep id is skipped or collection-skipped in both environments.
 `sanitizer/test_dlp_guard.py`, `sanitizer/test_oauth_system_preamble.py`, every
 `tests/litellm_hook/` module, `healthz/test_issue_token_*.py` + `test_issuance_schema_gate.py`,
 `tokens/test_{oidc_verifier,issuance_policy,middleware*}.py`, `tests/compose/**`,
-`tests/integration/**`, `docs/test_docs_pins.py`; and by id
-`test_litellm_hook.py::test_the_guardrail_defines_no_response_side_hook` and
-`::test_a_ticketed_pre_call_hands_the_mapping_and_the_record_to_the_ticket`.
+`tests/integration/**`, `docs/test_docs_pins.py`, `auth/test_rbac.py` (operator JWT: RS256
+claims accepted; HS256, forged, expired, wrong audience / issuer, missing role rejected),
+`test_serve.py` (the served target is the gated app, one worker); and by id
+`test_litellm_hook.py::test_the_guardrail_defines_no_response_side_hook`,
+`::test_a_ticketed_pre_call_hands_the_mapping_and_the_record_to_the_ticket`,
+`sanitizer/test_allowlist.py::test_allowlisted_secret_label_not_dropped` (an allowlist
+never drops a secret's label), `deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed`
+and its `deploy/test_deploy_script.py` twin, and the four e2e security checks of the open
+finding above.
 
 **Security-policy defaults** that look trivial: `test_config.py::test_corp_llm_verify_defaults_to_true`,
 `test_settings.py::test_forward_anthropic_auth_defaults_off`, `::test_route_gate_extras_default_to_empty`,
@@ -167,7 +192,8 @@ The 151 tests that run a security one, directly or through `_assert_gate_surface
 fails the guard until it is reviewed.
 
 **Name-pinned tests** (`name_pinned.json`): the acceptance matrix's `_ALL` (105 ids in 21
-files) and every test a doc cites — 47 distinct names in `docs/security.md`,
+files) and every test a citation source (`CLAUDE.md`, `README.md`, `docs/*.md`,
+`docs/ops/*.md`, each `*` one path segment; this directory is not a source) cites — 47 distinct names in `docs/security.md`,
 `docs/security.ru.md`, `docs/ops/capacity{,.ru}.md` (bare `::name`, `file.py::name`, a
 served `name`, `{a,b}` expansions), 116 ids in all, plus 40 cited test paths.
 `CLAUDE.md`'s `tests/sanitizer/test_engine.py::test_name` is the allow-listed placeholder.
@@ -176,16 +202,17 @@ Renaming or moving one updates the matrix and every citing site in the same PR.
 ## Gate self-tests
 
 Each mutation weakens a check and leaves every assert in place; the tree is restored after
-each. `python -m tests._gates.selftest inventory` (any venv) and
+each. An inventory self-test passes only when the gate reports the named column on every
+named test, so a column the gate stops filling fails it. `python -m tests._gates.selftest inventory` (any venv) and
 `python -m tests._gates.selftest ledger` (minimal venv):
 
 | # | mutation | rejected by |
 |---|---|---|
-| a | drop the `_assert_gate_surfaces_are_clean(...)` call in `invariants/test_no_originals_leak.py::test_a_refused_route_leaks_no_original_on_any_of_the_six_surfaces` | inventory: body hash + delegated checks |
-| b | replace the `try / pytest.fail` in `sanitizer/test_streaming_adversarial.py::test_framing_integrity_every_data_line_is_valid_json` with a bare `json.loads` | inventory: body hash + fail count |
-| c | build `test_oauth_system_preamble.py`'s guardrail with `RegexChecksumDetector()` only | inventory: every test using `_guardrail` |
-| d | select lines by `".env"` instead of `"$ENV_FILE"` in `deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed` | inventory: body hash |
-| e | make `holding_after` in `tests/desanitize_served_script.py` return `[]` | external dependencies: every served-stack test |
+| a | drop the `_assert_gate_surfaces_are_clean(...)` call in `invariants/test_no_originals_leak.py::test_a_refused_route_leaks_no_original_on_any_of_the_six_surfaces` | inventory: that test's `delegated` and `helpers` |
+| b | replace the `try / pytest.fail` in `sanitizer/test_streaming_adversarial.py::test_framing_integrity_every_data_line_is_valid_json` with a bare `json.loads` | inventory: that test's `fail 1 -> 0` |
+| c | build `test_oauth_system_preamble.py`'s guardrail with `RegexChecksumDetector()` only | inventory: `body_hash` of every test whose recorded `helpers` holds `_guardrail` (27) |
+| d | select lines by `".env"` instead of `"$ENV_FILE"` in `deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed` | inventory: that test's `body_hash` |
+| e | make `holding_after` in `tests/desanitize_served_script.py` return `[]` | external dependencies: `external tests/desanitize_served_script.py` of every test that records it (20) |
 | L1 | rename `team_config/test_store.py` so it is not collected | expected outcomes: missing ids |
 | L2 | drop the `redis` param of `storage/test_mapping_store.py`'s `store` fixture | expected outcomes: missing `[redis]` ids |
 | L3 | an autouse fixture that skips at setup in `team_config/test_store.py` | expected outcomes: `passed` → `skipped:…` |

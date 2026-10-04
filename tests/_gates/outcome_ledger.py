@@ -8,7 +8,7 @@ not in ``addopts``. Writes ``--outcome-ledger=PATH``:
   teardown reports (never from ``-rA`` text, which folds parametrised skips together);
 - ``collection_skipped``: module node id -> reason, for a module whose module-level
   ``importorskip`` / ``pytest.skip(allow_module_level=True)`` collected zero items;
-- ``collection_errors``: node id -> first line of the error.
+- ``collection_errors``: node id -> the error's last line (the exception).
 """
 
 from __future__ import annotations
@@ -42,7 +42,8 @@ def _skip_reason(report: Any) -> str:
     return normalise_reason(str(longrepr))
 
 
-def _first_line(report: Any) -> str:
+def _error_line(report: Any) -> str:
+    """The last line of the error: pytest puts the exception there."""
     text = str(report.longrepr or "").strip().splitlines()
     return text[-1] if text else "error"
 
@@ -63,7 +64,7 @@ class OutcomeLedger:
         if report.skipped:
             self.collection_skipped[report.nodeid] = _skip_reason(report)
         elif report.failed:
-            self.collection_errors[report.nodeid] = _first_line(report)
+            self.collection_errors[report.nodeid] = _error_line(report)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         nodeid = report.nodeid

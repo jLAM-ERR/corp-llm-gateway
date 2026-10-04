@@ -122,7 +122,7 @@ set it in staging or prod: it disables the operator claim check.
 
 ## litellm base image pin: v1.101.0
 
-The litellm version is pinned in **seven** places, all now on **`v1.101.0`** (the
+The litellm version is pinned in **eight** places, all now on **`v1.101.0`** (the
 release GitHub marks Latest, 2026-09-15):
 
 | Pin site | Previous | Now |
@@ -134,6 +134,7 @@ release GitHub marks Latest, 2026-09-15):
 | `docker/chatgpt-codex/Dockerfile` | `v1.95.0` | `v1.101.0` |
 | `docker/anthropic-oauth/Dockerfile` | `v1.95.0` | `v1.101.0` |
 | `pyproject.toml` (`litellm==1.101.0`) — **new seventh site** | `>=1.40,<2.0` | `==1.101.0` |
+| `scripts/test-env.full.txt` (`litellm==1.101.0`) — the full test environment's constraints (`scripts/test-env.sh`) | — | `==1.101.0` |
 
 **The floating tags no longer match the pin.** At the v1.95.0 bump, `v1.95.0`,
 `main-stable` and `latest` resolved to byte-identical manifests. Re-checked with
@@ -147,7 +148,7 @@ generated from ONE litellm's route source and guarded against it
 (`tests/route_gate/`). With the old `>=1.40,<2.0` range, CI's `pip install -e .`
 resolved whatever PyPI called latest, so the guard read a different litellm than
 the image ships and would have passed against routes the gateway never serves.
-Move it with the other six; `tests/test_litellm_pin.py` fails if the sites
+Move it with the other seven; `tests/test_litellm_pin.py` fails if the sites
 disagree. The one litellm symbol the request path imports,
 `ANTHROPIC_OAUTH_TOKEN_PREFIX`, has an in-tree fallback (`litellm_hook.py`) and
 is unchanged since v1.85.0.

@@ -103,8 +103,9 @@ def _targets(node: ast.AST) -> Iterator[str]:
             yield from _targets(elt)
 
 
-def _index(name: str, path: Path) -> Module:
-    tree = ast.parse(path.read_text(), filename=str(path))
+def _index(name: str, path: Path, text: str | None = None) -> Module:
+    source = path.read_text() if text is None else text
+    tree = ast.parse(source, filename=str(path))
     module = Module(name, path, tree)
     package = name.rsplit(".", 1)[0] if path.name != "__init__.py" else name
     for stmt in _top_level(tree.body):
@@ -249,6 +250,8 @@ def eval_path(module: Module, node: ast.AST) -> Path | None:
         return None
     if not isinstance(value, Path):
         return None
+    if not value.is_absolute():
+        value = ROOT / value
     try:
         rel = value.resolve().relative_to(ROOT)
     except ValueError:
@@ -321,8 +324,6 @@ def _module_fixtures(module: Module) -> dict[str, tuple[Module, ast.AST]]:
 
 def _scan_fixtures(module: Module) -> dict[str, tuple[Module, ast.AST]]:
     fixtures: dict[str, tuple[Module, ast.AST]] = {}
-    for local in module.defs:
-        target = _resolve_name(module, local)
     for local in [*module.defs, *module.imports]:
         target = _resolve_name(module, local)
         is_def = target is not None and target[0] == "def" and isinstance(target[2], FUNCS)
@@ -399,14 +400,25 @@ def _usefixtures(decorators: Iterable[ast.expr]) -> list[str]:
 
 @cache
 def renames() -> dict[str, str]:
+    """``renames.json`` ``{"names": {new: old}}``: approved renames of module-level helpers,
+    fixtures, classes and constants, applied to the current tree so a move PR that renames
+    one reproduces the baseline hashes. Only module-level names are rewritten (a ``def`` /
+    ``class`` statement of the module and a load of a name the module defines or imports),
+    never locals, attributes or arguments that happen to share the name."""
     if RENAMES_PATH.exists():
         return json.loads(RENAMES_PATH.read_text()).get("names", {})
     return {}
 
 
 class _Normaliser(ast.NodeTransformer):
-    def __init__(self, module: Module) -> None:
+    def __init__(self, module: Module, root: ast.AST, root_is_module_level: bool) -> None:
         self.module = module
+        self.root = root
+        self.root_is_module_level = root_is_module_level
+        self.top_level = {*module.defs, *module.consts, *module.imports}
+
+    def _rename(self, name: str) -> str:
+        return renames().get(name, name) if name in self.top_level else name
 
     def _strip_docstring(self, node: Any) -> Any:
         body = node.body
@@ -431,7 +443,7 @@ class _Normaliser(ast.NodeTransformer):
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id == "__file__":
             return ast.Constant(f"<repo>/{self.module.rel}")
-        node.id = renames().get(node.id, node.id)
+        node.id = self._rename(node.id)
         return node
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST:
@@ -440,15 +452,14 @@ class _Normaliser(ast.NodeTransformer):
             node.level = 0
         return node
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
-        node.name = renames().get(node.name, node.name)
+    def _visit_def(self, node: Any) -> ast.AST:
+        if node is self.root and self.root_is_module_level:
+            node.name = self._rename(node.name)
         return self.generic_visit(node)
 
-    visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
-        node.name = renames().get(node.name, node.name)
-        return self.generic_visit(node)
+    visit_FunctionDef = _visit_def  # noqa: N815
+    visit_AsyncFunctionDef = _visit_def  # noqa: N815
+    visit_ClassDef = _visit_def  # noqa: N815
 
 
 _DUMPS: dict[tuple[str, int, bool], str] = {}
@@ -465,7 +476,8 @@ def _normalise(module: Module, node: ast.AST, drop_name: bool) -> str:
     clone = copy.deepcopy(node)
     if drop_name and hasattr(clone, "name"):
         clone.name = "_"
-    clone = _Normaliser(module).visit(clone)
+    module_level = module.defs.get(getattr(node, "name", None)) is node
+    clone = _Normaliser(module, clone, module_level).visit(clone)
     return ast.dump(clone, annotate_fields=False, include_attributes=False)
 
 
@@ -523,14 +535,12 @@ class Context:
 
 @dataclass
 class Closure:
-    items: dict[tuple[str, str], tuple[Module, ast.AST, str]] = field(default_factory=dict)
+    # Keyed by node identity too: every test's root is "<test>", and two marks can share
+    # their truncated label.
+    items: dict[tuple[str, str, int], tuple[Module, ast.AST, str]] = field(default_factory=dict)
     fixtures: set[str] = field(default_factory=set)
     external_fixtures: set[str] = field(default_factory=set)
     module_refs: set[str] = field(default_factory=set)
-
-
-def _key(module: Module, node: ast.AST, qual: str) -> tuple[str, str]:
-    return (module.name, qual)
 
 
 def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -> Closure:
@@ -538,7 +548,7 @@ def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -
     queue = list(roots)
     while queue:
         module, node, qual, kind = queue.pop()
-        key = (module.name, qual)
+        key = (module.name, qual, id(node))
         if key in closure.items:
             continue
         closure.items[key] = (module, node, kind)
@@ -672,7 +682,7 @@ def inventory_entry(module: Module, node: ast.AST, cls: ast.ClassDef | None) -> 
     helpers: set[str] = set()
     constants: set[str] = set()
     parts = [normalised_dump(module, node, drop_name=True)]
-    for (_, qual), (owner, item, kind) in sorted(closure.items.items(), key=lambda kv: kv[0][1]):
+    for (_, qual, _), (owner, item, kind) in sorted(closure.items.items(), key=lambda kv: kv[0][1]):
         if kind == "test":
             continue
         name = qual.split(":", 1)[1] if qual.startswith("fixture:") else qual
@@ -857,8 +867,6 @@ def _scan_item(module: Module, node: ast.AST, qual: str) -> ExternalScan:
                 mods = modules()
                 if name in mods:
                     scan.deps.add(mods[name].rel)
-                elif name.startswith("corp_llm_gateway"):
-                    scan.programs.add(f"module:{name}")
                 else:
                     scan.programs.add(f"module:{name}")
             elif site in overrides():
@@ -891,35 +899,46 @@ def _python_imports_of(rel: str, seen: set[str]) -> set[str]:
 # ── whole-suite build ───────────────────────────────────────────────────────────
 
 
+TestItem = tuple[Module, str, ast.AST, ast.ClassDef | None]
+
+
 @cache
 def build() -> tuple[dict[str, Any], dict[str, Any]]:
+    return collect(
+        (module, qual, node, cls)
+        for module in suite_modules()
+        for qual, node, cls in _tests_in(module)
+    )
+
+
+def collect(items: Iterable[TestItem]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(checks, external) for the given tests; the scan cache is shared across them."""
     checks: dict[str, Any] = {}
     external: dict[str, Any] = {}
     unresolved: set[str] = set()
-    scans: dict[tuple[str, str], ExternalScan] = {}
-    for module in suite_modules():
-        for qual, node, cls in _tests_in(module):
-            node_id = f"{module.rel}::{qual}"
-            entry, closure = inventory_entry(module, node, cls)
-            checks[node_id] = entry
-            deps: set[str] = set()
-            programs: set[str] = set()
-            for key, (owner, item, _) in closure.items.items():
-                if key not in scans:
-                    scans[key] = _scan_item(owner, item, key[1] if key[1] != "<test>" else qual)
-                scan = scans[key]
-                deps |= scan.deps
-                programs |= scan.programs
-                unresolved |= {f"{s} (via {node_id})" for s in scan.unresolved}
-            for dep in list(deps):
-                if dep.startswith("tests/") and dep.endswith(".py"):
-                    deps |= _python_imports_of(dep, set())
-            deps.discard(module.rel)
-            if deps or programs:
-                external[node_id] = {
-                    "files": {dep: file_hash(dep) for dep in sorted(deps)},
-                    "programs": sorted(programs),
-                }
+    scans: dict[tuple[str, str, int], ExternalScan] = {}
+    for module, qual, node, cls in items:
+        node_id = f"{module.rel}::{qual}"
+        entry, closure = inventory_entry(module, node, cls)
+        checks[node_id] = entry
+        deps: set[str] = set()
+        programs: set[str] = set()
+        for key, (owner, item, _) in closure.items.items():
+            if key not in scans:
+                scans[key] = _scan_item(owner, item, key[1] if key[1] != "<test>" else qual)
+            scan = scans[key]
+            deps |= scan.deps
+            programs |= scan.programs
+            unresolved |= {f"{s} (via {node_id})" for s in scan.unresolved}
+        for dep in list(deps):
+            if dep.startswith("tests/") and dep.endswith(".py"):
+                deps |= _python_imports_of(dep, set())
+        deps.discard(module.rel)
+        if deps or programs:
+            external[node_id] = {
+                "files": {dep: file_hash(dep) for dep in sorted(deps)},
+                "programs": sorted(programs),
+            }
     unresolved_sites = sorted({u.split(" (via ", 1)[0] for u in unresolved})
     return checks, {"unresolved": unresolved_sites, "tests": external}
 
@@ -946,8 +965,10 @@ def cases_from_ledgers() -> dict[str, dict[str, int]]:
 
 
 def _area(node_id: str) -> str:
+    """``tests/<dir>/…`` -> ``<dir>``; ``tests/test_x.py`` -> ``_root__test_x`` (one file per
+    root module: together they are over the 500 KB commit limit)."""
     parts = node_id.split("::", 1)[0].split("/")
-    return parts[1] if len(parts) > 2 else "_root"
+    return parts[1] if len(parts) > 2 else f"_root__{parts[-1].removesuffix('.py')}"
 
 
 def _one_per_line(entries: dict[str, Any]) -> str:
@@ -959,7 +980,7 @@ def _one_per_line(entries: dict[str, Any]) -> str:
 
 
 def write_checks(checks: dict[str, Any]) -> None:
-    """One file per test directory (``_root`` for tests/*.py), one line per test, so a
+    """One file per test directory (per module for tests/*.py), one line per test, so a
     PR's manifest diff reads test by test and no file nears the 500 KB commit limit."""
     cases = cases_from_ledgers()
     CHECKS_DIR.mkdir(exist_ok=True)

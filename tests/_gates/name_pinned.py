@@ -22,6 +22,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 INDEX_PATH = ROOT / "tests" / "_manifests" / "name_pinned.json"
 MATRIX = "tests/litellm_hook/test_acceptance_matrix.py"
+# The citation sources, one segment per `*` (docs/testing/ is not one: it documents the
+# gates and cites tests as examples of their rules).
 DOC_GLOBS = ("CLAUDE.md", "README.md", "docs/*.md", "docs/ops/*.md")
 # Ignored by git, so absent on a clean checkout; never a citation source.
 UNTRACKED_DOCS = {"docs/remaining-steps.md", "docs/requirements-compliance.md"}
@@ -41,19 +43,32 @@ def _expand(text: str) -> list[str]:
     return [v for option in match.group(1).split(",") for v in _expand(head + option + tail)]
 
 
+def _sources(paths: list[str]) -> list[str]:
+    return sorted(p for p in set(paths) if p not in UNTRACKED_DOCS and (ROOT / p).is_file())
+
+
+def git_doc_files() -> list[str]:
+    # `:(glob)` keeps `*` inside one path segment, as Path.glob does.
+    out = subprocess.run(
+        ["git", "ls-files", "--", *(f":(glob){g}" for g in DOC_GLOBS)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    ).stdout.split()
+    return _sources(out)
+
+
+def tree_doc_files() -> list[str]:
+    return _sources([p.relative_to(ROOT).as_posix() for g in DOC_GLOBS for p in ROOT.glob(g)])
+
+
 def doc_files() -> list[str]:
     try:
-        out = subprocess.run(
-            ["git", "ls-files", "--", *DOC_GLOBS],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=60,
-        ).stdout.split()
+        return git_doc_files()
     except (OSError, subprocess.SubprocessError):
-        out = [p.relative_to(ROOT).as_posix() for g in DOC_GLOBS for p in ROOT.glob(g)]
-    return sorted(p for p in set(out) if p not in UNTRACKED_DOCS and (ROOT / p).is_file())
+        return tree_doc_files()
 
 
 @cache

@@ -16,11 +16,6 @@
    "minimal": "skipped:LANGFUSE_URL must be set for the langfuse e2e",
    "full": "skipped:LANGFUSE_URL must be set for the langfuse e2e"
   },
-  "tests/e2e/test_langfuse_pipeline.py::test_no_originals_in_batch_payload": {
-   "note": "needs the e2e compose stack (LANGFUSE_URL; docker compose run --rm e2e pytest -q tests/e2e); no CI job runs it",
-   "minimal": "skipped:LANGFUSE_URL must be set for the langfuse e2e",
-   "full": "skipped:LANGFUSE_URL must be set for the langfuse e2e"
-  },
   "tests/e2e/test_langfuse_pipeline.py::test_team_and_user_metadata_preserved": {
    "note": "needs the e2e compose stack (LANGFUSE_URL; docker compose run --rm e2e pytest -q tests/e2e); no CI job runs it",
    "minimal": "skipped:LANGFUSE_URL must be set for the langfuse e2e",
@@ -46,22 +41,7 @@
    "minimal": "skipped:REDIS_URL and CORP_LLM_ENDPOINT must be set for e2e",
    "full": "skipped:REDIS_URL and CORP_LLM_ENDPOINT must be set for e2e"
   },
-  "tests/e2e/test_proxy_pipeline.py::test_proxy_401_when_token_missing": {
-   "note": "needs a running header-injecting proxy (RUN_PROXY_E2E); no CI job runs it",
-   "minimal": "skipped:RUN_PROXY_E2E must be set",
-   "full": "skipped:RUN_PROXY_E2E must be set"
-  },
-  "tests/e2e/test_proxy_pipeline.py::test_proxy_forwards_authorization_untouched": {
-   "note": "needs a running header-injecting proxy (RUN_PROXY_E2E); no CI job runs it",
-   "minimal": "skipped:RUN_PROXY_E2E must be set",
-   "full": "skipped:RUN_PROXY_E2E must be set"
-  },
   "tests/e2e/test_proxy_pipeline.py::test_proxy_forwards_path_unchanged": {
-   "note": "needs a running header-injecting proxy (RUN_PROXY_E2E); no CI job runs it",
-   "minimal": "skipped:RUN_PROXY_E2E must be set",
-   "full": "skipped:RUN_PROXY_E2E must be set"
-  },
-  "tests/e2e/test_proxy_pipeline.py::test_proxy_injects_x_corp_auth": {
    "note": "needs a running header-injecting proxy (RUN_PROXY_E2E); no CI job runs it",
    "minimal": "skipped:RUN_PROXY_E2E must be set",
    "full": "skipped:RUN_PROXY_E2E must be set"

@@ -1,0 +1,13 @@
+{
+ "baseline": "807831a",
+ "tests": {
+  "tests/test_logger_state.py::test_a_change_left_on_a_gateway_logger_is_found_and_put_back": {"asserts":2,"body_hash":"8f9ec6c389eff3787e4bdf1592aad6d8","case_data":{"loops":[],"parametrize":[{"argnames":"'name'","cases":2,"values":"4efce57b41daf044accc422e4023498544f4e4312f08ecfad02f5315e6c99287"},{"argnames":"'change'","cases":4,"values":"fc35ea7b258f1b11d1e0526e9fcdf946735a8dd20a7d2f19d342b98976443e9e"}]},"constants":["PACKAGE","PROBE","State","_DEFAULT"],"delegated":{"_no_logger_state_left_behind":{"asserts":0,"fail":1,"raises":0}},"fail":0,"fixtures":["_fresh_metrics_exporter","_no_logger_state_left_behind"],"helpers":["_add_handler","_disable","_gateway_loggers","_set_level","_stop_propagating","changes","restore","snapshot"],"raises":0},
+  "tests/test_logger_state.py::test_a_logger_created_in_its_default_state_is_not_a_change": {"asserts":1,"body_hash":"9c969489f15ad89643f2f7cd5ee17e99","case_data":{"loops":[],"parametrize":[]},"constants":["PACKAGE","PROBE","State","_DEFAULT"],"delegated":{"_no_logger_state_left_behind":{"asserts":0,"fail":1,"raises":0}},"fail":0,"fixtures":["_fresh_metrics_exporter","_no_logger_state_left_behind"],"helpers":["_gateway_loggers","changes","restore","snapshot"],"raises":0},
+  "tests/test_logger_state.py::test_another_packages_logger_is_not_watched": {"asserts":1,"body_hash":"2599171a5c3f851b7968005d7f22fb86","case_data":{"loops":[],"parametrize":[]},"constants":["PACKAGE","State","_DEFAULT"],"delegated":{"_no_logger_state_left_behind":{"asserts":0,"fail":1,"raises":0}},"fail":0,"fixtures":["_fresh_metrics_exporter","_no_logger_state_left_behind"],"helpers":["_gateway_loggers","changes","restore","snapshot"],"raises":0}
+ },
+ "cases": {
+  "tests/test_logger_state.py::test_a_change_left_on_a_gateway_logger_is_found_and_put_back": {"full":8,"minimal":8},
+  "tests/test_logger_state.py::test_a_logger_created_in_its_default_state_is_not_a_change": {"full":1,"minimal":1},
+  "tests/test_logger_state.py::test_another_packages_logger_is_not_watched": {"full":1,"minimal":1}
+ }
+}

@@ -12,6 +12,8 @@ import importlib.util
 import json
 import re
 import sys
+import tomllib
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +64,18 @@ def current() -> dict[str, Any]:
     }
 
 
+@cache
+def litellm_pin() -> str:
+    """The exact litellm version pyproject pins (tests/test_litellm_pin.py holds every other site
+    to it)."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    for requirement in project["dependencies"]:
+        match = re.fullmatch(r"litellm==(\S+)", requirement.strip())
+        if match:
+            return match.group(1)
+    raise SystemExit("pyproject.toml pins no litellm==<version>")
+
+
 def path_for(env: str) -> Path:
     return MANIFESTS / f"env_fingerprint.{env}.json"
 
@@ -72,8 +86,8 @@ def problems(env: str, actual: dict[str, Any], recorded: dict[str, Any]) -> list
     for name, present in actual["markers"].items():
         if present is not want:
             found.append(f"{name} is {'present' if present else 'absent'} in the {env} env")
-    if env == "full" and actual["litellm_version"] != "1.101.0":
-        found.append(f"litellm is {actual['litellm_version']}, not 1.101.0")
+    if env == "full" and actual["litellm_version"] != litellm_pin():
+        found.append(f"litellm is {actual['litellm_version']}, not {litellm_pin()}")
     for key in ("python", "markers", "litellm_version"):
         if actual[key] != recorded[key]:
             found.append(f"{key}: recorded {recorded[key]!r}, now {actual[key]!r}")

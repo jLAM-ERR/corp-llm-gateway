@@ -9,19 +9,24 @@ parametrised ids from both expected-outcome ledgers, so a lost parameter case sh
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import json
+import re
+import subprocess
 import sys
+from functools import cache
 from pathlib import Path
 
 from tests._gates import ledger
-from tests._gates.inventory import _tests_in, modules
+from tests._gates.inventory import Module, _tests_in, modules
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFESTS = ROOT / "tests" / "_manifests"
 PATH = MANIFESTS / "must_keep.txt"
 
 # Step 1: `git diff --name-status e9e877f..807831a -- tests/` (PR #16-#18), frozen.
+STEP1_RANGE = ("e9e877f", "807831a")
 STEP1_ADDED = (
     "tests/audit/test_guardrail_information_gate.py",
     "tests/compose/test_issuance_overlay.py",
@@ -101,18 +106,19 @@ STEP1_MODIFIED_IN_FULL = (
 )
 # Modified by PR #16-#18 inside the plan's prunable universe: only the tests the diff
 # added or changed (reviewer note per file in docs/testing/must-keep.md).
-STEP1_MODIFIED_TOUCHED = {
-    "tests/deploy/test_deploy_script.py": "e9e877f..807831a",
-    "tests/team_config/test_postgres_store.py": "e9e877f..807831a",
-    "tests/test_bootstrap.py": "e9e877f..807831a",
-    "tests/test_bootstrap_edges.py": "e9e877f..807831a",
-    "tests/test_litellm_config.py": "e9e877f..807831a",
-    "tests/test_litellm_hook_adversarial.py": "e9e877f..807831a",
-    "tests/test_settings.py": "e9e877f..807831a",
-    "tests/tokens/test_postgres_store.py": "e9e877f..807831a",
-    "tests/tokens/test_token_store_contract.py": "e9e877f..807831a",
-}
-# tests/test_litellm_hook.py: the plan names its ticket / terminal-audit section.
+STEP1_MODIFIED_TOUCHED = (
+    "tests/deploy/test_deploy_script.py",
+    "tests/team_config/test_postgres_store.py",
+    "tests/test_bootstrap.py",
+    "tests/test_bootstrap_edges.py",
+    "tests/test_litellm_config.py",
+    "tests/test_litellm_hook.py",
+    "tests/test_litellm_hook_adversarial.py",
+    "tests/test_settings.py",
+    "tests/tokens/test_postgres_store.py",
+    "tests/tokens/test_token_store_contract.py",
+)
+# tests/test_litellm_hook.py: the plan also names its ticket / terminal-audit section.
 HOOK_FILE = "tests/test_litellm_hook.py"
 HOOK_SECTION_FROM_LINE = 5975
 
@@ -142,11 +148,26 @@ STEP2_GLOBS = (
     "tests/compose/*.py",
     "tests/integration/*.py",
     "tests/docs/test_docs_pins.py",
+    "tests/auth/test_rbac.py",
+    "tests/test_serve.py",
 )
 STEP2_LINE_RANGES = (("tests/audit/test_logger.py", 135, 163),)
+# Must-keep security checks skipped in both environments: an open finding for the DRI
+# (no CI job runs the e2e stack), not a reviewed not-applicable case. Any other must-keep
+# id skipped in both fails the gate.
+SKIPPED_IN_BOTH_OPEN = (
+    "tests/e2e/test_langfuse_pipeline.py::test_no_originals_in_batch_payload",
+    "tests/e2e/test_proxy_pipeline.py::test_proxy_forwards_authorization_untouched",
+    "tests/e2e/test_proxy_pipeline.py::test_proxy_injects_x_corp_auth",
+    "tests/e2e/test_proxy_pipeline.py::test_proxy_401_when_token_missing",
+)
 STEP2_IDS = (
     "tests/test_litellm_hook.py::test_the_guardrail_defines_no_response_side_hook",
     "tests/test_litellm_hook.py::test_a_ticketed_pre_call_hands_the_mapping_and_the_record_to_the_ticket",
+    "tests/sanitizer/test_allowlist.py::test_allowlisted_secret_label_not_dropped",
+    "tests/deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed",
+    "tests/deploy/test_deploy_script.py::test_env_file_contents_are_never_read_or_printed",
+    *SKIPPED_IN_BOTH_OPEN,
 )
 # Security-policy defaults that look trivial (plan Context): exempt from pruning.
 POLICY_DEFAULTS = (
@@ -157,36 +178,59 @@ POLICY_DEFAULTS = (
 )
 
 
-def _functions() -> dict[str, list[tuple[str, int, int]]]:
-    """file -> [(function-level node id, first line incl. decorators, last line)]."""
-    out: dict[str, list[tuple[str, int, int]]] = {}
-    for module in modules().values():
-        for qual, node, _ in _tests_in(module):
-            first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
-            out.setdefault(module.rel, []).append((f"{module.rel}::{qual}", first, node.end_lineno))
+def _spans(module: Module) -> list[tuple[str, int, int]]:
+    """[(function-level node id, first line incl. decorators, last line)]."""
+    out = []
+    for qual, node, _ in _tests_in(module):
+        first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+        out.append((f"{module.rel}::{qual}", first, node.end_lineno))
     return out
 
 
-def _touched_lines(path: str, commits: str) -> set[int]:
-    import re
-    import subprocess
+def _functions() -> dict[str, list[tuple[str, int, int]]]:
+    return {module.rel: _spans(module) for module in modules().values()}
 
-    diff = subprocess.run(
-        ["git", "diff", "-U0", commits, "--", path],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    lines: set[int] = set()
-    for match in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", diff, re.M):
+
+def _git(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args], cwd=ROOT, capture_output=True, text=True, check=False, timeout=60
+    )
+
+
+@cache
+def _have_step1_history() -> bool:
+    return all(_git("cat-file", "-e", f"{c}^{{commit}}").returncode == 0 for c in STEP1_RANGE)
+
+
+def _step1_touched(path: str) -> list[tuple[str, int, int]]:
+    """The tests of ``path`` as of 807831a that the step-1 diff added or changed (and, in the
+    hook file, its ticket section); 807831a's line numbers, so later moves cannot shift them."""
+    old, new = STEP1_RANGE
+    text = _git("show", f"{new}:{path}")
+    diff = _git("diff", "-U0", f"{old}..{new}", "--", path)
+    if text.returncode or diff.returncode:
+        raise SystemExit(f"git cannot read {path} at {new}: {text.stderr or diff.stderr}")
+    touched: set[int] = set()
+    for match in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", diff.stdout, re.M):
         start, count = int(match.group(1)), int(match.group(2) or 1)
-        lines |= set(range(start, start + max(count, 1)))
-    return lines
+        touched |= set(range(start, start + max(count, 1)))
+    module = Module(path, ROOT / path, ast.parse(text.stdout))
+    return [
+        (node_id, first, last)
+        for node_id, first, last in _spans(module)
+        if any(first <= line <= last for line in touched)
+        or (path == HOOK_FILE and first >= HOOK_SECTION_FROM_LINE)
+    ]
 
 
-def function_ids() -> dict[str, str]:
-    """function-level must-keep id -> the rule that put it there."""
+def _committed_in(path: str) -> list[str]:
+    return sorted(
+        {ledger.join_id(*ledger.split_id(i)[:2], "") for i in read() if i.startswith(path + "::")}
+    )
+
+
+def _rule_ids() -> dict[str, str]:
+    """function-level must-keep id -> the rule that put it there (no existence check)."""
     functions = _functions()
     chosen: dict[str, str] = {}
 
@@ -196,14 +240,20 @@ def function_ids() -> dict[str, str]:
     for path in STEP1_ADDED + STEP1_MODIFIED_IN_FULL:
         for node_id, _, _ in functions.get(path, []):
             add(node_id, "step1:file")
-    for path, commits in STEP1_MODIFIED_TOUCHED.items():
-        touched = _touched_lines(path, commits)
-        for node_id, first, last in functions.get(path, []):
-            if any(first <= line <= last for line in touched):
+    history = _have_step1_history()
+    if not history:
+        print(
+            f"WARNING: {'..'.join(STEP1_RANGE)} is not in this clone (shallow?); the step-1 "
+            "touched-test rule falls back to the ids committed in must_keep.txt",
+            file=sys.stderr,
+        )
+    for path in STEP1_MODIFIED_TOUCHED:
+        if history:
+            for node_id, _, _ in _step1_touched(path):
                 add(node_id, "step1:touched")
-    for node_id, first, _ in functions.get(HOOK_FILE, []):
-        if first >= HOOK_SECTION_FROM_LINE:
-            add(node_id, "step1:hook-ticket-section")
+        else:
+            for node_id in _committed_in(path):
+                add(node_id, "step1:touched (committed list)")
     for path, ids in functions.items():
         if any(fnmatch.fnmatch(path, pattern) for pattern in STEP2_GLOBS):
             for node_id, _, _ in ids:
@@ -222,7 +272,13 @@ def function_ids() -> dict[str, str]:
     pinned = json.loads((MANIFESTS / "name_pinned.json").read_text())
     for node_id in pinned["ids"]:
         add(node_id, "name-pinned")
-    known = {node_id for ids in functions.values() for node_id, _, _ in ids}
+    return chosen
+
+
+def function_ids() -> dict[str, str]:
+    """function-level must-keep id -> the rule that put it there."""
+    chosen = _rule_ids()
+    known = {node_id for ids in _functions().values() for node_id, _, _ in ids}
     missing = sorted(set(chosen) - known)
     if missing:
         raise SystemExit(f"must-keep rule names tests that do not exist: {missing}")
@@ -247,16 +303,38 @@ def read() -> list[str]:
     ]
 
 
+def _skipped(outcome: str | None) -> bool:
+    return outcome is not None and outcome.startswith(("skipped:", ledger.COLLECTION_SKIPPED))
+
+
 def problems() -> list[str]:
-    """Must-keep ids absent from the tree or from either environment's ledger."""
-    found = []
+    """Must-keep ids absent from the tree or from either environment's ledger, ids the rules
+    select that the committed list lacks, and must-keep ids skipped in both environments."""
+    committed = read()
+    found = [
+        f"the rules select a test missing from must_keep.txt: {node_id}"
+        for node_id in sorted(set(expand(_rule_ids())) - set(committed))
+    ]
     functions = {node_id for ids in _functions().values() for node_id, _, _ in ids}
     recorded = {env: ledger.ids_with_outcome(env) for env in ledger.ENVS}
+    outcomes = {
+        env: ledger.flat(json.loads(ledger.expected_path(env).read_text())) for env in ledger.ENVS
+    }
+    for node_id in committed:
+        function = ledger.join_id(*ledger.split_id(node_id)[:2], "")
+        if function in SKIPPED_IN_BOTH_OPEN:
+            continue
+        per_env = [
+            outcomes[env].get(node_id, outcomes[env].get(node_id.split("::")[0]))
+            for env in ledger.ENVS
+        ]
+        if all(_skipped(outcome) for outcome in per_env):
+            found.append(f"must-keep id is skipped in every environment: {node_id} {per_env}")
     files = {
         env: {node_id.split("::", 1)[0] for node_id in ids if "::" not in node_id}
         for env, ids in recorded.items()
     }
-    for node_id in read():
+    for node_id in committed:
         path, test, param = ledger.split_id(node_id)
         if ledger.join_id(path, test, "") not in functions:
             found.append(f"must-keep test is gone: {node_id}")

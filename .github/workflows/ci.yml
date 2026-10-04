@@ -56,7 +56,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
+      # Full history: the must-keep gate rebuilds its step-1 rule from the
+      # e9e877f..807831a diff (tests/_gates/must_keep.py); a depth-1 clone lacks both.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"

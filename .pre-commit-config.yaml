@@ -10,6 +10,9 @@ repos:
         args: [--maxkb=500]
       - id: check-merge-conflict
       - id: detect-private-key
+        # The manifests record a test's parametrize id that spells out a
+        # PEM header (tests/sanitizer/test_allowlist.py); a test case name, not a key.
+        exclude: ^tests/_manifests/
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.14
