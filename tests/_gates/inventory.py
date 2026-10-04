@@ -1063,7 +1063,7 @@ def collect(items: Iterable[TestItem]) -> tuple[dict[str, Any], dict[str, Any]]:
     checks: dict[str, Any] = {}
     external: dict[str, Any] = {}
     unresolved: set[str] = set()
-    scans: dict[tuple[str, str, int], ExternalScan] = {}
+    scans: dict[tuple[str, str, int], tuple[ast.AST, ExternalScan]] = {}
     for module, qual, node, cls in items:
         node_id = f"{module.rel}::{qual}"
         entry, closure = inventory_entry(module, node, cls)
@@ -1071,9 +1071,11 @@ def collect(items: Iterable[TestItem]) -> tuple[dict[str, Any], dict[str, Any]]:
         deps: set[str] = set()
         programs: set[str] = set()
         for key, (owner, item, _) in closure.items.items():
-            if key not in scans:
-                scans[key] = _scan_item(owner, item, key[1] if key[1] != "<test>" else qual)
-            scan = scans[key]
+            cached = scans.get(key)
+            if cached is None or cached[0] is not item:
+                name = key[1] if key[1] != "<test>" else qual
+                cached = scans[key] = (item, _scan_item(owner, item, name))
+            scan = cached[1]
             deps |= scan.deps
             programs |= scan.programs
             unresolved |= {f"{s} (via {node_id})" for s in scan.unresolved}

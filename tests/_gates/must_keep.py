@@ -330,16 +330,17 @@ def _skipped(outcome: str | None) -> bool:
     return outcome is not None and outcome.startswith(("skipped:", ledger.COLLECTION_SKIPPED))
 
 
-def problems() -> list[str]:
+def problems(*, strict: bool = False) -> list[str]:
     """Must-keep ids absent from the tree or from either environment's ledger, ids the rules
-    select that the committed list lacks, and must-keep ids skipped in both environments."""
+    select that the committed list lacks, and must-keep ids skipped in both environments.
+    Missing step-1 history is a problem when ``strict`` or under CI, else a warning."""
     committed = read()
     found = [
         f"the rules select a test missing from must_keep/: {node_id}"
         for node_id in sorted(set(expand(_rule_ids())) - set(committed))
     ]
     if not _have_step1_history():
-        if os.environ.get("CI"):
+        if strict or os.environ.get("CI"):
             found.append(NO_HISTORY)
         else:
             warnings.warn(NO_HISTORY, stacklevel=2)
@@ -390,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(NO_HISTORY + "; refusing to write from it")
         write(expand(function_ids()))
         return 0
-    found = problems()
+    found = problems(strict=True)
     for line in found:
         print(f"MUST-KEEP: {line}", file=sys.stderr)
     return 1 if found else 0

@@ -12,7 +12,7 @@ repos:
       - id: detect-private-key
         # The manifests record a test's parametrize id that spells out a
         # PEM header (tests/sanitizer/test_allowlist.py); a test case name, not a key.
-        exclude: ^tests/_manifests/
+        exclude: ^tests/_manifests/(expected_outcomes\.(minimal|full)\.json|must_keep/sanitizer\.txt)$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.14

@@ -148,6 +148,16 @@ def test_a_clone_without_the_step1_history_fails_on_ci_and_warns_elsewhere(
     assert must_keep.NO_HISTORY not in found
 
 
+def test_the_must_keep_cli_fails_without_the_step1_history_outside_ci_too(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(must_keep, "_have_step1_history", lambda: False)
+    monkeypatch.delenv("CI", raising=False)
+
+    assert must_keep.main(["--check"]) == 1
+    assert must_keep.NO_HISTORY in capsys.readouterr().err
+
+
 def test_every_must_keep_file_stays_under_the_commit_limit() -> None:
     shards = sorted(must_keep.DIR.glob("*.txt"))
 

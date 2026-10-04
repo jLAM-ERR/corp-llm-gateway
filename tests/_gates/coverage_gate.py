@@ -3,7 +3,7 @@
 ``tests/_manifests/coverage.<env>.json``: per source file, the executed lines as ranges
 and the executed arcs. A fresh run may cover more; any line or arc the baseline covers
 and the run does not is a drop and fails. The baseline is the intersection of clean
-whole-suite runs on 807831a's src (seven in minimal, four in full), so a line only a lucky
+whole-suite runs on 807831a's src (how many: the file's ``runs``), so a line only a lucky
 interleaving reaches is not in it; an arc shown timing-dependent outside those runs is
 taken out by hand and listed in docs/testing/must-keep.md.
 
@@ -78,6 +78,10 @@ def from_report(report: dict[str, Any]) -> dict[str, dict[str, set]]:
     return files
 
 
+def recorded_runs(env: str) -> int:
+    return json.loads(baseline_path(env).read_text())["runs"]
+
+
 def load(env: str) -> dict[str, dict[str, set]]:
     data = json.loads(baseline_path(env).read_text())
     return {
@@ -86,10 +90,11 @@ def load(env: str) -> dict[str, dict[str, set]]:
     }
 
 
-def save(env: str, files: dict[str, dict[str, set]]) -> None:
+def save(env: str, files: dict[str, dict[str, set]], runs: int) -> None:
     data = {
         "baseline": BASELINE,
         "env": env,
+        "runs": runs,
         "files": {
             path: {"lines": _ranges(list(entry["lines"])), "arcs": _arcs(list(entry["arcs"]))}
             for path, entry in sorted(files.items())
@@ -119,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     current = from_report(json.loads(args.report.read_text()))
     if args.command == "write":
-        save(args.env, current)
+        save(args.env, current, 1)
         return 0
     baseline = load(args.env)
     if args.command == "intersect":
@@ -132,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         for line in drops(baseline, current):
             print(f"COVERAGE {args.env} (dropped from the baseline as unstable): {line}")
-        save(args.env, merged)
+        save(args.env, merged, recorded_runs(args.env) + 1)
         return 0
     problems = drops(baseline, current)
     for line in problems:

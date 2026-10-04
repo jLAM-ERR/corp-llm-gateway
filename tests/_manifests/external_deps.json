@@ -80,6 +80,12 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_the_must_keep_cli_fails_without_the_step1_history_outside_ci_too": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_the_name_pinned_index_is_consistent": {
    "files": {
     "tests/litellm_hook/test_acceptance_matrix.py": "0f4d24f2c019fe55c24c68f93399ce07"
@@ -3109,7 +3115,7 @@
   },
   "tests/docs/test_docs_pins.py::test_documented_route_counts_match_the_table": {
    "files": {
-    "CLAUDE.md": "6737da02028878c66ccebef68bfac3b9",
+    "CLAUDE.md": "a824cc521ec46b6673c750247854b3e3",
     "docs/security.md": "f9355e78204245880d4dbc78082ea810",
     "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
    },
@@ -3131,14 +3137,14 @@
   },
   "tests/docs/test_docs_pins.py::test_every_corp_name_a_doc_mentions_exists_in_the_tree": {
    "files": {
-    "CLAUDE.md": "6737da02028878c66ccebef68bfac3b9",
+    "CLAUDE.md": "a824cc521ec46b6673c750247854b3e3",
     "compose/README.md": "448687d4d7531e4a95af5db777529584",
     "compose/README.ru.md": "fc17da788f837dadd343420eae2531be",
     "docs/audit-schema.md": "20b5396a990dab69346825e07f434877",
     "docs/audit-schema.ru.md": "4cbf9a443bf479a189397a96de159dba",
     "docs/extending.md": "527bd42e07e19c7844865357f7918080",
     "docs/extending.ru.md": "65f8fc16398383b150ab9993d40e9688",
-    "docs/ops": "dir:2e8f7111bac74bcde713a9089201",
+    "docs/ops": "dir:c923c30d0e242f0a4c656cb14f17",
     "docs/security.md": "f9355e78204245880d4dbc78082ea810",
     "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
    },
@@ -3146,14 +3152,14 @@
   },
   "tests/docs/test_docs_pins.py::test_every_error_code_a_doc_names_exists_in_the_tree": {
    "files": {
-    "CLAUDE.md": "6737da02028878c66ccebef68bfac3b9",
+    "CLAUDE.md": "a824cc521ec46b6673c750247854b3e3",
     "compose/README.md": "448687d4d7531e4a95af5db777529584",
     "compose/README.ru.md": "fc17da788f837dadd343420eae2531be",
     "docs/audit-schema.md": "20b5396a990dab69346825e07f434877",
     "docs/audit-schema.ru.md": "4cbf9a443bf479a189397a96de159dba",
     "docs/extending.md": "527bd42e07e19c7844865357f7918080",
     "docs/extending.ru.md": "65f8fc16398383b150ab9993d40e9688",
-    "docs/ops": "dir:2e8f7111bac74bcde713a9089201",
+    "docs/ops": "dir:c923c30d0e242f0a4c656cb14f17",
     "docs/security.md": "f9355e78204245880d4dbc78082ea810",
     "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
    },
@@ -5500,7 +5506,7 @@
     "docker/anthropic-oauth/Dockerfile": "642317853608e8a218aa681ce3cd51b1",
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
-    "docs/ops/upgrade.md": "6242061f0f1a7e2b293818394ac3a1c4",
+    "docs/ops/upgrade.md": "0ef741ef03636d81b9344660fdf47813",
     "pyproject.toml": "13012fab2bde5b78bf1bbce02aafc887",
     "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
