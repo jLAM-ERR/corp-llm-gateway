@@ -48,12 +48,6 @@
     "git"
    ]
   },
-  "tests/_gates/test_suite_gates.py::test_task0_changes_no_existing_test": {
-   "files": {},
-   "programs": [
-    "git"
-   ]
-  },
   "tests/_gates/test_suite_gates.py::test_the_check_inventory_matches_the_baseline": {
    "files": {},
    "programs": [

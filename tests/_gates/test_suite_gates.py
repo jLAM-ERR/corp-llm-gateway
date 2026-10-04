@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,9 +27,6 @@ from tests._gates import (
 ROOT = Path(__file__).resolve().parents[2]
 MANIFESTS = ROOT / "tests" / "_manifests"
 ENV_VAR = "CORP_TEST_ENV"
-# Task 0 adds the gates and their manifests and changes no existing test; Task 1a, the
-# first PR that moves tests, sets this to False.
-TASK0_FROZEN = True
 
 
 def test_the_check_inventory_matches_the_baseline() -> None:
@@ -238,30 +234,6 @@ def test_the_full_constraints_install_the_litellm_pyproject_pins(
         f"scripts/test-env.full.txt pins litellm==0.0.1, pyproject.toml pins "
         f"{fingerprint.litellm_pin()}"
     ]
-
-
-def test_task0_changes_no_existing_test() -> None:
-    if not TASK0_FROZEN:
-        pytest.skip("Task 0 is merged; later tasks change tests on purpose")
-    diff = subprocess.run(
-        ["git", "diff", "--name-status", "-M", inventory.BASELINE, "--", "tests/"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    if diff.returncode and not os.environ.get("CI"):
-        pytest.skip(f"{inventory.BASELINE} is not in this clone: {diff.stderr.strip()}")
-    assert diff.returncode == 0, diff.stderr
-
-    changed = []
-    for line in diff.stdout.splitlines():
-        status, *paths = line.split("\t")
-        manifests_only = all(p.startswith("tests/_manifests/") for p in paths)
-        if not (status == "A" or (status.startswith("R") and manifests_only)):
-            changed.append(line)
-    assert changed == []
 
 
 def test_the_environment_fingerprints_are_the_recipes() -> None:
