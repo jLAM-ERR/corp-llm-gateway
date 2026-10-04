@@ -537,12 +537,6 @@ def _assistant_dict_args_msg(arguments: dict | list, *, name: str = "save") -> d
     }
 
 
-def _chunk_tool_args(chunk: dict) -> str:
-    return "".join(
-        tc["function"]["arguments"] for tc in (chunk["choices"][0]["delta"].get("tool_calls") or [])
-    )
-
-
 def _build_guardrail_with_cap(cap: int) -> tuple[CorpLlmGuardrail, ListSink]:
     token_store = InMemoryTokenStore()
     now = datetime.now(UTC)
