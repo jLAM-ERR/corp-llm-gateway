@@ -17,6 +17,7 @@ from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpExcepti
 from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
 from corp_llm_gateway.rules import Gazetteer, Rule, Rules
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.placeholder import StaleSpanError
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import (
@@ -38,8 +39,6 @@ from tests.hook_fixtures import (
     _build_guardrail_oracle_disabled,
     _build_guardrail_oversize,
     _build_guardrail_with_cap,
-    _build_guardrail_with_dlp,
-    _build_guardrail_with_unreachable_upstream,
     _CancellingTokenStore,
     _case_bad_request,
     _case_corp_llm_down,
@@ -4704,7 +4703,7 @@ async def test_tool_use_input_no_leak_in_logs(caplog: pytest.LogCaptureFixture) 
 
 async def test_stage0_env_payload_raises_policy_blocked() -> None:
     """.env content is blocked before the sanitizer / upstream is called."""
-    g, _ = _build_guardrail_with_unreachable_upstream()
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
     env_content = (
         "DATABASE_URL=postgres://admin:hunter2@db.corp.lan:5432/prod\n"
         "SECRET_KEY=supersecretvalue-abc123\n"
@@ -4721,7 +4720,7 @@ async def test_stage0_env_payload_raises_policy_blocked() -> None:
 
 async def test_stage0_kube_payload_raises_policy_blocked() -> None:
     """Kubernetes manifest is blocked before egress."""
-    g, _ = _build_guardrail_with_unreachable_upstream()
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
     kube_content = (
         "apiVersion: apps/v1\n"
         "kind: Deployment\n"
@@ -4743,7 +4742,7 @@ async def test_stage0_kube_payload_raises_policy_blocked() -> None:
 
 async def test_stage0_log_dump_raises_policy_blocked() -> None:
     """Application log dump is blocked before egress."""
-    g, _ = _build_guardrail_with_unreachable_upstream()
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
     log_lines = "\n".join(
         [
             "2024-01-15 10:00:01 INFO  Starting application server",
@@ -4770,7 +4769,7 @@ async def test_stage0_upstream_not_called_for_blocked_request() -> None:
     the transport raises ConnectTimeout → E_CORP_LLM_DOWN, not E_POLICY_BLOCKED.
     Seeing E_POLICY_BLOCKED proves the upstream path was never reached.
     """
-    g, _ = _build_guardrail_with_unreachable_upstream()
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
     env_content = (
         "DATABASE_URL=postgres://user:secret@db.lan/prod\n"
         "SECRET_KEY=abc123-secret-value\n"
@@ -4826,7 +4825,7 @@ async def test_stage0_clean_request_passes_through() -> None:
 
 async def test_stage0_exception_message_is_generic() -> None:
     """The GuardrailHttpException message must NOT contain any raw payload content."""
-    g, _ = _build_guardrail_with_unreachable_upstream()
+    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
     secret_content = "DATABASE_URL=postgres://admin:hunter2@db.corp.lan/prod\n" * 3 + (
         "SECRET_KEY=sk-very-secret\nDEBUG=0\nREDIS_URL=redis://cache\n"
     )
@@ -4892,7 +4891,9 @@ async def test_stage5_dlp_blocks_canary_survivor(
 ) -> None:
     """Stage 5 blocks a canary that the primary sanitizer did not redact."""
     canary = "DLP-CANARY-RAW-99999"
-    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    g, _ = _build_guardrail(
+        [], dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    )
     data = _data_with_token("tok-1", content=f"here is {canary}")
     with caplog.at_level(logging.INFO), pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
@@ -4905,7 +4906,9 @@ async def test_stage5_dlp_blocks_canary_survivor(
 async def test_stage5_dlp_clean_request_passes_through() -> None:
     """A request without the canary passes Stage 5 and returns data."""
     canary = "DLP-CANARY-RAW-99999"
-    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    g, _ = _build_guardrail(
+        [], dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    )
     data = _data_with_token("tok-1", content="ordinary request without canary")
     out = await g.pre_call(data)
     assert out["messages"][0]["content"] == "ordinary request without canary"
@@ -4914,7 +4917,9 @@ async def test_stage5_dlp_clean_request_passes_through() -> None:
 async def test_stage5_dlp_audit_has_block_reason_dlp_canary() -> None:
     """The failure-event audit after Stage-5 block carries block_reason='dlp:canary'."""
     canary = "DLP-CANARY-RAW-99999"
-    g, sink = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    g, sink = _build_guardrail(
+        [], dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    )
     now = datetime.now(UTC)
     data = _data_with_token("tok-1", content=f"leaked {canary} here")
     with pytest.raises(GuardrailHttpException):
@@ -4950,7 +4955,9 @@ async def test_stage5_dlp_blocks_canary_in_responses_custom_tool_call_input() ->
     previously invisible (`collect_tool_call_text` returned [] for this item type,
     defect #1), so the canary egressed unblocked."""
     canary = "DLP-CANARY-RAW-99999"
-    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    g, _ = _build_guardrail(
+        [], dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    )
     data = {
         "model": "gpt-5.6-sol",
         "input": [
@@ -4975,7 +4982,9 @@ async def test_stage5_dlp_blocks_canary_in_local_shell_call_action_command() -> 
     canary there egressed unblocked (identical shape already caught for
     custom_tool_call.input above)."""
     canary = "DLP-CANARY-RAW-99999"
-    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    g, _ = _build_guardrail(
+        [], dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    )
     data = {
         "model": "gpt-5.6-sol",
         "input": [
@@ -5002,7 +5011,9 @@ async def test_stage5_dlp_scans_unmanaged_call_type_input_without_rewriting() ->
     (MAJOR 6's denylist), but Stage 5 must still SCAN it for canaries/raw
     secrets — an unmanaged call_type must not become a DLP blind spot."""
     canary = "DLP-CANARY-RAW-99999"
-    g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+    g, _ = _build_guardrail(
+        [], dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    )
     data = {
         "model": "text-embedding-3-small",
         "input": f"embed this {canary} please",
@@ -5055,7 +5066,9 @@ async def test_stage5_dlp_disabled_by_flag_passes_through() -> None:
     os.environ["CORP_LLM_DLP_GUARD"] = "0"
     _cfg_module.reset_cache()
     try:
-        g, _ = _build_guardrail_with_dlp(canary, corp_llm_pairs=[])
+        g, _ = _build_guardrail(
+            [], dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+        )
         data = _data_with_token("tok-1", content=f"here is {canary}")
         out = await g.pre_call(data)
         assert canary in out["messages"][0]["content"]

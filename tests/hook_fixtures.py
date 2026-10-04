@@ -19,6 +19,7 @@ from corp_llm_gateway.metrics import MetricsExporter
 from corp_llm_gateway.route_gate.terminal_audit import TerminalAudit, emit_to
 from corp_llm_gateway.rules import Gazetteer, Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator
+from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo, TokenStore
 from tests.response_restore import restore_stream
@@ -183,6 +184,9 @@ def _build_guardrail(
     corp_llm: CorpLlmClient | None = None,
     forward_chatgpt_auth: bool = False,
     rules: Rules | None = None,
+    forward_anthropic_auth: bool = False,
+    dlp_guard: DlpEgressGuard | None = None,
+    metrics: MetricsExporter | None = None,
 ) -> tuple[CorpLlmGuardrail, ListSink]:
     pairs = pairs if pairs is not None else []
     token_store = InMemoryTokenStore()
@@ -211,6 +215,9 @@ def _build_guardrail(
             auth,
             audit_logger,
             forward_chatgpt_auth=forward_chatgpt_auth,
+            forward_anthropic_auth=forward_anthropic_auth,
+            dlp_guard=dlp_guard,
+            metrics=metrics,
         ),
         sink,
     )
@@ -528,56 +535,6 @@ def _assistant_dict_args_msg(arguments: dict | list, *, name: str = "save") -> d
             {"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}
         ],
     }
-
-
-def _chunk_tool_args(chunk: dict) -> str:
-    return "".join(
-        tc["function"]["arguments"] for tc in (chunk["choices"][0]["delta"].get("tool_calls") or [])
-    )
-
-
-def _build_guardrail_with_unreachable_upstream(
-    valid_token: str = "tok-1",
-) -> tuple[CorpLlmGuardrail, ListSink]:
-    """Guardrail whose corp-LLM transport raises; any upstream call → immediate failure.
-
-    Used to prove the orchestrator was NOT called for blocked requests.
-    """
-    return _build_guardrail(corp_llm=_corp_llm_unreachable(), valid_token=valid_token)
-
-
-def _build_guardrail_with_dlp(
-    canary: str,
-    *,
-    corp_llm_pairs: list[tuple[str, str]] | None = None,
-    valid_token: str = "tok-1",
-) -> tuple[CorpLlmGuardrail, ListSink]:
-    """Guardrail with a DLP guard seeded with *canary*; no secret_rescan."""
-    from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
-
-    corp_llm_pairs = corp_llm_pairs if corp_llm_pairs is not None else []
-    token_store = InMemoryTokenStore()
-    now = datetime.now(UTC)
-    token_store.upsert(
-        TokenInfo(
-            corp_token=valid_token,
-            user_id="alice",
-            team_id="t1",
-            scopes=("read",),
-            issued_at=now,
-            expires_at=now + timedelta(days=30),
-        )
-    )
-    auth = AuthMiddleware(token_store)
-    orch = SanitizationOrchestrator(
-        _corp_llm_returning(corp_llm_pairs),
-        InMemoryMappingStore(),
-        _StaticRules(),
-    )
-    sink = ListSink()
-    audit_logger = AuditLogger(sink, gateway_version="0.0.1")
-    dlp = DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
-    return CorpLlmGuardrail(orch, auth, audit_logger, dlp_guard=dlp), sink
 
 
 def _build_guardrail_with_cap(cap: int) -> tuple[CorpLlmGuardrail, ListSink]:

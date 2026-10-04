@@ -9,6 +9,9 @@ from corp_llm_gateway import config
 from corp_llm_gateway.metrics import reset_exporter
 from tests import logger_state
 
+# Not a test module, so its asserts are rewritten only if registered before anything imports it.
+pytest.register_assert_rewrite("tests.hook_fixtures")
+
 
 @pytest.fixture(autouse=True)
 def _fresh_metrics_exporter() -> Iterator[None]:

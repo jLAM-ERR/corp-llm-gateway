@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +21,7 @@ import corp_llm_gateway as gateway_package
 from corp_llm_gateway import config
 from corp_llm_gateway import metrics as metrics_module
 from corp_llm_gateway.audit import AuditLogger, ListSink
-from corp_llm_gateway.corp_llm import CorpLlmClient
-from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
+from corp_llm_gateway.litellm_hook import GuardrailHttpException
 from corp_llm_gateway.metrics import (
     BLOCK_REASONS,
     FAILURE_COMPONENTS,
@@ -34,15 +33,11 @@ from corp_llm_gateway.metrics import (
     get_exporter,
     reset_exporter,
 )
-from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
-from corp_llm_gateway.storage import InMemoryMappingStore
-from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
 from tests.hook_fixtures import (
-    _corp_llm_returning,
+    _build_guardrail,
     _corp_llm_unreachable,
     _data_with_token,
-    _StaticRules,
 )
 
 _HAS_PROM = importlib.util.find_spec("prometheus_client") is not None
@@ -75,40 +70,6 @@ def _hermetic_metrics_config(tmp_path: object, monkeypatch: pytest.MonkeyPatch) 
 def _prom() -> PrometheusExporter:
     pytest.importorskip("prometheus_client")
     return PrometheusExporter()
-
-
-def _guardrail(
-    metrics: MetricsExporter | None,
-    *,
-    corp_llm: CorpLlmClient | None = None,
-    dlp_guard: DlpEgressGuard | None = None,
-) -> tuple[CorpLlmGuardrail, ListSink]:
-    store = InMemoryTokenStore()
-    now = datetime.now(UTC)
-    store.upsert(
-        TokenInfo(
-            corp_token="tok-1",
-            user_id="alice",
-            team_id="t1",
-            scopes=("read",),
-            issued_at=now,
-            expires_at=now + timedelta(days=30),
-        )
-    )
-    orch = SanitizationOrchestrator(
-        corp_llm if corp_llm is not None else _corp_llm_returning([]),
-        InMemoryMappingStore(),
-        _StaticRules(),
-    )
-    sink = ListSink()
-    g = CorpLlmGuardrail(
-        orch,
-        AuthMiddleware(store),
-        AuditLogger(sink, gateway_version="0.0.1"),
-        dlp_guard=dlp_guard,
-        metrics=metrics,
-    )
-    return g, sink
 
 
 # ── ABC + Noop default ───────────────────────────────────────────────────────
@@ -248,7 +209,7 @@ def test_prometheus_instances_have_independent_registries() -> None:
 
 async def test_hook_stage0_block_increments_blocked_counter() -> None:
     exporter = _prom()
-    g, _ = _guardrail(exporter)
+    g, _ = _build_guardrail(metrics=exporter)
     data = _data_with_token("tok-1", content=_ENV_PAYLOAD)
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
@@ -262,8 +223,8 @@ async def test_hook_stage0_block_increments_blocked_counter() -> None:
 async def test_hook_stage5_dlp_block_increments_blocked_counter() -> None:
     exporter = _prom()
     canary = "DLP-CANARY-RAW-99999"
-    g, _ = _guardrail(
-        exporter, dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
+    g, _ = _build_guardrail(
+        metrics=exporter, dlp_guard=DlpEgressGuard(canary_patterns=[canary], secret_rescan=False)
     )
     data = _data_with_token("tok-1", content=f"here is {canary}")
     with pytest.raises(GuardrailHttpException) as ei:
@@ -281,7 +242,7 @@ async def test_hook_stage5_dlp_block_increments_blocked_counter() -> None:
 
 async def test_hook_corp_llm_down_increments_gateway_failure_corp_llm() -> None:
     exporter = _prom()
-    g, _ = _guardrail(exporter, corp_llm=_corp_llm_unreachable())
+    g, _ = _build_guardrail(metrics=exporter, corp_llm=_corp_llm_unreachable())
     data = _data_with_token("tok-1", content="hello alice")
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
@@ -294,7 +255,7 @@ async def test_hook_corp_llm_down_increments_gateway_failure_corp_llm() -> None:
 
 async def test_hook_auth_failure_increments_gateway_failure_auth() -> None:
     exporter = _prom()
-    g, _ = _guardrail(exporter)
+    g, _ = _build_guardrail(metrics=exporter)
     # Missing token: _record_failure fires before per-request state exists.
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call({"messages": [], "headers": {}})
@@ -304,7 +265,7 @@ async def test_hook_auth_failure_increments_gateway_failure_auth() -> None:
 
 async def test_hook_latency_histogram_observed_on_audit() -> None:
     exporter = _prom()
-    g, _ = _guardrail(exporter)
+    g, _ = _build_guardrail(metrics=exporter)
     start = datetime.now(UTC)
     await g.audit({"model": "claude"}, None, start_time=start, end_time=start, status="ok")
     text = exporter.render().decode()
@@ -316,7 +277,7 @@ async def test_hook_latency_histogram_observed_on_audit() -> None:
 
 async def test_hook_default_noop_leaves_block_path_unchanged() -> None:
     # No exporter passed → the guardrail builds its own NoopExporter.
-    g, sink = _guardrail(None)
+    g, sink = _build_guardrail(metrics=None)
     data = _data_with_token("tok-1", content=_ENV_PAYLOAD)
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
