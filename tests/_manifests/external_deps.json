@@ -6,6 +6,12 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_a_global_declaration_reaches_the_module_level_helper": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_a_helper_reached_by_a_function_local_import_is_in_the_closure": {
    "files": {},
    "programs": [
@@ -30,7 +36,7 @@
     "git"
    ]
   },
-  "tests/_gates/test_suite_gates.py::test_an_unaliased_dotted_tests_import_is_refused": {
+  "tests/_gates/test_suite_gates.py::test_an_unaliased_tests_import_is_refused": {
    "files": {},
    "programs": [
     "git"

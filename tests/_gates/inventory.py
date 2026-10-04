@@ -31,7 +31,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ROOT / "tests"
@@ -111,6 +111,10 @@ class UnaliasedTestsImportError(ValueError):
     pass
 
 
+class RebindingImportError(ValueError):
+    pass
+
+
 def _import_bindings(
     stmt: ast.Import | ast.ImportFrom, package: str, path: Path
 ) -> Iterator[tuple[str, tuple[str, str | None]]]:
@@ -120,12 +124,12 @@ def _import_bindings(
             if alias.asname:
                 yield alias.asname, (alias.name, None)
                 continue
-            if alias.name.startswith("tests."):
+            if alias.name == "tests" or alias.name.startswith("tests."):
                 where = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
                 raise UnaliasedTestsImportError(
-                    f"{where}:{stmt.lineno}: `import {alias.name}` binds only `tests`, which "
-                    "the check inventory cannot follow; write `from tests.x import name` or "
-                    "`import tests.x as alias`"
+                    f"{where}:{stmt.lineno}: an unaliased `import {alias.name}` binds only "
+                    "`tests`, which the check inventory cannot follow; write "
+                    "`from tests.x import name` or `import tests.x as alias`"
                 )
             top = alias.name.split(".", 1)[0]
             yield top, (top, None)
@@ -154,7 +158,29 @@ def _index(name: str, path: Path, text: str | None = None) -> Module:
             module.consts.setdefault(stmt.target.id, stmt)
         elif isinstance(stmt, ast.Import | ast.ImportFrom):
             module.imports.update(_import_bindings(stmt, package, path))
+    _refuse_rebinding_imports(tree, package, path)
     return module
+
+
+def _refuse_rebinding_imports(tree: ast.Module, package: str, path: Path) -> None:
+    """A scope that imports a ``tests`` name it declares ``global`` / ``nonlocal`` rebinds it
+    for code the walker resolves elsewhere; refuse it rather than miss the helper."""
+    for scope in ast.walk(tree):
+        if not isinstance(scope, DEFS):
+            continue
+        globals_, nonlocals = _declarations(scope)
+        if not globals_ | nonlocals:
+            continue
+        for name, bindings in _own_imports(scope, package, path).items():
+            tests_bound = any(s == "tests" or s.startswith("tests.") for s, _ in bindings)
+            if tests_bound and name in globals_ | nonlocals:
+                where = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+                kind = "global" if name in globals_ else "nonlocal"
+                raise RebindingImportError(
+                    f"{where}:{scope.lineno}: `{scope.name}` declares `{kind} {name}` and "
+                    f"imports `{name}` from tests, rebinding it where the check inventory "
+                    "cannot follow; import it in the scope that uses it"
+                )
 
 
 def suite_files() -> list[Path]:
@@ -317,20 +343,42 @@ def _resolve_import(source: str, attr: str | None, seen: frozenset[str] = frozen
 # Every import a scope binds a name with: which one is live depends on control flow, so
 # all of them are followed.
 ImportTable = dict[str, list[tuple[str, str | None]]]
-# (is a class body, the imports that scope binds itself), innermost last.
-ScopeChain = tuple[tuple[bool, ImportTable], ...]
+
+
+class Scope(NamedTuple):
+    is_class: bool
+    imports: ImportTable
+    globals: set[str]
+    nonlocals: set[str]
+
+
+# Innermost last.
+ScopeChain = tuple[Scope, ...]
 
 
 def _resolve_scoped(module: Module, chain: ScopeChain, name: str) -> list[Any]:
     """Like ``_resolve_name``, but an import of an enclosing scope shadows the module's own
-    name; a class body's imports are visible in that body only, not in its methods."""
-    for depth, (is_class, table) in enumerate(reversed(chain)):
-        if is_class and depth:
+    name; a class body's imports are visible in that body only, not in its methods. Fails
+    closed on ``global`` / ``nonlocal``: a ``global`` declaration on the way to the matching
+    scope adds the module-level target, and a ``nonlocal`` scope's imports are kept while
+    the search goes on outward."""
+    found: list[Any] = []
+    global_seen = False
+    for depth, scope in enumerate(reversed(chain)):
+        if scope.is_class and depth:
             continue
-        if name in table:
-            return [t for t in (_resolve_import(*b) for b in table[name]) if t is not None]
-    target = _resolve_name(module, name)
-    return [] if target is None else [target]
+        global_seen |= name in scope.globals
+        if name in scope.imports:
+            found += [t for b in scope.imports[name] if (t := _resolve_import(*b)) is not None]
+            if name not in scope.nonlocals:
+                break
+    else:
+        global_seen = True
+    if global_seen:
+        target = _resolve_name(module, name)
+        if target is not None:
+            found.append(target)
+    return found
 
 
 def _decorator_names(node: ast.AST) -> list[str]:
@@ -513,6 +561,19 @@ def _own_nodes(scope: ast.AST) -> Iterator[ast.AST]:
             stack += ast.iter_child_nodes(node)
 
 
+def _declarations(scope: ast.AST) -> tuple[set[str], set[str]]:
+    """(``global`` names, ``nonlocal`` names) ``scope`` declares itself."""
+    globals_: set[str] = set()
+    nonlocals: set[str] = set()
+    if not isinstance(scope, COMPREHENSIONS):
+        for node in _own_nodes(scope):
+            if isinstance(node, ast.Global):
+                globals_ |= set(node.names)
+            elif isinstance(node, ast.Nonlocal):
+                nonlocals |= set(node.names)
+    return globals_, nonlocals
+
+
 def _own_imports(scope: ast.AST, package: str, path: Path) -> ImportTable:
     imports: ImportTable = {}
     if isinstance(scope, DEFS):
@@ -532,8 +593,12 @@ def _scoped_walk(module: Module, root: ast.AST) -> Iterator[tuple[ast.AST, Scope
         node, chain = stack.pop()
         yield node, chain
         if isinstance(node, SCOPES):
-            table = _own_imports(node, package, module.path)
-            inner = (*chain, (isinstance(node, ast.ClassDef), table))
+            scope = Scope(
+                isinstance(node, ast.ClassDef),
+                _own_imports(node, package, module.path),
+                *_declarations(node),
+            )
+            inner = (*chain, scope)
             stack += [(part, chain) for part in _enclosing_parts(node)]
             stack += [(part, inner) for part in _scope_parts(node)]
         else:
@@ -550,7 +615,6 @@ def _scope_bindings(scope: ast.AST) -> set[str]:
             if isinstance(n, ast.Name)
         }
     bound: set[str] = set()
-    declared: set[str] = set()
     if isinstance(scope, (*FUNCS, ast.Lambda)):
         a = scope.args
         for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg]:
@@ -578,9 +642,8 @@ def _scope_bindings(scope: ast.AST) -> set[str]:
             bound.add(node.name)
         elif isinstance(node, ast.MatchMapping) and node.rest:
             bound.add(node.rest)
-        elif isinstance(node, ast.Global | ast.Nonlocal):
-            declared |= set(node.names)
-    return bound - declared
+    globals_, nonlocals = _declarations(scope)
+    return bound - globals_ - nonlocals
 
 
 class _Normaliser(ast.NodeTransformer):
