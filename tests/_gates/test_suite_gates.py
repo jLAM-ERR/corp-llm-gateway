@@ -79,6 +79,12 @@ def test_a_helper_reached_by_a_function_local_import_is_in_the_closure() -> None
     assert rejected, evidence
 
 
+def test_a_nested_scope_import_never_hides_a_module_level_helper() -> None:
+    rejected, evidence = selftest.nested_scope_import()
+
+    assert rejected, evidence
+
+
 def test_a_rename_leaves_a_name_the_function_binds_itself(monkeypatch: pytest.MonkeyPatch) -> None:
     source = (
         "def helper():\n    return 1\n"

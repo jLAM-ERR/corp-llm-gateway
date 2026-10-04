@@ -8,7 +8,8 @@ a script a test runs by ``subprocess``, (f) a parametrize table shrunk; (g) the 
 synthetic module re-parsed with another body hashes differently every time (no stale
 cache entry survives a re-parse); and (h) a synthetic helper reached only through a
 function-local ``from tests.… import`` loses its assert (a sibling test that names it
-without the import must not move).
+without the import must not move); (i) an import in a nested def, or in another method of
+a class, binds in that scope only, so the module-level helper the test calls stays reached.
 
 Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
 stops being collected, a lost parametrize case, a setup-time skip, a changed
@@ -28,6 +29,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from tests._gates import inventory
 
@@ -175,21 +177,25 @@ def _only_modules(*extra: inventory.Module) -> Iterator[None]:
         inventory.modules = real
 
 
+def _synthetic_checks(suite: inventory.Module, *others: inventory.Module) -> dict[str, Any]:
+    with _only_modules(suite, *others):
+        checks, _ = inventory.collect(
+            (suite, qual, node, cls) for qual, node, cls in inventory._tests_in(suite)
+        )
+    return checks
+
+
+def _synthetic(name: str, text: str) -> inventory.Module:
+    return inventory._index(f"tests._gates.{name}", ROOT / f"tests/_gates/{name}.py", text)
+
+
 def local_import() -> tuple[bool, str]:
     """A helper reached only through a function-local import loses its assert: the
     importing test's ``delegated`` and ``body_hash`` must move, its sibling's must not."""
-    suite_path = ROOT / "tests" / "_gates" / "selftest_local_suite.py"
-    helper_path = ROOT / "tests" / "_gates" / "selftest_local_helper.py"
-    suite = inventory._index("tests._gates.selftest_local_suite", suite_path, LOCAL_SUITE)
-    records = []
-    for body in LOCAL_HELPER:
-        helper = inventory._index("tests._gates.selftest_local_helper", helper_path, body)
-        with _only_modules(suite, helper):
-            checks, _ = inventory.collect(
-                (suite, qual, node, cls) for qual, node, cls in inventory._tests_in(suite)
-            )
-        records.append(checks)
-    before, after = records
+    suite = _synthetic("selftest_local_suite", LOCAL_SUITE)
+    before, after = (
+        _synthetic_checks(suite, _synthetic("selftest_local_helper", body)) for body in LOCAL_HELPER
+    )
     problems = inventory.diff_checks(before, after)
     test = f"{suite.rel}::test_imports_it_inside"
     sibling = f"{suite.rel}::test_sibling_without_the_import"
@@ -202,6 +208,58 @@ def local_import() -> tuple[bool, str]:
     if ok:
         evidence = f"{len(expect)} expected line(s), e.g. {problems[0]}"
     return ok, evidence[:240]
+
+
+SCOPE_SUITE = (
+    "def helper(value):\n    assert value\n    return value\n"
+    "def test_a_nested_import_leaves_the_module_helper():\n"
+    "    def inner():\n"
+    "        from tests._gates.selftest_scope_other import helper\n"
+    "        return helper(2)\n"
+    "    helper(1)\n"
+    "    inner()\n"
+    "class Thing:\n"
+    "    def a(self):\n"
+    "        from tests._gates.selftest_scope_other import helper\n"
+    "        return helper(2)\n"
+    "    def b(self):\n"
+    "        return helper(1)\n"
+    "def test_a_method_import_leaves_the_module_helper():\n"
+    "    Thing().b()\n"
+)
+SCOPE_OTHER = "def helper(value):\n    assert value > 1\n    return value\n"
+
+
+def nested_scope_import() -> tuple[bool, str]:
+    """An import in a nested def, or in another method of a class, binds there only: the
+    test still reaches the module-level ``helper`` it calls, and the imported one too, so
+    dropping either one's assert moves both tests' ``delegated`` and ``body_hash``."""
+    base = _synthetic_checks(
+        _synthetic("selftest_scope_suite", SCOPE_SUITE),
+        _synthetic("selftest_scope_other", SCOPE_OTHER),
+    )
+    module_helper_weakened = _synthetic_checks(
+        _synthetic("selftest_scope_suite", SCOPE_SUITE.replace("    assert value\n", "", 1)),
+        _synthetic("selftest_scope_other", SCOPE_OTHER),
+    )
+    imported_helper_weakened = _synthetic_checks(
+        _synthetic("selftest_scope_suite", SCOPE_SUITE),
+        _synthetic("selftest_scope_other", SCOPE_OTHER.replace("    assert value > 1\n", "")),
+    )
+    unmet = []
+    for label, after in (
+        ("module-level", module_helper_weakened),
+        ("imported", imported_helper_weakened),
+    ):
+        problems = inventory.diff_checks(base, after)
+        for node_id in base:
+            for column in ("delegated", "body_hash"):
+                if not any(p.startswith(f"{node_id}: {column} ") for p in problems):
+                    unmet.append(f"{label} helper: {node_id.split('::')[1]} {column}")
+    if unmet:
+        return False, f"not reported: {unmet}"[:240]
+    first = inventory.diff_checks(base, module_helper_weakened)[0]
+    return True, f"{2 * 2 * len(base)} expected line(s), e.g. {first}"[:240]
 
 
 def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool, str]:
@@ -358,6 +416,10 @@ def main(argv: list[str] | None = None) -> int:
         rejected, evidence = local_import()
         results.append(
             ("h: helper reached by a function-local import, its assert dropped", rejected, evidence)
+        )
+        rejected, evidence = nested_scope_import()
+        results.append(
+            ("i: a nested-scope import never hides a module-level helper", rejected, evidence)
         )
     else:
         rejected, evidence = missing_module()

@@ -12,6 +12,12 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_a_nested_scope_import_never_hides_a_module_level_helper": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_a_reparsed_module_never_reads_a_stale_cache_entry": {
    "files": {},
    "programs": [
