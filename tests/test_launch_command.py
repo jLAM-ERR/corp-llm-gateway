@@ -9,7 +9,6 @@ that reach a provider without the guardrail.
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -90,7 +89,7 @@ def test_the_asgi_target_is_named_exactly_once_in_serve() -> None:
     assert ASGI_TARGET in (ROOT / "src/corp_llm_gateway/serve.py").read_text()
 
 
-@pytest.mark.skipif(shutil.which("helm") is None, reason="helm is not installed")
+@pytest.mark.requires_helm
 def test_the_helm_gateway_container_inherits_the_image_entrypoint() -> None:
     rendered = subprocess.run(
         ["helm", "template", "gw", str(ROOT / "helm/corp-llm-gateway")],

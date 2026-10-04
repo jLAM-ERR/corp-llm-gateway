@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+import os
+import shutil
+from collections.abc import Callable, Iterator
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,39 @@ from tests import logger_state
 
 # Not a test module, so its asserts are rewritten only if registered before anything imports it.
 pytest.register_assert_rewrite("tests.hook_fixtures")
+
+
+def _ner_missing() -> bool:
+    try:
+        import natasha  # noqa: F401
+        import spacy  # noqa: F401
+    except ImportError:
+        return True
+    return False
+
+
+SKIP_MARKERS: dict[str, tuple[Callable[[], bool], str]] = {
+    "requires_litellm": (lambda: find_spec("litellm") is None, "litellm is not installed"),
+    "requires_ner": (_ner_missing, "natasha/spacy not available"),
+    "requires_helm": (lambda: shutil.which("helm") is None, "helm binary not on PATH"),
+    "requires_shellcheck": (lambda: shutil.which("shellcheck") is None, "shellcheck not on PATH"),
+    "not_root": (lambda: os.geteuid() == 0, "needs a non-root user"),
+}
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Turn the dependency markers registered in pyproject.toml into setup-time skips, as
+    the per-test ``skipif`` they replaced did (plan 20260926 Task 1c): one condition and
+    one reason per dependency instead of a copy in every module."""
+    skips: dict[str, bool] = {}
+    for item in items:
+        for name, (condition, reason) in SKIP_MARKERS.items():
+            if item.get_closest_marker(name) is None:
+                continue
+            if name not in skips:
+                skips[name] = condition()
+            if skips[name]:
+                item.add_marker(pytest.mark.skip(reason=reason))
 
 
 @pytest.fixture(autouse=True)

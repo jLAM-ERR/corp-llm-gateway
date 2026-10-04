@@ -90,3 +90,10 @@ ignore = []
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
+markers = [
+    "requires_litellm: skip when litellm is not installed",
+    "requires_ner: skip when natasha or spacy cannot be imported",
+    "requires_helm: skip when the helm binary is not on PATH",
+    "requires_shellcheck: skip when shellcheck is not on PATH",
+    "not_root: skip when running as root",
+]

@@ -15,7 +15,6 @@ They also start none of litellm's own guardrails (plan 20260926 Task 6): no
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -36,8 +35,6 @@ COMPOSE_FILES = sorted(COMPOSE.glob("docker-compose*.yml"))
 
 # litellm's own DEBUG switches (proxy_server.initialize, proxy_cli.py) and ours.
 DEBUG_ENV_KEYS = ("DETAILED_DEBUG", "DEBUG", "CORP_LLM_ALLOW_LITELLM_DEBUG")
-
-needs_helm = pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not on PATH")
 
 
 def _helm_docs() -> list[dict[str, Any]]:
@@ -84,7 +81,7 @@ def test_compose_litellm_config_logs_no_request_content(name: str) -> None:
     _assert_logs_no_content(yaml.safe_load(LITELLM_CONFIGS[name].read_text()))
 
 
-@needs_helm
+@pytest.mark.requires_helm
 def test_helm_litellm_config_logs_no_request_content() -> None:
     _assert_logs_no_content(_helm_litellm_config())
 
@@ -98,7 +95,7 @@ def test_compose_litellm_config_drops_params_a_provider_does_not_take(name: str)
     assert config["litellm_settings"]["drop_params"] is True
 
 
-@needs_helm
+@pytest.mark.requires_helm
 def test_helm_litellm_config_drops_params_a_provider_does_not_take() -> None:
     assert _helm_litellm_config()["litellm_settings"]["drop_params"] is True
 
@@ -108,7 +105,7 @@ def test_compose_litellm_config_loads_no_policies_from_the_db(name: str) -> None
     _assert_db_objects_pinned(yaml.safe_load(LITELLM_CONFIGS[name].read_text()))
 
 
-@needs_helm
+@pytest.mark.requires_helm
 def test_helm_litellm_config_loads_no_policies_from_the_db() -> None:
     _assert_db_objects_pinned(_helm_litellm_config())
 
@@ -155,7 +152,7 @@ def test_compose_litellm_reads_its_config_table() -> None:
     assert env.get("STORE_MODEL_IN_DB") == "True"
 
 
-@needs_helm
+@pytest.mark.requires_helm
 def test_helm_litellm_has_no_database_to_read_a_config_table_from() -> None:
     docs = _helm_docs()
     pod = _first_of_kind(docs, "Deployment")["spec"]["template"]["spec"]
@@ -270,7 +267,7 @@ def test_compose_litellm_config_starts_no_litellm_guardrail(name: str) -> None:
     _assert_starts_no_litellm_guardrail(yaml.safe_load(text), text)
 
 
-@needs_helm
+@pytest.mark.requires_helm
 def test_helm_litellm_config_starts_no_litellm_guardrail() -> None:
     text = _litellm_configmap(_helm_docs())["data"]["config.yaml"]
     _assert_starts_no_litellm_guardrail(yaml.safe_load(text), text)
@@ -382,7 +379,7 @@ def test_compose_gateway_env_turns_no_litellm_debug_on(path: Path) -> None:
     _assert_no_debug_env(_compose_env(gateway.get("environment")))
 
 
-@needs_helm
+@pytest.mark.requires_helm
 def test_helm_gateway_env_turns_no_litellm_debug_on() -> None:
     pod = _first_of_kind(_helm_docs(), "Deployment")["spec"]["template"]["spec"]
     containers = pod["containers"] + pod.get("initContainers", [])

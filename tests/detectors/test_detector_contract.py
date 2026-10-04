@@ -23,15 +23,6 @@ import pytest
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
 from corp_llm_gateway.profiles import DETECTOR_REGISTRY, build_detectors
 
-_ner_available = False
-try:
-    import natasha as _nat  # noqa: F401
-    import spacy as _spa  # noqa: F401
-
-    _ner_available = True
-except ImportError:
-    pass
-
 _NER_DETECTORS = {"dual_ner", "ner_ru", "ner_en"}
 
 _NETWORK_DETECTORS = {"corp_ner"}
@@ -40,11 +31,7 @@ _TEXT = "write to ivan@example.com about ИНН 7707083893 and John Smith"
 
 
 def _param(name: str):
-    marks = (
-        [pytest.mark.skipif(not _ner_available, reason="natasha/spaCy not installed")]
-        if name in _NER_DETECTORS
-        else []
-    )
+    marks = [pytest.mark.requires_ner] if name in _NER_DETECTORS else []
     return pytest.param(name, id=name, marks=marks)
 
 

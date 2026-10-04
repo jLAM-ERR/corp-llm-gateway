@@ -39,16 +39,6 @@ BUNDLES_ROOT = Path(profiles_pkg.__file__).parent / "defaults"
 _VALID_INN = "7707083893"
 
 
-_ner_available = False
-try:
-    import natasha as _nat  # noqa: F401
-    import spacy as _spa  # noqa: F401
-
-    _ner_available = True
-except ImportError:
-    pass
-
-
 class _StaticRulesLoader(RulesLoader):
     def __init__(self, rules: Rules) -> None:
         self._rules = rules
@@ -209,7 +199,7 @@ async def test_merged_policy_knobs_are_most_restrictive() -> None:
 # NER-gated: PERSON redaction (skips without natasha/spaCy) ------------------
 
 
-@pytest.mark.skipif(not _ner_available, reason="natasha/spacy not available")
+@pytest.mark.requires_ner
 async def test_worked_example_redacts_person_with_ner() -> None:
     bundle = await _resolve_division_x()
     orch = _orchestrator_for(bundle)

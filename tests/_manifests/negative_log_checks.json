@@ -905,7 +905,7 @@
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_litellm_config_guards.py:264",
+   "site": "tests/test_litellm_config_guards.py:261",
    "owner": "tests/test_litellm_config_guards.py::_assert_starts_no_litellm_guardrail",
    "check": "name not in text",
    "class": "not-a-log-check",

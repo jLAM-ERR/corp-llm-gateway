@@ -9,9 +9,7 @@ tmp_path — the script only runs `main` when executed directly.
 
 from __future__ import annotations
 
-import os
 import re
-import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -60,7 +58,7 @@ def test_bash_syntax_is_valid() -> None:
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not on PATH")
+@pytest.mark.requires_shellcheck
 def test_shellcheck_clean() -> None:
     result = subprocess.run(["shellcheck", str(SCRIPT)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -251,7 +249,7 @@ def test_relative_target_dir_is_refused(tmp_path: Path) -> None:
     assert "must be an absolute path" in result.stderr
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="running as root would mutate this host")
+@pytest.mark.not_root
 def test_running_as_non_root_is_refused(tmp_path: Path) -> None:
     result = subprocess.run(
         [str(SCRIPT), "--dir", str(tmp_path / "deploy")], capture_output=True, text=True
