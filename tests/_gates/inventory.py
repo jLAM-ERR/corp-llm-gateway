@@ -103,11 +103,35 @@ def _targets(node: ast.AST) -> Iterator[str]:
             yield from _targets(elt)
 
 
+def _package(name: str, path: Path) -> str:
+    return name.rsplit(".", 1)[0] if path.name != "__init__.py" else name
+
+
+def _bind_import(
+    imports: dict[str, tuple[str, str | None]], stmt: ast.Import | ast.ImportFrom, package: str
+) -> None:
+    """Record the names ``stmt`` binds as ``name -> (source module, attribute or None)``."""
+    if isinstance(stmt, ast.Import):
+        for alias in stmt.names:
+            if alias.asname:
+                imports[alias.asname] = (alias.name, None)
+            else:
+                top = alias.name.split(".", 1)[0]
+                imports[top] = (top, None)
+        return
+    source = stmt.module or ""
+    if stmt.level:
+        base = package.rsplit(".", stmt.level - 1)[0] if stmt.level > 1 else package
+        source = f"{base}.{source}" if source else base
+    for alias in stmt.names:
+        imports[alias.asname or alias.name] = (source, alias.name)
+
+
 def _index(name: str, path: Path, text: str | None = None) -> Module:
     source = path.read_text() if text is None else text
     tree = ast.parse(source, filename=str(path))
     module = Module(name, path, tree)
-    package = name.rsplit(".", 1)[0] if path.name != "__init__.py" else name
+    package = _package(name, path)
     for stmt in _top_level(tree.body):
         if isinstance(stmt, DEFS):
             module.defs[stmt.name] = stmt
@@ -117,21 +141,22 @@ def _index(name: str, path: Path, text: str | None = None) -> Module:
                     module.consts[target_name] = stmt
         elif isinstance(stmt, ast.AnnAssign | ast.AugAssign) and isinstance(stmt.target, ast.Name):
             module.consts.setdefault(stmt.target.id, stmt)
-        elif isinstance(stmt, ast.Import):
-            for alias in stmt.names:
-                if alias.asname:
-                    module.imports[alias.asname] = (alias.name, None)
-                else:
-                    top = alias.name.split(".", 1)[0]
-                    module.imports[top] = (top, None)
-        elif isinstance(stmt, ast.ImportFrom):
-            source = stmt.module or ""
-            if stmt.level:
-                base = package.rsplit(".", stmt.level - 1)[0] if stmt.level > 1 else package
-                source = f"{base}.{source}" if source else base
-            for alias in stmt.names:
-                module.imports[alias.asname or alias.name] = (source, alias.name)
+        elif isinstance(stmt, ast.Import | ast.ImportFrom):
+            _bind_import(module.imports, stmt, package)
     return module
+
+
+def _local_imports(module: Module, node: ast.AST) -> dict[str, tuple[str, str | None]]:
+    """Imports nested anywhere inside ``node`` (a test, helper, fixture or class, nested
+    scopes included), bound as a module-level import would be."""
+    if not isinstance(node, DEFS):
+        return {}
+    imports: dict[str, tuple[str, str | None]] = {}
+    package = _package(module.name, module.path)
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Import | ast.ImportFrom):
+            _bind_import(imports, sub, package)
+    return imports
 
 
 def suite_files() -> list[Path]:
@@ -269,22 +294,33 @@ def _resolve_name(module: Module, name: str, seen: frozenset[str] = frozenset())
     if name in module.consts:
         return ("const", module, module.consts[name], name)
     if name in module.imports:
-        source, attr = module.imports[name]
-        key = f"{source}:{attr}"
-        if key in seen:
-            return None
-        mods = modules()
-        if attr is None:
-            if source in mods:
-                return ("module", mods[source], None, source)
-            return None
-        if source in mods:
-            found = _resolve_name(mods[source], attr, seen | {key})
-            if found is not None:
-                return found
-        if f"{source}.{attr}" in mods:
-            return ("module", mods[f"{source}.{attr}"], None, f"{source}.{attr}")
+        return _resolve_import(*module.imports[name], seen)
     return None
+
+
+def _resolve_import(source: str, attr: str | None, seen: frozenset[str] = frozenset()):
+    key = f"{source}:{attr}"
+    if key in seen:
+        return None
+    mods = modules()
+    if attr is None:
+        if source in mods:
+            return ("module", mods[source], None, source)
+        return None
+    if source in mods:
+        found = _resolve_name(mods[source], attr, seen | {key})
+        if found is not None:
+            return found
+    if f"{source}.{attr}" in mods:
+        return ("module", mods[f"{source}.{attr}"], None, f"{source}.{attr}")
+    return None
+
+
+def _resolve_scoped(module: Module, local: dict[str, tuple[str, str | None]], name: str):
+    """Like ``_resolve_name``, but a function-local import shadows the module's own name."""
+    if name in local:
+        return _resolve_import(*local[name])
+    return _resolve_name(module, name)
 
 
 def _decorator_names(node: ast.AST) -> list[str]:
@@ -701,6 +737,7 @@ def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -
                     queue.append((found[0], found[1], f"fixture:{arg.arg}", "fixture"))
                 else:
                     closure.external_fixtures.add(arg.arg)
+        local = _local_imports(module, node)
         for sub in ast.walk(node):
             if (
                 isinstance(sub, ast.Call)
@@ -713,7 +750,7 @@ def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -
                 if found:
                     queue.append((found[0], found[1], f"fixture:{name}", "fixture"))
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                target = _resolve_name(module, sub.id)
+                target = _resolve_scoped(module, local, sub.id)
                 if target is None:
                     continue
                 kind_, owner, target_node, name = target
@@ -722,7 +759,7 @@ def _walk_closure(ctx: Context, roots: list[tuple[Module, ast.AST, str, str]]) -
                     continue
                 queue.append((owner, target_node, name, "def" if kind_ == "def" else "const"))
             elif isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
-                target = _resolve_name(module, sub.value.id)
+                target = _resolve_scoped(module, local, sub.value.id)
                 if target and target[0] == "module":
                     owner = target[1]
                     inner = _resolve_name(owner, sub.attr)

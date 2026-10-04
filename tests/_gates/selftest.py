@@ -4,9 +4,11 @@ the gate must reject it. The working tree is restored after every mutation.
 Inventory gate (run in any venv): (a) a delegated helper check removed, (b) a
 ``pytest.fail`` path removed, (c) the production-detector builder swapped for a static
 one, (d) an assert made unreachable by a changed selector, (e) a predicate changed inside
-a script a test runs by ``subprocess``, (f) a parametrize table shrunk; and (g) the same
+a script a test runs by ``subprocess``, (f) a parametrize table shrunk; (g) the same
 synthetic module re-parsed with another body hashes differently every time (no stale
-cache entry survives a re-parse).
+cache entry survives a re-parse); and (h) a synthetic helper reached only through a
+function-local ``from tests.… import`` loses its assert (a sibling test that names it
+without the import must not move).
 
 Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
 stops being collected, a lost parametrize case, a setup-time skip, a changed
@@ -17,12 +19,13 @@ collection-skip reason.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -145,6 +148,60 @@ def cache_reparse(rounds: int = 200) -> tuple[bool, str]:
         del module, checks
     ok = len(hashes[0]) == len(hashes[1]) == 1 and hashes[0] != hashes[1]
     return ok, f"{rounds} re-parses, distinct hashes per body: {len(hashes[0])}/{len(hashes[1])}"
+
+
+LOCAL_HELPER = (
+    "def helper(value):\n    assert value\n    return value\n",
+    "def helper(value):\n    return value\n",
+)
+LOCAL_SUITE = (
+    "def test_imports_it_inside():\n"
+    "    if True:\n"
+    "        from tests._gates.selftest_local_helper import helper\n"
+    "    helper(1)\n"
+    "def test_sibling_without_the_import():\n"
+    "    helper(1)\n"
+)
+
+
+@contextlib.contextmanager
+def _only_modules(*extra: inventory.Module) -> Iterator[None]:
+    real = inventory.modules
+    mods = {module.name: module for module in extra}
+    inventory.modules = lambda: mods
+    try:
+        yield
+    finally:
+        inventory.modules = real
+
+
+def local_import() -> tuple[bool, str]:
+    """A helper reached only through a function-local import loses its assert: the
+    importing test's ``delegated`` and ``body_hash`` must move, its sibling's must not."""
+    suite_path = ROOT / "tests" / "_gates" / "selftest_local_suite.py"
+    helper_path = ROOT / "tests" / "_gates" / "selftest_local_helper.py"
+    suite = inventory._index("tests._gates.selftest_local_suite", suite_path, LOCAL_SUITE)
+    records = []
+    for body in LOCAL_HELPER:
+        helper = inventory._index("tests._gates.selftest_local_helper", helper_path, body)
+        with _only_modules(suite, helper):
+            checks, _ = inventory.collect(
+                (suite, qual, node, cls) for qual, node, cls in inventory._tests_in(suite)
+            )
+        records.append(checks)
+    before, after = records
+    problems = inventory.diff_checks(before, after)
+    test = f"{suite.rel}::test_imports_it_inside"
+    sibling = f"{suite.rel}::test_sibling_without_the_import"
+    expect = (f"{test}: delegated ", f"{test}: body_hash ")
+    unmet = [e for e in expect if not any(p.startswith(e) for p in problems)]
+    reached = before[test]["helpers"] == ["helper"]
+    unbound = before[sibling]["helpers"] == [] and not any(sibling in p for p in problems)
+    ok = not unmet and reached and unbound
+    evidence = f"not reported: {unmet}; reached {reached}; sibling unbound {unbound}"
+    if ok:
+        evidence = f"{len(expect)} expected line(s), e.g. {problems[0]}"
+    return ok, evidence[:240]
 
 
 def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool, str]:
@@ -298,6 +355,10 @@ def main(argv: list[str] | None = None) -> int:
             results.append((mutation.name, rejected, evidence))
         rejected, evidence = cache_reparse()
         results.append(("g: synthetic module re-parsed with another body", rejected, evidence))
+        rejected, evidence = local_import()
+        results.append(
+            ("h: helper reached by a function-local import, its assert dropped", rejected, evidence)
+        )
     else:
         rejected, evidence = missing_module()
         results.append(("newly missing module", rejected, evidence))
