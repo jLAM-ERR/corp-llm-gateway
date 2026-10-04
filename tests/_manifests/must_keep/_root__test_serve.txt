@@ -1,0 +1,14 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/test_serve.py::test_a_bad_serve_port_exits_78
+tests/test_serve.py::test_a_bad_serve_port_exits_78[-1]
+tests/test_serve.py::test_a_bad_serve_port_exits_78[0]
+tests/test_serve.py::test_a_bad_serve_port_exits_78[70000]
+tests/test_serve.py::test_a_bad_serve_port_exits_78[80.5]
+tests/test_serve.py::test_a_bad_serve_port_exits_78[four-thousand]
+tests/test_serve.py::test_host_and_port_come_from_config
+tests/test_serve.py::test_json_logs_selects_litellms_json_log_config
+tests/test_serve.py::test_no_json_log_config_when_the_litellm_config_does_not_ask_for_one
+tests/test_serve.py::test_one_worker_only
+tests/test_serve.py::test_the_defaults_match_the_litellm_cli
+tests/test_serve.py::test_the_served_target_is_the_gated_app

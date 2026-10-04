@@ -24,7 +24,14 @@ INDEX_PATH = ROOT / "tests" / "_manifests" / "name_pinned.json"
 MATRIX = "tests/litellm_hook/test_acceptance_matrix.py"
 # The citation sources, one segment per `*` (docs/testing/ is not one: it documents the
 # gates and cites tests as examples of their rules).
-DOC_GLOBS = ("CLAUDE.md", "README.md", "docs/*.md", "docs/ops/*.md")
+DOC_GLOBS = (
+    "CLAUDE.md",
+    "README.md",
+    "docs/*.md",
+    "docs/ops/*.md",
+    "compose/*.md",
+    "compose/nginx/*.md",
+)
 # Ignored by git, so absent on a clean checkout; never a citation source.
 UNTRACKED_DOCS = {"docs/remaining-steps.md", "docs/requirements-compliance.md"}
 
@@ -50,14 +57,13 @@ def _sources(paths: list[str]) -> list[str]:
 def git_doc_files() -> list[str]:
     # `:(glob)` keeps `*` inside one path segment, as Path.glob does.
     out = subprocess.run(
-        ["git", "ls-files", "--", *(f":(glob){g}" for g in DOC_GLOBS)],
+        ["git", "ls-files", "-z", "--", *(f":(glob){g}" for g in DOC_GLOBS)],
         cwd=ROOT,
         capture_output=True,
-        text=True,
         check=True,
         timeout=60,
-    ).stdout.split()
-    return _sources(out)
+    ).stdout
+    return _sources([p for p in out.decode().split("\0") if p])
 
 
 def tree_doc_files() -> list[str]:
@@ -202,7 +208,8 @@ def write(current: dict[str, Any]) -> None:
     data = {
         "about": (
             "Tests cited by name (acceptance matrix _ALL; docs/*.md, docs/ops/*.md, CLAUDE.md, "
-            "README.md). Renaming or moving one updates every site in the same PR."
+            "README.md, compose/*.md, compose/nginx/*.md). Renaming or moving one updates every "
+            "site in the same PR."
         ),
         "allow": previous.get("allow", {}),
         "ids": current["ids"],

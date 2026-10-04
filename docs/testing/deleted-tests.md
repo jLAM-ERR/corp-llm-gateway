@@ -6,7 +6,7 @@ semantic-equivalence note gate 1 asks for.
 
 A row is complete only when all of these hold:
 
-- the id is not in `tests/_manifests/must_keep.txt` (must-keep ids are never deleted,
+- the id is not in `tests/_manifests/must_keep/` (must-keep ids are never deleted,
   re-split or reduced to fewer parameter cases);
 - the surviving test(s) have the same inputs, select the same production path in setup,
   apply the same predicates and selectors, expect the same outcomes, and carry the same

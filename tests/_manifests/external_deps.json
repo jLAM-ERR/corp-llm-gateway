@@ -1,5 +1,17 @@
 {
  "tests": {
+  "tests/_gates/test_suite_gates.py::test_a_clone_without_the_step1_history_fails_on_ci_and_warns_elsewhere": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_reparsed_module_never_reads_a_stale_cache_entry": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_dropping_a_must_keep_id_needs_a_rule_change": {
    "files": {},
    "programs": [
@@ -36,6 +48,12 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_task0_changes_no_existing_test": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_the_check_inventory_matches_the_baseline": {
    "files": {},
    "programs": [
@@ -44,7 +62,15 @@
   },
   "tests/_gates/test_suite_gates.py::test_the_environment_fingerprints_are_the_recipes": {
    "files": {
-    "pyproject.toml": "d9d46c3ead14c35bae84669c2048fcf7"
+    "pyproject.toml": "13012fab2bde5b78bf1bbce02aafc887",
+    "scripts": "dir:708a18a792a9e845c04b1879deb3"
+   },
+   "programs": []
+  },
+  "tests/_gates/test_suite_gates.py::test_the_full_constraints_install_the_litellm_pyproject_pins": {
+   "files": {
+    "pyproject.toml": "13012fab2bde5b78bf1bbce02aafc887",
+    "scripts": "dir:708a18a792a9e845c04b1879deb3"
    },
    "programs": []
   },
@@ -3110,9 +3136,9 @@
     "compose/README.ru.md": "fc17da788f837dadd343420eae2531be",
     "docs/audit-schema.md": "20b5396a990dab69346825e07f434877",
     "docs/audit-schema.ru.md": "4cbf9a443bf479a189397a96de159dba",
-    "docs/extending.md": "030b4393d6a5bf6a68f13171020bd649",
+    "docs/extending.md": "527bd42e07e19c7844865357f7918080",
     "docs/extending.ru.md": "65f8fc16398383b150ab9993d40e9688",
-    "docs/ops": "dir:876e2537ded6103a7ca12a971718",
+    "docs/ops": "dir:2e8f7111bac74bcde713a9089201",
     "docs/security.md": "f9355e78204245880d4dbc78082ea810",
     "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
    },
@@ -3125,9 +3151,9 @@
     "compose/README.ru.md": "fc17da788f837dadd343420eae2531be",
     "docs/audit-schema.md": "20b5396a990dab69346825e07f434877",
     "docs/audit-schema.ru.md": "4cbf9a443bf479a189397a96de159dba",
-    "docs/extending.md": "030b4393d6a5bf6a68f13171020bd649",
+    "docs/extending.md": "527bd42e07e19c7844865357f7918080",
     "docs/extending.ru.md": "65f8fc16398383b150ab9993d40e9688",
-    "docs/ops": "dir:876e2537ded6103a7ca12a971718",
+    "docs/ops": "dir:2e8f7111bac74bcde713a9089201",
     "docs/security.md": "f9355e78204245880d4dbc78082ea810",
     "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
    },
@@ -4791,7 +4817,7 @@
   },
   "tests/test_ci_workflow.py::test_the_ner_extra_carries_the_gazetteer_lemmatizer": {
    "files": {
-    "pyproject.toml": "d9d46c3ead14c35bae84669c2048fcf7"
+    "pyproject.toml": "13012fab2bde5b78bf1bbce02aafc887"
    },
    "programs": []
   },
@@ -5438,9 +5464,8 @@
     "docker/anthropic-oauth/Dockerfile": "642317853608e8a218aa681ce3cd51b1",
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
-    "pyproject.toml": "d9d46c3ead14c35bae84669c2048fcf7",
-    "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab",
-    "scripts/test-env.full.txt": "41880a4cc705801bec4b965cee190f39"
+    "pyproject.toml": "13012fab2bde5b78bf1bbce02aafc887",
+    "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
    "programs": []
   },
@@ -5451,9 +5476,8 @@
     "docker/anthropic-oauth/Dockerfile": "642317853608e8a218aa681ce3cd51b1",
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
-    "pyproject.toml": "d9d46c3ead14c35bae84669c2048fcf7",
-    "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab",
-    "scripts/test-env.full.txt": "41880a4cc705801bec4b965cee190f39"
+    "pyproject.toml": "13012fab2bde5b78bf1bbce02aafc887",
+    "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
    "programs": []
   },
@@ -5464,9 +5488,8 @@
     "docker/anthropic-oauth/Dockerfile": "642317853608e8a218aa681ce3cd51b1",
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
-    "pyproject.toml": "d9d46c3ead14c35bae84669c2048fcf7",
-    "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab",
-    "scripts/test-env.full.txt": "41880a4cc705801bec4b965cee190f39"
+    "pyproject.toml": "13012fab2bde5b78bf1bbce02aafc887",
+    "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
    "programs": []
   },
@@ -5477,10 +5500,9 @@
     "docker/anthropic-oauth/Dockerfile": "642317853608e8a218aa681ce3cd51b1",
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
-    "docs/ops/upgrade.md": "1ec0b901a35d2cd8fde5c2c9fda4544a",
-    "pyproject.toml": "d9d46c3ead14c35bae84669c2048fcf7",
-    "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab",
-    "scripts/test-env.full.txt": "41880a4cc705801bec4b965cee190f39"
+    "docs/ops/upgrade.md": "6242061f0f1a7e2b293818394ac3a1c4",
+    "pyproject.toml": "13012fab2bde5b78bf1bbce02aafc887",
+    "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
    "programs": []
   },

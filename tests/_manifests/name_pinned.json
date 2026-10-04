@@ -1,5 +1,5 @@
 {
- "about": "Tests cited by name (acceptance matrix _ALL; docs/*.md, docs/ops/*.md, CLAUDE.md, README.md). Renaming or moving one updates every site in the same PR.",
+ "about": "Tests cited by name (acceptance matrix _ALL; docs/*.md, docs/ops/*.md, CLAUDE.md, README.md, compose/*.md, compose/nginx/*.md). Renaming or moving one updates every site in the same PR.",
  "allow": {
   "CLAUDE.md:tests/sanitizer/test_engine.py::test_name": "illustrative placeholder in the single-test command example (CLAUDE.md, Running tests)"
  },
@@ -422,32 +422,42 @@
   ]
  },
  "paths": {
+  "tests/_gates/fingerprint.py": [
+   "docs/ops/upgrade.md:153"
+  ],
   "tests/audit/test_guardrail_information_gate.py": [
    "docs/audit-schema.md:153",
    "docs/audit-schema.ru.md:157"
   ],
   "tests/compose/test_nginx_allowlist_routes.py": [
    "CLAUDE.md:72",
+   "compose/README.md:894",
+   "compose/README.ru.md:913",
+   "compose/nginx/README.md:20",
    "docs/security.md:1204",
    "docs/security.ru.md:1184"
   ],
   "tests/compose/test_nginx_profile.py": [
    "CLAUDE.md:72",
+   "compose/nginx/README.md:19",
    "docs/ops/capacity.md:240",
    "docs/ops/capacity.ru.md:181",
    "docs/security.md:1124",
    "docs/security.ru.md:1095"
   ],
   "tests/compose/test_nginx_runtime.py": [
-   "CLAUDE.md:72"
+   "CLAUDE.md:72",
+   "compose/nginx/README.md:19"
   ],
   "tests/integration/test_anthropic_oauth_outbound.py": [
-   "docs/ops/upgrade.md:194",
+   "docs/ops/upgrade.md:196",
    "docs/security.md:650",
    "docs/security.ru.md:604"
   ],
   "tests/integration/test_route_gate_container.py": [
    "CLAUDE.md:171",
+   "compose/README.md:38",
+   "compose/README.ru.md:39",
    "docs/security.md:1061",
    "docs/security.ru.md:1032"
   ],
@@ -533,7 +543,7 @@
    "docs/security.ru.md:1263"
   ],
   "tests/litellm_hook/test_litellm_route_assumptions.py": [
-   "docs/ops/upgrade.md:191",
+   "docs/ops/upgrade.md:193",
    "docs/security.md:690",
    "docs/security.ru.md:645"
   ],
@@ -654,8 +664,8 @@
   ],
   "tests/test_litellm_pin.py": [
    "docs/extending.md:149",
-   "docs/ops/upgrade.md:151",
-   "docs/ops/upgrade.md:185"
+   "docs/ops/upgrade.md:150",
+   "docs/ops/upgrade.md:187"
   ]
  }
 }

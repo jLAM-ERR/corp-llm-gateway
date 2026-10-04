@@ -1,0 +1,7 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/test_litellm_config.py::test_no_deploy_input_sets_litellms_dead_concurrency_knobs
+tests/test_litellm_config.py::test_the_compose_gateway_carries_the_in_flight_cap
+tests/test_litellm_config.py::test_the_shipped_litellm_configs_arm_cancel_on_disconnect
+tests/test_litellm_config.py::test_the_shipped_litellm_configs_arm_cancel_on_disconnect[config.oauth.yaml]
+tests/test_litellm_config.py::test_the_shipped_litellm_configs_arm_cancel_on_disconnect[config.yaml]

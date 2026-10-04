@@ -9,16 +9,28 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
-from tests._gates import fingerprint, inventory, ledger, must_keep, name_pinned, negative_logs
+from tests._gates import (
+    fingerprint,
+    inventory,
+    ledger,
+    must_keep,
+    name_pinned,
+    negative_logs,
+    selftest,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFESTS = ROOT / "tests" / "_manifests"
 ENV_VAR = "CORP_TEST_ENV"
+# Task 0 adds the gates and their manifests and changes no existing test; Task 1a, the
+# first PR that moves tests, sets this to False.
+TASK0_FROZEN = True
 
 
 def test_the_check_inventory_matches_the_baseline() -> None:
@@ -59,6 +71,31 @@ def test_each_test_in_a_module_keeps_its_own_external_files() -> None:
     }
 
 
+def test_a_reparsed_module_never_reads_a_stale_cache_entry() -> None:
+    rejected, evidence = selftest.cache_reparse(rounds=60)
+
+    assert rejected, evidence
+
+
+def test_a_rename_leaves_a_name_the_function_binds_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = (
+        "def helper():\n    return 1\n"
+        "def test_uses_both():\n"
+        "    assert helper() == 1\n"
+        "    def inner(helper):\n        return helper\n"
+        "    assert [helper for helper in (2,)] == [2]\n"
+    )
+    path = ROOT / "tests" / "_gates" / "renamed_helper.py"
+    module = inventory._index("tests._gates.renamed_helper", path, source)
+    monkeypatch.setattr(inventory, "renames", lambda: {"helper": "old_helper"})
+
+    dump = inventory._normalise(module, module.defs["test_uses_both"], False)
+
+    # The module-level call is renamed; the argument and the comprehension variable are not.
+    assert dump.count("Name('old_helper'") == 1
+    assert dump.count("Name('helper'") == 3
+
+
 def test_every_override_names_a_live_site_and_says_why() -> None:
     sites = json.loads(inventory.OVERRIDES_PATH.read_text())["sites"]
     files = {site.split("::", 1)[0] for site in sites}
@@ -94,7 +131,29 @@ def test_dropping_a_must_keep_id_needs_a_rule_change(monkeypatch: pytest.MonkeyP
     dropped = "tests/test_serve.py::test_one_worker_only"
     monkeypatch.setattr(must_keep, "read", lambda: [i for i in committed if i != dropped])
 
-    assert f"the rules select a test missing from must_keep.txt: {dropped}" in must_keep.problems()
+    assert f"the rules select a test missing from must_keep/: {dropped}" in must_keep.problems()
+
+
+def test_a_clone_without_the_step1_history_fails_on_ci_and_warns_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(must_keep, "_have_step1_history", lambda: False)
+    monkeypatch.setenv("CI", "true")
+
+    assert must_keep.NO_HISTORY in must_keep.problems()
+
+    monkeypatch.delenv("CI")
+    with pytest.warns(UserWarning, match="not in this clone"):
+        found = must_keep.problems()
+    assert must_keep.NO_HISTORY not in found
+
+
+def test_every_must_keep_file_stays_under_the_commit_limit() -> None:
+    shards = sorted(must_keep.DIR.glob("*.txt"))
+
+    assert shards
+    assert all(path.stat().st_size < 500_000 for path in shards)
+    assert {path.stem for path in shards} == {inventory._area(i) for i in must_keep.read()}
 
 
 def test_the_test_job_checks_out_the_history_the_must_keep_rule_reads() -> None:
@@ -154,6 +213,45 @@ def test_not_applicable_skips_are_reviewed_and_still_recorded() -> None:
             assert entry["note"]
             if env in entry:
                 assert outcomes[node_id] == f"{ledger.NOT_APPLICABLE}{entry['note']}"
+
+
+def test_the_full_constraints_install_the_litellm_pyproject_pins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded = json.loads(fingerprint.path_for("full").read_text())
+
+    assert fingerprint.constraints_litellm("full") == fingerprint.litellm_pin()
+    assert fingerprint.constraints_litellm("minimal") is None
+    assert fingerprint.problems("full", recorded, recorded) == []
+    monkeypatch.setattr(fingerprint, "constraints_litellm", lambda env: "0.0.1")
+    assert fingerprint.problems("full", recorded, recorded) == [
+        f"scripts/test-env.full.txt pins litellm==0.0.1, pyproject.toml pins "
+        f"{fingerprint.litellm_pin()}"
+    ]
+
+
+def test_task0_changes_no_existing_test() -> None:
+    if not TASK0_FROZEN:
+        pytest.skip("Task 0 is merged; later tasks change tests on purpose")
+    diff = subprocess.run(
+        ["git", "diff", "--name-status", "-M", inventory.BASELINE, "--", "tests/"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if diff.returncode and not os.environ.get("CI"):
+        pytest.skip(f"{inventory.BASELINE} is not in this clone: {diff.stderr.strip()}")
+    assert diff.returncode == 0, diff.stderr
+
+    changed = []
+    for line in diff.stdout.splitlines():
+        status, *paths = line.split("\t")
+        manifests_only = all(p.startswith("tests/_manifests/") for p in paths)
+        if not (status == "A" or (status.startswith("R") and manifests_only)):
+            changed.append(line)
+    assert changed == []
 
 
 def test_the_environment_fingerprints_are_the_recipes() -> None:

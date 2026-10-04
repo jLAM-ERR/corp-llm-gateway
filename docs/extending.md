@@ -146,7 +146,7 @@ Bumping litellm means re-running the classification, because the guard test
 
 The loop:
 
-1. Bump the pin in all **eight** sites at once (`tests/test_litellm_pin.py`
+1. Bump the pin in all **seven** sites at once (`tests/test_litellm_pin.py`
    names them; `pyproject.toml` is one of them, so CI's `pip install -e .`
    reads the same proxy the image ships) and install it into `.venv-bench`.
 2. Run the guard: `PYTHONPATH=src .venv-bench/bin/python -m pytest

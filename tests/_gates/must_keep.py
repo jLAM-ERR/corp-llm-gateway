@@ -12,18 +12,26 @@ import argparse
 import ast
 import fnmatch
 import json
+import os
 import re
 import subprocess
 import sys
+import warnings
 from functools import cache
 from pathlib import Path
 
 from tests._gates import ledger
-from tests._gates.inventory import Module, _tests_in, modules
+from tests._gates.inventory import Module, _area, _tests_in, modules
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFESTS = ROOT / "tests" / "_manifests"
-PATH = MANIFESTS / "must_keep.txt"
+# One file per test directory (per module for tests/*.py), as baseline_checks/: together
+# they are near the 500 KB commit limit.
+DIR = MANIFESTS / "must_keep"
+HEADER = (
+    "# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file\n"
+    "# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.\n"
+)
 
 # Step 1: `git diff --name-status e9e877f..807831a -- tests/` (PR #16-#18), frozen.
 STEP1_RANGE = ("e9e877f", "807831a")
@@ -241,12 +249,6 @@ def _rule_ids() -> dict[str, str]:
         for node_id, _, _ in functions.get(path, []):
             add(node_id, "step1:file")
     history = _have_step1_history()
-    if not history:
-        print(
-            f"WARNING: {'..'.join(STEP1_RANGE)} is not in this clone (shallow?); the step-1 "
-            "touched-test rule falls back to the ids committed in must_keep.txt",
-            file=sys.stderr,
-        )
     for path in STEP1_MODIFIED_TOUCHED:
         if history:
             for node_id, _, _ in _step1_touched(path):
@@ -299,8 +301,29 @@ def expand(function_level: dict[str, str]) -> list[str]:
 
 def read() -> list[str]:
     return [
-        line for line in PATH.read_text().splitlines() if line.strip() and not line.startswith("#")
+        line
+        for path in sorted(DIR.glob("*.txt"))
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
     ]
+
+
+def write(ids: list[str]) -> None:
+    shards: dict[str, list[str]] = {}
+    for node_id in ids:
+        shards.setdefault(_area(node_id), []).append(node_id)
+    DIR.mkdir(exist_ok=True)
+    for stale in DIR.glob("*.txt"):
+        if stale.stem not in shards:
+            stale.unlink()
+    for shard, shard_ids in shards.items():
+        (DIR / f"{shard}.txt").write_text(HEADER + "\n".join(sorted(shard_ids)) + "\n")
+
+
+NO_HISTORY = (
+    f"{'..'.join(STEP1_RANGE)} is not in this clone (shallow?): the step-1 touched-test rule "
+    "fell back to the ids committed in must_keep/"
+)
 
 
 def _skipped(outcome: str | None) -> bool:
@@ -312,9 +335,14 @@ def problems() -> list[str]:
     select that the committed list lacks, and must-keep ids skipped in both environments."""
     committed = read()
     found = [
-        f"the rules select a test missing from must_keep.txt: {node_id}"
+        f"the rules select a test missing from must_keep/: {node_id}"
         for node_id in sorted(set(expand(_rule_ids())) - set(committed))
     ]
+    if not _have_step1_history():
+        if os.environ.get("CI"):
+            found.append(NO_HISTORY)
+        else:
+            warnings.warn(NO_HISTORY, stacklevel=2)
     functions = {node_id for ids in _functions().values() for node_id, _, _ in ids}
     recorded = {env: ledger.ids_with_outcome(env) for env in ledger.ENVS}
     outcomes = {
@@ -358,12 +386,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     if args.write:
-        ids = expand(function_ids())
-        header = (
-            "# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file\n"
-            "# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.\n"
-        )
-        PATH.write_text(header + "\n".join(ids) + "\n")
+        if not _have_step1_history():
+            raise SystemExit(NO_HISTORY + "; refusing to write from it")
+        write(expand(function_ids()))
         return 0
     found = problems()
     for line in found:

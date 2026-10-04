@@ -312,14 +312,17 @@ def _fixture_spec(node: ast.AST) -> tuple[str, bool]:
     return name, autouse
 
 
-_FIXTURES: dict[str, dict[str, tuple[Module, ast.AST]]] = {}
-_CHAINS: dict[str, list[Module]] = {}
+# Keyed by object identity; each value holds its module, so the id cannot be reused by a
+# re-parsed module while the entry lives.
+_FIXTURES: dict[int, tuple[Module, dict[str, tuple[Module, ast.AST]]]] = {}
+_CHAINS: dict[int, tuple[Module, list[Module]]] = {}
 
 
 def _module_fixtures(module: Module) -> dict[str, tuple[Module, ast.AST]]:
-    if module.name not in _FIXTURES:
-        _FIXTURES[module.name] = _scan_fixtures(module)
-    return _FIXTURES[module.name]
+    cached = _FIXTURES.get(id(module))
+    if cached is None or cached[0] is not module:
+        cached = _FIXTURES[id(module)] = (module, _scan_fixtures(module))
+    return cached[1]
 
 
 def _scan_fixtures(module: Module) -> dict[str, tuple[Module, ast.AST]]:
@@ -333,9 +336,10 @@ def _scan_fixtures(module: Module) -> dict[str, tuple[Module, ast.AST]]:
 
 
 def _conftest_chain(module: Module) -> list[Module]:
-    if module.name not in _CHAINS:
-        _CHAINS[module.name] = _scan_chain(module)
-    return _CHAINS[module.name]
+    cached = _CHAINS.get(id(module))
+    if cached is None or cached[0] is not module:
+        cached = _CHAINS[id(module)] = (module, _scan_chain(module))
+    return cached[1]
 
 
 def _scan_chain(module: Module) -> list[Module]:
@@ -403,11 +407,69 @@ def renames() -> dict[str, str]:
     """``renames.json`` ``{"names": {new: old}}``: approved renames of module-level helpers,
     fixtures, classes and constants, applied to the current tree so a move PR that renames
     one reproduces the baseline hashes. Only module-level names are rewritten (a ``def`` /
-    ``class`` statement of the module and a load of a name the module defines or imports),
-    never locals, attributes or arguments that happen to share the name."""
+    ``class`` statement of the module and a name the module defines or imports), never
+    attributes, nor a name a function, lambda, comprehension or class body binds itself
+    (arguments, assignments, loop / ``with`` / ``except`` targets, imports, nested defs)
+    unless that scope declares it ``global``."""
     if RENAMES_PATH.exists():
         return json.loads(RENAMES_PATH.read_text()).get("names", {})
     return {}
+
+
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _scope_bindings(scope: ast.AST) -> set[str]:
+    """Names ``scope`` (a function, lambda, comprehension or class) binds locally."""
+    if isinstance(scope, COMPREHENSIONS):
+        return {
+            n.id
+            for gen in scope.generators
+            for n in ast.walk(gen.target)
+            if isinstance(n, ast.Name)
+        }
+    bound: set[str] = set()
+    declared: set[str] = set()
+    if isinstance(scope, (*FUNCS, ast.Lambda)):
+        a = scope.args
+        for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg]:
+            if arg is not None:
+                bound.add(arg.arg)
+    stack: list[ast.AST] = list(scope.body) if isinstance(scope.body, list) else [scope.body]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, DEFS):
+            bound.add(node.name)
+            stack += node.decorator_list
+            if isinstance(node, ast.ClassDef):
+                stack += [*node.bases, *(k.value for k in node.keywords)]
+            else:
+                stack += [*node.args.defaults, *filter(None, node.args.kw_defaults)]
+            continue
+        if isinstance(node, ast.Lambda):
+            stack += [*node.args.defaults, *filter(None, node.args.kw_defaults)]
+            continue
+        if isinstance(node, COMPREHENSIONS):
+            # A walrus inside a comprehension binds in the enclosing function.
+            bound |= {
+                n.target.id
+                for n in ast.walk(node)
+                if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name)
+            }
+            stack.append(node.generators[0].iter)
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+            bound.add(node.id)
+        elif isinstance(node, ast.Import | ast.ImportFrom):
+            bound |= {a.asname or a.name.split(".", 1)[0] for a in node.names}
+        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        elif isinstance(node, ast.Global | ast.Nonlocal):
+            declared |= set(node.names)
+        stack += ast.iter_child_nodes(node)
+    return bound - declared
 
 
 class _Normaliser(ast.NodeTransformer):
@@ -416,9 +478,56 @@ class _Normaliser(ast.NodeTransformer):
         self.root = root
         self.root_is_module_level = root_is_module_level
         self.top_level = {*module.defs, *module.consts, *module.imports}
+        # (is a class body, names it binds), innermost last.
+        self.scopes: list[tuple[bool, set[str]]] = []
+
+    def _local(self, name: str) -> bool:
+        # A class body's names are visible in that body only, not in functions nested in it.
+        for depth, (is_class, bound) in enumerate(reversed(self.scopes)):
+            if is_class and depth:
+                continue
+            if name in bound:
+                return True
+        return False
 
     def _rename(self, name: str) -> str:
-        return renames().get(name, name) if name in self.top_level else name
+        if name not in self.top_level or self._local(name):
+            return name
+        return renames().get(name, name)
+
+    def _visit_field(self, node: ast.AST, field_name: str) -> None:
+        value = getattr(node, field_name, None)
+        if isinstance(value, list):
+            new: list[Any] = []
+            for item in value:
+                if isinstance(item, ast.AST):
+                    item = self.visit(item)
+                    if item is None:
+                        continue
+                    if not isinstance(item, ast.AST):
+                        new.extend(item)
+                        continue
+                new.append(item)
+            value[:] = new
+        elif isinstance(value, ast.AST):
+            replaced = self.visit(value)
+            if replaced is None:
+                delattr(node, field_name)
+            else:
+                setattr(node, field_name, replaced)
+
+    def _in_scope(self, node: ast.AST, inner: tuple[str, ...]) -> ast.AST:
+        """Visit ``node``'s other fields in the enclosing scope, ``inner`` in its own."""
+        for field_name in node._fields:
+            if field_name not in inner:
+                self._visit_field(node, field_name)
+        self.scopes.append((isinstance(node, ast.ClassDef), _scope_bindings(node)))
+        try:
+            for field_name in inner:
+                self._visit_field(node, field_name)
+        finally:
+            self.scopes.pop()
+        return node
 
     def _strip_docstring(self, node: Any) -> Any:
         body = node.body
@@ -455,21 +564,49 @@ class _Normaliser(ast.NodeTransformer):
     def _visit_def(self, node: Any) -> ast.AST:
         if node is self.root and self.root_is_module_level:
             node.name = self._rename(node.name)
-        return self.generic_visit(node)
+        self._strip_docstring(node)
+        return self._in_scope(node, ("body",))
 
     visit_FunctionDef = _visit_def  # noqa: N815
     visit_AsyncFunctionDef = _visit_def  # noqa: N815
     visit_ClassDef = _visit_def  # noqa: N815
 
+    def visit_Lambda(self, node: ast.Lambda) -> ast.AST:
+        return self._in_scope(node, ("body",))
 
-_DUMPS: dict[tuple[str, int, bool], str] = {}
+    def _visit_comprehension(self, node: Any) -> ast.AST:
+        # The first iterable is evaluated outside the comprehension, the rest inside it.
+        first = node.generators[0]
+        first.iter = self.visit(first.iter)
+        self.scopes.append((False, _scope_bindings(node)))
+        try:
+            for gen in node.generators:
+                gen.target = self.visit(gen.target)
+                if gen is not first:
+                    gen.iter = self.visit(gen.iter)
+                gen.ifs = [self.visit(cond) for cond in gen.ifs]
+            for field_name in ("elt", "key", "value"):
+                if hasattr(node, field_name):
+                    setattr(node, field_name, self.visit(getattr(node, field_name)))
+        finally:
+            self.scopes.pop()
+        return node
+
+    visit_ListComp = _visit_comprehension  # noqa: N815
+    visit_SetComp = _visit_comprehension  # noqa: N815
+    visit_DictComp = _visit_comprehension  # noqa: N815
+    visit_GeneratorExp = _visit_comprehension  # noqa: N815
+
+
+_DUMPS: dict[tuple[int, int, bool], tuple[Module, ast.AST, str]] = {}
 
 
 def normalised_dump(module: Module, node: ast.AST, *, drop_name: bool = False) -> str:
-    key = (module.name, id(node), drop_name)
-    if key not in _DUMPS:
-        _DUMPS[key] = _normalise(module, node, drop_name)
-    return _DUMPS[key]
+    key = (id(module), id(node), drop_name)
+    cached = _DUMPS.get(key)
+    if cached is None or cached[0] is not module or cached[1] is not node:
+        cached = _DUMPS[key] = (module, node, _normalise(module, node, drop_name))
+    return cached[2]
 
 
 def _normalise(module: Module, node: ast.AST, drop_name: bool) -> str:
@@ -678,7 +815,9 @@ def inventory_entry(module: Module, node: ast.AST, cls: ast.ClassDef | None) -> 
         roots.append((module, decorator, f"<mark:{ast.unparse(decorator)[:80]}>", "mark"))
     closure = _walk_closure(ctx, roots)
 
-    delegated: dict[str, dict[str, int]] = {}
+    # Bare name -> {id(helper): counts}: two helpers that share a name in different modules
+    # both count. The key stays location-free so a move PR keeps it.
+    delegated: dict[str, dict[int, dict[str, int]]] = {}
     helpers: set[str] = set()
     constants: set[str] = set()
     parts = [normalised_dump(module, node, drop_name=True)]
@@ -695,20 +834,28 @@ def inventory_entry(module: Module, node: ast.AST, cls: ast.ClassDef | None) -> 
         if kind in {"def", "fixture"} and isinstance(item, (*FUNCS, ast.ClassDef)):
             counts = _counts(item)
             if any(counts.values()):
-                delegated[name] = counts
+                delegated.setdefault(name, {})[id(item)] = counts
         elif kind == "def" and ".<member" in qual:
             counts = _counts(item)
             if any(counts.values()) and hasattr(item, "name"):
-                delegated[f"{cls.name}.{item.name}"] = counts
+                delegated.setdefault(f"{cls.name}.{item.name}", {})[id(item)] = counts
     return {
         **_counts(node),
-        "delegated": dict(sorted(delegated.items())),
+        "delegated": {name: _merged(found) for name, found in sorted(delegated.items())},
         "case_data": _case_data(module, node, cls),
         "fixtures": sorted(closure.fixtures | {f"ext:{n}" for n in closure.external_fixtures}),
         "helpers": sorted(helpers),
         "constants": sorted(constants),
         "body_hash": _digest("\n".join(sorted(parts[1:])) + "\n" + parts[0])[:32],
     }, closure
+
+
+def _merged(found: dict[int, dict[str, int]]) -> dict[str, int] | list[dict[str, int]]:
+    """One helper's counts; for same-named helpers, each one's, in a stable order."""
+    values = list(found.values())
+    if len(values) == 1:
+        return values[0]
+    return sorted(values, key=lambda c: json.dumps(c, sort_keys=True))
 
 
 # ── external dependencies ───────────────────────────────────────────────────────

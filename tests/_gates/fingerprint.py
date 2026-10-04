@@ -67,13 +67,23 @@ def current() -> dict[str, Any]:
 @cache
 def litellm_pin() -> str:
     """The exact litellm version pyproject pins (tests/test_litellm_pin.py holds every other site
-    to it)."""
+    to it; the full constraints file is held here, in problems())."""
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     for requirement in project["dependencies"]:
         match = re.fullmatch(r"litellm==(\S+)", requirement.strip())
         if match:
             return match.group(1)
     raise SystemExit("pyproject.toml pins no litellm==<version>")
+
+
+def constraints_path(env: str) -> Path:
+    return ROOT / "scripts" / f"test-env.{env}.txt"
+
+
+def constraints_litellm(env: str) -> str | None:
+    """The ``litellm==<version>`` the environment's constraints file installs, if any."""
+    match = re.search(r"^litellm==(\S+)\s*$", constraints_path(env).read_text(), re.MULTILINE)
+    return match.group(1) if match else None
 
 
 def path_for(env: str) -> Path:
@@ -88,6 +98,11 @@ def problems(env: str, actual: dict[str, Any], recorded: dict[str, Any]) -> list
             found.append(f"{name} is {'present' if present else 'absent'} in the {env} env")
     if env == "full" and actual["litellm_version"] != litellm_pin():
         found.append(f"litellm is {actual['litellm_version']}, not {litellm_pin()}")
+    if env == "full" and constraints_litellm(env) != litellm_pin():
+        found.append(
+            f"{constraints_path(env).relative_to(ROOT)} pins litellm=={constraints_litellm(env)},"
+            f" pyproject.toml pins {litellm_pin()}"
+        )
     for key in ("python", "markers", "litellm_version"):
         if actual[key] != recorded[key]:
             found.append(f"{key}: recorded {recorded[key]!r}, now {actual[key]!r}")

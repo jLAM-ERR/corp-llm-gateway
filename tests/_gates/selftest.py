@@ -4,7 +4,9 @@ the gate must reject it. The working tree is restored after every mutation.
 Inventory gate (run in any venv): (a) a delegated helper check removed, (b) a
 ``pytest.fail`` path removed, (c) the production-detector builder swapped for a static
 one, (d) an assert made unreachable by a changed selector, (e) a predicate changed inside
-a script a test runs by ``subprocess``.
+a script a test runs by ``subprocess``, (f) a parametrize table shrunk; and (g) the same
+synthetic module re-parsed with another body hashes differently every time (no stale
+cache entry survives a re-parse).
 
 Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
 stops being collected, a lost parametrize case, a setup-time skip, a changed
@@ -51,6 +53,8 @@ ENV_FILE_TEST = (
     "tests/deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed"
 )
 SERVED_SCRIPT = "tests/desanitize_served_script.py"
+PIN = "tests/test_litellm_pin.py"
+PIN_TABLE_TEST = f"{PIN}::test_pin_extraction_refuses_a_file_without_a_pin"
 
 
 def _baseline_users(column: str, name: str, path: str) -> tuple[str, ...]:
@@ -109,7 +113,38 @@ def inventory_mutations() -> list[Mutation]:
             "        return []",
             tuple(f"{node_id}: external {SERVED_SCRIPT} " for node_id in _served_script_users()),
         ),
+        Mutation(
+            "f: parametrize table shrunk by one case",
+            PIN,
+            "        pytest.param(_PYPROJECT_PIN, '    \"litellm>=1.40,<2.0\",\\n',"
+            ' id="pyproject-range"),\n',
+            "",
+            (f"{PIN_TABLE_TEST}: case_data ",),
+        ),
     ]
+
+
+REPARSED_BODIES = (
+    "def test_x():\n    assert 1 == 1\n",
+    "def test_x():\n    assert 1 == 2\n",
+)
+
+
+def cache_reparse(rounds: int = 200) -> tuple[bool, str]:
+    """Re-parse one synthetic module with alternating bodies; each body must always hash the
+    same and the two must differ. A cache keyed by a reused ``id()`` breaks this."""
+    path = ROOT / "tests" / "_gates" / "selftest_reparsed.py"
+    hashes: dict[int, set[str]] = {0: set(), 1: set()}
+    for index in range(rounds):
+        which = index % 2
+        module = inventory._index("tests._gates.selftest_reparsed", path, REPARSED_BODIES[which])
+        checks, _ = inventory.collect(
+            (module, qual, node, cls) for qual, node, cls in inventory._tests_in(module)
+        )
+        hashes[which] |= {entry["body_hash"] for entry in checks.values()}
+        del module, checks
+    ok = len(hashes[0]) == len(hashes[1]) == 1 and hashes[0] != hashes[1]
+    return ok, f"{rounds} re-parses, distinct hashes per body: {len(hashes[0])}/{len(hashes[1])}"
 
 
 def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool, str]:
@@ -261,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
         for mutation in inventory_mutations():
             rejected, evidence = _apply(mutation, _inventory_check)
             results.append((mutation.name, rejected, evidence))
+        rejected, evidence = cache_reparse()
+        results.append(("g: synthetic module re-parsed with another body", rejected, evidence))
     else:
         rejected, evidence = missing_module()
         results.append(("newly missing module", rejected, evidence))
