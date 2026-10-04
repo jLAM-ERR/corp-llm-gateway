@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
-from corp_llm_gateway.audit import AuditLogger, ListSink
-from corp_llm_gateway.litellm_hook import CorpLlmGuardrail, GuardrailHttpException
+from corp_llm_gateway.litellm_hook import GuardrailHttpException
 from corp_llm_gateway.metrics import MetricsExporter
-from corp_llm_gateway.sanitizer import SanitizationOrchestrator
-from corp_llm_gateway.storage import InMemoryMappingStore
-from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
-from tests.hook_fixtures import _corp_llm_returning, _StaticRules
+from tests.hook_fixtures import _build_guardrail
 
 _OAUTH_TOKEN = "sk-ant-oat01-abcdef"
 _ANTHROPIC_MODEL = "claude-sonnet-4-5"
@@ -32,38 +27,6 @@ class _RecordingMetrics(MetricsExporter):
 
     def observe_request_latency(self, seconds: float, *, status: str) -> None:
         return None
-
-
-def _guardrail(
-    *, forward_anthropic_auth: bool = True
-) -> tuple[CorpLlmGuardrail, ListSink, _RecordingMetrics]:
-    store = InMemoryTokenStore()
-    now = datetime.now(UTC)
-    store.upsert(
-        TokenInfo(
-            corp_token="tok-1",
-            user_id="alice",
-            team_id="t1",
-            scopes=("read",),
-            issued_at=now,
-            expires_at=now + timedelta(days=30),
-        )
-    )
-    orch = SanitizationOrchestrator(
-        _corp_llm_returning([]),
-        InMemoryMappingStore(),
-        _StaticRules(),
-    )
-    sink = ListSink()
-    metrics = _RecordingMetrics()
-    g = CorpLlmGuardrail(
-        orch,
-        AuthMiddleware(store),
-        AuditLogger(sink, gateway_version="0.0.1"),
-        forward_anthropic_auth=forward_anthropic_auth,
-        metrics=metrics,
-    )
-    return g, sink, metrics
 
 
 def _request(
@@ -85,7 +48,7 @@ def _request(
 
 
 async def test_bridge_lifts_oauth_token_into_api_key() -> None:
-    g, _, _ = _guardrail()
+    g, _ = _build_guardrail(forward_anthropic_auth=True, metrics=_RecordingMetrics())
 
     out = await g.pre_call(_request())
     upstream = {name.lower(): value for name, value in out["extra_headers"].items()}
@@ -101,7 +64,7 @@ async def test_bridge_lifts_oauth_token_into_api_key() -> None:
 
 
 async def test_bridge_reads_the_merged_litellm_header_buckets() -> None:
-    g, _, _ = _guardrail()
+    g, _ = _build_guardrail(forward_anthropic_auth=True, metrics=_RecordingMetrics())
     data: dict[str, Any] = {
         "model": _ANTHROPIC_MODEL,
         "messages": [{"role": "user", "content": "hello"}],
@@ -125,7 +88,7 @@ async def test_bridge_reads_the_merged_litellm_header_buckets() -> None:
 
 
 async def test_bridge_scrubs_metadata_and_top_level_user() -> None:
-    g, _, _ = _guardrail()
+    g, _ = _build_guardrail(forward_anthropic_auth=True, metrics=_RecordingMetrics())
     data = _request()
     data["metadata"] = {"user_api_key_user_id": "alice", "requester_metadata": {"trace": "abc"}}
     data["user"] = "alice@corp.example"
@@ -154,7 +117,7 @@ class _FakeLoggingObj:
 
 
 async def test_bridge_scrubs_metadata_retained_by_the_litellm_logging_object() -> None:
-    g, _, _ = _guardrail()
+    g, _ = _build_guardrail(forward_anthropic_auth=True, metrics=_RecordingMetrics())
     data = _request()
     data["metadata"] = {"user_id": "alice@corp.example"}
     data["user"] = "alice@corp.example"
@@ -182,7 +145,7 @@ async def test_bridge_scrubs_metadata_retained_by_the_litellm_logging_object() -
     ],
 )
 async def test_logging_object_scrub_never_raises_out_of_the_hook(logging_obj: Any) -> None:
-    g, _, _ = _guardrail()
+    g, _ = _build_guardrail(forward_anthropic_auth=True, metrics=_RecordingMetrics())
     data = _request()
     if logging_obj is not None:
         data["litellm_logging_obj"] = logging_obj
@@ -202,7 +165,8 @@ async def test_logging_object_scrub_never_raises_out_of_the_hook(logging_obj: An
     ],
 )
 async def test_malformed_bearer_is_rejected_with_audit_and_metric(authorization: str) -> None:
-    g, sink, metrics = _guardrail()
+    metrics = _RecordingMetrics()
+    g, sink = _build_guardrail(forward_anthropic_auth=True, metrics=metrics)
     data = _request(authorization=authorization)
     if not authorization:
         del data["headers"]["Authorization"]
@@ -227,7 +191,7 @@ async def test_malformed_bearer_is_rejected_with_audit_and_metric(authorization:
 
 
 async def test_flag_off_leaves_the_request_untouched() -> None:
-    g, _, _ = _guardrail(forward_anthropic_auth=False)
+    g, _ = _build_guardrail(forward_anthropic_auth=False, metrics=_RecordingMetrics())
     data = _request()
     data["metadata"] = {"requester_metadata": {"trace": "abc"}}
     data["user"] = "alice@corp.example"
@@ -255,7 +219,7 @@ async def test_non_anthropic_route_never_receives_the_oauth_token(model: str) ->
     bucket (invariant 3, pinned by tests/invariants/test_no_originals_leak.py),
     so a blanket "token absent from data" assertion would contradict it.
     """
-    g, _, _ = _guardrail()
+    g, _ = _build_guardrail(forward_anthropic_auth=True, metrics=_RecordingMetrics())
     data = _request(model=model)
     data["api_key"] = "deployment-key"
 
