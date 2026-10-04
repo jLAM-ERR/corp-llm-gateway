@@ -52,6 +52,7 @@ from corp_llm_gateway.route_gate.terminal_audit import (
     deposit_usage,
 )
 from corp_llm_gateway.sanitizer.strategies import StrategyResult
+from tests.hook_fixtures import _data_with_token
 from tests.litellm_hook import _dispatch_fixtures
 from tests.litellm_hook._dispatch_fixtures import (
     EMAIL,
@@ -63,7 +64,6 @@ from tests.litellm_hook._dispatch_fixtures import (
     StubUpstream,
     build_ours,
 )
-from tests.test_litellm_hook import _data_with_token
 
 ROOT = Path(__file__).resolve().parents[2]
 QUOTED = 'Dan "the man" O\'Neil'

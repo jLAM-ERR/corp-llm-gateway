@@ -22,8 +22,8 @@ import pytest
 
 from corp_llm_gateway.metrics import NoopExporter
 from corp_llm_gateway.route_gate.inflight import _TICKET, RequestTicket
+from tests.hook_fixtures import _build_guardrail, _data_with_token
 from tests.litellm_hook.test_on_request_cancelled import EMAIL
-from tests.test_litellm_hook import _build_guardrail, _data_with_token
 
 
 async def _pre_call_in(guardrail: Any, ticket: RequestTicket, call_id: str) -> None:

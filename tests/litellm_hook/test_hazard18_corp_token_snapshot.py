@@ -28,6 +28,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
+from tests.hook_fixtures import _build_guardrail
 from tests.litellm_hook._dispatch_fixtures import (
     EMAIL,
     PLACEHOLDER,
@@ -35,7 +36,6 @@ from tests.litellm_hook._dispatch_fixtures import (
     StubUpstream,
     until,
 )
-from tests.test_litellm_hook import _build_guardrail
 
 CORP_TOKEN = "corp-tok-canary-h18-9d4c2e"
 BYOK = "Bearer byok-h18-keep-7a1f"

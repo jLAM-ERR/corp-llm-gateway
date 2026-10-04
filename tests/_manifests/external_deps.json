@@ -4842,11 +4842,10 @@
   "tests/test_desanitize_served_stack.py::test_a_body_naming_policies_is_refused_at_the_gate": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4855,11 +4854,10 @@
   "tests/test_desanitize_served_stack.py::test_a_chat_stream_client_gets_no_usage_chunk_it_did_not_ask_for": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4868,11 +4866,10 @@
   "tests/test_desanitize_served_stack.py::test_a_chat_stream_client_that_asked_for_usage_gets_the_chunk": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4881,11 +4878,10 @@
   "tests/test_desanitize_served_stack.py::test_a_client_that_leaves_mid_stream_gets_one_cancelled_record": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4894,11 +4890,10 @@
   "tests/test_desanitize_served_stack.py::test_a_db_added_callback_sees_placeholders_only": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4907,11 +4902,10 @@
   "tests/test_desanitize_served_stack.py::test_a_db_added_callbacks_failure_log_holds_placeholders_only": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4920,11 +4914,10 @@
   "tests/test_desanitize_served_stack.py::test_a_form_body_is_refused_at_the_gate": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4933,11 +4926,10 @@
   "tests/test_desanitize_served_stack.py::test_a_pass_through_route_added_at_runtime_is_404_at_the_gate": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4946,11 +4938,10 @@
   "tests/test_desanitize_served_stack.py::test_a_provider_error_log_holds_no_corp_token": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4959,11 +4950,10 @@
   "tests/test_desanitize_served_stack.py::test_a_restoration_failure_is_one_failed_record_and_a_counted_failure": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4972,11 +4962,10 @@
   "tests/test_desanitize_served_stack.py::test_a_spend_log_row_with_prompts_on_holds_placeholders_only": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4985,11 +4974,10 @@
   "tests/test_desanitize_served_stack.py::test_exactly_one_terminal_record_with_todays_fields": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -4998,11 +4986,10 @@
   "tests/test_desanitize_served_stack.py::test_litellms_debug_output_after_the_pre_call_holds_no_original": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -5011,11 +4998,10 @@
   "tests/test_desanitize_served_stack.py::test_no_litellm_capture_holds_an_original": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -5024,11 +5010,10 @@
   "tests/test_desanitize_served_stack.py::test_no_logging_surface_holds_the_corp_token": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -5037,11 +5022,10 @@
   "tests/test_desanitize_served_stack.py::test_the_db_row_adds_both_capture_kinds_prompt_logging_and_a_route": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -5050,11 +5034,10 @@
   "tests/test_desanitize_served_stack.py::test_the_openai_sdk_chat_stream_gets_the_original": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -5063,11 +5046,10 @@
   "tests/test_desanitize_served_stack.py::test_the_provider_gets_placeholders_and_the_client_its_originals": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -5076,11 +5058,10 @@
   "tests/test_desanitize_served_stack.py::test_the_stack_armed_with_captures_on_both_sides_of_ours": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"
@@ -5089,11 +5070,10 @@
   "tests/test_desanitize_served_stack.py::test_token_counts_reach_the_record_from_the_response": {
    "files": {
     "tests/desanitize_served_script.py": "82ec81b2733113deb049b07532748bd4",
+    "tests/hook_fixtures.py": "cb0fa944eace7c0fe7056d1ce05904a3",
     "tests/litellm_hook/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
-    "tests/litellm_hook/_dispatch_fixtures.py": "c8798526bb986072956f036146c3cd6c",
-    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b",
-    "tests/sanitizer/test_streaming.py": "ef73e4e7e54bcc032342636cf6833e16",
-    "tests/test_litellm_hook.py": "f449e2b78c6f19c15697d79cdbb0eb5d"
+    "tests/litellm_hook/_dispatch_fixtures.py": "e8dae3144508e08b147b0959790e4106",
+    "tests/response_restore.py": "6f2e5150acd8a4b0fe3ed88761d9234b"
    },
    "programs": [
     "python"

@@ -16,7 +16,7 @@ import pytest
 from corp_llm_gateway import litellm_hook
 from corp_llm_gateway.litellm_hook import GuardrailHttpException
 from corp_llm_gateway.route_gate.inflight import _TICKET, RequestTicket
-from tests.test_litellm_hook import _build_guardrail, _data_with_token
+from tests.hook_fixtures import _build_guardrail, _data_with_token
 
 EMAIL = "alice.secret@corp.example"
 # What a pending `cancelled` record may hold: audit-safe identity and counts.

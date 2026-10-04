@@ -38,7 +38,7 @@ from corp_llm_gateway.sanitizer import SanitizationOrchestrator
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.storage import InMemoryMappingStore
 from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
-from tests.test_litellm_hook import (
+from tests.hook_fixtures import (
     _corp_llm_returning,
     _corp_llm_unreachable,
     _data_with_token,

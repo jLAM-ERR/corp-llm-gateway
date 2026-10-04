@@ -16,12 +16,12 @@ from corp_llm_gateway.sanitizer.profile_orchestrator import (
     TeamConfigUnavailableError,
 )
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
+from tests.hook_fixtures import _RecordingMetrics
 from tests.sanitizer.test_profile_orchestrator import (
     _STORE_CANARY,
     _data,
     _guardrail,
 )
-from tests.test_litellm_hook import _RecordingMetrics
 
 
 class _Store(InMemoryTeamConfigStore):

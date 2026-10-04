@@ -45,7 +45,7 @@ from litellm.llms import load_guardrail_translation_mappings
 from litellm.types.utils import CallTypes
 
 from corp_llm_gateway.litellm_hook import CorpLlmGuardrail
-from tests.test_litellm_hook import _build_guardrail
+from tests.hook_fixtures import _build_guardrail
 
 CANARY = re.compile(r"CNRY_[A-Za-z0-9_]+")
 PLACEHOLDER = re.compile(r"\[CANARY_\d{3}\]")

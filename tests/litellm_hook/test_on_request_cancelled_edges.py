@@ -9,8 +9,8 @@ from datetime import UTC, datetime
 
 from corp_llm_gateway import litellm_hook
 from corp_llm_gateway.route_gate.inflight import _TICKET, RequestTicket
+from tests.hook_fixtures import _build_guardrail, _data_with_token
 from tests.litellm_hook.test_on_request_cancelled import EMAIL, _pre_called
-from tests.test_litellm_hook import _build_guardrail, _data_with_token
 
 
 async def test_unknown_ids_leave_no_state_behind_and_the_dedup_set_stays_capped() -> None:
