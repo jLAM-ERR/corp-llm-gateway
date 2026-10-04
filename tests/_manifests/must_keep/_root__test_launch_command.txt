@@ -1,0 +1,25 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/test_launch_command.py::test_every_dockerfile_entrypoint_runs_the_gate
+tests/test_launch_command.py::test_every_dockerfile_entrypoint_runs_the_gate[Dockerfile.gateway]
+tests/test_launch_command.py::test_every_dockerfile_entrypoint_runs_the_gate[docker/anthropic-oauth/Dockerfile]
+tests/test_launch_command.py::test_every_dockerfile_entrypoint_runs_the_gate[docker/chatgpt-codex/Dockerfile]
+tests/test_launch_command.py::test_every_dockerfile_entrypoint_runs_the_gate[docker/demo-litellm/Dockerfile]
+tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli
+tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[compose/docker-compose.oauth.yml]
+tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[compose/docker-compose.yml]
+tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[docker-compose.anthropic-oauth.yml]
+tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[docker-compose.chatgpt-codex.yml]
+tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[docker-compose.demo.yml]
+tests/test_launch_command.py::test_no_tracked_file_targets_litellms_app_directly
+tests/test_launch_command.py::test_the_asgi_target_is_named_exactly_once_in_serve
+tests/test_launch_command.py::test_the_cli_pattern_matches_commands_and_not_paths
+tests/test_launch_command.py::test_the_cli_pattern_matches_commands_and_not_paths[./litellm/config.yaml:/etc/litellm/config.yaml:ro-False]
+tests/test_launch_command.py::test_the_cli_pattern_matches_commands_and_not_paths[["sh", "-c", "litellm --port 4000"]-True]
+tests/test_launch_command.py::test_the_cli_pattern_matches_commands_and_not_paths[depends_on:\n  litellm:\n    condition: service_healthy-False]
+tests/test_launch_command.py::test_the_cli_pattern_matches_commands_and_not_paths[exec litellm --config /etc/litellm/config.yaml --port 4000-True]
+tests/test_launch_command.py::test_the_cli_pattern_matches_commands_and_not_paths[exec python -m corp_llm_gateway.serve-False]
+tests/test_launch_command.py::test_the_helm_gateway_container_inherits_the_image_entrypoint
+tests/test_launch_command.py::test_the_serving_compose_files_exec_the_gate
+tests/test_launch_command.py::test_the_serving_compose_files_exec_the_gate[docker-compose.demo.yml]
+tests/test_launch_command.py::test_the_serving_compose_files_exec_the_gate[docker-compose.yml]

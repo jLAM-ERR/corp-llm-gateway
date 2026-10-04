@@ -1,0 +1,6 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/test_issuance_bounds_upper.py::test_an_accepted_bound_is_one_issuance_can_run_with
+tests/test_issuance_bounds_upper.py::test_an_accepted_bound_is_one_issuance_can_run_with[interval-past-timedelta]
+tests/test_issuance_bounds_upper.py::test_an_accepted_bound_is_one_issuance_can_run_with[ttl-past-timedelta]
+tests/test_issuance_bounds_upper.py::test_an_accepted_bound_is_one_issuance_can_run_with[ttl-past-year-9999]

@@ -148,9 +148,13 @@ generated from ONE litellm's route source and guarded against it
 resolved whatever PyPI called latest, so the guard read a different litellm than
 the image ships and would have passed against routes the gateway never serves.
 Move it with the other six; `tests/test_litellm_pin.py` fails if the sites
-disagree. The one litellm symbol the request path imports,
-`ANTHROPIC_OAUTH_TOKEN_PREFIX`, has an in-tree fallback (`litellm_hook.py`) and
-is unchanged since v1.85.0.
+disagree. The full test environment's constraints (`scripts/test-env.full.txt`)
+also carry `litellm==`. That file is not a pin site, but the fingerprint gate
+(`tests/_gates/fingerprint.py`, run by `scripts/test-gates.sh full` and by every
+`pytest tests/` run) fails when it differs from `pyproject.toml`, so regenerate it
+in the same change. The one
+litellm symbol the request path imports, `ANTHROPIC_OAUTH_TOKEN_PREFIX`, has an
+in-tree fallback (`litellm_hook.py`) and is unchanged since v1.85.0.
 
 Note that litellm 1.101.0 raises its own dependency floors (`openai>=2.20`,
 `pydantic>=2.10`, `httpx>=0.28`, `pydantic-settings>=2.14.1`) and pulls in

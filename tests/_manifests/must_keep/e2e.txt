@@ -1,0 +1,6 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/e2e/test_langfuse_pipeline.py::test_no_originals_in_batch_payload
+tests/e2e/test_proxy_pipeline.py::test_proxy_401_when_token_missing
+tests/e2e/test_proxy_pipeline.py::test_proxy_forwards_authorization_untouched
+tests/e2e/test_proxy_pipeline.py::test_proxy_injects_x_corp_auth

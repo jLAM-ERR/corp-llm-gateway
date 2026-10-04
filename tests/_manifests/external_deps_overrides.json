@@ -1,0 +1,20 @@
+{
+ "about": "Process launches the inventory walker cannot resolve statically, resolved by a reviewer. Key: <file>::<function>#process<n> (n-th launch in that function). Every entry needs a note.",
+ "sites": {
+  "tests/deploy/test_deploy_script.py::_run#process0": {
+   "deps": ["scripts/deploy/deploy.sh"],
+   "programs": [],
+   "note": "runs <repo copy>/scripts/deploy/deploy.sh, the copy _fake_repo makes of SCRIPT"
+  },
+  "tests/deploy/test_make_selfsigned_certs.py::_make#process0": {
+   "deps": ["scripts/deploy/make-selfsigned-certs.sh"],
+   "programs": [],
+   "note": "script defaults to SCRIPT; a caller passing a tmp copy copies SCRIPT first"
+  },
+  "tests/integration/gateway_image.py::_run#process0": {
+   "deps": ["Dockerfile.gateway"],
+   "programs": ["docker"],
+   "note": "callers pass `docker image inspect <tag>` or build_command(), which builds Dockerfile.gateway"
+  }
+ }
+}

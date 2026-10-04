@@ -1,0 +1,5 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/team_config/test_postgres_store.py::test_init_schema_adds_profile_ids_to_preexisting_table
+tests/team_config/test_postgres_store.py::test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout
+tests/team_config/test_store.py::test_default_fail_policy_matches_matrix

@@ -1,0 +1,12 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/test_ci_workflow.py::test_every_job_runs_python_3_14
+tests/test_ci_workflow.py::test_the_container_job_builds_through_the_fixtures_own_helper
+tests/test_ci_workflow.py::test_the_container_job_cannot_pass_by_skipping
+tests/test_ci_workflow.py::test_the_container_job_exists_and_runs_the_container_suite
+tests/test_ci_workflow.py::test_the_container_job_runs_after_lint_and_beside_the_unit_suite
+tests/test_ci_workflow.py::test_the_container_job_stays_on_one_python
+tests/test_ci_workflow.py::test_the_ner_extra_carries_the_gazetteer_lemmatizer
+tests/test_ci_workflow.py::test_the_unit_suite_installs_every_extra_it_needs
+tests/test_ci_workflow.py::test_the_unit_suite_is_one_job_without_a_matrix
+tests/test_ci_workflow.py::test_the_workflow_never_names_python_3_12

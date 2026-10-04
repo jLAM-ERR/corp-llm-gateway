@@ -1,0 +1,11 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/test_bootstrap.py::test_build_health_router_wires_the_four_checks_and_no_issuer
+tests/test_bootstrap.py::test_dev_team_token_ignored_when_corp_env_prod
+tests/test_bootstrap.py::test_dev_team_token_ignored_when_pg_dsn_set
+tests/test_bootstrap.py::test_importing_module_does_not_build_guardrail
+tests/test_bootstrap.py::test_the_lazy_guardrail_still_seeds_the_dev_team_token
+tests/test_bootstrap.py::test_the_lazy_guardrail_uses_the_shared_stores
+tests/test_bootstrap.py::test_the_sanitization_probe_is_healthy_with_the_oracle_off
+tests/test_bootstrap.py::test_the_sanitization_probe_round_trips_through_the_live_guardrail
+tests/test_bootstrap.py::test_the_shared_token_store_selects_postgres_when_dsn_set

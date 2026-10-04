@@ -1,0 +1,12 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/test_litellm_pin.py::test_every_litellm_pin_site_names_the_same_tag
+tests/test_litellm_pin.py::test_pin_extraction_refuses_a_file_without_a_pin
+tests/test_litellm_pin.py::test_pin_extraction_refuses_a_file_without_a_pin[arg]
+tests/test_litellm_pin.py::test_pin_extraction_refuses_a_file_without_a_pin[from]
+tests/test_litellm_pin.py::test_pin_extraction_refuses_a_file_without_a_pin[pyproject-range]
+tests/test_litellm_pin.py::test_pin_extraction_refuses_a_file_without_a_pin[shell]
+tests/test_litellm_pin.py::test_pin_extraction_refuses_a_file_without_a_pin[workflow]
+tests/test_litellm_pin.py::test_published_image_pin_is_immutable
+tests/test_litellm_pin.py::test_release_workflow_and_local_gate_agree
+tests/test_litellm_pin.py::test_upgrade_doc_records_the_pin_and_the_rollback_versions

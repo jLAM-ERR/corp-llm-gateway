@@ -180,6 +180,12 @@ PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py::test_name -q
 docker compose run --rm e2e pytest -q tests/e2e
 ```
 
+Every `pytest tests/` run checks `tests/_manifests/external_deps.json`: whole-file hashes of the
+files tests read, this one, `pyproject.toml`, docs, compose and scripts included. A PR that changes
+a listed path reruns `PYTHONPATH=src:. python -m tests._gates.inventory --write` in the same PR;
+the diff must be hash-only. The listing command and review rule are in `docs/testing/must-keep.md`.
+A refactor-time gate, removed in Task 10 of the test-suite refactor plan.
+
 ## Tooling
 
 - Python 3.12+ (`requires-python = ">=3.12"`; the package still supports 3.12,

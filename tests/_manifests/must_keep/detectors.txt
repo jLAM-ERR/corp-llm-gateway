@@ -1,0 +1,6 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/detectors/test_corp_ner.py::test_never_logs_request_or_response_text
+tests/detectors/test_regex_checksum.py::test_card_buried_between_stray_digits_is_a_known_limitation
+tests/detectors/test_shadow.py::test_shadow_disagreement_is_logged_but_originals_are_not
+tests/detectors/test_shadow.py::test_shadow_exception_does_not_break_canonical

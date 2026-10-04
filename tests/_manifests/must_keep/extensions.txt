@@ -1,0 +1,3 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/extensions/test_corp_ner_hook_codes.py::test_corp_ner_failure_logs_and_audit_carry_no_originals

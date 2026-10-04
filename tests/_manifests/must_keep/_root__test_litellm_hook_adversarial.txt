@@ -1,0 +1,3 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/test_litellm_hook_adversarial.py::test_post_call_stream_unknown_type_chunk_passes_through

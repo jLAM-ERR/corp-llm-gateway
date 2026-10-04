@@ -1,0 +1,17 @@
+# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
+# notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/auth/test_rbac.py::test_empty_key_rejected
+tests/auth/test_rbac.py::test_empty_token_rejected
+tests/auth/test_rbac.py::test_expired_token_rejected
+tests/auth/test_rbac.py::test_forged_signature_rejected
+tests/auth/test_rbac.py::test_hs256_token_rejected
+tests/auth/test_rbac.py::test_malformed_token_rejected
+tests/auth/test_rbac.py::test_missing_audience_rejected
+tests/auth/test_rbac.py::test_missing_issuer_rejected
+tests/auth/test_rbac.py::test_missing_role_rejected
+tests/auth/test_rbac.py::test_unset_audience_config_rejected
+tests/auth/test_rbac.py::test_valid_rs256_operator_via_flat_roles
+tests/auth/test_rbac.py::test_valid_rs256_operator_via_realm_access
+tests/auth/test_rbac.py::test_valid_rs256_operator_via_scope
+tests/auth/test_rbac.py::test_wrong_audience_rejected
+tests/auth/test_rbac.py::test_wrong_issuer_rejected
