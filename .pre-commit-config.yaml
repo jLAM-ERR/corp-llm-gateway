@@ -6,13 +6,27 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--unsafe]
+        # The chart's templates are Go templates, not YAML; `helm lint` checks them
+        # (helmlint below, and tests/helm/test_chart_render.py in CI's test job).
+        exclude: ^helm/corp-llm-gateway/templates/
       - id: check-added-large-files
         args: [--maxkb=500]
       - id: check-merge-conflict
       - id: detect-private-key
-        # The manifests record a test's parametrize id that spells out a
-        # PEM header (tests/sanitizer/test_allowlist.py); a test case name, not a key.
-        exclude: ^tests/_manifests/(expected_outcomes\.(minimal|full)\.json|must_keep/sanitizer\.txt)$
+        # The manifests and tests/sanitizer/test_allowlist.py hold a parametrize id
+        # that spells out a PEM header; test_deploy_script.py writes a one-line
+        # placeholder server.key. test_dlp_guard.py and test_regex_checksum.py carry
+        # a PEM header plus one truncated base64 line (the fixed 2048-bit RSA DER
+        # prefix, ~39 bytes, no key material) so the detectors under test see a
+        # PEM-shaped block.
+        exclude: |
+          (?x)^tests/(
+            _manifests/(expected_outcomes\.(minimal|full)\.json|must_keep/sanitizer\.txt)
+            |sanitizer/test_allowlist\.py
+            |sanitizer/test_dlp_guard\.py
+            |detectors/test_regex_checksum\.py
+            |deploy/test_deploy_script\.py
+          )$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.14
