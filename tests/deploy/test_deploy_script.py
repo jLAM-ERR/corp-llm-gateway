@@ -238,7 +238,7 @@ def test_bash_syntax_is_valid() -> None:
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not on PATH")
+@pytest.mark.requires_shellcheck
 def test_shellcheck_clean() -> None:
     result = subprocess.run(["shellcheck", str(SCRIPT)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

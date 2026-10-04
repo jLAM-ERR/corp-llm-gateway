@@ -22,19 +22,6 @@ from corp_llm_gateway.detectors.dual_ner import DualNerDetector
 from corp_llm_gateway.detectors.regex_checksum import RegexChecksumDetector
 
 # ---------------------------------------------------------------------------
-# NER availability guard (module-level, evaluated at collection time)
-# ---------------------------------------------------------------------------
-
-_ner_available = False
-try:
-    import natasha as _nat  # noqa: F401
-    import spacy as _spa  # noqa: F401
-
-    _ner_available = True
-except ImportError:
-    pass
-
-# ---------------------------------------------------------------------------
 # Fixture parametrized over all detectors
 # ---------------------------------------------------------------------------
 
@@ -78,7 +65,7 @@ _REGEX_PARAM = pytest.param(RegexChecksumDetector, id="regex")
 _DUAL_NER_PARAM = pytest.param(
     DualNerDetector,
     id="dual_ner",
-    marks=pytest.mark.skipif(not _ner_available, reason="natasha/spacy not available"),
+    marks=pytest.mark.requires_ner,
 )
 _CORP_NER_PARAM = pytest.param(_make_corp_ner, id="corp_ner")
 

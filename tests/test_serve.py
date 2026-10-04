@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -87,7 +86,7 @@ def test_no_json_log_config_when_the_litellm_config_does_not_ask_for_one(
     assert "log_config" not in serve.uvicorn_arguments()
 
 
-@pytest.mark.skipif(find_spec("litellm") is None, reason="litellm is not installed")
+@pytest.mark.requires_litellm
 def test_json_logs_selects_litellms_json_log_config(litellm_config_file: Path) -> None:
     # Vector consumes container stdout, so uvicorn's own access and error lines
     # have to be JSON too — the CLI does this at proxy_cli.py:269-271.

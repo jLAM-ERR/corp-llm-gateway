@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -104,7 +103,7 @@ def test_an_empty_general_settings_is_not_a_problem(tmp_path: Path) -> None:
     assert litellm_config.problems(path, require_file=True) == []
 
 
-@pytest.mark.skipif(os.getuid() == 0, reason="root reads a 000 file")
+@pytest.mark.not_root
 def test_an_unreadable_file_is_refused(tmp_path: Path) -> None:
     # A config mounted with the wrong mode must exit 78, not raise PermissionError
     # out of the entrypoint's first statement.
