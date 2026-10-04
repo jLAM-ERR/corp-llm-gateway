@@ -9,7 +9,7 @@ baseline commit **`807831a`** (release/1.0.x). Task 0 built them and changed no 
 | 1. Check inventory | per test function: asserts, `pytest.raises` / `pytest.fail` sites, helpers it reaches that check something, parametrize tables and loop iterables, fixtures, helpers, constants, and one hash over the normalised body of the test plus everything it reaches | `tests/_manifests/baseline_checks/<dir>.json`, one per module for `tests/*.py` (`_root__<module>.json`) |
 | 1. External dependencies | every repo file a test reaches outside the Python call graph (scripts run by `subprocess`, templates, configs it reads), hashed whole; a launch the walker cannot resolve fails until reviewed | `tests/_manifests/external_deps.json`, `external_deps_overrides.json` |
 | 2. Must-keep | node ids no PR may delete, re-split or reduce | `tests/_manifests/must_keep/<dir>.txt`, one per module for `tests/*.py` (`_root__<module>.txt`) |
-| 3. Coverage | per source file: executed lines and branch arcs; any drop fails (a second clean run per environment covered every recorded line and arc) | `tests/_manifests/coverage.{minimal,full}.json` |
+| 3. Coverage | per source file: executed lines and branch arcs; any drop fails. The baseline is what every clean whole-suite run covered: seven in minimal, four in full, less one arc taken out by hand ([below](#coverage-baseline)) | `tests/_manifests/coverage.{minimal,full}.json` |
 | 4. Expected outcomes | per node id and environment: `passed`, `skipped:<reason>`, `collection-skipped:<reason>`, `not-applicable:<note>` | `tests/_manifests/expected_outcomes.{minimal,full}.json`, `not_applicable.json` |
 | 4. Environments | the two venv recipes and their fingerprints; full's constraints must install the `litellm==` `pyproject.toml` pins | `scripts/test-env.sh`, `scripts/test-env.{minimal,full}.txt`, `tests/_manifests/env_fingerprint.{minimal,full}.json` |
 | Name-pinned index | every test the acceptance matrix or a doc (`CLAUDE.md`, `README.md`, `docs/*.md`, `docs/ops/*.md`, `compose/*.md`, `compose/nginx/*.md`) cites by name, with its citing sites | `tests/_manifests/name_pinned.json` |
@@ -71,7 +71,7 @@ share a name in different modules are both kept, as a list of their counts.
 | constraints | `scripts/test-env.minimal.txt` | `scripts/test-env.full.txt` (`.venv-bench`'s versions) |
 | litellm, prometheus_client, asyncpg, natasha, spacy, cryptography | all absent | all present, litellm 1.101.0 |
 | invocation | `CORP_REQUIRE_PROXY_CAPTURE=1`, no `CI`, no `CORP_TEST_PG_DSN` | `CI=true`, `CORP_REQUIRE_PROXY_CAPTURE=1`, `CORP_TEST_PG_DSN`, Postgres reachable |
-| baseline run | 4,688 passed, 394 skipped, 20 modules collection-skipped (834 ids), 11 not-applicable | 5,911 passed, 6 skipped, 10 not-applicable |
+| baseline run | 4,693 passed, 394 skipped, 20 modules collection-skipped (834 ids), 11 not-applicable | 5,916 passed, 6 skipped, 10 not-applicable |
 
 The fingerprint (the six markers + a sorted `name==version` list, the editable checkout
 normalised, `pip`/`setuptools`/`wheel` left out) is asserted before collection. Both
@@ -87,7 +87,7 @@ Why minimal has no `CI`: under `CI=true`, `tests/postgres_support.py` turns "asy
 installed" into a failure, where the minimal ledger expects the skip. GitHub sets `CI` on
 every step, so `scripts/test-gates.sh` unsets it for minimal.
 
-The union of the two ledgers is the baseline collection: 5,927 ids. Every test function the
+The union of the two ledgers is the baseline collection: 5,932 ids. Every test function the
 inventory finds has at least one of them.
 
 ### Not-applicable cases (`not_applicable.json`)
@@ -115,9 +115,22 @@ Apart from these four (`SKIPPED_IN_BOTH_OPEN` in `tests/_gates/must_keep.py`), n
 must-keep id is skipped or collection-skipped in both environments, and the must-keep gate
 fails if one becomes so.
 
+## Coverage baseline
+
+`coverage.<env>.json` is the intersection of clean whole-suite runs of `807831a`'s `src/`
+(`python -m tests._gates.coverage_gate intersect <env> <report>` per run): seven in minimal
+(two in fixup 1, five in fixup 2, two of them side by side under load) and four in full (two
+and two). The fixup-2 runs dropped no line or arc in either environment.
+
+Taken out by hand, because it is timing-dependent though every whole-suite run took it:
+
+| env | file | arc | why |
+|---|---|---|---|
+| minimal | `src/corp_llm_gateway/pg_session.py` | `266>-265` | `_retrieve`'s cancelled-future exit. Only `test_pg_session.py::test_a_release_past_its_budget_drops_the_connection_and_keeps_the_result` (and loop teardown) reaches it, and only when the release future is cancelled before it completes: in 8 runs of `tests/test_pg_session*.py` alone it was taken 6 times. The other exit, `266>267`, stays. Full never recorded it. |
+
 ## Must-keep (`must_keep/`)
 
-4,402 node ids (1,923 test functions, every parametrised case listed) in 110 files.
+4,401 node ids (1,923 test functions, every parametrised case listed) in 110 files.
 `python -m tests._gates.must_keep --write` rebuilds the list from the rules in
 `tests/_gates/must_keep.py`. `--check` (and the guard test) rebuilds it too and fails when
 the rules select an id the committed list lacks, so dropping a must-keep id means editing

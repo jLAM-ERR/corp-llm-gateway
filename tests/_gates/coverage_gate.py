@@ -3,7 +3,9 @@
 ``tests/_manifests/coverage.<env>.json``: per source file, the executed lines as ranges
 and the executed arcs. A fresh run may cover more; any line or arc the baseline covers
 and the run does not is a drop and fails. The baseline is the intersection of clean
-runs, so a line only a lucky interleaving reaches is not in it.
+whole-suite runs on 807831a's src (seven in minimal, four in full), so a line only a lucky
+interleaving reaches is not in it; an arc shown timing-dependent outside those runs is
+taken out by hand and listed in docs/testing/must-keep.md.
 
 ``python -m tests._gates.coverage_gate write|intersect|check <env> COVERAGE.json``
 (``COVERAGE.json`` is pytest-cov's ``--cov-report=json`` with ``--cov-branch``).
