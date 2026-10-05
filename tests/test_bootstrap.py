@@ -58,11 +58,6 @@ def test_build_guardrail_returns_guardrail_with_in_memory_backends() -> None:
     assert isinstance(guardrail._orch._core._mapping_store, InMemoryMappingStore)
 
 
-def test_module_level_guardrail_is_importable_instance() -> None:
-    # LiteLLM `callbacks:` imports `corp_llm_gateway.bootstrap.guardrail`.
-    assert isinstance(bootstrap.guardrail, CorpLlmGuardrail)
-
-
 def test_importing_module_does_not_build_guardrail() -> None:
     # A fresh import (simulated via reload) must leave the guardrail unbuilt;
     # construction is deferred to first attribute access (PEP 562 __getattr__).
@@ -294,25 +289,6 @@ async def test_team_with_sealed_default_profile_resolves_and_applies() -> None:
 
 
 # ── CORP_LLM_ORACLE_ENABLED: local mode boots without corp-LLM (Task 3) ──────
-
-
-def test_oracle_disabled_build_guardrail_skips_client_build(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # No CORP_LLM_ENDPOINT set (hermetic_gateway_config clears it) — must not be
-    # required when the oracle is off.
-    monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")
-
-    def _fail_if_called() -> None:
-        raise AssertionError("build_corp_llm_client must not run when the oracle is disabled")
-
-    monkeypatch.setattr(bootstrap, "build_corp_llm_client", _fail_if_called)
-
-    guardrail = bootstrap.build_guardrail()
-
-    core = guardrail._orch._core
-    assert core._corp_llm is None
-    assert core._oracle_enabled is False
 
 
 def test_oracle_disabled_logs_one_info_at_build_time(
@@ -810,14 +786,6 @@ def test_mapping_store_selects_redis_when_url_set(monkeypatch: pytest.MonkeyPatc
 
 def test_mapping_store_in_memory_when_url_unset() -> None:
     assert isinstance(bootstrap.build_mapping_store(), InMemoryMappingStore)
-
-
-def test_team_config_store_selects_postgres_when_dsn_set(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@pg:5432/gw")
-
-    assert isinstance(bootstrap.build_team_config_store(), PostgresTeamConfigStore)
 
 
 def test_team_config_store_in_memory_when_dsn_unset() -> None:

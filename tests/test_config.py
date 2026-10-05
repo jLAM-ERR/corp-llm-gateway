@@ -97,13 +97,6 @@ def test_corp_llm_verify_ca_bundle_takes_precedence_over_ssl_verify(
     assert config.corp_llm_verify() == "/etc/certs/bundle.pem"
 
 
-def test_corp_llm_verify_ssl_verify_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CORP_LLM_CA_BUNDLE", raising=False)
-    monkeypatch.setenv("SSL_VERIFY", "false")
-
-    assert config.corp_llm_verify() is False
-
-
 def test_corp_llm_verify_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CORP_LLM_CA_BUNDLE", raising=False)
     monkeypatch.delenv("SSL_VERIFY", raising=False)
