@@ -863,21 +863,21 @@
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/test_bootstrap.py:889",
+   "site": "tests/test_bootstrap.py:857",
    "owner": "tests/test_bootstrap.py::test_dev_team_token_ignored_when_corp_env_prod",
    "check": "'solo-dev-token' not in caplog.text",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_bootstrap.py:875",
+   "site": "tests/test_bootstrap.py:843",
    "owner": "tests/test_bootstrap.py::test_dev_team_token_ignored_when_pg_dsn_set",
    "check": "'solo-dev-token' not in caplog.text",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/test_bootstrap.py:665",
+   "site": "tests/test_bootstrap.py:641",
    "owner": "tests/test_bootstrap.py::test_no_disarm_warning_when_the_env_pair_is_already_legal",
    "check": "not [r for r in caplog.records if 'mutually exclusive' in r.getMessage()]",
    "class": "behaviour",

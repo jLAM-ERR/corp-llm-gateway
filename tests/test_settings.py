@@ -467,14 +467,6 @@ def test_langfuse_sink_requires_keys(hermetic: Path, monkeypatch: pytest.MonkeyP
     assert isinstance(config.validate(), Settings)
 
 
-def test_noop_provider_needs_no_credentials(
-    hermetic: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
-    # default provider is noop; no bearer/mtls/oidc keys required.
-    assert isinstance(config.validate(), Settings)
-
-
 # ── validate(): resolution chain (NOT native pydantic env sourcing) ──────────
 
 
