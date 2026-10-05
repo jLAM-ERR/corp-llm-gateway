@@ -297,11 +297,12 @@ In `deleted-tests.md` (no gate reads the survivor column; this is for navigation
 
 | row | cited | annotation |
 |---|---|---|
-| 48 `…framing_intact_all_json` | survivor `tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_every_data_line_is_valid_json`; fault-injection `test_streaming_adversarial.py:82` | `(now: tests/sanitizer/test_streaming.py::test_framing_integrity_every_data_line_is_valid_json)`, `(now: test_streaming.py:852)` |
-| 49 `…placeholder_restored_and_no_leak` | survivor `::test_framing_integrity_original_reconstructed_after_split`; `test_streaming_adversarial.py:97` | `(now: tests/sanitizer/test_streaming.py::test_framing_integrity_original_reconstructed_after_split)`, `(now: test_streaming.py:<line>)` |
-| 50 `…str_chunks_return_str` | survivor `::test_str_input_returns_str_output`; `test_streaming_adversarial.py:380` | `(now: tests/sanitizer/test_streaming.py::test_str_input_returns_str_output)`, `(now: test_streaming.py:1141)` |
+| 48 `…framing_intact_all_json` | survivor `tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_every_data_line_is_valid_json`; fault-injection `test_streaming_adversarial.py:82` | `(now: tests/sanitizer/test_streaming.py::test_framing_integrity_every_data_line_is_valid_json)`, `(now: test_streaming.py:854)` |
+| 49 `…placeholder_restored_and_no_leak` | survivor `::test_framing_integrity_original_reconstructed_after_split`; `test_streaming_adversarial.py:97` | `(now: tests/sanitizer/test_streaming.py::test_framing_integrity_original_reconstructed_after_split)`, `(now: test_streaming.py:869)` |
+| 50 `…str_chunks_return_str` | survivor `::test_str_input_returns_str_output`; `test_streaming_adversarial.py:380` | `(now: tests/sanitizer/test_streaming.py::test_str_input_returns_str_output)`, `(now: test_streaming.py:1164)` |
 
-The new lines are those of the phase-2 preview layout below; phase 2 re-reads them.
+The new lines are those of the merged file at HEAD (phase 2); `deleted-tests.md` rows 48-50 carry both
+annotations in one parenthesis. In the merged file the fold tests are at `:909` (F1) and `:1065` (F2).
 `docs/testing/task3b-prune-audit.md` also cites adversarial ids (`:293-300`, `:309-311`, `:322`,
 `:445`); it is a record of Task 3b and is left as it is.
 
