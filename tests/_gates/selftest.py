@@ -111,7 +111,7 @@ def inventory_mutations() -> list[Mutation]:
         ),
         Mutation(
             "b: pytest.fail path removed",
-            "tests/sanitizer/test_streaming_adversarial.py",
+            "tests/sanitizer/test_streaming.py",
             "            try:\n                json.loads(payload)\n"
             "            except json.JSONDecodeError as exc:\n"
             '                pytest.fail(f"data: line is not valid JSON: {payload!r} — {exc}")\n',
