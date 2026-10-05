@@ -51,7 +51,8 @@ it is not repeated per row. `fixtures + builder` names the test's own arguments;
 fixtures are per file: `test_bootstrap.py` `_clean_config` (`hermetic_gateway_config` + the
 shared token / team stores reset to `None`), `test_bootstrap_edges.py` `_clean_config`
 (`hermetic_gateway_config` only), `test_settings.py` the explicit `hermetic` fixture where
-listed. `(:N)` is the current line of the `def`.
+listed. `(:N)` is the line of the `def` at `e3aec88`. Line numbers marked "at HEAD" are the
+folded tree's (phase 2), measured, not predicted.
 
 ## Family 1 — backend selection
 
@@ -172,7 +173,7 @@ literal verbatim:
 | `test_oidc_provider_missing_subkeys_fails_fast_at_build` | `oidc_provider_missing_subkeys` | `"oidc"` | `RuntimeError` | `"CORP_LLM_OIDC_ISSUER"` |
 
 New test `tests/test_bootstrap_edges.py::test_auth_provider_misconfig_fails_fast_at_build` at
-`:49` (lines 49-72 in the dry run, 28 lines → 24):
+`:49` (at HEAD: decorator `:49`, `def` `:65`, lines 49-72; 28 lines → 24):
 
 ```python
 @pytest.mark.parametrize(
@@ -235,8 +236,9 @@ The exception type is `ConfigError` in every member, so it stays a constant (not
 | `test_validate_rejects_unknown_audit_sink` | `audit_sink` | `CORP_AUDIT_SINK` | `"kafka"` | `"CORP_AUDIT_SINK"` |
 
 New test `tests/test_settings.py::test_validate_rejects_an_unknown_or_malformed_choice` at
-`:351`, in place of the two adjacent members `:351` and `:364` (dry run: lines 351-399); `:405`
-and `:414` go. The must-keep `:374` follows it at `:402`. Parametrised over
+`:351`, in place of the two adjacent members `:351` and `:364` (at HEAD: decorator `:351`, `def`
+`:393`, lines 351-399); `:405` and `:414` go. The must-keep `:374` follows it, at HEAD `:403`
+(decorator `:402`). Parametrised over
 `("key", "value", "match")`, one `pytest.param(<key>, <value>, <match>, id=<param id>)` per row
 above, in that order. The body:
 
@@ -311,11 +313,14 @@ member; both are kept.
 
 - `test_bootstrap.py` and `test_config.py` get no change, so nothing in them moves.
 - `test_bootstrap_edges.py`: E1 replaces `:49-76` (28 lines) with 24 lines; every test below
-  moves up 4. Negative-log site `test_bootstrap_edges.py:344` → **`:340`** (owner
-  `::test_endpoint_set_does_not_warn` unchanged).
+  moves up 4 (at HEAD `test_malformed_canary_regex_fails_fast_at_build` `:306` → `:302`,
+  `test_endpoint_set_does_not_warn` `:335` → `:331`; file 344 → 340 lines). Negative-log site
+  `test_bootstrap_edges.py:344` → **`:340`** at HEAD (owner `::test_endpoint_set_does_not_warn`
+  unchanged).
 - `test_settings.py`: E2 replaces `:351-370` with 49 lines (`:351-399`) and removes `:405-420`.
-  Tests between (`:374`, `:383`, `:398`) move down 29; tests after `:420` move down 11
-  (`test_the_allow_key_is_refused_in_prod` `:1416` → `:1426`; file 1,431 → 1,442 lines). No
+  Tests between (`:374`, `:383`, `:398`) move down 29, at HEAD `:403`, `:412`, `:427`; tests
+  after `:420` move down 11 (at HEAD `test_validate_accepts_valid_choices` `:423` → `:434`,
+  `test_the_allow_key_is_refused_in_prod` `:1416` → `:1427`; file 1,431 → 1,442 lines). No
   negative-log site and no name-pinned id is in this file.
 - `negative_log_checks.json`: `test_bootstrap.py:665`, `:875`, `:889` unchanged; one site drift
   `test_bootstrap_edges.py:344 → :340`. `negative_logs --write` keys a reviewed row by
