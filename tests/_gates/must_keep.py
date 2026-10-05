@@ -2,6 +2,8 @@
 
 Built from the rules below (documented in docs/testing/must-keep.md) and expanded to
 parametrised ids from both expected-outcome ledgers, so a lost parameter case shows up.
+Membership is a property of the test, not of where it sits today: every rule sees the
+baseline id and path (``moves.to_baseline``), so a move never adds or removes an id.
 
 ``python -m tests._gates.must_keep --write|--check``
 """
@@ -20,7 +22,7 @@ import warnings
 from functools import cache
 from pathlib import Path
 
-from tests._gates import ledger
+from tests._gates import ledger, moves
 from tests._gates.inventory import Module, _area, _tests_in, modules
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -159,7 +161,6 @@ STEP2_GLOBS = (
     "tests/auth/test_rbac.py",
     "tests/test_serve.py",
 )
-STEP2_LINE_RANGES = (("tests/audit/test_logger.py", 135, 163),)
 # Must-keep security checks skipped in both environments: an open finding for the DRI
 # (no CI job runs the e2e stack), not a reviewed not-applicable case. Any other must-keep
 # id skipped in both fails the gate.
@@ -175,6 +176,13 @@ STEP2_IDS = (
     "tests/sanitizer/test_allowlist.py::test_allowlisted_secret_label_not_dropped",
     "tests/deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed",
     "tests/deploy/test_deploy_script.py::test_env_file_contents_are_never_read_or_printed",
+    # The NEVER-field tests: tests/audit/test_logger.py:135-163 at 807831a, named so a move
+    # cannot shift them in or out.
+    "tests/audit/test_logger.py::test_assert_no_never_fields_passes_clean_record",
+    "tests/audit/test_logger.py::test_assert_no_never_fields_rejects_lowercase",
+    "tests/audit/test_logger.py::test_assert_no_never_fields_rejects_mixed_case",
+    "tests/audit/test_logger.py::test_assert_no_never_fields_rejects_uppercase",
+    "tests/audit/test_logger.py::test_never_fields_set_includes_critical_keys",
     *SKIPPED_IN_BOTH_OPEN,
 )
 # Security-policy defaults that look trivial (plan Context): exempt from pruning.
@@ -187,7 +195,8 @@ POLICY_DEFAULTS = (
 
 
 def _spans(module: Module) -> list[tuple[str, int, int]]:
-    """[(function-level node id, first line incl. decorators, last line)]."""
+    """[(function-level node id, first line incl. decorators, last line)], as ``module``
+    names them."""
     out = []
     for qual, node, _ in _tests_in(module):
         first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
@@ -196,7 +205,14 @@ def _spans(module: Module) -> list[tuple[str, int, int]]:
 
 
 def _functions() -> dict[str, list[tuple[str, int, int]]]:
-    return {module.rel: _spans(module) for module in modules().values()}
+    """Baseline path -> [(baseline function-level id, current first line, last line)]."""
+    out: dict[str, list[tuple[str, int, int]]] = {}
+    seen: dict[str, str] = {}
+    for module in modules().values():
+        for node_id, first, last in _spans(module):
+            baseline = moves.claim(seen, node_id)
+            out.setdefault(baseline.split("::", 1)[0], []).append((baseline, first, last))
+    return out
 
 
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
@@ -260,10 +276,6 @@ def _rule_ids() -> dict[str, str]:
         if any(fnmatch.fnmatch(path, pattern) for pattern in STEP2_GLOBS):
             for node_id, _, _ in ids:
                 add(node_id, "step2:invariant-file")
-    for path, start, end in STEP2_LINE_RANGES:
-        for node_id, first, last in functions.get(path, []):
-            if first <= end and last >= start:
-                add(node_id, "step2:invariant-range")
     for node_id in STEP2_IDS:
         add(node_id, "step2:named")
     for node_id in POLICY_DEFAULTS:
@@ -273,7 +285,7 @@ def _rule_ids() -> dict[str, str]:
         add(node_id, "negative-log")
     pinned = json.loads((MANIFESTS / "name_pinned.json").read_text())
     for node_id in pinned["ids"]:
-        add(node_id, "name-pinned")
+        add(moves.to_baseline(node_id), "name-pinned")
     return chosen
 
 

@@ -6,6 +6,9 @@ taking ``log_text`` — and attributes it to the test that runs it (directly or 
 helper). Discovery only: the reviewed ``class`` of each site (``security``, ``behaviour``,
 ``not-a-log-check``) lives in the manifest, and a site with no review fails ``--check``.
 
+``owner`` is the baseline node id (``moves.to_baseline``), so a move keeps a site's review;
+``site`` (``file:line``) is where the check is now.
+
 ``python -m tests._gates.negative_logs --write|--check``
 """
 
@@ -20,6 +23,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from tests._gates import moves, must_keep
 from tests._gates.inventory import build as build_inventory
 from tests._gates.inventory import modules
 
@@ -102,7 +106,7 @@ def sites() -> list[dict[str, Any]]:
                     found.append(
                         {
                             "site": f"{module.rel}:{sub.lineno}",
-                            "owner": f"{module.rel}::{qual}",
+                            "owner": moves.to_baseline(f"{module.rel}::{qual}"),
                             "check": ast.unparse(sub.test)[:200],
                         }
                     )
@@ -114,18 +118,35 @@ def _key(site: dict[str, Any]) -> str:
 
 
 def node_ids(manifest: dict[str, Any]) -> list[str]:
-    """Tests running a security negative check, directly or through a helper."""
+    """Tests running a security negative check, directly or through a helper: a test that
+    reaches a security helper's name and shares its module, at the baseline or now (a helper
+    owner moves only with ``files``, a test also with ``ids``)."""
     checks, _ = build_inventory()
     security = [s for s in manifest["sites"] if s["class"] == "security"]
     owners = {s["owner"] for s in security}
     helpers = [o for o in owners if o.rsplit("::", 1)[1].startswith("_")]
     helper_names = {owner.rsplit("::", 1)[1] for owner in helpers}
     helper_files = {owner.split("::", 1)[0] for owner in helpers}
+    helper_files_now = {moves.from_baseline(owner).split("::", 1)[0] for owner in helpers}
     ids = owners - set(helpers)
     for node_id, entry in checks.items():
-        if set(entry["helpers"]) & helper_names and node_id.split("::", 1)[0] in helper_files:
+        if not set(entry["helpers"]) & helper_names:
+            continue
+        then, now = node_id.split("::", 1)[0], moves.from_baseline(node_id).split("::", 1)[0]
+        if then in helper_files or now in helper_files_now:
             ids.add(node_id)
     return sorted(ids)
+
+
+def lost(previous: list[str], manifest: dict[str, Any]) -> list[str]:
+    """Must-keep tests that were in ``security_node_ids`` and that ``manifest`` no longer
+    selects (a security helper moved away from them, or reclassified). Both sides are
+    baseline ids. Dropping one on purpose means editing ``security_node_ids`` by hand."""
+    gone = set(previous) - set(node_ids(manifest))
+    return [
+        f"security negative-log id lost while its test is still must-keep: {node_id}"
+        for node_id in sorted(gone & set(must_keep.read()))
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -144,6 +165,11 @@ def main(argv: list[str] | None = None) -> int:
             old = reviewed.get(_key(site), {})
             review = {"class": old.get("class", "UNREVIEWED"), "note": old.get("note", "")}
             merged.append({**site, **review})
+        refused = lost(recorded.get("security_node_ids", []), {**recorded, "sites": merged})
+        for line in refused:
+            print(f"NEGATIVE-LOGS: {line}", file=sys.stderr)
+        if refused:
+            return 1
         recorded["sites"] = merged
         recorded["security_node_ids"] = node_ids(recorded)
         PATH.write_text(json.dumps(recorded, indent=1, ensure_ascii=False) + "\n")
@@ -153,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         f"reviewed site no longer present: {key}"
         for key in sorted(set(reviewed) - {_key(s) for s in current})
     ]
+    problems += lost(recorded.get("security_node_ids", []), recorded)
     for line in problems:
         print(f"NEGATIVE-LOGS: {line}", file=sys.stderr)
     return 1 if problems else 0

@@ -18,6 +18,18 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_a_move_neither_adds_nor_removes_a_must_keep_id": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_moved_test_that_lost_an_assert_is_rejected_despite_the_map": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_a_name_imported_twice_in_one_scope_reaches_both_helpers": {
    "files": {},
    "programs": [
@@ -30,7 +42,25 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_a_pure_move_changes_no_manifest_with_the_map_and_fails_without_it": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_a_reparsed_module_never_reads_a_stale_cache_entry": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_security_helper_moved_away_from_its_must_keep_test_is_refused": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_test_moved_with_its_security_helper_stays_a_negative_log_id": {
    "files": {},
    "programs": [
     "git"
@@ -60,6 +90,12 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_every_malformed_moves_entry_is_refused_by_name": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_every_must_keep_id_is_present_with_an_expected_outcome": {
    "files": {},
    "programs": [
@@ -78,6 +114,12 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_moved_ids_inside_a_parametrize_suffix_keep_their_baseline_id": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_the_check_inventory_matches_the_baseline": {
    "files": {},
    "programs": [
@@ -87,14 +129,14 @@
   "tests/_gates/test_suite_gates.py::test_the_environment_fingerprints_are_the_recipes": {
    "files": {
     "pyproject.toml": "2f0c255cf722d575260f22dc457a173f",
-    "scripts": "dir:708a18a792a9e845c04b1879deb3"
+    "scripts": "dir:95e185814501a3ebb575d75556bd"
    },
    "programs": []
   },
   "tests/_gates/test_suite_gates.py::test_the_full_constraints_install_the_litellm_pyproject_pins": {
    "files": {
     "pyproject.toml": "2f0c255cf722d575260f22dc457a173f",
-    "scripts": "dir:708a18a792a9e845c04b1879deb3"
+    "scripts": "dir:95e185814501a3ebb575d75556bd"
    },
    "programs": []
   },

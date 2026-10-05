@@ -1,0 +1,6 @@
+{
+ "about": "Moved or renamed tests, current -> baseline (plan 20260926, gate gap G3). files: {current path: baseline path}; ids: {current function-level id: baseline function-level id}, wins over files; no parametrize suffix, it carries over verbatim. Every gate translates through this map, so a move leaves the other manifests as they are. Rules: docs/testing/must-keep.md.",
+ "baseline": "807831a",
+ "files": {},
+ "ids": {}
+}

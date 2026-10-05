@@ -11,8 +11,11 @@ per parametrised id (``{"[case]": outcome}``):
   environment it applies to, the outcome it must still have (``skipped:<reason>``, or
   ``not-collected`` for a case parametrised only where its dependency is installed).
 
+Keyed by baseline node id: a run's current ids go through ``moves.to_baseline`` first.
+
 ``python -m tests._gates.ledger write --minimal RUN.json… --full RUN.json…`` (baseline) and
-``python -m tests._gates.ledger check <env> RUN.json [--scope PATH ...]``.
+``python -m tests._gates.ledger check <env> RUN.json [--scope PATH ...]``; a scope is a
+current path, and an id is in it where the test lives now.
 """
 
 from __future__ import annotations
@@ -23,6 +26,8 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+
+from tests._gates import moves
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFESTS = ROOT / "tests" / "_manifests"
@@ -101,6 +106,17 @@ def _expand(run: dict[str, Any], other: dict[str, Any]) -> dict[str, str]:
     return outcomes
 
 
+def _translated(outcomes: dict[str, str]) -> dict[str, str]:
+    """Current ids -> baseline ids (``moves.json``); two that land on one id are refused."""
+    seen: dict[str, str] = {}
+    return {moves.claim(seen, node_id): outcome for node_id, outcome in outcomes.items()}
+
+
+def _shown(node_id: str) -> str:
+    current = moves.from_baseline(node_id)
+    return node_id if current == node_id else f"{node_id} (now {current})"
+
+
 def _apply_not_applicable(env: str, outcomes: dict[str, str]) -> dict[str, str]:
     for node_id, entry in not_applicable().items():
         if env not in entry:
@@ -154,7 +170,7 @@ def write(runs: dict[str, dict[str, Any]], *, provisional: bool = False) -> list
         return problems
     for env in ENVS:
         other = runs["full" if env == "minimal" else "minimal"]
-        outcomes = _apply_not_applicable(env, _expand(runs[env], other))
+        outcomes = _apply_not_applicable(env, _translated(_expand(runs[env], other)))
         expected_path(env).write_text(_dump(env, nest(outcomes)))
     return problems if not provisional else []
 
@@ -170,18 +186,19 @@ def compare(env: str, run: dict[str, Any], scope: Iterable[str] = ()) -> list[st
     scope = list(scope)
     recorded = flat(json.loads(expected_path(env).read_text()))
     problems = _problems_of_run(env, run, scope)
-    actual = dict(run["outcomes"])
+    actual = _translated(run["outcomes"])
     skipped_modules = dict(run["collection_skipped"])
+    # Current module path -> the baseline ids of the tests it holds now.
     by_module: dict[str, list[str]] = {}
     for node_id in recorded:
-        by_module.setdefault(node_id.split("::", 1)[0], []).append(node_id)
+        by_module.setdefault(moves.from_baseline(node_id).split("::", 1)[0], []).append(node_id)
     for module, reason in skipped_modules.items():
-        ids = by_module.get(module, [module])
+        ids = by_module.get(module, [moves.to_baseline_path(module)])
         for node_id in ids:
             actual[node_id] = f"{COLLECTION_SKIPPED}{reason}"
     na = not_applicable()
     for node_id in sorted(set(recorded) | set(actual)):
-        if not _in_scope(node_id, scope):
+        if not _in_scope(moves.from_baseline(node_id), scope):
             continue
         want, got = recorded.get(node_id), actual.get(node_id)
         if want is not None and want.startswith(NOT_APPLICABLE) and env in na.get(node_id, {}):
@@ -190,11 +207,15 @@ def compare(env: str, run: dict[str, Any], scope: Iterable[str] = ()) -> list[st
         if want == got:
             continue
         if want is None:
-            problems.append(f"{env}: new id not in the expected outcomes: {node_id} ({got})")
+            problems.append(
+                f"{env}: new id not in the expected outcomes: {_shown(node_id)} ({got})"
+            )
         elif got is None:
-            problems.append(f"{env}: missing id (deselected, lost or not collected): {node_id}")
+            problems.append(
+                f"{env}: missing id (deselected, lost or not collected): {_shown(node_id)}"
+            )
         else:
-            problems.append(f"{env}: {node_id}: expected {want!r}, got {got!r}")
+            problems.append(f"{env}: {_shown(node_id)}: expected {want!r}, got {got!r}")
     return problems
 
 
