@@ -104,6 +104,30 @@ def test_a_global_declaration_reaches_the_module_level_helper() -> None:
     assert rejected, evidence
 
 
+def test_a_pure_move_changes_no_manifest_with_the_map_and_fails_without_it() -> None:
+    rejected, evidence = selftest.pure_move()
+
+    assert rejected, evidence
+
+
+def test_a_moved_test_that_lost_an_assert_is_rejected_despite_the_map() -> None:
+    rejected, evidence = selftest.weakened_move()
+
+    assert rejected, evidence
+
+
+def test_every_malformed_moves_entry_is_refused_by_name() -> None:
+    rejected, evidence = selftest.move_refusals()
+
+    assert rejected, evidence
+
+
+def test_a_move_neither_adds_nor_removes_a_must_keep_id() -> None:
+    rejected, evidence = selftest.membership_move()
+
+    assert rejected, evidence
+
+
 def test_the_moves_map_names_only_tests_that_moved() -> None:
     assert moves.problems() == []
 
