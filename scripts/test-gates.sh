@@ -7,7 +7,7 @@
 # 1. the environment's fingerprint (tests/_manifests/env_fingerprint.<env>.json);
 #    full also needs Postgres at CORP_TEST_PG_DSN;
 # 2. the static gates: check inventory + external dependencies, name-pinned index,
-#    negative-log review, must-keep ids;
+#    negative-log review, must-keep ids, the moves map;
 # 3. the whole suite once, with the outcome-ledger plugin and branch coverage;
 # 4. the run's ledger against expected_outcomes.<env>.json and its coverage against
 #    coverage.<env>.json — any new skip, lost id or case, changed reason, module that
@@ -89,6 +89,7 @@ if [[ ${RECORD} -eq 0 ]]; then
     "${PY}" -m tests._gates.name_pinned --check || fail "name-pinned index"
     "${PY}" -m tests._gates.negative_logs --check || fail "negative-log review"
     "${PY}" -m tests._gates.must_keep --check || fail "must-keep ids"
+    "${PY}" -m tests._gates.moves --check || fail "moves map"
 fi
 
 set +e

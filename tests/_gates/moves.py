@@ -29,6 +29,22 @@ ROOT = Path(__file__).resolve().parents[2]
 PATH = ROOT / "tests" / "_manifests" / "moves.json"
 
 
+class MoveCollisionError(ValueError):
+    pass
+
+
+def claim(seen: dict[str, str], current: str) -> str:
+    """Record ``current`` under its baseline id in ``seen``; a second current id landing on
+    the same baseline id would silently replace the first, so it is refused."""
+    baseline = to_baseline(current)
+    if baseline in seen and seen[baseline] != current:
+        raise MoveCollisionError(
+            f"moves.json: {seen[baseline]} and {current} both translate to {baseline}"
+        )
+    seen[baseline] = current
+    return baseline
+
+
 @dataclass(frozen=True)
 class Moves:
     files: dict[str, str]
@@ -112,11 +128,12 @@ def _function_ids(ids: set[str]) -> set[str]:
 def problems() -> list[str]:
     """The refusals: every entry must map a test that moved, 1:1, straight to its baseline."""
     from tests._gates import ledger
-    from tests._gates.inventory import _tests_in, modules
+    from tests._gates.inventory import _tests_in, suite_modules
 
     moves = load()
-    tree_paths = {module.rel for module in modules().values()}
-    tree_ids = {f"{m.rel}::{qual}" for m in modules().values() for qual, _, _ in _tests_in(m)}
+    # What the inventory walks: the modules pytest collects.
+    tree_paths = {module.rel for module in suite_modules()}
+    tree_ids = {f"{m.rel}::{qual}" for m in suite_modules() for qual, _, _ in _tests_in(m)}
     recorded = {i for env in ledger.ENVS for i in ledger.ids_with_outcome(env)}
     baseline_ids = _function_ids(recorded)
     baseline_paths = {i.split("::", 1)[0] for i in recorded}

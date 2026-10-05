@@ -1238,9 +1238,10 @@ def collect(items: Iterable[TestItem]) -> tuple[dict[str, Any], dict[str, Any]]:
     external: dict[str, Any] = {}
     unresolved: set[str] = set()
     scans: dict[tuple[str, str, int], tuple[ast.AST, ExternalScan]] = {}
+    seen: dict[str, str] = {}
     for module, qual, node, cls in items:
         # Keyed (and so sharded) by the baseline id: a moved test keeps its line.
-        node_id = moves.to_baseline(f"{module.rel}::{qual}")
+        node_id = moves.claim(seen, f"{module.rel}::{qual}")
         entry, closure = inventory_entry(module, node, cls)
         checks[node_id] = entry
         deps: set[str] = set()

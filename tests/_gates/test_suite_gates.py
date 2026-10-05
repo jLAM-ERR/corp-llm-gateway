@@ -128,6 +128,12 @@ def test_a_move_neither_adds_nor_removes_a_must_keep_id() -> None:
     assert rejected, evidence
 
 
+def test_a_test_moved_with_its_security_helper_stays_a_negative_log_id() -> None:
+    rejected, evidence = selftest.security_helper_move()
+
+    assert rejected, evidence
+
+
 def test_the_moves_map_names_only_tests_that_moved() -> None:
     assert moves.problems() == []
 
@@ -151,9 +157,27 @@ def test_a_rename_leaves_a_name_the_function_binds_itself(monkeypatch: pytest.Mo
     assert dump.count("Name('helper'") == 3
 
 
+def _override_files(sites: dict[str, object]) -> set[str]:
+    """The current module of each override site (sites are keyed by baseline id)."""
+    return {moves.from_baseline(site.split("#", 1)[0]).split("::", 1)[0] for site in sites}
+
+
+def test_an_override_site_of_a_test_moved_by_ids_resolves_to_its_module_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = "tests/_gates/test_suite_gates.py::test_the_check_inventory_matches_the_baseline"
+    monkeypatch.setattr(
+        moves, "load", lambda: moves.Moves({}, {now: "tests/old_place.py::test_launches"})
+    )
+
+    files = _override_files({"tests/old_place.py::test_launches#process0": {}})
+
+    assert files == {"tests/_gates/test_suite_gates.py"}
+
+
 def test_every_override_names_a_live_site_and_says_why() -> None:
     sites = json.loads(inventory.OVERRIDES_PATH.read_text())["sites"]
-    files = {moves.from_baseline(site.split("::", 1)[0]) for site in sites}
+    files = _override_files(sites)
 
     assert all(entry["note"] for entry in sites.values())
     assert all((ROOT / path).is_file() for path in files)

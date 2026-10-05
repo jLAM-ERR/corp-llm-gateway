@@ -110,13 +110,15 @@ current -> baseline:
   and `not_applicable.json`, and the `owner` of its `negative_log_checks.json` sites.
 - `ledger check --scope` takes current paths: a test is in scope where it is now.
 
-The gate (`python -m tests._gates.moves --check`, and every `pytest tests/` run) refuses:
+The gate (`python -m tests._gates.moves --check`, `scripts/test-gates.sh`, and every
+`pytest tests/` run) refuses:
 
-- a key that is not in the current tree;
+- a key that is not in the current tree (the `test_*.py` modules pytest collects);
 - a value that is still in the current tree (the test did not move);
 - an `ids` value that is not in the baseline collection (the two ledgers' ids), or a
   `files` value that is not one of the ledgers' paths;
-- a value used twice, or two current tests that translate to one baseline id;
+- a value used twice, or two current tests that translate to one baseline id (the
+  inventory, the ledger and must-keep stop on that too, rather than keep one of the two);
 - a chain: a value that is itself a key, or an `ids` value in a module that `files`
   renames. Always map straight to the baseline id;
 - a parametrize suffix on either side.
@@ -128,7 +130,12 @@ Its manifest diff is only:
 - `moves.json`;
 - `name_pinned.json`: it indexes the current ids, and the docs that cite a moved test
   change in the same PR;
-- `negative_log_checks.json`: the `site` (`file:line`) of a moved check, nothing else;
+- `negative_log_checks.json`: the `site` (`file:line`) of a moved check. A helper is not
+  in `moves.json`, so a security helper that moves to another module gets a new `owner`
+  and is reviewed again. `security_node_ids` keeps every test that shares a module with
+  the helper at the baseline or now, so a helper moved with its test, or left where it was,
+  changes nothing there; a helper moved where none of its tests is (a shared fixtures
+  module) drops them from that list, which review must catch (they stay in `must_keep/`);
 - `external_deps.json`: hashes only, for the docs and files it hashes that the PR edits.
 
 Anything else is not a pure move. One case is expected: a test whose body names its own
@@ -136,9 +143,10 @@ file (`__file__`, `Path(__file__).parent / …`, a literal `tests/…` path) get
 `body_hash` after a move, and it is reviewed like any other changed body.
 
 Must-keep membership belongs to the test, not to the directory it sits in. Every rule sees
-the baseline identity: the path rules (`STEP1_*`, `STEP2_GLOBS`, the `audit/test_logger.py`
-line range) match the baseline path, the literal ids are baseline ids, and a name-pinned id
-is translated first. A test moved into `tests/route_gate/` or `tests/litellm_hook/` does
+the baseline identity: the path rules (`STEP1_*`, `STEP2_GLOBS`) match the baseline path,
+the literal ids are baseline ids (the NEVER-field tests of `audit/test_logger.py` among
+them), and a name-pinned id is translated first. No rule reads a line number of the
+current tree. A test moved into `tests/route_gate/` or `tests/litellm_hook/` does
 not become must-keep, and a must-keep test moved out stays must-keep.
 
 ## The two environments
@@ -260,7 +268,7 @@ gate failure, elsewhere a Python warning (pytest shows it), and `--write` refuse
 `tests/invariants/**`, `tests/route_gate/**`, the two served-stack suites,
 `test_launch_command.py`, `test_litellm_pin.py`, `test_litellm_config_guards.py`,
 `test_ci_workflow.py`, `test_asgi_entrypoint.py`, `audit/test_{invariants,block_reason,guardrail_information_gate}.py`,
-`audit/test_logger.py:135-163` (the NEVER-field tests), `sanitizer/test_placeholder_allocator*.py`,
+`sanitizer/test_placeholder_allocator*.py`,
 `sanitizer/test_dlp_guard.py`, `sanitizer/test_oauth_system_preamble.py`, every
 `tests/litellm_hook/` module, `healthz/test_issue_token_*.py` + `test_issuance_schema_gate.py`,
 `tokens/test_{oidc_verifier,issuance_policy,middleware*}.py`, `tests/compose/**`,
@@ -271,8 +279,10 @@ claims accepted; HS256, forged, expired, wrong audience / issuer, missing role r
 `::test_a_ticketed_pre_call_hands_the_mapping_and_the_record_to_the_ticket`,
 `sanitizer/test_allowlist.py::test_allowlisted_secret_label_not_dropped` (an allowlist
 never drops a secret's label), `deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed`
-and its `deploy/test_deploy_script.py` twin, and the four e2e security checks of the open
-finding above.
+and its `deploy/test_deploy_script.py` twin, the five NEVER-field tests of
+`audit/test_logger.py` (`test_assert_no_never_fields_*` ×4 and
+`test_never_fields_set_includes_critical_keys`, lines 135-163 at `807831a`), and the four
+e2e security checks of the open finding above.
 
 **Security-policy defaults** that look trivial: `test_config.py::test_corp_llm_verify_defaults_to_true`,
 `test_settings.py::test_forward_anthropic_auth_defaults_off`, `::test_route_gate_extras_default_to_empty`,
@@ -323,8 +333,9 @@ named test, so a column the gate stops filling fails it. `python -m tests._gates
 | g | re-parse one synthetic module 200 times with two alternating bodies | inventory caches: each body always hashes the same and the two differ (a cache keyed by a reused `id()` returned a stale hash) |
 | m | move a synthetic test to a renamed module and rename another into it, with and without `moves.json` | with the map no gate reports anything and a ledger rewrite is byte-identical; without it inventory (`missing test`), expected outcomes (`missing id`, in a scoped check too), must-keep (`test is gone`) and negative logs (a new owner) |
 | n | the same move with the moved test's assert dropped | inventory: `asserts` and `body_hash`, despite the map |
-| o | one malformed `moves.json` entry per refusal above (14), and one valid map | the moves gate names each entry; the valid map passes |
-| p | a plain test moved into `tests/route_gate/`, a must-keep one moved out of it (one renamed), a name-pinned id cited at its new place | must-keep: the same ids as before the move, at their baseline ids |
+| o | one malformed `moves.json` entry per refusal above (15, a key in a module pytest does not collect among them), and one valid map | the moves gate names each entry; the valid map passes; the two-ids-one-baseline map also stops the inventory, the ledger and must-keep |
+| p | a plain test moved into `tests/route_gate/`, a must-keep one moved out of it (one renamed), a name-pinned id cited at its new place, a test moved onto `audit/test_logger.py:135-163` | must-keep: the same ids as before the move, at their baseline ids |
+| q | a test running `_assert_clean(log_text)` moved by `ids`, with the helper, and without it (imported from where it stayed) | negative logs: the same `security_node_ids` |
 | L1 | rename `team_config/test_store.py` so it is not collected | expected outcomes: missing ids |
 | L2 | drop the `redis` param of `storage/test_mapping_store.py`'s `store` fixture | expected outcomes: missing `[redis]` ids |
 | L3 | an autouse fixture that skips at setup in `team_config/test_store.py` | expected outcomes: `passed` → `skipped:…` |
@@ -332,6 +343,6 @@ named test, so a column the gate stops filling fails it. `python -m tests._gates
 
 All eleven were rejected on the baseline tree (2026-10-04); the same checks on the
 unmutated tree pass (the control). Cases h-l (function-local imports) are listed in the
-`tests/_gates/selftest.py` docstring. Cases m-p work on synthetic modules and ledgers, run
-with `selftest inventory`, and each one fails when the translation it covers is taken out
-of its gate (2026-10-05).
+`tests/_gates/selftest.py` docstring. Cases m-q work on synthetic modules and ledgers, run
+with `selftest inventory`, and each one fails when the translation or refusal it covers is
+taken out of its gate (2026-10-05).

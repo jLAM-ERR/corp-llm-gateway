@@ -118,16 +118,22 @@ def _key(site: dict[str, Any]) -> str:
 
 
 def node_ids(manifest: dict[str, Any]) -> list[str]:
-    """Tests running a security negative check, directly or through a helper."""
+    """Tests running a security negative check, directly or through a helper: a test that
+    reaches a security helper's name and shares its module, at the baseline or now (a helper
+    owner moves only with ``files``, a test also with ``ids``)."""
     checks, _ = build_inventory()
     security = [s for s in manifest["sites"] if s["class"] == "security"]
     owners = {s["owner"] for s in security}
     helpers = [o for o in owners if o.rsplit("::", 1)[1].startswith("_")]
     helper_names = {owner.rsplit("::", 1)[1] for owner in helpers}
     helper_files = {owner.split("::", 1)[0] for owner in helpers}
+    helper_files_now = {moves.from_baseline(owner).split("::", 1)[0] for owner in helpers}
     ids = owners - set(helpers)
     for node_id, entry in checks.items():
-        if set(entry["helpers"]) & helper_names and node_id.split("::", 1)[0] in helper_files:
+        if not set(entry["helpers"]) & helper_names:
+            continue
+        then, now = node_id.split("::", 1)[0], moves.from_baseline(node_id).split("::", 1)[0]
+        if then in helper_files or now in helper_files_now:
             ids.add(node_id)
     return sorted(ids)
 

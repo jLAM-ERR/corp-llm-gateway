@@ -22,13 +22,17 @@ answer or negative-log owner with the map, and without it the inventory, the led
 must-keep all reject; (n) the same move with an assert dropped is still rejected by the
 inventory; (o) every refusal of ``moves.problems()``, one entry each, and a valid map that
 passes; (p) must-keep membership survives a move either way: out of a ``STEP2_GLOBS``
-directory stays in, into one stays out, and a name-pinned id counts at its baseline id.
+directory stays in, into one stays out, a name-pinned id counts at its baseline id, and a
+test that lands on the NEVER-field tests' old lines is not one of them; (q) a test that runs
+a security negative check through a helper stays in ``security_node_ids`` when it moves by
+``ids``, with its helper or without it. A move map that sends two current tests to one
+baseline id stops every gate (o).
 
 Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
 stops being collected, a lost parametrize case, a setup-time skip, a changed
 collection-skip reason.
 
-``python -m tests._gates.selftest inventory|ledger`` (``inventory`` runs a-p)
+``python -m tests._gates.selftest inventory|ledger`` (``inventory`` runs a-q)
 """
 
 from __future__ import annotations
@@ -444,6 +448,13 @@ def _world(
         (inventory, "modules", lambda: tree),
         (must_keep, "modules", lambda: tree),
         (negative_logs, "modules", lambda: tree),
+        (
+            negative_logs,
+            "build_inventory",
+            lambda: inventory.collect(
+                (m, q, n, c) for m in tree.values() for q, n, c in inventory._tests_in(m)
+            ),
+        ),
         (moves, "load", lambda: the_map),
         (ledger, "not_applicable", dict),
     ]
@@ -487,8 +498,11 @@ MOVE_SUITE = (
     "    assert helper(n) == n\n"
 )
 MOVED_SUITE = MOVE_SUITE.replace("def test_old_name(", "def test_new_name(")
+# A module the run collection-skips and the ledgers hold no id for.
+SKIPPED_OLD = "tests/_gates/selftest_move_skipped_old.py"
+SKIPPED_NEW = "tests/_gates/selftest_move_skipped_new.py"
 MOVE_MAP = {
-    "files": {MOVE_NEW: MOVE_OLD},
+    "files": {MOVE_NEW: MOVE_OLD, SKIPPED_NEW: SKIPPED_OLD},
     "ids": {f"{MOVE_NEW}::test_new_name": f"{MOVE_OLD}::test_old_name"},
 }
 
@@ -539,6 +553,15 @@ def _move_world(suite: str, mapped: bool) -> dict[str, list[str]]:
                 "ledger in scope": ledger.compare(
                     "minimal", {**runs["minimal"], "outcomes": {}}, [MOVE_NEW]
                 ),
+                "ledger, unrecorded skipped module": ledger.compare(
+                    "full",
+                    {
+                        "outcomes": {},
+                        "collection_skipped": {SKIPPED_NEW: "selftest"},
+                        "collection_errors": {},
+                    },
+                    [SKIPPED_NEW],
+                ),
                 "must-keep": [p for p in must_keep.problems() if "selftest_move" in p],
                 "negative logs": sorted(
                     {negative_logs._key(site) for site in negative_logs.sites()} ^ reviewed
@@ -560,7 +583,11 @@ def pure_move() -> tuple[bool, str]:
     anything and a ledger rewrite is byte-identical; without it, the inventory (removed +
     added), the ledger (missing id, in scope too) and must-keep (test is gone) reject."""
     with_map, without = _move_world(MOVED_SUITE, True), _move_world(MOVED_SUITE, False)
-    noisy = {gate: lines for gate, lines in with_map.items() if gate != "ledger in scope" and lines}
+    checked_apart = {"ledger in scope", "ledger, unrecorded skipped module"}
+    noisy = {gate: lines for gate, lines in with_map.items() if gate not in checked_apart and lines}
+    want_skipped = f"new id not in the expected outcomes: {SKIPPED_OLD} (now {SKIPPED_NEW})"
+    if not any(want_skipped in line for line in with_map["ledger, unrecorded skipped module"]):
+        noisy["ledger, unrecorded skipped module"] = with_map["ledger, unrecorded skipped module"]
     want_in_scope = f"missing id (deselected, lost or not collected): {MOVE_OLD}::test_kept_name"
     if not any(want_in_scope in line for line in with_map["ledger in scope"]):
         noisy["ledger in scope"] = with_map["ledger in scope"]
@@ -597,13 +624,17 @@ def weakened_move() -> tuple[bool, str]:
 
 _OLD = "tests/_gates/selftest_moves_old.py"
 _OLD2 = "tests/_gates/selftest_moves_old2.py"
-_NEW = "tests/_gates/selftest_moves_new.py"
-_NEW2 = "tests/_gates/selftest_moves_new2.py"
-_STAY = "tests/_gates/selftest_moves_stay.py"
+_NEW = "tests/_gates/test_selftest_moves_new.py"
+_NEW2 = "tests/_gates/test_selftest_moves_new2.py"
+_STAY = "tests/_gates/test_selftest_moves_stay.py"
+# Not a test_*.py module: pytest does not collect it, so the inventory does not walk it.
+_NOT_COLLECTED = "tests/_gates/selftest_moves_helper.py"
 REFUSAL_TREE = {
     _NEW: "def test_a():\n    pass\ndef test_b():\n    pass\n",
-    _NEW2: "def test_a():\n    pass\ndef test_x():\n    pass\n",
+    # A different body from _NEW's test_a: a collision must not hide it.
+    _NEW2: "def test_a():\n    assert 1\ndef test_x():\n    pass\n",
     _STAY: "def test_s():\n    pass\n",
+    _NOT_COLLECTED: "def test_h():\n    pass\n",
 }
 REFUSAL_BASELINE = (
     f"{_OLD}::test_a",
@@ -685,6 +716,13 @@ REFUSALS = (
         f"{_NEW2}::test_x",
     ),
     Refusal(
+        "ids key in a module pytest does not collect",
+        {},
+        {f"{_NOT_COLLECTED}::test_h": f"{_OLD}::test_b"},
+        "key is not in",
+        f"{_NOT_COLLECTED}::test_h",
+    ),
+    Refusal(
         "parametrised key",
         {},
         {f"{_NEW}::test_a[p1]": f"{_OLD}::test_c"},
@@ -707,6 +745,31 @@ REFUSALS = (
     ),
 )
 VALID_MOVES = ({_NEW: _OLD}, {f"{_NEW2}::test_x": f"{_OLD2}::test_x"})
+COLLISION = REFUSALS[-1]
+
+
+def _collision_refused_by_every_gate(tree: list[inventory.Module], ledgers: Path) -> list[str]:
+    """The gates that let two current ids land on one baseline id without an error."""
+    suite = [m for m in tree if m.path.name.startswith("test_")]
+    current = [f"{m.rel}::{q}" for m in suite for q, _, _ in inventory._tests_in(m)]
+    calls = {
+        "inventory": lambda: inventory.collect(
+            (m, q, n, c) for m in suite for q, n, c in inventory._tests_in(m)
+        ),
+        "must-keep": must_keep._functions,
+        "ledger": lambda: ledger._translated(dict.fromkeys(current, "passed")),
+    }
+    silent = []
+    with _world(tree, files=COLLISION.files, ids=COLLISION.ids, ledgers=ledgers):
+        for gate, call in calls.items():
+            try:
+                call()
+            except moves.MoveCollisionError as exc:
+                if COLLISION.names not in str(exc):
+                    silent.append(f"{gate} (does not name the entry)")
+            else:
+                silent.append(gate)
+    return silent
 
 
 def move_refusals() -> tuple[bool, str]:
@@ -725,26 +788,41 @@ def move_refusals() -> tuple[bool, str]:
             if not any(r.says in line and r.names in line for line in found(r.files, r.ids))
         ]
         control = found(*VALID_MOVES)
-    if unmet or control:
-        return False, f"not refused: {unmet}; valid map refused: {control}"[:240]
-    return True, f"{len(REFUSALS)} refused by name, the valid map passes"
+        silent = _collision_refused_by_every_gate(tree, Path(tmp))
+    if unmet or control or silent:
+        return False, (
+            f"not refused: {unmet}; valid map refused: {control}; collision passes: {silent}"
+        )[:240]
+    return True, (
+        f"{len(REFUSALS)} refused by name, the valid map passes; the collision also stops "
+        "inventory, must-keep and ledger"
+    )
 
 
 PLAIN_AT = ("tests/_gates/selftest_plain.py", "tests/route_gate/selftest_plain.py")
 KEPT_AT = ("tests/route_gate/selftest_kept.py", "tests/_gates/selftest_kept.py")
+# A test moved into audit/test_logger.py's place, on the lines the NEVER-field tests held.
+LOGGER_AT = ("tests/audit/test_logger.py", "tests/_gates/selftest_logger.py")
 PINNED_AT = ("tests/_gates/selftest_pinned_old.py", "tests/_gates/selftest_pinned.py")
 
 
 def membership_move() -> tuple[bool, str]:
     """``STEP2_GLOBS`` and a name-pinned id decide on the baseline identity: a plain test
     moved into ``tests/route_gate/`` stays out, a must-keep one moved out of it (one renamed
-    on the way) stays in, and a pinned id cited at its new place counts at its old one."""
+    on the way) stays in, a pinned id cited at its new place counts at its old one, and a
+    test that lands on ``audit/test_logger.py:135-163`` is not a NEVER-field test."""
     tree = [
         _module_at(PLAIN_AT[1], "def test_plain():\n    pass\n"),
         _module_at(KEPT_AT[1], "def test_kept():\n    pass\ndef test_renamed():\n    pass\n"),
         _module_at(PINNED_AT[1], "def test_pinned():\n    pass\n"),
+        _module_at(LOGGER_AT[1], "\n" * 140 + "def test_selftest_on_the_old_lines():\n    pass\n"),
     ]
-    files = {PLAIN_AT[1]: PLAIN_AT[0], KEPT_AT[1]: KEPT_AT[0], PINNED_AT[1]: PINNED_AT[0]}
+    files = {
+        PLAIN_AT[1]: PLAIN_AT[0],
+        KEPT_AT[1]: KEPT_AT[0],
+        PINNED_AT[1]: PINNED_AT[0],
+        LOGGER_AT[1]: LOGGER_AT[0],
+    }
     ids = {f"{KEPT_AT[1]}::test_renamed": f"{KEPT_AT[0]}::test_original"}
     pinned = [f"{PINNED_AT[1]}::test_pinned"]
     selected = {}
@@ -764,6 +842,50 @@ def membership_move() -> tuple[bool, str]:
         f"mapped: {len(want)} kept at their baseline ids, the plain test out; "
         "unmapped: the current path decides",
     )
+
+
+Q_OLD = "tests/_gates/test_selftest_q_old.py"
+Q_NEW = "tests/_gates/test_selftest_q_new.py"
+Q_HELPER = "def _assert_clean(log_text):\n    assert 'secret' not in log_text\n"
+Q_TEST = "def {name}(caplog):\n    _assert_clean(caplog.text)\n"
+Q_IMPORT = "from tests._gates.test_selftest_q_old import _assert_clean\n"
+# (case, baseline module, current modules, ids): the tests run the helper's security check.
+Q_WORLDS = (
+    (
+        "helper and test moved together by ids",
+        Q_HELPER + Q_TEST.format(name="test_a"),
+        {Q_NEW: Q_HELPER + Q_TEST.format(name="test_a")},
+        {f"{Q_NEW}::test_a": f"{Q_OLD}::test_a"},
+    ),
+    (
+        "test moved by ids, helper left behind and imported",
+        Q_HELPER + Q_TEST.format(name="test_b"),
+        {Q_OLD: Q_HELPER, Q_NEW: Q_IMPORT + Q_TEST.format(name="test_b")},
+        {f"{Q_NEW}::test_b": f"{Q_OLD}::test_b"},
+    ),
+)
+
+
+def _security_node_ids() -> list[str]:
+    sites = [{**site, "class": "security"} for site in negative_logs.sites()]
+    return negative_logs.node_ids({"sites": sites})
+
+
+def security_helper_move() -> tuple[bool, str]:
+    """A test that runs a security negative check through a helper stays in
+    ``security_node_ids`` (so in must-keep) when it moves by ``ids``, with the helper or
+    without it."""
+    unmet = []
+    for case, baseline, current, ids in Q_WORLDS:
+        with _world([_module_at(Q_OLD, baseline)]):
+            before = _security_node_ids()
+        with _world([_module_at(rel, text) for rel, text in current.items()], ids=ids):
+            after = _security_node_ids()
+        if not before or after != before:
+            unmet.append(f"{case}: {before} -> {after}")
+    if unmet:
+        return False, f"security_node_ids changed: {unmet}"[:240]
+    return True, f"{len(Q_WORLDS)} moves, security_node_ids unchanged, e.g. {before}"[:240]
 
 
 def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool, str]:
@@ -941,6 +1063,8 @@ def main(argv: list[str] | None = None) -> int:
         results.append(("o: each malformed moves.json entry", rejected, evidence))
         rejected, evidence = membership_move()
         results.append(("p: must-keep membership across a move", rejected, evidence))
+        rejected, evidence = security_helper_move()
+        results.append(("q: a security helper's test moved by ids", rejected, evidence))
     else:
         rejected, evidence = missing_module()
         results.append(("newly missing module", rejected, evidence))

@@ -108,14 +108,8 @@ def _expand(run: dict[str, Any], other: dict[str, Any]) -> dict[str, str]:
 
 def _translated(outcomes: dict[str, str]) -> dict[str, str]:
     """Current ids -> baseline ids (``moves.json``); two that land on one id are refused."""
-    out: dict[str, str] = {}
-    origin: dict[str, str] = {}
-    for node_id, outcome in outcomes.items():
-        baseline = moves.to_baseline(node_id)
-        if baseline in out:
-            raise SystemExit(f"moves.json: {origin[baseline]} and {node_id} are both {baseline}")
-        out[baseline], origin[baseline] = outcome, node_id
-    return out
+    seen: dict[str, str] = {}
+    return {moves.claim(seen, node_id): outcome for node_id, outcome in outcomes.items()}
 
 
 def _shown(node_id: str) -> str:
