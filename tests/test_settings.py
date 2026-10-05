@@ -348,25 +348,54 @@ def test_master_key_conflict_is_the_single_shared_rule() -> None:
 # ── validate(): malformed choices ────────────────────────────────────────────
 
 
-def test_validate_rejects_unknown_oversize_policy(
-    hermetic: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
-    monkeypatch.setenv("CORP_LLM_OVERSIZE_POLICY", "nope")
-    with pytest.raises(ConfigError, match="CORP_LLM_OVERSIZE_POLICY"):
-        config.validate()
-
-
 @pytest.mark.parametrize(
-    "raw",
-    ["/internal/ops", "POST", "TRACE /internal/ops", "GET internal/ops", "GET /internal/../key"],
+    ("key", "value", "match"),
+    [
+        pytest.param(
+            "CORP_LLM_OVERSIZE_POLICY", "nope", "CORP_LLM_OVERSIZE_POLICY", id="oversize_policy"
+        ),
+        pytest.param(
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            "/internal/ops",
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            id="route_gate_extra-/internal/ops",
+        ),
+        pytest.param(
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            "POST",
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            id="route_gate_extra-POST",
+        ),
+        pytest.param(
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            "TRACE /internal/ops",
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            id="route_gate_extra-TRACE /internal/ops",
+        ),
+        pytest.param(
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            "GET internal/ops",
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            id="route_gate_extra-GET internal/ops",
+        ),
+        pytest.param(
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            "GET /internal/../key",
+            "CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH",
+            id="route_gate_extra-GET /internal/../key",
+        ),
+        pytest.param(
+            "CORP_LLM_AUTH_PROVIDER", "kerberos", "CORP_LLM_AUTH_PROVIDER", id="auth_provider"
+        ),
+        pytest.param("CORP_AUDIT_SINK", "kafka", "CORP_AUDIT_SINK", id="audit_sink"),
+    ],
 )
-def test_validate_rejects_a_malformed_route_gate_extra(
-    hermetic: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+def test_validate_rejects_an_unknown_or_malformed_choice(
+    hermetic: Path, monkeypatch: pytest.MonkeyPatch, key: str, value: str, match: str
 ) -> None:
     monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
-    monkeypatch.setenv("CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH", raw)
-    with pytest.raises(ConfigError, match="CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH"):
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ConfigError, match=match):
         config.validate()
 
 
@@ -400,24 +429,6 @@ def test_route_gate_extras_default_to_empty(
 ) -> None:
     monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
     assert config.route_gate_extras() == {}
-
-
-def test_validate_rejects_unknown_auth_provider(
-    hermetic: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
-    monkeypatch.setenv("CORP_LLM_AUTH_PROVIDER", "kerberos")
-    with pytest.raises(ConfigError, match="CORP_LLM_AUTH_PROVIDER"):
-        config.validate()
-
-
-def test_validate_rejects_unknown_audit_sink(
-    hermetic: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
-    monkeypatch.setenv("CORP_AUDIT_SINK", "kafka")
-    with pytest.raises(ConfigError, match="CORP_AUDIT_SINK"):
-        config.validate()
 
 
 def test_validate_accepts_valid_choices(hermetic: Path, monkeypatch: pytest.MonkeyPatch) -> None:
