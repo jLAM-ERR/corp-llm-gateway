@@ -1,4 +1,4 @@
-"""Plan 20260926 Task 0: the Option A prototype, ``route_gate/desanitize_middleware.py``.
+"""Plan 20260926 Task 0: the Option A middleware, ``route_gate/desanitize_middleware.py``.
 
 Stub ASGI apps emit litellm's three wire formats (unary JSON, chat / Anthropic SSE,
 Responses SSE); the last group mounts the prototype over litellm's real app. The three

@@ -133,7 +133,7 @@ async def test_standard_logging_payload_is_content_free(
 
     Hazard 1: no original in the payload a sink receives, metadata included, on all six
     flows. ``/v1/responses`` holds only since our pre-call refreshes litellm's logging
-    snapshot (hazard 17, ``test_hazard17_logging_snapshot.py``).
+    snapshot (hazard 17, ``test_logging_snapshot_is_content_free.py``).
 
     Hazard 16: a plain ``CustomLogger`` writes an allow-listed entry with litellm's
     ``add_standard_logging_guardrail_information_to_request_data`` (from a never-registered
