@@ -1589,7 +1589,7 @@ async def test_anthropic_oauth_rejection_never_leaks_the_offered_credential(
 
 
 # (xv) CodeQL-adjudication follow-up: seven pre_call error/blocked log lines were
-# each reached by exactly one existing unit test in tests/test_litellm_hook.py, but
+# each reached by exactly one existing unit test of the hook (tests/litellm_hook/), but
 # none of those tests drove caplog — so nothing pinned them as original-free. Each
 # test below drives the same code path with a distinctive corpus original present
 # in the request and asserts it never reaches caplog.text or the audit record.
