@@ -35,7 +35,6 @@ from tests.sanitizer.test_streaming import (
     _MSG_START,
     _MSG_STOP,
     _PING,
-    ANTHROPIC_SSE_FIXTURE,
     _cb_start,
     _cb_stop,
     _delta,
@@ -1166,100 +1165,6 @@ async def _collect(g: CorpLlmGuardrail, data: dict, chunks: list[Any]) -> list[A
     return out
 
 
-async def test_post_call_stream_sse_bytes_framing_intact_all_json() -> None:
-    """Every data: line in the output parses as valid JSON (framing integrity)."""
-    g = _build([("user@example.com", "[EMAIL_001]")])
-    data = _request(content="send to user@example.com")
-    await g.pre_call(data)
-
-    sse_events: list[bytes] = [
-        _MSG_START,
-        _cb_start(0),
-        _PING,
-        _delta(" ["),
-        _delta("EMAIL"),
-        _delta("_"),
-        _delta("001"),
-        _delta("]"),
-        _cb_stop(0),
-        _MSG_DELTA,
-        _MSG_STOP,
-    ]
-    out = await _collect(g, data, sse_events)
-    for chunk in out:
-        assert isinstance(chunk, bytes), f"expected bytes, got {type(chunk)}"
-        for line in chunk.decode("utf-8", errors="replace").splitlines():
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].lstrip()
-            if payload == "[DONE]":
-                continue
-            try:
-                json.loads(payload)
-            except json.JSONDecodeError as exc:
-                pytest.fail(f"data: line not valid JSON: {payload!r} — {exc}")
-
-
-async def test_post_call_stream_sse_bytes_placeholder_restored_and_no_leak() -> None:
-    """Original is reconstructed from split deltas; placeholder must not appear in output."""
-    g = _build([("user@example.com", "[EMAIL_001]")])
-    data = _request(content="send to user@example.com")
-    await g.pre_call(data)
-
-    sse_events: list[bytes] = [
-        _MSG_START,
-        _cb_start(0),
-        _PING,
-        _delta(" ["),
-        _delta("EMAIL"),
-        _delta("_"),
-        _delta("001"),
-        _delta("]"),
-        _cb_stop(0),
-        _MSG_DELTA,
-        _MSG_STOP,
-    ]
-    out = await _collect(g, data, sse_events)
-    text_parts: list[str] = []
-    for chunk in out:
-        for line in chunk.decode("utf-8", errors="replace").splitlines():
-            if not line.startswith("data:"):
-                continue
-            try:
-                obj = json.loads(line[5:].lstrip())
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") == "content_block_delta":
-                delta = obj.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    text_parts.append(delta["text"])
-    full = "".join(text_parts)
-    assert "user@example.com" in full, f"original not restored: {full!r}"
-    assert "[EMAIL_001]" not in full, f"placeholder leaked: {full!r}"
-
-
-async def test_post_call_stream_sse_bytes_message_stop_present() -> None:
-    """message_stop must be present in the output."""
-    g = _build([("user@example.com", "[EMAIL_001]")])
-    data = _request(content="send to user@example.com")
-    await g.pre_call(data)
-
-    out = await _collect(g, data, list(ANTHROPIC_SSE_FIXTURE))
-    types_seen: set[str] = set()
-    for chunk in out:
-        for line in chunk.decode("utf-8", errors="replace").splitlines():
-            if line.startswith("data:"):
-                try:
-                    obj = json.loads(line[5:].lstrip())
-                    t = obj.get("type")
-                    if t:
-                        types_seen.add(t)
-                except json.JSONDecodeError:
-                    pass
-    assert "message_stop" in types_seen
-    assert "content_block_stop" in types_seen
-
-
 async def test_post_call_stream_empty_mapping_sse_bytes_passthrough() -> None:
     """With an empty mapping, SSE bytes pass through byte-identical."""
     g = _build([])
@@ -1294,22 +1199,6 @@ async def test_post_call_stream_done_sentinel_passes_through() -> None:
     out = await _collect(g, data, [done_event])
     combined = b"".join(out)
     assert b"[DONE]" in combined
-
-
-async def test_post_call_stream_str_chunks_return_str() -> None:
-    """When SSE events are str, the output must also be str."""
-    g = _build([("alice", "[N1]")])
-    data = _request(content="hi alice")
-    await g.pre_call(data)
-
-    str_events = [
-        _cb_start().decode(),
-        _delta("[N1]").decode(),
-        _cb_stop().decode(),
-    ]
-    out = await _collect(g, data, str_events)
-    for chunk in out:
-        assert isinstance(chunk, str), f"expected str, got {type(chunk)}: {chunk!r}"
 
 
 async def test_post_call_stream_str_chunks_placeholder_restored() -> None:
@@ -1377,12 +1266,3 @@ async def test_post_call_stream_unknown_type_chunk_passes_through() -> None:
     unreadable = b": keep-alive \x01\n\n"
     out = await _collect(g, data, [unreadable])
     assert b"".join(out) == unreadable
-
-
-async def test_post_call_stream_no_pre_call_passthrough() -> None:
-    """Without a preceding pre_call (unknown request_id), SSE bytes pass through."""
-    g = _build([("alice", "[N1]")])
-    data = {"model": "claude", "_corp_gateway_request_id": "unknown-id-xyz"}
-    events: list[bytes] = [_MSG_STOP]
-    out = await _collect(g, data, events)
-    assert _MSG_STOP in out

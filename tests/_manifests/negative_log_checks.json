@@ -926,7 +926,7 @@
    "note": "no backend or exception detail in a log line (M1-14 error surface)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_stream.py:94",
+   "site": "tests/route_gate/test_desanitize_stream.py:93",
    "owner": "tests/test_litellm_hook.py::test_post_call_stream_own_bug_mid_stream_returns_opaque_500",
    "check": "'alice' not in json.dumps(out) and 'alice' not in caplog.text",
    "class": "security",
@@ -996,14 +996,14 @@
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_stream.py:1078",
+   "site": "tests/route_gate/test_desanitize_stream.py:1077",
    "owner": "tests/test_litellm_hook.py::test_user_typed_placeholder_literal_preserved_not_collided",
    "check": "'[EMAIL_001]' not in breadcrumb_lines[0]",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_stream.py:1077",
+   "site": "tests/route_gate/test_desanitize_stream.py:1076",
    "owner": "tests/test_litellm_hook.py::test_user_typed_placeholder_literal_preserved_not_collided",
    "check": "'a@corp.example' not in breadcrumb_lines[0]",
    "class": "security",
