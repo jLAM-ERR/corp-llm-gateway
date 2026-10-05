@@ -884,7 +884,7 @@
    "note": "no 'mutually exclusive' warning for a legal env pair: config warning behaviour"
   },
   {
-   "site": "tests/test_bootstrap_edges.py:344",
+   "site": "tests/test_bootstrap_edges.py:340",
    "owner": "tests/test_bootstrap_edges.py::test_endpoint_set_does_not_warn",
    "check": "not any(('CORP_LLM_ENDPOINT' in r.getMessage() for r in caplog.records))",
    "class": "behaviour",
