@@ -69,7 +69,11 @@ Task 10 removes it with the rest of the inventory.
 never goes away (a moved test keeps its baseline id, [below](#moving-or-renaming-a-test)),
 and coverage may only grow. Both change only on a re-baseline (a
 production change under `litellm_hook.py`, `route_gate/` or `sanitizer/streaming.py`, or a
-dependency bump), with the manifest diff reviewed.
+dependency bump), with the manifest diff reviewed. One exception: a prune PR whose fold-up
+creates a new test under a step-1 / step-2 must-keep path (the new test has no `moves.json`
+entry, so it is its own baseline) runs `must_keep --write`, and the `must_keep/` diff must be
+additions only — the new function and case ids (Task 3b: 2 functions, 7 cases in
+`litellm_hook.txt`).
 
 A move PR that renames a module-level helper, fixture, class or constant records it in
 `tests/_manifests/renames.json` as `{"names": {"<new name>": "<old name>"}}`. The inventory

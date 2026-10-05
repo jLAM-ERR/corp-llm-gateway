@@ -493,3 +493,12 @@ Decided by the DRI (plan rev 10, 2026-10-05):
   the `_text_deltas` tests and the held-tail tests; a non-must-keep stream test on the same wire
   input whose asserts are a subset of one of those is a (2) deletion. The three stream deletions
   stand.
+
+Decided in phase 2 (plan rev 11, option A, 2026-10-05):
+
+- **The fold tests are must-keep.** A fold's new test has no `moves.json` entry, so it is its own
+  baseline, and the step-2 glob `tests/litellm_hook/*.py` selects it.
+  `test_pre_call_shapes.py::test_pre_call_unmanaged_call_type_input_passes_through_untouched`
+  (4 cases) and `test_stage0_classifier.py::test_stage0_payload_raises_policy_blocked` (3 cases)
+  join `must_keep/litellm_hook.txt` — additions only, 2 functions + 7 case ids. The 7 ids they
+  replace were prunable; their checks are now must-keep.
