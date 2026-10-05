@@ -2,6 +2,8 @@
 
 Built from the rules below (documented in docs/testing/must-keep.md) and expanded to
 parametrised ids from both expected-outcome ledgers, so a lost parameter case shows up.
+Membership is a property of the test, not of where it sits today: every rule sees the
+baseline id and path (``moves.to_baseline``), so a move never adds or removes an id.
 
 ``python -m tests._gates.must_keep --write|--check``
 """
@@ -20,7 +22,7 @@ import warnings
 from functools import cache
 from pathlib import Path
 
-from tests._gates import ledger
+from tests._gates import ledger, moves
 from tests._gates.inventory import Module, _area, _tests_in, modules
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -187,7 +189,8 @@ POLICY_DEFAULTS = (
 
 
 def _spans(module: Module) -> list[tuple[str, int, int]]:
-    """[(function-level node id, first line incl. decorators, last line)]."""
+    """[(function-level node id, first line incl. decorators, last line)], as ``module``
+    names them."""
     out = []
     for qual, node, _ in _tests_in(module):
         first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
@@ -196,7 +199,13 @@ def _spans(module: Module) -> list[tuple[str, int, int]]:
 
 
 def _functions() -> dict[str, list[tuple[str, int, int]]]:
-    return {module.rel: _spans(module) for module in modules().values()}
+    """Baseline path -> [(baseline function-level id, current first line, last line)]."""
+    out: dict[str, list[tuple[str, int, int]]] = {}
+    for module in modules().values():
+        for node_id, first, last in _spans(module):
+            baseline = moves.to_baseline(node_id)
+            out.setdefault(baseline.split("::", 1)[0], []).append((baseline, first, last))
+    return out
 
 
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
@@ -273,7 +282,7 @@ def _rule_ids() -> dict[str, str]:
         add(node_id, "negative-log")
     pinned = json.loads((MANIFESTS / "name_pinned.json").read_text())
     for node_id in pinned["ids"]:
-        add(node_id, "name-pinned")
+        add(moves.to_baseline(node_id), "name-pinned")
     return chosen
 
 

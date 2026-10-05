@@ -18,6 +18,7 @@ from tests._gates import (
     fingerprint,
     inventory,
     ledger,
+    moves,
     must_keep,
     name_pinned,
     negative_logs,
@@ -103,6 +104,10 @@ def test_a_global_declaration_reaches_the_module_level_helper() -> None:
     assert rejected, evidence
 
 
+def test_the_moves_map_names_only_tests_that_moved() -> None:
+    assert moves.problems() == []
+
+
 def test_a_rename_leaves_a_name_the_function_binds_itself(monkeypatch: pytest.MonkeyPatch) -> None:
     source = (
         "def helper():\n    return 1\n"
@@ -124,7 +129,7 @@ def test_a_rename_leaves_a_name_the_function_binds_itself(monkeypatch: pytest.Mo
 
 def test_every_override_names_a_live_site_and_says_why() -> None:
     sites = json.loads(inventory.OVERRIDES_PATH.read_text())["sites"]
-    files = {site.split("::", 1)[0] for site in sites}
+    files = {moves.from_baseline(site.split("::", 1)[0]) for site in sites}
 
     assert all(entry["note"] for entry in sites.values())
     assert all((ROOT / path).is_file() for path in files)

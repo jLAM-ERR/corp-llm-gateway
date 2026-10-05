@@ -6,7 +6,8 @@ reaches that themselves check something, its case data (parametrize tables, loop
 iterables), its fixtures and helpers, and one hash over the normalised executable body
 of the test plus every helper, fixture, class and module constant it reaches
 transitively (docstrings and comments dropped, repo paths canonicalised, ``tests.*``
-import paths folded, approved renames applied).
+import paths folded, approved renames applied). Keyed by the baseline node id
+(``moves.to_baseline``), so a moved test keeps its entry.
 
 Beside it, the external-dependency manifest: every repo file a test reaches outside the
 Python call graph (a script run by ``subprocess``, a template, a config it reads, a
@@ -32,6 +33,8 @@ from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from typing import Any, NamedTuple
+
+from tests._gates import moves
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ROOT / "tests"
@@ -1133,7 +1136,7 @@ class ExternalScan:
 
 
 def _site(module: Module, qual: str, index: int, what: str) -> str:
-    return f"{module.rel}::{qual}#{what}{index}"
+    return f"{moves.to_baseline(f'{module.rel}::{qual}')}#{what}{index}"
 
 
 @cache
@@ -1236,7 +1239,8 @@ def collect(items: Iterable[TestItem]) -> tuple[dict[str, Any], dict[str, Any]]:
     unresolved: set[str] = set()
     scans: dict[tuple[str, str, int], tuple[ast.AST, ExternalScan]] = {}
     for module, qual, node, cls in items:
-        node_id = f"{module.rel}::{qual}"
+        # Keyed (and so sharded) by the baseline id: a moved test keeps its line.
+        node_id = moves.to_baseline(f"{module.rel}::{qual}")
         entry, closure = inventory_entry(module, node, cls)
         checks[node_id] = entry
         deps: set[str] = set()

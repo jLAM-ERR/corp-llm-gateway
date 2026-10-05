@@ -6,6 +6,9 @@ taking ``log_text`` — and attributes it to the test that runs it (directly or 
 helper). Discovery only: the reviewed ``class`` of each site (``security``, ``behaviour``,
 ``not-a-log-check``) lives in the manifest, and a site with no review fails ``--check``.
 
+``owner`` is the baseline node id (``moves.to_baseline``), so a move keeps a site's review;
+``site`` (``file:line``) is where the check is now.
+
 ``python -m tests._gates.negative_logs --write|--check``
 """
 
@@ -20,6 +23,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from tests._gates import moves
 from tests._gates.inventory import build as build_inventory
 from tests._gates.inventory import modules
 
@@ -102,7 +106,7 @@ def sites() -> list[dict[str, Any]]:
                     found.append(
                         {
                             "site": f"{module.rel}:{sub.lineno}",
-                            "owner": f"{module.rel}::{qual}",
+                            "owner": moves.to_baseline(f"{module.rel}::{qual}"),
                             "check": ast.unparse(sub.test)[:200],
                         }
                     )
