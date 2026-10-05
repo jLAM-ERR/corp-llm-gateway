@@ -154,7 +154,7 @@
   },
   "tests/_gates/test_suite_gates.py::test_the_name_pinned_index_is_consistent": {
    "files": {
-    "tests/litellm_hook/test_acceptance_matrix.py": "0f4d24f2c019fe55c24c68f93399ce07"
+    "tests/litellm_hook/test_acceptance_matrix.py": "50c68017129fb731a8cd8bdbbcb84b5d"
    },
    "programs": [
     "git"
@@ -3186,8 +3186,8 @@
   "tests/docs/test_docs_pins.py::test_documented_route_counts_match_the_table": {
    "files": {
     "CLAUDE.md": "a824cc521ec46b6673c750247854b3e3",
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810",
-    "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9",
+    "docs/security.ru.md": "1830495d2aed75794dd52975d0fdc477"
    },
    "programs": []
   },
@@ -3215,8 +3215,8 @@
     "docs/extending.md": "527bd42e07e19c7844865357f7918080",
     "docs/extending.ru.md": "65f8fc16398383b150ab9993d40e9688",
     "docs/ops": "dir:c923c30d0e242f0a4c656cb14f17",
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810",
-    "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9",
+    "docs/security.ru.md": "1830495d2aed75794dd52975d0fdc477"
    },
    "programs": []
   },
@@ -3230,14 +3230,14 @@
     "docs/extending.md": "527bd42e07e19c7844865357f7918080",
     "docs/extending.ru.md": "65f8fc16398383b150ab9993d40e9688",
     "docs/ops": "dir:c923c30d0e242f0a4c656cb14f17",
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810",
-    "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9",
+    "docs/security.ru.md": "1830495d2aed75794dd52975d0fdc477"
    },
    "programs": []
   },
   "tests/docs/test_docs_pins.py::test_every_issuance_code_the_route_can_answer_is_in_the_security_doc": {
    "files": {
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9"
    },
    "programs": []
   },
@@ -3251,15 +3251,15 @@
    "files": {
     "docs/ops/capacity.md": "8c987ce4d2994b9f5d6941c27b886a8a",
     "docs/ops/capacity.ru.md": "b940df2dc737ba35deb3e43a927f3db0",
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810",
-    "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9",
+    "docs/security.ru.md": "1830495d2aed75794dd52975d0fdc477"
    },
    "programs": []
   },
   "tests/docs/test_docs_pins.py::test_the_invariant_table_has_the_same_rows_in_both_languages": {
    "files": {
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810",
-    "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9",
+    "docs/security.ru.md": "1830495d2aed75794dd52975d0fdc477"
    },
    "programs": []
   },
@@ -3271,15 +3271,15 @@
   },
   "tests/docs/test_docs_pins.py::test_the_known_gaps_table_has_the_same_rows_in_both_languages": {
    "files": {
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810",
-    "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9",
+    "docs/security.ru.md": "1830495d2aed75794dd52975d0fdc477"
    },
    "programs": []
   },
   "tests/docs/test_docs_pins.py::test_the_litellm_section_has_one_row_per_hazard_of_the_acceptance_matrix": {
    "files": {
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810",
-    "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9",
+    "docs/security.ru.md": "1830495d2aed75794dd52975d0fdc477"
    },
    "programs": []
   },
@@ -3291,8 +3291,8 @@
   },
   "tests/docs/test_docs_pins.py::test_the_route_gate_section_has_the_same_subsections_in_both_languages": {
    "files": {
-    "docs/security.md": "f9355e78204245880d4dbc78082ea810",
-    "docs/security.ru.md": "71c602a43cca64297680d99ba536f8d4"
+    "docs/security.md": "24b8adbe64d4d98e1264274fd2ed28c9",
+    "docs/security.ru.md": "1830495d2aed75794dd52975d0fdc477"
    },
    "programs": []
   },

@@ -31,7 +31,7 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payloa
 
 from corp_llm_gateway import litellm_hook
 from tests.litellm_hook._dispatch_fixtures import DispatchHarness, StubUpstream, until
-from tests.litellm_hook.test_hazard18_corp_token_snapshot import (
+from tests.litellm_hook.test_corp_token_never_reaches_logging_surfaces import (
     CORP_TOKEN,
     _guardrail,
     token_sites,

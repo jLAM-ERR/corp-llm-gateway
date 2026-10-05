@@ -60,10 +60,11 @@ from tests.litellm_hook._dispatch_fixtures import (
     serialize,
     until,
 )
-from tests.litellm_hook.test_hazard18_corp_token_snapshot import token_sites
+from tests.litellm_hook.test_corp_token_never_reaches_logging_surfaces import token_sites
 
 ROUTES = ["chat", "messages", "responses"]
-# How a request that passed our pre-call ends (as in test_hazard18_corp_token_snapshot).
+# How a request that passed our pre-call ends (as in
+# test_corp_token_never_reaches_logging_surfaces).
 OUTCOMES: dict[str, tuple[int | None, dict[str, Any]]] = {
     "success": (None, {}),
     "provider-error": (400, {}),
