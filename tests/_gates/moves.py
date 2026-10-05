@@ -11,7 +11,9 @@ as they were:
   another module or renamed. ``ids`` wins over ``files``.
 
 A function-level id is ``path::name`` or ``path::Class::name``, never with a parametrize
-suffix: the suffix is carried over verbatim, so a move PR cannot re-parametrise.
+suffix, so a move PR cannot re-parametrise. Inside a suffix (a test parametrised over cited
+test ids, like the acceptance matrix) every ``ids`` key and ``files`` key is translated too;
+nothing else in it changes.
 
 ``python -m tests._gates.moves --check``
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from functools import cache
@@ -69,6 +72,34 @@ def to_baseline_path(path: str) -> str:
     return load().files.get(path, path)
 
 
+# Keyed by object identity; each value holds its Moves, so the id cannot be reused by a
+# reloaded map while the entry lives.
+_PATTERNS: dict[int, tuple[Moves, re.Pattern[str] | None]] = {}
+
+
+def _pattern(moves: Moves) -> re.Pattern[str] | None:
+    """Every ``ids`` and ``files`` key as a whole token: longest first, ``ids`` before
+    ``files`` at equal length; a key is never matched inside a longer name or path."""
+    cached = _PATTERNS.get(id(moves))
+    if cached is None or cached[0] is not moves:
+        keys = sorted(
+            [(k, 0) for k in moves.ids] + [(k, 1) for k in moves.files],
+            key=lambda item: (-len(item[0]), item[1]),
+        )
+        alternatives = "|".join(re.escape(k) for k, _ in keys)
+        compiled = re.compile(rf"(?<![\w./])(?:{alternatives})(?!\w)") if keys else None
+        cached = _PATTERNS[id(moves)] = (moves, compiled)
+    return cached[1]
+
+
+def _param(moves: Moves, param: str) -> str:
+    """The parametrize suffix with every moved id and module path in it translated."""
+    pattern = _pattern(moves) if param else None
+    if pattern is None:
+        return param
+    return pattern.sub(lambda m: moves.ids.get(m.group(0)) or moves.files[m.group(0)], param)
+
+
 def to_baseline(node_id: str) -> str:
     """The baseline id of a current node id (a bare path is a module-level entry)."""
     moves = load()
@@ -78,12 +109,11 @@ def to_baseline(node_id: str) -> str:
     if not sep:
         return moves.files.get(path, path)
     function, param = _cut(rest)
+    param = _param(moves, param)
     moved = moves.ids.get(f"{path}::{function}")
     if moved is not None:
         return moved + param
-    if path in moves.files:
-        return f"{moves.files[path]}::{rest}"
-    return node_id
+    return f"{moves.files.get(path, path)}::{function}{param}"
 
 
 # Keyed by object identity; each value holds its Moves, so the id cannot be reused by a
@@ -111,13 +141,12 @@ def from_baseline(node_id: str) -> str:
     if not sep:
         return back.files.get(path, path)
     function, param = _cut(rest)
+    param = _param(back, param)
     candidate = back.ids.get(f"{path}::{function}")
     if candidate is not None:
         candidate += param
-    elif path in back.files:
-        candidate = f"{back.files[path]}::{rest}"
     else:
-        return node_id
+        candidate = f"{back.files.get(path, path)}::{function}{param}"
     return candidate if to_baseline(candidate) == node_id else node_id
 
 

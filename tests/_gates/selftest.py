@@ -27,14 +27,16 @@ test that lands on the NEVER-field tests' old lines is not one of them; (q) a te
 a security negative check through a helper stays in ``security_node_ids`` when it moves by
 ``ids``, with its helper or without it; (r) a security helper moved into a module none of
 its tests lives in makes ``negative_logs --check`` / ``--write`` refuse while the test is
-must-keep, and only then. A move map that sends two current tests to one
+must-keep, and only then; (s) a test parametrised over cited test ids and module paths
+keeps its baseline ids when the cited tests move (ledger, ``must_keep.expand``), and a
+parameter the map does not name stays as it is. A move map that sends two current tests to one
 baseline id stops every gate (o).
 
 Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
 stops being collected, a lost parametrize case, a setup-time skip, a changed
 collection-skip reason.
 
-``python -m tests._gates.selftest inventory|ledger`` (``inventory`` runs a-r)
+``python -m tests._gates.selftest inventory|ledger`` (``inventory`` runs a-s)
 """
 
 from __future__ import annotations
@@ -955,6 +957,97 @@ def security_helper_moved_away() -> tuple[bool, str]:
     ]
 
 
+S_MATRIX = "tests/_gates/test_selftest_s_matrix.py::test_cites"
+S_FILE = ("tests/_gates/test_selftest_s_old.py", "tests/_gates/test_selftest_s_new.py")
+S_TEST = (
+    "tests/_gates/test_selftest_s_old2.py::test_old_name",
+    "tests/_gates/test_selftest_s_other.py::test_new_name",
+)
+S_UNMAPPED = "tests/_gates/test_selftest_s_unmapped.py::test_y"
+# (baseline parameter, current parameter): what a matrix-style test is parametrised over.
+S_PARAMS = (
+    (f"[{S_FILE[0]}::test_kept]", f"[{S_FILE[1]}::test_kept]"),
+    (f"[{S_TEST[0]}]", f"[{S_TEST[1]}]"),
+    (f"[{S_FILE[0]}]", f"[{S_FILE[1]}]"),
+    (f"[{S_TEST[0]}-{S_FILE[0]}::test_kept]", f"[{S_TEST[1]}-{S_FILE[1]}::test_kept]"),
+    # Not in the map, or only a longer name / path that starts with a key: as it is.
+    (f"[{S_UNMAPPED}]", f"[{S_UNMAPPED}]"),
+    (f"[{S_TEST[1]}_extra]", f"[{S_TEST[1]}_extra]"),
+    (f"[{S_FILE[1]}x::test_kept]", f"[{S_FILE[1]}x::test_kept]"),
+)
+
+
+def _matrix_runs(which: int) -> dict[str, dict[str, Any]]:
+    ids = [f"{S_MATRIX}{pair[which]}" for pair in S_PARAMS]
+    run = {
+        "outcomes": dict.fromkeys(ids, "passed"),
+        "collection_skipped": {},
+        "collection_errors": {},
+    }
+    return dict.fromkeys(ledger.ENVS, run)
+
+
+def moved_parameters() -> tuple[bool, str]:
+    """A test parametrised over cited test ids and module paths: with the map, ids and paths
+    inside the suffix translate to their baseline (the ledger compares clean, a rewrite is
+    byte-identical, ``must_keep.expand`` yields the baseline ids, ``from_baseline`` comes
+    back); without it, ``missing id`` / ``new id``. A parameter the map does not name, or
+    one that only starts with a key, stays as it is."""
+    the_map = {"files": {S_FILE[1]: S_FILE[0]}, "ids": {S_TEST[1]: S_TEST[0]}}
+    baseline_ids = sorted(f"{S_MATRIX}{old}" for old, _ in S_PARAMS)
+    found: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        recorded, rewritten = Path(tmp) / "recorded", Path(tmp) / "rewritten"
+        recorded.mkdir()
+        rewritten.mkdir()
+        with _world([], ledgers=recorded):
+            ledger.write(_matrix_runs(0))
+        for label, mapping in (("mapped", the_map), ("unmapped", {})):
+            with _world([], **mapping, ledgers=recorded):
+                found[f"{label} compare"] = [
+                    p for env in ledger.ENVS for p in ledger.compare(env, _matrix_runs(1)[env])
+                ]
+                found[f"{label} back"] = [
+                    moves.from_baseline(f"{S_MATRIX}{old}") for old, _ in S_PARAMS
+                ]
+            with _world([], **mapping, ledgers=rewritten):
+                ledger.write(_matrix_runs(1))
+                found[f"{label} expand"] = must_keep.expand({S_MATRIX: "selftest"})
+            found[f"{label} rewrite identical"] = all(
+                (recorded / f"{env}.json").read_bytes() == (rewritten / f"{env}.json").read_bytes()
+                for env in ledger.ENVS
+            )
+    unmet = []
+    if found["mapped compare"]:
+        unmet.append(f"mapped compare: {found['mapped compare'][:2]}")
+    if not found["mapped rewrite identical"]:
+        unmet.append("mapped rewrite differs")
+    if found["mapped expand"] != sorted([*baseline_ids, S_MATRIX]):
+        unmet.append(f"mapped expand: {found['mapped expand'][:3]}")
+    if found["mapped back"] != [f"{S_MATRIX}{new}" for _, new in S_PARAMS]:
+        unmet.append(f"mapped from_baseline: {found['mapped back'][:3]}")
+    moved = [i for i, (old, new) in enumerate(S_PARAMS) if old != new]
+    lines = found["unmapped compare"]
+    for index in moved:
+        old, new = S_PARAMS[index]
+        if not any(
+            f"missing id (deselected, lost or not collected): {S_MATRIX}{old}" in line
+            for line in lines
+        ):
+            unmet.append(f"unmapped: no missing id for {old}")
+        if not any(
+            f"new id not in the expected outcomes: {S_MATRIX}{new}" in line for line in lines
+        ):
+            unmet.append(f"unmapped: no new id for {new}")
+    if unmet:
+        return False, f"not as expected: {unmet}"[:240]
+    return True, (
+        f"mapped: {len(moved)} suffixes translated, compare clean, rewrite identical, expand "
+        f"baseline; {len(S_PARAMS) - len(moved)} unmapped suffixes kept; unmapped: "
+        f"{len(lines)} missing/new lines"
+    )[:240]
+
+
 def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool, str]:
     path = ROOT / mutation.path
     original = path.read_text()
@@ -1136,6 +1229,8 @@ def main(argv: list[str] | None = None) -> int:
         results.append(
             ("r: a security helper moved away from its must-keep test", rejected, evidence)
         )
+        rejected, evidence = moved_parameters()
+        results.append(("s: moved ids and paths inside a parametrize suffix", rejected, evidence))
     else:
         rejected, evidence = missing_module()
         results.append(("newly missing module", rejected, evidence))

@@ -140,6 +140,12 @@ def test_a_security_helper_moved_away_from_its_must_keep_test_is_refused() -> No
     assert rejected, evidence
 
 
+def test_moved_ids_inside_a_parametrize_suffix_keep_their_baseline_id() -> None:
+    rejected, evidence = selftest.moved_parameters()
+
+    assert rejected, evidence
+
+
 def test_the_moves_map_names_only_tests_that_moved() -> None:
     assert moves.problems() == []
 

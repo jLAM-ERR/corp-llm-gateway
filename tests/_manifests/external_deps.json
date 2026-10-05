@@ -114,6 +114,12 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_moved_ids_inside_a_parametrize_suffix_keep_their_baseline_id": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_the_check_inventory_matches_the_baseline": {
    "files": {},
    "programs": [

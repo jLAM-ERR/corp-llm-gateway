@@ -110,6 +110,17 @@ current -> baseline:
   and `not_applicable.json`, and the `owner` of its `negative_log_checks.json` sites.
 - `ledger check --scope` takes current paths: a test is in scope where it is now.
 
+A parametrize suffix can name tests too: the acceptance matrix's
+`test_every_listed_test_exists_and_runs[tests/litellm_hook/test_x.py::test_y]` is
+parametrised over the ids it cites. So `to_baseline` also translates inside the `[...]`:
+every `ids` key there becomes its baseline id and every `files` key its baseline path.
+Longest key first, `ids` before `files`, whole tokens only: a key with a letter, digit or
+`_` right after it, or with one of those, `.` or `/` right before it, is left alone.
+Nothing else in the suffix changes, and the map itself stays function-level. A parameter
+that only contains a path, such as a test parametrised over fixture files, changes only
+when that path is a `files` key, that is, a moved test module. Two run ids that translate
+to one baseline id still stop the gates.
+
 The gate (`python -m tests._gates.moves --check`, `scripts/test-gates.sh`, and every
 `pytest tests/` run) refuses:
 
@@ -343,6 +354,7 @@ named test, so a column the gate stops filling fails it. `python -m tests._gates
 | p | a plain test moved into `tests/route_gate/`, a must-keep one moved out of it (one renamed), a name-pinned id cited at its new place, a test moved onto `audit/test_logger.py:135-163` | must-keep: the same ids as before the move, at their baseline ids |
 | q | a test running `_assert_clean(log_text)` moved by `ids`, with the helper, and without it (imported from where it stayed) | negative logs: the same `security_node_ids` |
 | r | a security helper moved into a non-`test_` module none of its tests lives in, its test must-keep, then not | negative logs: `--check` and `--write` refuse by id and `--write` writes nothing; no refusal when the test is not must-keep |
+| s | a test parametrised over a moved test id, a moved module's path and ids, an unmapped id, and names / paths that only start with a key | with the map: expected outcomes compare clean, a rewrite is byte-identical, `must_keep.expand` gives the baseline ids; without it `missing id` / `new id` for the 4 moved suffixes; the other 3 never change |
 | L1 | rename `team_config/test_store.py` so it is not collected | expected outcomes: missing ids |
 | L2 | drop the `redis` param of `storage/test_mapping_store.py`'s `store` fixture | expected outcomes: missing `[redis]` ids |
 | L3 | an autouse fixture that skips at setup in `team_config/test_store.py` | expected outcomes: `passed` → `skipped:…` |
@@ -350,6 +362,6 @@ named test, so a column the gate stops filling fails it. `python -m tests._gates
 
 All eleven were rejected on the baseline tree (2026-10-04); the same checks on the
 unmutated tree pass (the control). Cases h-l (function-local imports) are listed in the
-`tests/_gates/selftest.py` docstring. Cases m-r work on synthetic modules and ledgers, run
+`tests/_gates/selftest.py` docstring. Cases m-s work on synthetic modules and ledgers, run
 with `selftest inventory`, and each one fails when the translation or refusal it covers is
 taken out of its gate (2026-10-05).
