@@ -46,33 +46,29 @@ def _restore_pkg_logger():
 # ── required-but-missing config → fail FAST at build (not lazily) ─────────────
 
 
-def test_bearer_provider_without_token_fails_fast_at_build(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("provider", "error", "match"),
+    [
+        # bearer auth needs CORP_LLM_BEARER_TOKEN; missing it must abort at
+        # construction, not on the first upstream request.
+        pytest.param(
+            "bearer", RuntimeError, "CORP_LLM_BEARER_TOKEN", id="bearer_provider_without_token"
+        ),
+        pytest.param(
+            "totally-made-up", ValueError, "CORP_LLM_AUTH_PROVIDER", id="unknown_auth_provider"
+        ),
+        pytest.param(
+            "oidc", RuntimeError, "CORP_LLM_OIDC_ISSUER", id="oidc_provider_missing_subkeys"
+        ),
+    ],
+)
+def test_auth_provider_misconfig_fails_fast_at_build(
+    monkeypatch: pytest.MonkeyPatch, provider: str, error: type[Exception], match: str
 ) -> None:
-    # bearer auth needs CORP_LLM_BEARER_TOKEN; missing it must abort at
-    # construction, not on the first upstream request.
-    monkeypatch.setenv("CORP_LLM_AUTH_PROVIDER", "bearer")
+    monkeypatch.setenv("CORP_LLM_AUTH_PROVIDER", provider)
     config.reset_cache()
 
-    with pytest.raises(RuntimeError, match="CORP_LLM_BEARER_TOKEN"):
-        bootstrap.build_guardrail()
-
-
-def test_unknown_auth_provider_fails_fast_at_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CORP_LLM_AUTH_PROVIDER", "totally-made-up")
-    config.reset_cache()
-
-    with pytest.raises(ValueError, match="CORP_LLM_AUTH_PROVIDER"):
-        bootstrap.build_guardrail()
-
-
-def test_oidc_provider_missing_subkeys_fails_fast_at_build(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("CORP_LLM_AUTH_PROVIDER", "oidc")
-    config.reset_cache()
-
-    with pytest.raises(RuntimeError, match="CORP_LLM_OIDC_ISSUER"):
+    with pytest.raises(error, match=match):
         bootstrap.build_guardrail()
 
 
