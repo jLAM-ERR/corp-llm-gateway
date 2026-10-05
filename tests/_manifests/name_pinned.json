@@ -38,14 +38,36 @@
    "docs/security.ru.md:1221",
    "tests/litellm_hook/test_acceptance_matrix.py:56"
   ],
-  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_after_start_failure_tears_the_upstream_down": [
-   "docs/security.md:1331"
+  "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_a_bearer_of_any_other_shape_is_logged_raw": [
+   "tests/litellm_hook/test_acceptance_matrix.py:195"
   ],
-  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_cancellation_resistant_requests_leave_nothing_behind": [
-   "docs/security.md:1324"
+  "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_a_shipped_bearer_shape_is_logged_only_hashed": [
+   "docs/security.md:1300",
+   "docs/security.ru.md:1262",
+   "tests/litellm_hook/test_acceptance_matrix.py:193"
   ],
-  "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_does_not_depend_on_cache_b": [
-   "docs/security.md:1325"
+  "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_an_anthropic_x_api_key_is_logged_only_hashed": [
+   "tests/litellm_hook/test_acceptance_matrix.py:194"
+  ],
+  "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_the_anthropic_bridge_token_sits_raw_in_litellms_log_kwargs": [
+   "tests/litellm_hook/test_acceptance_matrix.py:200"
+  ],
+  "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_the_chatgpt_bridge_bearer_sits_raw_in_litellms_log_kwargs": [
+   "docs/security.md:1301",
+   "docs/security.ru.md:1263",
+   "tests/litellm_hook/test_acceptance_matrix.py:199"
+  ],
+  "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_the_sites_are_where_litellm_keeps_any_provider_key": [
+   "tests/litellm_hook/test_acceptance_matrix.py:201"
+  ],
+  "tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py::test_a_refused_request_hands_no_failure_hook_the_corp_token": [
+   "tests/litellm_hook/test_acceptance_matrix.py:185"
+  ],
+  "tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py::test_no_logging_surface_holds_the_corp_token": [
+   "tests/litellm_hook/test_acceptance_matrix.py:183"
+  ],
+  "tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py::test_the_byok_authorization_survives_where_the_corp_token_is_dropped": [
+   "tests/litellm_hook/test_acceptance_matrix.py:184"
   ],
   "tests/litellm_hook/test_fail_open_probes.py::test_m4_status_codes_through_proxy": [
    "docs/security.md:1280",
@@ -71,6 +93,21 @@
    "docs/security.md:1262",
    "docs/security.ru.md:1228",
    "tests/litellm_hook/test_acceptance_matrix.py:89"
+  ],
+  "tests/litellm_hook/test_failure_hook_request_data_on_refusal.py::test_a_dlp_rejection_hands_the_failure_hook_the_sanitised_request": [
+   "tests/litellm_hook/test_acceptance_matrix.py:174"
+  ],
+  "tests/litellm_hook/test_failure_hook_request_data_on_refusal.py::test_a_stage0_rejection_hands_the_failure_hook_the_original": [
+   "tests/litellm_hook/test_acceptance_matrix.py:175"
+  ],
+  "tests/litellm_hook/test_failure_hook_request_data_on_refusal.py::test_no_callback_of_ours_overrides_the_failure_hook": [
+   "tests/litellm_hook/test_acceptance_matrix.py:178"
+  ],
+  "tests/litellm_hook/test_failure_hook_request_data_on_refusal.py::test_the_body_snapshot_gains_no_key_the_request_added": [
+   "tests/litellm_hook/test_acceptance_matrix.py:177"
+  ],
+  "tests/litellm_hook/test_failure_hook_request_data_on_refusal.py::test_the_body_snapshot_takes_the_rewritten_content_keys": [
+   "tests/litellm_hook/test_acceptance_matrix.py:176"
   ],
   "tests/litellm_hook/test_guardrail_information.py::test_a_raising_writer_is_logged_by_type_and_leaves_no_entry": [
    "docs/security.md:1284",
@@ -108,60 +145,14 @@
   "tests/litellm_hook/test_guardrails_only_dispatch.py::test_without_the_attribute_the_scan_skips_our_pre_call": [
    "tests/litellm_hook/test_acceptance_matrix.py:51"
   ],
-  "tests/litellm_hook/test_hazard17_logging_snapshot.py::test_a_failure_before_the_provider_call_logs_the_sanitised_input": [
+  "tests/litellm_hook/test_logging_snapshot_is_content_free.py::test_a_failure_before_the_provider_call_logs_the_sanitised_input": [
    "tests/litellm_hook/test_acceptance_matrix.py:168"
   ],
-  "tests/litellm_hook/test_hazard17_logging_snapshot.py::test_chat_and_messages_logging_payload_stays_content_free": [
+  "tests/litellm_hook/test_logging_snapshot_is_content_free.py::test_chat_and_messages_logging_payload_stays_content_free": [
    "tests/litellm_hook/test_acceptance_matrix.py:167"
   ],
-  "tests/litellm_hook/test_hazard17_logging_snapshot.py::test_responses_logging_payload_holds_placeholders_only": [
+  "tests/litellm_hook/test_logging_snapshot_is_content_free.py::test_responses_logging_payload_holds_placeholders_only": [
    "tests/litellm_hook/test_acceptance_matrix.py:166"
-  ],
-  "tests/litellm_hook/test_hazard17b_failure_hook_request_data.py::test_a_dlp_rejection_hands_the_failure_hook_the_sanitised_request": [
-   "tests/litellm_hook/test_acceptance_matrix.py:174"
-  ],
-  "tests/litellm_hook/test_hazard17b_failure_hook_request_data.py::test_a_stage0_rejection_hands_the_failure_hook_the_original": [
-   "tests/litellm_hook/test_acceptance_matrix.py:175"
-  ],
-  "tests/litellm_hook/test_hazard17b_failure_hook_request_data.py::test_no_callback_of_ours_overrides_the_failure_hook": [
-   "tests/litellm_hook/test_acceptance_matrix.py:178"
-  ],
-  "tests/litellm_hook/test_hazard17b_failure_hook_request_data.py::test_the_body_snapshot_gains_no_key_the_request_added": [
-   "tests/litellm_hook/test_acceptance_matrix.py:177"
-  ],
-  "tests/litellm_hook/test_hazard17b_failure_hook_request_data.py::test_the_body_snapshot_takes_the_rewritten_content_keys": [
-   "tests/litellm_hook/test_acceptance_matrix.py:176"
-  ],
-  "tests/litellm_hook/test_hazard18_corp_token_snapshot.py::test_a_refused_request_hands_no_failure_hook_the_corp_token": [
-   "tests/litellm_hook/test_acceptance_matrix.py:185"
-  ],
-  "tests/litellm_hook/test_hazard18_corp_token_snapshot.py::test_no_logging_surface_holds_the_corp_token": [
-   "tests/litellm_hook/test_acceptance_matrix.py:183"
-  ],
-  "tests/litellm_hook/test_hazard18_corp_token_snapshot.py::test_the_byok_authorization_survives_where_the_corp_token_is_dropped": [
-   "tests/litellm_hook/test_acceptance_matrix.py:184"
-  ],
-  "tests/litellm_hook/test_hazard19_bearer_hashing.py::test_a_bearer_of_any_other_shape_is_logged_raw": [
-   "tests/litellm_hook/test_acceptance_matrix.py:195"
-  ],
-  "tests/litellm_hook/test_hazard19_bearer_hashing.py::test_a_shipped_bearer_shape_is_logged_only_hashed": [
-   "docs/security.md:1300",
-   "docs/security.ru.md:1262",
-   "tests/litellm_hook/test_acceptance_matrix.py:193"
-  ],
-  "tests/litellm_hook/test_hazard19_bearer_hashing.py::test_an_anthropic_x_api_key_is_logged_only_hashed": [
-   "tests/litellm_hook/test_acceptance_matrix.py:194"
-  ],
-  "tests/litellm_hook/test_hazard19_bearer_hashing.py::test_the_anthropic_bridge_token_sits_raw_in_litellms_log_kwargs": [
-   "tests/litellm_hook/test_acceptance_matrix.py:200"
-  ],
-  "tests/litellm_hook/test_hazard19_bearer_hashing.py::test_the_chatgpt_bridge_bearer_sits_raw_in_litellms_log_kwargs": [
-   "docs/security.md:1301",
-   "docs/security.ru.md:1263",
-   "tests/litellm_hook/test_acceptance_matrix.py:199"
-  ],
-  "tests/litellm_hook/test_hazard19_bearer_hashing.py::test_the_sites_are_where_litellm_keeps_any_provider_key": [
-   "tests/litellm_hook/test_acceptance_matrix.py:201"
   ],
   "tests/litellm_hook/test_logging_surfaces.py::test_a_custom_guardrail_turns_per_chunk_hooks_on": [
    "tests/litellm_hook/test_acceptance_matrix.py:96"
@@ -275,6 +266,15 @@
   ],
   "tests/route_gate/test_body_policies.py::test_two_content_types_are_not_json": [
    "tests/litellm_hook/test_acceptance_matrix.py:229"
+  ],
+  "tests/route_gate/test_desanitize_middleware.py::test_after_start_failure_tears_the_upstream_down": [
+   "docs/security.md:1331"
+  ],
+  "tests/route_gate/test_desanitize_middleware.py::test_cancellation_resistant_requests_leave_nothing_behind": [
+   "docs/security.md:1324"
+  ],
+  "tests/route_gate/test_desanitize_middleware.py::test_restoration_does_not_depend_on_cache_b": [
+   "docs/security.md:1325"
   ],
   "tests/route_gate/test_litellm_route_guard.py::test_every_collected_route_is_listed": [
    "tests/litellm_hook/test_acceptance_matrix.py:224"
@@ -450,7 +450,7 @@
    "compose/nginx/README.md:19"
   ],
   "tests/integration/test_anthropic_oauth_outbound.py": [
-   "docs/ops/upgrade.md:196",
+   "docs/ops/upgrade.md:197",
    "docs/security.md:650",
    "docs/security.ru.md:604"
   ],
@@ -474,7 +474,7 @@
    "docs/security.ru.md:918"
   ],
   "tests/invariants/test_no_originals_leak.py": [
-   "CLAUDE.md:233",
+   "CLAUDE.md:239",
    "docs/harness-integration.md:134",
    "docs/harness-integration.ru.md:119",
    "docs/ops/runbook.md:292",
@@ -499,6 +499,20 @@
    "docs/security.ru.md:1221",
    "docs/security.ru.md:1234"
   ],
+  "tests/litellm_hook/test_bearer_is_hashed_before_logging.py": [
+   "docs/security.md:532",
+   "docs/security.md:1300",
+   "docs/security.md:1301",
+   "docs/security.ru.md:510",
+   "docs/security.ru.md:1262",
+   "docs/security.ru.md:1263"
+  ],
+  "tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py": [
+   "docs/security.md:484",
+   "docs/security.md:1299",
+   "docs/security.ru.md:461",
+   "docs/security.ru.md:1261"
+  ],
   "tests/litellm_hook/test_fail_open_probes.py": [
    "docs/security.md:1262",
    "docs/security.md:1278",
@@ -507,6 +521,10 @@
    "docs/security.ru.md:1228",
    "docs/security.ru.md:1240",
    "docs/security.ru.md:1242"
+  ],
+  "tests/litellm_hook/test_failure_hook_request_data_on_refusal.py": [
+   "docs/security.md:1298",
+   "docs/security.ru.md:1260"
   ],
   "tests/litellm_hook/test_guardrail_information.py": [
    "docs/audit-schema.md:153",
@@ -520,32 +538,14 @@
    "docs/security.md:1279",
    "docs/security.ru.md:1241"
   ],
-  "tests/litellm_hook/test_hazard17_logging_snapshot.py": [
-   "docs/security.md:1297",
-   "docs/security.ru.md:1259"
-  ],
-  "tests/litellm_hook/test_hazard17b_failure_hook_request_data.py": [
-   "docs/security.md:1298",
-   "docs/security.ru.md:1260"
-  ],
-  "tests/litellm_hook/test_hazard18_corp_token_snapshot.py": [
-   "docs/security.md:484",
-   "docs/security.md:1299",
-   "docs/security.ru.md:461",
-   "docs/security.ru.md:1261"
-  ],
-  "tests/litellm_hook/test_hazard19_bearer_hashing.py": [
-   "docs/security.md:532",
-   "docs/security.md:1300",
-   "docs/security.md:1301",
-   "docs/security.ru.md:510",
-   "docs/security.ru.md:1262",
-   "docs/security.ru.md:1263"
-  ],
   "tests/litellm_hook/test_litellm_route_assumptions.py": [
-   "docs/ops/upgrade.md:193",
+   "docs/ops/upgrade.md:194",
    "docs/security.md:690",
    "docs/security.ru.md:645"
+  ],
+  "tests/litellm_hook/test_logging_snapshot_is_content_free.py": [
+   "docs/security.md:1297",
+   "docs/security.ru.md:1259"
   ],
   "tests/litellm_hook/test_logging_surfaces.py": [
    "docs/security.md:1277",
@@ -621,7 +621,7 @@
    "docs/security.md:1364"
   ],
   "tests/storage/test_mapping_store.py": [
-   "CLAUDE.md:295"
+   "CLAUDE.md:301"
   ],
   "tests/test_anthropic_oauth_profile.py": [
    "docs/ops/configuration.md:182",
@@ -629,13 +629,13 @@
    "docs/security.ru.md:627"
   ],
   "tests/test_asgi_entrypoint.py": [
-   "CLAUDE.md:196",
+   "CLAUDE.md:202",
    "docs/extending.md:166",
    "docs/security.md:1282",
    "docs/security.md:1288"
   ],
   "tests/test_ci_workflow.py": [
-   "CLAUDE.md:206"
+   "CLAUDE.md:212"
   ],
   "tests/test_desanitize_served_stack.py": [
    "docs/security.md:484",
@@ -665,7 +665,7 @@
   "tests/test_litellm_pin.py": [
    "docs/extending.md:149",
    "docs/ops/upgrade.md:150",
-   "docs/ops/upgrade.md:187"
+   "docs/ops/upgrade.md:188"
   ]
  }
 }
