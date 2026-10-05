@@ -18,6 +18,18 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_a_move_neither_adds_nor_removes_a_must_keep_id": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_moved_test_that_lost_an_assert_is_rejected_despite_the_map": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_a_name_imported_twice_in_one_scope_reaches_both_helpers": {
    "files": {},
    "programs": [
@@ -25,6 +37,12 @@
    ]
   },
   "tests/_gates/test_suite_gates.py::test_a_nested_scope_import_never_hides_a_module_level_helper": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
+  "tests/_gates/test_suite_gates.py::test_a_pure_move_changes_no_manifest_with_the_map_and_fails_without_it": {
    "files": {},
    "programs": [
     "git"
