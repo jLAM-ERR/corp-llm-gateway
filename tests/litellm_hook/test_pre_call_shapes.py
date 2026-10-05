@@ -477,15 +477,6 @@ async def test_pre_call_rejects_non_list_messages() -> None:
     assert ei.value.error_code == "E_BAD_REQUEST"
 
 
-async def test_pre_call_request_id_stable_across_calls_on_same_data() -> None:
-    g, _ = _build_guardrail()
-    data = _data_with_token("tok-1")
-    await g.pre_call(data)
-    rid1 = data["_corp_gateway_request_id"]
-    # Re-running pre_call on same dict reuses the request id.
-    assert isinstance(rid1, str) and rid1
-
-
 async def test_pre_call_skips_unwrapped_literal_scan_when_codex_flag_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

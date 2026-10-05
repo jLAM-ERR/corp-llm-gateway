@@ -1024,6 +1024,60 @@ async def test_case_insensitive_rule_matches_collapse_to_one_configured_token() 
     assert restored == "acme and acme and acme"
 
 
+async def test_user_typed_placeholder_literal_preserved_not_collided(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Security fix: a user-typed [FAMILY_NNN] literal must not collide with a real redaction.
+
+    The real email a@corp.example must be assigned a DIFFERENT token (e.g.
+    [EMAIL_002]), because [EMAIL_001] is already present verbatim in the input.
+    On the reverse pass, [EMAIL_001] is NOT in the mapping, so it stays unchanged
+    in the response (the user's literal is preserved). The real redaction token
+    ([EMAIL_002]) IS in the mapping and restores correctly.
+    """
+    g, _ = _build_guardrail(corp_llm=_corp_llm_email_per_segment())
+    data = _data_with_token(
+        "tok-1", content="My email a@corp.example and the marker [EMAIL_001] in docs"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        out = await g.pre_call(data)
+
+    sanitized = out["messages"][0]["content"]
+
+    # The real email must be redacted to a token OTHER than [EMAIL_001].
+    assert "a@corp.example" not in sanitized, f"email not redacted: {sanitized!r}"
+    real_ph = re.search(r"\[EMAIL_\d+\]", sanitized.replace("[EMAIL_001]", ""))
+    assert real_ph is not None, f"no redaction token found: {sanitized!r}"
+    real_token = real_ph.group(0)
+    assert real_token != "[EMAIL_001]", (
+        "collision: real email got [EMAIL_001] despite user typing it verbatim"
+    )
+
+    # The user's literal "[EMAIL_001]" still appears verbatim in egress.
+    assert "[EMAIL_001]" in sanitized, f"user literal was removed: {sanitized!r}"
+
+    # On post_call_stream: a response with both tokens restores correctly.
+    chunks_in = [{"choices": [{"delta": {"content": f"{real_token} and [EMAIL_001]"}}]}]
+    out_text = ""
+    async for chunk in restore_stream(g, data, _async_iter(chunks_in)):
+        out_text += chunk["choices"][0]["delta"]["content"]
+    # The real token is restored; the user's literal is unchanged (not in mapping).
+    assert "a@corp.example" in out_text, f"real email not restored: {out_text!r}"
+    assert "[EMAIL_001]" in out_text, f"user literal was reversed: {out_text!r}"
+
+    # Breadcrumb: warning was emitted with count=1 and contains NO email content.
+    breadcrumb_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if "input_placeholder_literal_detected" in r.getMessage()
+    ]
+    assert breadcrumb_lines, "breadcrumb warning not emitted"
+    assert "count=1" in breadcrumb_lines[0], f"expected count=1 in: {breadcrumb_lines[0]!r}"
+    assert "a@corp.example" not in breadcrumb_lines[0], "email leaked into breadcrumb log"
+    assert "[EMAIL_001]" not in breadcrumb_lines[0], "literal leaked into breadcrumb log"
+
+
 # ---- Anthropic SSE bytes and str chunks, with their own harness (empty rules) ----
 
 
