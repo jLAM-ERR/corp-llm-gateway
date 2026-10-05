@@ -134,6 +134,12 @@ def test_a_test_moved_with_its_security_helper_stays_a_negative_log_id() -> None
     assert rejected, evidence
 
 
+def test_a_security_helper_moved_away_from_its_must_keep_test_is_refused() -> None:
+    rejected, evidence = selftest.security_helper_moved_away()
+
+    assert rejected, evidence
+
+
 def test_the_moves_map_names_only_tests_that_moved() -> None:
     assert moves.problems() == []
 
@@ -268,6 +274,7 @@ def test_every_negative_log_check_is_reviewed() -> None:
         "not-a-log-check",
     }
     assert recorded["security_node_ids"] == negative_logs.node_ids(recorded)
+    assert negative_logs.lost(recorded["security_node_ids"], recorded) == []
 
 
 def test_the_ledgers_cover_every_test_and_count_its_cases() -> None:

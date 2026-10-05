@@ -25,19 +25,22 @@ passes; (p) must-keep membership survives a move either way: out of a ``STEP2_GL
 directory stays in, into one stays out, a name-pinned id counts at its baseline id, and a
 test that lands on the NEVER-field tests' old lines is not one of them; (q) a test that runs
 a security negative check through a helper stays in ``security_node_ids`` when it moves by
-``ids``, with its helper or without it. A move map that sends two current tests to one
+``ids``, with its helper or without it; (r) a security helper moved into a module none of
+its tests lives in makes ``negative_logs --check`` / ``--write`` refuse while the test is
+must-keep, and only then. A move map that sends two current tests to one
 baseline id stops every gate (o).
 
 Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
 stops being collected, a lost parametrize case, a setup-time skip, a changed
 collection-skip reason.
 
-``python -m tests._gates.selftest inventory|ledger`` (``inventory`` runs a-q)
+``python -m tests._gates.selftest inventory|ledger`` (``inventory`` runs a-r)
 """
 
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import subprocess
@@ -438,6 +441,7 @@ def _world(
     ledgers: Path | None = None,
     committed: list[str] | None = None,
     pinned: list[str] | None = None,
+    negative: Path | None = None,
 ) -> Iterator[None]:
     """Every gate sees only ``mods`` and this move map; when given, the expected outcomes
     in ``ledgers`` (``<env>.json``), this must-keep list and these name-pinned ids. The real
@@ -462,6 +466,8 @@ def _world(
         patches.append((ledger, "expected_path", lambda env: ledgers / f"{env}.json"))
     if committed is not None:
         patches.append((must_keep, "read", lambda: list(committed)))
+    if negative is not None:
+        patches.append((negative_logs, "PATH", negative))
     with tempfile.TemporaryDirectory() as tmp:
         if pinned is not None:
             manifests = Path(tmp)
@@ -888,6 +894,67 @@ def security_helper_move() -> tuple[bool, str]:
     return True, f"{len(Q_WORLDS)} moves, security_node_ids unchanged, e.g. {before}"[:240]
 
 
+R_SUITE = "tests/_gates/test_selftest_r.py"
+# Not a test_*.py module: a shared helper module none of the tests lives in.
+R_FIXTURES = "tests/_gates/selftest_r_fixtures.py"
+R_TEST = f"{R_SUITE}::test_a"
+R_LOST = f"security negative-log id lost while its test is still must-keep: {R_TEST}"
+
+
+def _negative_logs_cli(argv: list[str]) -> tuple[int, str]:
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        code = negative_logs.main(argv)
+    return code, err.getvalue()
+
+
+def security_helper_moved_away() -> tuple[bool, str]:
+    """A security helper moved into a module none of its tests lives in: its test drops out of
+    ``security_node_ids``. While the test is must-keep, ``--check`` and ``--write`` refuse by
+    id and ``--write`` leaves the manifest as it was; a test that is not must-keep drops out
+    with no refusal (review only)."""
+    with _world([_module_at(R_SUITE, Q_HELPER + Q_TEST.format(name="test_a"))]):
+        sites = [
+            {**site, "class": "security", "note": "selftest"} for site in negative_logs.sites()
+        ]
+        before = negative_logs.node_ids({"sites": sites})
+    # The reviewer carried the helper's row to its new owner, class and note kept.
+    moved = [{**site, "owner": f"{R_FIXTURES}::_assert_clean"} for site in sites]
+    current = [
+        _module_at(R_FIXTURES, Q_HELPER),
+        _module_at(
+            R_SUITE,
+            "from tests._gates.selftest_r_fixtures import _assert_clean\n"
+            + Q_TEST.format(name="test_a"),
+        ),
+    ]
+    results: dict[str, tuple[int, str, bool]] = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "negative_log_checks.json"
+        text = json.dumps({"sites": moved, "security_node_ids": before}, indent=1) + "\n"
+        for label, committed in (("must-keep", [R_TEST]), ("not must-keep", [])):
+            for command in ("--check", "--write"):
+                path.write_text(text)
+                with _world(current, committed=committed, negative=path):
+                    code, err = _negative_logs_cli([command])
+                results[f"{label} {command}"] = (code, err, path.read_text() == text)
+    unmet = [
+        f"{key}: exit {code}"
+        for key, (code, err, unchanged) in results.items()
+        if key.startswith("must-keep") and (code == 0 or R_LOST not in err or not unchanged)
+    ]
+    unmet += [
+        f"{key}: exit {code} {err.strip()[:80]}"
+        for key, (code, err, _) in results.items()
+        if key.startswith("not") and (code != 0 or "lost" in err)
+    ]
+    if before != [R_TEST] or unmet:
+        return False, f"baseline ids {before}; not as expected: {unmet}"[:240]
+    return True, f"must-keep: --check and --write refuse ({R_LOST}); not must-keep: no refusal"[
+        :240
+    ]
+
+
 def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool, str]:
     path = ROOT / mutation.path
     original = path.read_text()
@@ -1065,6 +1132,10 @@ def main(argv: list[str] | None = None) -> int:
         results.append(("p: must-keep membership across a move", rejected, evidence))
         rejected, evidence = security_helper_move()
         results.append(("q: a security helper's test moved by ids", rejected, evidence))
+        rejected, evidence = security_helper_moved_away()
+        results.append(
+            ("r: a security helper moved away from its must-keep test", rejected, evidence)
+        )
     else:
         rejected, evidence = missing_module()
         results.append(("newly missing module", rejected, evidence))

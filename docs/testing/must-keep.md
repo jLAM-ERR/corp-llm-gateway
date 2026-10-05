@@ -134,8 +134,14 @@ Its manifest diff is only:
   in `moves.json`, so a security helper that moves to another module gets a new `owner`
   and is reviewed again. `security_node_ids` keeps every test that shares a module with
   the helper at the baseline or now, so a helper moved with its test, or left where it was,
-  changes nothing there; a helper moved where none of its tests is (a shared fixtures
-  module) drops them from that list, which review must catch (they stay in `must_keep/`);
+  changes nothing there. A helper moved where none of its tests is (a shared fixtures
+  module) drops them from that list: `negative_logs --check` and `--write` refuse ("security
+  negative-log id lost while its test is still must-keep") for each such test in
+  `must_keep/`, and `--write` writes nothing. Dropping a must-keep test from
+  `security_node_ids` on purpose (a security check reclassified as behaviour) means editing
+  that list by hand. A test that is not must-keep drops out with no refusal, and only review
+  catches it. To move a security helper, first edit its row's `owner` by hand, keeping
+  `class` and `note`, then run `--write`;
 - `external_deps.json`: hashes only, for the docs and files it hashes that the PR edits.
 
 Anything else is not a pure move. One case is expected: a test whose body names its own
@@ -336,6 +342,7 @@ named test, so a column the gate stops filling fails it. `python -m tests._gates
 | o | one malformed `moves.json` entry per refusal above (15, a key in a module pytest does not collect among them), and one valid map | the moves gate names each entry; the valid map passes; the two-ids-one-baseline map also stops the inventory, the ledger and must-keep |
 | p | a plain test moved into `tests/route_gate/`, a must-keep one moved out of it (one renamed), a name-pinned id cited at its new place, a test moved onto `audit/test_logger.py:135-163` | must-keep: the same ids as before the move, at their baseline ids |
 | q | a test running `_assert_clean(log_text)` moved by `ids`, with the helper, and without it (imported from where it stayed) | negative logs: the same `security_node_ids` |
+| r | a security helper moved into a non-`test_` module none of its tests lives in, its test must-keep, then not | negative logs: `--check` and `--write` refuse by id and `--write` writes nothing; no refusal when the test is not must-keep |
 | L1 | rename `team_config/test_store.py` so it is not collected | expected outcomes: missing ids |
 | L2 | drop the `redis` param of `storage/test_mapping_store.py`'s `store` fixture | expected outcomes: missing `[redis]` ids |
 | L3 | an autouse fixture that skips at setup in `team_config/test_store.py` | expected outcomes: `passed` → `skipped:…` |
@@ -343,6 +350,6 @@ named test, so a column the gate stops filling fails it. `python -m tests._gates
 
 All eleven were rejected on the baseline tree (2026-10-04); the same checks on the
 unmutated tree pass (the control). Cases h-l (function-local imports) are listed in the
-`tests/_gates/selftest.py` docstring. Cases m-q work on synthetic modules and ledgers, run
+`tests/_gates/selftest.py` docstring. Cases m-r work on synthetic modules and ledgers, run
 with `selftest inventory`, and each one fails when the translation or refusal it covers is
 taken out of its gate (2026-10-05).

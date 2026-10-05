@@ -23,7 +23,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from tests._gates import moves
+from tests._gates import moves, must_keep
 from tests._gates.inventory import build as build_inventory
 from tests._gates.inventory import modules
 
@@ -138,6 +138,17 @@ def node_ids(manifest: dict[str, Any]) -> list[str]:
     return sorted(ids)
 
 
+def lost(previous: list[str], manifest: dict[str, Any]) -> list[str]:
+    """Must-keep tests that were in ``security_node_ids`` and that ``manifest`` no longer
+    selects (a security helper moved away from them, or reclassified). Both sides are
+    baseline ids. Dropping one on purpose means editing ``security_node_ids`` by hand."""
+    gone = set(previous) - set(node_ids(manifest))
+    return [
+        f"security negative-log id lost while its test is still must-keep: {node_id}"
+        for node_id in sorted(gone & set(must_keep.read()))
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -154,6 +165,11 @@ def main(argv: list[str] | None = None) -> int:
             old = reviewed.get(_key(site), {})
             review = {"class": old.get("class", "UNREVIEWED"), "note": old.get("note", "")}
             merged.append({**site, **review})
+        refused = lost(recorded.get("security_node_ids", []), {**recorded, "sites": merged})
+        for line in refused:
+            print(f"NEGATIVE-LOGS: {line}", file=sys.stderr)
+        if refused:
+            return 1
         recorded["sites"] = merged
         recorded["security_node_ids"] = node_ids(recorded)
         PATH.write_text(json.dumps(recorded, indent=1, ensure_ascii=False) + "\n")
@@ -163,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         f"reviewed site no longer present: {key}"
         for key in sorted(set(reviewed) - {_key(s) for s in current})
     ]
+    problems += lost(recorded.get("security_node_ids", []), recorded)
     for line in problems:
         print(f"NEGATIVE-LOGS: {line}", file=sys.stderr)
     return 1 if problems else 0

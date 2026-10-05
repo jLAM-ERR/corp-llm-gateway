@@ -54,6 +54,12 @@
     "git"
    ]
   },
+  "tests/_gates/test_suite_gates.py::test_a_security_helper_moved_away_from_its_must_keep_test_is_refused": {
+   "files": {},
+   "programs": [
+    "git"
+   ]
+  },
   "tests/_gates/test_suite_gates.py::test_a_test_moved_with_its_security_helper_stays_a_negative_log_id": {
    "files": {},
    "programs": [
