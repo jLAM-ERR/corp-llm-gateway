@@ -1,14 +1,15 @@
 # Task 4 streaming audit (phase 1)
 
-The audit of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 11, local only),
+The audit of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 12, local only),
 Task 4: `tests/sanitizer/test_streaming.py` absorbs `tests/sanitizer/test_streaming_adversarial.py`.
 Phase 1 decides move / fold / delete for each of the 44 adversarial ids and changes no test.
 Phase 2 (after review) does the absorption, the [deleted-tests.md](deleted-tests.md) rows,
 `moves.json`, the self-test edit and the manifest regeneration. The gates are in
 [must-keep.md](must-keep.md). Tree: `release/1.0.x` at `2560566`.
 
-**Decision: 32 move / 11 fold (F1 8, F2 3) / 1 delete.** After phase 2 the merged file holds
-46 + 32 + 2 functions, 89 collected ids (90 today).
+**Decision (plan rev 12): 33 move / 11 fold (F1 8, F2 3) / 0 delete.** After phase 2 the merged
+file holds 46 + 33 + 2 = 81 functions, 90 collected ids (90 today). The one criterion-(3) twin
+found is moved, not deleted, and is recorded below for the last prune PR (Task 7).
 
 ## Rules applied
 
@@ -22,7 +23,8 @@ Phase 2 (after review) does the absorption, the [deleted-tests.md](deleted-tests
   is not a data literal.
 - **delete** (plan rev 10, criterion (3)): a survivor in the base file or the adversarial file on
   the same wire input, the same mapping and the same builder, with equal-or-stronger asserts. Same
-  file after the merge and same builder, so no fault injection.
+  file after the merge and same builder, so no fault injection. Plan rev 12: a move PR deletes
+  nothing, so a twin found here is a `move` and a candidate for Task 7.
 - Groups made only of base-file tests are out of scope; no base-file test is deleted or folded.
 - Candidates were found by reading the bodies, and cross-checked by a script that groups all 90
   functions by their check statements with literals (then names) normalised. Its groups of
@@ -44,7 +46,7 @@ branch it reaches; for `delete`, the ledger row's semantic note, ready to copy.
 | node id | checks | decision | fold group or survivor | semantic note | fault injection |
 |---|---|---|---|---|---|
 | `tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_every_data_line_is_valid_json` (:68) | a0 r0 f1; delegated `_no_logger_state_left_behind` a0 r0 f1; loops 2 | move | — | unchanged; helpers `_collect_bytes`. The plan's `json.loads` + `pytest.fail` framing check over the eleven `ANTHROPIC_SSE_FIXTURE` events; the self-test (b) mutation site (body byte-identical). Task 3b survivor (`deleted-tests.md` row 48). Near: `::test_each_emitted_bytes_chunk_is_self_contained_sse` has the same predicate on another mapping (`user@corp.com`) and without `_PING` / `_MSG_DELTA`; no base test parses every `data:` line. | n/a |
-| `tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_original_reconstructed_after_split` (:85) | a2 r0 f0; delegated `_no_logger_state_left_behind` a0 r0 f1; loops 1 | **delete** | `tests/sanitizer/test_streaming.py::test_sse_placeholder_split_across_deltas_reassembled` (`:414`) | Criterion (3), a same-file twin after the merge. The survivor feeds the same eleven `ANTHROPIC_SSE_FIXTURE` events through the same builder `SseStreamDesanitizer(_mapping(("user@example.com", "[EMAIL_001]")))` and the same collector (`_collect`, whose body is `_collect_bytes`'s), joins the same `text_delta` texts and makes the same two asserts (`"user@example.com" in`, `"[EMAIL_001]" not in`). Its parser `_data_of` is stricter than `_data_obj`: a `data:` line that is not JSON raises `JSONDecodeError` there, where `_data_obj` returned `None` and the line was skipped, and it decodes with `chunk.decode()`, where `_data_obj` used `errors="replace"`; a chunk without a `data:` line is skipped by both. The deleted test's assert messages are diagnostics only. | n/a (same production path — same builder, same file after the merge). Task 3b evidence: `streaming.py:600` `rewritten = ds.feed(text_in)` → `rewritten = text_in` failed both this test (`:97`) and the survivor (`test_streaming.py:429`) |
+| `tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_original_reconstructed_after_split` (:85) | a2 r0 f0; delegated `_no_logger_state_left_behind` a0 r0 f1; loops 1 | move | criterion-(3) candidate for the last prune PR (Task 7), survivor `tests/sanitizer/test_streaming.py::test_sse_placeholder_split_across_deltas_reassembled` (`:414`) | unchanged; helpers `_collect_bytes`, `_data_obj`. Plan rev 12: moved, not deleted. The rest of this note is the ready-to-copy Task 7 ledger text: Criterion (3), a same-file twin after the merge. The survivor feeds the same eleven `ANTHROPIC_SSE_FIXTURE` events through the same builder `SseStreamDesanitizer(_mapping(("user@example.com", "[EMAIL_001]")))` and the same collector (`_collect`, whose body is `_collect_bytes`'s), joins the same `text_delta` texts and makes the same two asserts (`"user@example.com" in`, `"[EMAIL_001]" not in`). Its parser `_data_of` is stricter than `_data_obj`: a `data:` line that is not JSON raises `JSONDecodeError` there, where `_data_obj` returned `None` and the line was skipped, and it decodes with `chunk.decode()`, where `_data_obj` used `errors="replace"`; a chunk without a `data:` line is skipped by both. The deleted test's assert messages are diagnostics only. | n/a (same production path — same builder, same file after the merge). Task 3b evidence: `streaming.py:600` `rewritten = ds.feed(text_in)` → `rewritten = text_in` failed both this test (`:97`) and the survivor (`test_streaming.py:429`) |
 | `tests/sanitizer/test_streaming_adversarial.py::test_malformed_data_line_passes_through_unchanged` (:106) | a1 r0 f0; delegated `_no_logger_state_left_behind` a0 r0 f1 | **fold** | F1 `[malformed_data_line]` | Data `b"event: content_block_delta\ndata: NOT JSON AT ALL\n\n"`; branch `streaming.py:560-563` (`JSONDecodeError` → pass-through). | n/a |
 | `tests/sanitizer/test_streaming_adversarial.py::test_done_sentinel_passes_through_unchanged` (:114) | a1 r0 f0; delegated `_no_logger_state_left_behind` a0 r0 f1 | **fold** | F1 `[done_sentinel]` | Data `b"data: [DONE]\n\n"`; branch `streaming.py:557-559` with nothing held. | n/a |
 | `tests/sanitizer/test_streaming_adversarial.py::test_done_sentinel_after_openai_content_flushes_desanitizer` (:122) | a3 r0 f0; delegated `_no_logger_state_left_behind` a0 r0 f1; loops 4 | move | — | unchanged; helpers `_collect_bytes`. The only test that sends an OpenAI content delta then `[DONE]` and checks that the held tail goes out first in a `choices` envelope (`streaming.py:557-559` → `_held_tails` → `_chat_tail`), with `[DONE]` kept and `alice` restored. | n/a |
@@ -92,13 +94,13 @@ branch it reaches; for `delete`, the ledger row's semantic note, ready to copy.
 
 | decision | ids |
 |---|---|
-| move | 32 |
+| move | 33 (one a criterion-(3) candidate for Task 7) |
 | fold | 11 (F1: 8, F2: 3) → 2 new parametrised tests, 11 param ids |
-| delete | 1 |
+| delete | 0 |
 | **total** | **44** |
 
-Ledger rows in phase 2: 12 (8 + 3 fold members, 1 deletion), `PR` = `Task 4`, reviewer
-`auto-review (pending)`. `moves.json`: 32 `ids` entries.
+Ledger rows in phase 2: 11 (the 8 + 3 fold members only), `PR` = `Task 4`, reviewer
+`auto-review (pending)`. `moves.json`: 33 `ids` entries.
 
 ## Fold groups
 
@@ -175,14 +177,17 @@ Considered and not folded:
   / `test_sse_event_split_across_feeds`, `test_sse_event_split_at_first_byte_across_feeds` /
   `test_sse_crlf_separators_accepted`): 2 each, and their extraction differs (`_data_obj` vs `_data_of`).
 
-## The delete
+## The criterion-(3) twin (moved; for Task 7)
 
-| deleted id | survivor | why | fault injection |
+Plan rev 12: Task 4 is a move PR and deletes nothing, so this twin is **moved** with the other
+32. The row below is ready to copy into the last prune PR (Task 7).
+
+| twin id (after the move) | survivor | why | fault injection |
 |---|---|---|---|
-| `tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_original_reconstructed_after_split` | `tests/sanitizer/test_streaming.py::test_sse_placeholder_split_across_deltas_reassembled` | criterion (3): same fixture, mapping, builder, collector body and two asserts; the survivor's `_data_of` is stricter (errors on a non-JSON `data:` line and on bad UTF-8) | none (same file after the merge, same builder); Task 3b's `streaming.py:600` injection already failed both |
+| `tests/sanitizer/test_streaming.py::test_framing_integrity_original_reconstructed_after_split` (baseline `tests/sanitizer/test_streaming_adversarial.py::…`) | `tests/sanitizer/test_streaming.py::test_sse_placeholder_split_across_deltas_reassembled` | criterion (3): same fixture, mapping, builder, collector body and two asserts; the survivor's `_data_of` is stricter (errors on a non-JSON `data:` line and on bad UTF-8) | none (same file after the merge, same builder); Task 3b's `streaming.py:600` injection already failed both |
 
 It is a survivor of Task 3b's `deleted-tests.md` row 49; that row also names the base-file
-survivor, which stays.
+survivor.
 
 Near-twins checked and kept as `move` (other wire input or other mapping, so criterion (3) is
 not met): `test_two_text_blocks_no_runtime_error_on_second_block` vs base `:562` (mapping
@@ -224,11 +229,12 @@ annotations (`list[bytes]`, `dict | None`, `StrategyResult`) all evaluate on 3.1
   against the committed `baseline_checks/` — 0 diff lines over the whole tree; external
   dependencies — 0; negative-log discovery — 148 sites, none new, none gone; `must_keep.problems()`
   — none; `moves.problems()` — none. `ruff check` and `ruff format --check` clean; 90 passed.
-- **Phase-2 preview** (F1, F2 and the delete applied to that file): 89 passed (minimal);
+- **Phase-2 preview** (F1, F2 and the delete applied to that file, rev 11): 89 passed (minimal);
   inventory diff exactly 12 `missing test` (the 11 fold members and the deletion, all at their
   `test_streaming_adversarial.py` ids) and 2 `new test` (the two fold tests); the 32 moved ids
   unchanged; `moves.problems()` with the 32-entry map — none; must-keep and negative logs
-  unchanged.
+  unchanged. Under rev 12 (the twin moved) the same preview gives 90 passed, 11 `missing test`
+  + 2 `new test`, a 33-entry map.
 
 ## The self-test
 
@@ -252,9 +258,9 @@ the path there. Not a stop condition.
 
 ## `moves.json`
 
-The `ids` section: 32 entries `tests/sanitizer/test_streaming.py::<name>` →
-`tests/sanitizer/test_streaming_adversarial.py::<name>`; nothing for the two fold tests or the
-deleted id. No `files` entry:
+The `ids` section: 33 entries `tests/sanitizer/test_streaming.py::<name>` →
+`tests/sanitizer/test_streaming_adversarial.py::<name>`; nothing for the two fold tests. No
+`files` entry:
 
 - `files: {"tests/sanitizer/test_streaming_adversarial.py": …}` is refused by `moves.problems()`
   ("the key is not in the current tree");
@@ -267,11 +273,11 @@ entry is refused ("the value is still in the current tree").
 ## Where the manifests put the moved ids
 
 The ledger keys by baseline id too (`ledger._translated` → `nest`), so in
-`expected_outcomes.{minimal,full}.json` the 32 moved ids **stay under the
-`tests/sanitizer/test_streaming_adversarial.py` key** (44 → 32 entries, all `passed`) — as after
+`expected_outcomes.{minimal,full}.json` the 33 moved ids **stay under the
+`tests/sanitizer/test_streaming_adversarial.py` key** (44 → 33 entries, all `passed`) — as after
 Task 2, where `tests/test_litellm_hook.py` still holds 227 entries. `tests/sanitizer/test_streaming.py`
 gains the two fold functions with 8 and 3 cases (`passed` in both). `baseline_checks/sanitizer.json`:
-−24 lines (12 tests + their 12 `cases` lines), +4 (2 tests + 2 `cases`); the 32 moved lines do
+−22 lines (11 tests + their 11 `cases` lines), +4 (2 tests + 2 `cases`); the 33 moved lines do
 not change. `negative_log_checks.json`, `name_pinned.json`, `must_keep/`, `coverage.*.json`,
 `not_applicable.json`, `external_deps.json`: unchanged.
 
@@ -292,7 +298,7 @@ In `deleted-tests.md` (no gate reads the survivor column; this is for navigation
 | row | cited | annotation |
 |---|---|---|
 | 48 `…framing_intact_all_json` | survivor `tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_every_data_line_is_valid_json`; fault-injection `test_streaming_adversarial.py:82` | `(now: tests/sanitizer/test_streaming.py::test_framing_integrity_every_data_line_is_valid_json)`, `(now: test_streaming.py:852)` |
-| 49 `…placeholder_restored_and_no_leak` | survivor `::test_framing_integrity_original_reconstructed_after_split`; `test_streaming_adversarial.py:97` | `(now: deleted in Task 4; the row's other survivor test_streaming.py::test_sse_placeholder_split_across_deltas_reassembled holds it)` |
+| 49 `…placeholder_restored_and_no_leak` | survivor `::test_framing_integrity_original_reconstructed_after_split`; `test_streaming_adversarial.py:97` | `(now: tests/sanitizer/test_streaming.py::test_framing_integrity_original_reconstructed_after_split)`, `(now: test_streaming.py:<line>)` |
 | 50 `…str_chunks_return_str` | survivor `::test_str_input_returns_str_output`; `test_streaming_adversarial.py:380` | `(now: tests/sanitizer/test_streaming.py::test_str_input_returns_str_output)`, `(now: test_streaming.py:1141)` |
 
 The new lines are those of the phase-2 preview layout below; phase 2 re-reads them.
@@ -308,7 +314,7 @@ The new lines are those of the phase-2 preview layout below; phase 2 re-reads th
    `#` banner (comments are not hashed).
 3. F1 in section 2, where `test_malformed_data_line_passes_through_unchanged` was; F2 in
    section 3, where `test_non_text_content_block_start_no_desanitizer_created` was (after the
-   section's helpers); the deleted test out of section 1; the other 9 members out.
+   section's helpers); the other 9 members out. The criterion-(3) twin stays in section 1.
 
 ## Sanity run (2026-10-05)
 
@@ -316,7 +322,7 @@ The new lines are those of the phase-2 preview layout below; phase 2 re-reads th
 minimal (`.venv-test-minimal`, no `CI`, `CORP_REQUIRE_PROXY_CAPTURE=1`) **90 passed**; full
 (`.venv-test-full`, `CI=true`, Postgres `pg-test` up on 55432) **90 passed**. No skips. Both
 fingerprints match (`python -m tests._gates.fingerprint <env> --check` → 0). Expected after
-phase 2: 89 in each.
+phase 2 (rev 12): 90 in each.
 
 ## Open questions / decisions by rule
 
@@ -331,7 +337,7 @@ Decided by the plan's rules:
 - Folds by the rev 9 rule (F1, F2); F2's checks are vacuous but identical, so it is folded, and
   Task 7 decides on the cases.
 - The `assert result == []` trio is not a fold (the operation differs).
-- One deletion by criterion (3); near-twins on other data stay moves.
+- No deletion (plan rev 12): the one criterion-(3) twin moves; near-twins on other data stay moves.
 - The Task 3b audit document is left as a record; only `deleted-tests.md` rows are annotated.
 
 Against the brief (findings, not choices):
@@ -340,12 +346,15 @@ Against the brief (findings, not choices):
 - The moved ids' outcomes stay under the adversarial file's key in `expected_outcomes.*`
   (baseline-keyed), not under the base file's.
 
+Decided on review (plan rev 12):
+
+- A move PR and a prune PR never share a PR (rev 3), so the one criterion-(3) twin,
+  `test_framing_integrity_original_reconstructed_after_split`, is **moved** (33 / 11 / 0) and
+  waits for the last prune PR (Task 7) with the row in "The criterion-(3) twin". The folds stay
+  in Task 4 (rev 9 names them).
+
 Left for review:
 
-- The plan's Development Approach says a move half and a prune half never share a PR, and Task 4
-  is titled a move PR; rev 9 makes each fold a prune-style row and the brief adds criterion-(3)
-  deletions to this PR. This audit follows the brief. If the split is wanted, the one deletion
-  becomes a move (33 / 11 / 0) and waits for a prune PR.
 - The fold test names and param ids are proposals.
 - Smells for Task 7 (flagged ⚠ in the table): vacuous checks in F2,
   `test_flush_called_twice_does_not_raise`, `test_feed_after_complete_stream_is_safe`; weak or
