@@ -8,6 +8,10 @@ makes the deletions, the [deleted-tests.md](deleted-tests.md) rows, the fault in
 manifest regeneration. The gates are in [must-keep.md](must-keep.md). Tree: `release/1.0.x` at
 `f066b10`.
 
+**Phase 2 done** (commits `b830239` deletions + ledger rows, `7172308` manifests, this commit line refs): the five
+deletions below are made, rev 14 decided the review questions (all five deletions stand, `:428` is kept, the classes as
+proposed). Line numbers marked "at HEAD" are the pruned tree's, measured; every other line number is `f066b10`'s.
+
 **Decision: 5 delete, 149 keep.** All five deletions are criterion-(3) intra-layer twins (rule B).
 Rule A (per-key default tests) deletes nothing: every default test in the universe either reads a
 sensitive key or has no survivor on the same path. After phase 2 the four files hold 109 / 27 / 77
@@ -119,7 +123,7 @@ names the sensitivity area a non-default test touches, for orientation only.
 | `test_validate_accepts_valid_choices` | :434 | a1 r0 f0 | other | keep (not a default test, no twin) | — | `chunk` + `stdout`; no other test on this input. | — |
 | `test_bearer_provider_requires_token` | :444 | a1 r1 f0 | other (credential) | keep (not a default test, no twin) | — | Refusal + recovery on `validate()`. Near: `test_bootstrap_edges.py::test_auth_provider_misconfig_fails_fast_at_build[bearer_provider_without_token]` (`build_guardrail()`, another resolver, no recovery). | — |
 | `test_langfuse_sink_requires_keys` | :454 | a4 r1 f0 | other (credential) | keep (not a default test, no twin) | — | Three missing keys + recovery; no survivor. | — |
-| `test_noop_provider_needs_no_credentials` | :470 | a1 r0 f0 | twin | **delete** | `tests/test_settings.py::test_validate_uses_pydantic_when_present` | Criterion (3), intra-layer twin, same file. The survivor's first block is this test's body: the same `hermetic` + `monkeypatch` fixtures, the same single `monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")`, the same `config.validate()` and the same assert `isinstance(config.validate(), Settings)`; it then adds `CORP_LLM_AUTH_PROVIDER=bogus` → `pytest.raises(ConfigError, match="CORP_LLM_AUTH_PROVIDER")`. Its `pytest.importorskip("pydantic")` does not skip: pydantic is in both recipes and the survivor passed in both ledgers. The deleted test's comment ("default provider is noop") is a default reading, but no assert reads `CORP_LLM_AUTH_PROVIDER`'s value, so it is not a criterion-(A) default test (reviewer question Q2). | n/a (rev 10 same-path waiver: same file, same resolver `config.validate()`); mutation `src/corp_llm_gateway/settings.py:184` `default="noop"` → `default="bearer"`, dry-run on the scratch clone: the deleted test and the survivor both raise `ConfigError` ("CORP_LLM_BEARER_TOKEN: required when CORP_LLM_AUTH_PROVIDER=bearer") at the survivor's `:554` `assert isinstance(config.validate(), Settings)`, minimal and full |
+| `test_noop_provider_needs_no_credentials` | :470 | a1 r0 f0 | twin | **delete** | `tests/test_settings.py::test_validate_uses_pydantic_when_present` | Criterion (3), intra-layer twin, same file. The survivor's first block is this test's body: the same `hermetic` + `monkeypatch` fixtures, the same single `monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")`, the same `config.validate()` and the same assert `isinstance(config.validate(), Settings)`; it then adds `CORP_LLM_AUTH_PROVIDER=bogus` → `pytest.raises(ConfigError, match="CORP_LLM_AUTH_PROVIDER")`. Its `pytest.importorskip("pydantic")` does not skip: pydantic is in both recipes and the survivor passed in both ledgers. The deleted test's comment ("default provider is noop") is a default reading, but no assert reads `CORP_LLM_AUTH_PROVIDER`'s value, so it is not a criterion-(A) default test (reviewer question Q2). | Not required (rev 10 same-builder waiver: same file, same `config.validate()`), run anyway on the checkout: `src/corp_llm_gateway/settings.py:184` `default="noop"` → `default="bearer"`; the survivor failed `test_settings.py:546` (at HEAD) `assert isinstance(config.validate(), Settings)` with `ConfigError` (`settings.py:1121`); reverted with `git checkout -- src/corp_llm_gateway/settings.py`, `git diff --stat -- src/` empty, the survivor passes again; minimal and full (2026-10-05). The deleted test failed the same mutation on the phase-1 scratch clone |
 | `test_validate_resolves_endpoint_from_file_with_env_cleared` | :481 | a1 r0 f0 | resolution-order | keep (registry / resolution-order (plan-kept)) | — | Plan-kept resolution-order test. | — |
 | `test_env_overrides_file_through_the_chain` | :489 | a0 r1 f0 | resolution-order | keep (registry / resolution-order (plan-kept)) | — | Plan-kept resolution-order test. | — |
 | `test_example_toml_documents_every_key` | :501 | a1 r0 f0; loops 1 | registry | keep (registry / resolution-order (plan-kept)) | — | Plan-kept registry test (`config.example.toml` has every key). | — |
@@ -139,8 +143,8 @@ names the sensitivity area a non-default test touches, for orientation only.
 | `test_get_required_uses_file_when_env_missing` | :64 | a1 r0 f0 | resolution-order | keep (registry / resolution-order (plan-kept)) | — | Plan-kept (`test_config.py:17-75`). | — |
 | `test_non_string_values_are_stringified` | :75 | a1 r0 f0 | resolution-order | keep (registry / resolution-order (plan-kept)) | — | Plan-kept (`test_config.py:17-75`). | — |
 | `test_corp_llm_verify_ca_bundle_set` | :84 | a1 r0 f0 | other (TLS) | keep (near-twin rejected (no survivor as strong)) | — | Bundle set, `SSL_VERIFY` unset. Near: `:91` sets `SSL_VERIFY=false`, `:130` also `CORP_ENV=prod` — the same `ca_bundle` branch on another input. | — |
-| `test_corp_llm_verify_ca_bundle_takes_precedence_over_ssl_verify` | :91 | a1 r0 f0 | other (TLS) | keep (near-twin rejected (no survivor as strong)) | — | Near: `:130` adds `CORP_ENV=prod` and file isolation; another input. | — |
-| `test_corp_llm_verify_ssl_verify_false` | :100 | a1 r0 f0 | twin (TLS) | **delete** | `tests/test_config.py::test_corp_llm_verify_demo_allows_ssl_verify_false` | Criterion (3), intra-layer twin, same file. Same env values (`CORP_LLM_CA_BUNDLE` deleted, `SSL_VERIFY=false`), same resolver `config.corp_llm_verify()`, same assert `is False`. The survivor also pins the rest of the input the result depends on: `_isolate_from_file` (`CORP_LLM_GATEWAY_CONFIG_FILE=/nonexistent/config.toml` + `reset_cache()`) and `delenv("CORP_ENV")`; this test reads `CORP_ENV` and the TOML from the process (the file has no hermetic fixture), so under `CORP_ENV=prod` it would raise. Same autouse `_reset_config_cache`. Not a criterion-(A) default test (it sets `SSL_VERIFY`); TLS-related, so reviewer question Q3. | n/a (rev 10 same-path waiver: same file, same resolver); mutation `src/corp_llm_gateway/config.py:185` `verify = (get("SSL_VERIFY", "true") or "true").lower() != "false"` → `verify = True`, dry-run on the scratch clone: the survivor failed `test_config.py:146` `assert config.corp_llm_verify() is False` (`True is False`), the deleted test failed its `:104`; minimal and full |
+| `test_corp_llm_verify_ca_bundle_takes_precedence_over_ssl_verify` | :91 | a1 r0 f0 | other (TLS) | keep (near-twin rejected (no survivor as strong)) | — | Near: `:130` returns through the same `ca_bundle` branch (`config.py:183-184`) but also sets `CORP_ENV=prod`. Kept: the plan rule asks for the same env values, a set key the resolver never reads on that branch notwithstanding. | — |
+| `test_corp_llm_verify_ssl_verify_false` | :100 | a1 r0 f0 | twin (TLS) | **delete** | `tests/test_config.py::test_corp_llm_verify_demo_allows_ssl_verify_false` | Criterion (3), intra-layer twin, same file. Same env values (`CORP_LLM_CA_BUNDLE` deleted, `SSL_VERIFY=false`), same resolver `config.corp_llm_verify()`, same assert `is False`. The survivor also `delenv`s `CORP_ENV` (so `is_prod()` is false by construction, not by the process env; it does not set `demo`) and calls `_isolate_from_file`. The file input is isolated in neither test: `_isolate_from_file` only points `CORP_LLM_GATEWAY_CONFIG_FILE` at `/nonexistent/config.toml`, and `config._load_file` (`config.py:43-51`) then falls through to `~/.corp-llm-gateway/config.toml` and `/etc/corp-llm-gateway/config.toml` exactly as this test's lookup does (the file has no hermetic fixture). Same autouse `_reset_config_cache`. Not a criterion-(A) default test (it sets `SSL_VERIFY`); plan rev 14 (Q3): governed by criterion (3). | Not required (rev 10 same-builder waiver: same file, same resolver), run anyway on the checkout: `src/corp_llm_gateway/config.py:185` → `verify = True`; the survivor failed `test_config.py:139` (at HEAD) `assert config.corp_llm_verify() is False` (`True is False`); reverted with `git checkout -- src/corp_llm_gateway/config.py`, `git diff --stat -- src/` empty, the survivor passes again; minimal and full (2026-10-05). The deleted test failed the same mutation on the phase-1 scratch clone |
 | `test_corp_llm_verify_prod_refuses_ssl_verify_false` | :119 | a0 r1 f0 | other (TLS, fail-policy) | keep (not a default test, no twin) | — | The F9 refusal; no survivor. | — |
 | `test_corp_llm_verify_prod_allows_ca_bundle` | :130 | a1 r0 f0 | other (TLS) | keep (not a default test, no twin) | — | Prod + bundle + `SSL_VERIFY=false`; no survivor. | — |
 | `test_corp_llm_verify_demo_allows_ssl_verify_false` | :140 | a1 r0 f0 | other (TLS) | keep (not a default test, no twin) | — | Survivor of `:100`. | — |
@@ -164,7 +168,7 @@ names the sensitivity area a non-default test touches, for orientation only.
 | node id | def line at f066b10 | checks | class | decision | survivor node id(s) | semantic note | fault injection |
 |---|---|---|---|---|---|---|---|
 | `test_build_guardrail_returns_guardrail_with_in_memory_backends` | :52 | a3 r0 f0 | default grouping: `REDIS_URL`, `CORP_LLM_PG_DSN`; credential | keep (default grouping (≥ 2 keys) kept) | — | Two keys' defaults + the guardrail type in one test (Task 5a: extra check); an existing grouping. | — |
-| `test_module_level_guardrail_is_importable_instance` | :61 | a1 r0 f0 | twin | **delete** | `tests/test_bootstrap.py::test_guardrail_attribute_builds_once_and_caches` | Criterion (3), intra-layer twin, same file. The survivor reads the same attribute `bootstrap.guardrail` through the same PEP 562 `__getattr__` (`bootstrap.py:706-717`) and asserts the same `isinstance(…, CorpLlmGuardrail)`, plus build-once / cached identity. Input: the survivor starts from `_guardrail = None` (the first access LiteLLM's `callbacks:` import makes); this test reads whatever `_guardrail` holds when it runs (built here or cached by an earlier test). The survivor wraps `bootstrap.build_guardrail` in a counter that calls the real one, which `__getattr__` looks up as a module global, so the same build runs. Same autouse `_clean_config`. | n/a (rev 10 same-path waiver: same file, same `__getattr__`); mutation `src/corp_llm_gateway/bootstrap.py:717` `return _guardrail` → `return None`, dry-run on the scratch clone: the survivor failed `test_bootstrap.py:94` `assert isinstance(first, CorpLlmGuardrail)`, the deleted test failed its `:63`; minimal and full |
+| `test_module_level_guardrail_is_importable_instance` | :61 | a1 r0 f0 | twin | **delete** | `tests/test_bootstrap.py::test_guardrail_attribute_builds_once_and_caches` | Criterion (3), intra-layer twin, same file. The survivor reads the same attribute `bootstrap.guardrail` through the same PEP 562 `__getattr__` (`bootstrap.py:706-717`) and asserts the same `isinstance(…, CorpLlmGuardrail)`, plus build-once / cached identity. Input: the survivor starts from `_guardrail = None` (the first access LiteLLM's `callbacks:` import makes); this test reads whatever `_guardrail` holds when it runs (built here or cached by an earlier test). The `from corp_llm_gateway.bootstrap import guardrail` form litellm's callback loader uses is exercised by neither test; it resolves through the same `__getattr__`. The survivor wraps `bootstrap.build_guardrail` in a counter that calls the real one, which `__getattr__` looks up as a module global, so the same build runs. Same autouse `_clean_config`. | Not required (rev 10 same-builder waiver: same file, same `__getattr__`), run anyway on the checkout: `src/corp_llm_gateway/bootstrap.py:717` `return _guardrail` → `return None`; the survivor failed `test_bootstrap.py:89` (at HEAD) `assert isinstance(first, CorpLlmGuardrail)`; reverted with `git checkout -- src/corp_llm_gateway/bootstrap.py`, `git diff --stat -- src/` empty, the survivor passes again; minimal and full (2026-10-05). The deleted test failed the same mutation on the phase-1 scratch clone |
 | `test_guardrail_attribute_builds_once_and_caches` | :77 | a5 r0 f0 | other | keep (not a default test, no twin) | — | Survivor of `:61`. | — |
 | `test_getattr_raises_for_unknown_attribute` | :97 | a0 r1 f0 | other | keep (not a default test, no twin) | — | The `AttributeError` branch of `__getattr__`; no survivor. | — |
 | `test_gateway_version_is_metadata_not_demo_string` | :102 | a2 r0 f0 | other (package metadata, no key) | keep (not a default test, no twin) | — | No other test reads `_audit._gateway_version` from `build_guardrail()`. | — |
@@ -177,7 +181,7 @@ names the sensitivity area a non-default test touches, for orientation only.
 | `test_build_guardrail_wraps_orchestrator_in_profile_aware` | :256 | a2 r0 f0 | other | keep (not a default test, no twin) | — | Near: `tests/sanitizer/test_team_config_outage_edges.py:68` asserts `ProfileAwareOrchestrator` on its own `_guardrail` builder, not `build_guardrail()`. | — |
 | `test_no_profile_team_passes_through_to_core_unchanged` | :264 | a3 r0 f0 | other (policy) | keep (not a default test, no twin) | — | No survivor. | — |
 | `test_team_with_sealed_default_profile_resolves_and_applies` | :276 | a5 r0 f0 | other (policy) | keep (not a default test, no twin) | — | No survivor. | — |
-| `test_oracle_disabled_build_guardrail_skips_client_build` | :299 | a2 r0 f0 | twin | **delete** | `tests/test_bootstrap.py::test_oracle_falsy_spellings_disable_oracle_without_endpoint[0]` | Criterion (3), intra-layer twin, same file. The survivor's `[0]` case is this test's body with the literal as its parameter: `monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")`, the same `_fail_if_called` patch of `bootstrap.build_corp_llm_client`, `bootstrap.build_guardrail()`, and the same two asserts `core._corp_llm is None`, `core._oracle_enabled is False`; its four other cases (`off`, `no`, `false`, `OFF`) add spellings. Same autouse `_clean_config` (`hermetic_gateway_config` clears `CORP_LLM_ENDPOINT`). | n/a (rev 10 same-path waiver: same file, same builder); mutation `src/corp_llm_gateway/bootstrap.py:650` `oracle_enabled = _flag("CORP_LLM_ORACLE_ENABLED")` → `oracle_enabled = True`, dry-run on the scratch clone: all five survivor cases failed at `test_bootstrap.py:369` (`AssertionError: build_corp_llm_client must not run when the oracle is disabled`), the deleted test failed at its `:307`; minimal and full |
+| `test_oracle_disabled_build_guardrail_skips_client_build` | :299 | a2 r0 f0 | twin | **delete** | `tests/test_bootstrap.py::test_oracle_falsy_spellings_disable_oracle_without_endpoint[0]` | Criterion (3), intra-layer twin, same file. The survivor's `[0]` case is this test's body with the literal as its parameter: `monkeypatch.setenv("CORP_LLM_ORACLE_ENABLED", "0")`, the same `_fail_if_called` patch of `bootstrap.build_corp_llm_client`, `bootstrap.build_guardrail()`, and the same two asserts `core._corp_llm is None`, `core._oracle_enabled is False`; its four other cases (`off`, `no`, `false`, `OFF`) add spellings. Same autouse `_clean_config` (`hermetic_gateway_config` clears `CORP_LLM_ENDPOINT`). | Not required (rev 10 same-builder waiver: same file, same builder), run anyway on the checkout: `src/corp_llm_gateway/bootstrap.py:650` → `oracle_enabled = True`; all five survivor cases failed at `test_bootstrap.py:345` (at HEAD; `AssertionError: build_corp_llm_client must not run when the oracle is disabled` from the `_fail_if_called` patch); reverted with `git checkout -- src/corp_llm_gateway/bootstrap.py`, `git diff --stat -- src/` empty, the survivor passes again; minimal and full (2026-10-05). The deleted test failed the same mutation on the phase-1 scratch clone |
 | `test_oracle_disabled_logs_one_info_at_build_time` | :318 | a1 r0 f0 | other | keep (not a default test, no twin) | — | The `caplog` INFO check; no survivor. | — |
 | `test_oracle_disabled_profiled_team_inner_orchestrator_has_no_client` | :329 | a4 r0 f0 | other (policy) | keep (not a default test, no twin) | — | Inner orchestrator + a sanitize; no survivor. | — |
 | `test_oracle_falsy_spellings_disable_oracle_without_endpoint` | :360 | a2 r0 f0; parametrize 'falsy' ×5 | other | keep (not a default test, no twin) | — | Survivor of `:299` (case `[0]`). | — |
@@ -211,7 +215,7 @@ names the sensitivity area a non-default test touches, for orientation only.
 | `test_oracle_default_on_and_local_first_off_builds_fine` | :790 | a1 r0 f0 | default: `CORP_LLM_ORACLE_ENABLED` (with local-first off), policy | keep (sensitive default (class ≠ none)) | — | policy class (`settings.py:150-155` oracle switch) → keep. Near: `test_bootstrap_edges.py::test_local_first_flag_toggles_local_detectors[0]` (asserts `_local`, not the guardrail type). | — |
 | `test_mapping_store_selects_redis_when_url_set` | :804 | a1 r0 f0 | other | keep (near-twin rejected (no survivor as strong)) | — | Task 5a near-twin (edges `:129` same `REDIS_URL` through `build_guardrail()`; edges `:113` another host), not re-litigated. | — |
 | `test_mapping_store_in_memory_when_url_unset` | :811 | a1 r0 f0 | default: `REDIS_URL`, credential | keep (sensitive default (class ≠ none)) | — | credential class: the key is registered `secret=True` (`settings.py:179`, a URL that can carry a password). Under a `none` reading it would be deletable with survivor `test_bootstrap_edges.py::test_postgres_set_redis_absent_selects_mixed_backends` (`REDIS_URL` unset, `isinstance(build_mapping_store(), InMemoryMappingStore)`; its `CORP_LLM_PG_DSN` is never read by `build_mapping_store`) — reviewer question Q1. | — |
-| `test_team_config_store_selects_postgres_when_dsn_set` | :815 | a1 r0 f0 | twin | **delete** | `tests/test_bootstrap_edges.py::test_postgres_set_redis_absent_selects_mixed_backends` | Criterion (3), intra-layer twin in another file (both are composition-root tests at the tests root). Same env value `CORP_LLM_PG_DSN=postgresql://gw:gw@pg:5432/gw`, same builder `bootstrap.build_team_config_store()` and the same assert `isinstance(…, PostgresTeamConfigStore)`; the survivor also asserts `build_mapping_store()` is in-memory. The builder is stateless (`bootstrap.py:140-145`: `config.get("CORP_LLM_PG_DSN")`, a new store), so the fixture difference does not reach it: `test_bootstrap.py`'s autouse `_clean_config` also resets `bootstrap._token_store` / `_team_config_store`, which `build_team_config_store()` never reads; both use `hermetic_gateway_config`. The survivor's extra `config.reset_cache()` after the setenv changes no resolved value. (Task 5a's ready row.) | required (other file; rev 10's same-builder waiver would also apply): `src/corp_llm_gateway/bootstrap.py:144` `return PostgresTeamConfigStore(dsn)` → `return InMemoryTeamConfigStore()`, dry-run on the scratch clone: the survivor failed `test_bootstrap_edges.py:150` `assert isinstance(bootstrap.build_team_config_store(), PostgresTeamConfigStore)`, the deleted test failed its `:820`; minimal and full |
+| `test_team_config_store_selects_postgres_when_dsn_set` | :815 | a1 r0 f0 | twin | **delete** | `tests/test_bootstrap_edges.py::test_postgres_set_redis_absent_selects_mixed_backends` | Criterion (3), intra-layer twin in another file (both are composition-root tests at the tests root). Same env value `CORP_LLM_PG_DSN=postgresql://gw:gw@pg:5432/gw`, same builder `bootstrap.build_team_config_store()` and the same assert `isinstance(…, PostgresTeamConfigStore)`; the survivor also asserts `build_mapping_store()` is in-memory. The builder is stateless (`bootstrap.py:140-145`: `config.get("CORP_LLM_PG_DSN")`, a new store), so the fixture difference does not reach it: `test_bootstrap.py`'s autouse `_clean_config` also resets `bootstrap._token_store` / `_team_config_store`, which `build_team_config_store()` never reads; both use `hermetic_gateway_config`. The survivor's extra `config.reset_cache()` after the setenv changes no resolved value. (Task 5a's ready row.) | Required (other file), run on the checkout: `src/corp_llm_gateway/bootstrap.py:144` `return PostgresTeamConfigStore(dsn)` → `return InMemoryTeamConfigStore()`; the survivor failed `test_bootstrap_edges.py:150` `assert isinstance(bootstrap.build_team_config_store(), PostgresTeamConfigStore)`; reverted with `git checkout -- src/corp_llm_gateway/bootstrap.py`, `git diff --stat -- src/` empty, the survivor passes again; minimal and full (2026-10-05). The deleted test failed the same mutation on the phase-1 scratch clone |
 | `test_team_config_store_in_memory_when_dsn_unset` | :823 | a1 r0 f0 | default: `CORP_LLM_PG_DSN`, credential | keep (sensitive default (class ≠ none)) | — | credential class: the key is registered `secret=True` (`settings.py:178`, a DSN with a password). Under a `none` reading: survivor `test_bootstrap_edges.py::test_redis_set_postgres_absent_selects_mixed_backends` (`CORP_LLM_PG_DSN` unset, `isinstance(build_team_config_store(), InMemoryTeamConfigStore)`; its `REDIS_URL` is never read by that builder) — Q1. | — |
 | `test_build_guardrail_selects_postgres_token_store` | :827 | a1 r0 f0; skipped in minimal (asyncpg), passed in full | other | keep (near-twin rejected (no survivor as strong)) | — | Skipped in minimal, passed in full. Task 5a near-twins (edges `:78`, another host and branch-dependent; must-keep `:861`, extra env + `caplog`), not re-litigated. | — |
 | `test_dev_team_token_seeds_local_dev_team` | :841 | a2 r0 f0 | other (credential) | keep (not a default test, no twin) | — | Near: must-keep `:172` seeds through the lazy `bootstrap.guardrail`, not `build_guardrail()`, and asserts no store type. | — |
@@ -292,7 +296,7 @@ here; the four marked Q1 are the borderline ones.
 |---|---|---|---|---|
 | `CORP_LLM_REQUIRE_NER` | fail-policy | `:141` "fail closed when NER absent (F2)" | `test_config.py::test_require_ner_defaults_to_false` | keep |
 | `SSL_VERIFY` (under `CORP_ENV=prod`) | TLS | `:182` "'false' disables corp-LLM TLS verification" | `test_config.py::test_corp_llm_verify_prod_true_when_verify_on` | keep |
-| `CORP_LLM_FORWARD_CHATGPT_AUTH` | credential | `:104-109` forwards Codex OAuth headers upstream | `test_bootstrap.py::test_forward_chatgpt_auth_unset_defaults_off` | keep (a twin of `:571`, Q4) |
+| `CORP_LLM_FORWARD_CHATGPT_AUTH` | credential | `:104-109` forwards Codex OAuth headers upstream | `test_bootstrap.py::test_forward_chatgpt_auth_unset_defaults_off` | keep (a twin of `:571`; rev 14: kept by the literal default rule) |
 | `CORP_LLM_STRIP_INBOUND_HEADERS` | route-gate | `:110-119` strip inbound wire headers before upstream | `test_bootstrap.py::test_strip_inbound_headers_unset_defaults_on` | keep |
 | `CORP_LLM_LOCAL_FIRST` | policy | `:99` the local-first cascade | `test_bootstrap.py::test_oracle_off_and_local_first_default_on_builds_fine` | keep |
 | `CORP_LLM_ORACLE_ENABLED` | policy | `:150-155` the corp-LLM oracle | `test_bootstrap.py::test_oracle_default_on_and_local_first_off_builds_fine` | keep |
@@ -368,24 +372,30 @@ E2 `[audit_sink]` vs `:489`, E2 `[oversize_policy]` vs `:83`) are cited, not re-
 - `must_keep.py` gate gap: none. No universe id runs a security negative-log check or matches a
   step-1 / step-2 rule that `must_keep/` lacks (`must_keep --check` 0 before and after the dry run).
 
-## Predicted phase-2 manifest diff
+## Phase-2 manifest diff (observed at HEAD, `git diff f066b10`)
+
+Predicted in phase 1 and observed in `7172308`, exactly as below.
 
 | manifest | change |
 |---|---|
-| `expected_outcomes.minimal.json`, `expected_outcomes.full.json` | per env −5 ids, all `passed` (5,937 → 5,932): `test_bootstrap.py` 113 → 110, `test_config.py` 42 → 41, `test_settings.py` 229 → 228; one line per file changes; `test_bootstrap_edges.py` unchanged |
-| `baseline_checks/_root__test_bootstrap.json` | −6 lines (3 `tests` + 3 `cases` entries) |
-| `baseline_checks/_root__test_config.json` | −2 lines (1 + 1) |
-| `baseline_checks/_root__test_settings.json` | −2 lines (1 + 1) |
+| `expected_outcomes.minimal.json`, `expected_outcomes.full.json` | per env −5 ids, all `passed` (5,937 → 5,932), 0 added, 0 changed: `test_bootstrap.py` 113 → 110, `test_config.py` 42 → 41, `test_settings.py` 229 → 228; one line per file changes (3 per env); `test_bootstrap_edges.py` unchanged |
+| `baseline_checks/_root__test_bootstrap.json` | −6 lines (3 `tests` + 3 `cases` entries; 80 → 77 each), 0 changed entries as JSON |
+| `baseline_checks/_root__test_config.json` | −2 lines (1 + 1; 28 → 27), 0 changed |
+| `baseline_checks/_root__test_settings.json` | −2 lines (1 + 1; 110 → 109), 0 changed |
 | `baseline_checks/_root__test_bootstrap_edges.json` | unchanged |
-| `negative_log_checks.json` | 3 `site` drifts, owners unchanged, no row lost: `tests/test_bootstrap.py:665 → :641` (−5 for `:61`, −19 for `:299`), `:875 → :843` and `:889 → :857` (also −8 for `:815`); `test_bootstrap_edges.py:340` unchanged |
+| `negative_log_checks.json` | 3 `site` drifts (at HEAD), owners unchanged, no row lost: `tests/test_bootstrap.py:665 → :641` (−5 for `:61`, −19 for `:299`), `:875 → :843` and `:889 → :857` (also −8 for `:815`); `test_bootstrap_edges.py:340` unchanged |
 | `must_keep/` | byte-identical (no `must_keep --write`) |
 | `moves.json`, `name_pinned.json`, `coverage.*.json`, `not_applicable.json`, `external_deps.json` | unchanged (dry `inventory --write` and `name_pinned --write` changed neither `external_deps.json` nor `name_pinned.json`) |
-| `docs/testing/deleted-tests.md` | +5 rows, `PR` = `Task 5b`, reviewer `auto-review (pending)`; no existing row cites the four files, so no `(now: …)` |
+| `docs/testing/deleted-tests.md` | +5 rows (`b830239`), `PR` = `Task 5b`, reviewer `auto-review (pending)`; no existing row cites a line of the four files (the Task 5a rows cite node ids only), so no `(now: …)` |
 
-Lines removed per deletion (the `def` through the two blank lines after it): `test_bootstrap.py`
+Lines removed per deletion (the `def` through the two blank lines after it), at HEAD: `test_bootstrap.py`
 `:61` 5, `:299` 19, `:815` 8 (file 1,289 → 1,257 lines); `test_config.py` `:100` 7 (277 → 270);
 `test_settings.py` `:470` 8 (1,442 → 1,434; `test_the_allow_key_is_refused_in_prod` `:1427 → :1419`). The two
-must-keep matrix ids move up 5 (`:207 → :202`, `:235 → :230`); `name_pinned.json` holds the matrix's
+must-keep matrix ids move up 5 (at HEAD `:207 → :202`, `:235 → :230`); survivors at HEAD:
+`test_settings.py::test_validate_uses_pydantic_when_present` `:541`, `test_config.py::test_corp_llm_verify_demo_allows_ssl_verify_false`
+`:133`, `test_bootstrap.py::test_guardrail_attribute_builds_once_and_caches` `:72`,
+`::test_oracle_falsy_spellings_disable_oracle_without_endpoint` `:336`, `test_bootstrap_edges.py::test_postgres_set_redis_absent_selects_mixed_backends`
+`:143` (unchanged); `name_pinned.json` holds the matrix's
 citing lines, not these, so it does not change. `baseline_checks` entries carry no line, so the
 shifted tests report nothing in `inventory --check` (dry run).
 
@@ -436,6 +446,30 @@ A `git clone --shared` of the checkout at `f066b10` in the session scratch direc
 - Fingerprints: `python -m tests._gates.fingerprint {minimal,full} --check` → 0; Postgres `pg-test` up
   on 55432.
 
+## Phase 2 on the checkout
+
+- **Deletions** (`b830239`): the five functions, nothing else; every surviving def / fixture / import in the three
+  files AST-identical to `f066b10` (top-level statements settings / config / bootstrap 126 / 34 / 115 → 125 / 33 / 112); no import lost its
+  last caller (ruff clean, no F401), no helper removed; `test_bootstrap_edges.py`, `src/`, `tests/_gates/`,
+  `moves.json`, `must_keep/` untouched.
+- **Fault injections** on the checkout, each in both venvs, each reverted with `git checkout -- <file>`
+  (`git diff --stat -- src/` empty after every one): `settings.py:184` `noop` → `bearer` — survivor failed
+  `test_settings.py:546` (`ConfigError`); `config.py:185` → `verify = True` — survivor failed `test_config.py:139`
+  (`True is False`); `bootstrap.py:717` → `return None` — survivor failed `test_bootstrap.py:89`; `bootstrap.py:650` →
+  `oracle_enabled = True` — all five survivor cases failed at `test_bootstrap.py:345`; `bootstrap.py:144` →
+  `InMemoryTeamConfigStore()` — survivor failed `test_bootstrap_edges.py:150`. Lines at HEAD.
+- **Four files**: minimal 401 passed / 3 skipped, full 404 passed (409 → 404 collected).
+- **Record runs** (`.test-gates/t5b-{minimal,full}`): minimal 4,692 passed / 424 skipped / 1 failed (5,122 → 5,117
+  collected), full 5,915 passed / 16 skipped / 1 failed; the one failure in each is
+  `test_the_check_inventory_matches_the_baseline` (the five `missing test` lines). Strict `ledger write` refused it →
+  provisional → `inventory`, `name_pinned`, `negative_logs --write` → scoped re-runs (`tests/_gates` + matrix +
+  `test_docs_pins.py`, 315 passed each) → strict `ledger write` on run + re-runs (0) → the three writers again (no
+  change). No `must_keep --write`.
+- **Gates, final tree, both venvs**: fingerprint, `must_keep`, `moves`, `negative_logs`, `name_pinned`, `inventory
+  --check` 0; `ledger check` on the merged run + re-run file 0; `coverage_gate check` 0. Coverage equal to the
+  whole-suite baselines: `bootstrap.py` 207 / 38 minimal, 244 / 44 full; `settings.py` 391 / 114, 390 / 113;
+  `config.py` 67 / 19 both; `drops()` empty; the only gain anywhere is the known `pg_session.py (266, -265)` arc.
+
 ## Ledger rows (phase 2)
 
 The `semantic note` and `fault injection` columns are the rows above. The other columns:
@@ -461,6 +495,9 @@ Not deletions here:
   after patching cannot fail.
 - `test_settings.py::test_validate_uses_pydantic_when_present`: nothing checks that pydantic ran;
   the name promises more than the asserts.
+- `test_config.py::_isolate_from_file`: points `CORP_LLM_GATEWAY_CONFIG_FILE` at a nonexistent path, so
+  `config._load_file` (`config.py:43-51`) falls through to `~/.corp-llm-gateway/config.toml` and
+  `/etc/corp-llm-gateway/config.toml`; the name promises isolation it does not give (rev 14).
 
 ## Open questions / decisions by rule
 
@@ -476,7 +513,10 @@ Decided by the rules:
   N1 / N2 / N3 out of scope); no move.
 - The Task 5a fold tests are kept: no survivor per case.
 
-For the reviewer:
+Decided by rev 14 (plan header): the classes stand as proposed (`REDIS_URL` / `CORP_LLM_PG_DSN`
+credential, `CORP_AUDIT_SINK` / `CORP_METRICS_EXPORTER` `none` and kept for want of a same-path
+survivor); Q2 and Q3 are governed by criterion (3), so both deletions stand; Q4 is kept by the
+literal default rule. The questions as asked in phase 1:
 
 - **Q1 — sensitivity classes.** `REDIS_URL` and `CORP_LLM_PG_DSN` are proposed `credential` because
   `KEYS` registers both `secret=True`; the default itself only picks the in-memory store, so a
