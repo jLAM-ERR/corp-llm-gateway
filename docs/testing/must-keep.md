@@ -346,7 +346,7 @@ named test, so a column the gate stops filling fails it. `python -m tests._gates
 | # | mutation | rejected by |
 |---|---|---|
 | a | drop the `_assert_gate_surfaces_are_clean(...)` call in `invariants/test_no_originals_leak.py::test_a_refused_route_leaks_no_original_on_any_of_the_six_surfaces` | inventory: that test's `delegated` and `helpers` |
-| b | replace the `try / pytest.fail` in `sanitizer/test_streaming_adversarial.py::test_framing_integrity_every_data_line_is_valid_json` with a bare `json.loads` | inventory: that test's `fail 1 -> 0` |
+| b | replace the `try / pytest.fail` in `sanitizer/test_streaming.py::test_framing_integrity_every_data_line_is_valid_json` with a bare `json.loads` | inventory: that test's `fail 1 -> 0`, named by its baseline id `sanitizer/test_streaming_adversarial.py::…` (`moves.json`) |
 | c | build `test_oauth_system_preamble.py`'s guardrail with `RegexChecksumDetector()` only | inventory: `body_hash` of every test whose recorded `helpers` holds `_guardrail` (27) |
 | d | select lines by `".env"` instead of `"$ENV_FILE"` in `deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed` | inventory: that test's `body_hash` |
 | e | make `holding_after` in `tests/desanitize_served_script.py` return `[]` | external dependencies: `external tests/desanitize_served_script.py` of every test that records it (20) |
