@@ -356,7 +356,10 @@ not in F1 (two functions, not a group).
 
 Phase 2: the four become `test_pre_call_unmanaged_call_type_input_passes_through_untouched`,
 parametrised over `(pairs, model, payload, call_type)` with ids `embedding`, `moderation`,
-`aspeech`, `pass_through_endpoint`; each old docstring is a `#` comment above its case.
+`aspeech`, `pass_through_endpoint`; each old docstring is a `#` comment above its case. The
+request carries `copy.deepcopy(payload)` as `input`: each old test had two separate literals (one
+sent, one expected), so an in-place rewrite of a list `input` stays visible to
+`assert out["input"] == payload`.
 
 **F2** — `tests/litellm_hook/test_stage0_classifier.py`, 3 functions (`:31`, `:48`, `:70`), each
 a2 r1 f0, builder `_build_guardrail(corp_llm=_corp_llm_unreachable())`, helper `_data_with_token`:

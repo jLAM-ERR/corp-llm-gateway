@@ -28,61 +28,49 @@ async def test_stage0_blocks_env_dump_in_responses_custom_tool_call_input() -> N
     assert ei.value.error_code == "E_POLICY_BLOCKED"
 
 
-async def test_stage0_env_payload_raises_policy_blocked() -> None:
-    """.env content is blocked before the sanitizer / upstream is called."""
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # .env content is blocked before the sanitizer / upstream is called.
+        (
+            "DATABASE_URL=postgres://admin:hunter2@db.corp.lan:5432/prod\n"
+            "SECRET_KEY=supersecretvalue-abc123\n"
+            "DEBUG=False\n"
+            "REDIS_URL=redis://cache.corp.lan:6379/0\n"
+            "ALLOWED_HOSTS=*.corp.lan\n"
+        ),
+        # Kubernetes manifest is blocked before egress.
+        (
+            "apiVersion: apps/v1\n"
+            "kind: Deployment\n"
+            "metadata:\n"
+            "  name: my-app\n"
+            "  namespace: production\n"
+            "spec:\n"
+            "  replicas: 3\n"
+            "  selector:\n"
+            "    matchLabels:\n"
+            "      app: my-app\n"
+        ),
+        # Application log dump is blocked before egress.
+        "\n".join(
+            [
+                "2024-01-15 10:00:01 INFO  Starting application server",
+                "2024-01-15 10:00:02 INFO  Loaded configuration from /etc/app.conf",
+                "2024-01-15 10:00:03 DEBUG Database pool initialized connections=10",
+                "2024-01-15 10:00:15 INFO  Listening on 0.0.0.0:8080",
+                "2024-01-15 10:01:22 ERROR Failed to connect to cache host=redis port=6379",
+                "2024-01-15 10:01:23 WARN  Retrying connection attempt=1",
+                "2024-01-15 10:01:25 WARN  Retrying connection attempt=2",
+                "2024-01-15 10:01:30 ERROR Max retries exceeded",
+            ]
+        ),
+    ],
+    ids=["env", "kube", "log"],
+)
+async def test_stage0_payload_raises_policy_blocked(payload: str) -> None:
     g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
-    env_content = (
-        "DATABASE_URL=postgres://admin:hunter2@db.corp.lan:5432/prod\n"
-        "SECRET_KEY=supersecretvalue-abc123\n"
-        "DEBUG=False\n"
-        "REDIS_URL=redis://cache.corp.lan:6379/0\n"
-        "ALLOWED_HOSTS=*.corp.lan\n"
-    )
-    data = _data_with_token("tok-1", content=env_content)
-    with pytest.raises(GuardrailHttpException) as ei:
-        await g.pre_call(data)
-    assert ei.value.status_code == 422
-    assert ei.value.error_code == "E_POLICY_BLOCKED"
-
-
-async def test_stage0_kube_payload_raises_policy_blocked() -> None:
-    """Kubernetes manifest is blocked before egress."""
-    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
-    kube_content = (
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: my-app\n"
-        "  namespace: production\n"
-        "spec:\n"
-        "  replicas: 3\n"
-        "  selector:\n"
-        "    matchLabels:\n"
-        "      app: my-app\n"
-    )
-    data = _data_with_token("tok-1", content=kube_content)
-    with pytest.raises(GuardrailHttpException) as ei:
-        await g.pre_call(data)
-    assert ei.value.status_code == 422
-    assert ei.value.error_code == "E_POLICY_BLOCKED"
-
-
-async def test_stage0_log_dump_raises_policy_blocked() -> None:
-    """Application log dump is blocked before egress."""
-    g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
-    log_lines = "\n".join(
-        [
-            "2024-01-15 10:00:01 INFO  Starting application server",
-            "2024-01-15 10:00:02 INFO  Loaded configuration from /etc/app.conf",
-            "2024-01-15 10:00:03 DEBUG Database pool initialized connections=10",
-            "2024-01-15 10:00:15 INFO  Listening on 0.0.0.0:8080",
-            "2024-01-15 10:01:22 ERROR Failed to connect to cache host=redis port=6379",
-            "2024-01-15 10:01:23 WARN  Retrying connection attempt=1",
-            "2024-01-15 10:01:25 WARN  Retrying connection attempt=2",
-            "2024-01-15 10:01:30 ERROR Max retries exceeded",
-        ]
-    )
-    data = _data_with_token("tok-1", content=log_lines)
+    data = _data_with_token("tok-1", content=payload)
     with pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
     assert ei.value.status_code == 422

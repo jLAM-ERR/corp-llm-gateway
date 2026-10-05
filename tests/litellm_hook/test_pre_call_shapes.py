@@ -1,6 +1,7 @@
 """What the pre-call rewrites in each request shape: messages, system, instructions, Responses
 `input`, audio, and the call_type gate on `input`."""
 
+import copy
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -215,33 +216,52 @@ async def test_pre_call_responses_bare_string_input_element_is_sanitized() -> No
     assert out["input"][0] == "leak [SECRET_001] here"
 
 
-async def test_pre_call_embeddings_input_string_passes_through_untouched() -> None:
-    """Exact review repro: /v1/embeddings' `input` is raw text to vectorize,
-    not a Responses items list — release left it untouched; sanitizing it
-    would vectorize on placeholder text instead of the real text."""
-    g, _ = _build_guardrail([("alice", "[NAME_001]")])
+@pytest.mark.parametrize(
+    ("pairs", "model", "payload", "call_type"),
+    [
+        # Exact review repro: /v1/embeddings' `input` is raw text to vectorize,
+        # not a Responses items list — release left it untouched; sanitizing it
+        # would vectorize on placeholder text instead of the real text.
+        ([("alice", "[NAME_001]")], "text-embedding-3-small", "alice@corp.example", "embedding"),
+        # Exact review repro: /v1/moderations' `input` is a list of raw strings
+        # to score, not Responses items — moderation scoring must see the real
+        # text, not a redacted one.
+        (
+            [("alice", "[NAME_001]"), ("bob", "[NAME_002]")],
+            "omni-moderation-latest",
+            ["alice", "bob"],
+            "moderation",
+        ),
+        # Exact review repro: litellm's pinned proxy_server.py passes
+        # call_type="aspeech" for POST /v1/audio/speech, whose `input` is the raw
+        # text to synthesize — there is no reverse path for audio, so redacting it
+        # would make the synthesized speech say the placeholder token aloud.
+        (
+            [("Alice Smith", "[NAME_001]")],
+            "tts-1",
+            "Please welcome Alice Smith to the stage",
+            "aspeech",
+        ),
+        # pass_through_endpoint bodies are opaque and admin/backend-defined (e.g.
+        # a Voyage-embeddings-shaped `{"input": [...]}`) — same class of risk as
+        # /v1/embeddings, so treated the same way: not rewritten as Responses
+        # items, only DLP-scanned (Stage 5) via the unmanaged shape.
+        ([("alice", "[NAME_001]")], "voyage-3", ["alice@corp.example"], "pass_through_endpoint"),
+    ],
+    ids=["embedding", "moderation", "aspeech", "pass_through_endpoint"],
+)
+async def test_pre_call_unmanaged_call_type_input_passes_through_untouched(
+    pairs: list[tuple[str, str]], model: str, payload: Any, call_type: str
+) -> None:
+    g, _ = _build_guardrail(pairs)
     data = {
-        "model": "text-embedding-3-small",
-        "input": "alice@corp.example",
+        "model": model,
+        # A copy: `payload` stays the expected value even if pre_call rewrites `input` in place.
+        "input": copy.deepcopy(payload),
         "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
     }
-    out = await g.pre_call(data, call_type="embedding")
-    assert out["input"] == "alice@corp.example"
-    assert "messages" not in out
-
-
-async def test_pre_call_moderations_input_list_passes_through_untouched() -> None:
-    """Exact review repro: /v1/moderations' `input` is a list of raw strings
-    to score, not Responses items — moderation scoring must see the real
-    text, not a redacted one."""
-    g, _ = _build_guardrail([("alice", "[NAME_001]"), ("bob", "[NAME_002]")])
-    data = {
-        "model": "omni-moderation-latest",
-        "input": ["alice", "bob"],
-        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
-    }
-    out = await g.pre_call(data, call_type="moderation")
-    assert out["input"] == ["alice", "bob"]
+    out = await g.pre_call(data, call_type=call_type)
+    assert out["input"] == payload
     assert "messages" not in out
 
 
@@ -321,22 +341,6 @@ async def test_pre_call_unrecognized_call_type_still_sanitizes_input() -> None:
     assert out["input"] == "contact [NAME_001]"
 
 
-async def test_pre_call_speech_input_passes_through_untouched() -> None:
-    """Exact review repro: litellm's pinned proxy_server.py passes
-    call_type="aspeech" for POST /v1/audio/speech, whose `input` is the raw
-    text to synthesize — there is no reverse path for audio, so redacting it
-    would make the synthesized speech say the placeholder token aloud."""
-    g, _ = _build_guardrail([("Alice Smith", "[NAME_001]")])
-    data = {
-        "model": "tts-1",
-        "input": "Please welcome Alice Smith to the stage",
-        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
-    }
-    out = await g.pre_call(data, call_type="aspeech")
-    assert out["input"] == "Please welcome Alice Smith to the stage"
-    assert "messages" not in out
-
-
 async def test_pre_call_speech_call_type_also_passes_through() -> None:
     g, _ = _build_guardrail([("Alice Smith", "[NAME_001]")])
     data = {
@@ -346,22 +350,6 @@ async def test_pre_call_speech_call_type_also_passes_through() -> None:
     }
     out = await g.pre_call(data, call_type="speech")
     assert out["input"] == "Alice Smith"
-
-
-async def test_pre_call_pass_through_endpoint_input_passes_through_untouched() -> None:
-    """pass_through_endpoint bodies are opaque and admin/backend-defined (e.g.
-    a Voyage-embeddings-shaped `{"input": [...]}`) — same class of risk as
-    /v1/embeddings, so treated the same way: not rewritten as Responses
-    items, only DLP-scanned (Stage 5) via the unmanaged shape."""
-    g, _ = _build_guardrail([("alice", "[NAME_001]")])
-    data = {
-        "model": "voyage-3",
-        "input": ["alice@corp.example"],
-        "headers": {"X-Corp-Auth": "tok-1", "Authorization": "Bearer byok"},
-    }
-    out = await g.pre_call(data, call_type="pass_through_endpoint")
-    assert out["input"] == ["alice@corp.example"]
-    assert "messages" not in out
 
 
 async def test_pre_call_codex_profile_oracle_disabled_applies_rules_directly() -> None:
@@ -409,13 +397,6 @@ async def test_pre_call_codex_profile_oracle_disabled_applies_rules_directly() -
     out = await g.pre_call(data)
 
     assert out["input"][0]["content"][0]["text"] == "Migrating [CONFIDENTIAL_PROJECT] to new stack"
-
-
-async def test_pre_call_replaces_message_content_with_sanitized() -> None:
-    g, _ = _build_guardrail([("alice", "[NAME_001]")])
-    data = _data_with_token("tok-1", content="hello alice")
-    out = await g.pre_call(data)
-    assert out["messages"][0]["content"] == "hello [NAME_001]"
 
 
 async def test_pre_call_same_email_two_segments_reuses_one_token() -> None:
@@ -467,14 +448,6 @@ async def test_pre_call_collision_message_vs_tool_result() -> None:
     text_ph = re.search(r"\[EMAIL_\d+\]", blocks[0]["text"]).group(0)
     tr_ph = re.search(r"\[EMAIL_\d+\]", blocks[1]["content"]).group(0)
     assert text_ph != tr_ph, (text_ph, tr_ph)
-
-
-async def test_pre_call_rejects_non_list_messages() -> None:
-    g, _ = _build_guardrail()
-    data = {"model": "claude", "messages": "not-a-list", "headers": {"X-Corp-Auth": "tok-1"}}
-    with pytest.raises(GuardrailHttpException) as ei:
-        await g.pre_call(data)
-    assert ei.value.error_code == "E_BAD_REQUEST"
 
 
 async def test_pre_call_skips_unwrapped_literal_scan_when_codex_flag_off(
@@ -545,22 +518,6 @@ async def test_pre_call_block_list_message_content_sanitized() -> None:
     assert out["messages"][0]["content"][1] == content[1]
 
 
-async def test_pre_call_tool_result_block_sanitized() -> None:
-    """Task 2: tool_result blocks with str content are sanitized."""
-    g, _ = _build_guardrail([("secret", "[SECRET_001]")])
-    content = [
-        {
-            "type": "tool_result",
-            "content": "the secret is revealed",
-        }
-    ]
-    data = _data_with_token("tok-1", content=content)
-    out = await g.pre_call(data)
-
-    assert out["messages"][0]["content"][0]["type"] == "tool_result"
-    assert out["messages"][0]["content"][0]["content"] == "the [SECRET_001] is revealed"
-
-
 async def test_pre_call_system_str_sanitized() -> None:
     """Task 3: system field as str is sanitized."""
     g, _ = _build_guardrail([("SecretEnv", "[ENV_001]")])
@@ -610,15 +567,6 @@ async def test_pre_call_sanitizes_both_system_and_instructions_when_both_present
     forwarded = json.dumps(out)
     assert "SecretEnvA" not in forwarded, "system original egressed"
     assert "SecretEnvB" not in forwarded, "instructions original egressed"
-
-
-async def test_pre_call_str_message_regression() -> None:
-    """Task 2: plain-string message content still works (OpenAI-compatible regression)."""
-    g, _ = _build_guardrail([("alice", "[N1]")])
-    data = _data_with_token("tok-1", content="hi alice")
-    out = await g.pre_call(data)
-
-    assert out["messages"][0]["content"] == "hi [N1]"
 
 
 async def test_pre_call_hybrid_messages_empty_and_input_rejected() -> None:
