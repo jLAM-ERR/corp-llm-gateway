@@ -845,8 +845,8 @@
    "site": "tests/sanitizer/test_orchestrator.py:1313",
    "owner": "tests/sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed",
    "check": "not any(('fingerprint source unavailable' in m for m in warnings))",
-   "class": "behaviour",
-   "note": "the fingerprint warning names the exception type, not its text (upgrade.md:402); construction-time, the text is a test constant, no user content"
+   "class": "security",
+   "note": "no exception detail (policy terms / allowlist entries) in the cache_a_disabled warning (M1-14; orchestrator.py:487)"
   },
   {
    "site": "tests/sanitizer/test_orchestrator.py:1302",
@@ -1145,6 +1145,7 @@
   "tests/route_gate/test_terminal_audit.py::test_a_failed_write_is_retried_once_at_close_with_the_same_outcome",
   "tests/route_gate/test_terminal_audit.py::test_the_close_write_has_no_retry_of_its_own",
   "tests/route_gate/test_terminal_audit.py::test_the_retry_behind_a_failed_in_flight_write_keeps_its_outcome",
+  "tests/sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed",
   "tests/sanitizer/test_profile_orchestrator.py::test_an_unreachable_team_config_store_is_503_profile_unavailable",
   "tests/sanitizer/test_streaming.py::test_responses_stream_event_reconstruct_failure_log_has_no_original",
   "tests/test_bootstrap.py::test_dev_team_token_ignored_when_corp_env_prod",
