@@ -9,14 +9,14 @@
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/detectors/test_corp_ner.py:380",
+   "site": "tests/detectors/test_corp_ner.py:374",
    "owner": "tests/detectors/test_corp_ner.py::test_never_logs_request_or_response_text",
    "check": "'Корол' not in record.getMessage()",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/detectors/test_corp_ner.py:379",
+   "site": "tests/detectors/test_corp_ner.py:373",
    "owner": "tests/detectors/test_corp_ner.py::test_never_logs_request_or_response_text",
    "check": "secret not in record.getMessage()",
    "class": "security",
