@@ -441,8 +441,9 @@ compared with `tests/_gates/coverage_gate.py`'s `from_report` / `drops`:
 | minimal / full | `healthz/checks.py` | 87 / 17 | 87 / 17 | 113 / 26 |
 
 `drops(before, after)` and `drops(after, before)` are empty in both environments over all 122 `src/` files the run
-reports (2,409 lines / 279 arcs before and after). The two no-survivor deletions (#3, #6) execute no line or arc
-that a surviving test of the same files does not.
+reports (2,409 lines / 279 arcs before and after). Phase 1 proposed two no-survivor deletions (#3, #6); rev 17
+named a survivor for #3 (`test_nfc_offsets_map_back_to_the_original_string`), so #6 is the one survivor-less
+deletion. Neither executes a line or arc that a surviving test of the same files does not.
 
 ## Dry run (scratch clone; nothing in the checkout's `tests/` or `src/` changed)
 
@@ -482,9 +483,12 @@ Ready to copy; the fault-injection column is re-run on the checkout in phase 2 a
 
 `deleted-tests.md`'s header says a row is complete only when "the surviving test(s) have the same inputs, select the
 same production path, …" and, for a disputed replacement, the survivor failed a mutation (gate 5); "How to fill a
-row" defines outcome, checks, note and injection, and nothing for a missing survivor. **So the spec does not admit
-`none — trivial (<reason>)` today.** The rows for #3 and #6 above are written that way only as a proposal; they
-need a rev 17 ruling (Q1). Every earlier row names a survivor.
+row" defines outcome, checks, note and injection, and nothing for a missing survivor. **So at phase 1 the spec
+did not admit `none — trivial (<reason>)`**, and phase 1 proposed the rows for #3 and #6 that way, pending a rev 17
+ruling (Q1). Rev 17 ruled: #3 names the survivor `test_nfc_offsets_map_back_to_the_original_string`; #6 stays
+`none — trivial`, admitted by the header bullet a40c4cf added (a trivial test, not a policy default, with
+`n/a (no survivor; coverage equal: <module>)` as fault injection, when the coverage gate shows no dropped line or
+arc). #6 is the ledger's only row without a survivor.
 
 ## Noted for Task 10 / a strengthening PR
 
@@ -524,8 +528,9 @@ Decided by the rules:
 - No log assert is deleted: every (b) and (c) assert sits in a test kept for other asserts or is the only probe of
   its behaviour; the 4 negative ones are reviewed `behaviour` rows with no survivor (K1-K3).
 - No `call_count` assert is an implementation detail; all 37 keep.
-- 5 trivial deletions (2 with survivors on the same input, 1 with survivors on the record path, 2 with none; rev 17: 1 with none, #3 got a survivor) and
-  the Task 4 twin. Coverage equal; every injection fails the survivor where one is named.
+- 6 deletions: 5 with survivors, 1 with none (#6). That is the Task 4 twin (#1) and 5 trivial deletions: #2 and #4
+  with survivors on the same input, #5 with survivors on the record path, #3 with the survivor rev 17 named.
+  Coverage equal; every injection fails the survivor where one is named.
 - 23 Set C keeps: policy default, a branch into `src/`, a fail-policy or security property, or a registry
   relation.
 
