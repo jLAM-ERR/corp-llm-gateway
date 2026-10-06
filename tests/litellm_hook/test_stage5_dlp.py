@@ -28,6 +28,7 @@ async def test_stage5_dlp_blocks_canary_survivor(
     assert "dlp:canary" in caplog.text
     blocked = [r for r in caplog.records if r.getMessage().startswith("litellm_egress_blocked ")]
     assert len(blocked) == 1
+    assert blocked[0].levelno == logging.INFO
     assert "block_reason=dlp:canary" in blocked[0].getMessage().split()
 
 
