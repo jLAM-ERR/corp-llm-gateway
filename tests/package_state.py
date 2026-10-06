@@ -8,7 +8,10 @@ a module the code under test never reads, and that test passes or fails by run o
 from __future__ import annotations
 
 import sys
+from collections.abc import Generator
 from types import ModuleType
+
+import pytest
 
 PACKAGE = "corp_llm_gateway"
 
@@ -74,3 +77,21 @@ def restore_package_attributes() -> None:
             setattr(parent, child, module)
         else:
             delattr(parent, child)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item) -> Generator[None, None, None]:
+    """Fail a test that leaves a stale package attribute (and put it back). Registered by
+    ``tests/conftest.py``; it runs after every fixture's teardown, ``monkeypatch``'s undo
+    included, so it sees what the next test will."""
+    try:
+        result = yield
+    except BaseException as exc:
+        if stale := stale_package_attributes():
+            restore_package_attributes()
+            exc.add_note(f"test also left stale package attributes: {stale}")
+        raise
+    if stale := stale_package_attributes():
+        restore_package_attributes()
+        pytest.fail(f"test left package attributes on stale modules: {stale}", pytrace=False)
+    return result

@@ -14,8 +14,9 @@
 #    stops collecting, or dropped line / branch arc fails.
 #
 # --record runs 1 and 3 only and leaves the ledger and coverage in --out, for a
-# re-baseline. --shuffle-seed N runs step 3 in pytest's seeded random order (tests/conftest.py);
-# the ledger and coverage are keyed by node id and file, so the checks do not depend on it.
+# re-baseline. --shuffle-seed N runs step 3 in the suite's own seeded order (the option
+# tests/conftest.py adds); the ledger and coverage are keyed by node id and file, so the
+# checks do not depend on it.
 # Create the venv first with scripts/test-env.sh <env>.
 set -euo pipefail
 

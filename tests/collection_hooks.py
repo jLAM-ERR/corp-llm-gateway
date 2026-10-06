@@ -7,16 +7,17 @@ import random
 from pathlib import Path
 
 import pytest
-from _pytest.fixtures import reorder_items
 
 SLOW_TESTS_FILE = Path(__file__).parent / "slow_tests.txt"
 
 
 def slow_entries(path: Path = SLOW_TESTS_FILE) -> set[str]:
+    """Every line but blank ones and whole-line ``#`` comments; a ``#`` inside an entry
+    (a parametrize id) is part of it."""
     entries = set()
     for line in path.read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
+        line = line.strip()
+        if line and not line.startswith("#"):
             entries.add(line)
     return entries
 
@@ -36,6 +37,9 @@ def shuffled(items: list[pytest.Item], seed: int) -> list[pytest.Item]:
     """Modules in a seeded random order, then the classes in each, then the tests in each;
     pytest's own reorder then groups the cases of a module- or class-scoped parameter, so
     no wider-scoped fixture is set up more often than in the ordered run."""
+    # Private pytest API, imported here so an upgrade that moves it breaks only shuffled runs.
+    from _pytest.fixtures import reorder_items
+
     rng = random.Random(seed)
     modules: dict[str, dict[str, list[pytest.Item]]] = {}
     for item in items:
