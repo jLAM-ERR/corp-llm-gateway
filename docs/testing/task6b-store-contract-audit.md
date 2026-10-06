@@ -8,6 +8,24 @@ of the six files and changes no test. Phase 2 (after review) makes the deletions
 [deleted-tests.md](deleted-tests.md) rows, the fault injections on the checkout and the manifest regeneration.
 The gates are in [must-keep.md](must-keep.md). Tree: `release/1.0.x` at `6b8e9bb`.
 
+**Phase 2 done** (commits `f31122f` deletions + ledger rows + injections, `11d3754` manifests, this commit line refs):
+the 14 deletions below are made. Rev 16 decided the review questions: the 14 deletions stand; Q1 / Q2 keep (so
+`test_in_memory.py` stays a collected module, no `git rm`); Q3 / Q4 delete (a survivor that sets more store data is
+a superset survivor when the store neither reads nor transforms it); Q5 delete (the read-path tz survivor, D8a-c
+required); Q6 the `tokens/test_postgres_store.py` docstring sentence is added, the `team_config/test_store.py`
+pointer comment is unchanged. The only edits besides the function removals are the `TeamNotFoundError,` import
+line, the EOF blank-line strips and that docstring sentence. The 14 injections were re-run on the checkout
+(survivors only; in-memory in both venvs, Postgres in full): every survivor failed at the line its row cites, and
+each was reverted with `src/` clean after. Line numbers marked "at HEAD" are the pruned tree's, measured; every
+other line number is `6b8e9bb`'s. At HEAD the three edited files are 25 / 424 / 49 lines (`test_in_memory.py` /
+`tokens/test_postgres_store.py` / `team_config/test_store.py`; 424 = 422 + the two docstring lines `:7-8`) and hold
+1 / 8 / 3 test functions; the seven files collect 133 ids (minimal 78 passed / 55 skipped, full 133 passed); the
+record runs collect 5,103 ids in minimal and 5,918 in full. The K rows' kept candidates assert at
+`test_in_memory.py:25` (K1), `tokens/test_postgres_store.py:91` (K2) and `team_config/test_store.py:45` (K3) at
+HEAD. The manifest diff (`git diff 6b8e9bb 11d3754 -- tests/_manifests`) is the
+[prediction below](#predicted-phase-2-manifest-diff), byte-identical to the scratch preview; every gate exits 0 in
+both venvs, and `coverage_gate check` finds no dropped line or arc.
+
 **Decision: 14 delete, 23 keep.** All 14 deletions repeat a contract case on the same backend
 (`tests/tokens/test_token_store_contract.py` or `tests/team_config/test_postgres_store.py`): 3 in
 `tokens/test_in_memory.py`, 5 in `tokens/test_postgres_store.py`, 6 in `team_config/test_store.py`. Nothing in
@@ -104,7 +122,7 @@ delegated `skip_or_fail` fail 1. `def line` is the `def` statement at `6b8e9bb`.
 
 | node id | def line at 6b8e9bb | checks | class | decision | survivor node id(s) | semantic note | fault injection |
 |---|---|---|---|---|---|---|---|
-| `test_pg_lookup_unknown_returns_none` | :79 | a2 r0 f0; fixture `pg_store` | contract repeat: `test_lookup_unknown_returns_none` | delete | `tests/tokens/test_token_store_contract.py::test_lookup_unknown_returns_none[postgres]` | Contract repeat, same backend (`PostgresTokenStore`, same `lookup`, same `is None`). Fixture: `pg_store` (`_dsn()`, default pool, `DELETE … LIKE 'pg-test-%'`) vs the contract's `_try_make_postgres` (`pg_dsn()`, 12-connection warmed pool, `TRUNCATE`). Both resolve `CORP_TEST_PG_DSN` first. The missing key is random `pg-missing-<hex>` vs `ct-contract-unknown`. The extra `isinstance(pg_store, PostgresTokenStore)` only narrows the fixture's `object` type: the fixture builds that class, and no production change can fail it. The must-keep `test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout_not_waits` (assert at `:460`) also asserts a Postgres miss is `None`. | n/a (same path: `PostgresTokenStore.lookup`), run anyway in full (both skip in minimal): `src/corp_llm_gateway/tokens/postgres_store.py:189` `return None` → `return TokenInfo(corp_token, '', '', (), datetime.now(UTC), datetime.now(UTC))`. The candidate failed `test_postgres_store.py:83` and the survivor failed `test_token_store_contract.py:99`. Reverted, empty |
+| `test_pg_lookup_unknown_returns_none` | :79 | a2 r0 f0; fixture `pg_store` | contract repeat: `test_lookup_unknown_returns_none` | delete | `tests/tokens/test_token_store_contract.py::test_lookup_unknown_returns_none[postgres]` | Contract repeat, same backend (`PostgresTokenStore`, same `lookup`, same `is None`). Fixture: `pg_store` (`_dsn()`, default pool, `DELETE … LIKE 'pg-test-%'`) vs the contract's `_try_make_postgres` (`pg_dsn()`, 12-connection warmed pool, `TRUNCATE`). Both resolve `CORP_TEST_PG_DSN` first. The missing key is random `pg-missing-<hex>` vs `ct-contract-unknown`. The extra `isinstance(pg_store, PostgresTokenStore)` only narrows the fixture's `object` type: the fixture builds that class, and no production change can fail it. The must-keep `test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout_not_waits` (assert at `:460`; `:395` at HEAD) also asserts a Postgres miss is `None`. | n/a (same path: `PostgresTokenStore.lookup`), run anyway in full (both skip in minimal): `src/corp_llm_gateway/tokens/postgres_store.py:189` `return None` → `return TokenInfo(corp_token, '', '', (), datetime.now(UTC), datetime.now(UTC))`. The candidate failed `test_postgres_store.py:83` and the survivor failed `test_token_store_contract.py:99`. Reverted, empty |
 | `test_pg_upsert_and_lookup` | :87 | a8 r0 f0; fixture `pg_store` | backend-specific | keep | — | Backend-specific check the contract lacks: `got.scopes == ("read", "write")`, a 2-element `TEXT[]` round trip in order. The contract stores and asserts `("read",)` only, and no other Postgres test asserts a multi-scope row. `got.corp_token == tok` and the `issued_at` / `expires_at` `tzinfo` asserts do have implicit survivors on the same read function `_row_to_token_info`: `[postgres]` `test_parallel_distinct_jtis_at_full_capacity` (`corp_token`) and `test_issue_for_subject_stores_an_active_row` (`stored.issued_at == _T0`, an aware compare). Both write through `issue_for_subject`, not `upsert`. The scopes assert alone keeps it. Keep evidence K2. | — (K2) |
 | `test_pg_revoke_reflects_in_lookup` | :104 | a5 r0 f0; fixture `pg_store` | contract repeat: `test_revoke_user_idempotent` + `test_revoke_user_marks_all_their_tokens`; tz: `test_a_subject_at_cap_with_only_expired_and_revoked_rows_revokes_nothing` | delete | `tests/tokens/test_token_store_contract.py::test_revoke_user_idempotent[postgres]`, `::test_revoke_user_marks_all_their_tokens[postgres]`, `::test_a_subject_at_cap_with_only_expired_and_revoked_rows_revokes_nothing[postgres]` | Contract repeat across three cases, same backend. `n == 1` on one row is the first assert of `test_revoke_user_idempotent[postgres]`. "revoked after `revoke_user`, read by `lookup`" is `test_revoke_user_marks_all_their_tokens[postgres]` (`a1`/`a2 .revoked_at is not None`). `revoked_at.tzinfo is not None` is the third case's `kept.revoked_at == revoked_at` (`:513`, `:521`): an aware `revoked_at` compared after `lookup`, which fails if the read returns a naive value. The tz assert reads `revoke_user`'s value, the survivor reads an `upsert`-written one. The tz of a read row is set only by `_row_to_token_info` / `_ensure_utc_opt` (`postgres_store.py:77-89`) on a `TIMESTAMPTZ` column, so no write-side change reaches it. Fixture, DSN, scopes, token naming and the `isinstance` assert: as `test_pg_lookup_unknown_returns_none`. | Required (the tz survivor writes through `upsert`, another method), full: (a) `src/corp_llm_gateway/tokens/postgres_store.py:78` `return None if dt is None else _ensure_utc(dt)` → `… else dt.replace(tzinfo=None)`. The candidate failed `test_postgres_store.py:115` (`revoked_at.tzinfo is not None`) and the survivor failed `test_token_store_contract.py:513` (`kept.revoked_at == revoked_at`). (b) `:206` `return int(status.split()[-1])` → `… + 1`. The candidate failed `:111` (`2 == 1`); `test_revoke_user_idempotent[postgres]` failed `:155` (`2 == 1`) and `test_revoke_user_marks_all_their_tokens[postgres]` failed `:140` (`3 == 2`). (c) `:201` `… AND revoked_at IS NULL` → `… AND revoked_at IS NULL AND FALSE`. The candidate failed `:111` (`0 == 1`) and `marks_all[postgres]` failed `:140` (`0 == 2`). Each reverted, empty |
 | `test_pg_revoke_idempotent` | :119 | a3 r0 f0; fixture `pg_store` | contract repeat: `test_revoke_user_idempotent` | delete | `tests/tokens/test_token_store_contract.py::test_revoke_user_idempotent[postgres]` | Contract repeat, same backend. One row for the user, `revoke_user` twice, `n1 == 1`, `n2 == 0`. Here: user `pg-test-alice`, scopes `("read", "write")`, a random token and direct `await pg_store.upsert`. In the survivor: user `alice`, `("read",)`, a fixed token and `_upsert`. Fixture and `isinstance`: as above. | n/a (same path: `PostgresTokenStore.revoke_user`), run anyway in full: `src/corp_llm_gateway/tokens/postgres_store.py:201` `WHERE user_id = $2 AND revoked_at IS NULL` → `WHERE user_id = $2`. The candidate failed `test_postgres_store.py:128` and the survivor failed `test_token_store_contract.py:156` (`assert 1 == 0`). Reverted, empty |
@@ -273,7 +291,7 @@ store's `issue_for_subject`). Neither is in the universe and neither can be dele
   and Postgres) is tests/team_config/test_postgres_store.py (Postgres cases skip without asyncpg).` (One comment
   line; it changes no test's body hash.) Gate self-tests L1 / L3 use this module whole. On the pruned clone
   `selftest ledger` still rejects both (L3 on `test_default_fail_policy_matches_matrix`).
-- **`tests/tokens/test_postgres_store.py`**: 489 → 422 lines. `pg_store`, `_dsn`, `_tok`, `_info`, `_issue_for`,
+- **`tests/tokens/test_postgres_store.py`**: 489 → 422 lines from the deletions; 424 at HEAD with the docstring sentence. `pg_store`, `_dsn`, `_tok`, `_info`, `_issue_for`,
   `_wait_for_lock_waiter` and `_issue_many` stay in use by the seven must-keep tests (`pg_store` in the four
   fixture-using races and in `test_pg_upsert_and_lookup`; `_dsn()` in the three that build their own store; `_tok`
   / `_info` in all). No helper is orphaned. No import goes unused (ruff clean). `_info`'s `user_id=` and
@@ -282,7 +300,7 @@ store's `issue_for_subject`). Neither is in the universe and neither can be dele
   must-keep test that reaches it. Noted for Task 7. The module docstring (`:1-7`) stays true. An optional sentence
   for phase 2, if the reviewer wants it: `Basic CRUD (lookup, upsert, revoke) runs against both stores in
   tests/tokens/test_token_store_contract.py; this file keeps the Postgres-only checks.` A module docstring is in
-  no test's body hash. The dry run did not add it.
+  no test's body hash. The dry run did not add it; phase 2 did (rev 16 (5)), at HEAD `:7-8`.
 - **`tests/tokens/test_issuance.py`**: nothing is deleted, and nothing structural changes.
 - **`tests/tokens/test_issuance_policy.py`**, **`tests/team_config/test_postgres_store.py`**: no edit.
 
@@ -329,18 +347,19 @@ The one expected failure before regeneration is `tests/_gates/test_suite_gates.p
 
 Lines removed per deletion (the decorator through the blank lines after it), and the drift of what stays:
 
-- `tests/tokens/test_in_memory.py` 59 → 25: `:20-25` 6, `:34-59` 26 (the last two functions, with the blank lines
+- `tests/tokens/test_in_memory.py` 59 → 25 (at HEAD): `:20-25` 6, `:34-59` 26 (the last two functions, with the blank lines
   between them), 2 trailing blank lines stripped; `test_upsert_and_lookup` `:27 → :21`.
-- `tests/tokens/test_postgres_store.py` 489 → 422: `:78-85` 8, `:103-117` 15, `:118-130` 13, `:131-144` 14,
-  `:145-161` 17; `test_pg_upsert_and_lookup` `:87 → :79`. Every must-keep test after `:161` moves −67:
-  `test_pg_jti_unique_violation_is_a_replay_without_driver_detail` `:193 → :126`,
-  `test_pg_subject_lock_wait_times_out_as_busy` `:239 → :172`, `test_init_schema_adds_oidc_columns_to_preexisting_table`
-  `:281 → :214`, `test_pg_colliding_subject_locks_serialise_but_never_mix_rows` `:357 → :290`,
-  `test_pg_issuance_waits_for_a_pool_connection_instead_of_failing` `:393 → :326`,
-  `test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout_not_waits` `:432 → :365`,
-  `test_pg_a_statement_past_its_timeout_is_busy` `:466 → :399`. `must-keep.md` and the ledger cite none of these
+- `tests/tokens/test_postgres_store.py` 489 → 422 (424 at HEAD: +2 docstring lines at `:7-8`): `:78-85` 8,
+  `:103-117` 15, `:118-130` 13, `:131-144` 14, `:145-161` 17; at HEAD `test_pg_upsert_and_lookup` `:87 → :81`, and
+  every must-keep test after `:161` moves −65 (−67 + 2):
+  `test_pg_jti_unique_violation_is_a_replay_without_driver_detail` `:193 → :128`,
+  `test_pg_subject_lock_wait_times_out_as_busy` `:239 → :174`, `test_init_schema_adds_oidc_columns_to_preexisting_table`
+  `:281 → :216`, `test_pg_colliding_subject_locks_serialise_but_never_mix_rows` `:357 → :292`,
+  `test_pg_issuance_waits_for_a_pool_connection_instead_of_failing` `:393 → :328`,
+  `test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout_not_waits` `:432 → :367`,
+  `test_pg_a_statement_past_its_timeout_is_busy` `:466 → :401`. `must-keep.md` and the ledger cite none of these
   lines.
-- `tests/team_config/test_store.py` 99 → 49: `:9` 1 (the import), `:41-47` 7, `:56-64` 9, `:65-70` 6, `:71-79` 9,
+- `tests/team_config/test_store.py` 99 → 49 (at HEAD): `:9` 1 (the import), `:41-47` 7, `:56-64` 9, `:65-70` 6, `:71-79` 9,
   `:80-88` 9, `:89-97` 9; `_team` `:13 → :12`, `test_team_config_defaults` `:22 → :21`,
   `test_default_fail_policy_matches_matrix` `:31 → :30`, `test_upsert_and_get` `:49 → :41`.
 - `baseline_checks` entries carry no line, so no surviving test reports anything in `inventory --check`
