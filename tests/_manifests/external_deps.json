@@ -4801,6 +4801,12 @@
    },
    "programs": []
   },
+  "tests/test_bootstrap.py::test_a_demo_reimport_test_restores_the_module_and_the_package_attribute": {
+   "files": {},
+   "programs": [
+    "module:corp_llm_gateway._demo_guardrail"
+   ]
+  },
   "tests/test_bootstrap.py::test_demo_boot_path_raises_when_both_forward_auth_flags_set": {
    "files": {},
    "programs": [
