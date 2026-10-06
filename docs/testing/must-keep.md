@@ -157,7 +157,9 @@ Its manifest diff is only:
   that list by hand. A test that is not must-keep drops out with no refusal, and only review
   catches it. To move a security helper, first edit its row's `owner` by hand, keeping
   `class` and `note`, then run `--write`;
-- `external_deps.json`: hashes only, for the docs and files it hashes that the PR edits.
+- `external_deps.json`: hashes only, for the docs and files it hashes that the PR edits, or
+  the per-test file set of a fold's members (Task 6a: the four bootstrap members' entries
+  go, the four deploy entries gain `scripts/deploy/bootstrap-server.sh`; no hash changes).
 
 Anything else is not a pure move. One case is expected: a test whose body names its own
 file (`__file__`, `Path(__file__).parent / …`, a literal `tests/…` path) gets a new

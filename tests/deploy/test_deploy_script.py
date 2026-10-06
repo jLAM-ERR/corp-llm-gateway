@@ -6,7 +6,8 @@ the repo's stderr helpers, no destructive flag, no committed secret), function
 level tests that source the script against a tmp_path, and end-to-end runs of a
 copy of the script inside a fake checkout with `ssh`, `rsync` and `docker`
 stubs on PATH. The rsync stub calls the real rsync into a local directory, so
-the ".env is never synced" claims are semantic, not textual.
+the ".env is never synced" claims are semantic, not textual. The strict-mode,
+stderr-helper, `bash -n` and shellcheck asserts run on bootstrap-server.sh too.
 """
 
 from __future__ import annotations
@@ -215,32 +216,38 @@ def _remote_dir(tmp_path: Path, *, with_env: bool = True) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# content asserts
+# content asserts — the first four run on both deploy scripts
 # --------------------------------------------------------------------------- #
 
 
-def test_script_is_executable_bash_with_strict_mode(script_text: str) -> None:
-    assert SCRIPT.exists(), f"{SCRIPT} does not exist"
-    assert SCRIPT.stat().st_mode & stat.S_IXUSR, "script is not executable"
+@pytest.mark.parametrize("script", [SCRIPT, BOOTSTRAP], ids=["deploy", "bootstrap-server"])
+def test_script_is_executable_bash_with_strict_mode(script: Path) -> None:
+    script_text = script.read_text()
+    assert script.exists(), f"{script} does not exist"
+    assert script.stat().st_mode & stat.S_IXUSR, "script is not executable"
     assert script_text.startswith("#!/usr/bin/env bash\n")
     assert "set -euo pipefail" in script_text
 
 
-def test_defines_repo_standard_helpers_writing_to_stderr(script_text: str) -> None:
+@pytest.mark.parametrize("script", [SCRIPT, BOOTSTRAP], ids=["deploy", "bootstrap-server"])
+def test_defines_repo_standard_helpers_writing_to_stderr(script: Path) -> None:
+    script_text = script.read_text()
     for name in ("fatal", "warn", "info"):
         body = _function_body(script_text, name)
         assert ">&2" in body, f"{name}() must write to stderr like scripts/demo.sh"
     assert "exit 1" in _function_body(script_text, "fatal")
 
 
-def test_bash_syntax_is_valid() -> None:
-    result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
+@pytest.mark.parametrize("script", [SCRIPT, BOOTSTRAP], ids=["deploy", "bootstrap-server"])
+def test_bash_syntax_is_valid(script: Path) -> None:
+    result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("script", [SCRIPT, BOOTSTRAP], ids=["deploy", "bootstrap-server"])
 @pytest.mark.requires_shellcheck
-def test_shellcheck_clean() -> None:
-    result = subprocess.run(["shellcheck", str(SCRIPT)], capture_output=True, text=True)
+def test_shellcheck_clean(script: Path) -> None:
+    result = subprocess.run(["shellcheck", str(script)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

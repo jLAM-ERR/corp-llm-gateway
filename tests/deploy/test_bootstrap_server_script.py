@@ -1,10 +1,12 @@
 """Asserts for the day-0 server bootstrap script (plan Task 7 / D1).
 
 `main` installs Docker and writes under `/opt` as root, so it is never run
-here. Two layers instead: content asserts on the script text (strict mode, the
-repo's stderr helpers, no destructive command, no committed secret), and
-behaviour tests that source the script and call single functions against a
-tmp_path — the script only runs `main` when executed directly.
+here. Two layers instead: content asserts on the script text (no destructive
+command, no committed secret), and behaviour tests that source the script and
+call single functions against a tmp_path — the script only runs `main` when
+executed directly. Strict mode, the repo's stderr helpers, `bash -n` and
+shellcheck run on this script from test_deploy_script.py, parametrised over both
+deploy scripts.
 """
 
 from __future__ import annotations
@@ -39,29 +41,8 @@ def _function_body(text: str, name: str) -> str:
     return match.group(1)
 
 
-def test_script_is_executable_bash_with_strict_mode(script_text: str) -> None:
-    assert SCRIPT.exists(), f"{SCRIPT} does not exist"
-    assert SCRIPT.stat().st_mode & stat.S_IXUSR, "script is not executable"
-    assert script_text.startswith("#!/usr/bin/env bash\n")
-    assert "set -euo pipefail" in script_text
-
-
-def test_defines_repo_standard_helpers_writing_to_stderr(script_text: str) -> None:
-    for name in ("fatal", "warn", "info"):
-        body = _function_body(script_text, name)
-        assert ">&2" in body, f"{name}() must write to stderr like scripts/demo.sh"
-    assert "exit 1" in _function_body(script_text, "fatal")
-
-
-def test_bash_syntax_is_valid() -> None:
-    result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.requires_shellcheck
-def test_shellcheck_clean() -> None:
-    result = subprocess.run(["shellcheck", str(SCRIPT)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr
+# Strict mode, the stderr helpers, `bash -n` and shellcheck: test_deploy_script.py runs
+# them on this script, parametrised over both deploy scripts.
 
 
 def test_help_exits_zero_without_touching_the_host() -> None:
