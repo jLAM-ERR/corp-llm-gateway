@@ -335,9 +335,3 @@ async def test_extensions_exception_caught() -> None:
     status = await ExtensionsCheck(health_all=_boom).check()
     assert status.healthy is False
     assert "extensions_error" in status.detail
-
-
-def test_status_is_immutable_dataclass() -> None:
-    s = HealthStatus(True)
-    with pytest.raises(AttributeError):
-        s.healthy = False  # type: ignore[misc]

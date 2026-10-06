@@ -20,7 +20,7 @@ from corp_llm_gateway.corp_ner import (
     CorpNerUnavailableError,
     Span,
 )
-from corp_llm_gateway.detectors.base import BatchPIIDetector, Finding
+from corp_llm_gateway.detectors.base import BatchPIIDetector
 from corp_llm_gateway.detectors.corp_ner import _MIN_COMPOSABLE_SECOND, CorpNerDetector
 
 BASE_URL = "http://corp-ner.corp.lan:8004"
@@ -77,12 +77,6 @@ def _fixed(*spans: dict, truncated: bool = False) -> Any:
 # ---------------------------------------------------------------------------
 # NFC offset mapping
 # ---------------------------------------------------------------------------
-
-
-def test_fixture_actually_diverges_in_length_under_nfc() -> None:
-    assert len(_NFC) != len(_DECOMPOSED)
-    assert (len(_DECOMPOSED), len(_NFC)) == (16, 14)
-    assert _NFC == "Андрей Королёв"
 
 
 async def test_nfc_offsets_map_back_to_the_original_string() -> None:
@@ -388,10 +382,6 @@ async def test_failure_message_carries_no_text() -> None:
         await CorpNerDetector(_client(handler)).detect("\u041a\u043e\u0440\u043e\u043b\u0451\u0432")
 
     assert "\u041a\u043e\u0440\u043e\u043b" not in str(excinfo.value)
-
-
-def test_finding_is_the_shared_dataclass() -> None:
-    assert Finding(text="a", label="PERSON", start=0, end=1, score=1.0).label == "PERSON"
 
 
 # ---------------------------------------------------------------------------

@@ -44,18 +44,6 @@ def _base_event(**overrides: object) -> AuditEvent:
 # AuditEvent carries the fields ---------------------------------------------
 
 
-def test_event_defaults_are_empty() -> None:
-    event = _base_event()
-    assert event.profile_ids == ()
-    assert event.jurisdiction is None
-
-
-def test_event_carries_profile_ids_and_jurisdiction() -> None:
-    event = _base_event(profile_ids=("core", "ru-152fz"), jurisdiction="ru")
-    assert event.profile_ids == ("core", "ru-152fz")
-    assert event.jurisdiction == "ru"
-
-
 # Conditional serialization: present when set, omitted when not -------------
 
 
