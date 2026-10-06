@@ -3284,6 +3284,12 @@
     "module:corp_llm_gateway.extensions"
    ]
   },
+  "tests/extensions/test_registry_boundaries.py::test_the_reimport_check_leaves_the_package_attribute_on_the_live_module": {
+   "files": {},
+   "programs": [
+    "module:corp_llm_gateway.extensions"
+   ]
+  },
   "tests/healthz/test_ready_probe_postgres.py::test_a_schema_verified_at_boot_is_not_queried_by_readiness": {
    "files": {
     "src/corp_llm_gateway/tokens/schema.sql": "959818aff4943833e41f13dba1458d8f"
