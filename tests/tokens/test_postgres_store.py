@@ -4,6 +4,8 @@ Skips when asyncpg is absent OR the demo Postgres is unreachable; fails
 instead on CI (see tests/postgres_support.py).
 DSN: CORP_TEST_PG_DSN → CORP_LLM_PG_DSN → demo stack default (localhost:5432).
 Demo credentials: gateway/gateway/gateway (from docker-compose.demo.yml).
+Basic CRUD (lookup, upsert, revoke) runs against both stores in
+tests/tokens/test_token_store_contract.py; this file keeps the Postgres-only checks.
 """
 
 from __future__ import annotations
@@ -76,14 +78,6 @@ async def pg_store() -> AsyncIterator[object]:
 
 
 @pytest.mark.asyncio
-async def test_pg_lookup_unknown_returns_none(pg_store: object) -> None:
-    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
-
-    assert isinstance(pg_store, PostgresTokenStore)
-    assert await pg_store.lookup(_tok("pg-missing")) is None
-
-
-@pytest.mark.asyncio
 async def test_pg_upsert_and_lookup(pg_store: object) -> None:
     from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
 
@@ -98,65 +92,6 @@ async def test_pg_upsert_and_lookup(pg_store: object) -> None:
     assert got.revoked_at is None
     assert got.issued_at.tzinfo is not None
     assert got.expires_at.tzinfo is not None
-
-
-@pytest.mark.asyncio
-async def test_pg_revoke_reflects_in_lookup(pg_store: object) -> None:
-    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
-
-    assert isinstance(pg_store, PostgresTokenStore)
-    tok = _tok()
-    await pg_store.upsert(_info(tok))
-    n = await pg_store.revoke_user("pg-test-alice")
-    assert n == 1
-    got = await pg_store.lookup(tok)
-    assert got is not None
-    assert got.revoked_at is not None
-    assert got.revoked_at.tzinfo is not None
-
-
-@pytest.mark.asyncio
-async def test_pg_revoke_idempotent(pg_store: object) -> None:
-    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
-
-    assert isinstance(pg_store, PostgresTokenStore)
-    tok = _tok()
-    await pg_store.upsert(_info(tok))
-    n1 = await pg_store.revoke_user("pg-test-alice")
-    n2 = await pg_store.revoke_user("pg-test-alice")
-    assert n1 == 1
-    assert n2 == 0
-
-
-@pytest.mark.asyncio
-async def test_pg_upsert_overwrite(pg_store: object) -> None:
-    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
-
-    assert isinstance(pg_store, PostgresTokenStore)
-    tok = _tok()
-    await pg_store.upsert(_info(tok))
-    now = datetime.now(UTC)
-    await pg_store.upsert(_info(tok, revoked_at=now))
-    got = await pg_store.lookup(tok)
-    assert got is not None
-    assert got.revoked_at is not None
-
-
-@pytest.mark.asyncio
-async def test_pg_revoke_only_affects_target_user(pg_store: object) -> None:
-    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
-
-    assert isinstance(pg_store, PostgresTokenStore)
-    tok_alice = _tok()
-    tok_bob = _tok()
-    await pg_store.upsert(_info(tok_alice, user_id="pg-test-alice"))
-    await pg_store.upsert(_info(tok_bob, user_id="pg-test-bob"))
-    n = await pg_store.revoke_user("pg-test-alice")
-    assert n == 1
-    a = await pg_store.lookup(tok_alice)
-    b = await pg_store.lookup(tok_bob)
-    assert a is not None and a.revoked_at is not None
-    assert b is not None and b.revoked_at is None
 
 
 _ISS = "https://kc.corp.test/realms/dev"
