@@ -129,14 +129,14 @@
   "tests/_gates/test_suite_gates.py::test_the_environment_fingerprints_are_the_recipes": {
    "files": {
     "pyproject.toml": "f285403c5ba2173d837998856713ba9f",
-    "scripts": "dir:9d8215e899319d234d9abce821d8"
+    "scripts": "dir:62fdeae8db65a17617737e942d18"
    },
    "programs": []
   },
   "tests/_gates/test_suite_gates.py::test_the_full_constraints_install_the_litellm_pyproject_pins": {
    "files": {
     "pyproject.toml": "f285403c5ba2173d837998856713ba9f",
-    "scripts": "dir:9d8215e899319d234d9abce821d8"
+    "scripts": "dir:62fdeae8db65a17617737e942d18"
    },
    "programs": []
   },
@@ -4903,11 +4903,41 @@
    },
    "programs": []
   },
+  "tests/test_conftest_hooks.py::test_every_case_level_slow_entry_is_still_collected": {
+   "files": {
+    "tests/slow_tests.txt": "a7723ca41a71fd4c4a9c9a2fde4df03c"
+   },
+   "programs": [
+    "python"
+   ]
+  },
   "tests/test_conftest_hooks.py::test_every_slow_entry_names_a_test_defined_in_its_file": {
    "files": {
     "tests/slow_tests.txt": "a7723ca41a71fd4c4a9c9a2fde4df03c"
    },
    "programs": []
+  },
+  "tests/test_conftest_hooks.py::test_the_conftest_registers_the_guard_as_a_teardown_wrapper": {
+   "files": {
+    "tests/__init__.py": "e3b0c44298fc1c149afbf4c8996fb924",
+    "tests/collection_hooks.py": "8c41a169ccfe9ca90253b0d2e5579de0",
+    "tests/conftest.py": "657ebb3c1bcb93a4b2fdfb0395169661",
+    "tests/logger_state.py": "24da867dbebad08285eb792d05701835",
+    "tests/package_state.py": "83b70cc89a50610a10dc8ecf8fbadd80"
+   },
+   "programs": []
+  },
+  "tests/test_conftest_hooks.py::test_the_slow_list_skips_only_blank_lines_and_whole_line_comments": {
+   "files": {
+    "tests/slow_tests.txt": "a7723ca41a71fd4c4a9c9a2fde4df03c"
+   },
+   "programs": []
+  },
+  "tests/test_conftest_hooks.py::test_without_a_seed_the_collection_order_is_unchanged_and_a_seed_only_reorders": {
+   "files": {},
+   "programs": [
+    "python"
+   ]
   },
   "tests/test_desanitize_served_stack.py::test_a_body_naming_policies_is_refused_at_the_gate": {
    "files": {
