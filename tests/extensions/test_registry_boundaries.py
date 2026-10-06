@@ -10,6 +10,7 @@ import sys
 
 import pytest
 
+import corp_llm_gateway
 import corp_llm_gateway.config as config_mod
 from corp_llm_gateway.extensions import (
     EXTENSION_API_VERSION,
@@ -188,8 +189,21 @@ def test_importing_extensions_package_reads_no_config(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(config_mod, "get", _boom)
     monkeypatch.setattr(config_mod, "get_required", _boom)
+    # The import below rebinds the package attribute; teardown must restore it with sys.modules.
+    monkeypatch.setattr(corp_llm_gateway, "extensions", sys.modules["corp_llm_gateway.extensions"])
     for name in list(sys.modules):
         if name == "corp_llm_gateway.extensions" or name.startswith("corp_llm_gateway.extensions."):
             monkeypatch.delitem(sys.modules, name, raising=False)
     module = importlib.import_module("corp_llm_gateway.extensions")
     assert isinstance(module.REGISTRY, module.ExtensionRegistry)
+
+
+def test_the_reimport_check_leaves_the_package_attribute_on_the_live_module() -> None:
+    # A stale package attribute makes a monkeypatch of
+    # "corp_llm_gateway.extensions.REGISTRY" patch a module the CLI never reads.
+    mp = pytest.MonkeyPatch()
+    try:
+        test_importing_extensions_package_reads_no_config(mp)
+    finally:
+        mp.undo()
+    assert corp_llm_gateway.extensions is sys.modules["corp_llm_gateway.extensions"]

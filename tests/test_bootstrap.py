@@ -5,13 +5,15 @@ import importlib
 import json
 import logging
 import sys
-from collections.abc import Iterator
+import types
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 
+import corp_llm_gateway
 from corp_llm_gateway import bootstrap, config, settings
 from corp_llm_gateway.audit import StdoutSink
 from corp_llm_gateway.corp_ner import E_CORP_NER_UNAVAILABLE
@@ -922,6 +924,15 @@ def _restore_pkg_logger() -> None:
     pkg.handlers = handlers
 
 
+def _unload_demo_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Teardown puts the module and the package attribute back as they were, absent included.
+    name = "corp_llm_gateway._demo_guardrail"
+    monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
+    monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(corp_llm_gateway, "_demo_guardrail", None, raising=False)
+    monkeypatch.delattr(corp_llm_gateway, "_demo_guardrail")
+
+
 @pytest.mark.usefixtures("_restore_pkg_logger")
 async def test_demo_shim_yields_in_memory_deps_and_working_guardrail() -> None:
     from corp_llm_gateway import _demo_guardrail
@@ -946,12 +957,11 @@ def test_demo_shim_resolves_forward_anthropic_auth_from_config(
     # not a raw `== "1"`.
     monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "yes")
     config.reset_cache()
-    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
+    _unload_demo_module(monkeypatch)
 
     module = importlib.import_module("corp_llm_gateway._demo_guardrail")
 
     assert module.guardrail._forward_anthropic_auth is True
-    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
 
 
 @pytest.mark.usefixtures("_restore_pkg_logger")
@@ -963,12 +973,10 @@ def test_demo_boot_path_raises_when_both_forward_auth_flags_set(
     monkeypatch.setenv("CORP_LLM_FORWARD_CHATGPT_AUTH", "1")
     monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
     config.reset_cache()
-    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
+    _unload_demo_module(monkeypatch)
 
     with pytest.raises(ConfigError, match="mutually"):
         importlib.import_module("corp_llm_gateway._demo_guardrail")
-
-    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
 
 
 @pytest.mark.usefixtures("_restore_pkg_logger")
@@ -980,11 +988,40 @@ def test_importing_demo_guardrail_with_pg_dsn_and_no_asyncpg_does_not_raise(
     # build (a Postgres token store) — which used to crash at import time.
     monkeypatch.setenv("CORP_LLM_PG_DSN", "postgresql://gw:gw@10.255.255.1:5432/gw")
     config.reset_cache()
-    sys.modules.pop("corp_llm_gateway._demo_guardrail", None)
+    _unload_demo_module(monkeypatch)
 
     module = importlib.import_module("corp_llm_gateway._demo_guardrail")
 
     assert isinstance(module.guardrail, CorpLlmGuardrail)
+
+
+@pytest.mark.usefixtures("_restore_pkg_logger")
+@pytest.mark.parametrize(
+    "reimport_test",
+    [
+        test_demo_shim_resolves_forward_anthropic_auth_from_config,
+        test_demo_boot_path_raises_when_both_forward_auth_flags_set,
+        test_importing_demo_guardrail_with_pg_dsn_and_no_asyncpg_does_not_raise,
+    ],
+    ids=lambda t: t.__name__,
+)
+def test_a_demo_reimport_test_restores_the_module_and_the_package_attribute(
+    reimport_test: Callable[[pytest.MonkeyPatch], None],
+) -> None:
+    # `from corp_llm_gateway import _demo_guardrail` returns the package attribute when it is set,
+    # so a stale one hands later tests a guardrail built under another test's env.
+    name = "corp_llm_gateway._demo_guardrail"
+    loaded = types.ModuleType(name)
+    with pytest.MonkeyPatch.context() as outer:
+        outer.setitem(sys.modules, name, loaded)
+        outer.setattr(corp_llm_gateway, "_demo_guardrail", loaded, raising=False)
+        mp = pytest.MonkeyPatch()
+        try:
+            reimport_test(mp)
+        finally:
+            mp.undo()
+        assert sys.modules.get(name) is loaded
+        assert getattr(corp_llm_gateway, "_demo_guardrail", None) is loaded
 
 
 # ── B4: corp NER wiring (default off) ────────────────────────────────────────
