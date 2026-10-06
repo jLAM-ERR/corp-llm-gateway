@@ -212,6 +212,17 @@ async def test_system_oversize_deliver_flag_logs_system_oversize_delivered(
     assert out["system"] == clean_system, "clean oversize system leaf must be delivered"
     assert "litellm_pre_call_system_oversize_delivered" in caplog.text
     assert "field=system" in caplog.text
+    delivered = [
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("litellm_pre_call_system_oversize_delivered ")
+    ]
+    assert len(delivered) == 1
+    assert delivered[0].levelno == logging.WARNING
+    tokens = delivered[0].getMessage().split()
+    assert "field=system" in tokens
+    # docs/security.md: every deliver-flag egress is auditable in the log line too.
+    assert "block_reason=oversize:delivered" in tokens
 
     start = time.time()
     await g.async_log_success_event(

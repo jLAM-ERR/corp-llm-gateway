@@ -73,7 +73,10 @@ dependency bump), with the manifest diff reviewed. One exception: a prune PR who
 creates a new test under a step-1 / step-2 must-keep path (the new test has no `moves.json`
 entry, so it is its own baseline) runs `must_keep --write`, and the `must_keep/` diff must be
 additions only — the new function and case ids (Task 3b: 2 functions, 7 cases in
-`litellm_hook.txt`).
+`litellm_hook.txt`). A second one: a new negative-log check reviewed as `security` makes its
+owner must-keep by the negative-log rule, so that PR runs `must_keep --write` and the
+`must_keep/` diff must be that owner's ids only, as additions (rev 18 (1) PR:
+`sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed`).
 
 A move PR that renames a module-level helper, fixture, class or constant records it in
 `tests/_manifests/renames.json` as `{"names": {"<new name>": "<old name>"}}`. The inventory

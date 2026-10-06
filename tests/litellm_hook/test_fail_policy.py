@@ -289,7 +289,9 @@ async def test_pre_call_stale_span_in_prompt_field_maps_to_fail_policy_matrix(
     assert "b@corp.example" not in rec_json
 
 
-async def test_pre_call_corp_llm_down_fails_closed_503() -> None:
+async def test_pre_call_corp_llm_down_fails_closed_503(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Fail-policy matrix (M4): a corp-LLM sanitization failure must fail
     CLOSED with 503 E_CORP_LLM_DOWN — not leak as a generic 500.
 
@@ -300,10 +302,18 @@ async def test_pre_call_corp_llm_down_fails_closed_503() -> None:
     """
     g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
     data = _data_with_token("tok-1", content="hello alice")
-    with pytest.raises(GuardrailHttpException) as ei:
+    with caplog.at_level(logging.WARNING), pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
     assert ei.value.status_code == 503
     assert ei.value.error_code == "E_CORP_LLM_DOWN"
+    failed = [
+        r for r in caplog.records if r.getMessage().startswith("litellm_pre_call_corp_llm_failed ")
+    ]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.WARNING
+    tokens = failed[0].getMessage().split()
+    assert "error_code=E_CORP_LLM_DOWN" in tokens
+    assert "message_index=0" in tokens
 
 
 async def test_pre_call_corp_llm_down_does_not_forward_content() -> None:
@@ -383,7 +393,7 @@ async def test_pre_call_corp_llm_down_on_system_fails_closed_503(
 ) -> None:
     """Fail-closed (M4): corp-LLM error on system field also raises 503 E_CORP_LLM_DOWN."""
     g, _ = _build_guardrail(corp_llm=_corp_llm_unreachable())
-    data = _data_with_token("tok-1", content="hello", system="SecretEnv=/prod")
+    data = _data_with_token("tok-1", content="", system="SecretEnv=/prod")
 
     with caplog.at_level(logging.WARNING), pytest.raises(GuardrailHttpException) as ei:
         await g.pre_call(data)
@@ -392,6 +402,15 @@ async def test_pre_call_corp_llm_down_on_system_fails_closed_503(
     assert ei.value.error_code == "E_CORP_LLM_DOWN"
     # Verify the failure was logged.
     assert "litellm_pre_call_corp_llm_failed" in caplog.text
+    failed = [
+        r for r in caplog.records if r.getMessage().startswith("litellm_pre_call_corp_llm_failed ")
+    ]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.WARNING
+    tokens = failed[0].getMessage().split()
+    # docs/ops/runbook.md tells operators to grep `error_code=`.
+    assert "error_code=E_CORP_LLM_DOWN" in tokens
+    assert "field=system" in tokens
 
 
 async def test_corp_llm_fails_on_second_segment_fails_closed_503() -> None:

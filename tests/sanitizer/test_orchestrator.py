@@ -1300,6 +1300,17 @@ async def test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed(
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("cache_a_disabled" in m for m in warnings)
     assert not any(_R9_TERM in m for m in warnings), "M1-14: no user content in logs"
+    disabled = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.getMessage().startswith("cache_a_disabled ")
+    ]
+    assert len(disabled) == 1
+    tokens = disabled[0].getMessage().split()
+    assert "reason=policy_fingerprint_failed" in tokens
+    assert "exc=RuntimeError" in tokens
+    # docs/ops/upgrade.md: the exception type only, never its text.
+    assert not any("fingerprint source unavailable" in m for m in warnings)
 
     r1 = await orch.sanitize(_R9_TEXT, team_id="t1", conversation_id="c1")
     r2 = await orch.sanitize(_R9_TEXT, team_id="t1", conversation_id="c2")

@@ -842,6 +842,13 @@
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
+   "site": "tests/sanitizer/test_orchestrator.py:1313",
+   "owner": "tests/sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed",
+   "check": "not any(('fingerprint source unavailable' in m for m in warnings))",
+   "class": "security",
+   "note": "no exception detail (policy terms / allowlist entries) in the cache_a_disabled warning (M1-14; orchestrator.py:487)"
+  },
+  {
    "site": "tests/sanitizer/test_orchestrator.py:1302",
    "owner": "tests/sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed",
    "check": "not any((_R9_TERM in m for m in warnings))",
@@ -912,14 +919,14 @@
    "note": "searches a config file's text, not log output"
   },
   {
-   "site": "tests/litellm_hook/test_fail_policy.py:507",
+   "site": "tests/litellm_hook/test_fail_policy.py:526",
    "owner": "tests/test_litellm_hook.py::test_an_unavailable_token_store_is_503_not_500",
    "check": "'tok-secret-7c1f' not in caplog.text",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
-   "site": "tests/litellm_hook/test_fail_policy.py:506",
+   "site": "tests/litellm_hook/test_fail_policy.py:525",
    "owner": "tests/test_litellm_hook.py::test_an_unavailable_token_store_is_503_not_500",
    "check": "_STORE_DETAIL not in caplog.text",
    "class": "security",
@@ -1138,6 +1145,7 @@
   "tests/route_gate/test_terminal_audit.py::test_a_failed_write_is_retried_once_at_close_with_the_same_outcome",
   "tests/route_gate/test_terminal_audit.py::test_the_close_write_has_no_retry_of_its_own",
   "tests/route_gate/test_terminal_audit.py::test_the_retry_behind_a_failed_in_flight_write_keeps_its_outcome",
+  "tests/sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed",
   "tests/sanitizer/test_profile_orchestrator.py::test_an_unreachable_team_config_store_is_503_profile_unavailable",
   "tests/sanitizer/test_streaming.py::test_responses_stream_event_reconstruct_failure_log_has_no_original",
   "tests/test_bootstrap.py::test_dev_team_token_ignored_when_corp_env_prod",
