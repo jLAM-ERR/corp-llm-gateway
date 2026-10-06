@@ -128,15 +128,15 @@
   },
   "tests/_gates/test_suite_gates.py::test_the_environment_fingerprints_are_the_recipes": {
    "files": {
-    "pyproject.toml": "2f0c255cf722d575260f22dc457a173f",
-    "scripts": "dir:95e185814501a3ebb575d75556bd"
+    "pyproject.toml": "f285403c5ba2173d837998856713ba9f",
+    "scripts": "dir:9d8215e899319d234d9abce821d8"
    },
    "programs": []
   },
   "tests/_gates/test_suite_gates.py::test_the_full_constraints_install_the_litellm_pyproject_pins": {
    "files": {
-    "pyproject.toml": "2f0c255cf722d575260f22dc457a173f",
-    "scripts": "dir:95e185814501a3ebb575d75556bd"
+    "pyproject.toml": "f285403c5ba2173d837998856713ba9f",
+    "scripts": "dir:9d8215e899319d234d9abce821d8"
    },
    "programs": []
   },
@@ -4881,7 +4881,7 @@
   },
   "tests/test_ci_workflow.py::test_the_ner_extra_carries_the_gazetteer_lemmatizer": {
    "files": {
-    "pyproject.toml": "2f0c255cf722d575260f22dc457a173f"
+    "pyproject.toml": "f285403c5ba2173d837998856713ba9f"
    },
    "programs": []
   },
@@ -4900,6 +4900,12 @@
   "tests/test_ci_workflow.py::test_the_workflow_never_names_python_3_12": {
    "files": {
     ".github/workflows/ci.yml": "ef1372715da8e29b7c01e3bc6fe0439b"
+   },
+   "programs": []
+  },
+  "tests/test_conftest_hooks.py::test_every_slow_entry_names_a_test_defined_in_its_file": {
+   "files": {
+    "tests/slow_tests.txt": "a7723ca41a71fd4c4a9c9a2fde4df03c"
    },
    "programs": []
   },
@@ -5508,7 +5514,7 @@
     "docker/anthropic-oauth/Dockerfile": "642317853608e8a218aa681ce3cd51b1",
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
-    "pyproject.toml": "2f0c255cf722d575260f22dc457a173f",
+    "pyproject.toml": "f285403c5ba2173d837998856713ba9f",
     "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
    "programs": []
@@ -5520,7 +5526,7 @@
     "docker/anthropic-oauth/Dockerfile": "642317853608e8a218aa681ce3cd51b1",
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
-    "pyproject.toml": "2f0c255cf722d575260f22dc457a173f",
+    "pyproject.toml": "f285403c5ba2173d837998856713ba9f",
     "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
    "programs": []
@@ -5532,7 +5538,7 @@
     "docker/anthropic-oauth/Dockerfile": "642317853608e8a218aa681ce3cd51b1",
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
-    "pyproject.toml": "2f0c255cf722d575260f22dc457a173f",
+    "pyproject.toml": "f285403c5ba2173d837998856713ba9f",
     "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
    "programs": []
@@ -5545,7 +5551,7 @@
     "docker/chatgpt-codex/Dockerfile": "ffa38afe9824d0585d3a7c35a830a4e7",
     "docker/demo-litellm/Dockerfile": "8a88aa30ee21282ea86ce239425df724",
     "docs/ops/upgrade.md": "0ef741ef03636d81b9344660fdf47813",
-    "pyproject.toml": "2f0c255cf722d575260f22dc457a173f",
+    "pyproject.toml": "f285403c5ba2173d837998856713ba9f",
     "scripts/release/gates.sh": "5372694260050df239dcd250a90844ab"
    },
    "programs": []
