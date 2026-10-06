@@ -1,16 +1,21 @@
-"""The stale package attribute guard tests/conftest.py runs after every test."""
+"""The hooks tests/conftest.py adds around every test: the stale package attribute guard,
+the ``slow`` marker list and the ``--shuffle-seed`` order."""
 
 from __future__ import annotations
 
+import ast
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
 import corp_llm_gateway
 import corp_llm_gateway.config
 import corp_llm_gateway.metrics
-from tests import package_state
+from tests import collection_hooks, package_state
+
+ROOT = Path(__file__).resolve().parents[1]
 
 # The guard runs in pytest_runtest_teardown after every fixture's teardown, so the
 # monkeypatch below is undone before it looks.
@@ -62,3 +67,55 @@ def test_restore_rebinds_the_live_module_and_drops_an_unloaded_one(
         assert package_state.stale_package_attributes() == []
     finally:
         vars(corp_llm_gateway).pop("_never_imported", None)
+
+
+def _defines(tree: ast.Module, names: list[str]) -> bool:
+    body: list[ast.stmt] = tree.body
+    for name in names[:-1]:
+        cls = next((s for s in body if isinstance(s, ast.ClassDef) and s.name == name), None)
+        if cls is None:
+            return False
+        body = cls.body
+    return any(
+        isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == names[-1] for s in body
+    )
+
+
+def test_every_slow_entry_names_a_test_defined_in_its_file() -> None:
+    entries = collection_hooks.slow_entries()
+    stale = []
+    for entry in sorted(entries):
+        path, *names = collection_hooks.function_id(entry).split("::")
+        source = ROOT / path
+        if not path.startswith("tests/") or not source.is_file():
+            stale.append(f"{entry}: no file {path}")
+        elif not names or not _defines(ast.parse(source.read_text()), names):
+            stale.append(f"{entry}: {path} defines no {'::'.join(names)}")
+
+    assert entries
+    assert stale == []
+
+
+class _Item:
+    def __init__(self, nodeid: str) -> None:
+        self.nodeid = nodeid
+        self.marks: list[str] = []
+
+    def add_marker(self, mark: pytest.MarkDecorator) -> None:
+        self.marks.append(mark.name)
+
+
+def test_a_slow_entry_marks_its_case_or_every_case_of_its_function() -> None:
+    items = [
+        _Item("tests/a.py::test_one[x]"),
+        _Item("tests/a.py::test_one[y]"),
+        _Item("tests/a.py::test_two[x]"),
+        _Item("tests/a.py::test_two[y]"),
+        _Item("tests/a.py::TestC::test_three"),
+        _Item("tests/a.py::test_four[tests/b.py::test_one[x]]"),
+    ]
+    entries = {"tests/a.py::test_one", "tests/a.py::test_two[y]", "tests/a.py::TestC::test_three"}
+
+    collection_hooks.mark_slow(items, entries)  # type: ignore[arg-type]
+
+    assert [item.marks for item in items] == [["slow"], ["slow"], [], ["slow"], ["slow"], []]

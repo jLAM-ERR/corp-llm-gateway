@@ -96,4 +96,5 @@ markers = [
     "requires_helm: skip when the helm binary is not on PATH",
     "requires_shellcheck: skip when shellcheck is not on PATH",
     "not_root: skip when running as root",
+    "slow: tests over 2 s; deselect with -m \"not slow\"; CI runs everything",
 ]

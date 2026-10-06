@@ -2,7 +2,7 @@
 # Runs the suite in one of the two test environments and checks it against the
 # committed baseline (plan 20260926, docs/testing/must-keep.md):
 #
-#   scripts/test-gates.sh minimal|full [--record] [--venv DIR] [--out DIR]
+#   scripts/test-gates.sh minimal|full [--record] [--venv DIR] [--out DIR] [--shuffle-seed N]
 #
 # 1. the environment's fingerprint (tests/_manifests/env_fingerprint.<env>.json);
 #    full also needs Postgres at CORP_TEST_PG_DSN;
@@ -14,14 +14,16 @@
 #    stops collecting, or dropped line / branch arc fails.
 #
 # --record runs 1 and 3 only and leaves the ledger and coverage in --out, for a
-# re-baseline. Create the venv first with scripts/test-env.sh <env>.
+# re-baseline. --shuffle-seed N runs step 3 in pytest's seeded random order (tests/conftest.py);
+# the ledger and coverage are keyed by node id and file, so the checks do not depend on it.
+# Create the venv first with scripts/test-env.sh <env>.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 usage() {
-    echo "usage: scripts/test-gates.sh minimal|full [--record] [--venv DIR] [--out DIR]" >&2
+    echo "usage: scripts/test-gates.sh minimal|full [--record] [--venv DIR] [--out DIR] [--shuffle-seed N]" >&2
     exit 64
 }
 
@@ -36,11 +38,13 @@ esac
 RECORD=0
 VENV=".venv-test-${ENV_NAME}"
 OUT=".test-gates/${ENV_NAME}"
+SHUFFLE=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --record) RECORD=1 ;;
         --venv) VENV="$2"; shift ;;
         --out) OUT="$2"; shift ;;
+        --shuffle-seed) SHUFFLE=(--shuffle-seed "$2"); shift ;;
         *) usage ;;
     esac
     shift
@@ -95,7 +99,8 @@ fi
 set +e
 "${PY}" -m pytest tests/ -q -p tests._gates.outcome_ledger \
     --outcome-ledger="${OUT}/ledger.json" \
-    --cov=corp_llm_gateway --cov-branch --cov-report="json:${OUT}/coverage.json"
+    --cov=corp_llm_gateway --cov-branch --cov-report="json:${OUT}/coverage.json" \
+    ${SHUFFLE[@]+"${SHUFFLE[@]}"}
 pytest_status=$?
 set -e
 echo "pytest exited ${pytest_status}; ledger and coverage in ${OUT}"
