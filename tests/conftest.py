@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -10,7 +10,7 @@ import pytest
 
 from corp_llm_gateway import config
 from corp_llm_gateway.metrics import reset_exporter
-from tests import logger_state
+from tests import logger_state, package_state
 
 # Not a test module, so its asserts are rewritten only if registered before anything imports it.
 pytest.register_assert_rewrite("tests.hook_fixtures")
@@ -47,6 +47,24 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 skips[name] = condition()
             if skips[name]:
                 item.add_marker(pytest.mark.skip(reason=reason))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item) -> Generator[None, None, None]:
+    """Fail a test that leaves a ``corp_llm_gateway`` package attribute on a module other
+    than the one ``sys.modules`` holds (and put it back). It runs after every fixture's
+    teardown, ``monkeypatch``'s undo included, so it sees what the next test will."""
+    try:
+        result = yield
+    except BaseException as exc:
+        if stale := package_state.stale_package_attributes():
+            package_state.restore_package_attributes()
+            exc.add_note(f"test also left stale package attributes: {stale}")
+        raise
+    if stale := package_state.stale_package_attributes():
+        package_state.restore_package_attributes()
+        pytest.fail(f"test left package attributes on stale modules: {stale}", pytrace=False)
+    return result
 
 
 @pytest.fixture(autouse=True)
