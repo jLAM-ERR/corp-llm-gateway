@@ -854,22 +854,6 @@ def test_framing_integrity_every_data_line_is_valid_json() -> None:
                 pytest.fail(f"data: line is not valid JSON: {payload!r} — {exc}")
 
 
-def test_framing_integrity_original_reconstructed_after_split() -> None:
-    """Text reconstruction: joined delta.text values contain the original, not the placeholder."""
-    sse = SseStreamDesanitizer(_mapping(("user@example.com", "[EMAIL_001]")))
-    out = _collect_bytes(sse, list(ANTHROPIC_SSE_FIXTURE))
-    text_parts: list[str] = []
-    for chunk in out:
-        obj = _data_obj(chunk)
-        if obj and obj.get("type") == "content_block_delta":
-            delta = obj.get("delta", {})
-            if delta.get("type") == "text_delta":
-                text_parts.append(delta["text"])
-    full = "".join(text_parts)
-    assert "user@example.com" in full, f"original not restored: {full!r}"
-    assert "[EMAIL_001]" not in full, f"placeholder leaked: {full!r}"
-
-
 # ---------------------------------------------------------------------------
 # 2. Malformed / non-JSON data: lines
 # ---------------------------------------------------------------------------

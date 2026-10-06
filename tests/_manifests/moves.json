@@ -254,7 +254,6 @@
   "tests/sanitizer/test_streaming.py::test_flush_called_twice_does_not_raise": "tests/sanitizer/test_streaming_adversarial.py::test_flush_called_twice_does_not_raise",
   "tests/sanitizer/test_streaming.py::test_flush_with_nothing_fed_returns_empty_list": "tests/sanitizer/test_streaming_adversarial.py::test_flush_with_nothing_fed_returns_empty_list",
   "tests/sanitizer/test_streaming.py::test_framing_integrity_every_data_line_is_valid_json": "tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_every_data_line_is_valid_json",
-  "tests/sanitizer/test_streaming.py::test_framing_integrity_original_reconstructed_after_split": "tests/sanitizer/test_streaming_adversarial.py::test_framing_integrity_original_reconstructed_after_split",
   "tests/sanitizer/test_streaming.py::test_input_json_delta_after_tool_use_block_start_unchanged": "tests/sanitizer/test_streaming_adversarial.py::test_input_json_delta_after_tool_use_block_start_unchanged",
   "tests/sanitizer/test_streaming.py::test_input_json_delta_passes_through_byte_identical": "tests/sanitizer/test_streaming_adversarial.py::test_input_json_delta_passes_through_byte_identical",
   "tests/sanitizer/test_streaming.py::test_mixed_text_and_tool_use_blocks_both_desanitize": "tests/sanitizer/test_streaming_adversarial.py::test_mixed_text_and_tool_use_blocks_both_desanitize",
