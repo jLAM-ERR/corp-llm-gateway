@@ -7,6 +7,27 @@ rows, the fault injections on the checkout and the manifest regeneration. The ga
 [must-keep.md](must-keep.md). Tree: `release/1.0.x` at `152e57a`. Every line number here is `152e57a`'s unless it
 says "after".
 
+**Phase 2 done** (commits `a40c4cf` deletions + ledger rows + injections + the review fixes, `318b967` manifests, this
+commit line refs): the 6 deletions below are made. Rev 17 decided the review questions: the 6 deletions stand; Q1 #3
+has a survivor (`::test_nfc_offsets_map_back_to_the_original_string` builds `Finding` through `corp_ner.py:217-223`
+and asserts `.label`) and #6 is the one survivor-less row, admitted as `none — trivial (<reason>)` with `n/a (no
+survivor; coverage equal: <module>)` (one bullet in `deleted-tests.md`'s completeness list); Q2 the test-side
+injection is gate-5 evidence; Q3 #4 / #5 delete; Q4 no rewrite in this PR, the (b) work is one optional strengthening
+PR after Task 7; Q5 a prune PR carries no case deletion; Q6-Q8 keep as audited; Q9 `test_orchestrator.py:1302` stays
+`behaviour`; Q10-Q12 as proposed (banner and `_NFC` left, the in-line `Finding` import edit is a residual edit,
+`moves.json` −1). The only edits besides the function removals are that import edit, the EOF blank-line strip in
+`test_checks.py` and the twin's `moves.json` key. The injections were re-run on the checkout in both venvs (I1, I2 /
+I2b, I3 / I4 / I3r / I6a / I6b, I5, and I7 for #3: `corp_ner.py:219` `label=label,` → `label="LOCATION",`): every
+survivor failed at the line its row cites, I3r and I5 failed nothing, and each was reverted with `src/` clean after.
+Line numbers marked "at HEAD" are the pruned tree's, measured; every other line number is `152e57a`'s. At HEAD the
+four edited files are 1,682 / 445 / 162 / 337 lines (`test_streaming.py` / `test_corp_ner.py` / `test_profile_ids.py`
+/ `test_checks.py`) and hold 80 / 29 / 12 / 29 test functions; they collect 226 ids, all passed in both venvs; the
+record runs collect 5,097 ids in minimal and 5,912 in full. The survivors fail at HEAD at `test_streaming.py:429`
+(I1), `test_corp_ner.py:88` (I2, I2b, I7) and `:101` (I2), `test_profile_ids.py:55` (I3), `:56` (I4) and `:41`
+(`_base_event`, I6a / I6b). The manifest diff (`git diff 152e57a 318b967 -- tests/_manifests`) is the
+[prediction below](#predicted-phase-2-manifest-diff), byte-identical to the scratch preview; every gate exits 0 in
+both venvs, and `coverage_gate check` finds no dropped line or arc.
+
 **Decision: 6 delete, 91 keep, and 6 asserts in 4 kept tests marked rewrite-candidate.** No log assert, no
 `call_count` assert and no must-keep id is deleted. The six deletions:
 
