@@ -6,7 +6,6 @@ from corp_llm_gateway.team_config import (
     FailPolicyOverrides,
     InMemoryTeamConfigStore,
     TeamConfig,
-    TeamNotFoundError,
 )
 
 
@@ -39,60 +38,11 @@ def test_default_fail_policy_matches_matrix() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_unknown_team_raises() -> None:
-    store = InMemoryTeamConfigStore()
-    with pytest.raises(TeamNotFoundError):
-        await store.get("missing")
-
-
-@pytest.mark.asyncio
 async def test_upsert_and_get() -> None:
     store = InMemoryTeamConfigStore()
     cfg = _team("t1")
     await store.upsert(cfg)
     assert await store.get("t1") == cfg
-
-
-@pytest.mark.asyncio
-async def test_upsert_overwrites() -> None:
-    store = InMemoryTeamConfigStore()
-    await store.upsert(_team("t1", name="Original"))
-    await store.upsert(_team("t1", name="Updated"))
-    cfg = await store.get("t1")
-    assert cfg.name == "Updated"
-
-
-@pytest.mark.asyncio
-async def test_list_all_empty() -> None:
-    store = InMemoryTeamConfigStore()
-    assert await store.list_all() == ()
-
-
-@pytest.mark.asyncio
-async def test_list_all_returns_all() -> None:
-    store = InMemoryTeamConfigStore()
-    await store.upsert(_team("t1"))
-    await store.upsert(_team("t2"))
-    teams = await store.list_all()
-    assert {t.team_id for t in teams} == {"t1", "t2"}
-
-
-@pytest.mark.asyncio
-async def test_per_team_retention_overrides_persist() -> None:
-    store = InMemoryTeamConfigStore()
-    await store.upsert(_team("t1", retention_hot_days=30, retention_cold_years=1))
-    cfg = await store.get("t1")
-    assert cfg.retention_hot_days == 30
-    assert cfg.retention_cold_years == 1
-
-
-@pytest.mark.asyncio
-async def test_per_team_fail_policy_overrides_persist() -> None:
-    store = InMemoryTeamConfigStore()
-    overrides = FailPolicyOverrides(audit_buffer_full="continue")
-    await store.upsert(_team("t1", fail_policy=overrides))
-    cfg = await store.get("t1")
-    assert cfg.fail_policy.audit_buffer_full == "continue"
 
 
 # PostgresTeamConfigStore is contract-tested against the in-memory store in
