@@ -2092,21 +2092,7 @@
    },
    "programs": []
   },
-  "tests/deploy/test_bootstrap_server_script.py::test_bash_syntax_is_valid": {
-   "files": {
-    "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417"
-   },
-   "programs": [
-    "bash"
-   ]
-  },
   "tests/deploy/test_bootstrap_server_script.py::test_compose_v2_is_verified_not_assumed": {
-   "files": {
-    "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417"
-   },
-   "programs": []
-  },
-  "tests/deploy/test_bootstrap_server_script.py::test_defines_repo_standard_helpers_writing_to_stderr": {
    "files": {
     "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417"
    },
@@ -2181,12 +2167,6 @@
    },
    "programs": []
   },
-  "tests/deploy/test_bootstrap_server_script.py::test_script_is_executable_bash_with_strict_mode": {
-   "files": {
-    "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417"
-   },
-   "programs": []
-  },
   "tests/deploy/test_bootstrap_server_script.py::test_seed_env_keeps_an_existing_env_untouched": {
    "files": {
     "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417"
@@ -2209,14 +2189,6 @@
    },
    "programs": [
     "bash"
-   ]
-  },
-  "tests/deploy/test_bootstrap_server_script.py::test_shellcheck_clean": {
-   "files": {
-    "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417"
-   },
-   "programs": [
-    "shellcheck"
    ]
   },
   "tests/deploy/test_bootstrap_server_script.py::test_systemd_unit_is_opt_in": {
@@ -2385,6 +2357,7 @@
   },
   "tests/deploy/test_deploy_script.py::test_bash_syntax_is_valid": {
    "files": {
+    "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417",
     "scripts/deploy/deploy.sh": "1b4e9413cb895b543fa9584e6fbabfa2"
    },
    "programs": [
@@ -2393,6 +2366,7 @@
   },
   "tests/deploy/test_deploy_script.py::test_defines_repo_standard_helpers_writing_to_stderr": {
    "files": {
+    "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417",
     "scripts/deploy/deploy.sh": "1b4e9413cb895b543fa9584e6fbabfa2"
    },
    "programs": []
@@ -2628,12 +2602,14 @@
   },
   "tests/deploy/test_deploy_script.py::test_script_is_executable_bash_with_strict_mode": {
    "files": {
+    "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417",
     "scripts/deploy/deploy.sh": "1b4e9413cb895b543fa9584e6fbabfa2"
    },
    "programs": []
   },
   "tests/deploy/test_deploy_script.py::test_shellcheck_clean": {
    "files": {
+    "scripts/deploy/bootstrap-server.sh": "e7e7d85ea4084833e534c6680293e417",
     "scripts/deploy/deploy.sh": "1b4e9413cb895b543fa9584e6fbabfa2"
    },
    "programs": [
