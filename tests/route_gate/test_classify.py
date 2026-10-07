@@ -1,3 +1,15 @@
+"""How the route gate turns a request into a verdict: PASSTHROUGH, REWRITTEN or REFUSE.
+
+The verdict is decided first by the ASGI scope type and the Upgrade header, then by the upper-cased
+method and the decoded path, taken as received. The raw (still-encoded) path is read only to spot a
+malformed one: an encoded slash, NUL or `..`, or a non-ASCII byte; the decoded path is malformed if
+it holds `..`, `//` or a NUL. A lifespan scope is passed through; a websocket scope, a websocket
+Upgrade header, an unknown scope type and a malformed path are refused. Otherwise the built-in
+tables decide (exact rows, then regex rows), and operator extras are consulted only when they have
+no row: HEAD checks a HEAD row, then the GET row, and a REWRITTEN result is refused; an extra can
+only add an otherwise-unlisted PASSTHROUGH route — it never reopens a refusal or promises a rewrite.
+"""
+
 from __future__ import annotations
 
 import re

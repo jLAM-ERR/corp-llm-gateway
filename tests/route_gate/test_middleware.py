@@ -1,3 +1,11 @@
+"""The route-gate ASGI middleware: what a refused, a passed-through and a rewritten request get.
+
+A refusal has a fixed JSON shape and code, echoes no byte of the body, logs no path and writes one
+audit record. A passthrough is forwarded byte for byte and writes none. A rewritten route is
+forwarded only once the gate is armed. Websockets are refused, and an operator extra cannot
+re-admit a refused route.
+"""
+
 from __future__ import annotations
 
 import asyncio

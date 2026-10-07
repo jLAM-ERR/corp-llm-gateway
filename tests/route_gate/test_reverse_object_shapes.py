@@ -1,4 +1,9 @@
-"""⚠️ `_apply_reverse_to_response` on model objects (`model_dump` / `model_validate` /
+"""Response restoration on litellm model objects, a path the middleware never takes.
+
+On model objects rather than wire JSON, placeholders are reversed, litellm's hidden params are
+kept, and a failed rebuild neither skips validation nor logs an original.
+
+⚠️ `_apply_reverse_to_response` on model objects (`model_dump` / `model_validate` /
 `model_copy`). The middleware calls it only with decoded wire JSON
 (`desanitize_middleware.py:150`), so these shapes are not reached in production. They wait
 on the src follow-up that removes those branches from `litellm_hook.py`; prune them only

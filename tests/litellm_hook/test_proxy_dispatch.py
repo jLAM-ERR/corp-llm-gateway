@@ -1,4 +1,11 @@
-"""Plan 20260926 Task 0: litellm 1.101.0's real dispatch, driven end to end.
+"""Which of our hooks litellm's real proxy runs, end to end, and what the client gets back.
+
+Our plain callback runs on every request flow, even when a litellm policy names it, and the client
+gets the originals back. The other tests show what would break that: an `apply_guardrail` method,
+a second guardrail answering to our name, or a guardrail registered the litellm way that a policy
+pipeline skips. A check that runs after our pre-call refuses a request our pre-call never saw.
+
+Plan 20260926 Task 0, litellm 1.101.0.
 
 Each request goes through our gate, litellm's own proxy app and a stub provider on a
 socket (``_dispatch_fixtures``). "Today" is ``CorpLlmGuardrail(CustomLogger)`` as

@@ -1,4 +1,12 @@
-"""Plan 20260926 Task 0: the Option A middleware, ``route_gate/desanitize_middleware.py``.
+"""The response desanitiser middleware: each request's originals restored, and restore failures.
+
+It restores the originals in unary JSON, chat / Anthropic SSE and Responses SSE with the mapping
+held on the request's ticket (never a client header) and releases that mapping on the final body.
+A restoration failure before the response starts is a content-free 500; after it starts, the
+events already restored reach the client and the stream closes cleanly. No failure puts an
+original in a log line.
+
+Plan 20260926 Task 0; the module is ``route_gate/desanitize_middleware.py``.
 
 Stub ASGI apps emit litellm's three wire formats (unary JSON, chat / Anthropic SSE,
 Responses SSE); the last group mounts the prototype over litellm's real app. The three
