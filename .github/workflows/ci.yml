@@ -3,7 +3,8 @@ name: ci
 # Gates every PR on the real suite: ruff (lint job) + the full pytest suite on
 # Python 3.14 with the ner/postgres/oidc/asgi/metrics extras (test job) — the
 # authoritative run CLAUDE.md refers to, including NER, RS256/RBAC crypto, the
-# Postgres contract tests and the helm render tests. Every job runs 3.14, the
+# Postgres contract tests and the helm render tests. tests/e2e runs in its own
+# job (e2e) against real Redis and the two mocks. Every job runs 3.14, the
 # interpreter .venv-bench runs; pyproject still declares a lower floor, which CI
 # no longer exercises.
 
@@ -126,3 +127,60 @@ jobs:
           tests/integration/test_nginx_allowlist_image.py
         env:
           CORP_REQUIRE_PROXY_CAPTURE: "1"
+
+  # tests/e2e against real Redis and the corp-LLM and Langfuse mocks, started from
+  # docker/*/app.py, in parallel with the other jobs. docker-compose.yml's e2e
+  # service is the local route to the same run. Every e2e test skips without its
+  # service env var, so CORP_REQUIRE_E2E (tests/e2e/conftest.py) turns any skip
+  # into a failure: a dropped var cannot report green over nothing.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      REDIS_URL: redis://localhost:6379/0
+      CORP_LLM_ENDPOINT: http://127.0.0.1:8000
+      CORP_LLM_AUTH_PROVIDER: noop
+      LANGFUSE_URL: http://127.0.0.1:3000
+      LANGFUSE_PUBLIC_KEY: pk-test-ci
+      LANGFUSE_SECRET_KEY: sk-test-ci
+      RUN_PROXY_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # [dev] brings pytest and, through asgi, the mocks' fastapi + uvicorn.
+      - run: pip install -e ".[dev]"
+      - name: Start the corp-LLM and Langfuse mocks
+        run: |
+          nohup python -m uvicorn --app-dir docker/corp-llm-mock app:app \
+            --host 127.0.0.1 --port 8000 > corp-llm-mock.log 2>&1 &
+          nohup python -m uvicorn --app-dir docker/langfuse-mock app:app \
+            --host 127.0.0.1 --port 3000 > langfuse-mock.log 2>&1 &
+          for url in http://127.0.0.1:8000/healthz/live http://127.0.0.1:3000/api/public/health; do
+            for _ in $(seq 1 30); do
+              curl -fsS "$url" > /dev/null && continue 2
+              sleep 1
+            done
+            echo "::error::mock not healthy after 30 s: $url"
+            cat corp-llm-mock.log langfuse-mock.log
+            exit 1
+          done
+      - run: PYTHONPATH=src python -m pytest tests/e2e -q -rs
+        env:
+          CORP_REQUIRE_E2E: "1"
+      - name: Mock logs
+        if: failure()
+        run: cat corp-llm-mock.log langfuse-mock.log

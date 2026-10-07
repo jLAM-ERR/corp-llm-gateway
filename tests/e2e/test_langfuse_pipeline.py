@@ -11,6 +11,7 @@ Run via:
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 
@@ -18,6 +19,7 @@ import httpx
 import pytest
 
 from corp_llm_gateway.audit import AuditEvent, LangfuseSink
+from corp_llm_gateway.audit.invariants import NEVER_FIELDS, NeverFieldPresentError
 
 LANGFUSE_URL = os.environ.get("LANGFUSE_URL")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "pk-test-ci")
@@ -121,19 +123,97 @@ async def test_token_usage_in_generation(sink_and_client) -> None:
     }
 
 
+# Recognisable originals: an email, a card number, a person, a provider key, a
+# corp token. None of them may reach Langfuse, whatever field carries them in.
+ORIGINALS = (
+    "zed.original@corp.lan",
+    "4111111111111111",
+    "Ivan Originalov",
+    "sk-ant-e2e-original-key",
+    "ct_e2e_original_token",
+)
+
+
 @skip_if_no_langfuse
 async def test_no_originals_in_batch_payload(sink_and_client) -> None:
-    """Even though the event holds placeholders, an original-looking
-    string ('alice') passed via tags or metadata must not appear in the
-    Langfuse-bound payload."""
+    """No original reaches the Langfuse-bound payload: the sink forwards a fixed
+    metadata subset, and the NEVER gate refuses a record that carries a mapping,
+    original content or a credential before anything is sent."""
     sink, control = sink_and_client
-    await sink.write_event(_event(user_id="alice", team_id="t1"))
-    cap = (await control.get("/__captures")).json()["captures"][0]
-    payload_text = str(cap["body"])
-    # Originals from the test corpus would have been redacted upstream;
-    # what reaches Langfuse can carry user_id + tags, but never the
-    # message content itself.
-    assert "[EMAIL_001]" in payload_text  # placeholder is fine
-    # finding_label_counts must be present (counts only, no text)
-    trace = next(e for e in cap["body"]["batch"] if e["type"] == "trace-create")["body"]
-    assert trace["metadata"]["finding_label_counts"] == {"EMAIL": 1}
+    email, card, person, api_key, corp_token = ORIGINALS
+    event = _event(
+        user_id="alice",
+        team_id="t1",
+        redaction_count=3,
+        finding_label_counts={"EMAIL": 1, "CREDIT_CARD": 1, "PERSON": 1},
+        placeholder_list=("[CREDIT_CARD_001]", "[EMAIL_001]", "[PERSON_001]"),
+    )
+    await sink.write_event(event)
+    # A record from another producer: the audit fields plus content-bearing keys
+    # outside the forwarded subset, at the top level and nested.
+    record = {
+        "timestamp": event.timestamp.isoformat(),
+        "request_id": "e2e-req-2",
+        "user_id": "alice",
+        "team_id": "t1",
+        "provider": "anthropic",
+        "model": "claude-opus-4-7",
+        "latency_ms": 250,
+        "prompt_token_count": 42,
+        "completion_token_count": 17,
+        "redaction_count": 3,
+        "finding_label_counts": {"EMAIL": 1, "CREDIT_CARD": 1, "PERSON": 1},
+        "cache_a_hit": False,
+        "status": "ok",
+        "placeholder_list": ["[CREDIT_CARD_001]", "[EMAIL_001]", "[PERSON_001]"],
+        "messages": [{"role": "user", "content": f"mail {email}, card {card}"}],
+        "prompt": f"{person} wrote to {email}",
+        "response": f"done, {person}",
+        "detail": {"note": f"{card} {person}"},
+    }
+    await sink.write(record)
+
+    # NEVER fields at the top level, nested under a key the sink drops, and nested under
+    # finding_label_counts, which it forwards as-is: refused, nothing sent.
+    never_values = {
+        "mapping": {email: "[EMAIL_001]"},
+        "mapping_table": [[person, "[PERSON_001]"]],
+        "pairs": [[card, "[CREDIT_CARD_001]"]],
+        "original_content": f"{person} {email}",
+        "unredacted_content": card,
+        "pre_sanitization": email,
+        "replace_md": f"{person} -> [PERSON_001]",
+        "rule_values": [person],
+        "x_corp_auth": corp_token,
+        "corp_token": corp_token,
+        "api_key": api_key,
+        "authorization": f"Bearer {api_key}",
+        "cookie": f"session={corp_token}",
+        "set_cookie": f"session={corp_token}",
+        "extra_headers": {"x-api-key": api_key},
+    }
+    assert set(never_values) == NEVER_FIELDS
+    for key, value in never_values.items():
+        for smuggled in (
+            {**record, key: value},
+            {**record, "metadata": {key: value}},
+            {**record, "finding_label_counts": {"EMAIL": {key: value}}},
+        ):
+            with pytest.raises(NeverFieldPresentError):
+                await sink.write(smuggled)
+
+    captures = (await control.get("/__captures")).json()
+    assert captures["count"] == 2
+    wire = json.dumps(captures)
+    for original in ORIGINALS:
+        assert original not in wire
+    for cap in captures["captures"]:
+        trace = next(e for e in cap["body"]["batch"] if e["type"] == "trace-create")["body"]
+        assert trace["userId"] == "alice"
+        assert trace["metadata"]["team_id"] == "t1"
+        assert trace["metadata"]["redaction_count"] == 3
+        assert trace["metadata"]["finding_label_counts"] == {
+            "EMAIL": 1,
+            "CREDIT_CARD": 1,
+            "PERSON": 1,
+        }

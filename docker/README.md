@@ -12,8 +12,8 @@ docker compose up --build --abort-on-container-exit e2e
 This:
 1. Starts Redis 7 with `allkeys-lru`.
 2. Starts Postgres 16 and applies `tokens/schema.sql` on init.
-3. Starts the corp-llm-mock (FastAPI) on port 8000.
-4. Builds the e2e container, installs the gateway, and runs `pytest tests/e2e`.
+3. Starts the corp-llm-mock (FastAPI) on port 8000 and the langfuse-mock on port 3000.
+4. Builds the e2e container (Python 3.14), installs the gateway, and runs `pytest tests/e2e`.
 
 The e2e container exits with the pytest exit code; `--abort-on-container-exit`
 tears down the rest.
@@ -43,25 +43,25 @@ chat-completion tool call.
 
 ## Outside docker-compose
 
-The e2e tests skip cleanly when `REDIS_URL` / `CORP_LLM_ENDPOINT` aren't
-set, so they're safe to keep in the pytest run on a developer laptop:
-
-```
-PYTHONPATH=src .venv/bin/pytest tests/ -q   # 265 unit, 0 e2e (skipped)
-```
+The e2e tests skip cleanly when their env vars aren't set, so they're safe to
+keep in the pytest run on a developer laptop. CI's `e2e` job
+(`.github/workflows/ci.yml`) runs them the way below, on Python 3.14, with
+`CORP_REQUIRE_E2E=1` so that a skip fails the job.
 
 To run e2e locally without docker compose:
 
 ```
-# in one shell
+# Redis
 docker run --rm -p 6379:6379 redis:7-alpine
 
-# in another
-docker run --rm -p 8000:8000 -v $PWD/docker/corp-llm-mock:/app python:3.12-slim \
-  bash -c "pip install fastapi uvicorn && uvicorn --app-dir /app app:app --host 0.0.0.0"
+# the two mocks, from a venv with fastapi + uvicorn (the [dev] extra)
+python -m uvicorn --app-dir docker/corp-llm-mock app:app --port 8000
+python -m uvicorn --app-dir docker/langfuse-mock app:app --port 3000
 
-# in a third
-REDIS_URL=redis://localhost:6379/0 \
-CORP_LLM_ENDPOINT=http://localhost:8000 \
-PYTHONPATH=src .venv/bin/pytest tests/e2e -q
+# the suite
+REDIS_URL=redis://localhost:6379/0 CORP_LLM_ENDPOINT=http://localhost:8000 \
+CORP_LLM_AUTH_PROVIDER=noop LANGFUSE_URL=http://localhost:3000 \
+LANGFUSE_PUBLIC_KEY=pk-test-ci LANGFUSE_SECRET_KEY=sk-test-ci RUN_PROXY_E2E=1 \
+CORP_REQUIRE_E2E=1 NO_PROXY=127.0.0.1,localhost \
+PYTHONPATH=src .venv/bin/pytest tests/e2e -q -rs
 ```

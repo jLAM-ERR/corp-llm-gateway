@@ -2,13 +2,16 @@
 
 Speaks just enough of /v1/chat/completions to drive the gateway's
 SanitizationOrchestrator end-to-end. Returns canned tool_calls for the
-sanitization tool; everything else is a stub.
+sanitization tool; everything else is a stub. GET /__calls reports how many
+chat completions it served (DELETE resets), so a test can tell whether the
+orchestrator called the oracle.
 
 Environment:
   MOCK_PAIRS  JSON list of {"original":..., "replacement":...} pairs
               the mock will report for every request. Default: redact
               "alice" -> "[NAME_001]" and "alice@corp.lan" -> "[EMAIL_001]".
 """
+
 import json
 import os
 import uuid
@@ -36,6 +39,7 @@ def _load_pairs() -> list[dict[str, str]]:
 
 
 app = FastAPI(title="corp-llm-mock")
+_calls = 0
 
 
 @app.get("/healthz/live")
@@ -43,8 +47,22 @@ async def live() -> dict[str, str]:
     return {"status": "live"}
 
 
+@app.get("/__calls")
+async def list_calls() -> dict[str, int]:
+    return {"count": _calls}
+
+
+@app.delete("/__calls")
+async def clear_calls() -> dict[str, str]:
+    global _calls
+    _calls = 0
+    return {"status": "cleared"}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> dict[str, Any]:
+    global _calls
+    _calls += 1
     body = await request.json()
     tool_choice = body.get("tool_choice")
 

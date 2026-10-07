@@ -161,9 +161,9 @@ STEP2_GLOBS = (
     "tests/auth/test_rbac.py",
     "tests/test_serve.py",
 )
-# Must-keep security checks skipped in both environments: an open finding for the DRI
-# (no CI job runs the e2e stack), not a reviewed not-applicable case. Any other must-keep
-# id skipped in both fails the gate.
+# Must-keep security checks skipped in both environments: CI's e2e job runs them; both
+# gate environments still skip them. Not a reviewed not-applicable case. Any other
+# must-keep id skipped in both fails the gate.
 SKIPPED_IN_BOTH_OPEN = (
     "tests/e2e/test_langfuse_pipeline.py::test_no_originals_in_batch_payload",
     "tests/e2e/test_proxy_pipeline.py::test_proxy_forwards_authorization_untouched",

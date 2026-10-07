@@ -131,7 +131,7 @@ def test_proxy_rereads_token_per_request(proxy, upstream, tmp_path) -> None:
 
 @skip_if_no_e2e
 def test_proxy_401_when_token_missing(upstream, tmp_path) -> None:
-    upstream_url, _ = upstream
+    upstream_url, captured = upstream
     s = serve("127.0.0.1:0", upstream_url, tmp_path / "no-token")
     port = s.server_address[1]
     t = threading.Thread(target=s.serve_forever, args=(0.05,), daemon=True)
@@ -141,6 +141,7 @@ def test_proxy_401_when_token_missing(upstream, tmp_path) -> None:
         with pytest.raises(urllib.error.HTTPError) as ei:
             _post(url, {"x": 1})
         assert ei.value.code == 401
+        assert captured == [], "a request without a corp token must not reach the upstream"
     finally:
         s.shutdown()
         s.server_close()
