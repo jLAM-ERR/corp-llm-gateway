@@ -289,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         problems = compare(args.env, json.loads(args.run.read_text()), args.scope)
     for line in problems:
-        print(f"OUTCOMES {line}", file=sys.stderr)
+        print(f"OUTCOMES: {line}", file=sys.stderr)
     return 1 if problems else 0
 
 

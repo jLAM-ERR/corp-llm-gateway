@@ -77,6 +77,11 @@ def test_every_malformed_moves_entry_is_refused_by_name() -> None:
     rejected, evidence = selftest.move_refusals()
 
     assert rejected, evidence
+    if moves.full_ledger_ids() is None:
+        reason = f"{moves.NO_FULL_LEDGERS}; not run: {list(selftest.BASELINE_CASES)}"
+        if os.environ.get("CI"):
+            pytest.fail(reason)
+        pytest.skip(reason)
 
 
 def test_a_move_neither_adds_nor_removes_a_must_keep_id() -> None:
@@ -395,6 +400,23 @@ def test_a_module_level_name_imported_twice_from_tests_is_refused() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "from tests.a import *\nfrom tests.b import *\n",
+        "import tests.x as x\nfrom tests import x\n",
+        "from tests import x\nimport tests.x as x\n",
+    ],
+    ids=["two-star-imports", "alias-then-from", "from-then-alias"],
+)
+def test_two_module_level_imports_of_one_object_or_star_imports_are_not_refused(
+    text: str,
+) -> None:
+    path = ROOT / "tests" / "_gates" / "selftest_twice.py"
+
+    inventory._index("tests._gates.selftest_twice", path, text)
+
+
 def test_a_lost_security_id_names_an_unreviewed_check_of_its_own() -> None:
     recorded = json.loads(negative_logs.PATH.read_text())
     owner = "tests/detectors/test_shadow.py::test_shadow_exception_does_not_break_canonical"
@@ -405,7 +427,7 @@ def test_a_lost_security_id_names_an_unreviewed_check_of_its_own() -> None:
     lost = f"security negative-log id lost while its test is still must-keep: {owner}"
 
     assert negative_logs.lost(recorded["security_node_ids"], {**recorded, "sites": sites}) == [
-        lost + negative_logs.UNREVIEWED_HINT
+        lost + negative_logs.unreviewed_hint([owner])
     ]
     behaviour = [
         {**site, "class": "behaviour"} if site["owner"] == owner else site for site in sites
@@ -413,6 +435,24 @@ def test_a_lost_security_id_names_an_unreviewed_check_of_its_own() -> None:
     assert negative_logs.lost(recorded["security_node_ids"], {**recorded, "sites": behaviour}) == [
         lost
     ]
+
+
+def test_a_security_helper_moved_to_another_module_is_named_where_its_tests_are_lost() -> None:
+    recorded = json.loads(negative_logs.PATH.read_text())
+    helper, moved = (
+        "tests/invariants/test_issuance_no_leak.py::_assert_clean",
+        "tests/shared_helpers.py::_assert_clean",
+    )
+    sites = [
+        {**site, "owner": moved, "class": "UNREVIEWED"} if site["owner"] == helper else site
+        for site in recorded["sites"]
+    ]
+
+    lines = negative_logs.lost(recorded["security_node_ids"], {**recorded, "sites": sites})
+
+    assert lines
+    assert all(line.startswith("security negative-log id lost") for line in lines)
+    assert all(line.endswith(negative_logs.unreviewed_hint([moved])) for line in lines)
 
 
 def test_not_applicable_skips_are_reviewed_and_still_recorded() -> None:

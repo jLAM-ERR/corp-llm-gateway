@@ -141,28 +141,35 @@ def node_ids(manifest: dict[str, Any]) -> list[str]:
 def lost(previous: list[str], manifest: dict[str, Any]) -> list[str]:
     """Must-keep tests that were in ``security_node_ids`` and that ``manifest`` no longer
     selects (a security helper moved away from them, or reclassified). Both sides are
-    baseline ids. Dropping one on purpose means editing ``security_node_ids`` by hand."""
+    baseline ids. Dropping one on purpose means editing ``security_node_ids`` by hand. A
+    line names the UNREVIEWED sites the test owns or reaches through a helper."""
     gone = set(previous) - set(node_ids(manifest))
     unreviewed = {s["owner"] for s in manifest["sites"] if s["class"] == "UNREVIEWED"}
-    return [
-        f"security negative-log id lost while its test is still must-keep: {node_id}"
-        + (UNREVIEWED_HINT if _owns_unreviewed(node_id, unreviewed) else "")
-        for node_id in sorted(gone & set(must_keep.read()))
-    ]
+    lines = []
+    for node_id in sorted(gone & set(must_keep.read())):
+        line = f"security negative-log id lost while its test is still must-keep: {node_id}"
+        owners = _unreviewed_reached(node_id, unreviewed)
+        if owners:
+            line += unreviewed_hint(owners)
+        lines.append(line)
+    return lines
 
 
-UNREVIEWED_HINT = (
-    " (a check of this test or of a helper in its module is UNREVIEWED: a security check "
-    "whose text changed comes back unreviewed; review it before --write)"
-)
+def unreviewed_hint(owners: list[str]) -> str:
+    return (
+        f" (UNREVIEWED: {', '.join(owners)}; a security check whose text or owner changed "
+        "comes back unreviewed: review it before --write)"
+    )
 
 
-def _owns_unreviewed(node_id: str, unreviewed: set[str]) -> bool:
-    path = node_id.split("::", 1)[0]
-    return any(
-        owner == node_id
-        or (owner.split("::", 1)[0] == path and owner.rsplit("::", 1)[1].startswith("_"))
+def _unreviewed_reached(node_id: str, unreviewed: set[str]) -> list[str]:
+    """The UNREVIEWED owners that are the test itself or a helper its closure reaches."""
+    reached = set(build_inventory().get(node_id, {}).get("helpers", []))
+    return sorted(
+        owner
         for owner in unreviewed
+        if owner == node_id
+        or (owner.rsplit("::", 1)[1].startswith("_") and owner.rsplit("::", 1)[1] in reached)
     )
 
 

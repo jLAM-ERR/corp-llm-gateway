@@ -155,9 +155,12 @@ The gate (`python -m tests._gates.moves --check`, `scripts/test-gates.sh`, and e
 - an `ids` value that is not in the baseline collection, or a `files` value that is not
   one of its paths. The collection is the ledgers' ids as of `8936dc6` (the last commit
   whose ledgers held every test, read with `git show`) plus today's must-keep ledgers. In
-  a clone without `8936dc6` (or with no working `git`) the CLI, and so
-  `scripts/test-gates.sh`, fails; a plain `pytest tests/` run warns and skips this refusal,
-  and fails it under `CI`. CI's `fetch-depth: 0` has the commit;
+  a clone without `8936dc6` (or with no working `git`) the CLI, `selftest static` and so
+  `scripts/test-gates.sh` fail; a plain `pytest tests/` run warns, skips the two cases
+  that need those ledgers (self-test o's baseline cases and
+  `test_moves_checks_values_against_the_collection_before_the_ledgers_narrowed`) with that
+  reason, runs every other case, and fails them under `CI`. CI's `fetch-depth: 0` has the
+  commit;
 - a value used twice, or two current tests that translate to one baseline id (the
   index, the ledger and must-keep stop on that too, rather than keep one of the two);
 - a chain: a value that is itself a key, or an `ids` value in a module that `files`
@@ -173,9 +176,11 @@ Its manifest diff is only:
   change in the same PR;
 - `negative_log_checks.json`: the `site` (`file:line`) of a moved check. A helper is not
   in `moves.json`, so a security helper that moves to another module gets a new `owner`:
-  `--write` brings its site back `UNREVIEWED`, the tests that reach a security check only
-  through it drop out of `security_node_ids`, and `--write` refuses for the must-keep ones,
-  naming the `UNREVIEWED` check. Once the
+  `--write` brings its site back `UNREVIEWED` under the new owner, the tests that reach a
+  security check only through it drop out of `security_node_ids`, and `--write` refuses
+  for the must-keep ones. Each refusal line names the `UNREVIEWED` owners the test is, or
+  reaches through a helper of the same name (the index's closure; matched by name, so a
+  same-named helper elsewhere is named too). Once the
   row's `owner` is edited by hand to the new place (the last sentence below),
   `security_node_ids` keeps every test that shares a module with the helper at the
   baseline or now, so a helper moved with its test, or left where it was, changes nothing
@@ -252,8 +257,8 @@ fails if one becomes so.
 
 ## Must-keep (`must_keep/`)
 
-4,420 node ids in 40 files (1,929 test functions; a parametrised test is listed by its
-function id and by every case), measured 2026-10-07.
+4,420 node ids from 113 test modules, in 40 `must_keep/*.txt` files (1,929 test functions;
+a parametrised test is listed by its function id and by every case), measured 2026-10-07.
 `python -m tests._gates.must_keep --write` rebuilds the list from the rules in
 `tests/_gates/must_keep.py`. `--check` (and the guard test) rebuilds it too and fails when
 the rules select an id the committed list lacks, so dropping a must-keep id means editing
@@ -367,7 +372,7 @@ restored after each. `python -m tests._gates.selftest static` (any venv) runs g-
 | k | an unaliased `import tests[.x]`, dotted or bare | index: refused with an error that names the fix |
 | l | a nested def or class body declares `global helper` past an enclosing local import; an import under `global` / `nonlocal` | index: each test reaches both helpers; the import is refused |
 | m | move a synthetic test to a renamed module and rename another into it, with and without `moves.json` | with the map no gate reports anything, a ledger rewrite is byte-identical and a moved module's changed collection-skip reason is reported under its baseline path; without it expected outcomes (`missing id`, in a scoped check too), must-keep (`test is gone`) and negative logs (a new owner) |
-| o | one malformed `moves.json` entry per refusal above (15, a key in a module pytest does not collect among them), and one valid map | the moves gate names each entry; the valid map passes; the two-ids-one-baseline map also stops the index, the ledger and must-keep |
+| o | one malformed `moves.json` entry per refusal above (15, a key in a module pytest does not collect among them; the two baseline cases need `8936dc6`, above), and one valid map | the moves gate names each entry; the valid map passes; the two-ids-one-baseline map also stops the index, the ledger and must-keep |
 | p | a plain test moved into `tests/route_gate/`, a must-keep one moved out of it (one renamed), a name-pinned id cited at its new place, a test moved onto `audit/test_logger.py:135-163` | must-keep: the same ids as before the move, at their baseline ids |
 | q | a test running `_assert_clean(log_text)` moved by `ids`, with the helper, and without it (imported from where it stayed) | negative logs: the same `security_node_ids` |
 | r | a security helper moved into a non-`test_` module none of its tests lives in, its test must-keep, then not | negative logs: `--check` and `--write` refuse by id and `--write` writes nothing; no refusal when the test is not must-keep |

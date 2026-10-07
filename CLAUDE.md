@@ -160,9 +160,13 @@ docker run --rm -d --name pg-test -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=
 scripts/test-env.sh full && CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
   scripts/test-gates.sh full                                    # 5,930 passed / 16 skipped, ~21 min
 
+# Run both environments before committing.
+
 # Local loop without the tests tests/slow_tests.txt lists (CI runs everything):
-# ~5.5 min in minimal, ~10.5 min in full (with the full env's variables above).
-CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"
+CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"  # ~5.5 min
+CI=true CORP_REQUIRE_PROXY_CAPTURE=1 NO_PROXY=127.0.0.1,localhost \
+  CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
+  PYTHONPATH=src .venv-test-full/bin/python -m pytest tests/ -q -m "not slow"                  # ~10.5 min
 
 # The older local venvs still work: .venv (Python 3.14, no extras, no litellm) and
 # .venv-bench (every extra + litellm 1.101.0). NO_PROXY: on a machine with a system HTTP

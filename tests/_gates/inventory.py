@@ -134,13 +134,22 @@ def _from_tests(binding: tuple[str, str | None]) -> bool:
     return binding[0] == "tests" or binding[0].startswith("tests.")
 
 
+def _dotted(binding: tuple[str, str | None]) -> str:
+    """``import tests.x as x`` and ``from tests import x`` bind the same object."""
+    source, attr = binding
+    return source if attr is None else f"{source}.{attr}"
+
+
 def _refuse_second_tests_binding(
     module: Module, name: str, binding: tuple[str, str | None], stmt: ast.stmt
 ) -> None:
     """Module-level imports are indexed one binding per name; a second import of the same
-    name (a try / except fallback) where either side is from tests would hide a helper."""
+    name (a try / except fallback) where either side is from tests would hide a helper.
+    A star import binds no name the index follows."""
     first = module.imports.get(name)
-    if first is None or first == binding or not (_from_tests(first) or _from_tests(binding)):
+    if name == "*" or first is None or _dotted(first) == _dotted(binding):
+        return
+    if not (_from_tests(first) or _from_tests(binding)):
         return
     path = module.path
     where = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path

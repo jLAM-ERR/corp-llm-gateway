@@ -42,6 +42,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import warnings
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -661,30 +662,44 @@ def _collision_refused_by_every_gate(tree: list[inventory.Module], ledgers: Path
     return silent
 
 
-def move_refusals() -> tuple[bool, str]:
-    """Each malformed ``moves.json`` entry is refused by name; a valid map is not."""
+# Refused only against the full ledgers at ``moves.FULL_LEDGERS_AT``, which a clone may lack.
+BASELINE_CASES = ("ids value outside the baseline", "files value outside the baseline")
+
+
+def move_refusals(*, strict: bool = False) -> tuple[bool, str]:
+    """Each malformed ``moves.json`` entry is refused by name; a valid map is not. Without
+    the full ledgers the ``BASELINE_CASES`` cannot be refused: they count as not refused
+    when ``strict``, else they are left out and named in the evidence."""
     tree = [_module_at(rel, text) for rel, text in REFUSAL_TREE.items()]
+    cases = list(REFUSALS)
+    left_out: list[str] = []
+    if moves.full_ledger_ids() is None and not strict:
+        left_out = list(BASELINE_CASES)
+        cases = [r for r in REFUSALS if r.case not in BASELINE_CASES]
     with tempfile.TemporaryDirectory() as tmp:
         _write_ledgers(Path(tmp), dict.fromkeys(REFUSAL_BASELINE, "passed"))
 
         def found(files: dict[str, str], ids: dict[str, str]) -> list[str]:
             with _world(tree, files=files, ids=ids, ledgers=Path(tmp)):
-                return moves.problems()
+                return [line for line in moves.problems() if line != moves.NO_FULL_LEDGERS]
 
-        unmet = [
-            r.case
-            for r in REFUSALS
-            if not any(r.says in line and r.names in line for line in found(r.files, r.ids))
-        ]
-        control = found(*VALID_MOVES)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            unmet = [
+                r.case
+                for r in cases
+                if not any(r.says in line and r.names in line for line in found(r.files, r.ids))
+            ]
+            control = found(*VALID_MOVES)
         silent = _collision_refused_by_every_gate(tree, Path(tmp))
     if unmet or control or silent:
         return False, (
             f"not refused: {unmet}; valid map refused: {control}; collision passes: {silent}"
         )[:240]
+    skipped = f"; not run without the full ledgers: {left_out}" if left_out else ""
     return True, (
-        f"{len(REFUSALS)} refused by name, the valid map passes; the collision also stops "
-        "the index, must-keep and the ledger"
+        f"{len(cases)} refused by name, the valid map passes; the collision also stops "
+        f"the index, must-keep and the ledger{skipped}"
     )
 
 
@@ -1082,7 +1097,7 @@ def main(argv: list[str] | None = None) -> int:
         results.append(("l: global / nonlocal past or under a local import", rejected, evidence))
         rejected, evidence = pure_move()
         results.append(("m: a pure move, with and without moves.json", rejected, evidence))
-        rejected, evidence = move_refusals()
+        rejected, evidence = move_refusals(strict=True)
         results.append(("o: each malformed moves.json entry", rejected, evidence))
         rejected, evidence = membership_move()
         results.append(("p: must-keep membership across a move", rejected, evidence))

@@ -47,7 +47,7 @@ moved, never pruned.
 | `audit/`, `metrics/` | unit | audit records, the NEVER-fields gate, sinks, retention; the metrics exporter |
 | `auth/`, `extensions/`, `profiles/`, `providers/` | unit | auth providers and RBAC; the extension registry; profile bundles, manifest and signing; the provider registry |
 | `litellm_hook/` | integration | what `CorpLlmGuardrail` adds: request shapes per call type, headers and auth bridges, Stage 0 and Stage 5 at the hook, fail policy, audit facts on the ticket, litellm dispatch, the acceptance matrix |
-| `route_gate/` | boundary | the route table and classifier, the gate middleware, the in-flight limiter, the response reversal (`test_desanitize_*.py`, every `tests/response_restore.py` user), the terminal audit record, arm checks |
+| `route_gate/` | boundary | the route table and classifier, the gate middleware, the in-flight limiter, the response reversal (`test_desanitize_*.py` and the other `tests/response_restore.py` users, except `invariants/test_no_originals_leak.py` and the litellm_hook tests that reach it through `hook_fixtures.restore_stream`), the terminal audit record, arm checks |
 | `invariants/` | boundary | the M1-14 leak surfaces and the issuance error / leak contracts |
 | `healthz/` | boundary | health checks and the gateway-owned issuance route |
 | `integration/`, `compose/` | boundary | the real image; the compose stack and its nginx front door |
@@ -70,8 +70,10 @@ A PR either moves or renames tests, or prunes them; never both.
 - A **prune** deletes or folds tests that are not must-keep. Every deleted or changed node id
   gets a row in [deleted-tests.md](deleted-tests.md) in the same PR: the survivor, a semantic
   note, and a fault injection where the replacement is disputed. A deleted test is in no
-  ledger, so the only manifest change is its own negative-log sites; a fold that creates a
-  test under a must-keep path adds its ids to `must_keep/`, additions only.
+  ledger, so its manifest changes are its own negative-log sites and, if it was moved
+  earlier, its `moves.json` entry (the moves gate refuses a key no longer in the tree); a
+  fold that creates a test under a must-keep path adds its ids to `must_keep/`, additions
+  only.
 - Both must leave `scripts/test-gates.sh minimal` and `full` green. The mechanics, and the
   order to regenerate the manifests in, are in [must-keep.md](must-keep.md).
 
