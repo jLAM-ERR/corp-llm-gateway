@@ -10,7 +10,10 @@ import pytest
 
 from corp_llm_gateway import config
 from corp_llm_gateway.metrics import reset_exporter
-from tests import logger_state
+from tests import collection_hooks, logger_state
+
+# The stale package attribute guard: a hook pytest finds by its name in this module.
+from tests.package_state import pytest_runtest_teardown  # noqa: F401
 
 # Not a test module, so its asserts are rewritten only if registered before anything imports it.
 pytest.register_assert_rewrite("tests.hook_fixtures")
@@ -34,10 +37,33 @@ SKIP_MARKERS: dict[str, tuple[Callable[[], bool], str]] = {
 }
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--shuffle-seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="run the tests in an order shuffled with seed N (modules, then classes, then tests)",
+    )
+
+
+def pytest_report_header(config: pytest.Config) -> str | None:
+    seed = config.getoption("shuffle_seed")
+    return None if seed is None else f"shuffle seed: {seed}"
+
+
+def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    # -q drops the header, so the seed is repeated where a quiet run still prints.
+    seed = terminalreporter.config.getoption("shuffle_seed")
+    if seed is not None:
+        terminalreporter.write_line(f"shuffle seed: {seed}")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Turn the dependency markers registered in pyproject.toml into setup-time skips, as
     the per-test ``skipif`` they replaced did (plan 20260926 Task 1c): one condition and
-    one reason per dependency instead of a copy in every module."""
+    one reason per dependency instead of a copy in every module. Then mark the tests
+    ``tests/slow_tests.txt`` lists ``slow``, and shuffle when ``--shuffle-seed`` is given."""
     skips: dict[str, bool] = {}
     for item in items:
         for name, (condition, reason) in SKIP_MARKERS.items():
@@ -47,6 +73,10 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 skips[name] = condition()
             if skips[name]:
                 item.add_marker(pytest.mark.skip(reason=reason))
+    collection_hooks.mark_slow(items, collection_hooks.slow_entries())
+    seed = config.getoption("shuffle_seed")
+    if seed is not None:
+        items[:] = collection_hooks.shuffled(items, seed)
 
 
 @pytest.fixture(autouse=True)
