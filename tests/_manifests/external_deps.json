@@ -4923,7 +4923,7 @@
     "tests/collection_hooks.py": "8c41a169ccfe9ca90253b0d2e5579de0",
     "tests/conftest.py": "657ebb3c1bcb93a4b2fdfb0395169661",
     "tests/logger_state.py": "24da867dbebad08285eb792d05701835",
-    "tests/package_state.py": "83b70cc89a50610a10dc8ecf8fbadd80"
+    "tests/package_state.py": "099eccc17cb65c674c7b2712a70d9b73"
    },
    "programs": []
   },
