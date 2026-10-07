@@ -33,21 +33,16 @@ def _tok(prefix: str = "pg-itest") -> str:
     return f"{prefix}-{secrets.token_hex(4)}"
 
 
-def _info(
-    corp_token: str,
-    *,
-    user_id: str = "pg-test-alice",
-    revoked_at: datetime | None = None,
-) -> TokenInfo:
+def _info(corp_token: str) -> TokenInfo:
     now = datetime.now(UTC)
     return TokenInfo(
         corp_token=corp_token,
-        user_id=user_id,
+        user_id="pg-test-alice",
         team_id="t1",
         scopes=("read", "write"),
         issued_at=now,
         expires_at=now + timedelta(days=30),
-        revoked_at=revoked_at,
+        revoked_at=None,
     )
 
 

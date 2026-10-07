@@ -6,6 +6,7 @@
 # in .venv-test-minimal and .venv-test-full (docs/testing/must-keep.md has the invocation).
 # A test is listed when its setup + call + teardown exceeds 2.0 s in either run; a
 # module-scoped fixture's setup counts against the first test that uses it.
+# Added on 2026-10-07 by the same rule: test_conftest_hooks.py's case-level entry check (5.2 s, full).
 # Refresh: rerun both, apply the same rule, and collapse a function's cases to its id only
 # when every case either environment collects is over 2 s. A stale entry fails
 # tests/test_conftest_hooks.py.
@@ -99,6 +100,7 @@ tests/test_asgi_entrypoint.py::test_the_test_only_key_never_lets_a_bypassable_gu
 tests/test_asgi_entrypoint.py::test_without_a_database_url_the_prisma_sequence_is_skipped
 tests/test_asgi_issuance_schema_identity.py::test_a_server_declining_the_tls_the_dsn_demands_exits_78[no-sslmode]
 tests/test_asgi_issuance_schema_identity.py::test_a_server_sent_transient_failure_warns_and_boots
+tests/test_conftest_hooks.py::test_every_case_level_slow_entry_is_still_collected
 tests/test_desanitize_served_stack.py::test_the_stack_armed_with_captures_on_both_sides_of_ours
 tests/test_inflight_served_stack.py::test_the_budget_stack_reads_the_byte_budget_from_the_environment
 tests/test_inflight_served_stack.py::test_the_isolation_stack_runs_the_default_limits
