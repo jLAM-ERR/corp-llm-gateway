@@ -1,4 +1,6 @@
-"""Pins ci.yml: the unit suite on Python 3.14, and the route gate on the real image."""
+"""Pins ci.yml: the unit suite on Python 3.14, and the route gate on the real image.
+
+The e2e job's own pins are in test_ci_e2e_job.py."""
 
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ JOB = "integration-container"
 UNIT_JOB = "test"
 # The one interpreter CI runs, and the one .venv-bench runs.
 CI_PYTHON = "3.14"
-ALL_JOBS = ["lint", UNIT_JOB, JOB]
+ALL_JOBS = ["lint", UNIT_JOB, JOB, "e2e"]
 
 
 def _jobs() -> dict[str, Any]:

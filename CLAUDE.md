@@ -183,8 +183,13 @@ CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway NO_PROXY=1
 PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py -q
 PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py::test_name -q
 
-# E2E (Langfuse + corp-llm-mock via docker compose; no CI job runs it)
+# E2E: CI's e2e job runs tests/e2e against Redis + both mocks, CORP_REQUIRE_E2E=1 (a skip fails).
+# Locally either through compose:
 docker compose run --rm e2e pytest -q tests/e2e
+# or against a Redis and both mocks you started (uvicorn --app-dir docker/<mock> app:app):
+REDIS_URL=redis://localhost:6379/0 CORP_LLM_ENDPOINT=http://localhost:8000 CORP_LLM_AUTH_PROVIDER=noop \
+  LANGFUSE_URL=http://localhost:3000 LANGFUSE_PUBLIC_KEY=pk-test-ci LANGFUSE_SECRET_KEY=sk-test-ci \
+  RUN_PROXY_E2E=1 CORP_REQUIRE_E2E=1 NO_PROXY=127.0.0.1,localhost PYTHONPATH=src .venv/bin/pytest tests/e2e -q -rs
 ```
 
 - Markers (`pyproject.toml`, `--strict-markers`): `requires_litellm`, `requires_ner`,
