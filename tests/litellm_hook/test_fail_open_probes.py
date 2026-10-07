@@ -1,10 +1,14 @@
 """Ways litellm could let an original reach the provider, driven through its real proxy app.
 
-A client's guardrail opt-out in the request metadata is stripped; our refusal keeps its status and
-error code through litellm; litellm's `scan_raw_request` and `run_in_parallel` modes are refused;
-and a policy row written into litellm's database makes a guardrail registered the litellm way
-(under `guardrails:`, not as a plain callback, as ours is) skip the request, so the original
-leaves. The check that our pre-call ran, which runs after it, cannot see a `scan_raw_request` run.
+A client's guardrail opt-out, in `metadata`, `litellm_metadata` or at the root, is stripped or
+overwritten; our refusal keeps its status and error code through litellm; litellm's
+`scan_raw_request` and `run_in_parallel` flags are refused when the gateway arms. A policy row
+written into litellm's database, or a request body naming one, makes a guardrail registered the
+litellm way (under `guardrails:`, not as a plain callback, as ours is) skip the request, so the
+original would leave. The same tests pin the defences: our plain callback still rewrites, a check
+that runs after our pre-call refuses the request with 503, pinning `supported_db_objects` keeps
+the row out, and the gate refuses a body with a `policies` key with 403. That after-pre-call
+check cannot see a `scan_raw_request` run; the arm check refuses the flag instead.
 
 Plan 20260926 Task 0, hazards 2, 4, 11, 14a, 14b.
 

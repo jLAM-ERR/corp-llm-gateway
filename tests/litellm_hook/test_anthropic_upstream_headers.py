@@ -1,8 +1,10 @@
 """The headers the hook forwards to Anthropic, and the OAuth token prefix it expects.
 
 An allow-list keeps the headers Anthropic needs and drops the corp token and every unlisted
-header; a malformed Authorization is rejected. The OAuth token prefix is read from litellm, with
-a fixed fallback when litellm's value is missing or unusable, and is never empty.
+header. An Authorization that is missing, not a Bearer, empty, carries a line break, or holds no
+OAuth token (a truncated prefix, a plain API key, any other bearer) is rejected. The OAuth token
+prefix is read from litellm, with a fixed fallback when litellm's value is missing or unusable,
+and is never empty.
 """
 
 from __future__ import annotations

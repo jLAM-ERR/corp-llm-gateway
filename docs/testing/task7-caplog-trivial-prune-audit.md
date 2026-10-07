@@ -154,7 +154,7 @@ tests keep.
 whose token an operator doc cites, and no test pins the cited form today: no log assert pins
 `error_code=E_CORP_LLM_DOWN`, `block_reason=dlp:canary` or `reason=policy_fingerprint_failed` (two log asserts pin
 other `error_code=` / `reason=` values: `extensions/test_corp_ner_hook_codes.py:182`,
-`route_gate/test_desanitize_middleware.py:1467` (now: `:1473` after Task 9's docstring); the must-keep
+`route_gate/test_desanitize_middleware.py:1467` (now: `:1475` after Task 9's docstring); the must-keep
 `invariants/test_no_originals_leak.py:1967-1968` pins
 `litellm_pre_call_corp_llm_failed` / `field=system`). A rewrite strengthens the check, so it changes the four
 `body_hash`es: it is neither a move nor a prune, and needs Task 1b-style ledger rows (`(changed: …)`). Everything else

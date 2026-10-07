@@ -527,126 +527,126 @@
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:1724",
+   "site": "tests/route_gate/test_desanitize_middleware.py:1726",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_failed_terminal_write_is_retried_at_close_and_written_once",
    "check": "CANARY not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:1928",
+   "site": "tests/route_gate/test_desanitize_middleware.py:1930",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_flush_failure_delivers_what_was_restored_and_closes",
    "check": "'phase=after_start' in caplog.text and CANARY not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:1474",
+   "site": "tests/route_gate/test_desanitize_middleware.py:1476",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_mapping_is_refused_for_a_cancelled_or_closed_ticket",
    "check": "ORIGINAL_MARK not in caplog.text and QUOTED not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:812",
+   "site": "tests/route_gate/test_desanitize_middleware.py:814",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_raising_failure_reporter_still_closes_the_stream",
    "check": "'gateway_desanitize_report_failed' in caplog.text and 'Traceback' not in caplog.text",
    "class": "security",
    "note": "no exception trace in a log line (M1-14 exception-trace surface)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:692",
+   "site": "tests/route_gate/test_desanitize_middleware.py:694",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_restorer_that_cannot_be_built_is_a_content_free_500",
    "check": "'Traceback' not in caplog.text",
    "class": "security",
    "note": "no exception trace in a log line (M1-14 exception-trace surface)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:691",
+   "site": "tests/route_gate/test_desanitize_middleware.py:693",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_a_restorer_that_cannot_be_built_is_a_content_free_500",
    "check": "CANARY not in caplog.text and EMAIL not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:763",
+   "site": "tests/route_gate/test_desanitize_middleware.py:765",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_after_start_failure_delivers_what_was_restored_then_closes",
    "check": "'Traceback' not in caplog.text",
    "class": "security",
    "note": "no exception trace in a log line (M1-14 exception-trace surface)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:762",
+   "site": "tests/route_gate/test_desanitize_middleware.py:764",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_after_start_failure_delivers_what_was_restored_then_closes",
    "check": "CANARY not in caplog.text and EMAIL not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:1908",
+   "site": "tests/route_gate/test_desanitize_middleware.py:1910",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_an_adapter_that_cannot_be_built_is_a_content_free_500_for_every_family",
    "check": "CANARY not in caplog.text and 'phase=before_start' in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:1584",
+   "site": "tests/route_gate/test_desanitize_middleware.py:1586",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_cancellation_resistant_requests_leave_nothing_behind",
    "check": "ORIGINAL_MARK not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:727",
+   "site": "tests/route_gate/test_desanitize_middleware.py:729",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_after_start_closes_the_stream_silently",
    "check": "'Traceback' not in caplog.text",
    "class": "security",
    "note": "no exception trace in a log line (M1-14 exception-trace surface)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:726",
+   "site": "tests/route_gate/test_desanitize_middleware.py:728",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_after_start_closes_the_stream_silently",
    "check": "CANARY not in caplog.text and EMAIL not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:663",
+   "site": "tests/route_gate/test_desanitize_middleware.py:665",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_before_start_is_a_content_free_500",
    "check": "'Traceback' not in caplog.text",
    "class": "security",
    "note": "no exception trace in a log line (M1-14 exception-trace surface)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:662",
+   "site": "tests/route_gate/test_desanitize_middleware.py:664",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_before_start_is_a_content_free_500",
    "check": "CANARY not in caplog.text and EMAIL not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:905",
+   "site": "tests/route_gate/test_desanitize_middleware.py:907",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_never_reaches_litellms_handler",
    "check": "'Unhandled exception in request' not in caplog.text",
    "class": "security",
    "note": "no backend or exception detail in a log line (M1-14 error surface)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:906",
+   "site": "tests/route_gate/test_desanitize_middleware.py:908",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restoration_failure_never_reaches_litellms_handler",
    "check": "CANARY not in caplog.text and 'Traceback' not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:1887",
+   "site": "tests/route_gate/test_desanitize_middleware.py:1889",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_restored_text_reaches_the_client_before_a_later_failure",
    "check": "CANARY not in caplog.text and 'Traceback' not in caplog.text",
    "class": "security",
    "note": "no original request/response content in a log line (M1-14)"
   },
   {
-   "site": "tests/route_gate/test_desanitize_middleware.py:604",
+   "site": "tests/route_gate/test_desanitize_middleware.py:606",
    "owner": "tests/litellm_hook/test_asgi_desanitize_prototype.py::test_stream_abort_releases_the_mapping_and_logs_no_content",
    "check": "ORIGINAL_MARK not in caplog.text and QUOTED not in caplog.text",
    "class": "security",

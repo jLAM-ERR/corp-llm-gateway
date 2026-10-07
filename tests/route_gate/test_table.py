@@ -1,8 +1,9 @@
 """The hand-classified route table's own rules.
 
 Every row is well formed and says why. Exactly eight spellings are REWRITTEN; the bypass,
-management and non-probe health routes are refused; the table covers every route litellm
-registers, and the verdict counts are pinned.
+management and non-probe health routes are refused; the table is the whole collected surface
+(size floors only: `test_litellm_route_guard.py` checks it against litellm's routes), and the
+verdict counts are pinned.
 """
 
 from __future__ import annotations
