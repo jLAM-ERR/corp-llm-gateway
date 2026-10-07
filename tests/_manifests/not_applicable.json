@@ -1,5 +1,5 @@
 {
- "about": "Reviewed not-applicable cases (plan 20260926 Task 0, gate 4): per environment, the outcome each must still have. A case skipped in both environments is a finding unless it is here.",
+ "about": "Reviewed not-applicable cases (plan 20260926 Task 0): per environment, the outcome each must still have. `ledger write` checks every entry against its run; the expected-outcome ledgers record, and `ledger check` compares, the must-keep entries only. A must-keep case skipped in both environments is a finding unless it is here.",
  "ids": {
   "tests/e2e/test_langfuse_pipeline.py::test_basic_auth_forwarded": {
    "note": "needs the e2e compose stack (LANGFUSE_URL; docker compose run --rm e2e pytest -q tests/e2e); no CI job runs it",

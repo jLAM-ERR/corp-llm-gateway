@@ -256,6 +256,27 @@ def test_the_ledger_check_speaks_for_the_must_keep_ids_only(
     assert len(check({}, {"tests/x/test_a.py": "no module"})) == 3
 
 
+def test_a_module_skipped_whole_that_collects_again_names_its_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = "tests/x/test_m.py"
+    recorded = {module: "collection-skipped:no extra"}
+    (tmp_path / "minimal.json").write_text(ledger._dump("minimal", ledger.nest(recorded)))
+    monkeypatch.setattr(ledger, "expected_path", lambda env: tmp_path / f"{env}.json")
+    monkeypatch.setattr(ledger, "not_applicable", dict)
+    monkeypatch.setattr(moves, "load", lambda: moves.Moves({}, {}))
+    run = {
+        "outcomes": {f"{module}::test_a": "passed", "tests/y/test_b.py::test_b": "passed"},
+        "collection_skipped": {},
+        "collection_errors": {},
+    }
+
+    assert ledger.compare("minimal", run) == [
+        f"minimal: missing id (deselected, lost or not collected): {module}",
+        f"minimal: new id not in the expected outcomes: {module}::test_a (passed)",
+    ]
+
+
 def test_ledger_write_keeps_only_the_tests_it_is_given(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -277,8 +298,11 @@ def test_ledger_write_keeps_only_the_tests_it_is_given(
 
 def test_moves_checks_values_against_the_collection_before_the_ledgers_narrowed() -> None:
     full = moves.full_ledger_ids()
+    if full is None:
+        if os.environ.get("CI"):
+            pytest.fail(moves.NO_FULL_LEDGERS)
+        pytest.skip(moves.NO_FULL_LEDGERS)
 
-    assert full is not None
     assert len(full) > len(ledger.ids_with_outcome("minimal"))
     assert set(moves.load().ids.values()) <= {ledger.function_id(i) for i in full if "::" in i}
 
@@ -295,6 +319,100 @@ def test_a_clone_without_the_full_ledgers_fails_moves_on_ci_and_warns_elsewhere(
     with pytest.warns(UserWarning, match="not in this clone"):
         found = moves.problems()
     assert found == []
+
+
+def test_the_moves_cli_fails_without_the_full_ledgers_outside_ci_too(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(moves, "full_ledger_ids", lambda: None)
+    monkeypatch.delenv("CI", raising=False)
+
+    assert moves.main(["--check"]) == 1
+    assert moves.NO_FULL_LEDGERS in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "failure", [subprocess.TimeoutExpired(["git"], 60), FileNotFoundError("git")]
+)
+def test_a_git_that_hangs_or_is_missing_reads_as_no_full_ledgers(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    def run(*args: object, **kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(moves.subprocess, "run", run)
+    moves.full_ledger_ids.cache_clear()
+    try:
+        assert moves.full_ledger_ids() is None
+    finally:
+        moves.full_ledger_ids.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("gate", "target", "argv", "prefix", "error"),
+    [
+        (must_keep, "problems", ["--check"], "MUST-KEEP", moves.MoveCollisionError),
+        (moves, "problems", ["--check"], "MOVES", moves.MoveCollisionError),
+        (negative_logs, "sites", ["--check"], "NEGATIVE-LOGS", inventory.RebindingImportError),
+        (name_pinned, "build", ["--check"], "NAME-PINNED", inventory.UnaliasedTestsImportError),
+        (ledger, "compare", ["check", "minimal", "RUN"], "OUTCOMES", moves.MoveCollisionError),
+    ],
+    ids=["must_keep", "moves", "negative_logs", "name_pinned", "ledger"],
+)
+def test_a_gate_cli_reports_a_refusal_as_one_line_not_a_traceback(
+    gate: object,
+    target: str,
+    argv: list[str],
+    prefix: str,
+    error: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise error("tests/x/test_a.py:3: the refusal")
+
+    run = tmp_path / "run.json"
+    run.write_text("{}")
+    monkeypatch.setattr(gate, target, refuse)
+
+    assert gate.main([str(run) if a == "RUN" else a for a in argv]) == 1
+    assert capsys.readouterr().err == f"{prefix}: tests/x/test_a.py:3: the refusal\n"
+
+
+def test_a_module_level_name_imported_twice_from_tests_is_refused() -> None:
+    path = ROOT / "tests" / "_gates" / "selftest_twice.py"
+    twice = (
+        "try:\n    from tests.a import helper\n"
+        "except ImportError:\n    from tests.b import helper\n"
+    )
+    other = "try:\n    import tomllib\nexcept ImportError:\n    import tomli as tomllib\n"
+
+    with pytest.raises(inventory.RebindingImportError, match=r"selftest_twice.py:4: `helper`"):
+        inventory._index("tests._gates.selftest_twice", path, twice)
+    assert inventory._index("tests._gates.selftest_twice", path, other).imports == {
+        "tomllib": ("tomli", None)
+    }
+
+
+def test_a_lost_security_id_names_an_unreviewed_check_of_its_own() -> None:
+    recorded = json.loads(negative_logs.PATH.read_text())
+    owner = "tests/detectors/test_shadow.py::test_shadow_exception_does_not_break_canonical"
+    sites = [
+        {**site, "class": "UNREVIEWED"} if site["owner"] == owner else site
+        for site in recorded["sites"]
+    ]
+    lost = f"security negative-log id lost while its test is still must-keep: {owner}"
+
+    assert negative_logs.lost(recorded["security_node_ids"], {**recorded, "sites": sites}) == [
+        lost + negative_logs.UNREVIEWED_HINT
+    ]
+    behaviour = [
+        {**site, "class": "behaviour"} if site["owner"] == owner else site for site in sites
+    ]
+    assert negative_logs.lost(recorded["security_node_ids"], {**recorded, "sites": behaviour}) == [
+        lost
+    ]
 
 
 def test_not_applicable_skips_are_reviewed_and_still_recorded() -> None:
@@ -324,6 +442,16 @@ def test_the_full_constraints_install_the_litellm_pyproject_pins(
     assert fingerprint.problems("full", recorded, recorded) == [
         f"scripts/test-env.full.txt pins litellm==0.0.1, pyproject.toml pins "
         f"{fingerprint.litellm_pin()}"
+    ]
+
+
+def test_a_different_python_patch_version_still_matches_the_fingerprint() -> None:
+    recorded = json.loads(fingerprint.path_for("minimal").read_text())
+
+    assert recorded["python_patch"].startswith(recorded["python"] + ".")
+    assert fingerprint.problems("minimal", {**recorded, "python_patch": "3.14.99"}, recorded) == []
+    assert fingerprint.problems("minimal", {**recorded, "python": "3.15"}, recorded) == [
+        "python: recorded '3.14', now '3.15'"
     ]
 
 

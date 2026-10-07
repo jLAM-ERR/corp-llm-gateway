@@ -75,8 +75,8 @@ REPARSED_HELPERS = ("first", "second")
 
 def cache_reparse(rounds: int = 200) -> tuple[bool, str]:
     """Re-parse one synthetic module with alternating bodies, whose fixture calls a different
-    helper; each must always reach its own. A fixture or conftest cache keyed by a reused
-    ``id()`` hands back the other body's fixture."""
+    helper; each must always reach its own. A fixture or conftest cache keyed by module name
+    hands back the other body's fixture."""
     path = ROOT / "tests" / "_gates" / "selftest_reparsed.py"
     reached: dict[int, set[tuple[str, ...]]] = {0: set(), 1: set()}
     for index in range(rounds):

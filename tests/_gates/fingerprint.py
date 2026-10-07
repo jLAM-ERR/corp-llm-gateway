@@ -58,6 +58,8 @@ def current() -> dict[str, Any]:
         litellm = importlib.metadata.version("litellm")
     return {
         "python": "{}.{}".format(*sys.version_info[:2]),
+        # Informational: CI pins the minor version only, so problems() never compares it.
+        "python_patch": "{}.{}.{}".format(*sys.version_info[:3]),
         "markers": markers,
         "litellm_version": litellm,
         "packages": packages(),

@@ -73,11 +73,11 @@ def _package(name: str, path: Path) -> str:
     return name.rsplit(".", 1)[0] if path.name != "__init__.py" else name
 
 
-class UnaliasedTestsImportError(ValueError):
+class UnaliasedTestsImportError(moves.GateRefusalError):
     pass
 
 
-class RebindingImportError(ValueError):
+class RebindingImportError(moves.GateRefusalError):
     pass
 
 
@@ -123,9 +123,32 @@ def _index(name: str, path: Path, text: str | None = None) -> Module:
         elif isinstance(stmt, ast.AnnAssign | ast.AugAssign) and isinstance(stmt.target, ast.Name):
             module.consts.setdefault(stmt.target.id, stmt)
         elif isinstance(stmt, ast.Import | ast.ImportFrom):
-            module.imports.update(_import_bindings(stmt, package, path))
+            for bound, binding in _import_bindings(stmt, package, path):
+                _refuse_second_tests_binding(module, bound, binding, stmt)
+                module.imports[bound] = binding
     _refuse_rebinding_imports(tree, package, path)
     return module
+
+
+def _from_tests(binding: tuple[str, str | None]) -> bool:
+    return binding[0] == "tests" or binding[0].startswith("tests.")
+
+
+def _refuse_second_tests_binding(
+    module: Module, name: str, binding: tuple[str, str | None], stmt: ast.stmt
+) -> None:
+    """Module-level imports are indexed one binding per name; a second import of the same
+    name (a try / except fallback) where either side is from tests would hide a helper."""
+    first = module.imports.get(name)
+    if first is None or first == binding or not (_from_tests(first) or _from_tests(binding)):
+        return
+    path = module.path
+    where = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+    raise RebindingImportError(
+        f"{where}:{stmt.lineno}: `{name}` is imported at module level a second time, and "
+        "one of the two is from tests; the suite index follows one binding per module-level "
+        "name, so import it once"
+    )
 
 
 def _refuse_rebinding_imports(tree: ast.Module, package: str, path: Path) -> None:

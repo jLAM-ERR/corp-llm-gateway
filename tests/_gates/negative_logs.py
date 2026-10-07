@@ -143,12 +143,30 @@ def lost(previous: list[str], manifest: dict[str, Any]) -> list[str]:
     selects (a security helper moved away from them, or reclassified). Both sides are
     baseline ids. Dropping one on purpose means editing ``security_node_ids`` by hand."""
     gone = set(previous) - set(node_ids(manifest))
+    unreviewed = {s["owner"] for s in manifest["sites"] if s["class"] == "UNREVIEWED"}
     return [
         f"security negative-log id lost while its test is still must-keep: {node_id}"
+        + (UNREVIEWED_HINT if _owns_unreviewed(node_id, unreviewed) else "")
         for node_id in sorted(gone & set(must_keep.read()))
     ]
 
 
+UNREVIEWED_HINT = (
+    " (a check of this test or of a helper in its module is UNREVIEWED: a security check "
+    "whose text changed comes back unreviewed; review it before --write)"
+)
+
+
+def _owns_unreviewed(node_id: str, unreviewed: set[str]) -> bool:
+    path = node_id.split("::", 1)[0]
+    return any(
+        owner == node_id
+        or (owner.split("::", 1)[0] == path and owner.rsplit("::", 1)[1].startswith("_"))
+        for owner in unreviewed
+    )
+
+
+@moves.refusals("NEGATIVE-LOGS")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)

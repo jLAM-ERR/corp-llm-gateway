@@ -89,7 +89,11 @@ function-local, nested-scope or `global` import of a `tests.` module like a modu
 so the helper it binds joins the test's closure. An unaliased `import tests[.x]` binds only
 `tests`, so the index refuses it; write `from tests.x import name` or
 `import tests.x as alias`. It also refuses a scope that imports a `tests` name it declares
-`global` or `nonlocal`; import it in the scope that uses it. A move PR that renames a
+`global` or `nonlocal`; import it in the scope that uses it. It keeps one binding per
+module-level name, so it refuses a module-level name imported twice where either import is
+from `tests` (a try / except fallback); import it once. Each gate CLI reports such a
+refusal, or two tests that translate to one baseline id, as one line naming the file and
+line, not a traceback. A move PR that renames a
 module-level helper may record it in `tests/_manifests/renames.json` as
 `{"names": {"<new name>": "<old name>"}}`, so the helper keeps its baseline name in a test's
 `helpers`.
@@ -135,9 +139,10 @@ The gate (`python -m tests._gates.moves --check`, `scripts/test-gates.sh`, and e
 - a value that is still in the current tree (the test did not move);
 - an `ids` value that is not in the baseline collection, or a `files` value that is not
   one of its paths. The collection is the ledgers' ids as of `8936dc6` (the last commit
-  whose ledgers held every test, read with `git show`) plus today's must-keep ledgers. A
-  clone without `8936dc6` skips this refusal with a warning, and fails it under `CI`;
-  CI's `fetch-depth: 0` has it;
+  whose ledgers held every test, read with `git show`) plus today's must-keep ledgers. In
+  a clone without `8936dc6` (or with no working `git`) the CLI, and so
+  `scripts/test-gates.sh`, fails; a plain `pytest tests/` run warns and skips this refusal,
+  and fails it under `CI`. CI's `fetch-depth: 0` has the commit;
 - a value used twice, or two current tests that translate to one baseline id (the
   index, the ledger and must-keep stop on that too, rather than keep one of the two);
 - a chain: a value that is itself a key, or an `ids` value in a module that `files`
@@ -334,7 +339,7 @@ restored after each. `python -m tests._gates.selftest static` (any venv) runs g-
 
 | # | case | rejected by |
 |---|---|---|
-| g | re-parse one synthetic module 200 times, its fixture calling `first` in one body and `second` in the other | index caches: each body always reaches its own helper (a fixture cache keyed by name, or by a reused `id()`, hands back the other body's) |
+| g | re-parse one synthetic module 200 times, its fixture calling `first` in one body and `second` in the other | index caches: each body always reaches its own helper (a fixture cache keyed by module name hands back the other body's) |
 | h | a helper reached only through a function-local `from tests.… import` | index: the importing test reaches it, a sibling that names it without the import does not |
 | i | an import in a nested def, or in another method of a class | index: each test still reaches the module-level helper it calls, and the imported one |
 | j | one scope imports `helper` from two modules | index: the test reaches both |

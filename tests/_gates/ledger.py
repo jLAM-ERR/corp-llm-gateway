@@ -270,6 +270,7 @@ def ids_with_outcome(env: str) -> set[str]:
     return set(flat(json.loads(expected_path(env).read_text())))
 
 
+@moves.refusals("OUTCOMES")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)

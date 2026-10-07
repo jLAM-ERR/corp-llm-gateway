@@ -36,5 +36,6 @@
   "typing-extensions==4.16.0",
   "typing-inspection==0.4.4"
  ],
- "python": "3.14"
+ "python": "3.14",
+ "python_patch": "3.14.8"
 }

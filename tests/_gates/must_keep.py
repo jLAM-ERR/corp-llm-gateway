@@ -392,6 +392,7 @@ def problems(*, strict: bool = False) -> list[str]:
     return found
 
 
+@moves.refusals("MUST-KEEP")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
