@@ -216,6 +216,10 @@ def test_the_metrics_count_every_cancellation_and_no_gate_failure(served: dict[s
 # ── isolation: shared tasks and idle bodies ──────────────────────────────────
 
 BODY_READ_S = 2.0
+# The server's deadline runs on the loop clock; the client measures with time.monotonic().
+# uvloop's loop clock is libuv's millisecond time, cached at the start of each iteration,
+# so its timer can fire up to ~1 ms before monotonic time has moved by the full deadline.
+CLOCK_GRANULARITY_S = 0.01
 
 
 @pytest.fixture(scope="module", params=LOOPS)
@@ -290,7 +294,7 @@ def test_idle_bodies_get_408_once_the_deadline_passes(isolated: dict[str, Any]) 
     assert result["statuses"] == ["408"]
     assert result["body_timeout_codes"] == 65
     # No refusal before the first deadline; all of them within 3 s of the last one.
-    assert result["first_refused_s"] >= BODY_READ_S
+    assert result["first_refused_s"] >= BODY_READ_S - CLOCK_GRANULARITY_S
     assert result["refused_after_draining_s"] <= BODY_READ_S + 3
     assert result["draining_after"] == 0
     text = isolated["metrics"]["text"]
