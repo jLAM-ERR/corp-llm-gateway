@@ -31,6 +31,11 @@
    "minimal": "skipped:REDIS_URL and CORP_LLM_ENDPOINT must be set for e2e",
    "full": "skipped:REDIS_URL and CORP_LLM_ENDPOINT must be set for e2e"
   },
+  "tests/e2e/test_orchestrator_against_mock.py::test_no_gazetteer_hit_skips_the_oracle": {
+   "note": "needs the e2e compose stack (REDIS_URL + CORP_LLM_ENDPOINT of the corp-llm mock); no CI job runs it",
+   "minimal": "skipped:REDIS_URL and CORP_LLM_ENDPOINT must be set for e2e",
+   "full": "skipped:REDIS_URL and CORP_LLM_ENDPOINT must be set for e2e"
+  },
   "tests/e2e/test_orchestrator_against_mock.py::test_per_team_cache_isolation": {
    "note": "needs the e2e compose stack (REDIS_URL + CORP_LLM_ENDPOINT of the corp-llm mock); no CI job runs it",
    "minimal": "skipped:REDIS_URL and CORP_LLM_ENDPOINT must be set for e2e",
