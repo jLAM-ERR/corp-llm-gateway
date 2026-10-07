@@ -173,7 +173,8 @@ async def test_no_originals_in_batch_payload(sink_and_client) -> None:
     }
     await sink.write(record)
 
-    # NEVER fields, top level and nested under a forwarded key: refused, nothing sent.
+    # NEVER fields at the top level, nested under a key the sink drops, and nested under
+    # finding_label_counts, which it forwards as-is: refused, nothing sent.
     never_values = {
         "mapping": {email: "[EMAIL_001]"},
         "mapping_table": [[person, "[PERSON_001]"]],
@@ -193,7 +194,11 @@ async def test_no_originals_in_batch_payload(sink_and_client) -> None:
     }
     assert set(never_values) == NEVER_FIELDS
     for key, value in never_values.items():
-        for smuggled in ({**record, key: value}, {**record, "metadata": {key: value}}):
+        for smuggled in (
+            {**record, key: value},
+            {**record, "metadata": {key: value}},
+            {**record, "finding_label_counts": {"EMAIL": {key: value}}},
+        ):
             with pytest.raises(NeverFieldPresentError):
                 await sink.write(smuggled)
 

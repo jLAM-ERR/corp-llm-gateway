@@ -184,7 +184,7 @@ PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py -q
 PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py::test_name -q
 
 # E2E: CI's e2e job runs tests/e2e against Redis + both mocks, CORP_REQUIRE_E2E=1 (a skip fails).
-# Locally either through compose:
+# Locally either through compose (its e2e service sets CORP_REQUIRE_E2E=1 too):
 docker compose run --rm e2e pytest -q tests/e2e
 # or against a Redis and both mocks you started (uvicorn --app-dir docker/<mock> app:app):
 REDIS_URL=redis://localhost:6379/0 CORP_LLM_ENDPOINT=http://localhost:8000 CORP_LLM_AUTH_PROVIDER=noop \

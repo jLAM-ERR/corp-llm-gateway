@@ -51,7 +51,7 @@ moved, never pruned.
 | `invariants/` | boundary | the M1-14 leak surfaces and the issuance error / leak contracts |
 | `healthz/` | boundary | health checks and the gateway-owned issuance route |
 | `integration/`, `compose/` | boundary | the real image; the compose stack and its nginx front door |
-| `e2e/` | boundary | the compose e2e stack (skips without it; no CI job runs it) |
+| `e2e/` | boundary | the e2e stack: Redis and the two mocks (skips without it; CI's `e2e` job runs it, where a skip fails) |
 | `cli/`, `deploy/`, `helm/`, `docs/` | — | the operator and laptop CLIs; the deploy and install scripts; the Helm chart; doc pins (counts, keys and codes the docs name) |
 | `tests/*.py` (root) | boundary and composition | the served-stack suites, the ASGI entrypoint and `serve`, launch-command and litellm pins, CI workflow pins; `bootstrap`, `config`, `settings`, `pg_session` and the conftest hooks |
 | `_gates/` | — | the test-suite gates ([must-keep.md](must-keep.md)) |

@@ -123,6 +123,6 @@ The demo intentionally does **not** cover:
 - ❌ S3 audit sink or SIEM audit sink (Langfuse is the only sink in the demo)
 - ❌ Multi-team isolation (single team: `demo-team`)
 - ❌ Per-team `replace.md` rules (one default rules file)
-- ❌ CI `e2e:langfuse` job or the existing `docker-compose.yml` (demo stack is parallel, independent)
+- ❌ CI's `e2e` job or the existing `docker-compose.yml` (demo stack is parallel, independent)
 
 These are production concerns; the demo focuses on the core redaction→audit→recovery flow.

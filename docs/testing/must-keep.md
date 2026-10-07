@@ -159,8 +159,9 @@ The gate (`python -m tests._gates.moves --check`, `scripts/test-gates.sh`, and e
   `scripts/test-gates.sh` fail; a plain `pytest tests/` run warns, skips the two cases
   that need those ledgers (self-test o's baseline cases and
   `test_moves_checks_values_against_the_collection_before_the_ledgers_narrowed`) with that
-  reason, runs every other case, and fails them under `CI`. CI's `fetch-depth: 0` has the
-  commit;
+  reason, runs every other case, and fails them under `CI`. Under `CI`
+  `test_the_moves_map_names_only_tests_that_moved` fails too: `moves.problems()` then
+  reports `NO_FULL_LEDGERS` as a problem. CI's `fetch-depth: 0` has the commit;
 - a value used twice, or two current tests that translate to one baseline id (the
   index, the ledger and must-keep stop on that too, rather than keep one of the two);
 - a chain: a value that is itself a key, or an `ids` value in a module that `files`

@@ -1,7 +1,9 @@
 """End-to-end test running the SanitizationOrchestrator against the
-corp-llm-mock over HTTP + real Redis, wired local-first the way bootstrap
-wires it: regex+checksum locally, a gazetteer, and the oracle called only on
-a gazetteer hit. Skipped unless explicit env vars are set.
+corp-llm-mock over HTTP + real Redis, local-first with the oracle called only
+on a gazetteer hit. The orchestrator is a hand-built subset of
+`bootstrap._build_orchestrator`: regex+checksum as the only local detector, a
+one-term custom gazetteer, and no NER, allowlist or `code_safe_detectors`.
+Skipped unless explicit env vars are set.
 
 Run via:
   docker compose run --rm e2e
@@ -38,7 +40,8 @@ skip_if_no_e2e = pytest.mark.skipif(
 # A made-up product term: the gazetteer hit that makes the orchestrator call the oracle.
 PRODUCT = "Zorblax"
 # The mock's default pairs: alice@corp.lan -> [EMAIL_001], alice -> [NAME_001].
-# No local detector finds a bare name, so [NAME_001] in a result came from the oracle.
+# Regex+checksum finds no bare name, so with this subset [NAME_001] came from the
+# oracle. NER (not wired here, and not installed in CI's e2e job) could find it locally.
 HIT_TEXT = f"alice asked about the {PRODUCT} launch, reply to alice@corp.lan"
 NO_HIT_TEXT = "alice asked me to reply to alice@corp.lan"
 
