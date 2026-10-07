@@ -1,7 +1,7 @@
 """What a test must leave on the ``corp_llm_gateway`` packages as it found it: a package
 attribute naming a submodule must be the module ``sys.modules`` holds. A test that drops
 a submodule from ``sys.modules`` and re-imports it rebinds the attribute; restoring only
-``sys.modules`` leaves the attribute on a stale module, so a later
+``sys.modules`` (or leaving ``None`` there) leaves the attribute on a stale module, so a later
 ``from corp_llm_gateway import x`` or a monkeypatch through ``corp_llm_gateway.x`` reaches
 a module the code under test never reads, and that test passes or fails by run order."""
 
@@ -50,26 +50,34 @@ def _stale() -> list[Stale]:
             continue
         for child, bound in list(vars(parent).items()):
             name = f"{parent_name}.{child}"
-            if isinstance(bound, ModuleType) and bound.__name__ == name and name not in sys.modules:
-                found.append(
-                    (
-                        parent,
-                        child,
-                        f"{name} is module {bound.__name__} at {id(bound):#x}, "
-                        f"but sys.modules has no {name!r}",
-                    )
+            if not isinstance(bound, ModuleType) or bound.__name__ != name:
+                continue
+            # A None or other non-module entry blocks `import`; `from ... import` would still
+            # hand out the attribute.
+            if name not in sys.modules:
+                held = f"sys.modules has no {name!r}"
+            elif not isinstance(sys.modules[name], ModuleType):
+                held = (
+                    f"sys.modules[{name!r}] holds {type(sys.modules[name]).__name__}, not a module"
                 )
+            else:
+                continue
+            found.append(
+                (parent, child, f"{name} is module {bound.__name__} at {id(bound):#x}, but {held}")
+            )
     return found
 
 
 def stale_package_attributes() -> list[str]:
     """One line per ``corp_llm_gateway`` package attribute that is a submodule other than
-    the one ``sys.modules`` holds under its name, or one ``sys.modules`` no longer holds."""
+    the one ``sys.modules`` holds under its name, or one ``sys.modules`` no longer holds
+    (no entry, or an entry that is not a module, such as ``None``)."""
     return sorted(message for _, _, message in _stale())
 
 
 def restore_package_attributes() -> None:
-    """Rebind each stale attribute to the module ``sys.modules`` holds, or drop it."""
+    """Rebind each stale attribute to the module ``sys.modules`` holds, or drop it when
+    ``sys.modules`` holds no module under that name; ``sys.modules`` itself is left alone."""
     for parent, child, _ in _stale():
         name = f"{parent.__name__}.{child}"
         module = sys.modules.get(name)

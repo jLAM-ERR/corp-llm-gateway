@@ -54,6 +54,25 @@ def test_a_package_attribute_whose_module_left_sys_modules_is_reported(
     ]
 
 
+def test_a_package_attribute_whose_sys_modules_entry_is_not_a_module_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live = sys.modules["corp_llm_gateway.metrics"]
+    monkeypatch.setitem(sys.modules, "corp_llm_gateway.metrics", None)
+
+    assert package_state.stale_package_attributes() == [
+        f"corp_llm_gateway.metrics is module corp_llm_gateway.metrics at {id(live):#x}, "
+        "but sys.modules['corp_llm_gateway.metrics'] holds NoneType, not a module"
+    ]
+
+    # Recorded so teardown puts the attribute back after the restore drops it.
+    monkeypatch.setattr(corp_llm_gateway, "metrics", live)
+    package_state.restore_package_attributes()
+
+    assert "metrics" not in vars(corp_llm_gateway)
+    assert package_state.stale_package_attributes() == []
+
+
 def test_restore_rebinds_the_live_module_and_drops_an_unloaded_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
