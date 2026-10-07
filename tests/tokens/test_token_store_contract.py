@@ -676,7 +676,12 @@ def test_ci_test_job_runs_the_postgres_the_contract_tests_need() -> None:
     assert "5432:5432" in service["ports"]
     assert "pg_isready" in service["options"]
 
-    steps = [step for step in job["steps"] if "pytest" in (step.get("run") or "")]
+    # scripts/test-gates.sh runs the suite with the job's step env.
+    steps = [
+        step
+        for step in job["steps"]
+        if any(marker in (step.get("run") or "") for marker in ("pytest", "test-gates.sh"))
+    ]
     assert steps
     for step in steps:
         env = {**(job.get("env") or {}), **(step.get("env") or {})}

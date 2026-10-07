@@ -34,6 +34,9 @@ PROXY_E2E = "tests/e2e/test_proxy_pipeline.py"
 E2E_COMMAND = ["PYTHONPATH=src", "python", "-m", "pytest", E2E_SUITE, "-q", "-rs"]
 # The one interpreter CI runs, and the one .venv-bench runs.
 CI_PYTHON = "3.14"
+# The test job's one unit-suite run: the pinned full environment under the gates.
+UNIT_SUITE_RUN = ["scripts/test-env.sh", "full", "&&", "scripts/test-gates.sh", "full"]
+TEST_ENV_SCRIPT = ROOT / "scripts/test-env.sh"
 ALL_JOBS = ["lint", UNIT_JOB, JOB, E2E_JOB]
 
 
@@ -89,6 +92,10 @@ def _uses(job: dict[str, Any], action: str) -> list[dict[str, Any]]:
     return [step for step in job["steps"] if str(step.get("uses", "")).startswith(action)]
 
 
+def _runs_the_unit_suite(run: str) -> bool:
+    return any(marker in run for marker in ("pytest", "test-gates.sh", "test-env.sh"))
+
+
 def test_the_unit_suite_is_one_job_without_a_matrix() -> None:
     jobs = _jobs()
     job = jobs[UNIT_JOB]
@@ -96,6 +103,14 @@ def test_the_unit_suite_is_one_job_without_a_matrix() -> None:
     assert "strategy" not in job
     assert "name" not in job
     assert [name for name in jobs if name.startswith(UNIT_JOB)] == [UNIT_JOB]
+    # One run of the suite, in the full environment: no plain pytest step beside the
+    # gates, and no minimal-environment step (a local check only).
+    suite_runs = [step["run"] for step in _runs(job) if _runs_the_unit_suite(step["run"])]
+    assert [shlex.split(run) for run in suite_runs] == [UNIT_SUITE_RUN]
+    # Neither the job nor any of its steps can be skipped or made non-blocking.
+    for scope in (job, *job["steps"]):
+        assert "continue-on-error" not in scope, scope
+        assert "if" not in scope, scope
 
 
 def test_every_job_runs_python_3_14() -> None:
@@ -111,10 +126,15 @@ def test_the_workflow_never_names_python_3_12() -> None:
 
 
 def test_the_unit_suite_installs_every_extra_it_needs() -> None:
-    installs = [step["run"] for step in _runs(_jobs()[UNIT_JOB]) if "pip install -e" in step["run"]]
+    # The test job builds the suite's venv with scripts/test-env.sh full, which installs
+    # the package with its extras; the job's own interpreter installs nothing.
+    runs = [step["run"] for step in _runs(_jobs()[UNIT_JOB])]
+    assert any(shlex.split(run)[:2] == ["scripts/test-env.sh", "full"] for run in runs)
+    assert not any("pip install" in run for run in runs)
+    installs = [line for line in TEST_ENV_SCRIPT.read_text().splitlines() if '-e ".[' in line]
 
     assert len(installs) == 1
-    extras = installs[0].split("[", 1)[1].split("]", 1)[0].split(",")
+    extras = installs[0].split('-e ".[', 1)[1].split("]", 1)[0].split(",")
     assert set(extras) >= {"dev", "ner", "postgres", "oidc", "asgi", "metrics"}
 
 

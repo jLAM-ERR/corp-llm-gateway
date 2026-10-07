@@ -66,7 +66,8 @@ if [[ "${ENV_NAME}" == minimal ]]; then
     "${PIP[@]}" install -c "${CONSTRAINTS}" "${MINIMAL_RUNNERS[@]}"
 else
     "${PIP[@]}" install -c "${CONSTRAINTS}" -e ".[dev,ner,postgres,oidc,asgi,metrics]"
-    # Model wheel version mirrors .github/workflows/ci.yml and Dockerfile.gateway.
+    # Model wheel version mirrors Dockerfile.gateway's EN_MODEL_VERSION default and
+    # build-image.yml's default (3.8.0); keep all three in sync. CI's test job installs it here.
     "${PIP[@]}" install --no-deps "${EN_MODEL_WHEEL}"
 fi
 

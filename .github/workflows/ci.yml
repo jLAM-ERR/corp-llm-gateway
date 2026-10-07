@@ -1,12 +1,13 @@
 name: ci
 
 # Gates every PR on the real suite: ruff (lint job) + the full pytest suite on
-# Python 3.14 with the ner/postgres/oidc/asgi/metrics extras (test job) — the
-# authoritative run CLAUDE.md refers to, including NER, RS256/RBAC crypto, the
-# Postgres contract tests and the helm render tests. tests/e2e runs in its own
-# job (e2e) against real Redis and the two mocks. Every job runs 3.14, the
-# interpreter .venv-bench runs; pyproject still declares a lower floor, which CI
-# no longer exercises.
+# Python 3.14 with the ner/postgres/oidc/asgi/metrics extras (test job), run once
+# through the test-suite gates in the pinned full environment — the authoritative
+# run CLAUDE.md refers to, including NER, RS256/RBAC crypto, the Postgres contract
+# tests and the helm render tests. The minimal environment is a local check
+# (docs/testing/must-keep.md). tests/e2e runs in its own job (e2e) against real
+# Redis and the two mocks. Every job runs 3.14, the interpreter .venv-bench runs;
+# pyproject still declares a lower floor, which CI no longer exercises.
 
 on:
   pull_request:
@@ -36,8 +37,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     # 1.2 GB litellm image pull for tests/integration/test_anthropic_oauth_outbound.py
-    # on top of the unit suite, then the suite twice more under the test-suite gates.
-    timeout-minutes: 120
+    # on top of the unit suite, which runs once, under the test-suite gates.
+    timeout-minutes: 60
     # The Postgres store contract tests (incl. the issuance race tests) run against
     # this service. GitHub sets CI=true, which turns their "Postgres unreachable"
     # skip into a failure (tests/postgres_support.py); the credentials mirror the
@@ -62,36 +63,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The interpreter scripts/test-env.sh builds the venv from; the venv's pip
+      # shares this job's pip cache, keyed on what the full recipe installs.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            scripts/test-env.full.txt
       # Unconditional: tests/helm render tests are skipif-helm — without this step
       # they'd silently skip instead of gating the chart.
       - uses: azure/setup-helm@v4
-      - run: pip install -e ".[dev,ner,postgres,oidc,asgi,metrics]"
-      # Model wheel version mirrors Dockerfile.gateway's EN_MODEL_VERSION default
-      # and build-image.yml's default (3.8.0) — keep all three in sync.
-      - run: pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl
-      # CORP_REQUIRE_PROXY_CAPTURE turns the docker/image/reachability skips in
-      # tests/integration/test_anthropic_oauth_outbound.py into failures. Without
-      # it a daemon, registry or network fault produces a green job that verified
-      # none of the outbound headers, body, streaming, retention or proxy stdout.
-      # Asserted from the suite itself, so a dropped var fails the run.
-      - run: PYTHONPATH=src pytest tests/ -q
-        env:
-          CORP_REQUIRE_PROXY_CAPTURE: "1"
-          CORP_TEST_PG_DSN: postgresql://gateway:gateway@localhost:5432/gateway
-      # The test-suite gates (docs/testing/must-keep.md): the suite again in each of the
-      # two reproducible environments, each built from its recipe and checked against the
-      # committed outcome ledger, must-keep ids and the other manifests. The script
-      # sets each run's own env (minimal drops CI, full sets it); the var below keeps
-      # the skip guard armed for this step like every other one that runs the suite.
-      - name: Test-suite gates, minimal environment
-        run: scripts/test-env.sh minimal && scripts/test-gates.sh minimal
-        env:
-          CORP_REQUIRE_PROXY_CAPTURE: "1"
+      # The test-suite gates (docs/testing/must-keep.md): the venv built from its pinned
+      # recipe (every extra + the en_core_web_md wheel), its fingerprint, the static
+      # gates, then the whole suite once, checked against the committed outcome ledger.
+      # The script sets CI=true and its own env; the var below keeps the skip guard armed
+      # in the step itself. CORP_REQUIRE_PROXY_CAPTURE turns the docker/image/reachability
+      # skips in tests/integration/test_anthropic_oauth_outbound.py into failures: without
+      # it a daemon, registry or network fault produces a green job that verified none of
+      # the outbound headers, body, streaming, retention or proxy stdout. Asserted from the
+      # suite itself, so a dropped var fails the run.
       - name: Test-suite gates, full environment
         run: scripts/test-env.sh full && scripts/test-gates.sh full
         env:
