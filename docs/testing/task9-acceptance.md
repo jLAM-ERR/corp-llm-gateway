@@ -307,7 +307,8 @@ Checks on commit 2:
   by line. So `--write` was not run (rev 20 (2)). The `site` values of 23 checks in
   `tests/_manifests/negative_log_checks.json` now point early: `route_gate/test_desanitize_middleware.py` 18
   sites by 6 lines, `route_gate/test_middleware.py` 4 by 8, `route_gate/test_reverse_object_shapes.py` 1 by 5.
-  The next `negative_logs --write` refreshes them.
+  The next `negative_logs --write` refreshes them. Commit 3 refreshed them: one `negative_logs --write`, a diff of
+  exactly those 23 `site` values, nothing else in the file changed.
 - In both venvs, `inventory`, `must_keep`, `moves`, `name_pinned` and `negative_logs --check` all exit 0, and
   `pytest tests/_gates -q` gives 33 passed. The 8 files plus `litellm_hook/test_acceptance_matrix.py` and
   `docs/test_docs_pins.py`: minimal 529 passed / 6 skipped, full 716 passed. The 6 minimal skips are the
