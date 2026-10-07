@@ -1,3 +1,10 @@
+"""How the route gate turns a request into a verdict: PASSTHROUGH, REWRITTEN or REFUSE.
+
+The verdict comes from the method and the raw path. A websocket or an upgrade request is refused,
+an encoded or traversing path is malformed, HEAD takes its GET row and is never rewritten, and an
+operator extra can only add a PASSTHROUGH route: it never undoes a refusal or promises a rewrite.
+"""
+
 from __future__ import annotations
 
 import re

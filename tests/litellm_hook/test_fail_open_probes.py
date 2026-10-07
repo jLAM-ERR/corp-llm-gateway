@@ -1,4 +1,12 @@
-"""Plan 20260926 Task 0: fail-open probes (hazards 2, 4, 11, 14a, 14b), through litellm's app.
+"""Ways litellm could let an original reach the provider, driven through its real proxy app.
+
+A client's guardrail opt-out in the request metadata is stripped; our refusal keeps its status and
+error code through litellm; litellm's `scan_raw_request` and `run_in_parallel` modes are refused;
+and a policy row written into litellm's database makes a guardrail registered the litellm way
+(under `guardrails:`, not as a plain callback, as ours is) skip the request, so the original
+leaves. The check that our pre-call ran, which runs after it, cannot see a `scan_raw_request` run.
+
+Plan 20260926 Task 0, hazards 2, 4, 11, 14a, 14b.
 
 14a/14b write rows straight into litellm's policy tables in Postgres, created from
 litellm's own migration SQL; ``prisma`` (litellm's client) is not installed, so a thin

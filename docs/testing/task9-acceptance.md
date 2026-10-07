@@ -1,7 +1,7 @@
 # Task 9 acceptance check
 
 The acceptance check of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 19, local only), Task 9.
-It changes no test, manifest or script. Tree: `release/1.0.x` at `f050208` (PR #36). Baseline: `807831a`, with its
+Commit 1 (`5b91553`) changes no test, manifest or script. Commit 2 adds module docstrings to 8 test files (criterion 5) and nothing else under `tests/`. Tree: `release/1.0.x` at `f050208` (PR #36). Baseline: `807831a`, with its
 manifests committed in Task 0 as `7ae1098` (PR #19). Every number below was measured on this checkout on
 2026-10-07, in `.venv-test-minimal` and `.venv-test-full` (Python 3.14.8), with the env each recipe sets
 ([must-keep.md](must-keep.md), "The two environments"). Run outputs are in `.test-gates/t9-{minimal,full}`
@@ -12,8 +12,8 @@ manifests committed in Task 0 as `7ae1098` (PR #19). Every number below was meas
 | 1 | must-keep guard | met | every gate exits 0 in both envs; acceptance matrix 127 / 127 passed in both; inventory diff vs `7ae1098`: 64 removed, 35 added, 391 changed, all explained |
 | 2 | every baseline id mapped 1:1 or ledgered | met, with one note | 5,933 baseline ids per env: 5,346 present, 515 moved, 67 deleted with a row, 4 re-parametrised with a row, 1 Task 0 gate test removed by Task 1a; 0 unaccounted |
 | 3 | both envs green, coverage identical | met | minimal 4,695 passed / 419 skipped / 0 failed; full 5,913 / 16 / 0; four areas identical in both envs |
-| 4 | wall time not worse | met, with notes | tests present at both commits take the same time (minimal 545.4 s vs 544.7 s). The whole suite is 22-50 s longer (+2-6 %) because of tests added since: `tests/_gates` alone is 18.6-19.6 s |
-| 5 | a reader can name each file's behaviour | not met | 8 of 45 files flagged (4 with no docstring, 4 whose docstring names a task, hazard or `src/` function instead of a behaviour) |
+| 4 | wall time not worse | met (per-test reading, rev 20 (1)) | tests present at both commits take the same time (minimal 545.4 s vs 544.7 s). The whole suite is 22-50 s longer (+2-6 %) because of tests added since: `tests/_gates` alone is 18.6-19.6 s |
+| 5 | a reader can name each file's behaviour | met (commit 2) | 8 of 45 files were flagged at `f050208` (4 with no docstring, 4 whose docstring named a task, hazard or `src/` function instead of a behaviour); commit 2 gives each a docstring that names the behaviour, with no other change |
 
 ## 1. Must-keep guard
 
@@ -196,11 +196,11 @@ The time by test, from run 2. These are the sums of setup + call + teardown that
 | new: other (fold tests, PR #34 pins) | 0.6 s | 2.2 s |
 | gone: deleted or folded tests | 0.7 s | 1.2 s |
 
-Verdict: **met, with notes.** The tests that exist at both commits run in the same time. In minimal the gap is
+Verdict: **met (per-test reading, rev 20 (1)).** The tests that exist at both commits run in the same time. In minimal the gap is
 +0.7 s on 545 s. In full the common tests are +19.9 s in run 2, spread across subprocess and docker tests
 (`tests/deploy` +9.8 s, teardown +11.2 s). Run 1 puts them at about −5 s instead (the +21.9 s total, less 28.4 s of
-new tests, plus 1.2 s of deleted ones, taking run 2's per-test times). The two HEAD full runs differ by 27 s, so this is within run-to-run noise. Two numbers explain
-why the whole suite is longer than at `807831a`. First, the gate tests Task 0 to Task 1e added, about 19 s
+new tests, plus 1.2 s of deleted ones, taking run 2's per-test times). The two HEAD full runs differ by 27 s, so
+this is within run-to-run noise. Two numbers explain why the whole suite is longer than at `807831a`. First, the gate tests Task 0 to Task 1e added, about 19 s
 (`test_the_check_inventory_matches_the_baseline` alone is 13.8 s in minimal and 14.2 s in full, run 2;
 `tests/slow_tests.txt:12`). Task 10 deletes the inventory and its self-tests. Second, Task 8's guard tests. Read
 strictly as "whole suite not slower than `807831a`", the criterion is not met: the suite is +22-50 s (2-6 %).
@@ -266,7 +266,7 @@ behaviour: `test_bearer_is_hashed_before_logging.py`, `test_corp_token_never_rea
 `test_failure_hook_request_data_on_refusal.py`, `test_guardrail_information.py`, `test_guardrails_only_dispatch.py`,
 `test_logging_snapshot_is_content_free.py`, `test_logging_surfaces.py`, `test_walker_oracle.py`.
 
-**The 8 flagged files, with a suggested one-line docstring** (none of them is edited here):
+**The 8 flagged files, with the one-line docstring suggested in commit 1** (as found at `f050208`):
 
 | file | suggested docstring |
 |---|---|
@@ -279,17 +279,51 @@ behaviour: `test_bearer_is_hashed_before_logging.py`, `test_corp_token_never_rea
 | `tests/route_gate/test_reverse_object_shapes.py` | Response restoration on litellm model objects rather than wire JSON, a path the middleware never takes: placeholders reversed, hidden params kept, a reconstruct failure neither bypasses validation nor logs an original. |
 | `tests/route_gate/test_table.py` | The hand-classified route table's own rules: well-formed rows, a reason on every row, exactly eight rewritten spellings, bypass and management routes refused, and the verdict counts. |
 
-The fix is docstring-only. The inventory drops docstrings, and none of the 8 files is hashed in
-`external_deps.json` (only `test_acceptance_matrix.py` and `_dispatch_fixtures.py` from these two directories
-are). So `baseline_checks/` and the ledgers would not change. Adding a new docstring line to
-`route_gate/test_middleware.py` moves its 12 negative-log `site` lines, so that PR also runs
-`negative_logs --write` (a diff of `site` values only). `test_classify.py`, `test_table.py` and
-`test_anthropic_upstream_headers.py` have no negative-log sites. The other four files already have a docstring,
-and a one-line replacement shifts nothing.
+### Fix (commit 2, plan rev 20 (2))
+
+Each of the 8 files got a module docstring whose first line names the behaviour, with plan terms
+spelled out (no "migrated pipeline", "sentinel", "Option A" or "M4" left unexplained). The four files
+that had a docstring keep its old text below the new lines. The plan / hazard tag stays as a closing
+line, and the ⚠️ paragraph of `test_reverse_object_shapes.py` is kept word for word. The summaries as
+committed:
+
+| file | new docstring (summary and first paragraph) |
+|---|---|
+| `tests/litellm_hook/test_anthropic_upstream_headers.py` | The headers the hook forwards to Anthropic, and the OAuth token prefix it expects. An allow-list keeps the headers Anthropic needs and drops the corp token and every unlisted header; a malformed Authorization is rejected. The OAuth token prefix is read from litellm, with a fixed fallback when litellm's value is missing or unusable, and is never empty. |
+| `tests/litellm_hook/test_fail_open_probes.py` | Ways litellm could let an original reach the provider, driven through its real proxy app. A client's guardrail opt-out in the request metadata is stripped; our refusal keeps its status and error code through litellm; litellm's `scan_raw_request` and `run_in_parallel` modes are refused; and a policy row written into litellm's database makes a guardrail registered the litellm way (under `guardrails:`, not as a plain callback, as ours is) skip the request, so the original leaves. The check that our pre-call ran, which runs after it, cannot see a `scan_raw_request` run. |
+| `tests/litellm_hook/test_proxy_dispatch.py` | Which of our hooks litellm's real proxy runs, end to end, and what the client gets back. Our plain callback runs on every request flow, even when a litellm policy names it, and the client gets the originals back. The other tests show what would break that: an `apply_guardrail` method, a second guardrail answering to our name, or a guardrail registered the litellm way that a policy pipeline skips. A check that runs after our pre-call refuses a request our pre-call never saw. |
+| `tests/route_gate/test_classify.py` | How the route gate turns a request into a verdict: PASSTHROUGH, REWRITTEN or REFUSE. The verdict comes from the method and the raw path. A websocket or an upgrade request is refused, an encoded or traversing path is malformed, HEAD takes its GET row and is never rewritten, and an operator extra can only add a PASSTHROUGH route: it never undoes a refusal or promises a rewrite. |
+| `tests/route_gate/test_desanitize_middleware.py` | The response desanitiser middleware: originals restored per request, failures content-free. It restores the originals in unary JSON, chat / Anthropic SSE and Responses SSE with the mapping held on the request's ticket (never a client header), releases that mapping on the final body, and answers any failure with a response that carries no content. |
+| `tests/route_gate/test_middleware.py` | The route-gate ASGI middleware: what a refused, a passed-through and a rewritten request get. A refusal has a fixed JSON shape and code, echoes no byte of the body, logs no path and writes one audit record. A passthrough is forwarded byte for byte and writes none. A rewritten route is forwarded only once the gate is armed. Websockets are refused, and an operator extra cannot re-admit a refused route. |
+| `tests/route_gate/test_reverse_object_shapes.py` | Response restoration on litellm model objects, a path the middleware never takes. On model objects rather than wire JSON, placeholders are reversed, litellm's hidden params are kept, and a failed rebuild neither skips validation nor logs an original. (Then the ⚠️ paragraph, unchanged.) |
+| `tests/route_gate/test_table.py` | The hand-classified route table's own rules. Every row is well formed and says why. Exactly eight spellings are REWRITTEN; the bypass, management and non-probe health routes are refused; the table covers every route litellm registers, and the verdict counts are pinned. |
+
+Checks on commit 2:
+
+- The edit is the module docstring only. For each of the 8 files, a script compared against `f050208` with
+  `ast.dump`: the module body after the docstring is identical, and so is every function and class (304 in all).
+  The new lines shift each file by 5-8 lines. `ruff check` and `ruff format --check` are clean on `tests/`.
+- Manifests: **no diff**. `negative_logs --check` exits 0, because it keys a site by owner and check text, not
+  by line. So `--write` was not run (rev 20 (2)). The `site` values of 23 checks in
+  `tests/_manifests/negative_log_checks.json` now point early: `route_gate/test_desanitize_middleware.py` 18
+  sites by 6 lines, `route_gate/test_middleware.py` 4 by 8, `route_gate/test_reverse_object_shapes.py` 1 by 5.
+  The next `negative_logs --write` refreshes them.
+- In both venvs, `inventory`, `must_keep`, `moves`, `name_pinned` and `negative_logs --check` all exit 0, and
+  `pytest tests/_gates -q` gives 33 passed. The 8 files plus `litellm_hook/test_acceptance_matrix.py` and
+  `docs/test_docs_pins.py`: minimal 529 passed / 6 skipped, full 716 passed. The 6 minimal skips are the
+  recorded ones: three modules collection-skipped without litellm, `test_reverse_object_shapes.py`'s
+  `importorskip`, and two `test_anthropic_upstream_headers.py` runtime skips.
+- No full record run: the change is docstrings only, the inventory drops docstrings, and none of the 8 files
+  is hashed in `external_deps.json`.
+- Citations of a shifted line: one, `docs/testing/task7-caplog-trivial-prune-audit.md`'s
+  `route_gate/test_desanitize_middleware.py:1467`, now annotated `(now: :1473 …)`. `CLAUDE.md`, `README.md`,
+  the other `docs/` files and `tests/` cite no line in the 8 files.
+
+Verdict: **met.**
 
 ## Other findings
 
 - [must-keep.md](must-keep.md) line 186 gives the baseline run as 4,693 / 5,916 passed. The committed `7ae1098`
-  ledgers record 4,694 / 5,917 passed. Not changed here.
+  ledgers record 4,694 / 5,917 passed. Not changed here; rev 20 (3) moves it to Task 10.
 - Coverage manifests: `tests/_manifests/coverage.{minimal,full}.json` were last written in `7ae1098` (`runs` 7 /
   4). Every later PR checked against the baseline, not against a re-written file.
