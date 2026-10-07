@@ -150,10 +150,13 @@ Two caches:
 ## Running tests
 
 ```
-# CI-matching: the two reproducible environments (Python 3.14). minimal = the package
-# without extras or litellm; full = every extra CI installs + litellm, Postgres at
-# CORP_TEST_PG_DSN, CI=true. test-gates.sh checks the venv's fingerprint and the static
-# gates, runs the whole suite, compares it with the must-keep ledger and prints OK.
+# The two reproducible environments (Python 3.14). minimal = the package without extras
+# or litellm; full = every extra CI installs + litellm, Postgres at CORP_TEST_PG_DSN,
+# CI=true. test-gates.sh checks the venv's fingerprint and the static gates, runs the whole
+# suite, compares it with the must-keep ledger and prints OK. CI's test job runs the full
+# one once (scripts/test-gates.sh full) and never minimal: minimal is a local check. Run it
+# before changing optional-extra imports, lazy-import / graceful-degradation code, or the
+# laptop CLI / proxy install.
 scripts/test-env.sh minimal && scripts/test-gates.sh minimal   # 4,712 passed / 419 skipped, ~10 min
 docker run --rm -d --name pg-test -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=gateway \
   -e POSTGRES_DB=gateway -p 55432:5432 postgres:16
@@ -237,11 +240,14 @@ REDIS_URL=redis://localhost:6379/0 CORP_LLM_ENDPOINT=http://localhost:8000 CORP_
   gazetteer's RU lemmatizer) — plus the `en_core_web_md` wheel CI installs
 - `.github/workflows/ci.yml` gates every PR: a lint job (`ruff check` AND
   `ruff format --check` — running only `ruff check` locally can still leave
-  you with a CI format failure), a single `test` job running the full pytest
-  suite on Python **3.14** (no matrix) with the `ner`/`postgres`/`oidc`/`asgi`/`metrics`
-  extras, a Postgres 16 service and `CORP_TEST_PG_DSN`, + helm render tests, and
-  an `integration-container` job (route gate on the real image). All three run
-  Python 3.14; `tests/test_ci_workflow.py` pins that
+  you with a CI format failure), a single `test` job (no matrix) that runs the full
+  pytest suite once on Python **3.14**, through `scripts/test-env.sh full &&
+  scripts/test-gates.sh full`: the pinned full environment (the `ner`/`postgres`/`oidc`/
+  `asgi`/`metrics` extras + `en_core_web_md`), a Postgres 16 service and
+  `CORP_TEST_PG_DSN`, + helm render tests, checked against the full ledger (the minimal
+  environment is local only, see Running tests), and an `integration-container` job
+  (route gate on the real image). All three run Python 3.14; `tests/test_ci_workflow.py`
+  pins that
 
 ## CLI entry points
 

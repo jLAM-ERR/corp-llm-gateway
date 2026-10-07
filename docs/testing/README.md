@@ -1,14 +1,16 @@
 # Running the tests
 
 ```
-PYTHONPATH=src .venv/bin/pytest tests/ -q                          # everything; what CI runs
+PYTHONPATH=src .venv/bin/pytest tests/ -q                          # everything
 PYTHONPATH=src .venv/bin/pytest tests/ -q -m "not slow"            # skip the listed slow tests
 PYTHONPATH=src .venv/bin/pytest tests/ -q --shuffle-seed=20261006  # a seeded random order
 scripts/test-gates.sh minimal --shuffle-seed 20261006              # the gates in a seeded order
 ```
 
-The CI-matching route is the two reproducible environments, `scripts/test-env.sh` and
+The gated route is the two reproducible environments, `scripts/test-env.sh` and
 `scripts/test-gates.sh`; [must-keep.md](must-keep.md) has the commands and the gates they run.
+CI's `test` job runs the full environment once (`scripts/test-gates.sh full`); the minimal
+one, and its ledger, are checked locally only.
 
 - `slow` marks every test listed in `tests/slow_tests.txt`: over 2 s (setup + call +
   teardown) in either test environment when measured. A module-scoped fixture's setup counts

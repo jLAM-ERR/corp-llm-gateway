@@ -480,7 +480,12 @@ def test_ci_runs_this_suite_with_the_skip_guard_armed() -> None:
     reporting green over nothing.
     """
     job = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["test"]
-    steps = [step for step in job.get("steps", []) if "pytest" in (step.get("run") or "")]
+    # scripts/test-gates.sh runs the suite with the job's step env.
+    steps = [
+        step
+        for step in job.get("steps", [])
+        if any(marker in (step.get("run") or "") for marker in ("pytest", "test-gates.sh"))
+    ]
 
     assert steps, f"{CI_WORKFLOW.name}'s test job no longer runs pytest"
     for step in steps:

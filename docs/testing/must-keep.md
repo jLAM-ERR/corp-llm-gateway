@@ -36,8 +36,14 @@ scripts/test-env.sh full && \
   CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway scripts/test-gates.sh full
 ```
 
-CI runs both as two more steps of the `test` job, after the unchanged
-`PYTHONPATH=src pytest tests/ -q` step.
+CI runs the full one only, as the `test` job's one unit-suite run
+(`scripts/test-env.sh full && scripts/test-gates.sh full`, DRI decision 2026-10-07;
+`tests/test_ci_workflow.py` pins it). The minimal ledger is enforced locally only: run the
+minimal gates before changing optional-extra imports, lazy-import / graceful-degradation
+code, or the laptop CLI / proxy install. Two must-keep ids pass only there and so are no
+longer run by CI (full records them as skips):
+`tests/metrics/test_metrics.py::test_get_exporter_prometheus_without_dep_raises_clear_error`
+and `tests/tokens/test_middleware.py::test_postgres_store_without_asyncpg_raises`.
 
 A PR that changes a gated test on purpose regenerates the manifests and the diff is what
 review reads (one line per file in the ledgers):
