@@ -22,7 +22,6 @@ CONTAINER_SUITE = "tests/integration/test_route_gate_container.py"
 NGINX_IMAGE_SUITE = "tests/integration/test_nginx_allowlist_image.py"
 JOB = "integration-container"
 UNIT_JOB = "test"
-# The one interpreter CI runs, and the one .venv-bench runs.
 E2E_JOB = "e2e"
 E2E_SUITE = "tests/e2e"
 # tests/e2e/conftest.py: set, a skipped or deselected e2e test fails.
@@ -30,6 +29,10 @@ E2E_GUARD = "CORP_REQUIRE_E2E"
 E2E_CONFTEST = ROOT / "tests/e2e/conftest.py"
 # Its upstream and proxy run in-process, so a nested run needs nothing started.
 PROXY_E2E = "tests/e2e/test_proxy_pipeline.py"
+# The e2e step's whole command line: any other flag (--co, --noconftest, -p no:…, -k)
+# can make the job green while running nothing.
+E2E_COMMAND = ["PYTHONPATH=src", "python", "-m", "pytest", E2E_SUITE, "-q", "-rs"]
+# The one interpreter CI runs, and the one .venv-bench runs.
 CI_PYTHON = "3.14"
 ALL_JOBS = ["lint", UNIT_JOB, JOB, E2E_JOB]
 
@@ -148,9 +151,7 @@ def test_the_e2e_job_runs_the_e2e_suite_beside_the_other_jobs() -> None:
     assert "strategy" not in job
     steps = _e2e_pytest_steps()
     assert len(steps) == 1
-    args = shlex.split(steps[0]["run"])
-    assert E2E_SUITE in args
-    assert "-rs" in args
+    assert shlex.split(steps[0]["run"]) == E2E_COMMAND
 
 
 def test_the_e2e_job_runs_redis_as_a_health_checked_service() -> None:
@@ -161,23 +162,21 @@ def test_the_e2e_job_runs_redis_as_a_health_checked_service() -> None:
 
 
 def test_the_e2e_job_cannot_pass_by_skipping() -> None:
-    job = _jobs()[E2E_JOB]
+    workflow = yaml.safe_load(CI_WORKFLOW.read_text())
+    job = workflow["jobs"][E2E_JOB]
     steps = _e2e_pytest_steps()
 
     assert steps
     assert "continue-on-error" not in job
     for step in job["steps"]:
         assert "continue-on-error" not in step, step
+    # PYTEST_ADDOPTS reaches the command line unseen (e.g. --noconftest drops the guard).
+    for scope in (workflow, job, *job["steps"]):
+        assert "PYTEST_ADDOPTS" not in (scope.get("env") or {}), scope
     for step in steps:
         env = {**(job.get("env") or {}), **(step.get("env") or {})}
         assert parse_flag(str(env.get(E2E_GUARD, "")))
-        run = step["run"]
-        assert "||" not in run
-        assert "; true" not in run
-        args = shlex.split(run)
-        selectors = args[args.index("pytest") + 1 :]
-        for arg in selectors:
-            assert not arg.startswith(("-k", "-m", "--deselect", "--ignore")), arg
+        assert shlex.split(step["run"]) == E2E_COMMAND
 
 
 def _nested_pytest(cwd: Path, guard: bool, *args: str) -> subprocess.CompletedProcess[str]:
