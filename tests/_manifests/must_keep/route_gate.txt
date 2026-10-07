@@ -134,6 +134,10 @@ tests/route_gate/test_call_id_header.py::test_the_call_id_header_never_reaches_t
 tests/route_gate/test_call_id_header.py::test_the_call_id_header_never_reaches_the_downstream[rewritten-no-limiter-X-LITELLM-CALL-ID]
 tests/route_gate/test_call_id_header.py::test_the_call_id_header_never_reaches_the_downstream[rewritten-no-limiter-X-LiteLLM-Call-Id]
 tests/route_gate/test_call_id_header.py::test_the_call_id_header_never_reaches_the_downstream[rewritten-no-limiter-x-litellm-call-id]
+tests/route_gate/test_classify.py::test_a_decoded_nul_alone_is_refused_as_malformed
+tests/route_gate/test_classify.py::test_a_decoded_nul_alone_is_refused_as_malformed[absent]
+tests/route_gate/test_classify.py::test_a_decoded_nul_alone_is_refused_as_malformed[clean]
+tests/route_gate/test_classify.py::test_a_decoded_nul_alone_is_refused_as_malformed[empty]
 tests/route_gate/test_classify.py::test_a_decoded_traversal_is_malformed_even_without_a_raw_path
 tests/route_gate/test_classify.py::test_a_malformed_extra_names_its_position
 tests/route_gate/test_classify.py::test_a_malformed_extra_names_its_position[/internal/ops-item 1: malformed (expected 'METHOD /path')]
@@ -163,6 +167,11 @@ tests/route_gate/test_classify.py::test_a_malformed_extra_raises_at_load[WEBSOCK
 tests/route_gate/test_classify.py::test_a_path_extra_names_the_offending_token_not_the_path
 tests/route_gate/test_classify.py::test_a_refused_extra_names_its_position_and_route
 tests/route_gate/test_classify.py::test_a_websocket_scope_is_refused
+tests/route_gate/test_classify.py::test_an_encoded_double_dot_alone_is_refused_as_malformed
+tests/route_gate/test_classify.py::test_an_encoded_double_dot_alone_is_refused_as_malformed[%2E%2E]
+tests/route_gate/test_classify.py::test_an_encoded_double_dot_alone_is_refused_as_malformed[%2e%2E]
+tests/route_gate/test_classify.py::test_an_encoded_double_dot_alone_is_refused_as_malformed[%2e%2e]
+tests/route_gate/test_classify.py::test_an_exact_row_wins_over_a_regex_row_that_also_matches
 tests/route_gate/test_classify.py::test_an_extra_can_never_promise_a_rewrite
 tests/route_gate/test_classify.py::test_an_extra_never_overrides_a_listed_refusal
 tests/route_gate/test_classify.py::test_an_extra_never_overrides_a_listed_refusal[/search/brave]
