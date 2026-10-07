@@ -180,11 +180,9 @@ PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py::test_name -q
 docker compose run --rm e2e pytest -q tests/e2e
 ```
 
-Every `pytest tests/` run checks `tests/_manifests/external_deps.json`: whole-file hashes of the
-files tests read, this one, `pyproject.toml`, docs, compose and scripts included. A PR that changes
-a listed path reruns `PYTHONPATH=src:. python -m tests._gates.inventory --write` in the same PR;
-the diff must be hash-only. The listing command and review rule are in `docs/testing/must-keep.md`.
-A refactor-time gate, removed in Task 10 of the test-suite refactor plan.
+Every `pytest tests/` run and `scripts/test-gates.sh minimal|full` check the test-suite gates
+(must-keep ids, expected-outcome ledgers, name-pinned index, negative-log review, moves map); what
+each one holds and how to regenerate it after an approved change: `docs/testing/must-keep.md`.
 
 ## Tooling
 

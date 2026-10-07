@@ -1,42 +1,36 @@
-"""Self-tests of the gates: each mutation weakens a check without touching its asserts, and
-the gate must reject it. The working tree is restored after every mutation.
+"""Self-tests of the gates: each one breaks or bends what a gate relies on and the gate must
+notice. The working tree is restored after every mutation.
 
-Inventory gate (run in any venv): (a) a delegated helper check removed, (b) a
-``pytest.fail`` path removed, (c) the production-detector builder swapped for a static
-one, (d) an assert made unreachable by a changed selector, (e) a predicate changed inside
-a script a test runs by ``subprocess``, (f) a parametrize table shrunk; (g) the same
-synthetic module re-parsed with another body hashes differently every time (no stale
-cache entry survives a re-parse); and (h) a synthetic helper reached only through a
-function-local ``from tests.… import`` loses its assert (a sibling test that names it
-without the import must not move); (i) an import in a nested def, or in another method of
-a class, binds in that scope only, so the module-level helper the test calls stays reached;
-(j) a name one scope imports from two modules reaches both helpers, so weakening either
-moves the test; (k) an unaliased ``import tests[.x]``, dotted or bare, is refused with an
-error; and (l) a nested def or class body that declares ``global helper`` past an
-enclosing local import still reaches the module-level ``helper``, and an import
-under ``global`` / ``nonlocal`` is refused.
+Suite index (``tests/_gates/inventory.py``, any venv, synthetic modules): (g) the same
+synthetic module re-parsed with another body reaches its own helper every time (no stale
+cache entry survives a re-parse); (h) a helper reached only through a function-local
+``from tests.… import`` is in the importing test's closure and not in a sibling's that names
+it without the import; (i) an import in a nested def, or in another method of a class, binds
+in that scope only, so the module-level helper the test calls stays reached; (j) a name one
+scope imports from two modules reaches both helpers; (k) an unaliased ``import tests[.x]``,
+dotted or bare, is refused with an error; and (l) a nested def or class body that declares
+``global helper`` past an enclosing local import still reaches the module-level ``helper``,
+and an import under ``global`` / ``nonlocal`` is refused.
 
 Moves (``moves.json``, any venv, synthetic tree and ledgers): (m) a pure move — one test in
-a renamed module, one renamed into it — changes no inventory entry, ledger, must-keep
-answer or negative-log owner with the map, and without it the inventory, the ledger and
-must-keep all reject; (n) the same move with an assert dropped is still rejected by the
-inventory; (o) every refusal of ``moves.problems()``, one entry each, and a valid map that
-passes; (p) must-keep membership survives a move either way: out of a ``STEP2_GLOBS``
-directory stays in, into one stays out, a name-pinned id counts at its baseline id, and a
-test that lands on the NEVER-field tests' old lines is not one of them; (q) a test that runs
-a security negative check through a helper stays in ``security_node_ids`` when it moves by
-``ids``, with its helper or without it; (r) a security helper moved into a module none of
-its tests lives in makes ``negative_logs --check`` / ``--write`` refuse while the test is
-must-keep, and only then; (s) a test parametrised over cited test ids and module paths
-keeps its baseline ids when the cited tests move (ledger, ``must_keep.expand``), and a
-parameter the map does not name stays as it is. A move map that sends two current tests to one
-baseline id stops every gate (o).
+a renamed module, one renamed into it — changes no ledger, must-keep answer or negative-log
+owner with the map, and without it the ledger and must-keep reject; (o) every refusal of
+``moves.problems()``, one entry each, and a valid map that passes; (p) must-keep membership
+survives a move either way: out of a ``STEP2_GLOBS`` directory stays in, into one stays out,
+a name-pinned id counts at its baseline id, and a test that lands on the NEVER-field tests'
+old lines is not one of them; (q) a test that runs a security negative check through a
+helper stays in ``security_node_ids`` when it moves by ``ids``, with its helper or without
+it; (r) a security helper moved into a module none of its tests lives in makes
+``negative_logs --check`` / ``--write`` refuse while the test is must-keep, and only then;
+(s) a test parametrised over cited test ids and module paths keeps its baseline ids when the
+cited tests move (ledger, ``must_keep.expand``), and a parameter the map does not name stays
+as it is. A move map that sends two current tests to one baseline id stops every gate (o).
 
-Outcome ledger (run with the minimal venv, scoped to the mutated files): a module that
-stops being collected, a lost parametrize case, a setup-time skip, a changed
+Outcome ledger (run with the minimal venv, scoped to the mutated must-keep files): a module
+that stops being collected, a lost parametrize case, a setup-time skip, a changed
 collection-skip reason.
 
-``python -m tests._gates.selftest inventory|ledger`` (``inventory`` runs a-s)
+``python -m tests._gates.selftest static|ledger`` (``static`` runs g-s)
 """
 
 from __future__ import annotations
@@ -64,120 +58,47 @@ class Mutation:
     path: str
     old: str
     new: str
-    # Every one must appear in the gate's output: each names the node id and the column
-    # that has to catch the mutation, so a column the gate stops filling fails here.
+    # Every one must appear in the gate's output.
     expect: tuple[str, ...]
 
 
-LEAK = "tests/invariants/test_no_originals_leak.py"
-LEAK_TEST = f"{LEAK}::test_a_refused_route_leaks_no_original_on_any_of_the_six_surfaces"
-FRAMING = (
-    "tests/sanitizer/test_streaming_adversarial.py"
-    "::test_framing_integrity_every_data_line_is_valid_json"
+REPARSED_BODY = (
+    "import pytest\n"
+    "def first():\n    pass\n"
+    "def second():\n    pass\n"
+    "@pytest.fixture\n"
+    "def value():\n    return {helper}()\n"
+    "def test_x(value):\n    pass\n"
 )
-PREAMBLE = "tests/sanitizer/test_oauth_system_preamble.py"
-ENV_FILE_TEST = (
-    "tests/deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed"
-)
-SERVED_SCRIPT = "tests/desanitize_served_script.py"
-PIN = "tests/test_litellm_pin.py"
-PIN_TABLE_TEST = f"{PIN}::test_pin_extraction_refuses_a_file_without_a_pin"
-
-
-def _baseline_users(column: str, name: str, path: str) -> tuple[str, ...]:
-    """Recorded tests in ``path`` whose ``column`` names ``name``."""
-    tests, _ = inventory.read_checks()
-    return tuple(
-        sorted(i for i, e in tests.items() if i.startswith(path + "::") and name in e[column])
-    )
-
-
-def _served_script_users() -> tuple[str, ...]:
-    recorded = json.loads(inventory.EXTERNAL_PATH.read_text())["tests"]
-    return tuple(sorted(i for i, e in recorded.items() if SERVED_SCRIPT in e["files"]))
-
-
-def inventory_mutations() -> list[Mutation]:
-    guardrail_users = _baseline_users("helpers", "_guardrail", PREAMBLE)
-    return [
-        Mutation(
-            "a: delegated helper check removed",
-            LEAK,
-            "    assert got == status\n    _assert_gate_surfaces_are_clean(\n"
-            "        body=body, log_text=caplog.text, sink=sink, metrics=metrics, reason=reason\n"
-            "    )\n    # (v) nothing forwarded",
-            "    assert got == status\n    # (v) nothing forwarded",
-            (f"{LEAK_TEST}: delegated ", f"{LEAK_TEST}: helpers "),
-        ),
-        Mutation(
-            "b: pytest.fail path removed",
-            "tests/sanitizer/test_streaming.py",
-            "            try:\n                json.loads(payload)\n"
-            "            except json.JSONDecodeError as exc:\n"
-            '                pytest.fail(f"data: line is not valid JSON: {payload!r} — {exc}")\n',
-            "            json.loads(payload)\n",
-            (f"{FRAMING}: fail 1 -> 0",),
-        ),
-        Mutation(
-            "c: production-detector builder swapped for a static one",
-            PREAMBLE,
-            "local_detectors=[RegexChecksumDetector(), DualNerDetector()],",
-            "local_detectors=[RegexChecksumDetector()],",
-            tuple(f"{node_id}: body_hash " for node_id in guardrail_users),
-        ),
-        Mutation(
-            "d: $ENV_FILE selector swapped for '.env' (every assert survives)",
-            "tests/deploy/test_bootstrap_server_script.py",
-            'if "$ENV_FILE" not in stripped or stripped.startswith("#"):',
-            'if ".env" not in stripped or stripped.startswith("#"):',
-            (f"{ENV_FILE_TEST}: body_hash ",),
-        ),
-        Mutation(
-            "e: holding_after returns [] inside the served subprocess script",
-            SERVED_SCRIPT,
-            "        return sorted({(f, n) for f, n, m in self.records[starts[0] + 1 :] "
-            "if needle in m})",
-            "        return []",
-            tuple(f"{node_id}: external {SERVED_SCRIPT} " for node_id in _served_script_users()),
-        ),
-        Mutation(
-            "f: parametrize table shrunk by one case",
-            PIN,
-            "        pytest.param(_PYPROJECT_PIN, '    \"litellm>=1.40,<2.0\",\\n',"
-            ' id="pyproject-range"),\n',
-            "",
-            (f"{PIN_TABLE_TEST}: case_data ",),
-        ),
-    ]
-
-
-REPARSED_BODIES = (
-    "def test_x():\n    assert 1 == 1\n",
-    "def test_x():\n    assert 1 == 2\n",
-)
+REPARSED_HELPERS = ("first", "second")
 
 
 def cache_reparse(rounds: int = 200) -> tuple[bool, str]:
-    """Re-parse one synthetic module with alternating bodies; each body must always hash the
-    same and the two must differ. A cache keyed by a reused ``id()`` breaks this."""
+    """Re-parse one synthetic module with alternating bodies, whose fixture calls a different
+    helper; each must always reach its own. A fixture or conftest cache keyed by a reused
+    ``id()`` hands back the other body's fixture."""
     path = ROOT / "tests" / "_gates" / "selftest_reparsed.py"
-    hashes: dict[int, set[str]] = {0: set(), 1: set()}
+    reached: dict[int, set[tuple[str, ...]]] = {0: set(), 1: set()}
     for index in range(rounds):
         which = index % 2
-        module = inventory._index("tests._gates.selftest_reparsed", path, REPARSED_BODIES[which])
-        checks, _ = inventory.collect(
+        text = REPARSED_BODY.format(helper=REPARSED_HELPERS[which])
+        module = inventory._index("tests._gates.selftest_reparsed", path, text)
+        checks = inventory.collect(
             (module, qual, node, cls) for qual, node, cls in inventory._tests_in(module)
         )
-        hashes[which] |= {entry["body_hash"] for entry in checks.values()}
+        reached[which] |= {tuple(entry["helpers"]) for entry in checks.values()}
         del module, checks
-    ok = len(hashes[0]) == len(hashes[1]) == 1 and hashes[0] != hashes[1]
-    return ok, f"{rounds} re-parses, distinct hashes per body: {len(hashes[0])}/{len(hashes[1])}"
+    # The real conftest chain's autouse fixtures add their helpers to both bodies.
+    ok = all(
+        len(found) == 1
+        and REPARSED_HELPERS[which] in next(iter(found))
+        and REPARSED_HELPERS[1 - which] not in next(iter(found))
+        for which, found in reached.items()
+    )
+    return ok, f"{rounds} re-parses, helpers reached per body: {reached}"[:240]
 
 
-LOCAL_HELPER = (
-    "def helper(value):\n    assert value\n    return value\n",
-    "def helper(value):\n    return value\n",
-)
+LOCAL_HELPER = "def helper(value):\n    assert value\n    return value\n"
 LOCAL_SUITE = (
     "def test_imports_it_inside():\n"
     "    if True:\n"
@@ -201,10 +122,24 @@ def _only_modules(*extra: inventory.Module) -> Iterator[None]:
 
 def _synthetic_checks(suite: inventory.Module, *others: inventory.Module) -> dict[str, Any]:
     with _only_modules(suite, *others):
-        checks, _ = inventory.collect(
+        return inventory.collect(
             (suite, qual, node, cls) for qual, node, cls in inventory._tests_in(suite)
         )
-    return checks
+
+
+def _reached(suite: inventory.Module, *others: inventory.Module) -> dict[str, set[str]]:
+    """Test id -> every module-level function or class its closure reaches, as
+    ``module.name``, so two helpers that share a name stay apart."""
+    found: dict[str, set[str]] = {}
+    with _only_modules(suite, *others):
+        for qual, node, cls in inventory._tests_in(suite):
+            _, closure = inventory.inventory_entry(suite, node, cls)
+            found[f"{suite.rel}::{qual}"] = {
+                f"{owner.name}.{item.name}"
+                for owner, item, kind in closure.items.values()
+                if kind == "def" and isinstance(item, inventory.DEFS)
+            }
+    return found
 
 
 def _synthetic(name: str, text: str) -> inventory.Module:
@@ -212,24 +147,20 @@ def _synthetic(name: str, text: str) -> inventory.Module:
 
 
 def local_import() -> tuple[bool, str]:
-    """A helper reached only through a function-local import loses its assert: the
-    importing test's ``delegated`` and ``body_hash`` must move, its sibling's must not."""
+    """A helper reached only through a function-local import is in the importing test's
+    closure and ``helpers``; its sibling, which names it without the import, reaches none."""
     suite = _synthetic("selftest_local_suite", LOCAL_SUITE)
-    before, after = (
-        _synthetic_checks(suite, _synthetic("selftest_local_helper", body)) for body in LOCAL_HELPER
-    )
-    problems = inventory.diff_checks(before, after)
+    helper = _synthetic("selftest_local_helper", LOCAL_HELPER)
+    checks, reached = _synthetic_checks(suite, helper), _reached(suite, helper)
     test = f"{suite.rel}::test_imports_it_inside"
     sibling = f"{suite.rel}::test_sibling_without_the_import"
-    expect = (f"{test}: delegated ", f"{test}: body_hash ")
-    unmet = [e for e in expect if not any(p.startswith(e) for p in problems)]
-    reached = before[test]["helpers"] == ["helper"]
-    unbound = before[sibling]["helpers"] == [] and not any(sibling in p for p in problems)
-    ok = not unmet and reached and unbound
-    evidence = f"not reported: {unmet}; reached {reached}; sibling unbound {unbound}"
-    if ok:
-        evidence = f"{len(expect)} expected line(s), e.g. {problems[0]}"
-    return ok, evidence[:240]
+    ok = (
+        reached[test] == {"tests._gates.selftest_local_helper.helper"}
+        and checks[test]["helpers"] == ["helper"]
+        and reached[sibling] == set()
+        and checks[sibling]["helpers"] == []
+    )
+    return ok, f"reached: {reached}"[:240]
 
 
 SCOPE_SUITE = (
@@ -252,36 +183,30 @@ SCOPE_SUITE = (
 SCOPE_OTHER = "def helper(value):\n    assert value > 1\n    return value\n"
 
 
+BOTH_HELPERS = "tests._gates.selftest_{}_suite.helper", "tests._gates.selftest_{}_other.helper"
+
+
+def _missing_helpers(reached: dict[str, set[str]], prefix: str) -> list[str]:
+    """Each test that does not reach both same-named helpers, with the one it misses."""
+    want = {name.format(prefix) for name in BOTH_HELPERS}
+    return [
+        f"{node_id.split('::')[1]}: {sorted(want - found)}"
+        for node_id, found in reached.items()
+        if not want <= found
+    ]
+
+
 def nested_scope_import() -> tuple[bool, str]:
-    """An import in a nested def, or in another method of a class, binds there only: the
-    test still reaches the module-level ``helper`` it calls, and the imported one too, so
-    dropping either one's assert moves both tests' ``delegated`` and ``body_hash``."""
-    base = _synthetic_checks(
+    """An import in a nested def, or in another method of a class, binds there only: each
+    test reaches the module-level ``helper`` it calls, and the imported one too."""
+    reached = _reached(
         _synthetic("selftest_scope_suite", SCOPE_SUITE),
         _synthetic("selftest_scope_other", SCOPE_OTHER),
     )
-    module_helper_weakened = _synthetic_checks(
-        _synthetic("selftest_scope_suite", SCOPE_SUITE.replace("    assert value\n", "", 1)),
-        _synthetic("selftest_scope_other", SCOPE_OTHER),
-    )
-    imported_helper_weakened = _synthetic_checks(
-        _synthetic("selftest_scope_suite", SCOPE_SUITE),
-        _synthetic("selftest_scope_other", SCOPE_OTHER.replace("    assert value > 1\n", "")),
-    )
-    unmet = []
-    for label, after in (
-        ("module-level", module_helper_weakened),
-        ("imported", imported_helper_weakened),
-    ):
-        problems = inventory.diff_checks(base, after)
-        for node_id in base:
-            for column in ("delegated", "body_hash"):
-                if not any(p.startswith(f"{node_id}: {column} ") for p in problems):
-                    unmet.append(f"{label} helper: {node_id.split('::')[1]} {column}")
-    if unmet:
-        return False, f"not reported: {unmet}"[:240]
-    first = inventory.diff_checks(base, module_helper_weakened)[0]
-    return True, f"{2 * 2 * len(base)} expected line(s), e.g. {first}"[:240]
+    unmet = _missing_helpers(reached, "scope")
+    if unmet or len(reached) != 2:
+        return False, f"not reached: {unmet}; tests {len(reached)}"[:240]
+    return True, f"{len(reached)} tests, each reaches both helpers"
 
 
 REBOUND_SUITE = (
@@ -295,32 +220,18 @@ REBOUND_HELPER = "def helper(value):\n    assert value\n    return value\n"
 
 def rebound_import() -> tuple[bool, str]:
     """One scope imports ``helper`` from two modules: which binding is live depends on
-    control flow, so dropping either helper's assert must move ``delegated`` and
-    ``body_hash``."""
-    weakened = REBOUND_HELPER.replace("    assert value\n", "")
+    control flow, so the test reaches both."""
     suite = _synthetic("selftest_rebound_suite", REBOUND_SUITE)
-
-    def checks(a: str, b: str) -> dict[str, Any]:
-        return _synthetic_checks(
-            suite, _synthetic("selftest_rebound_a", a), _synthetic("selftest_rebound_b", b)
-        )
-
-    base = checks(REBOUND_HELPER, REBOUND_HELPER)
-    test = f"{suite.rel}::test_imports_helper_twice"
-    unmet = []
-    lines = 0
-    for label, after in (
-        ("first", checks(weakened, REBOUND_HELPER)),
-        ("second", checks(REBOUND_HELPER, weakened)),
-    ):
-        problems = inventory.diff_checks(base, after)
-        lines += len(problems)
-        for column in ("delegated", "body_hash"):
-            if not any(p.startswith(f"{test}: {column} ") for p in problems):
-                unmet.append(f"{label} helper: {column}")
-    if unmet:
-        return False, f"not reported: {unmet}"[:240]
-    return True, f"{lines} line(s) across both weakenings, delegated and body_hash each time"
+    reached = _reached(
+        suite,
+        _synthetic("selftest_rebound_a", REBOUND_HELPER),
+        _synthetic("selftest_rebound_b", REBOUND_HELPER),
+    )
+    want = {"tests._gates.selftest_rebound_a.helper", "tests._gates.selftest_rebound_b.helper"}
+    found = reached[f"{suite.rel}::test_imports_helper_twice"]
+    if found != want:
+        return False, f"reached {sorted(found)}, want {sorted(want)}"[:240]
+    return True, f"reached both: {sorted(found)}"[:240]
 
 
 UNALIASED_SUITES = {
@@ -395,31 +306,15 @@ REBINDING_SUITES = {
 
 def global_in_nested_scope() -> tuple[bool, str]:
     """A nested def or class body declares ``global helper`` inside a test that imports
-    another ``helper``: it calls the module-level one, so dropping that one's assert (or the
-    imported one's) moves both tests' ``delegated`` and ``body_hash``. A scope that imports a
-    ``tests`` name it declares ``global`` / ``nonlocal`` is refused."""
-
-    def checks(suite: str, other: str) -> dict[str, Any]:
-        return _synthetic_checks(
-            _synthetic("selftest_global_suite", suite),
-            _synthetic("selftest_global_other", other),
-        )
-
-    base = checks(GLOBAL_SUITE, GLOBAL_OTHER)
-    unmet = []
-    lines = 0
-    for label, after in (
-        ("module-level", checks(GLOBAL_SUITE.replace("    assert value\n", "", 1), GLOBAL_OTHER)),
-        ("imported", checks(GLOBAL_SUITE, GLOBAL_OTHER.replace("    assert value > 1\n", ""))),
-    ):
-        problems = inventory.diff_checks(base, after)
-        lines += len(problems)
-        for node_id in base:
-            for column in ("delegated", "body_hash"):
-                if not any(p.startswith(f"{node_id}: {column} ") for p in problems):
-                    unmet.append(f"{label} helper: {node_id.split('::')[1]} {column}")
-    if unmet:
-        return False, f"not reported: {unmet}"[:240]
+    another ``helper``: it calls the module-level one, so each test reaches both. A scope
+    that imports a ``tests`` name it declares ``global`` / ``nonlocal`` is refused."""
+    reached = _reached(
+        _synthetic("selftest_global_suite", GLOBAL_SUITE),
+        _synthetic("selftest_global_other", GLOBAL_OTHER),
+    )
+    unmet = _missing_helpers(reached, "global")
+    if unmet or len(reached) != 2:
+        return False, f"not reached: {unmet}; tests {len(reached)}"[:240]
     for kind, source in REBINDING_SUITES.items():
         try:
             _synthetic("selftest_rebinding_suite", source)
@@ -429,8 +324,8 @@ def global_in_nested_scope() -> tuple[bool, str]:
         else:
             return False, f"accepted an import under `{kind} helper`"
     return True, (
-        f"{lines} line(s) across both weakenings, delegated and body_hash for each test; "
-        f"an import under global / nonlocal refused"
+        f"{len(reached)} tests, each reaches both helpers; an import under global / nonlocal "
+        "refused"
     )
 
 
@@ -506,7 +401,7 @@ MOVE_SUITE = (
     "    assert helper(n) == n\n"
 )
 MOVED_SUITE = MOVE_SUITE.replace("def test_old_name(", "def test_new_name(")
-# A module the run collection-skips and the ledgers hold no id for.
+# A module collection-skipped in full and recorded there as one file-level entry.
 SKIPPED_OLD = "tests/_gates/selftest_move_skipped_old.py"
 SKIPPED_NEW = "tests/_gates/selftest_move_skipped_new.py"
 MOVE_MAP = {
@@ -519,9 +414,9 @@ def _module_at(rel: str, text: str) -> inventory.Module:
     return inventory._index(inventory._module_name(ROOT / rel), ROOT / rel, text)
 
 
-def _runs(path: str, renamed: str) -> dict[str, dict[str, Any]]:
+def _runs(path: str, renamed: str, skipped: str) -> dict[str, dict[str, Any]]:
     """Both environments' runs of the move suite at ``path``: passed in minimal, the module
-    collection-skipped in full."""
+    collection-skipped in full, with the ``skipped`` module."""
     ids = [f"{path}::test_kept_name", *(f"{path}::{renamed}[{n}]" for n in (1, 2))]
     empty: dict[str, str] = {}
     return {
@@ -532,7 +427,7 @@ def _runs(path: str, renamed: str) -> dict[str, dict[str, Any]]:
         },
         "full": {
             "outcomes": empty,
-            "collection_skipped": {path: "selftest"},
+            "collection_skipped": {path: "selftest", skipped: "selftest"},
             "collection_errors": empty,
         },
     }
@@ -547,25 +442,23 @@ def _move_world(suite: str, mapped: bool) -> dict[str, list[str]]:
         recorded_dir.mkdir()
         rewritten_dir.mkdir()
         with _world([old], ledgers=recorded_dir):
-            ledger.write(_runs(MOVE_OLD, "test_old_name"))
-            checks, _ = inventory.collect((old, q, n, c) for q, n, c in inventory._tests_in(old))
+            ledger.write(_runs(MOVE_OLD, "test_old_name", SKIPPED_OLD))
+            checks = inventory.collect((old, q, n, c) for q, n, c in inventory._tests_in(old))
             reviewed = {negative_logs._key(site) for site in negative_logs.sites()}
             committed = must_keep.expand(dict.fromkeys(checks))
-        runs = _runs(MOVE_NEW, "test_new_name")
+        runs = _runs(MOVE_NEW, "test_new_name", SKIPPED_NEW)
         the_map = MOVE_MAP if mapped else {}
         with _world([new], **the_map, ledgers=recorded_dir, committed=committed):
-            current, _ = inventory.collect((new, q, n, c) for q, n, c in inventory._tests_in(new))
             out = {
-                "inventory": inventory.diff_checks(checks, current),
                 "ledger": [p for env in ledger.ENVS for p in ledger.compare(env, runs[env])],
                 "ledger in scope": ledger.compare(
                     "minimal", {**runs["minimal"], "outcomes": {}}, [MOVE_NEW]
                 ),
-                "ledger, unrecorded skipped module": ledger.compare(
+                "ledger, skipped module's reason": ledger.compare(
                     "full",
                     {
                         "outcomes": {},
-                        "collection_skipped": {SKIPPED_NEW: "selftest"},
+                        "collection_skipped": {SKIPPED_NEW: "selftest: changed"},
                         "collection_errors": {},
                     },
                     [SKIPPED_NEW],
@@ -588,21 +481,22 @@ def _move_world(suite: str, mapped: bool) -> dict[str, list[str]]:
 
 def pure_move() -> tuple[bool, str]:
     """A test in a renamed module and a test renamed into it: with the map, no gate reports
-    anything and a ledger rewrite is byte-identical; without it, the inventory (removed +
-    added), the ledger (missing id, in scope too) and must-keep (test is gone) reject."""
+    anything and a ledger rewrite is byte-identical; without it, the ledger (missing id, in
+    scope too) and must-keep (test is gone) reject. A moved module's changed collection-skip
+    reason is reported under its baseline path."""
     with_map, without = _move_world(MOVED_SUITE, True), _move_world(MOVED_SUITE, False)
-    checked_apart = {"ledger in scope", "ledger, unrecorded skipped module"}
+    reason = "ledger, skipped module's reason"
+    checked_apart = {"ledger in scope", reason}
     noisy = {gate: lines for gate, lines in with_map.items() if gate not in checked_apart and lines}
-    want_skipped = f"new id not in the expected outcomes: {SKIPPED_OLD} (now {SKIPPED_NEW})"
-    if not any(want_skipped in line for line in with_map["ledger, unrecorded skipped module"]):
-        noisy["ledger, unrecorded skipped module"] = with_map["ledger, unrecorded skipped module"]
+    want_skipped = f"{SKIPPED_OLD} (now {SKIPPED_NEW}): expected 'collection-skipped:selftest'"
+    if not any(want_skipped in line for line in with_map[reason]):
+        noisy[reason] = with_map[reason]
     want_in_scope = f"missing id (deselected, lost or not collected): {MOVE_OLD}::test_kept_name"
     if not any(want_in_scope in line for line in with_map["ledger in scope"]):
         noisy["ledger in scope"] = with_map["ledger in scope"]
     if noisy:
         return False, f"the mapped move is not a no-op: {noisy}"[:240]
     expect = {
-        "inventory": f"missing test: {MOVE_OLD}::test_old_name",
         "ledger": f"missing id (deselected, lost or not collected): {MOVE_OLD}::test_kept_name",
         "must-keep": f"must-keep test is gone: {MOVE_OLD}::test_kept_name",
         "negative logs": f"{MOVE_NEW}::test_kept_name|",
@@ -615,19 +509,6 @@ def pure_move() -> tuple[bool, str]:
         True,
         f"mapped: no gate line, ledgers byte-identical; unmapped: {without['must-keep'][0]}"[:240],
     )
-
-
-def weakened_move() -> tuple[bool, str]:
-    """The same move with the moved test's own assert dropped: the map does not hide it."""
-    weakened = MOVED_SUITE.replace("    assert 'secret' not in caplog.text\n", "")
-    found = _move_world(weakened, True)["inventory"]
-    test = f"{MOVE_OLD}::test_kept_name"
-    unmet = [
-        c for c in ("asserts", "body_hash") if not any(p.startswith(f"{test}: {c} ") for p in found)
-    ]
-    if unmet:
-        return False, f"not reported: {unmet}; got {found}"[:240]
-    return True, f"{len(found)} line(s), e.g. {found[0]}"[:240]
 
 
 _OLD = "tests/_gates/selftest_moves_old.py"
@@ -761,7 +642,7 @@ def _collision_refused_by_every_gate(tree: list[inventory.Module], ledgers: Path
     suite = [m for m in tree if m.path.name.startswith("test_")]
     current = [f"{m.rel}::{q}" for m in suite for q, _, _ in inventory._tests_in(m)]
     calls = {
-        "inventory": lambda: inventory.collect(
+        "index": lambda: inventory.collect(
             (m, q, n, c) for m in suite for q, n, c in inventory._tests_in(m)
         ),
         "must-keep": must_keep._functions,
@@ -803,7 +684,7 @@ def move_refusals() -> tuple[bool, str]:
         )[:240]
     return True, (
         f"{len(REFUSALS)} refused by name, the valid map passes; the collision also stops "
-        "inventory, must-keep and ledger"
+        "the index, must-keep and the ledger"
     )
 
 
@@ -1068,18 +949,6 @@ def _apply(mutation: Mutation, run: Callable[[], tuple[int, str]]) -> tuple[bool
     return True, f"{len(mutation.expect)} expected line(s), e.g. {first}"[:240]
 
 
-def _inventory_check() -> tuple[int, str]:
-    result = subprocess.run(
-        [sys.executable, "-m", "tests._gates.inventory", "--check"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "PYTHONPATH": f"{ROOT / 'src'}{os.pathsep}{ROOT}"},
-        check=False,
-    )
-    return result.returncode, result.stdout + result.stderr
-
-
 def _ledger_check(scope: str, env_name: str = "minimal") -> Callable[[], tuple[int, str]]:
     def run() -> tuple[int, str]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1191,25 +1060,20 @@ def missing_module() -> tuple[bool, str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    which = (argv or sys.argv[1:] or ["inventory"])[0]
+    which = (argv or sys.argv[1:] or ["static"])[0]
     results: list[tuple[str, bool, str]] = []
-    if which == "inventory":
-        for mutation in inventory_mutations():
-            rejected, evidence = _apply(mutation, _inventory_check)
-            results.append((mutation.name, rejected, evidence))
+    if which == "static":
         rejected, evidence = cache_reparse()
         results.append(("g: synthetic module re-parsed with another body", rejected, evidence))
         rejected, evidence = local_import()
-        results.append(
-            ("h: helper reached by a function-local import, its assert dropped", rejected, evidence)
-        )
+        results.append(("h: helper reached only by a function-local import", rejected, evidence))
         rejected, evidence = nested_scope_import()
         results.append(
             ("i: a nested-scope import never hides a module-level helper", rejected, evidence)
         )
         rejected, evidence = rebound_import()
         results.append(
-            ("j: a name imported twice in one scope, either helper weakened", rejected, evidence)
+            ("j: a name imported twice in one scope reaches both helpers", rejected, evidence)
         )
         rejected, evidence = unaliased_tests_import()
         results.append(("k: an unaliased import tests[.x], dotted or bare", rejected, evidence))
@@ -1217,8 +1081,6 @@ def main(argv: list[str] | None = None) -> int:
         results.append(("l: global / nonlocal past or under a local import", rejected, evidence))
         rejected, evidence = pure_move()
         results.append(("m: a pure move, with and without moves.json", rejected, evidence))
-        rejected, evidence = weakened_move()
-        results.append(("n: a move whose body lost an assert", rejected, evidence))
         rejected, evidence = move_refusals()
         results.append(("o: each malformed moves.json entry", rejected, evidence))
         rejected, evidence = membership_move()

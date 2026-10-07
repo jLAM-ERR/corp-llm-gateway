@@ -121,7 +121,7 @@ def node_ids(manifest: dict[str, Any]) -> list[str]:
     """Tests running a security negative check, directly or through a helper: a test that
     reaches a security helper's name and shares its module, at the baseline or now (a helper
     owner moves only with ``files``, a test also with ``ids``)."""
-    checks, _ = build_inventory()
+    checks = build_inventory()
     security = [s for s in manifest["sites"] if s["class"] == "security"]
     owners = {s["owner"] for s in security}
     helpers = [o for o in owners if o.rsplit("::", 1)[1].startswith("_")]

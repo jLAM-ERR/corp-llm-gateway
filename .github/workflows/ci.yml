@@ -35,7 +35,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     # 1.2 GB litellm image pull for tests/integration/test_anthropic_oauth_outbound.py
-    # on top of the unit suite, then the suite twice more under the refactor gates.
+    # on top of the unit suite, then the suite twice more under the test-suite gates.
     timeout-minutes: 120
     # The Postgres store contract tests (incl. the issuance race tests) run against
     # this service. GitHub sets CI=true, which turns their "Postgres unreachable"
@@ -82,16 +82,16 @@ jobs:
         env:
           CORP_REQUIRE_PROXY_CAPTURE: "1"
           CORP_TEST_PG_DSN: postgresql://gateway:gateway@localhost:5432/gateway
-      # The test-suite refactor gates (docs/testing/must-keep.md): the suite again in each
-      # of the two reproducible environments, each built from its recipe and checked
-      # against the committed outcome ledger, coverage and check inventory. The script
+      # The test-suite gates (docs/testing/must-keep.md): the suite again in each of the
+      # two reproducible environments, each built from its recipe and checked against the
+      # committed outcome ledger, must-keep ids and the other manifests. The script
       # sets each run's own env (minimal drops CI, full sets it); the var below keeps
       # the skip guard armed for this step like every other one that runs the suite.
-      - name: Refactor gates, minimal environment
+      - name: Test-suite gates, minimal environment
         run: scripts/test-env.sh minimal && scripts/test-gates.sh minimal
         env:
           CORP_REQUIRE_PROXY_CAPTURE: "1"
-      - name: Refactor gates, full environment
+      - name: Test-suite gates, full environment
         run: scripts/test-env.sh full && scripts/test-gates.sh full
         env:
           CORP_REQUIRE_PROXY_CAPTURE: "1"

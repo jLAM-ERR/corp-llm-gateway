@@ -9,7 +9,6 @@
 # Refresh: rerun both, apply the same rule, and collapse a function's cases to its id only
 # when every case either environment collects is over 2 s. A stale entry fails
 # tests/test_conftest_hooks.py.
-tests/_gates/test_suite_gates.py::test_the_check_inventory_matches_the_baseline
 tests/cli/test_status.py::test_no_token_file_unhealthy
 tests/compose/test_nginx_allowlist_routes.py::test_every_admitted_litellm_pair_is_a_route_litellm_registers
 tests/compose/test_nginx_runtime.py::test_a_buffering_location_holds_the_same_stream_back

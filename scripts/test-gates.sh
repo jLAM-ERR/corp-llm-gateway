@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
 # Runs the suite in one of the two test environments and checks it against the
-# committed baseline (plan 20260926, docs/testing/must-keep.md):
+# committed manifests (docs/testing/must-keep.md):
 #
 #   scripts/test-gates.sh minimal|full [--record] [--venv DIR] [--out DIR] [--shuffle-seed N]
 #
 # 1. the environment's fingerprint (tests/_manifests/env_fingerprint.<env>.json);
 #    full also needs Postgres at CORP_TEST_PG_DSN;
-# 2. the static gates: check inventory + external dependencies, name-pinned index,
-#    negative-log review, must-keep ids, the moves map;
-# 3. the whole suite once, with the outcome-ledger plugin and branch coverage;
-# 4. the run's ledger against expected_outcomes.<env>.json and its coverage against
-#    coverage.<env>.json — any new skip, lost id or case, changed reason, module that
-#    stops collecting, or dropped line / branch arc fails.
+# 2. the static gates: name-pinned index, negative-log review, must-keep ids, the moves map;
+# 3. the whole suite once, with the outcome-ledger plugin;
+# 4. any failed test, and the run's ledger against expected_outcomes.<env>.json — any
+#    new skip, lost id or case, changed reason, or module that stops collecting fails.
 #
-# --record runs 1 and 3 only and leaves the ledger and coverage in --out, for a
-# re-baseline. --shuffle-seed N runs step 3 in the suite's own seeded order (the option
-# tests/conftest.py adds); the ledger and coverage are keyed by node id and file, so the
-# checks do not depend on it.
+# --record runs 1 and 3 only and leaves the run's ledger in --out, for `ledger write`.
+# --shuffle-seed N runs step 3 in the suite's own seeded order (the option
+# tests/conftest.py adds); the ledger is keyed by node id, so the check does not depend on it.
 # Create the venv first with scripts/test-env.sh <env>.
 set -euo pipefail
 
@@ -90,7 +87,6 @@ fi
 [[ ${status} -eq 0 ]] || exit 1
 
 if [[ ${RECORD} -eq 0 ]]; then
-    "${PY}" -m tests._gates.inventory --check || fail "check inventory / external dependencies"
     "${PY}" -m tests._gates.name_pinned --check || fail "name-pinned index"
     "${PY}" -m tests._gates.negative_logs --check || fail "negative-log review"
     "${PY}" -m tests._gates.must_keep --check || fail "must-keep ids"
@@ -100,18 +96,16 @@ fi
 set +e
 "${PY}" -m pytest tests/ -q -p tests._gates.outcome_ledger \
     --outcome-ledger="${OUT}/ledger.json" \
-    --cov=corp_llm_gateway --cov-branch --cov-report="json:${OUT}/coverage.json" \
     ${SHUFFLE[@]+"${SHUFFLE[@]}"}
 pytest_status=$?
 set -e
-echo "pytest exited ${pytest_status}; ledger and coverage in ${OUT}"
+echo "pytest exited ${pytest_status}; ledger in ${OUT}"
 
 if [[ ${RECORD} -eq 1 ]]; then
     exit 0
 fi
 [[ ${pytest_status} -eq 0 ]] || fail "pytest exited ${pytest_status}"
 "${PY}" -m tests._gates.ledger check "${ENV_NAME}" "${OUT}/ledger.json" || fail "expected outcomes"
-"${PY}" -m tests._gates.coverage_gate check "${ENV_NAME}" "${OUT}/coverage.json" || fail "coverage"
 
 if [[ ${status} -eq 0 ]]; then
     echo "OK: every gate holds in the ${ENV_NAME} environment"
