@@ -8,8 +8,9 @@
 #    full also needs Postgres at CORP_TEST_PG_DSN;
 # 2. the static gates: name-pinned index, negative-log review, must-keep ids, the moves map;
 # 3. the whole suite once, with the outcome-ledger plugin;
-# 4. any failed test, and the run's ledger against expected_outcomes.<env>.json — any
-#    new skip, lost id or case, changed reason, or module that stops collecting fails.
+# 4. any failed test, and the run's ledger against expected_outcomes.<env>.json — a
+#    must-keep id that is lost, gains or loses a case, gets a new skip or skip reason, or
+#    whose module stops collecting fails; other tests may come and go.
 #
 # --record runs 1 and 3 only and leaves the run's ledger in --out, for `ledger write`.
 # --shuffle-seed N runs step 3 in the suite's own seeded order (the option

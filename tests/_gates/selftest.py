@@ -1007,20 +1007,21 @@ LEDGER_SETUP_SKIP = (
 
 
 def ledger_mutations() -> list[tuple[Mutation, Callable[[], tuple[int, str]]]]:
-    store = "tests/storage/test_mapping_store.py"
+    # Must-keep modules: the ledger speaks for nothing else.
+    store = "tests/tokens/test_token_store_contract.py"
     team = "tests/team_config/test_store.py"
-    ner = "tests/detectors/test_ner_en.py"
+    rbac = "tests/auth/test_rbac.py"
     team_text = (ROOT / team).read_text()
     return [
         (
             Mutation(
                 "lost parametrize case",
                 store,
-                'params=[_make_in_memory, _make_redis], ids=["in_memory", "redis"]',
+                'params=[_make_in_memory, _try_make_postgres], ids=["in_memory", "postgres"]',
                 'params=[_make_in_memory], ids=["in_memory"]',
-                ("missing id",),
+                ("missing id", "[postgres]"),
             ),
-            _ledger_check("tests/storage/"),
+            _ledger_check(store),
         ),
         (
             Mutation(
@@ -1035,12 +1036,12 @@ def ledger_mutations() -> list[tuple[Mutation, Callable[[], tuple[int, str]]]]:
         (
             Mutation(
                 "changed collection-skip reason",
-                ner,
-                'pytest.importorskip("spacy")',
-                'pytest.importorskip("spacy", reason="selftest: another reason")',
+                rbac,
+                'pytest.importorskip("cryptography")',
+                'pytest.importorskip("cryptography", reason="selftest: another reason")',
                 ("selftest: another reason",),
             ),
-            _ledger_check(ner),
+            _ledger_check(rbac),
         ),
     ]
 

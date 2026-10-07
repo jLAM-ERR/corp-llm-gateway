@@ -198,32 +198,118 @@ def test_every_negative_log_check_is_reviewed() -> None:
     assert negative_logs.lost(recorded["security_node_ids"], recorded) == []
 
 
-def test_the_ledgers_cover_every_test() -> None:
-    covered: set[str] = set()
-    covered_files: set[str] = set()
+def test_the_ledgers_hold_exactly_the_must_keep_ids() -> None:
+    committed = set(must_keep.read())
+    functions = {ledger.function_id(node_id) for node_id in committed}
     for env in ledger.ENVS:
-        for node_id in ledger.ids_with_outcome(env):
-            if "::" not in node_id:
-                covered_files.add(node_id)
-                continue
-            covered.add(ledger.join_id(*ledger.split_id(node_id)[:2], ""))
-    uncovered = sorted(
-        node_id
-        for node_id in inventory.build()
-        if node_id not in covered and node_id.split("::", 1)[0] not in covered_files
-    )
+        recorded = ledger.ids_with_outcome(env)
+        files = {node_id for node_id in recorded if "::" not in node_id}
+        cases = recorded - files
+        under_files = {i for i in committed if i.split("::", 1)[0] in files}
+        # A parametrised test is listed by its function id too; the ledger has only its cases.
+        listed_only = {ledger.function_id(i) for i in cases if ledger.split_id(i)[2]}
 
-    assert uncovered == []
+        assert cases <= committed, env
+        assert all(any(f.startswith(path + "::") for f in functions) for path in files), env
+        assert committed - cases - under_files <= listed_only, env
+
+
+def test_the_ledger_check_speaks_for_the_must_keep_ids_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept, cases, other = (
+        "tests/x/test_a.py::test_kept",
+        "tests/x/test_a.py::test_cases",
+        "tests/x/test_a.py::test_other",
+    )
+    recorded = {kept: "passed", f"{cases}[1]": "passed", f"{cases}[2]": "skipped:no redis"}
+    (tmp_path / "minimal.json").write_text(ledger._dump("minimal", ledger.nest(recorded)))
+    monkeypatch.setattr(ledger, "expected_path", lambda env: tmp_path / f"{env}.json")
+    monkeypatch.setattr(ledger, "not_applicable", dict)
+    monkeypatch.setattr(moves, "load", lambda: moves.Moves({}, {}))
+
+    def check(outcomes: dict[str, str], skipped: dict[str, str] | None = None) -> list[str]:
+        run = {"outcomes": outcomes, "collection_skipped": skipped or {}, "collection_errors": {}}
+        return ledger.compare("minimal", run)
+
+    assert check({**recorded, other: "passed"}) == []
+    assert check(recorded) == []
+    assert check({**recorded, other: "skipped:gone quiet"}) == []
+    assert check({**recorded, "tests/y/test_b.py::test_new": "passed"}) == []
+    assert check(recorded, {"tests/y/test_b.py": "no module"}) == []
+    assert check({**recorded, other: "failed"}) == [f"minimal: {other} failed"]
+    assert check({k: v for k, v in recorded.items() if k != kept}) == [
+        f"minimal: missing id (deselected, lost or not collected): {kept}"
+    ]
+    assert check({k: v for k, v in recorded.items() if k != f"{cases}[2]"}) == [
+        f"minimal: missing id (deselected, lost or not collected): {cases}[2]"
+    ]
+    assert check({**recorded, f"{cases}[3]": "passed"}) == [
+        f"minimal: new id not in the expected outcomes: {cases}[3] (passed)"
+    ]
+    assert check({**recorded, kept: "skipped:flaky"}) == [
+        f"minimal: {kept}: expected 'passed', got 'skipped:flaky'"
+    ]
+    assert check({**recorded, f"{cases}[2]": "skipped:no postgres"}) == [
+        f"minimal: {cases}[2]: expected 'skipped:no redis', got 'skipped:no postgres'"
+    ]
+    assert len(check({}, {"tests/x/test_a.py": "no module"})) == 3
+
+
+def test_ledger_write_keeps_only_the_tests_it_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept, other = "tests/x/test_a.py::test_kept", "tests/x/test_a.py::test_other"
+    monkeypatch.setattr(ledger, "expected_path", lambda env: tmp_path / f"{env}.json")
+    monkeypatch.setattr(ledger, "not_applicable", dict)
+    monkeypatch.setattr(moves, "load", lambda: moves.Moves({}, {}))
+    run = {
+        "outcomes": {f"{kept}[1]": "passed", f"{kept}[2]": "passed", other: "passed"},
+        "collection_skipped": {"tests/z/test_c.py": "no module"},
+        "collection_errors": {},
+    }
+
+    assert ledger.write(dict.fromkeys(ledger.ENVS, run), keep={kept}) == []
+
+    for env in ledger.ENVS:
+        assert ledger.ids_with_outcome(env) == {f"{kept}[1]", f"{kept}[2]"}
+
+
+def test_moves_checks_values_against_the_collection_before_the_ledgers_narrowed() -> None:
+    full = moves.full_ledger_ids()
+
+    assert full is not None
+    assert len(full) > len(ledger.ids_with_outcome("minimal"))
+    assert set(moves.load().ids.values()) <= {ledger.function_id(i) for i in full if "::" in i}
+
+
+def test_a_clone_without_the_full_ledgers_fails_moves_on_ci_and_warns_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(moves, "full_ledger_ids", lambda: None)
+    monkeypatch.setenv("CI", "true")
+
+    assert moves.NO_FULL_LEDGERS in moves.problems()
+
+    monkeypatch.delenv("CI")
+    with pytest.warns(UserWarning, match="not in this clone"):
+        found = moves.problems()
+    assert found == []
 
 
 def test_not_applicable_skips_are_reviewed_and_still_recorded() -> None:
     entries = ledger.not_applicable()
+    committed = set(must_keep.read())
     for env in ledger.ENVS:
         outcomes = ledger.flat(json.loads(ledger.expected_path(env).read_text()))
         for node_id, entry in entries.items():
             assert entry["note"]
-            if env in entry:
+            if env not in entry:
+                continue
+            if node_id in committed:
                 assert outcomes[node_id] == f"{ledger.NOT_APPLICABLE}{entry['note']}"
+            else:
+                assert node_id not in outcomes
 
 
 def test_the_full_constraints_install_the_litellm_pyproject_pins(

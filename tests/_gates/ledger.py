@@ -1,7 +1,8 @@
-"""Expected outcome per (node id, environment), built from two outcome-ledger runs.
+"""Expected outcome per (must-keep node id, environment), built from two outcome-ledger runs.
 
-``tests/_manifests/expected_outcomes.<env>.json`` maps file -> test -> outcome, one entry
-per parametrised id (``{"[case]": outcome}``):
+``tests/_manifests/expected_outcomes.<env>.json`` maps file -> test -> outcome for the
+must-keep tests only (``tests/_manifests/must_keep/``), one entry per parametrised id
+(``{"[case]": outcome}``):
 
 - ``passed`` / ``skipped:<reason>``;
 - ``collection-skipped:<reason>`` for every id a module expands to in the other
@@ -12,10 +13,14 @@ per parametrised id (``{"[case]": outcome}``):
   ``not-collected`` for a case parametrised only where its dependency is installed).
 
 Keyed by baseline node id: a run's current ids go through ``moves.to_baseline`` first.
+``check`` speaks only for what the ledger records: a recorded id that is missing or changes
+outcome, a new case of a recorded test, or a recorded module that changes how it is
+skipped fails; any other test may be added, removed or change outcome. A failed test or a
+collection error fails anywhere.
 
-``python -m tests._gates.ledger write --minimal RUN.json… --full RUN.json…`` (baseline) and
-``python -m tests._gates.ledger check <env> RUN.json [--scope PATH ...]``; a scope is a
-current path, and an id is in it where the test lives now.
+``python -m tests._gates.ledger write --minimal RUN.json… --full RUN.json…`` (keeps the tests
+the must-keep rules select) and ``python -m tests._gates.ledger check <env> RUN.json
+[--scope PATH ...]``; a scope is a current path, and an id is in it where the test lives now.
 """
 
 from __future__ import annotations
@@ -154,6 +159,30 @@ def _dump(env: str, files: dict[str, Any]) -> str:
     return f'{{\n "baseline": "{BASELINE}",\n "env": "{env}",\n "files": {files_text}\n}}\n'
 
 
+def function_id(node_id: str) -> str:
+    return join_id(*split_id(node_id)[:2], "")
+
+
+def narrowed(outcomes: dict[str, str], keep: set[str]) -> dict[str, str]:
+    """The entries of the function-level ids in ``keep``, and the file-level entries of the
+    modules that hold one."""
+    files = {node_id.split("::", 1)[0] for node_id in keep}
+    return {
+        node_id: outcome
+        for node_id, outcome in outcomes.items()
+        if (function_id(node_id) in keep if "::" in node_id else node_id in files)
+    }
+
+
+def must_keep_functions() -> set[str]:
+    """Function-level ids of the committed must-keep list and of every test its rules select
+    now, so a test the rules just picked up is recorded before ``must_keep --write``."""
+    from tests._gates import must_keep
+
+    committed = {function_id(node_id) for node_id in must_keep.read()}
+    return committed | set(must_keep.function_ids())
+
+
 def merge(paths: list[Path]) -> dict[str, Any]:
     """Later runs override earlier ones per id (a scoped re-run of a few files)."""
     merged: dict[str, Any] = {"outcomes": {}, "collection_skipped": {}, "collection_errors": {}}
@@ -164,13 +193,21 @@ def merge(paths: list[Path]) -> dict[str, Any]:
     return merged
 
 
-def write(runs: dict[str, dict[str, Any]], *, provisional: bool = False) -> list[str]:
+def write(
+    runs: dict[str, dict[str, Any]],
+    *,
+    provisional: bool = False,
+    keep: set[str] | None = None,
+) -> list[str]:
+    """Both ledgers from both runs; with ``keep`` (function-level ids), only those tests."""
     problems = [p for env in ENVS for p in _problems_of_run(env, runs[env])]
     if problems and not provisional:
         return problems
     for env in ENVS:
         other = runs["full" if env == "minimal" else "minimal"]
         outcomes = _apply_not_applicable(env, _translated(_expand(runs[env], other)))
+        if keep is not None:
+            outcomes = narrowed(outcomes, keep)
         expected_path(env).write_text(_dump(env, nest(outcomes)))
     return problems if not provisional else []
 
@@ -182,9 +219,12 @@ def _in_scope(node_id: str, scope: Iterable[str]) -> bool:
 
 
 def compare(env: str, run: dict[str, Any], scope: Iterable[str] = ()) -> list[str]:
-    """Every difference between a fresh run and the committed expected outcomes."""
+    """Every difference between a fresh run and the committed expected outcomes, for the ids
+    the ledger speaks for: the recorded ones, new cases of a recorded test, and a recorded
+    module skipped as a whole."""
     scope = list(scope)
     recorded = flat(json.loads(expected_path(env).read_text()))
+    functions = {function_id(node_id) for node_id in recorded if "::" in node_id}
     problems = _problems_of_run(env, run, scope)
     actual = _translated(run["outcomes"])
     skipped_modules = dict(run["collection_skipped"])
@@ -197,7 +237,14 @@ def compare(env: str, run: dict[str, Any], scope: Iterable[str] = ()) -> list[st
         for node_id in ids:
             actual[node_id] = f"{COLLECTION_SKIPPED}{reason}"
     na = not_applicable()
-    for node_id in sorted(set(recorded) | set(actual)):
+    spoken_for = {
+        node_id
+        for node_id in actual
+        if node_id in recorded
+        or ("::" in node_id and function_id(node_id) in functions)
+        or ("::" in node_id and node_id.split("::", 1)[0] in recorded)
+    }
+    for node_id in sorted(set(recorded) | spoken_for):
         if not _in_scope(moves.from_baseline(node_id), scope):
             continue
         want, got = recorded.get(node_id), actual.get(node_id)
@@ -237,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "write":
         runs = {"minimal": merge(args.minimal), "full": merge(args.full)}
-        problems = write(runs, provisional=args.provisional)
+        problems = write(runs, provisional=args.provisional, keep=must_keep_functions())
     else:
         problems = compare(args.env, json.loads(args.run.read_text()), args.scope)
     for line in problems:
