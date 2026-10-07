@@ -19,6 +19,8 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from tests._gates import moves
+
 ROOT = Path(__file__).resolve().parents[2]
 INDEX_PATH = ROOT / "tests" / "_manifests" / "name_pinned.json"
 MATRIX = "tests/litellm_hook/test_acceptance_matrix.py"
@@ -218,6 +220,7 @@ def write(current: dict[str, Any]) -> None:
     INDEX_PATH.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n")
 
 
+@moves.refusals("NAME-PINNED")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)

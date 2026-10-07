@@ -105,7 +105,9 @@ def test_corp_llm_verify_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def _isolate_from_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A missing explicit file falls back to the default paths, so those go too.
     monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", "/nonexistent/config.toml")
+    monkeypatch.setattr(config, "_DEFAULT_PATHS", ())
     config.reset_cache()
 
 

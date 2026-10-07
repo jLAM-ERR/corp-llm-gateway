@@ -151,7 +151,7 @@ def test_the_conftest_registers_the_guard_as_a_teardown_wrapper(
     impls = [
         impl
         for impl in request.config.pluginmanager.hook.pytest_runtest_teardown.get_hookimpls()
-        if Path(getattr(impl.plugin, "__file__", "") or "") == conftest
+        if Path(getattr(impl.plugin, "__file__", "") or "").resolve() == conftest.resolve()
     ]
 
     assert [(impl.function, impl.wrapper) for impl in impls] == [
@@ -198,6 +198,52 @@ def test_the_guard_fails_the_leaking_test_at_teardown_and_restores_for_the_next(
         ["PASSED test_inner.py::test_clean", "ERROR test_inner.py::test_leaks*"]
     )
     assert "ERROR test_inner.py::test_clean" not in result.stdout.str()
+
+
+def test_a_teardown_error_keeps_its_traceback_names_the_leak_and_restores_for_the_next(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(ROOT / "src"), str(ROOT)]))
+    pytester.makeconftest("from tests.package_state import pytest_runtest_teardown  # noqa: F401\n")
+    pytester.makepyfile(
+        test_inner="""
+        import sys
+        import types
+
+        import pytest
+
+        import corp_llm_gateway
+        import corp_llm_gateway.metrics
+
+
+        @pytest.fixture
+        def breaks_at_teardown():
+            yield
+            raise RuntimeError("the fixture broke at teardown")
+
+
+        def test_leaks(breaks_at_teardown):
+            corp_llm_gateway.metrics = types.ModuleType("corp_llm_gateway.metrics")
+
+
+        def test_clean():
+            assert corp_llm_gateway.metrics is sys.modules["corp_llm_gateway.metrics"]
+        """
+    )
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider", "-p", "no:asyncio", "-rA")
+
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*RuntimeError: the fixture broke at teardown",
+            "E * test also left stale package attributes: *corp_llm_gateway.metrics is module*",
+        ]
+    )
+    assert "test left package attributes on stale modules" not in result.stdout.str()
+    result.stdout.fnmatch_lines(
+        ["PASSED test_inner.py::test_clean", "ERROR test_inner.py::test_leaks*"]
+    )
 
 
 def test_shuffled_is_a_seeded_permutation_that_keeps_modules_classes_and_scoped_params_together(
@@ -248,9 +294,12 @@ def test_shuffled_is_a_seeded_permutation_that_keeps_modules_classes_and_scoped_
 
 
 def _collected(*args: str) -> list[str]:
+    # A --shuffle-seed in the caller's PYTEST_ADDOPTS would reorder every collection here.
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
     run = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", *args],
         cwd=ROOT,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
@@ -261,19 +310,15 @@ def _collected(*args: str) -> list[str]:
 
 def test_without_a_seed_the_collection_order_is_unchanged_and_a_seed_only_reorders() -> None:
     files = ["tests/test_ci_workflow.py", "tests/test_conftest_hooks.py"]
-    defined = [
-        f"{path}::{node.name}"
-        for path in files
-        for node in ast.parse((ROOT / path).read_text()).body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.startswith("test")
-    ]
+    # pytest's own order, every collected test: the same collection without tests/conftest.py.
+    native = _collected("--noconftest", *files)
 
     shuffled = _collected("--shuffle-seed=20261006", *files)
 
-    assert _collected(*files) == defined
-    assert sorted(shuffled) == sorted(defined)
-    assert shuffled != defined
+    assert {nodeid.split("::", 1)[0] for nodeid in native} == set(files)
+    assert _collected(*files) == native
+    assert sorted(shuffled) == sorted(native)
+    assert shuffled != native
 
 
 def test_every_case_level_slow_entry_is_still_collected() -> None:

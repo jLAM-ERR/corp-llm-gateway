@@ -5,9 +5,10 @@ method and the decoded path, taken as received. The raw (still-encoded) path is 
 malformed one: an encoded slash, NUL or `..`, or a non-ASCII byte; the decoded path is malformed if
 it holds `..`, `//` or a NUL. A lifespan scope is passed through; a websocket scope, a websocket
 Upgrade header, an unknown scope type and a malformed path are refused. Otherwise the built-in
-tables decide (exact rows, then regex rows), and operator extras are consulted only when they have
-no row: HEAD checks a HEAD row, then the GET row, and a REWRITTEN result is refused; an extra can
-only add an otherwise-unlisted PASSTHROUGH route — it never reopens a refusal or promises a rewrite.
+tables decide (exact rows, then regex rows), and operator extras are consulted only when the tables
+have no row. HEAD checks a HEAD row, then the GET row, in the tables first and only then in the
+extras, and a REWRITTEN result is refused; an extra can only add an otherwise-unlisted PASSTHROUGH
+route — it never reopens a refusal or promises a rewrite.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import re
 import pytest
 
 from corp_llm_gateway.route_gate import (
+    LITELLM_REGEX_TABLE,
     LITELLM_ROUTE_TABLE,
     ROUTE_GATE_ERROR,
     ROUTE_GATE_LISTED,
@@ -109,6 +111,35 @@ def test_a_decoded_traversal_is_malformed_even_without_a_raw_path() -> None:
     decision = classify("POST", "/v1/messages/../key/generate", None)
     assert decision.verdict is Verdict.REFUSE
     assert decision.block_reason == ROUTE_GATE_MALFORMED
+
+
+@pytest.mark.parametrize("dots", ["%2e%2e", "%2E%2E", "%2e%2E"])
+def test_an_encoded_double_dot_alone_is_refused_as_malformed(dots: str) -> None:
+    # The decoded path is clean, so only the raw path's encoded `..` can refuse it.
+    decision = classify("POST", "/v1/messages", f"/v1/{dots}/messages".encode())
+    assert decision.verdict is Verdict.REFUSE
+    assert decision.block_reason == ROUTE_GATE_MALFORMED
+
+
+@pytest.mark.parametrize(
+    "raw_path", [None, b"", b"/v1/responses/resp_1"], ids=["absent", "empty", "clean"]
+)
+def test_a_decoded_nul_alone_is_refused_as_malformed(raw_path: bytes | None) -> None:
+    # A scope may carry no raw_path, or one without the `%00`: only the decoded check sees it.
+    decision = classify("GET", "/v1/responses/resp_1\x00", raw_path)
+    assert decision.verdict is Verdict.REFUSE
+    assert decision.block_reason == ROUTE_GATE_MALFORMED
+
+
+def test_an_exact_row_wins_over_a_regex_row_that_also_matches() -> None:
+    path = "/cursor/models"
+    regex = [
+        row.entry for row in LITELLM_REGEX_TABLE if row.method == "GET" and row.pattern.match(path)
+    ]
+
+    assert LITELLM_ROUTE_TABLE[("GET", path)].verdict is Verdict.PASSTHROUGH
+    assert regex and regex[0].verdict is Verdict.REFUSE
+    assert classify("GET", path, path.encode()).verdict is Verdict.PASSTHROUGH
 
 
 def test_head_inherits_the_get_entry() -> None:

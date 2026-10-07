@@ -21,19 +21,56 @@ nothing else in it changes.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import os
 import re
+import subprocess
 import sys
+import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PATH = ROOT / "tests" / "_manifests" / "moves.json"
+# The last commit whose expected-outcome ledgers recorded every test; Task 10 narrowed them
+# to the must-keep ids, so a moves.json value is looked up in these as well.
+FULL_LEDGERS_AT = "8936dc691be54651ed6d9bf237660bcae18ea96b"
+NO_FULL_LEDGERS = (
+    f"{FULL_LEDGERS_AT[:7]} is not in this clone (shallow?): moves.json values outside the "
+    "must-keep ledgers cannot be checked against the baseline collection"
+)
 
 
-class MoveCollisionError(ValueError):
+class GateRefusalError(ValueError):
+    """The tree is one a gate cannot read; its CLI reports it as one line (``refusals``)."""
+
+
+class MoveCollisionError(GateRefusalError):
     pass
+
+
+Main = Callable[[list[str] | None], int]
+
+
+def refusals(prefix: str) -> Callable[[Main], Main]:
+    """Decorates a gate's ``main``: a ``GateRefusalError`` is printed as one ``prefix:`` line on
+    stderr and exits 1, instead of a traceback."""
+
+    def wrap(main: Main) -> Main:
+        @functools.wraps(main)
+        def run(argv: list[str] | None = None) -> int:
+            try:
+                return main(argv)
+            except GateRefusalError as exc:
+                print(f"{prefix}: {exc}", file=sys.stderr)
+                return 1
+
+        return run
+
+    return wrap
 
 
 def claim(seen: dict[str, str], current: str) -> str:
@@ -150,12 +187,38 @@ def from_baseline(node_id: str) -> str:
     return candidate if to_baseline(candidate) == node_id else node_id
 
 
+@cache
+def full_ledger_ids() -> frozenset[str] | None:
+    """Every id the two ledgers recorded at ``FULL_LEDGERS_AT``; None without that commit."""
+    from tests._gates import ledger
+
+    found: set[str] = set()
+    for env in ledger.ENVS:
+        try:
+            shown = subprocess.run(
+                ["git", "show", f"{FULL_LEDGERS_AT}:tests/_manifests/expected_outcomes.{env}.json"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if shown.returncode:
+            return None
+        found |= set(ledger.flat(json.loads(shown.stdout)))
+    return frozenset(found)
+
+
 def _function_ids(ids: set[str]) -> set[str]:
     return {i.partition("::")[0] + "::" + _cut(i.partition("::")[2])[0] for i in ids if "::" in i}
 
 
-def problems() -> list[str]:
-    """The refusals: every entry must map a test that moved, 1:1, straight to its baseline."""
+def problems(*, strict: bool = False) -> list[str]:
+    """The refusals: every entry must map a test that moved, 1:1, straight to its baseline.
+    Without ``FULL_LEDGERS_AT`` the values cannot be checked: a problem when ``strict`` or
+    under CI, else a warning."""
     from tests._gates import ledger
     from tests._gates.inventory import _tests_in, suite_modules
 
@@ -164,9 +227,16 @@ def problems() -> list[str]:
     tree_paths = {module.rel for module in suite_modules()}
     tree_ids = {f"{m.rel}::{qual}" for m in suite_modules() for qual, _, _ in _tests_in(m)}
     recorded = {i for env in ledger.ENVS for i in ledger.ids_with_outcome(env)}
+    found: list[str] = []
+    full = full_ledger_ids()
+    if full is not None:
+        recorded |= full
+    elif strict or os.environ.get("CI"):
+        found.append(NO_FULL_LEDGERS)
+    else:
+        warnings.warn(NO_FULL_LEDGERS, stacklevel=2)
     baseline_ids = _function_ids(recorded)
     baseline_paths = {i.split("::", 1)[0] for i in recorded}
-    found: list[str] = []
 
     def refuse(kind: str, key: str, value: str, why: str) -> None:
         found.append(f"moves.json {kind}: {key!r} -> {value!r}: {why}")
@@ -185,7 +255,7 @@ def problems() -> list[str]:
                 refuse(kind, key, value, "the key is not in the current tree")
             if value in present:
                 refuse(kind, key, value, "the value is still in the current tree (no move)")
-            if value not in baseline:
+            if value not in baseline and full is not None:
                 where = "collection (ledgers)" if is_ids else "ledgers' paths"
                 refuse(kind, key, value, f"the value is not in the baseline {where}")
             if value in seen:
@@ -206,11 +276,12 @@ def problems() -> list[str]:
     return found
 
 
+@refusals("MOVES")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", required=True)
     parser.parse_args(argv)
-    found = problems()
+    found = problems(strict=True)
     for line in found:
         print(f"MOVES: {line}", file=sys.stderr)
     return 1 if found else 0

@@ -1,9 +1,0 @@
-{
- "baseline": "807831a",
- "tests": {
-  "tests/test_issuance_bounds_upper.py::test_an_accepted_bound_is_one_issuance_can_run_with": {"asserts":3,"body_hash":"df40af0b280a5f973565e7e7ae2c30d4","case_data":{"loops":["exc.problems"],"parametrize":[{"argnames":"('key', 'value')","cases":3,"values":"5462741aebe4178d3c681ff37f04f40a557cfa7aa89c797ee74175b5937b151b"}]},"constants":["PACKAGE","State","_DEFAULT"],"delegated":{"_no_logger_state_left_behind":{"asserts":0,"fail":1,"raises":0}},"fail":0,"fixtures":["_fresh_metrics_exporter","_no_logger_state_left_behind","ext:monkeypatch","ext:tmp_path","issuance_env"],"helpers":["_gateway_loggers","changes","restore","snapshot"],"raises":0}
- },
- "cases": {
-  "tests/test_issuance_bounds_upper.py::test_an_accepted_bound_is_one_issuance_can_run_with": {"full":3,"minimal":3}
- }
-}

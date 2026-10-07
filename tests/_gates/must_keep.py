@@ -27,8 +27,8 @@ from tests._gates.inventory import Module, _area, _tests_in, modules
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFESTS = ROOT / "tests" / "_manifests"
-# One file per test directory (per module for tests/*.py), as baseline_checks/: together
-# they are near the 500 KB commit limit.
+# One file per test directory (per module for tests/*.py): together they are near the
+# 500 KB commit limit.
 DIR = MANIFESTS / "must_keep"
 HEADER = (
     "# Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file\n"
@@ -392,6 +392,7 @@ def problems(*, strict: bool = False) -> list[str]:
     return found
 
 
+@moves.refusals("MUST-KEEP")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)

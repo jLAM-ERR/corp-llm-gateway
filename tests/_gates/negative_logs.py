@@ -121,7 +121,7 @@ def node_ids(manifest: dict[str, Any]) -> list[str]:
     """Tests running a security negative check, directly or through a helper: a test that
     reaches a security helper's name and shares its module, at the baseline or now (a helper
     owner moves only with ``files``, a test also with ``ids``)."""
-    checks, _ = build_inventory()
+    checks = build_inventory()
     security = [s for s in manifest["sites"] if s["class"] == "security"]
     owners = {s["owner"] for s in security}
     helpers = [o for o in owners if o.rsplit("::", 1)[1].startswith("_")]
@@ -141,14 +141,39 @@ def node_ids(manifest: dict[str, Any]) -> list[str]:
 def lost(previous: list[str], manifest: dict[str, Any]) -> list[str]:
     """Must-keep tests that were in ``security_node_ids`` and that ``manifest`` no longer
     selects (a security helper moved away from them, or reclassified). Both sides are
-    baseline ids. Dropping one on purpose means editing ``security_node_ids`` by hand."""
+    baseline ids. Dropping one on purpose means editing ``security_node_ids`` by hand. A
+    line names the UNREVIEWED sites the test owns or reaches through a helper."""
     gone = set(previous) - set(node_ids(manifest))
-    return [
-        f"security negative-log id lost while its test is still must-keep: {node_id}"
-        for node_id in sorted(gone & set(must_keep.read()))
-    ]
+    unreviewed = {s["owner"] for s in manifest["sites"] if s["class"] == "UNREVIEWED"}
+    lines = []
+    for node_id in sorted(gone & set(must_keep.read())):
+        line = f"security negative-log id lost while its test is still must-keep: {node_id}"
+        owners = _unreviewed_reached(node_id, unreviewed)
+        if owners:
+            line += unreviewed_hint(owners)
+        lines.append(line)
+    return lines
 
 
+def unreviewed_hint(owners: list[str]) -> str:
+    return (
+        f" (UNREVIEWED: {', '.join(owners)}; a security check whose text or owner changed "
+        "comes back unreviewed: review it before --write)"
+    )
+
+
+def _unreviewed_reached(node_id: str, unreviewed: set[str]) -> list[str]:
+    """The UNREVIEWED owners that are the test itself or a helper its closure reaches."""
+    reached = set(build_inventory().get(node_id, {}).get("helpers", []))
+    return sorted(
+        owner
+        for owner in unreviewed
+        if owner == node_id
+        or (owner.rsplit("::", 1)[1].startswith("_") and owner.rsplit("::", 1)[1] in reached)
+    )
+
+
+@moves.refusals("NEGATIVE-LOGS")
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
