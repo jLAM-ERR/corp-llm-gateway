@@ -1,15 +1,16 @@
 # Task 9 acceptance check
 
 The acceptance check of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 19 when measured, rev 20
-for the fixes; local only), Task 9. Four commits. Commit 1 (`5b91553`) is this report and changes nothing under
+for the fixes; local only), Task 9. Five commits. Commit 1 (`5b91553`) is this report and changes nothing under
 `tests/`. Commit 2 (`cc00051`) adds module docstrings to 8 test files in `tests/litellm_hook/` and
 `tests/route_gate/` (criterion 5). Commit 3 (`e0c5680`) refreshes 23 `site` values in
-`tests/_manifests/negative_log_checks.json` that those docstrings moved. Commit 4 corrects four of the docstrings
-after review and refreshes the 18 `site` values they moved again. Tree: `release/1.0.x` at `f050208` (PR #36).
-Baseline: `807831a`, with its manifests committed in Task 0 as `7ae1098` (PR #19). Every number below was measured
-on this checkout on 2026-10-07, in `.venv-test-minimal` and `.venv-test-full` (Python 3.14.8), with the env each
-recipe sets ([must-keep.md](must-keep.md), "The two environments"). Run outputs are in
-`.test-gates/t9-{minimal,full}` (not committed).
+`tests/_manifests/negative_log_checks.json` that those docstrings moved. Commit 4 (`941f78f`) corrects four of the
+docstrings after review and refreshes the 18 `site` values they moved again. Commit 5 rewrites `test_classify.py`'s
+docstring paragraph after a Codex review on PR #37 (no `site` moves; the file has no negative-log check). Tree:
+`release/1.0.x` at `f050208` (PR #36). Baseline: `807831a`, with its manifests committed in Task 0 as `7ae1098` (PR
+#19). Every number below was measured on this checkout on 2026-10-07, in `.venv-test-minimal` and `.venv-test-full`
+(Python 3.14.8), with the env each recipe sets ([must-keep.md](must-keep.md), "The two environments"). Run outputs
+are in `.test-gates/t9-{minimal,full}` (not committed).
 
 | # | criterion | verdict | key numbers |
 |---|---|---|---|
@@ -17,7 +18,7 @@ recipe sets ([must-keep.md](must-keep.md), "The two environments"). Run outputs 
 | 2 | every baseline id mapped 1:1 or ledgered | met, with one note | 5,933 baseline ids per env: 5,346 present, 515 moved, 67 deleted with a row, 4 re-parametrised with a row, 1 Task 0 gate test removed by Task 1a; 0 unaccounted |
 | 3 | both envs green, coverage identical | met | minimal 4,695 passed / 419 skipped / 0 failed; full 5,913 / 16 / 0; four areas identical in both envs |
 | 4 | wall time not worse | met (per-test reading, rev 20 (1)) | tests present at both commits take the same time (minimal 545.4 s vs 544.7 s). The whole suite is 22-50 s longer (+2-6 %) because of tests added since: `tests/_gates` alone is 18.6-19.6 s |
-| 5 | a reader can name each file's behaviour | met (commits 2-4) | 8 of 45 files were flagged at `f050208` (4 with no docstring, 4 whose docstring named a task, hazard or `src/` function instead of a behaviour); commits 2-4 give each a docstring that names the behaviour, with no other change |
+| 5 | a reader can name each file's behaviour | met (commits 2-5) | 8 of 45 files were flagged at `f050208` (4 with no docstring, 4 whose docstring named a task, hazard or `src/` function instead of a behaviour); commits 2-5 give each a docstring that names the behaviour, with no other change |
 
 ## 1. Must-keep guard
 
@@ -284,25 +285,28 @@ behaviour: `test_bearer_is_hashed_before_logging.py`, `test_corp_token_never_rea
 | `tests/route_gate/test_reverse_object_shapes.py` | Response restoration on litellm model objects rather than wire JSON, a path the middleware never takes: placeholders reversed, hidden params kept, a reconstruct failure neither bypasses validation nor logs an original. |
 | `tests/route_gate/test_table.py` | The hand-classified route table's own rules: well-formed rows, a reason on every row, exactly eight rewritten spellings, bypass and management routes refused, and the verdict counts. |
 
-### Fix (commits 2-4, plan rev 20 (2))
+### Fix (commits 2-5, plan rev 20 (2))
 
-Each of the 8 files has a module docstring whose first line names the behaviour, with plan terms
-spelled out (no "migrated pipeline", "sentinel", "Option A" or "M4" left unexplained). The four files
-that had a docstring keep its old text below the new lines. The plan / hazard tag stays as a closing
-line, and the ⚠️ paragraph of `test_reverse_object_shapes.py` is kept word for word. Commit 4 fixed four
-of them after review, so that each says only what its tests check: `test_table.py` (the table is the
-collected surface by size floors; `test_litellm_route_guard.py` holds the check against litellm's routes),
-`test_desanitize_middleware.py` (a failure after the response starts sends what was already restored,
-then closes), `test_fail_open_probes.py` (the opt-out is stripped or overwritten; the defences the same
-tests pin), `test_anthropic_upstream_headers.py` (every rejected Authorization case). The docstrings at
-the final commit (summary and first paragraph):
+Each of the 8 files has a module docstring whose first line names the behaviour, with plan terms spelled out (no
+"migrated pipeline", "sentinel", "Option A" or "M4" left unexplained). The four files that had a docstring keep its
+old text below the new lines. The plan / hazard tag stays as a closing line, and the ⚠️ paragraph of
+`test_reverse_object_shapes.py` is kept word for word. Commit 4 fixed four of them after review, so that each says
+only what its tests check: `test_table.py` (the table is the collected surface by size floors;
+`test_litellm_route_guard.py` holds the check against litellm's routes), `test_desanitize_middleware.py` (a failure
+after the response starts sends what was already restored, then closes), `test_fail_open_probes.py` (the opt-out is
+stripped or overwritten; the defences the same tests pin), `test_anthropic_upstream_headers.py` (every rejected
+Authorization case). Commit 5 answers a Codex review on PR #37 (P2): `test_classify.py`'s second paragraph said the
+verdict comes from the method and the raw path; it now names every input `classify()` reads (scope type, Upgrade
+header, upper-cased method, decoded path, the raw path for malformed checks only, the tables, then extras), each
+clause checked against `route_gate/classify.py` and `route_gate/table.py`. The docstrings at the final commit
+(summary and first paragraph):
 
 | file | docstring (summary and first paragraph) |
 |---|---|
 | `tests/litellm_hook/test_anthropic_upstream_headers.py` | The headers the hook forwards to Anthropic, and the OAuth token prefix it expects. An allow-list keeps the headers Anthropic needs and drops the corp token and every unlisted header. An Authorization that is missing, not a Bearer, empty, carries a line break, or holds no OAuth token (a truncated prefix, a plain API key, any other bearer) is rejected. The OAuth token prefix is read from litellm, with a fixed fallback when litellm's value is missing or unusable, and is never empty. |
 | `tests/litellm_hook/test_fail_open_probes.py` | Ways litellm could let an original reach the provider, driven through its real proxy app. A client's guardrail opt-out, in `metadata`, `litellm_metadata` or at the root, is stripped or overwritten; our refusal keeps its status and error code through litellm; litellm's `scan_raw_request` and `run_in_parallel` flags are refused when the gateway arms. A policy row written into litellm's database, or a request body naming one, makes a guardrail registered the litellm way (under `guardrails:`, not as a plain callback, as ours is) skip the request, so the original would leave. The same tests pin the defences: our plain callback still rewrites, a check that runs after our pre-call refuses the request with 503, pinning `supported_db_objects` keeps the row out, and the gate refuses a body with a `policies` key with 403. That after-pre-call check cannot see a `scan_raw_request` run; the arm check refuses the flag instead. |
 | `tests/litellm_hook/test_proxy_dispatch.py` | Which of our hooks litellm's real proxy runs, end to end, and what the client gets back. Our plain callback runs on every request flow, even when a litellm policy names it, and the client gets the originals back. The other tests show what would break that: an `apply_guardrail` method, a second guardrail answering to our name, or a guardrail registered the litellm way that a policy pipeline skips. A check that runs after our pre-call refuses a request our pre-call never saw. |
-| `tests/route_gate/test_classify.py` | How the route gate turns a request into a verdict: PASSTHROUGH, REWRITTEN or REFUSE. The verdict comes from the method and the raw path. A websocket or an upgrade request is refused, an encoded or traversing path is malformed, HEAD takes its GET row and is never rewritten, and an operator extra can only add a PASSTHROUGH route: it never undoes a refusal or promises a rewrite. |
+| `tests/route_gate/test_classify.py` | How the route gate turns a request into a verdict: PASSTHROUGH, REWRITTEN or REFUSE. The verdict is decided first by the ASGI scope type and the Upgrade header, then by the upper-cased method and the decoded path, taken as received. The raw (still-encoded) path is read only to spot a malformed one: an encoded slash, NUL or `..`, or a non-ASCII byte; the decoded path is malformed if it holds `..`, `//` or a NUL. A lifespan scope is passed through; a websocket scope, a websocket Upgrade header, an unknown scope type and a malformed path are refused. Otherwise the built-in tables decide (exact rows, then regex rows), and operator extras are consulted only when they have no row: HEAD checks a HEAD row, then the GET row, and a REWRITTEN result is refused; an extra can only add an otherwise-unlisted PASSTHROUGH route — it never reopens a refusal or promises a rewrite. |
 | `tests/route_gate/test_desanitize_middleware.py` | The response desanitiser middleware: each request's originals restored, and restore failures. It restores the originals in unary JSON, chat / Anthropic SSE and Responses SSE with the mapping held on the request's ticket (never a client header) and releases that mapping on the final body. A restoration failure before the response starts is a content-free 500; after it starts, the events already restored reach the client and the stream closes cleanly. No failure puts an original in a log line. |
 | `tests/route_gate/test_middleware.py` | The route-gate ASGI middleware: what a refused, a passed-through and a rewritten request get. A refusal has a fixed JSON shape and code, echoes no byte of the body, logs no path and writes one audit record. A passthrough is forwarded byte for byte and writes none. A rewritten route is forwarded only once the gate is armed. Websockets are refused, and an operator extra cannot re-admit a refused route. |
 | `tests/route_gate/test_reverse_object_shapes.py` | Response restoration on litellm model objects, a path the middleware never takes. On model objects rather than wire JSON, placeholders are reversed, litellm's hidden params are kept, and a failed rebuild neither skips validation nor logs an original. (Then the ⚠️ paragraph, unchanged.) |
