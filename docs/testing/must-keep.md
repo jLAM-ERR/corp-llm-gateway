@@ -13,7 +13,7 @@ gates below stay.
 
 | Gate | What it compares | Where |
 |---|---|---|
-| Must-keep | node ids no PR may delete, re-split or reduce | `tests/_manifests/must_keep/<dir>.txt`, one per module for `tests/*.py` (`_root__<module>.txt`) |
+| Must-keep | node ids no PR may delete, re-split or reduce to fewer cases; the gates check that each is present, keeps its outcome and its case count, not what its body asserts (a weakened body is caught by review only, [below](#gate-self-tests)) | `tests/_manifests/must_keep/<dir>.txt`, one per module for `tests/*.py` (`_root__<module>.txt`) |
 | Expected outcomes | per must-keep node id and environment ([below](#expected-outcomes-must-keep-ids-only)): `passed`, `skipped:<reason>`, `collection-skipped:<reason>`, `not-applicable:<note>` | `tests/_manifests/expected_outcomes.{minimal,full}.json`, `not_applicable.json` |
 | Environments | the two venv recipes and their fingerprints; full's constraints must install the `litellm==` `pyproject.toml` pins | `scripts/test-env.sh`, `scripts/test-env.{minimal,full}.txt`, `tests/_manifests/env_fingerprint.{minimal,full}.json` |
 | Name-pinned index | every test the acceptance matrix or a doc (`CLAUDE.md`, `README.md`, `docs/*.md`, `docs/ops/*.md`, `compose/*.md`, `compose/nginx/*.md`) cites by name, with its citing sites | `tests/_manifests/name_pinned.json` |
@@ -53,9 +53,10 @@ python -m tests._gates.negative_logs --write   # then review every UNREVIEWED si
 
 ### Expected outcomes: must-keep ids only
 
-Since Task 10 the two ledgers hold the must-keep ids only (3,956 per environment, a pure
-filter of the 5,922 they held before; a parametrised test is there as its cases, so the
-455 function-level must-keep ids of parametrised tests have no line of their own).
+Since Task 10 the two ledgers hold the must-keep ids only: 3,963 per environment (the pure
+filter of the 5,922 they held before gave 3,956; Task 10's three new classify tests added 7).
+A parametrised test is there as its cases, so the 457 function-level must-keep ids of
+parametrised tests have no line of their own.
 `ledger check` fails when a recorded id is missing, gains or loses a case, or changes
 outcome or skip reason, or when a module that holds one stops collecting. Any other test
 may be added, removed or change outcome with no ledger change; a failed test or a collection
@@ -66,7 +67,21 @@ regenerates nothing.
 select now, so a new test under a must-keep path is recorded first; then
 `python -m tests._gates.must_keep --write` adds its ids (additions only, see below), and
 `must_keep --check` holds the two together: every must-keep id needs an expected outcome in
-each environment. `not_applicable.json` is unchanged: its one must-keep entry is recorded,
+each environment. Until `must_keep/` has the new ids, the record runs fail one gate test
+(`test_every_must_keep_id_is_present_with_an_expected_outcome`), so a strict `ledger write`
+refuses them. The route for a new must-keep test:
+
+```
+python -m tests._gates.ledger write --provisional --minimal .test-gates/minimal/ledger.json --full .test-gates/full/ledger.json
+python -m tests._gates.must_keep --write          # diff: the new ids only, as additions
+# re-run tests/_gates in each environment with its variables, e.g. minimal:
+python -m pytest tests/_gates -q -p tests._gates.outcome_ledger --outcome-ledger=.test-gates/minimal/rerun.json
+python -m tests._gates.ledger write --minimal .test-gates/minimal/ledger.json .test-gates/minimal/rerun.json \
+  --full .test-gates/full/ledger.json .test-gates/full/rerun.json   # strict; must change nothing
+```
+
+A later run overrides an earlier one per id, so the re-run's passing gate test replaces the
+record run's failure. `not_applicable.json` is unchanged: its one must-keep entry is recorded,
 and its ten `tests/e2e/` entries are not must-keep, so `ledger write` still checks them
 against the run but the ledgers no longer list them.
 
@@ -157,10 +172,14 @@ Its manifest diff is only:
 - `name_pinned.json`: it indexes the current ids, and the docs that cite a moved test
   change in the same PR;
 - `negative_log_checks.json`: the `site` (`file:line`) of a moved check. A helper is not
-  in `moves.json`, so a security helper that moves to another module gets a new `owner`
-  and is reviewed again. `security_node_ids` keeps every test that shares a module with
-  the helper at the baseline or now, so a helper moved with its test, or left where it was,
-  changes nothing there. A helper moved where none of its tests is (a shared fixtures
+  in `moves.json`, so a security helper that moves to another module gets a new `owner`:
+  `--write` brings its site back `UNREVIEWED`, the tests that reach a security check only
+  through it drop out of `security_node_ids`, and `--write` refuses for the must-keep ones,
+  naming the `UNREVIEWED` check. Once the
+  row's `owner` is edited by hand to the new place (the last sentence below),
+  `security_node_ids` keeps every test that shares a module with the helper at the
+  baseline or now, so a helper moved with its test, or left where it was, changes nothing
+  there. A helper moved where none of its tests is (a shared fixtures
   module) drops them from that list: `negative_logs --check` and `--write` refuse ("security
   negative-log id lost while its test is still must-keep") for each such test in
   `must_keep/`, and `--write` writes nothing. Dropping a must-keep test from
@@ -186,7 +205,7 @@ not become must-keep, and a must-keep test moved out stays must-keep.
 | constraints | `scripts/test-env.minimal.txt` | `scripts/test-env.full.txt` (`.venv-bench`'s versions) |
 | litellm, prometheus_client, asyncpg, natasha, spacy, cryptography | all absent | all present, litellm 1.101.0 |
 | invocation | `CORP_REQUIRE_PROXY_CAPTURE=1`, no `CI`, no `CORP_TEST_PG_DSN` | `CI=true`, `CORP_REQUIRE_PROXY_CAPTURE=1`, `CORP_TEST_PG_DSN`, Postgres reachable |
-| baseline run | 4,693 passed, 394 skipped, 20 modules collection-skipped (834 ids), 11 not-applicable | 5,916 passed, 6 skipped, 10 not-applicable |
+| baseline ledger (Task 0, `7ae1098`) | 4,694 passed, 394 skipped, 20 modules collection-skipped (834 ids), 11 not-applicable | 5,917 passed, 6 skipped, 10 not-applicable |
 
 The fingerprint (the six markers + a sorted `name==version` list, the editable checkout
 normalised, `pip`/`setuptools`/`wheel` left out) is asserted before collection. Both
@@ -202,7 +221,8 @@ Why minimal has no `CI`: under `CI=true`, `tests/postgres_support.py` turns "asy
 installed" into a failure, where the minimal ledger expects the skip. GitHub sets `CI` on
 every step, so `scripts/test-gates.sh` unsets it for minimal.
 
-The union of the two ledgers was the baseline collection: 5,932 ids. Every test function the
+The union of the two Task 0 ledgers was the baseline collection: 5,933 ids, 5,933 in each
+(`git show 7ae1098:tests/_manifests/expected_outcomes.<env>.json`). Every test function the
 index found had at least one of them. Task 10 narrowed both to the must-keep ids.
 
 ### Not-applicable cases (`not_applicable.json`)
@@ -232,7 +252,8 @@ fails if one becomes so.
 
 ## Must-keep (`must_keep/`)
 
-4,401 node ids (1,923 test functions, every parametrised case listed) in 110 files.
+4,420 node ids in 40 files (1,929 test functions; a parametrised test is listed by its
+function id and by every case), measured 2026-10-07.
 `python -m tests._gates.must_keep --write` rebuilds the list from the rules in
 `tests/_gates/must_keep.py`. `--check` (and the guard test) rebuilds it too and fails when
 the rules select an id the committed list lacks, so dropping a must-keep id means editing
@@ -360,7 +381,10 @@ L1-L4 run on must-keep modules (L2 and L4 moved off `storage/test_mapping_store.
 `detectors/test_ner_en.py` in Task 10, when the ledgers stopped recording them); all four
 were rejected on 2026-10-07. Cases a-f (a weakened check under the inventory and the
 external-dependency manifest) and
-n (a moved test that lost an assert) tested the check inventory and went with it in Task 10.
+n (a moved test that lost an assert) tested the check inventory and went with it in Task 10
+(plan rev 7). Since then no gate reads a test's body: a must-keep test that keeps its id,
+outcome and cases but asserts less (a dropped assert, a moved test that lost one, a looser
+predicate) passes every gate, and only review catches it.
 g-l asserted `delegated` / `body_hash` moves until then; they now assert the closure itself,
 and each fails when the resolution it covers is taken out of `inventory.py` (2026-10-07: g
 with the fixture cache keyed by name, h with scope imports ignored, i with a scope's imports
