@@ -107,6 +107,10 @@ def test_the_unit_suite_is_one_job_without_a_matrix() -> None:
     # gates, and no minimal-environment step (a local check only).
     suite_runs = [step["run"] for step in _runs(job) if _runs_the_unit_suite(step["run"])]
     assert [shlex.split(run) for run in suite_runs] == [UNIT_SUITE_RUN]
+    # Neither the job nor any of its steps can be skipped or made non-blocking.
+    for scope in (job, *job["steps"]):
+        assert "continue-on-error" not in scope, scope
+        assert "if" not in scope, scope
 
 
 def test_every_job_runs_python_3_14() -> None:

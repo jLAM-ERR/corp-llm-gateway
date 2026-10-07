@@ -163,7 +163,7 @@ docker run --rm -d --name pg-test -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=
 scripts/test-env.sh full && CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
   scripts/test-gates.sh full                                    # 5,930 passed / 16 skipped, ~21 min
 
-# Run both environments before committing.
+# Run the full environment before every commit; minimal too when the cases above apply.
 
 # Local loop without the tests tests/slow_tests.txt lists (CI runs everything):
 CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"  # ~5.5 min
@@ -245,9 +245,9 @@ REDIS_URL=redis://localhost:6379/0 CORP_LLM_ENDPOINT=http://localhost:8000 CORP_
   scripts/test-gates.sh full`: the pinned full environment (the `ner`/`postgres`/`oidc`/
   `asgi`/`metrics` extras + `en_core_web_md`), a Postgres 16 service and
   `CORP_TEST_PG_DSN`, + helm render tests, checked against the full ledger (the minimal
-  environment is local only, see Running tests), and an `integration-container` job
-  (route gate on the real image). All three run Python 3.14; `tests/test_ci_workflow.py`
-  pins that
+  environment is local only, see Running tests), an `integration-container` job
+  (route gate on the real image), and an `e2e` job (`tests/e2e` against Redis and both
+  mocks). All four run Python 3.14; `tests/test_ci_workflow.py` pins that
 
 ## CLI entry points
 

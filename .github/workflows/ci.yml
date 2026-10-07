@@ -5,10 +5,9 @@ name: ci
 # through the test-suite gates in the pinned full environment — the authoritative
 # run CLAUDE.md refers to, including NER, RS256/RBAC crypto, the Postgres contract
 # tests and the helm render tests. The minimal environment is a local check
-# (docs/testing/must-keep.md). tests/e2e runs in its own
-# job (e2e) against real Redis and the two mocks. Every job runs 3.14, the
-# interpreter .venv-bench runs; pyproject still declares a lower floor, which CI
-# no longer exercises.
+# (docs/testing/must-keep.md). tests/e2e runs in its own job (e2e) against real
+# Redis and the two mocks. Every job runs 3.14, the interpreter .venv-bench runs;
+# pyproject still declares a lower floor, which CI no longer exercises.
 
 on:
   pull_request:
