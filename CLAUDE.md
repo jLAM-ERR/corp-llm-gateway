@@ -72,8 +72,9 @@ compose/                 production compose stack for non-k8s hosts (data plane 
                          tests/compose/test_nginx_{profile,runtime,allowlist_routes}.py
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
-tests/                   pytest, pytest-asyncio mode=auto (4573 passed / 426 skipped on .venv; 5791 / 16 on .venv-bench with
-                         Postgres, where NER, RS256 crypto, the Postgres contracts and the entrypoint/route-gate suites run)
+tests/                   pytest, pytest-asyncio mode=auto; one directory per component or layer (table: docs/testing/README.md);
+                         4,712 passed / 419 skipped in the minimal env (.venv-test-minimal), 5,930 / 16 in the full one
+                         (.venv-test-full: every extra, litellm, Postgres, CI=true), both from scripts/test-env.sh
 ```
 
 The GA-readiness / security / extensibility build is `docs/plans/20260708-ga-readiness-security-extensibility.md`
@@ -149,23 +150,25 @@ Two caches:
 ## Running tests
 
 ```
-# Full unit suite. Local .venv is Python 3.14 with no extras and no litellm (graceful
-# NER degradation): measured 4573 passed + 426 skipped, ~9min. The authoritative
-# local run is .venv-bench = Python 3.14.7 with every extra (`ner` incl. pymorphy3,
-# `postgres`, `oidc`, `asgi`, `metrics`) + litellm 1.101.0: measured 5791 passed + 16 skipped
-# with Postgres and CI=true, ~19min — the entrypoint, route-guard, served-stack and nginx route
-# cross-check suites only RUN there (the docker container suites run in both). CI runs the same suite on Python
-# 3.14 only — the same interpreter line as .venv-bench; nothing exercises 3.12 any
-# more. Always run both before committing.
-PYTHONPATH=src .venv/bin/pytest tests/ -q
-NO_PROXY=127.0.0.1,localhost PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs
-
-# NO_PROXY: on a machine with a system HTTP proxy the served-stack tests would talk to
-# the proxy instead of the local server.
-# Postgres-backed tests (token/team stores, issuance races) skip locally without a
-# server and FAIL on CI (CI=true). To run them locally:
+# CI-matching: the two reproducible environments (Python 3.14). minimal = the package
+# without extras or litellm; full = every extra CI installs + litellm, Postgres at
+# CORP_TEST_PG_DSN, CI=true. test-gates.sh checks the venv's fingerprint and the static
+# gates, runs the whole suite, compares it with the must-keep ledger and prints OK.
+scripts/test-env.sh minimal && scripts/test-gates.sh minimal   # 4,712 passed / 419 skipped, ~10 min
 docker run --rm -d --name pg-test -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=gateway \
   -e POSTGRES_DB=gateway -p 55432:5432 postgres:16
+scripts/test-env.sh full && CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
+  scripts/test-gates.sh full                                    # 5,930 passed / 16 skipped, ~21 min
+
+# Local loop without the tests tests/slow_tests.txt lists (CI runs everything):
+# ~5.5 min in minimal, ~10.5 min in full (with the full env's variables above).
+CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"
+
+# The older local venvs still work: .venv (Python 3.14, no extras, no litellm) and
+# .venv-bench (every extra + litellm 1.101.0). NO_PROXY: on a machine with a system HTTP
+# proxy the served-stack tests would talk to the proxy instead of the local server.
+# Postgres-backed tests skip without CORP_TEST_PG_DSN and FAIL under CI=true.
+PYTHONPATH=src .venv/bin/pytest tests/ -q
 CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway NO_PROXY=127.0.0.1,localhost \
   PYTHONPATH=src .venv-bench/bin/python -m pytest tests/ -q -rs
 # The route-gate container suite (tests/integration/test_route_gate_container.py) builds
@@ -176,13 +179,35 @@ CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway NO_PROXY=1
 PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py -q
 PYTHONPATH=src .venv/bin/pytest tests/sanitizer/test_engine.py::test_name -q
 
-# E2E (Langfuse + corp-llm-mock via docker compose; matches CI e2e:langfuse)
+# E2E (Langfuse + corp-llm-mock via docker compose; no CI job runs it)
 docker compose run --rm e2e pytest -q tests/e2e
 ```
 
-Every `pytest tests/` run and `scripts/test-gates.sh minimal|full` check the test-suite gates
-(must-keep ids, expected-outcome ledgers, name-pinned index, negative-log review, moves map); what
-each one holds and how to regenerate it after an approved change: `docs/testing/must-keep.md`.
+- Markers (`pyproject.toml`, `--strict-markers`): `requires_litellm`, `requires_ner`,
+  `requires_helm`, `requires_shellcheck`, `not_root` become setup-time skips when the
+  dependency is missing (the root conftest); `slow` marks the tests `tests/slow_tests.txt`
+  lists. `--shuffle-seed N` runs the suite in a seeded random order.
+- Layout: `docs/testing/README.md` — which `tests/<dir>/` owns which behaviour, the move /
+  prune PR rule, the name-pinned rule.
+- Permanent gates (`docs/testing/must-keep.md`, manifests in `tests/_manifests/`):
+  - must-keep ids (`must_keep/`): tests no PR may delete, re-split or reduce;
+  - expected-outcome ledgers (`expected_outcomes.{minimal,full}.json`): each must-keep id's
+    outcome per environment;
+  - environment fingerprints (`env_fingerprint.{minimal,full}.json`): each venv's markers
+    and `name==version` set;
+  - name-pinned index (`name_pinned.json`): every test a doc or the acceptance matrix
+    cites, with its citing lines;
+  - negative-log review (`negative_log_checks.json`): every "a log line does not hold X"
+    assert, classified by hand;
+  - moves map (`moves.json`): each moved or renamed test back to its baseline id.
+
+  A plain `pytest tests/` run checks the static manifests and the recorded fingerprints
+  (the gate tests in `tests/_gates/`; the running venv against its fingerprint only with
+  `CORP_TEST_ENV=<env>`, which `scripts/test-gates.sh` sets). The run-vs-ledger compare
+  is `scripts/test-gates.sh` only.
+- After an approved change to a must-keep test: record both environments and rewrite the
+  ledgers as `docs/testing/must-keep.md` "Running the gates" says, ending with
+  `python -m tests._gates.ledger write --minimal .test-gates/minimal/ledger.json --full .test-gates/full/ledger.json`.
 
 ## Tooling
 

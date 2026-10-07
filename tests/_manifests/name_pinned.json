@@ -455,7 +455,7 @@
    "docs/security.ru.md:604"
   ],
   "tests/integration/test_route_gate_container.py": [
-   "CLAUDE.md:171",
+   "CLAUDE.md:174",
    "compose/README.md:38",
    "compose/README.ru.md:39",
    "docs/security.md:1061",
@@ -474,7 +474,7 @@
    "docs/security.ru.md:918"
   ],
   "tests/invariants/test_no_originals_leak.py": [
-   "CLAUDE.md:239",
+   "CLAUDE.md:262",
    "docs/harness-integration.md:134",
    "docs/harness-integration.ru.md:119",
    "docs/ops/runbook.md:292",
@@ -610,8 +610,8 @@
    "docs/security.md:1409"
   ],
   "tests/sanitizer/test_engine.py": [
-   "CLAUDE.md:176",
-   "CLAUDE.md:177"
+   "CLAUDE.md:179",
+   "CLAUDE.md:180"
   ],
   "tests/sanitizer/test_oauth_system_preamble.py": [
    "docs/security.md:746",
@@ -621,7 +621,7 @@
    "docs/security.md:1364"
   ],
   "tests/storage/test_mapping_store.py": [
-   "CLAUDE.md:301"
+   "CLAUDE.md:324"
   ],
   "tests/test_anthropic_oauth_profile.py": [
    "docs/ops/configuration.md:182",
@@ -629,13 +629,13 @@
    "docs/security.ru.md:627"
   ],
   "tests/test_asgi_entrypoint.py": [
-   "CLAUDE.md:202",
+   "CLAUDE.md:225",
    "docs/extending.md:166",
    "docs/security.md:1282",
    "docs/security.md:1288"
   ],
   "tests/test_ci_workflow.py": [
-   "CLAUDE.md:212"
+   "CLAUDE.md:235"
   ],
   "tests/test_desanitize_served_stack.py": [
    "docs/security.md:484",
@@ -648,7 +648,7 @@
    "docs/security.ru.md:469"
   ],
   "tests/test_launch_command.py": [
-   "CLAUDE.md:130"
+   "CLAUDE.md:131"
   ],
   "tests/test_litellm_config_guards.py": [
    "docs/extending.md:261",
