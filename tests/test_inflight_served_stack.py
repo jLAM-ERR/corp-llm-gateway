@@ -217,8 +217,8 @@ def test_the_metrics_count_every_cancellation_and_no_gate_failure(served: dict[s
 
 BODY_READ_S = 2.0
 # The server's deadline runs on the loop clock; the client measures with time.monotonic().
-# uvloop's loop clock is libuv's millisecond time, cached at the start of each iteration,
-# so its timer can fire up to ~1 ms before monotonic time has moved by the full deadline.
+# uvloop's loop clock is libuv's whole-millisecond time, so its timer can fire up to ~1 ms
+# (a Linux coarse clock: ~2 ms) before time.monotonic() has moved by the full deadline.
 CLOCK_GRANULARITY_S = 0.01
 
 
