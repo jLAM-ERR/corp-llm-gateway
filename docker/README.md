@@ -57,7 +57,7 @@ To run e2e locally without docker compose:
 docker run --rm -p 6379:6379 redis:7-alpine
 
 # in another
-docker run --rm -p 8000:8000 -v $PWD/docker/corp-llm-mock:/app python:3.12-slim \
+docker run --rm -p 8000:8000 -v $PWD/docker/corp-llm-mock:/app python:3.14-slim \
   bash -c "pip install fastapi uvicorn && uvicorn --app-dir /app app:app --host 0.0.0.0"
 
 # in a third
