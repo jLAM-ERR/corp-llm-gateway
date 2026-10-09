@@ -2,9 +2,16 @@
  "about": "Hand-reviewed inventory of negative log checks (plan 20260926 Task 0). Discovery: python -m tests._gates.negative_logs; class is the reviewer's: security (into must-keep), behaviour, not-a-log-check.",
  "sites": [
   {
-   "site": "tests/cli/test_admin.py:274",
+   "site": "tests/cli/test_admin.py:375",
    "owner": "tests/cli/test_admin.py::_assert_value_absent",
    "check": "value not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
+   "site": "tests/cli/test_admin.py:203",
+   "owner": "tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error",
+   "check": "secret not in caplog.text",
    "class": "security",
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
@@ -1053,6 +1060,7 @@
   }
  ],
  "security_node_ids": [
+  "tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error",
   "tests/cli/test_admin.py::test_token_issue_value_never_reaches_stdout_stderr_or_logs",
   "tests/cli/test_admin.py::test_token_issue_value_refuses_a_revoked_value",
   "tests/cli/test_admin.py::test_token_issue_value_refuses_a_value_another_owner_holds",

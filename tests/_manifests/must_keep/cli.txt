@@ -28,6 +28,13 @@ tests/cli/test_admin.py::test_config_check_routes_prints_the_effective_table
 tests/cli/test_admin.py::test_config_check_routes_reports_a_malformed_extra_rather_than_raising
 tests/cli/test_admin.py::test_config_check_routes_without_extras_says_none
 tests/cli/test_admin.py::test_config_check_without_routes_prints_no_table
+tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error
+tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error[malformed-port]
+tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error[refused]
+tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error[unknown-host]
+tests/cli/test_admin.py::test_db_init_postgres_creates_both_schemas_and_reruns_without_change
+tests/cli/test_admin.py::test_db_init_rbac_enforced
+tests/cli/test_admin.py::test_db_init_without_a_dsn_names_the_key
 tests/cli/test_admin.py::test_extensions_disable_stub_raises
 tests/cli/test_admin.py::test_extensions_enable_rbac_enforced
 tests/cli/test_admin.py::test_extensions_enable_stub_raises
@@ -50,6 +57,10 @@ tests/cli/test_admin.py::test_missing_required_arg_errors
 tests/cli/test_admin.py::test_no_command_errors
 tests/cli/test_admin.py::test_team_backend_not_configured_errors
 tests/cli/test_admin.py::test_team_create_duplicate_errors
+tests/cli/test_admin.py::test_team_create_if_absent_creates_a_missing_team
+tests/cli/test_admin.py::test_team_create_if_absent_is_rbac_gated
+tests/cli/test_admin.py::test_team_create_if_absent_leaves_an_existing_team_unchanged
+tests/cli/test_admin.py::test_team_create_if_absent_postgres_is_idempotent
 tests/cli/test_admin.py::test_team_create_persists
 tests/cli/test_admin.py::test_team_create_rbac_enforced
 tests/cli/test_admin.py::test_team_list_empty

@@ -2,11 +2,14 @@ import asyncio
 import json
 import logging
 import secrets
+import socket
 import sys
 import types
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
@@ -100,6 +103,104 @@ def test_team_create_duplicate_errors(
     rc = main(["team", "create", "--team-id", "t1", "--name", "Dup"])
     assert rc == 2
     assert "already exists" in capsys.readouterr().err
+
+
+def test_team_create_if_absent_leaves_an_existing_team_unchanged(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    existing = TeamConfig(team_id="t1", name="Existing", replace_md_path="rules.md")
+    asyncio.run(team_store.upsert(existing))
+
+    rc = main(["team", "create", "--team-id", "t1", "--name", "Other", "--if-absent"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "team exists: t1 (unchanged)" in captured.out
+    assert captured.err == ""
+    assert asyncio.run(team_store.get("t1")) == existing
+
+    assert main(["team", "create", "--team-id", "t1", "--name", "Other"]) == 2
+    assert "already exists" in capsys.readouterr().err
+    assert asyncio.run(team_store.get("t1")) == existing
+
+
+def test_team_create_if_absent_creates_a_missing_team(
+    team_store: InMemoryTeamConfigStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["team", "create", "--team-id", "t1", "--name", "Team One", "--if-absent"])
+    assert rc == 0
+    assert "team created: t1" in capsys.readouterr().out
+    assert asyncio.run(team_store.get("t1")).name == "Team One"
+
+
+def test_team_create_if_absent_is_rbac_gated(
+    team_store: InMemoryTeamConfigStore,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", "1")
+    monkeypatch.delenv("CORP_GATEWAY_ADMIN_TOKEN", raising=False)
+    rc = main(["team", "create", "--team-id", "t1", "--name", "X", "--if-absent"])
+    assert rc == 2
+    assert "gateway:operator" in capsys.readouterr().err
+    assert not asyncio.run(team_store.list_all())
+
+
+# db init — apply both store schemas -----------------------------------------
+
+
+def test_db_init_without_a_dsn_names_the_key(
+    hermetic_gateway_config: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["db", "init"])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "CORP_LLM_PG_DSN" in captured.err
+    assert captured.out == ""
+
+
+def test_db_init_rbac_enforced(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", "1")
+    monkeypatch.delenv("CORP_GATEWAY_ADMIN_TOKEN", raising=False)
+    rc = main(["db", "init"])
+    assert rc == 2
+    assert "gateway:operator" in capsys.readouterr().err
+
+
+_DSN_PASSWORD = "dsn-secret-pw-8Kq3"
+
+
+def _closed_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.mark.parametrize("shape", ["refused", "malformed-port", "unknown-host"])
+def test_db_init_never_prints_the_dsn_on_a_connection_error(
+    shape: str,
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    host = {
+        "refused": f"127.0.0.1:{_closed_port()}",
+        "malformed-port": "127.0.0.1:notaport",
+        "unknown-host": "db-init-no-such-host.invalid:5432",
+    }[shape]
+    dsn = f"postgresql://gateway:{_DSN_PASSWORD}@{host}/gateway"
+    monkeypatch.setenv("CORP_LLM_PG_DSN", dsn)
+    rc = main(["db", "init"])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error: ")
+    for secret in (dsn, _DSN_PASSWORD):
+        assert secret not in captured.out
+        assert secret not in captured.err
+        assert secret not in caplog.text
 
 
 def test_team_set_rules_updates_path(team_store: InMemoryTeamConfigStore) -> None:
@@ -598,6 +699,112 @@ def test_token_issue_value_postgres_refuses_a_value_another_owner_holds(
         assert "another user or team" in captured.err
         assert value not in captured.out + captured.err
     assert asyncio.run(_pg_lookup(dsn, value, owner=(user, "local"))) == before
+
+
+@pytest.fixture
+def pg_empty_db(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """DSN of a freshly created, empty database on the test Postgres; dropped after."""
+    require_asyncpg()
+    import asyncpg
+
+    admin_dsn = pg_dsn()
+    name = f"cli_db_init_{secrets.token_hex(6)}"
+
+    async def _admin(sql: str) -> None:
+        conn = await asyncpg.connect(admin_dsn, timeout=5.0)
+        try:
+            await conn.execute(sql)
+        finally:
+            await conn.close()
+
+    try:
+        asyncio.run(_admin(f'CREATE DATABASE "{name}"'))
+    except Exception as exc:
+        skip_or_fail(f"Postgres unreachable or CREATE DATABASE refused: {exc}")
+    dsn = urlunsplit(urlsplit(admin_dsn)._replace(path=f"/{name}"))
+    monkeypatch.setenv("CORP_LLM_PG_DSN", dsn)
+    try:
+        yield dsn
+    finally:
+        asyncio.run(_admin(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+
+
+async def _pg_schema_snapshot(dsn: str) -> dict[str, list[tuple[Any, ...]]]:
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn, timeout=5.0)
+    try:
+        columns = await conn.fetch(
+            "SELECT table_name, column_name, data_type, column_default, is_nullable "
+            "FROM information_schema.columns WHERE table_schema = 'public' "
+            "ORDER BY table_name, column_name"
+        )
+        indexes = await conn.fetch(
+            "SELECT tablename, indexname, indexdef FROM pg_indexes "
+            "WHERE schemaname = 'public' ORDER BY indexname"
+        )
+        teams = await conn.fetch("SELECT team_id, name FROM team_config ORDER BY team_id")
+        tokens = await conn.fetch("SELECT corp_token, user_id FROM corp_tokens ORDER BY 1")
+    finally:
+        await conn.close()
+    return {
+        "columns": [tuple(r) for r in columns],
+        "indexes": [tuple(r) for r in indexes],
+        "teams": [tuple(r) for r in teams],
+        "tokens": [tuple(r) for r in tokens],
+    }
+
+
+async def _pg_table_names(dsn: str) -> set[str]:
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn, timeout=5.0)
+    try:
+        rows = await conn.fetch(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+        )
+    finally:
+        await conn.close()
+    return {r["table_name"] for r in rows}
+
+
+def test_db_init_postgres_creates_both_schemas_and_reruns_without_change(
+    pg_empty_db: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dsn = pg_empty_db
+    assert asyncio.run(_pg_table_names(dsn)) == set()
+
+    assert main(["db", "init"]) == 0
+    captured = capsys.readouterr()
+    assert "db init: schema applied (corp_tokens, team_config)" in captured.out
+    assert asyncio.run(_pg_table_names(dsn)) >= {"corp_tokens", "team_config"}
+
+    assert main(["team", "create", "--team-id", "local", "--name", "local"]) == 0
+    assert main(["token", "issue", "--user", "local", "--team", "local", "--value", _VALUE]) == 0
+    before = asyncio.run(_pg_schema_snapshot(dsn))
+    assert before["teams"] == [("local", "local")]
+    assert len(before["tokens"]) == 1
+    capsys.readouterr()
+
+    assert main(["db", "init"]) == 0
+    captured = capsys.readouterr()
+    assert asyncio.run(_pg_schema_snapshot(dsn)) == before
+    assert dsn not in captured.out + captured.err
+
+
+def test_team_create_if_absent_postgres_is_idempotent(
+    pg_empty_db: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["db", "init"]) == 0
+    argv = ["team", "create", "--team-id", "local", "--name", "local", "--if-absent"]
+    assert main(argv) == 0
+    assert "team created: local" in capsys.readouterr().out
+    first = asyncio.run(_pg_schema_snapshot(pg_empty_db))
+    assert main(argv) == 0
+    assert "team exists: local (unchanged)" in capsys.readouterr().out
+    assert asyncio.run(_pg_schema_snapshot(pg_empty_db)) == first
+    assert main(argv[:-1]) == 2
+    assert "already exists" in capsys.readouterr().err
 
 
 # team / token — RBAC (mutations gated, reads ungated) ----------------------

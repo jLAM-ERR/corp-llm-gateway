@@ -1,7 +1,7 @@
 # `gateway-admin` reference
 
 The operator CLI. Installed with the package (`pyproject` entry point
-`gateway-admin`). Command groups: `team`, `token`, `extensions`, `config`,
+`gateway-admin`). Command groups: `db`, `team`, `token`, `extensions`, `config`,
 `sanitize`.
 
 ## RBAC
@@ -12,21 +12,40 @@ Mutating verbs require the `gateway:operator` claim on an RS256 JWT (see
 - Token source: `--token <JWT>`, else `CORP_GATEWAY_ADMIN_TOKEN`.
 - Verification needs `CORP_GATEWAY_OIDC_KEY` + `CORP_GATEWAY_OIDC_AUDIENCE` +
   `CORP_GATEWAY_OIDC_ISSUER`; any missing → denied (fail-closed).
-- `CORP_GATEWAY_RBAC=0` bypasses the check entirely (local dev only).
+- `CORP_GATEWAY_RBAC=0` bypasses the check entirely (local dev only). Only the
+  exact value `0` does; `false`, `no` or `off` leave RBAC on. `CORP_ENV` has no
+  effect on it.
 
-RBAC-gated verbs: `team create` / `set-rules` / `set-retention`,
+RBAC-gated verbs: `db init`, `team create` / `set-rules` / `set-retention`,
 `token issue` / `revoke`, `extensions enable` / `disable`. Denial prints
 `error: gateway:operator role required` and exits 2.
 
-`team` and `token` require Postgres (`CORP_LLM_PG_DSN` + the `postgres` extra);
-without a DSN they exit 2 with a clear message.
+`db`, `team` and `token` require Postgres (`CORP_LLM_PG_DSN` + the `postgres`
+extra); without a DSN they exit 2 with a clear message.
+
+## `db`
+
+```
+gateway-admin db init
+```
+
+```
+$ gateway-admin db init
+db init: schema applied (corp_tokens, team_config)
+```
+
+Applies the token and team-config schemas (the `schema.sql` files the wheel
+ships) to the database `CORP_LLM_PG_DSN` names. Idempotent: re-running it on an
+initialised database exits 0 and keeps every row. A connection or SQL failure
+exits 2 with the error type only (`error: db init failed: ConnectionRefusedError`):
+the DSN can carry a password, so it is never printed.
 
 ## `team`
 
 Manage per-team config (rules path, retention, fail-policy).
 
 ```
-gateway-admin team create --team-id team-x --name "Team X"
+gateway-admin team create --team-id team-x --name "Team X" [--if-absent]
 gateway-admin team set-rules --team-id team-x --from-file team-x.replace.md
 gateway-admin team set-retention --team-id team-x --hot-days 90 --cold-years 7
 gateway-admin team list [--json]
@@ -44,6 +63,8 @@ team-x   Team X  90        7           -
 
 `set-rules` / `set-retention` / `show` on an unknown team exit 2
 (`error: unknown team 'team-x'`); `create` on an existing team exits 2.
+With `--if-absent` it exits 0 instead and changes nothing
+(`team exists: team-x (unchanged)`), so a setup script can re-run it.
 
 ## `token`
 

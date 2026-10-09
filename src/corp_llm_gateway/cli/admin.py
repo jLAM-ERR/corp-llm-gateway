@@ -1,8 +1,8 @@
 """gateway-admin — operator CLI for the corp LLM gateway.
 
-The ``team`` and ``token`` subcommands are Postgres-backed (config key
+The ``db``, ``team`` and ``token`` subcommands are Postgres-backed (config key
 ``CORP_LLM_PG_DSN``); read verbs (``list`` / ``show``) run ungated, mutating
-verbs (``create`` / ``set-*`` / ``issue`` / ``revoke``) require the
+verbs (``init`` / ``create`` / ``set-*`` / ``issue`` / ``revoke``) require the
 ``gateway:operator`` claim. The ``sanitize`` subcommand runs the live three-tier
 sanitizer against the corp LLM and prints the before/after redaction.
 """
@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import importlib.util
 import json
 import sys
 from collections.abc import Sequence
@@ -543,6 +544,9 @@ async def _team_create(store: TeamConfigStore, args: argparse.Namespace) -> int:
     except TeamNotFoundError:
         pass
     else:
+        if args.if_absent:
+            print(f"team exists: {args.team_id} (unchanged)")
+            return 0
         print(f"error: team {args.team_id!r} already exists", file=sys.stderr)
         return 2
     await store.upsert(TeamConfig(team_id=args.team_id, name=args.name))
@@ -650,6 +654,40 @@ def _dispatch_team(args: argparse.Namespace) -> int:
     except (RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+
+async def _db_init(dsn: str) -> None:
+    tokens = PostgresTokenStore(dsn)
+    teams = PostgresTeamConfigStore(dsn)
+    try:
+        await tokens.init_schema()
+        await teams.init_schema()
+    finally:
+        try:
+            await tokens.close()
+        finally:
+            await teams.close()
+
+
+def _dispatch_db(args: argparse.Namespace) -> int:
+    rbac_rc = _enforce_rbac(args)
+    if rbac_rc is not None:
+        return rbac_rc
+    dsn = config.get("CORP_LLM_PG_DSN")
+    if not dsn:
+        print("error: db init requires Postgres: set CORP_LLM_PG_DSN", file=sys.stderr)
+        return 2
+    if importlib.util.find_spec("asyncpg") is None:
+        print("error: db init requires asyncpg: install the 'postgres' extra", file=sys.stderr)
+        return 2
+    try:
+        asyncio.run(_db_init(dsn))
+    except Exception as exc:
+        # The DSN may carry a password and driver errors can quote it: name the type only.
+        print(f"error: db init failed: {type(exc).__name__}", file=sys.stderr)
+        return 2
+    print("db init: schema applied (corp_tokens, team_config)")
+    return 0
 
 
 _MIN_TOKEN_VALUE_CHARS = 16
@@ -834,12 +872,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_db = sub.add_parser("db", help="manage the gateway database")
+    db_sub = p_db.add_subparsers(dest="db_command", required=True)
+    db_sub.add_parser("init", help="apply the token and team-config schemas (idempotent)")
+
     p_team = sub.add_parser("team", help="manage teams")
     team_sub = p_team.add_subparsers(dest="team_command", required=True)
 
     team_create = team_sub.add_parser("create", help="create a team")
     team_create.add_argument("--team-id", required=True)
     team_create.add_argument("--name", required=True)
+    team_create.add_argument(
+        "--if-absent",
+        action="store_true",
+        help="exit 0 without changes when the team already exists",
+    )
 
     team_set_rules = team_sub.add_parser("set-rules", help="set replace.md for a team")
     team_set_rules.add_argument("--team-id", required=True)
@@ -939,6 +986,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "db":
+        return _dispatch_db(args)
 
     if args.command == "team":
         return _dispatch_team(args)

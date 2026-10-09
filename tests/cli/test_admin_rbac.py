@@ -341,3 +341,60 @@ def test_rbac_disabled_allows_without_token(
     rc = main(["team", "create", "--team-id", "t1", "--name", "Dev Team"])
     assert rc == 0
     assert "team created" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("corp_env", ["", "production"])
+def test_rbac_bypass_does_not_depend_on_corp_env(
+    corp_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", "0")
+    monkeypatch.setenv("CORP_ENV", corp_env)
+    store = InMemoryTeamConfigStore()
+    monkeypatch.setattr("corp_llm_gateway.cli.admin._team_store", lambda: store)
+    rc = main(["team", "create", "--team-id", "local", "--name", "local", "--if-absent"])
+    assert rc == 0
+    assert "team created: local" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("raw", ["false", "no", "off"])
+def test_rbac_bypass_needs_exactly_0(
+    raw: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CORP_GATEWAY_RBAC", raw)
+    rc = main(["team", "create", "--team-id", "t1", "--name", "X"])
+    assert rc == 2
+    assert "gateway:operator" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# CLI integration — db init
+# ---------------------------------------------------------------------------
+
+
+def test_db_init_without_token_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(["db", "init"])
+    assert rc == 2
+    assert "gateway:operator" in capsys.readouterr().err
+
+
+def test_db_init_without_operator_role_returns_2(
+    make_token: MakeToken, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(["--token", make_token(roles=["developer"]), "db", "init"])
+    assert rc == 2
+    assert "gateway:operator" in capsys.readouterr().err
+
+
+def test_db_init_with_operator_token_passes_rbac(
+    make_token: MakeToken,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("CORP_LLM_PG_DSN", raising=False)
+    rc = main(["--token", make_token(roles=["gateway:operator"]), "db", "init"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "gateway:operator" not in err
+    assert "CORP_LLM_PG_DSN" in err
