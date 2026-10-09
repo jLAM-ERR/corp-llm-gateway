@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0] — GA (2026-10-09)
+
+The first GA release — the **local-first detection cycle** (below) plus the **GA-readiness /
+security & extensibility** build. Non-negotiable criterion: zero confirmed leak incidents in the
+90 days post-GA. Release candidates v1.0.0-rc.1 to rc.6 were cut from 2026-07-10 to
+2026-08-04.
+
 ### Security — litellm's logging surfaces, DEBUG and policy bodies
 
 Found by the litellm guardrail adoption plan (`docs/security.md` §15, hazards 1-19). Hazards 17,
@@ -262,12 +269,6 @@ none but the gateway's own.
   default in `docs/security.md` §8. Durability is bounded by docker log rotation.
 - **No untrusted `docker run` on the host** — Vector's container-label filter is a
   misconfiguration guard, not a security boundary (`docs/security.md` §8.2).
-
-## [1.0.0] — GA (2026-07-09)
-
-The first GA release — the **local-first detection cycle** (below) plus the **GA-readiness /
-security & extensibility** build. Non-negotiable criterion: zero confirmed leak incidents in the
-90 days post-GA.
 
 ### Added — Local mode (oracle on/off switch + compose quickstart)
 - **`CORP_LLM_ORACLE_ENABLED`** — on/off switch for the LLM oracle (corp vLLM). Off = local-first
