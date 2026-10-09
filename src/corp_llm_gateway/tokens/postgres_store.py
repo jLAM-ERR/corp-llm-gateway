@@ -134,12 +134,18 @@ class PostgresTokenStore(TokenStore):
             pool, work, acquire_timeout=_ACQUIRE_TIMEOUT_S, release_budget=_RELEASE_BUDGET_S
         )
 
-    async def init_schema(self) -> None:
-        """Apply schema.sql idempotently; safe on an already-initialised DB."""
-        pool = await self._get_pool()
+    async def init_schema(self, conn: Any = None) -> None:
+        """Apply schema.sql idempotently; safe on an already-initialised DB.
+
+        On ``conn`` when given (the caller's transaction, with its transaction-scoped
+        settings and locks), else on a pooled connection."""
         sql = _SCHEMA_SQL.read_text()
-        async with self._acquire(pool) as conn:
+        if conn is not None:
             await conn.execute(sql)
+            return
+        pool = await self._get_pool()
+        async with self._acquire(pool) as pooled:
+            await pooled.execute(sql)
 
     async def upsert(self, info: TokenInfo) -> None:
         """Insert or replace a token record."""

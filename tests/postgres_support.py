@@ -7,11 +7,14 @@ fault FAILS: the issuance race tests must never go green by skipping.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import secrets
 import socket
 import struct
 import threading
-from typing import NoReturn
+from collections.abc import AsyncIterator
+from typing import Any, NoReturn
 
 import pytest
 
@@ -41,6 +44,39 @@ def require_asyncpg() -> None:
         import asyncpg  # noqa: F401
     except ImportError:
         skip_or_fail("asyncpg not installed")
+
+
+@contextlib.asynccontextmanager
+async def scratch_schema_connection() -> AsyncIterator[tuple[Any, str]]:
+    """(connection, schema): an asyncpg connection whose search_path is a fresh
+    schema on the test Postgres, dropped afterwards."""
+    require_asyncpg()
+    import asyncpg
+
+    schema = f"scratch_{secrets.token_hex(6)}"
+    try:
+        admin = await asyncpg.connect(pg_dsn(), timeout=5.0)
+    except Exception as exc:
+        skip_or_fail(f"Postgres unreachable: {exc}")
+    try:
+        await admin.execute(f'CREATE SCHEMA "{schema}"')
+        conn = await asyncpg.connect(pg_dsn(), timeout=5.0, server_settings={"search_path": schema})
+        try:
+            yield conn, schema
+        finally:
+            await conn.close()
+    finally:
+        try:
+            await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            await admin.close()
+
+
+async def schema_tables(conn: Any, schema: str) -> set[str]:
+    rows = await conn.fetch(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = $1", schema
+    )
+    return {r["table_name"] for r in rows}
 
 
 _SSL_REQUEST = 80877103

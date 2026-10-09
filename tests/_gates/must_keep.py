@@ -183,6 +183,11 @@ STEP2_IDS = (
     "tests/audit/test_logger.py::test_assert_no_never_fields_rejects_mixed_case",
     "tests/audit/test_logger.py::test_assert_no_never_fields_rejects_uppercase",
     "tests/audit/test_logger.py::test_never_fields_set_includes_critical_keys",
+    # `team create` relies on create_if_absent never overwriting an existing team
+    # (plan 20261009 Task 2): the contract, both stores.
+    "tests/team_config/test_postgres_store.py::test_create_if_absent_creates_a_missing_team",
+    "tests/team_config/test_postgres_store.py::test_create_if_absent_leaves_an_existing_team_unchanged",
+    "tests/team_config/test_postgres_store.py::test_create_if_absent_concurrent_callers_create_once",
     *SKIPPED_IN_BOTH_OPEN,
 )
 # Security-policy defaults that look trivial (plan Context): exempt from pruning.

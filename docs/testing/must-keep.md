@@ -60,7 +60,8 @@ python -m tests._gates.negative_logs --write   # then review every UNREVIEWED si
 ### Expected outcomes: must-keep ids only
 
 Since Task 10 the two ledgers hold the must-keep ids only: 3,963 per environment (the pure
-filter of the 5,922 they held before gave 3,956; Task 10's three new classify tests added 7).
+filter of the 5,922 they held before gave 3,956; Task 10's three new classify tests added 7);
+3,972 at the 1.0.0 tag, 4,050 after plan 20261009 Tasks 1-2 (the `gateway-admin` additions).
 A parametrised test is there as its cases, so the 457 function-level must-keep ids of
 parametrised tests have no line of their own.
 `ledger check` fails when a recorded id is missing, gains or loses a case, or changes
@@ -102,7 +103,13 @@ additions only — the new function and case ids (Task 3b: 2 functions, 7 cases 
 `litellm_hook.txt`). A second one: a new negative-log check reviewed as `security` makes its
 owner must-keep by the negative-log rule, so that PR runs `must_keep --write` and the
 `must_keep/` diff must be that owner's ids only, as additions (rev 18 (1) PR:
-`sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed`).
+`sanitizer/test_orchestrator.py::test_cache_a_disabled_when_policy_fingerprint_cannot_be_computed`). A third:
+a test outside every rule that a production behaviour now relies on is named in
+`STEP2_IDS` (`tests/_gates/must_keep.py`, with a comment saying why) and listed in the
+step-2 "by id" paragraph below; the PR then runs `must_keep --write`, and the diff is that
+test's function and case ids, as additions (plan 20261009 Task 2: the three
+`create_if_absent` contract tests of `team_config/test_postgres_store.py`, 3 functions and
+6 cases in `team_config.txt`).
 
 The index (`tests/_gates/inventory.py`) gives negative-logs, per test, the module-level
 helpers it reaches through its body, fixtures, marks and class members. It resolves a
@@ -312,7 +319,7 @@ gate failure, elsewhere a Python warning (pytest shows it), and `--write` refuse
   | `deploy/test_deploy_script.py` | 44 | the deploy flow PR #17 added (43) + the `$ENV_FILE` never-read check (step 2) |
   | `tokens/test_token_store_contract.py` | 29 | the issuance races and the jti contract |
   | `tokens/test_postgres_store.py` | 7 | the Postgres races |
-  | `team_config/test_postgres_store.py` | 2 | |
+  | `team_config/test_postgres_store.py` | 5 | + the three `create_if_absent` contract tests (by id, step 2) |
 
 **Step 2 — CLAUDE.md invariants → the files that assert them**, in full:
 `tests/invariants/**`, `tests/route_gate/**`, the two served-stack suites,
@@ -331,8 +338,11 @@ claims accepted; HS256, forged, expired, wrong audience / issuer, missing role r
 never drops a secret's label), `deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed`
 and its `deploy/test_deploy_script.py` twin, the five NEVER-field tests of
 `audit/test_logger.py` (`test_assert_no_never_fields_*` ×4 and
-`test_never_fields_set_includes_critical_keys`, lines 135-163 at `807831a`), and the four
-e2e security checks of the open finding above.
+`test_never_fields_set_includes_critical_keys`, lines 135-163 at `807831a`), the four
+e2e security checks of the open finding above, and the three `create_if_absent` contract
+tests of `team_config/test_postgres_store.py` (`test_create_if_absent_*`, both stores:
+`team create` relies on them never overwriting an existing team; added by plan 20261009
+Task 2).
 
 **Security-policy defaults** that look trivial: `test_config.py::test_corp_llm_verify_defaults_to_true`,
 `test_settings.py::test_forward_anthropic_auth_defaults_off`, `::test_route_gate_extras_default_to_empty`,

@@ -33,7 +33,7 @@
   "click==8.5.0",
   "cloudpathlib==0.25.0",
   "confection==1.3.3",
-  "corp-llm-gateway==1.0.0 (editable <checkout>)",
+  "corp-llm-gateway==1.1.0 (editable <checkout>)",
   "coverage==7.16.1",
   "croniter==6.2.4",
   "cryptography==50.0.1",

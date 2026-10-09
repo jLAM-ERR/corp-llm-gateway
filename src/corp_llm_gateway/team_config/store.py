@@ -15,4 +15,8 @@ class TeamConfigStore(ABC):
     async def upsert(self, config: TeamConfig) -> None: ...
 
     @abstractmethod
+    async def create_if_absent(self, config: TeamConfig) -> bool:
+        """Store ``config`` only if its team_id is new, atomically; True when it did."""
+
+    @abstractmethod
     async def list_all(self) -> tuple[TeamConfig, ...]: ...

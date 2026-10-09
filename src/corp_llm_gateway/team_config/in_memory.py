@@ -15,5 +15,12 @@ class InMemoryTeamConfigStore(TeamConfigStore):
     async def upsert(self, config: TeamConfig) -> None:
         self._configs[config.team_id] = config
 
+    async def create_if_absent(self, config: TeamConfig) -> bool:
+        # No await between the check and the write: atomic on the event loop.
+        if config.team_id in self._configs:
+            return False
+        self._configs[config.team_id] = config
+        return True
+
     async def list_all(self) -> tuple[TeamConfig, ...]:
         return tuple(self._configs.values())

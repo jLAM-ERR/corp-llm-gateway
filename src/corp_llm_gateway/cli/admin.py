@@ -1,8 +1,8 @@
 """gateway-admin — operator CLI for the corp LLM gateway.
 
-The ``team`` and ``token`` subcommands are Postgres-backed (config key
+The ``db``, ``team`` and ``token`` subcommands are Postgres-backed (config key
 ``CORP_LLM_PG_DSN``); read verbs (``list`` / ``show``) run ungated, mutating
-verbs (``create`` / ``set-*`` / ``issue`` / ``revoke``) require the
+verbs (``init`` / ``create`` / ``set-*`` / ``issue`` / ``revoke``) require the
 ``gateway:operator`` claim. The ``sanitize`` subcommand runs the live three-tier
 sanitizer against the corp LLM and prints the before/after redaction.
 """
@@ -14,7 +14,7 @@ import dataclasses
 import json
 import sys
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast, get_args
 
 import httpx
@@ -26,6 +26,7 @@ from corp_llm_gateway.auth.rbac import OperatorDenied, get_admin_token, verify_o
 from corp_llm_gateway.corp_llm import CorpLlmClient, CorpLlmHttpError
 from corp_llm_gateway.extensions import ExtensionKind, ExtensionRegistry, ExtensionSpec
 from corp_llm_gateway.payload import OversizeContentError
+from corp_llm_gateway.pg_session import connect_with_keepalives
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator, SanitizeResult
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
@@ -44,6 +45,7 @@ from corp_llm_gateway.tokens import (
     TokenIssuer,
     TokenStore,
 )
+from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
 
 
 class _NoTeamRules(RulesLoader):
@@ -516,6 +518,9 @@ async def _aclose(store: object) -> None:
 
 
 def _mask_token(token: str) -> str:
+    # A chosen (--value) token shows nothing: its prefix is a guessable part of the secret.
+    if not token.startswith("ct_"):
+        return "***"
     return f"{token[:8]}…" if len(token) > 8 else token
 
 
@@ -535,16 +540,14 @@ def _team_to_dict(cfg: TeamConfig) -> dict[str, Any]:
 
 
 async def _team_create(store: TeamConfigStore, args: argparse.Namespace) -> int:
-    try:
-        await store.get(args.team_id)
-    except TeamNotFoundError:
-        pass
-    else:
-        print(f"error: team {args.team_id!r} already exists", file=sys.stderr)
-        return 2
-    await store.upsert(TeamConfig(team_id=args.team_id, name=args.name))
-    print(f"team created: {args.team_id}")
-    return 0
+    if await store.create_if_absent(TeamConfig(team_id=args.team_id, name=args.name)):
+        print(f"team created: {args.team_id}")
+        return 0
+    if args.if_absent:
+        print(f"team exists: {args.team_id} (unchanged)")
+        return 0
+    print(f"error: team {args.team_id!r} already exists", file=sys.stderr)
+    return 2
 
 
 async def _team_set_rules(store: TeamConfigStore, args: argparse.Namespace) -> int:
@@ -649,8 +652,152 @@ def _dispatch_team(args: argparse.Namespace) -> int:
         return 2
 
 
+# Transaction-scoped advisory lock serialising concurrent `db init` runs
+# ("corp_dbi" in ASCII). lock_timeout bounds the wait for it, then each DDL lock wait.
+_DB_INIT_LOCK_KEY = 0x636F72705F646269
+_DB_INIT_LOCK_WAIT_MS = 60_000
+# The schema's ALTER TABLE / DROP TRIGGER take ACCESS EXCLUSIVE even when nothing
+# changes, and a token lookup queues behind each table lock a transaction waits for in
+# turn (tokens/schema.sql locks corp_tokens, then team_config). Keep that sum well
+# under the lookup's own timeout; a busy table fails db init fast instead.
+_DB_INIT_MAX_TABLES_PER_TXN = 2
+_DB_INIT_DDL_LOCK_TIMEOUT_MS = int(LOOKUP_TIMEOUT_S * 1000 * 0.6) // _DB_INIT_MAX_TABLES_PER_TXN
+_DB_INIT_CONNECT_TIMEOUT_S = 5.0
+_DB_INIT_CLOSE_TIMEOUT_S = 5.0
+
+
+class _DbInitLockBusyError(Exception):
+    pass
+
+
+async def _apply_schema(conn: Any, store: PostgresTokenStore | PostgresTeamConfigStore) -> None:
+    import asyncpg
+
+    # Only transaction-scoped settings and locks, and no bound parameters: nothing
+    # outlives the transaction, so this also holds behind a transaction-mode pooler.
+    async with conn.transaction():
+        await conn.execute(
+            f"SELECT set_config('lock_timeout', '{int(_DB_INIT_LOCK_WAIT_MS)}', true)"
+        )
+        try:
+            await conn.execute(f"SELECT pg_advisory_xact_lock({int(_DB_INIT_LOCK_KEY)})")
+        except asyncpg.exceptions.LockNotAvailableError:
+            raise _DbInitLockBusyError from None
+        await conn.execute(
+            f"SELECT set_config('lock_timeout', '{int(_DB_INIT_DDL_LOCK_TIMEOUT_MS)}', true)"
+        )
+        await store.init_schema(conn)
+
+
+async def _apply_schemas(conn: Any, dsn: str) -> None:
+    # One transaction per file: each holds its locks only until its own commit.
+    await _apply_schema(conn, PostgresTokenStore(dsn))
+    await _apply_schema(conn, PostgresTeamConfigStore(dsn))
+
+
+async def _db_init(dsn: str) -> None:
+    import asyncpg
+
+    conn = await connect_with_keepalives(asyncpg.connect, dsn, timeout=_DB_INIT_CONNECT_TIMEOUT_S)
+    try:
+        await _apply_schemas(conn, dsn)
+    finally:
+        # A failed close neither undoes a committed schema nor replaces the error
+        # that ended the run.
+        try:
+            await conn.close(timeout=_DB_INIT_CLOSE_TIMEOUT_S)
+        except Exception:
+            conn.terminate()
+        except BaseException:
+            conn.terminate()
+            raise
+
+
+def _dispatch_db(args: argparse.Namespace) -> int:
+    rbac_rc = _enforce_rbac(args)
+    if rbac_rc is not None:
+        return rbac_rc
+    dsn = config.get("CORP_LLM_PG_DSN")
+    if not dsn:
+        print("error: db init requires Postgres: set CORP_LLM_PG_DSN", file=sys.stderr)
+        return 2
+    try:
+        import asyncpg  # noqa: F401
+    except Exception:
+        print("error: db init requires asyncpg: install the 'postgres' extra", file=sys.stderr)
+        return 2
+    try:
+        asyncio.run(_db_init(dsn))
+    except _DbInitLockBusyError:
+        print(
+            "error: db init failed: another db init holds the lock (LockNotAvailableError)",
+            file=sys.stderr,
+        )
+        return 2
+    except Exception as exc:
+        # The DSN may carry a password and driver errors can quote it: name the type only.
+        print(f"error: db init failed: {type(exc).__name__}", file=sys.stderr)
+        return 2
+    print("db init: schema applied (corp_tokens, team_config)")
+    return 0
+
+
+_MIN_TOKEN_VALUE_CHARS = 16
+_MAX_TOKEN_VALUE_CHARS = 256
+
+
+def _token_value_arg(value: str) -> str:
+    """argparse type for ``--value``. Raises only ArgumentTypeError, whose message
+    argparse prints as is: any other exception would make it echo the value."""
+    if len(value) < _MIN_TOKEN_VALUE_CHARS:
+        raise argparse.ArgumentTypeError(f"must be at least {_MIN_TOKEN_VALUE_CHARS} characters")
+    if len(value) > _MAX_TOKEN_VALUE_CHARS:
+        raise argparse.ArgumentTypeError(f"must be at most {_MAX_TOKEN_VALUE_CHARS} characters")
+    if not all("!" <= ch <= "~" for ch in value):
+        raise argparse.ArgumentTypeError(
+            "must be printable ASCII (0x21-0x7E): no spaces, control or non-ASCII characters"
+        )
+    # token list shows a ct_ token's prefix: only a generated token may carry one.
+    if value.startswith("ct_"):
+        raise argparse.ArgumentTypeError(
+            "must not start with 'ct_' (reserved for generated tokens)"
+        )
+    return value
+
+
+def _ttl_days_arg(raw: str) -> int:
+    try:
+        days = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if days < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    try:
+        datetime.now(UTC) + timedelta(days=days)
+    except OverflowError:
+        raise argparse.ArgumentTypeError("is too large") from None
+    return days
+
+
 async def _token_issue(store: TokenStore, args: argparse.Namespace) -> int:
     scopes = tuple(s for s in (args.scopes or "").split(",") if s)
+    value: str | None = args.corp_token_value
+    if value is not None:
+        existing = await store.lookup(value)
+        # The store's upsert would clear revoked_at and silently revive the token.
+        if existing is not None and existing.revoked_at is not None:
+            print(
+                "error: that token value was revoked and cannot be issued again; "
+                "choose a new value",
+                file=sys.stderr,
+            )
+            return 2
+        if existing is not None and (existing.user_id, existing.team_id) != (args.user, args.team):
+            print(
+                "error: that token value is held by another user or team; choose a new value",
+                file=sys.stderr,
+            )
+            return 2
 
     # The operator is the trust anchor (RBAC-gated above), so the verifier just
     # echoes the CLI-provided claims; the sentinel satisfies issue()'s non-empty
@@ -658,8 +805,29 @@ async def _token_issue(store: TokenStore, args: argparse.Namespace) -> int:
     async def _verify(_oidc_token: str) -> OidcClaims:
         return OidcClaims(user_id=args.user, team_id=args.team, scopes=scopes)
 
-    issuer = TokenIssuer(store, _verify, ttl=timedelta(days=args.ttl_days))
+    issuer = TokenIssuer(
+        store,
+        _verify,
+        ttl=timedelta(days=args.ttl_days),
+        token_factory=(lambda: value) if value is not None else None,
+    )
     result = await issuer.issue("operator-cli")
+    if value is not None:
+        if args.json_output:
+            print(
+                json.dumps(
+                    {
+                        "user_id": args.user,
+                        "team_id": args.team,
+                        "scopes": list(scopes),
+                        "expires_at": result.expires_at.isoformat(),
+                    }
+                )
+            )
+            return 0
+        print(f"issued corp token for user={args.user} team={args.team} (value from --value)")
+        print(f"expires: {result.expires_at.isoformat()}")
+        return 0
     if args.json_output:
         print(
             json.dumps(
@@ -761,12 +929,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_db = sub.add_parser("db", help="manage the gateway database")
+    db_sub = p_db.add_subparsers(dest="db_command", required=True)
+    db_sub.add_parser("init", help="apply the token and team-config schemas (idempotent)")
+
     p_team = sub.add_parser("team", help="manage teams")
     team_sub = p_team.add_subparsers(dest="team_command", required=True)
 
     team_create = team_sub.add_parser("create", help="create a team")
     team_create.add_argument("--team-id", required=True)
     team_create.add_argument("--name", required=True)
+    team_create.add_argument(
+        "--if-absent",
+        action="store_true",
+        help="exit 0 without changes when the team already exists",
+    )
 
     team_set_rules = team_sub.add_parser("set-rules", help="set replace.md for a team")
     team_set_rules.add_argument("--team-id", required=True)
@@ -793,7 +970,15 @@ def build_parser() -> argparse.ArgumentParser:
     token_issue.add_argument("--user", required=True)
     token_issue.add_argument("--team", required=True)
     token_issue.add_argument("--scopes", default="", help="comma-separated scopes")
-    token_issue.add_argument("--ttl-days", type=int, default=DEFAULT_TOKEN_TTL_DAYS)
+    token_issue.add_argument("--ttl-days", type=_ttl_days_arg, default=DEFAULT_TOKEN_TTL_DAYS)
+    token_issue.add_argument(
+        "--value",
+        dest="corp_token_value",
+        type=_token_value_arg,
+        default=None,
+        metavar="VALUE",
+        help="a chosen token value instead of a random one (16-256 printable ASCII; never printed)",
+    )
     token_issue.add_argument("--json", dest="json_output", action="store_true")
 
     token_revoke = token_sub.add_parser("revoke", help="revoke a corp token")
@@ -858,6 +1043,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "db":
+        return _dispatch_db(args)
 
     if args.command == "team":
         return _dispatch_team(args)
