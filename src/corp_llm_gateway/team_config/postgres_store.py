@@ -131,8 +131,8 @@ class PostgresTeamConfigStore(TeamConfigStore):
     async def init_schema(self, conn: Any = None) -> None:
         """Apply schema.sql idempotently; safe on an already-initialised DB.
 
-        On ``conn`` when given (the caller owns its session settings and locks),
-        else on a pooled connection."""
+        On ``conn`` when given (the caller's transaction, with its transaction-scoped
+        settings and locks), else on a pooled connection."""
         sql = _SCHEMA_SQL.read_text()
         if conn is not None:
             await conn.execute(sql)

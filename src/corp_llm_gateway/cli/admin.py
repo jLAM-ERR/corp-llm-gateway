@@ -45,6 +45,7 @@ from corp_llm_gateway.tokens import (
     TokenIssuer,
     TokenStore,
 )
+from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
 
 
 class _NoTeamRules(RulesLoader):
@@ -656,8 +657,11 @@ def _dispatch_team(args: argparse.Namespace) -> int:
 _DB_INIT_LOCK_KEY = 0x636F72705F646269
 _DB_INIT_LOCK_WAIT_MS = 60_000
 # The schema's ALTER TABLE / DROP TRIGGER take ACCESS EXCLUSIVE even when nothing
-# changes: past this, give up rather than queue every serving gateway's lookups.
-_DB_INIT_DDL_LOCK_TIMEOUT_MS = 5_000
+# changes, and a token lookup queues behind each table lock a transaction waits for in
+# turn (tokens/schema.sql locks corp_tokens, then team_config). Keep that sum well
+# under the lookup's own timeout; a busy table fails db init fast instead.
+_DB_INIT_MAX_TABLES_PER_TXN = 2
+_DB_INIT_DDL_LOCK_TIMEOUT_MS = int(LOOKUP_TIMEOUT_S * 1000 * 0.6) // _DB_INIT_MAX_TABLES_PER_TXN
 _DB_INIT_CONNECT_TIMEOUT_S = 5.0
 _DB_INIT_CLOSE_TIMEOUT_S = 5.0
 
@@ -685,9 +689,8 @@ async def _apply_schema(conn: Any, store: PostgresTokenStore | PostgresTeamConfi
         await store.init_schema(conn)
 
 
-async def _apply_schemas(conn: Any, dsn: str = "") -> None:
-    # One transaction per file, so corp_tokens' ACCESS EXCLUSIVE lock is released
-    # before team_config's DDL waits for its own.
+async def _apply_schemas(conn: Any, dsn: str) -> None:
+    # One transaction per file: each holds its locks only until its own commit.
     await _apply_schema(conn, PostgresTokenStore(dsn))
     await _apply_schema(conn, PostgresTeamConfigStore(dsn))
 
@@ -699,8 +702,12 @@ async def _db_init(dsn: str) -> None:
     try:
         await _apply_schemas(conn, dsn)
     finally:
+        # A failed close neither undoes a committed schema nor replaces the error
+        # that ended the run.
         try:
             await conn.close(timeout=_DB_INIT_CLOSE_TIMEOUT_S)
+        except Exception:
+            conn.terminate()
         except BaseException:
             conn.terminate()
             raise

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import secrets
 import socket
 import sys
@@ -986,7 +987,7 @@ def test_db_init_postgres_leaves_no_session_state_behind(pg_empty_db: str) -> No
         conn = await asyncpg.connect(pg_empty_db, timeout=5.0)
         try:
             default = await conn.fetchval("SHOW lock_timeout")
-            await admin._apply_schemas(conn)
+            await admin._apply_schemas(conn, pg_empty_db)
             assert await conn.fetchval("SHOW lock_timeout") == default
             assert not conn.is_in_transaction()
             held = await conn.fetchval(
@@ -1069,6 +1070,171 @@ def test_db_init_names_a_pooler_rejecting_startup_parameters(
     captured = capsys.readouterr()
     assert captured.err == "error: db init failed: StartupParameterRejectedError\n"
     assert _DSN_PASSWORD not in captured.out + captured.err
+
+
+def _schema_tables(sql: str) -> set[str]:
+    code = "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+    pattern = r"\b(?:TABLE(?:\s+IF\s+(?:NOT\s+)?EXISTS)?|ON)\s+(\w+)"
+    return {name.lower() for name in re.findall(pattern, code, flags=re.IGNORECASE)}
+
+
+def test_db_init_ddl_lock_bound_stays_under_the_token_lookup_timeout() -> None:
+    import corp_llm_gateway.team_config as team_config_pkg
+    import corp_llm_gateway.tokens as tokens_pkg
+    from corp_llm_gateway.cli import admin
+    from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
+
+    per_file = {
+        pkg.__name__: _schema_tables((Path(pkg.__file__).parent / "schema.sql").read_text())
+        for pkg in (tokens_pkg, team_config_pkg)
+    }
+    assert per_file["corp_llm_gateway.tokens"] == {"corp_tokens", "team_config"}
+    assert per_file["corp_llm_gateway.team_config"] == {"team_config"}
+    assert max(len(t) for t in per_file.values()) <= admin._DB_INIT_MAX_TABLES_PER_TXN
+    # A lookup can queue behind each table lock the transaction waits for in turn.
+    worst_stall_s = admin._DB_INIT_MAX_TABLES_PER_TXN * admin._DB_INIT_DDL_LOCK_TIMEOUT_MS / 1000
+    assert worst_stall_s <= 0.75 * LOOKUP_TIMEOUT_S
+
+
+def test_db_init_postgres_never_stalls_a_token_lookup_past_its_timeout(pg_empty_db: str) -> None:
+    import time
+
+    import asyncpg
+
+    from corp_llm_gateway.cli import admin
+    from corp_llm_gateway.tokens import PostgresTokenStore
+
+    dsn = pg_empty_db
+    assert main(["db", "init"]) == 0
+    ddl_wait_s = admin._DB_INIT_DDL_LOCK_TIMEOUT_MS / 1000
+
+    async def _run() -> float:
+        holders = []
+        for table in ("corp_tokens", "team_config"):
+            conn = await asyncpg.connect(dsn, timeout=5.0)
+            tx = conn.transaction()
+            await tx.start()
+            await conn.fetch(f"SELECT 1 FROM {table} LIMIT 1")
+            holders.append((conn, tx))
+        store = PostgresTokenStore(dsn)
+        await store._get_pool()
+        init = await asyncpg.connect(dsn, timeout=5.0)
+        try:
+            task = asyncio.create_task(admin._apply_schemas(init, dsn))
+            await asyncio.sleep(0.3)
+
+            async def _release_corp_tokens_just_in_time() -> None:
+                # db init gets corp_tokens, then waits on team_config while holding it.
+                await asyncio.sleep(0.8 * ddl_wait_s - 0.3)
+                await holders[0][1].rollback()
+
+            release = asyncio.create_task(_release_corp_tokens_just_in_time())
+            started = time.monotonic()
+            assert await store.lookup("no-such-token") is None
+            elapsed = time.monotonic() - started
+            await release
+            with pytest.raises(asyncpg.exceptions.LockNotAvailableError):
+                await task
+        finally:
+            await holders[1][1].rollback()
+            for conn, _ in holders:
+                await conn.close()
+            await init.close()
+            await store.close()
+        return elapsed
+
+    from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
+
+    assert asyncio.run(_run()) < LOOKUP_TIMEOUT_S
+
+
+def _close_fails_on(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Every connection db init opens fails its close(); returns those connections."""
+    import asyncpg
+
+    opened: list[Any] = []
+    real_connect = asyncpg.connect
+    real_close = asyncpg.connection.Connection.close
+
+    async def _spy_connect(*args: Any, **kwargs: Any) -> Any:
+        conn = await real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    async def _failing_close(self: Any, *, timeout: float | None = None) -> None:
+        if any(self is conn for conn in opened):
+            raise OSError("close failed")
+        await real_close(self, timeout=timeout)
+
+    monkeypatch.setattr(asyncpg, "connect", _spy_connect)
+    monkeypatch.setattr(asyncpg.connection.Connection, "close", _failing_close)
+    return opened
+
+
+def test_db_init_postgres_close_failure_after_success_still_succeeds(
+    pg_empty_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    opened = _close_fails_on(monkeypatch)
+    assert main(["db", "init"]) == 0
+    captured = capsys.readouterr()
+    assert "db init: schema applied (corp_tokens, team_config)" in captured.out
+    assert captured.err == ""
+    assert opened
+    assert all(conn.is_closed() for conn in opened)
+    monkeypatch.undo()  # the fixture's teardown connections close normally
+
+
+def test_db_init_postgres_close_failure_after_failure_reports_the_first_error(
+    pg_empty_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncpg
+
+    from corp_llm_gateway.team_config import PostgresTeamConfigStore
+
+    async def _broken_init_schema(self: Any, conn: Any = None) -> None:
+        raise asyncpg.exceptions.UndefinedTableError("boom")
+
+    monkeypatch.setattr(PostgresTeamConfigStore, "init_schema", _broken_init_schema)
+    opened = _close_fails_on(monkeypatch)
+    assert main(["db", "init"]) == 2
+    assert capsys.readouterr().err == "error: db init failed: UndefinedTableError\n"
+    assert opened
+    assert all(conn.is_closed() for conn in opened)
+    monkeypatch.undo()  # the fixture's teardown connections close normally
+
+
+def test_db_init_postgres_busy_on_the_second_transaction(
+    pg_empty_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncpg
+
+    from corp_llm_gateway.cli import admin
+    from corp_llm_gateway.team_config import PostgresTeamConfigStore
+
+    dsn = pg_empty_db
+    monkeypatch.setattr(admin, "_DB_INIT_LOCK_WAIT_MS", 500)
+    real_apply = admin._apply_schema
+    applied: list[str] = []
+
+    async def _apply_with_the_key_taken(conn: Any, store: Any) -> None:
+        if not isinstance(store, PostgresTeamConfigStore):
+            await real_apply(conn, store)
+            applied.append(type(store).__name__)
+            return
+        holder = await asyncpg.connect(dsn, timeout=5.0)
+        try:
+            await holder.execute(f"SELECT pg_advisory_lock({admin._DB_INIT_LOCK_KEY})")
+            await real_apply(conn, store)
+        finally:
+            await holder.close()
+
+    monkeypatch.setattr(admin, "_apply_schema", _apply_with_the_key_taken)
+    assert main(["db", "init"]) == 2
+    assert capsys.readouterr().err == (
+        "error: db init failed: another db init holds the lock (LockNotAvailableError)\n"
+    )
+    assert applied == ["PostgresTokenStore"]
+    assert "corp_tokens" in asyncio.run(_pg_table_names(dsn))
 
 
 def test_db_init_with_a_broken_asyncpg_names_the_extra(

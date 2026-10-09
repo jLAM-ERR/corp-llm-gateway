@@ -23,11 +23,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`gateway-admin db init`** applies the token and team-config schemas to the database
   `CORP_LLM_PG_DSN` names. Idempotent, RBAC-gated. Each schema file runs in its own transaction
   under a transaction-scoped advisory lock, so concurrent runs take turns, and it works through
-  a transaction-mode pooler (PgBouncer). `lock_timeout` bounds each lock wait: 60 s for another
-  `db init` (`another db init holds the lock (LockNotAvailableError)`), 5 s for each table lock
+  a transaction-mode pooler (PgBouncer). Like the gateway's pools it sends the TCP keepalive
+  startup parameters, so PgBouncer needs them in `ignore_startup_parameters`
+  (`docs/ops/runbook.md`), else it fails with `StartupParameterRejectedError`. `lock_timeout`
+  bounds each lock wait: 60 s for another `db init`
+  (`another db init holds the lock (LockNotAvailableError)`) and 1.5 s for each table lock
   (`LockNotAvailableError`). A re-run against serving gateways can stall their token lookups
-  for up to about 5 s per transaction. No DSN or no `postgres` extra prints a named message; a
-  connection or SQL failure exits 2 with the error type only. The DSN is never printed.
+  for about 3 s at most (two table waits), under the 5 s lookup timeout; on a busy database it
+  fails fast with exit 2 and is safe to re-run. No DSN or no `postgres` extra exits 2 with a
+  named message; a connection or SQL failure exits 2 with the error type only. The DSN is
+  never printed.
 - **`team create --if-absent`** exits 0 and changes nothing when the team exists (without the
   flag it still exits 2).
 

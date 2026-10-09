@@ -58,16 +58,22 @@ Each transaction takes the advisory lock
 so concurrent runs take turns instead of deadlocking. Settings and locks are
 transaction-scoped (`set_config(..., true)`, no session `SET`) and no statement
 uses bound parameters, so `db init` also works through a transaction-mode
-pooler such as PgBouncer and leaves nothing set on the server session.
+pooler such as PgBouncer and leaves nothing set on the server session. Like the
+gateway's pools, it sends the TCP keepalive startup parameters: PgBouncer needs
+them in `ignore_startup_parameters` (`configuration.md`, "PgBouncer in front of
+Postgres"; `runbook.md`), else `db init` fails with
+`StartupParameterRejectedError`.
 
-`lock_timeout` bounds each lock wait: 60 s for the advisory lock, then 5 s for
-each table lock the schema statements need. Some of them
+`lock_timeout` bounds each lock wait: 60 s for the advisory lock, then 1.5 s
+for each table lock the schema statements need. Some of them
 (`ALTER TABLE … ADD COLUMN IF NOT EXISTS`, the `team_config` trigger's drop and
 create) take an `ACCESS EXCLUSIVE` lock even when nothing changes. While that
-lock waits, new queries on the table queue behind it, so a re-run against
-serving gateways can stall their token lookups for up to about 5 s per
-transaction; a lock it cannot get in 5 s ends the run (exit 2) instead of
-stalling them longer.
+lock waits, new queries on the table queue behind it. The token schema locks
+`corp_tokens` and then `team_config` in one transaction, so a token lookup can
+queue behind both waits: about 3 s at most, under the gateway's 5 s lookup
+timeout (the 1.5 s is derived from it). On a busy database `db init` therefore
+fails fast with `LockNotAvailableError` (exit 2) rather than stall the serving
+gateways; the failed transaction is rolled back, so re-running it is safe.
 
 ## `team`
 
