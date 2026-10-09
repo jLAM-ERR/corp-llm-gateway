@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import secrets
 import sys
 import types
 from datetime import UTC, datetime, timedelta
@@ -8,11 +10,12 @@ from pathlib import Path
 import pytest
 
 from corp_llm_gateway import config, settings
-from corp_llm_gateway.cli.admin import main
+from corp_llm_gateway.cli.admin import build_parser, main
 from corp_llm_gateway.extensions import Extension, ExtensionRegistry, ExtensionSpec
 from corp_llm_gateway.healthz import HealthStatus
 from corp_llm_gateway.team_config import InMemoryTeamConfigStore, TeamConfig
-from corp_llm_gateway.tokens import InMemoryTokenStore, TokenInfo
+from corp_llm_gateway.tokens import AuthMiddleware, InMemoryTokenStore, TokenInfo
+from tests.postgres_support import pg_dsn, require_asyncpg, skip_or_fail
 
 
 @pytest.fixture(autouse=True)
@@ -233,6 +236,234 @@ def test_token_list_empty(
     rc = main(["token", "list"])
     assert rc == 0
     assert "no tokens issued" in capsys.readouterr().out
+
+
+# token issue --value — a caller-chosen token value ----------------------------
+
+_VALUE = "local-team-token-7Qx2"
+
+
+def _issue_value(value: str = _VALUE, *extra: str) -> int:
+    argv = ["token", "issue", "--user", "local", "--team", "local", "--value", value, *extra]
+    return main(argv)
+
+
+def _assert_value_absent(
+    value: str, captured: pytest.CaptureResult[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    assert value not in captured.out
+    assert value not in captured.err
+    assert value not in caplog.text
+
+
+def test_token_issue_value_parses_apart_from_the_operator_jwt() -> None:
+    args = build_parser().parse_args(
+        ["--token", "op-jwt", "token", "issue", "--user", "u", "--team", "t", "--value", _VALUE]
+    )
+    assert args.token == "op-jwt"
+    assert args.corp_token_value == _VALUE
+
+
+def test_token_issue_without_value_leaves_it_unset() -> None:
+    args = build_parser().parse_args(["token", "issue", "--user", "u", "--team", "t"])
+    assert args.corp_token_value is None
+
+
+def test_token_issue_value_stores_it_and_it_authenticates(
+    token_store: InMemoryTokenStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _issue_value() == 0
+    ctx = asyncio.run(AuthMiddleware(token_store).authenticate(_VALUE))
+    assert (ctx.user_id, ctx.team_id) == ("local", "local")
+    out = capsys.readouterr().out
+    assert "issued corp token for user=local team=local" in out
+    assert "expires: " in out
+    assert "token:" not in out
+
+
+def test_token_issue_value_of_exactly_16_chars_is_accepted(
+    token_store: InMemoryTokenStore,
+) -> None:
+    value = "a" * 16
+    assert _issue_value(value) == 0
+    assert asyncio.run(token_store.lookup(value)) is not None
+
+
+def test_token_issue_value_json_omits_the_value(
+    token_store: InMemoryTokenStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _issue_value(_VALUE, "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert set(data) == {"user_id", "team_id", "scopes", "expires_at"}
+    assert (data["user_id"], data["team_id"]) == ("local", "local")
+    stored = asyncio.run(token_store.lookup(_VALUE))
+    assert stored is not None
+    assert data["expires_at"] == stored.expires_at.isoformat()
+
+
+def test_token_issue_value_twice_keeps_one_row_with_a_new_expiry(
+    token_store: InMemoryTokenStore,
+) -> None:
+    assert _issue_value(_VALUE, "--ttl-days", "1") == 0
+    first = asyncio.run(token_store.lookup(_VALUE))
+    assert _issue_value(_VALUE, "--ttl-days", "36500") == 0
+    rows = asyncio.run(token_store.list_tokens())
+    assert [r.corp_token for r in rows] == [_VALUE]
+    assert first is not None
+    assert rows[0].expires_at > first.expires_at
+    assert rows[0].revoked_at is None
+
+
+def test_token_issue_value_refuses_a_revoked_value(
+    token_store: InMemoryTokenStore,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    assert _issue_value() == 0
+    asyncio.run(token_store.revoke_user("local"))
+    capsys.readouterr()
+    assert _issue_value() == 2
+    captured = capsys.readouterr()
+    assert "revoked" in captured.err
+    _assert_value_absent(_VALUE, captured, caplog)
+    stored = asyncio.run(token_store.lookup(_VALUE))
+    assert stored is not None
+    assert stored.revoked_at is not None
+
+
+@pytest.mark.parametrize(
+    ("value", "extra", "names"),
+    [
+        pytest.param("tooShort-7Qx2ab", (), "--value", id="15-chars"),
+        pytest.param("", (), "--value", id="empty"),
+        pytest.param("local team token 7Qx2", (), "--value", id="space"),
+        pytest.param("local-team\ttoken-7Qx2", (), "--value", id="tab"),
+        pytest.param("local-team-token\n7Qx2", (), "--value", id="newline"),
+        pytest.param("local-team-token\x077Qx2", (), "--value", id="control-char"),
+        pytest.param("local-team-token\u200b7Qx2", (), "--value", id="zero-width-format-char"),
+        pytest.param(_VALUE, ("--ttl-days", "0"), "--ttl-days", id="ttl-zero"),
+        pytest.param(_VALUE, ("--ttl-days", "-1"), "--ttl-days", id="ttl-negative"),
+        pytest.param(_VALUE, ("--ttl-days", "3000000"), "--ttl-days", id="ttl-past-year-9999"),
+        pytest.param(
+            _VALUE, ("--ttl-days", "99999999999"), "--ttl-days", id="ttl-past-timedelta-max"
+        ),
+    ],
+)
+def test_token_issue_value_usage_errors_never_echo_the_value(
+    token_store: InMemoryTokenStore,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    value: str,
+    extra: tuple[str, ...],
+    names: str,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(SystemExit) as excinfo:
+        _issue_value(value, *extra)
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert names in captured.err
+    if value:
+        _assert_value_absent(value, captured, caplog)
+    assert asyncio.run(token_store.list_tokens()) == ()
+
+
+@pytest.mark.parametrize("path", ["plain", "json", "revoked", "no-store"])
+def test_token_issue_value_never_reaches_stdout_stderr_or_logs(
+    path: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    store = InMemoryTokenStore()
+    if path == "no-store":
+        empty = tmp_path / "config.toml"
+        empty.write_text("")
+        monkeypatch.setenv("CORP_LLM_GATEWAY_CONFIG_FILE", str(empty))
+        monkeypatch.delenv("CORP_LLM_PG_DSN", raising=False)
+    else:
+        monkeypatch.setattr("corp_llm_gateway.cli.admin._token_store", lambda: store)
+    config.reset_cache()
+    try:
+        if path == "revoked":
+            assert _issue_value() == 0
+            asyncio.run(store.revoke_user("local"))
+        rc = _issue_value(_VALUE, "--json") if path == "json" else _issue_value()
+    finally:
+        config.reset_cache()
+    assert rc == (0 if path in ("plain", "json") else 2)
+    captured = capsys.readouterr()
+    if path == "no-store":
+        assert "CORP_LLM_PG_DSN" in captured.err
+    _assert_value_absent(_VALUE, captured, caplog)
+
+
+def test_token_issue_value_postgres_stores_authenticates_and_refuses_revoked(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    require_asyncpg()
+    from corp_llm_gateway.tokens import PostgresTokenStore
+
+    dsn = pg_dsn()
+    user = f"pg-test-cli-{secrets.token_hex(4)}"
+    value = f"pg-test-cli-value-{secrets.token_hex(8)}"
+
+    async def _cleanup() -> None:
+        store = PostgresTokenStore(dsn)
+        try:
+            await store.init_schema()
+            pool = await store._get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM corp_tokens WHERE user_id = $1", user)
+        finally:
+            await store.close()
+
+    async def _lookup(*, authenticate: bool = True) -> TokenInfo | None:
+        store = PostgresTokenStore(dsn)
+        try:
+            if authenticate:
+                ctx = await AuthMiddleware(store).authenticate(value)
+                assert (ctx.user_id, ctx.team_id) == (user, "local")
+            return await store.lookup(value)
+        finally:
+            await store.close()
+
+    async def _revoke() -> None:
+        store = PostgresTokenStore(dsn)
+        try:
+            await store.revoke_user(user)
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(_cleanup())
+    except Exception as exc:
+        skip_or_fail(f"Postgres unreachable: {exc}")
+    monkeypatch.setenv("CORP_LLM_PG_DSN", dsn)
+    argv = ["token", "issue", "--user", user, "--team", "local", "--value", value]
+    try:
+        assert main([*argv, "--ttl-days", "1"]) == 0
+        first = asyncio.run(_lookup())
+        assert first is not None
+        assert first.user_id == user
+        assert main([*argv, "--ttl-days", "36500"]) == 0
+        second = asyncio.run(_lookup())
+        assert second is not None
+        assert second.expires_at > first.expires_at
+
+        asyncio.run(_revoke())
+        assert main(argv) == 2
+        captured = capsys.readouterr()
+        assert "revoked" in captured.err
+        assert value not in captured.out + captured.err
+        stored = asyncio.run(_lookup(authenticate=False))
+        assert stored is not None
+        assert stored.revoked_at is not None
+    finally:
+        asyncio.run(_cleanup())
 
 
 # team / token — RBAC (mutations gated, reads ungated) ----------------------

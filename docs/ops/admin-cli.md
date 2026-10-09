@@ -60,7 +60,7 @@ revokes both kinds; for an issued token the user is the Keycloak
 `CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM`).
 
 ```
-gateway-admin token issue --user alice --team team-x [--scopes a,b] [--ttl-days 30] [--json]
+gateway-admin token issue --user alice --team team-x [--scopes a,b] [--ttl-days 30] [--value VALUE] [--json]
 gateway-admin token revoke --user alice
 gateway-admin token list [--user alice] [--json]
 ```
@@ -81,6 +81,33 @@ ct_9f3c1a…  alice  team-x  -       2026-08-07  no
 
 `token list` masks each token to its first 8 chars. Revocation is bound to the
 ≤60 s `AuthMiddleware` cache (see `runbook.md`).
+
+### `token issue --value`
+
+`--value VALUE` stores a value you choose instead of a random `ct_…` token, for
+a fixed team token such as the Local setup's `LOCAL_TEAM_TOKEN`. It is not the
+global `--token` (the operator JWT); RBAC works the same with or without it.
+
+```
+gateway-admin token issue --user local --team local --value "$LOCAL_TEAM_TOKEN" --ttl-days 36500 [--json]
+```
+
+```
+$ gateway-admin token issue --user local --team local --value "$LOCAL_TEAM_TOKEN"
+issued corp token for user=local team=local (value from --value)
+expires: 2026-11-08T12:00:00+00:00
+```
+
+- The value is never printed or logged. Plain output has no `token:` line;
+  `--json` reports `user_id`, `team_id`, `scopes` and `expires_at` only.
+- Usage errors (exit 2, before any store call): a value shorter than 16 chars or
+  with whitespace / control characters, `--ttl-days` below 1, or a TTL past the
+  year 9999. The message names the flag, never the value.
+- Re-running with the same value updates the row (new `expires_at`), so it is
+  safe to repeat.
+- A revoked value is refused (exit 2): issuing it again would clear the
+  revocation. Pick a new value instead.
+- `token list` still shows the value's first 8 chars, as for every token.
 
 ## `extensions`
 

@@ -14,7 +14,7 @@ import dataclasses
 import json
 import sys
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast, get_args
 
 import httpx
@@ -649,8 +649,37 @@ def _dispatch_team(args: argparse.Namespace) -> int:
         return 2
 
 
+_MIN_TOKEN_VALUE_CHARS = 16
+
+
+def _token_value_problem(value: str, ttl_days: int) -> str | None:
+    """Why ``token issue --value`` must refuse its arguments, or None. Never names the value."""
+    if len(value) < _MIN_TOKEN_VALUE_CHARS:
+        return f"--value must be at least {_MIN_TOKEN_VALUE_CHARS} characters"
+    if not value.isprintable() or any(ch.isspace() for ch in value):
+        return "--value must not contain whitespace or control characters"
+    if ttl_days < 1:
+        return "--ttl-days must be at least 1"
+    try:
+        datetime.now(UTC) + timedelta(days=ttl_days)
+    except OverflowError:
+        return "--ttl-days is too large"
+    return None
+
+
 async def _token_issue(store: TokenStore, args: argparse.Namespace) -> int:
     scopes = tuple(s for s in (args.scopes or "").split(",") if s)
+    value: str | None = args.corp_token_value
+    if value is not None:
+        existing = await store.lookup(value)
+        # The store's upsert would clear revoked_at and silently revive the token.
+        if existing is not None and existing.revoked_at is not None:
+            print(
+                "error: that token value was revoked and cannot be issued again; "
+                "choose a new value",
+                file=sys.stderr,
+            )
+            return 2
 
     # The operator is the trust anchor (RBAC-gated above), so the verifier just
     # echoes the CLI-provided claims; the sentinel satisfies issue()'s non-empty
@@ -658,8 +687,29 @@ async def _token_issue(store: TokenStore, args: argparse.Namespace) -> int:
     async def _verify(_oidc_token: str) -> OidcClaims:
         return OidcClaims(user_id=args.user, team_id=args.team, scopes=scopes)
 
-    issuer = TokenIssuer(store, _verify, ttl=timedelta(days=args.ttl_days))
+    issuer = TokenIssuer(
+        store,
+        _verify,
+        ttl=timedelta(days=args.ttl_days),
+        token_factory=(lambda: value) if value is not None else None,
+    )
     result = await issuer.issue("operator-cli")
+    if value is not None:
+        if args.json_output:
+            print(
+                json.dumps(
+                    {
+                        "user_id": args.user,
+                        "team_id": args.team,
+                        "scopes": list(scopes),
+                        "expires_at": result.expires_at.isoformat(),
+                    }
+                )
+            )
+            return 0
+        print(f"issued corp token for user={args.user} team={args.team} (value from --value)")
+        print(f"expires: {result.expires_at.isoformat()}")
+        return 0
     if args.json_output:
         print(
             json.dumps(
@@ -794,6 +844,13 @@ def build_parser() -> argparse.ArgumentParser:
     token_issue.add_argument("--team", required=True)
     token_issue.add_argument("--scopes", default="", help="comma-separated scopes")
     token_issue.add_argument("--ttl-days", type=int, default=DEFAULT_TOKEN_TTL_DAYS)
+    token_issue.add_argument(
+        "--value",
+        dest="corp_token_value",
+        default=None,
+        metavar="VALUE",
+        help="use this token value instead of a random one (>= 16 chars; never printed)",
+    )
     token_issue.add_argument("--json", dest="json_output", action="store_true")
 
     token_revoke = token_sub.add_parser("revoke", help="revoke a corp token")
@@ -858,6 +915,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "token" and args.token_command == "issue":
+        value = args.corp_token_value
+        problem = None if value is None else _token_value_problem(value, args.ttl_days)
+        if problem is not None:
+            parser.error(problem)
 
     if args.command == "team":
         return _dispatch_team(args)
