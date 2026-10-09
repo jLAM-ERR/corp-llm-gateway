@@ -5,8 +5,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
-
 ## [1.0.0] — GA (2026-10-09)
 
 The first GA release — the **local-first detection cycle** (below) plus the **GA-readiness /
