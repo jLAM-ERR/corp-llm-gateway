@@ -32,8 +32,14 @@ tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error
 tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error[malformed-port]
 tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error[refused]
 tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error[unknown-host]
+tests/cli/test_admin.py::test_db_init_postgres_concurrent_runs_all_succeed
+tests/cli/test_admin.py::test_db_init_postgres_concurrent_runs_all_succeed[existing]
+tests/cli/test_admin.py::test_db_init_postgres_concurrent_runs_all_succeed[fresh]
 tests/cli/test_admin.py::test_db_init_postgres_creates_both_schemas_and_reruns_without_change
+tests/cli/test_admin.py::test_db_init_postgres_failure_after_connect_closes_and_names_the_type_only
+tests/cli/test_admin.py::test_db_init_postgres_gives_up_on_a_held_table_lock
 tests/cli/test_admin.py::test_db_init_rbac_enforced
+tests/cli/test_admin.py::test_db_init_with_a_broken_asyncpg_names_the_extra
 tests/cli/test_admin.py::test_db_init_without_a_dsn_names_the_key
 tests/cli/test_admin.py::test_extensions_disable_stub_raises
 tests/cli/test_admin.py::test_extensions_enable_rbac_enforced

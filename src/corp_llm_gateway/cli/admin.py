@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
-import importlib.util
 import json
 import sys
 from collections.abc import Sequence
@@ -27,6 +26,7 @@ from corp_llm_gateway.auth.rbac import OperatorDenied, get_admin_token, verify_o
 from corp_llm_gateway.corp_llm import CorpLlmClient, CorpLlmHttpError
 from corp_llm_gateway.extensions import ExtensionKind, ExtensionRegistry, ExtensionSpec
 from corp_llm_gateway.payload import OversizeContentError
+from corp_llm_gateway.pg_session import KEEPALIVE_SERVER_SETTINGS
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator, SanitizeResult
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
@@ -539,19 +539,14 @@ def _team_to_dict(cfg: TeamConfig) -> dict[str, Any]:
 
 
 async def _team_create(store: TeamConfigStore, args: argparse.Namespace) -> int:
-    try:
-        await store.get(args.team_id)
-    except TeamNotFoundError:
-        pass
-    else:
-        if args.if_absent:
-            print(f"team exists: {args.team_id} (unchanged)")
-            return 0
-        print(f"error: team {args.team_id!r} already exists", file=sys.stderr)
-        return 2
-    await store.upsert(TeamConfig(team_id=args.team_id, name=args.name))
-    print(f"team created: {args.team_id}")
-    return 0
+    if await store.create_if_absent(TeamConfig(team_id=args.team_id, name=args.name)):
+        print(f"team created: {args.team_id}")
+        return 0
+    if args.if_absent:
+        print(f"team exists: {args.team_id} (unchanged)")
+        return 0
+    print(f"error: team {args.team_id!r} already exists", file=sys.stderr)
+    return 2
 
 
 async def _team_set_rules(store: TeamConfigStore, args: argparse.Namespace) -> int:
@@ -656,17 +651,34 @@ def _dispatch_team(args: argparse.Namespace) -> int:
         return 2
 
 
+# Session advisory lock serialising concurrent `db init` runs ("corp_dbi" in ASCII).
+_DB_INIT_LOCK_KEY = 0x636F72705F646269
+_DB_INIT_LOCK_WAIT_MS = 60_000
+# The schema's ALTER TABLE / DROP TRIGGER take ACCESS EXCLUSIVE even when nothing
+# changes: past this, give up rather than queue every serving gateway's lookups.
+_DB_INIT_DDL_LOCK_TIMEOUT_MS = 5_000
+_DB_INIT_CONNECT_TIMEOUT_S = 5.0
+_DB_INIT_CLOSE_TIMEOUT_S = 5.0
+
+
 async def _db_init(dsn: str) -> None:
-    tokens = PostgresTokenStore(dsn)
-    teams = PostgresTeamConfigStore(dsn)
+    import asyncpg
+
+    conn = await asyncpg.connect(
+        dsn, timeout=_DB_INIT_CONNECT_TIMEOUT_S, server_settings=KEEPALIVE_SERVER_SETTINGS
+    )
     try:
-        await tokens.init_schema()
-        await teams.init_schema()
+        await conn.execute(f"SET lock_timeout = {int(_DB_INIT_LOCK_WAIT_MS)}")
+        await conn.execute("SELECT pg_advisory_lock($1)", _DB_INIT_LOCK_KEY)
+        await conn.execute(f"SET lock_timeout = {int(_DB_INIT_DDL_LOCK_TIMEOUT_MS)}")
+        await PostgresTokenStore(dsn).init_schema(conn)
+        await PostgresTeamConfigStore(dsn).init_schema(conn)
     finally:
+        # Closing the session releases the advisory lock.
         try:
-            await tokens.close()
-        finally:
-            await teams.close()
+            await conn.close(timeout=_DB_INIT_CLOSE_TIMEOUT_S)
+        except Exception:
+            conn.terminate()
 
 
 def _dispatch_db(args: argparse.Namespace) -> int:
@@ -677,7 +689,9 @@ def _dispatch_db(args: argparse.Namespace) -> int:
     if not dsn:
         print("error: db init requires Postgres: set CORP_LLM_PG_DSN", file=sys.stderr)
         return 2
-    if importlib.util.find_spec("asyncpg") is None:
+    try:
+        import asyncpg  # noqa: F401
+    except Exception:
         print("error: db init requires asyncpg: install the 'postgres' extra", file=sys.stderr)
         return 2
     try:

@@ -801,16 +801,199 @@ def test_db_init_postgres_creates_both_schemas_and_reruns_without_change(
 def test_team_create_if_absent_postgres_is_idempotent(
     pg_empty_db: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    dsn = pg_empty_db
     assert main(["db", "init"]) == 0
     argv = ["team", "create", "--team-id", "local", "--name", "local", "--if-absent"]
     assert main(argv) == 0
     assert "team created: local" in capsys.readouterr().out
-    first = asyncio.run(_pg_schema_snapshot(pg_empty_db))
-    assert main(argv) == 0
+    assert main(["team", "set-rules", "--team-id", "local", "--from-file", "local.md"]) == 0
+    retention = ["--hot-days", "30", "--cold-years", "2"]
+    assert main(["team", "set-retention", "--team-id", "local", *retention]) == 0
+    asyncio.run(
+        _pg_execute(
+            dsn,
+            "UPDATE team_config SET fail_policy = $1::jsonb, profile_ids = $2::text[] "
+            "WHERE team_id = 'local'",
+            json.dumps({"pre_pass_down": "fail-closed", "audit_sink_down": "fail-closed"}),
+            ["core"],
+        )
+    )
+    before = asyncio.run(_pg_team_row(dsn, "local"))
+    assert before["replace_md_path"] == "local.md"
+    assert before["retention_hot_days"] == 30
+    capsys.readouterr()
+
+    other_name = ["team", "create", "--team-id", "local", "--name", "Other", "--if-absent"]
+    assert main(other_name) == 0
     assert "team exists: local (unchanged)" in capsys.readouterr().out
-    assert asyncio.run(_pg_schema_snapshot(pg_empty_db)) == first
-    assert main(argv[:-1]) == 2
+    assert asyncio.run(_pg_team_row(dsn, "local")) == before
+    assert main(other_name[:-1]) == 2
     assert "already exists" in capsys.readouterr().err
+    assert asyncio.run(_pg_team_row(dsn, "local")) == before
+
+
+async def _pg_execute(dsn: str, sql: str, *params: Any) -> None:
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn, timeout=5.0)
+    try:
+        await conn.execute(sql, *params)
+    finally:
+        await conn.close()
+
+
+async def _pg_team_row(dsn: str, team_id: str) -> dict[str, Any]:
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn, timeout=5.0)
+    try:
+        row = await conn.fetchrow("SELECT * FROM team_config WHERE team_id = $1", team_id)
+    finally:
+        await conn.close()
+    assert row is not None
+    return dict(row)
+
+
+def _run_concurrently(argv: list[str], n: int) -> list[int]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        return list(pool.map(lambda _: main(argv), range(n)))
+
+
+@pytest.mark.parametrize("state", ["fresh", "existing"])
+def test_db_init_postgres_concurrent_runs_all_succeed(
+    state: str, pg_empty_db: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if state == "existing":
+        assert main(["db", "init"]) == 0
+    for _ in range(3):
+        assert _run_concurrently(["db", "init"], 6) == [0] * 6
+    assert "db init failed" not in capsys.readouterr().err
+    assert asyncio.run(_pg_table_names(pg_empty_db)) >= {"corp_tokens", "team_config"}
+
+
+def test_db_init_postgres_gives_up_on_a_held_table_lock(
+    pg_empty_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import threading
+    import time
+
+    import asyncpg
+
+    from corp_llm_gateway.cli import admin
+
+    assert main(["db", "init"]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(admin, "_DB_INIT_DDL_LOCK_TIMEOUT_MS", 1000)
+    held = threading.Event()
+    release = threading.Event()
+
+    def _hold_lock() -> None:
+        async def _hold() -> None:
+            conn = await asyncpg.connect(pg_empty_db, timeout=5.0)
+            try:
+                async with conn.transaction():
+                    await conn.execute("LOCK TABLE corp_tokens IN ACCESS SHARE MODE")
+                    held.set()
+                    while not release.is_set():
+                        await asyncio.sleep(0.05)
+            finally:
+                await conn.close()
+
+        asyncio.run(_hold())
+
+    holder = threading.Thread(target=_hold_lock)
+    holder.start()
+    try:
+        assert held.wait(10)
+        result: list[int] = []
+        runner = threading.Thread(target=lambda: result.append(main(["db", "init"])))
+        started = time.monotonic()
+        runner.start()
+        runner.join(30)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        holder.join(10)
+    assert not runner.is_alive(), "db init kept waiting on the table lock"
+    assert result == [2]
+    assert elapsed < 10
+    captured = capsys.readouterr()
+    assert "error: db init failed: LockNotAvailableError" in captured.err
+    assert pg_empty_db not in captured.out + captured.err
+
+
+def test_db_init_postgres_failure_after_connect_closes_and_names_the_type_only(
+    pg_empty_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncpg
+
+    from corp_llm_gateway.cli import admin
+    from corp_llm_gateway.team_config import PostgresTeamConfigStore
+
+    caplog.set_level(logging.DEBUG)
+    dsn = pg_empty_db
+    opened: list[Any] = []
+    real_connect = asyncpg.connect
+
+    async def _spy_connect(*args: Any, **kwargs: Any) -> Any:
+        conn = await real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    async def _no_pool(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("db init must not open a pool")
+
+    async def _broken_init_schema(self: Any, conn: Any = None) -> None:
+        await conn.execute("SELECT 1")
+        raise asyncpg.exceptions.UndefinedTableError(f"boom near {dsn}")
+
+    monkeypatch.setattr(asyncpg, "connect", _spy_connect)
+    monkeypatch.setattr(asyncpg, "create_pool", _no_pool)
+    monkeypatch.setattr(PostgresTeamConfigStore, "init_schema", _broken_init_schema)
+
+    assert main(["db", "init"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == "error: db init failed: UndefinedTableError\n"
+    assert dsn not in captured.out + captured.err
+    assert dsn not in caplog.text
+    assert opened
+    assert all(conn.is_closed() for conn in opened)
+    monkeypatch.setattr(asyncpg, "connect", real_connect)
+
+    async def _lock_is_free() -> bool:
+        conn = await real_connect(dsn, timeout=5.0)
+        try:
+            return bool(
+                await conn.fetchval("SELECT pg_try_advisory_lock($1)", admin._DB_INIT_LOCK_KEY)
+            )
+        finally:
+            await conn.close()
+
+    assert asyncio.run(_lock_is_free())
+
+
+def test_db_init_with_a_broken_asyncpg_names_the_extra(
+    hermetic_gateway_config: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    broken = tmp_path / "broken-site" / "asyncpg"
+    broken.mkdir(parents=True)
+    (broken / "__init__.py").write_text("raise ImportError('broken asyncpg build')\n")
+    monkeypatch.syspath_prepend(str(broken.parent))
+    monkeypatch.delitem(sys.modules, "asyncpg", raising=False)
+    dsn = f"postgresql://gateway:{_DSN_PASSWORD}@127.0.0.1:{_closed_port()}/gateway"
+    monkeypatch.setenv("CORP_LLM_PG_DSN", dsn)
+    assert main(["db", "init"]) == 2
+    captured = capsys.readouterr()
+    assert "install the 'postgres' extra" in captured.err
+    assert _DSN_PASSWORD not in captured.out + captured.err
 
 
 # team / token — RBAC (mutations gated, reads ungated) ----------------------

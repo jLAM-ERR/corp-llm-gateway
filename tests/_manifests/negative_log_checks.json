@@ -16,6 +16,13 @@
    "note": "no credential or secret in a log line (M1-14 / invariant 4)"
   },
   {
+   "site": "tests/cli/test_admin.py:963",
+   "owner": "tests/cli/test_admin.py::test_db_init_postgres_failure_after_connect_closes_and_names_the_type_only",
+   "check": "dsn not in caplog.text",
+   "class": "security",
+   "note": "no credential or secret in a log line (M1-14 / invariant 4)"
+  },
+  {
    "site": "tests/corp_ner/test_client.py:540",
    "owner": "tests/corp_ner/test_client.py::test_never_logs_request_or_response_text",
    "check": "canary not in emitted",
@@ -1061,6 +1068,7 @@
  ],
  "security_node_ids": [
   "tests/cli/test_admin.py::test_db_init_never_prints_the_dsn_on_a_connection_error",
+  "tests/cli/test_admin.py::test_db_init_postgres_failure_after_connect_closes_and_names_the_type_only",
   "tests/cli/test_admin.py::test_token_issue_value_never_reaches_stdout_stderr_or_logs",
   "tests/cli/test_admin.py::test_token_issue_value_refuses_a_revoked_value",
   "tests/cli/test_admin.py::test_token_issue_value_refuses_a_value_another_owner_holds",

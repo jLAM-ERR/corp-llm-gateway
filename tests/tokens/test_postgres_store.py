@@ -22,7 +22,14 @@ import pytest_asyncio
 
 from corp_llm_gateway.tokens.errors import IssuancePolicyError
 from corp_llm_gateway.tokens.models import TokenInfo
-from tests.postgres_support import PG_DSN_ENV_VAR, pg_dsn, require_asyncpg, skip_or_fail
+from tests.postgres_support import (
+    PG_DSN_ENV_VAR,
+    pg_dsn,
+    require_asyncpg,
+    schema_tables,
+    scratch_schema_connection,
+    skip_or_fail,
+)
 
 
 def _dsn() -> str:
@@ -205,6 +212,19 @@ CREATE TABLE corp_tokens (
     last_used_at         TIMESTAMPTZ
 )
 """
+
+
+@pytest.mark.asyncio
+async def test_init_schema_on_a_given_connection_uses_it_and_opens_no_pool() -> None:
+    require_asyncpg()
+    from corp_llm_gateway.tokens.postgres_store import PostgresTokenStore
+
+    async with scratch_schema_connection() as (conn, schema):
+        store = PostgresTokenStore(_dsn())
+        await store.init_schema(conn)
+        await store.init_schema(conn)
+        assert store._pool is None
+        assert "corp_tokens" in await schema_tables(conn, schema)
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ tests/tokens/test_token_store_contract.py.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 import pytest
@@ -22,7 +23,13 @@ from corp_llm_gateway.team_config import (
     TeamConfigStore,
     TeamNotFoundError,
 )
-from tests.postgres_support import pg_dsn, require_asyncpg, skip_or_fail
+from tests.postgres_support import (
+    pg_dsn,
+    require_asyncpg,
+    schema_tables,
+    scratch_schema_connection,
+    skip_or_fail,
+)
 
 StoreFactory = Callable[[], Awaitable[TeamConfigStore]]
 
@@ -78,6 +85,37 @@ async def test_upsert_and_get(store: TeamConfigStore) -> None:
     got = await store.get("t1")
     assert got.team_id == "t1"
     assert got.name == "One"
+
+
+@pytest.mark.asyncio
+async def test_create_if_absent_creates_a_missing_team(store: TeamConfigStore) -> None:
+    assert await store.create_if_absent(_team("t1", name="One")) is True
+    assert await store.get("t1") == _team("t1", name="One")
+
+
+@pytest.mark.asyncio
+async def test_create_if_absent_leaves_an_existing_team_unchanged(store: TeamConfigStore) -> None:
+    existing = _team(
+        "t1",
+        name="Original",
+        replace_md_path="t1.replace.md",
+        profile_ids=("core",),
+        retention_hot_days=30,
+        retention_cold_years=2,
+        fail_policy=FailPolicyOverrides(pre_pass_down="fail-closed", audit_sink_down="fail-closed"),
+    )
+    await store.upsert(existing)
+    assert await store.create_if_absent(_team("t1", name="Other")) is False
+    assert await store.get("t1") == existing
+
+
+@pytest.mark.asyncio
+async def test_create_if_absent_concurrent_callers_create_once(store: TeamConfigStore) -> None:
+    results = await asyncio.gather(
+        *(store.create_if_absent(_team("t1", name=f"n{i}")) for i in range(8))
+    )
+    assert sorted(results) == [False] * 7 + [True]
+    assert (await store.get("t1")).name == f"n{results.index(True)}"
 
 
 @pytest.mark.asyncio
@@ -163,6 +201,19 @@ CREATE TABLE team_config (
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 )
 """
+
+
+@pytest.mark.asyncio
+async def test_init_schema_on_a_given_connection_uses_it_and_opens_no_pool() -> None:
+    require_asyncpg()
+    from corp_llm_gateway.team_config.postgres_store import PostgresTeamConfigStore
+
+    async with scratch_schema_connection() as (conn, schema):
+        store = PostgresTeamConfigStore(pg_dsn())
+        await store.init_schema(conn)
+        await store.init_schema(conn)
+        assert store._pool is None
+        assert "team_config" in await schema_tables(conn, schema)
 
 
 @pytest.mark.asyncio

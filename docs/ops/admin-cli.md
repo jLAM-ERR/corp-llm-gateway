@@ -40,6 +40,18 @@ initialised database exits 0 and keeps every row. A connection or SQL failure
 exits 2 with the error type only (`error: db init failed: ConnectionRefusedError`):
 the DSN can carry a password, so it is never printed.
 
+It runs on one connection and holds the session advisory lock
+`pg_advisory_lock(7165071359132066409)` (`0x636F72705F646269`, "corp_dbi")
+while it applies both files, so concurrent runs take turns instead of
+deadlocking. It waits at most 60 s for that lock.
+
+Some schema statements (`ALTER TABLE … ADD COLUMN IF NOT EXISTS`, the
+`team_config` trigger's drop and create) take an `ACCESS EXCLUSIVE` table lock
+even when nothing changes. `db init` sets `lock_timeout` to 5 s for them: if a
+long transaction holds `corp_tokens` or `team_config`, it gives up with
+`error: db init failed: LockNotAvailableError` (exit 2) rather than queue every
+serving gateway's token lookups behind it. Re-run it when the table is free.
+
 ## `team`
 
 Manage per-team config (rules path, retention, fail-policy).
@@ -64,7 +76,9 @@ team-x   Team X  90        7           -
 `set-rules` / `set-retention` / `show` on an unknown team exit 2
 (`error: unknown team 'team-x'`); `create` on an existing team exits 2.
 With `--if-absent` it exits 0 instead and changes nothing
-(`team exists: team-x (unchanged)`), so a setup script can re-run it.
+(`team exists: team-x (unchanged)`), so a setup script can re-run it. The
+create is one atomic insert, so two concurrent `create` runs never overwrite an
+existing team's settings.
 
 ## `token`
 

@@ -128,12 +128,18 @@ class PostgresTeamConfigStore(TeamConfigStore):
     def _acquire(self, pool: Any) -> Any:
         return pool.acquire(timeout=_ACQUIRE_TIMEOUT_S)
 
-    async def init_schema(self) -> None:
-        """Apply schema.sql idempotently; safe on an already-initialised DB."""
-        pool = await self._get_pool()
+    async def init_schema(self, conn: Any = None) -> None:
+        """Apply schema.sql idempotently; safe on an already-initialised DB.
+
+        On ``conn`` when given (the caller owns its session settings and locks),
+        else on a pooled connection."""
         sql = _SCHEMA_SQL.read_text()
-        async with self._acquire(pool) as conn:
+        if conn is not None:
             await conn.execute(sql)
+            return
+        pool = await self._get_pool()
+        async with self._acquire(pool) as pooled:
+            await pooled.execute(sql)
 
     async def get(self, team_id: str) -> TeamConfig:
         # On the issuance route and the request path: bounded like issuance.
@@ -177,6 +183,27 @@ class PostgresTeamConfigStore(TeamConfigStore):
                 config.retention_cold_years,
                 _fail_policy_to_json(config.fail_policy),
             )
+
+    async def create_if_absent(self, config: TeamConfig) -> bool:
+        pool = await self._get_pool()
+        async with self._acquire(pool) as conn:
+            status: str = await conn.execute(
+                """
+                INSERT INTO team_config
+                    (team_id, name, replace_md_path, profile_ids,
+                     retention_hot_days, retention_cold_years, fail_policy)
+                VALUES ($1, $2, $3, $4::text[], $5, $6, $7::jsonb)
+                ON CONFLICT (team_id) DO NOTHING
+                """,
+                config.team_id,
+                config.name,
+                config.replace_md_path,
+                list(config.profile_ids),
+                config.retention_hot_days,
+                config.retention_cold_years,
+                _fail_policy_to_json(config.fail_policy),
+            )
+        return status == "INSERT 0 1"
 
     async def list_all(self) -> tuple[TeamConfig, ...]:
         pool = await self._get_pool()
