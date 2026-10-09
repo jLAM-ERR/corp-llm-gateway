@@ -1072,10 +1072,65 @@ def test_db_init_names_a_pooler_rejecting_startup_parameters(
     assert _DSN_PASSWORD not in captured.out + captured.err
 
 
+_SCHEMA_KNOWN_TABLES = frozenset({"corp_tokens", "team_config"})
+_SQL_TABLE = r'(?:ONLY\s+)?(?:"?\w+"?\.)?"?(?P<table>\w+)"?'
+# Every statement a schema file may hold, with the table it locks (None: no table).
+_SCHEMA_STATEMENT_SHAPES = (
+    rf"CREATE TABLE IF NOT EXISTS {_SQL_TABLE} \(.*\)",
+    rf"CREATE (?:UNIQUE )?INDEX IF NOT EXISTS \w+ ON {_SQL_TABLE} \(.*\)(?: WHERE .*)?",
+    rf"ALTER TABLE {_SQL_TABLE} ADD COLUMN IF NOT EXISTS [^,]+",
+    r"CREATE OR REPLACE FUNCTION \w+\(\) RETURNS TRIGGER AS \$\$.*\$\$ LANGUAGE plpgsql",
+    rf"DROP TRIGGER IF EXISTS \w+ ON {_SQL_TABLE}",
+    rf"CREATE TRIGGER \w+ (?:BEFORE|AFTER) (?:INSERT|UPDATE|DELETE) ON {_SQL_TABLE}"
+    r" FOR EACH ROW EXECUTE FUNCTION \w+\(\)",
+)
+
+
+def _sql_statements(sql: str) -> list[str]:
+    """Split on `;` outside quotes and $$ bodies, dropping `--` comments."""
+    statements: list[str] = []
+    current: list[str] = []
+    i, quote, dollar = 0, False, False
+    while i < len(sql):
+        ch = sql[i]
+        if not quote and not dollar and sql.startswith("--", i):
+            i = sql.find("\n", i) if "\n" in sql[i:] else len(sql)
+            continue
+        if not quote and sql.startswith("$$", i):
+            dollar = not dollar
+            current.append("$$")
+            i += 2
+            continue
+        if not dollar and ch == "'":
+            quote = not quote
+        if ch == ";" and not quote and not dollar:
+            statements.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    statements.append("".join(current))
+    return [" ".join(stmt.split()) for stmt in statements if stmt.strip()]
+
+
 def _schema_tables(sql: str) -> set[str]:
-    code = "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
-    pattern = r"\b(?:TABLE(?:\s+IF\s+(?:NOT\s+)?EXISTS)?|ON)\s+(\w+)"
-    return {name.lower() for name in re.findall(pattern, code, flags=re.IGNORECASE)}
+    tables: set[str] = set()
+    for statement in _sql_statements(sql):
+        for shape in _SCHEMA_STATEMENT_SHAPES:
+            match = re.fullmatch(shape, statement, flags=re.IGNORECASE | re.DOTALL)
+            if match is None:
+                continue
+            table = match.groupdict().get("table")
+            if table is None or table.lower() in _SCHEMA_KNOWN_TABLES:
+                if table is not None:
+                    tables.add(table.lower())
+                break
+        else:
+            raise ValueError(
+                f"unrecognised schema statement {statement[:80]!r}: re-check the db init "
+                "lock bound (admin._DB_INIT_MAX_TABLES_PER_TXN) and extend this allow-list"
+            )
+    return tables
 
 
 def test_db_init_ddl_lock_bound_stays_under_the_token_lookup_timeout() -> None:
@@ -1096,6 +1151,60 @@ def test_db_init_ddl_lock_bound_stays_under_the_token_lookup_timeout() -> None:
     assert worst_stall_s <= 0.75 * LOOKUP_TIMEOUT_S
 
 
+@pytest.mark.parametrize(
+    ("sql", "tables"),
+    [
+        pytest.param(
+            'ALTER TABLE ONLY public."corp_tokens" ADD COLUMN IF NOT EXISTS x TEXT;',
+            {"corp_tokens"},
+            id="quoted-qualified-only",
+        ),
+        pytest.param(
+            "-- a; comment\nCREATE INDEX IF NOT EXISTS i ON team_config (name) WHERE x = ';';",
+            {"team_config"},
+            id="comment-and-quoted-semicolon",
+        ),
+    ],
+)
+def test_schema_statement_allow_list_extracts_the_table(sql: str, tables: set[str]) -> None:
+    assert _schema_tables(sql) == tables
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param('ALTER TABLE "audit" ADD COLUMN IF NOT EXISTS x TEXT;', id="unknown-table"),
+        pytest.param(
+            "ALTER TABLE corp_tokens ADD COLUMN IF NOT EXISTS a TEXT, DROP COLUMN b;",
+            id="extra-alter-clause",
+        ),
+        pytest.param("DROP INDEX corp_tokens_user_id_idx;", id="drop-index"),
+        pytest.param("TRUNCATE corp_tokens;", id="truncate"),
+        pytest.param("LOCK TABLE team_config IN ACCESS EXCLUSIVE MODE;", id="lock"),
+        pytest.param("UPDATE corp_tokens SET revoked_at = now();", id="update"),
+        pytest.param("INSERT INTO team_config (team_id, name) VALUES ('a', 'b');", id="insert"),
+    ],
+)
+def test_schema_statement_allow_list_refuses_an_unknown_shape(sql: str) -> None:
+    with pytest.raises(ValueError, match="re-check the db init lock bound"):
+        _schema_tables(sql)
+
+
+async def _poll(conn: Any, sql: str, *, within_s: float = 10.0) -> None:
+    deadline = asyncio.get_running_loop().time() + within_s
+    while not await conn.fetchval(sql):
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"timed out waiting for: {sql}")
+        await asyncio.sleep(0.01)
+
+
+def _lock_sql(table: str, mode: str, *, granted: bool, pid: str) -> str:
+    return (
+        f"SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = '{table}'::regclass "
+        f"AND mode = '{mode}' AND granted = {str(granted).lower()} AND pid {pid})"
+    )
+
+
 def test_db_init_postgres_never_stalls_a_token_lookup_past_its_timeout(pg_empty_db: str) -> None:
     import time
 
@@ -1103,10 +1212,10 @@ def test_db_init_postgres_never_stalls_a_token_lookup_past_its_timeout(pg_empty_
 
     from corp_llm_gateway.cli import admin
     from corp_llm_gateway.tokens import PostgresTokenStore
+    from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
 
     dsn = pg_empty_db
     assert main(["db", "init"]) == 0
-    ddl_wait_s = admin._DB_INIT_DDL_LOCK_TIMEOUT_MS / 1000
 
     async def _run() -> float:
         holders = []
@@ -1116,34 +1225,45 @@ def test_db_init_postgres_never_stalls_a_token_lookup_past_its_timeout(pg_empty_
             await tx.start()
             await conn.fetch(f"SELECT 1 FROM {table} LIMIT 1")
             holders.append((conn, tx))
+        monitor = await asyncpg.connect(dsn, timeout=5.0)
         store = PostgresTokenStore(dsn)
         await store._get_pool()
         init = await asyncpg.connect(dsn, timeout=5.0)
+        pid = f"= {init.get_server_pid()}"
         try:
             task = asyncio.create_task(admin._apply_schemas(init, dsn))
-            await asyncio.sleep(0.3)
-
-            async def _release_corp_tokens_just_in_time() -> None:
-                # db init gets corp_tokens, then waits on team_config while holding it.
-                await asyncio.sleep(0.8 * ddl_wait_s - 0.3)
-                await holders[0][1].rollback()
-
-            release = asyncio.create_task(_release_corp_tokens_just_in_time())
+            # 1. db init queues for ACCESS EXCLUSIVE on corp_tokens.
+            await _poll(
+                monitor, _lock_sql("corp_tokens", "AccessExclusiveLock", granted=False, pid=pid)
+            )
             started = time.monotonic()
-            assert await store.lookup("no-such-token") is None
+            lookup = asyncio.create_task(store.lookup("no-such-token"))
+            # 2. The lookup queues behind it.
+            await _poll(
+                monitor,
+                _lock_sql("corp_tokens", "AccessShareLock", granted=False, pid=f"<> {pid[2:]}"),
+            )
+            await holders[0][1].rollback()
+            # 3. db init holds corp_tokens and queues for team_config, the lookup still behind.
+            await _poll(
+                monitor, _lock_sql("corp_tokens", "AccessExclusiveLock", granted=True, pid=pid)
+            )
+            await _poll(
+                monitor, _lock_sql("team_config", "AccessExclusiveLock", granted=False, pid=pid)
+            )
+            assert not lookup.done()
+            assert await lookup is None
             elapsed = time.monotonic() - started
-            await release
             with pytest.raises(asyncpg.exceptions.LockNotAvailableError):
                 await task
         finally:
             await holders[1][1].rollback()
             for conn, _ in holders:
                 await conn.close()
-            await init.close()
+            for conn in (init, monitor):
+                await conn.close()
             await store.close()
         return elapsed
-
-    from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
 
     assert asyncio.run(_run()) < LOOKUP_TIMEOUT_S
 
@@ -1174,14 +1294,16 @@ def _close_fails_on(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 def test_db_init_postgres_close_failure_after_success_still_succeeds(
     pg_empty_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    opened = _close_fails_on(monkeypatch)
-    assert main(["db", "init"]) == 0
-    captured = capsys.readouterr()
-    assert "db init: schema applied (corp_tokens, team_config)" in captured.out
-    assert captured.err == ""
-    assert opened
-    assert all(conn.is_closed() for conn in opened)
-    monkeypatch.undo()  # the fixture's teardown connections close normally
+    try:
+        opened = _close_fails_on(monkeypatch)
+        assert main(["db", "init"]) == 0
+        captured = capsys.readouterr()
+        assert "db init: schema applied (corp_tokens, team_config)" in captured.out
+        assert captured.err == ""
+        assert opened
+        assert all(conn.is_closed() for conn in opened)
+    finally:
+        monkeypatch.undo()  # the fixture's teardown connections close normally
 
 
 def test_db_init_postgres_close_failure_after_failure_reports_the_first_error(
@@ -1194,13 +1316,15 @@ def test_db_init_postgres_close_failure_after_failure_reports_the_first_error(
     async def _broken_init_schema(self: Any, conn: Any = None) -> None:
         raise asyncpg.exceptions.UndefinedTableError("boom")
 
-    monkeypatch.setattr(PostgresTeamConfigStore, "init_schema", _broken_init_schema)
-    opened = _close_fails_on(monkeypatch)
-    assert main(["db", "init"]) == 2
-    assert capsys.readouterr().err == "error: db init failed: UndefinedTableError\n"
-    assert opened
-    assert all(conn.is_closed() for conn in opened)
-    monkeypatch.undo()  # the fixture's teardown connections close normally
+    try:
+        monkeypatch.setattr(PostgresTeamConfigStore, "init_schema", _broken_init_schema)
+        opened = _close_fails_on(monkeypatch)
+        assert main(["db", "init"]) == 2
+        assert capsys.readouterr().err == "error: db init failed: UndefinedTableError\n"
+        assert opened
+        assert all(conn.is_closed() for conn in opened)
+    finally:
+        monkeypatch.undo()  # the fixture's teardown connections close normally
 
 
 def test_db_init_postgres_busy_on_the_second_transaction(

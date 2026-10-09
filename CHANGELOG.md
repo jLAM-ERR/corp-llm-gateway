@@ -28,9 +28,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`docs/ops/runbook.md`), else it fails with `StartupParameterRejectedError`. `lock_timeout`
   bounds each lock wait: 60 s for another `db init`
   (`another db init holds the lock (LockNotAvailableError)`) and 1.5 s for each table lock
-  (`LockNotAvailableError`). A re-run against serving gateways can stall their token lookups
-  for about 3 s at most (two table waits), under the 5 s lookup timeout; on a busy database it
-  fails fast with exit 2 and is safe to re-run. No DSN or no `postgres` extra exits 2 with a
+  (`LockNotAvailableError`). Lock waits can stall serving gateways' token lookups for about 3 s
+  at most (two table waits), under the 5 s lookup timeout; on a busy database it fails fast with
+  exit 2 and is safe to re-run. Work done once a lock is granted is not bounded and also blocks
+  lookups: the OIDC column and index builds on an upgrade from a pre-OIDC schema, or a slow
+  synchronous-replication `COMMIT` (see `docs/ops/admin-cli.md`). No DSN or no `postgres` extra exits 2 with a
   named message; a connection or SQL failure exits 2 with the error type only. The DSN is
   never printed.
 - **`team create --if-absent`** exits 0 and changes nothing when the team exists (without the

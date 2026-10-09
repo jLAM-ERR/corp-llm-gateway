@@ -69,6 +69,17 @@ tests/cli/test_admin.py::test_extensions_list_unknown_kind_rejected
 tests/cli/test_admin.py::test_extensions_read_verb_skips_rbac
 tests/cli/test_admin.py::test_missing_required_arg_errors
 tests/cli/test_admin.py::test_no_command_errors
+tests/cli/test_admin.py::test_schema_statement_allow_list_extracts_the_table
+tests/cli/test_admin.py::test_schema_statement_allow_list_extracts_the_table[comment-and-quoted-semicolon]
+tests/cli/test_admin.py::test_schema_statement_allow_list_extracts_the_table[quoted-qualified-only]
+tests/cli/test_admin.py::test_schema_statement_allow_list_refuses_an_unknown_shape
+tests/cli/test_admin.py::test_schema_statement_allow_list_refuses_an_unknown_shape[drop-index]
+tests/cli/test_admin.py::test_schema_statement_allow_list_refuses_an_unknown_shape[extra-alter-clause]
+tests/cli/test_admin.py::test_schema_statement_allow_list_refuses_an_unknown_shape[insert]
+tests/cli/test_admin.py::test_schema_statement_allow_list_refuses_an_unknown_shape[lock]
+tests/cli/test_admin.py::test_schema_statement_allow_list_refuses_an_unknown_shape[truncate]
+tests/cli/test_admin.py::test_schema_statement_allow_list_refuses_an_unknown_shape[unknown-table]
+tests/cli/test_admin.py::test_schema_statement_allow_list_refuses_an_unknown_shape[update]
 tests/cli/test_admin.py::test_team_backend_not_configured_errors
 tests/cli/test_admin.py::test_team_create_duplicate_errors
 tests/cli/test_admin.py::test_team_create_if_absent_creates_a_missing_team

@@ -71,9 +71,14 @@ create) take an `ACCESS EXCLUSIVE` lock even when nothing changes. While that
 lock waits, new queries on the table queue behind it. The token schema locks
 `corp_tokens` and then `team_config` in one transaction, so a token lookup can
 queue behind both waits: about 3 s at most, under the gateway's 5 s lookup
-timeout (the 1.5 s is derived from it). On a busy database `db init` therefore
-fails fast with `LockNotAvailableError` (exit 2) rather than stall the serving
-gateways; the failed transaction is rolled back, so re-running it is safe.
+timeout (the 1.5 s is derived from it). That bounds the lock waits only. Once a
+lock is granted, the work done under it also blocks lookups and `lock_timeout`
+does not bound it: on an upgrade from a schema without the OIDC columns, adding
+them and building their indexes on a large `corp_tokens`; or a slow `COMMIT`
+under synchronous replication. Run such an upgrade in a quiet window. On a busy
+database `db init` fails fast with `LockNotAvailableError` (exit 2) rather than
+stall the serving gateways; the failed transaction is rolled back, so re-running
+it is safe.
 
 ## `team`
 

@@ -61,7 +61,7 @@ python -m tests._gates.negative_logs --write   # then review every UNREVIEWED si
 
 Since Task 10 the two ledgers hold the must-keep ids only: 3,963 per environment (the pure
 filter of the 5,922 they held before gave 3,956; Task 10's three new classify tests added 7);
-3,972 at the 1.0.0 tag, 4,041 after plan 20261009 Tasks 1-2 (the `gateway-admin` additions).
+3,972 at the 1.0.0 tag, 4,050 after plan 20261009 Tasks 1-2 (the `gateway-admin` additions).
 A parametrised test is there as its cases, so the 457 function-level must-keep ids of
 parametrised tests have no line of their own.
 `ledger check` fails when a recorded id is missing, gains or loses a case, or changes
