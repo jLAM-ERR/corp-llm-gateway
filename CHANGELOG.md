@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [1.1.0]
+
+### Added — `gateway-admin` bootstrap for a fixed team token
+
+- **`token issue --value VALUE`** stores a value you choose instead of a random `ct_…` token
+  (for a fixed team token such as the Local setup's). The value is never printed or logged: plain
+  output has no `token:` line and `--json` omits it. It must be 16-256 printable ASCII characters
+  (0x21-0x7E) and must not start with `ct_` (reserved for generated tokens); otherwise it is a
+  usage error (exit 2) that names the flag and the reason, never the value. Re-issuing the same
+  value for the same user and team updates its `expires_at`; a value held by another user or
+  team, or a revoked value, is refused (exit 2). The global `--token` (operator JWT) and RBAC
+  are unchanged.
+- **`token list` masks a chosen value fully, as `***`**; a generated `ct_` token still shows
+  its first 8 chars.
+- **`--ttl-days` is validated on every `token issue`**: below 1, or past the year 9999, is a
+  usage error (exit 2).
+- **`gateway-admin db init`** applies the token and team-config schemas to the database
+  `CORP_LLM_PG_DSN` names. Idempotent, RBAC-gated. It runs on one connection under a session
+  advisory lock (waits at most 60 s), so concurrent runs take turns, and sets `lock_timeout`
+  to 5 s for the DDL, so a held table lock ends in exit 2 (`LockNotAvailableError`) instead of
+  queueing every serving gateway's token lookups. No DSN, no `postgres` extra, or a connection or
+  SQL failure exits 2 with the error type only — the DSN is never printed.
+- **`team create --if-absent`** exits 0 and changes nothing when the team exists (without the
+  flag it still exits 2). The create is now one atomic insert, so a concurrent `create` never
+  overwrites an existing team's settings.
+
 ## [1.0.0] — GA (2026-10-09)
 
 The first GA release — the **local-first detection cycle** (below) plus the **GA-readiness /
