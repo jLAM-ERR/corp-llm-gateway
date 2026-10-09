@@ -705,6 +705,11 @@ def _token_value_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(
             "must be printable ASCII (0x21-0x7E): no spaces, control or non-ASCII characters"
         )
+    # token list shows a ct_ token's prefix: only a generated token may carry one.
+    if value.startswith("ct_"):
+        raise argparse.ArgumentTypeError(
+            "must not start with 'ct_' (reserved for generated tokens)"
+        )
     return value
 
 

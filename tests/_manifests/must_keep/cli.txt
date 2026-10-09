@@ -107,6 +107,7 @@ tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_valu
 tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_value[control-char]
 tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_value[cyrillic]
 tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_value[empty]
+tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_value[generated-token-prefix]
 tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_value[newline]
 tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_value[space]
 tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_value[tab]

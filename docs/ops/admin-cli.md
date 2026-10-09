@@ -100,8 +100,9 @@ TOKEN      USER   TEAM    SCOPES  EXPIRES     REVOKED
 ct_9f3c1a…  alice  team-x  -       2026-08-07  no
 ```
 
-`token list` masks a random `ct_` token to its first 8 chars and a chosen
-(`--value`) token fully, as `***`. Revocation is bound to the ≤60 s
+`token list` masks a generated `ct_` token to its first 8 chars and a chosen
+(`--value`) token fully, as `***`. Only generated tokens start with `ct_`:
+`--value` refuses that prefix. Revocation is bound to the ≤60 s
 `AuthMiddleware` cache (see `runbook.md`).
 
 `--ttl-days` must be at least 1 and stay within the year 9999, on every
@@ -126,14 +127,17 @@ expires: 2026-11-08T12:00:00+00:00
 Pass the value through a variable (set from an env file or `read -rs`), never
 typed on the command line: a literal lands in your shell history. Even through a
 variable it is in the process's argv, visible to `ps` on the host, while the
-command runs.
+command runs. A misspelled flag (say `--vlaue`) makes argparse print the
+unrecognised arguments, the value among them, to stderr: check the command
+before you run it.
 
 - The value is never printed or logged. Plain output has no `token:` line;
   `--json` reports `user_id`, `team_id`, `scopes` and `expires_at` only.
 - Usage errors (exit 2, before any store call): a value that is not 16-256
   printable ASCII characters (0x21-0x7E: no spaces, control or non-ASCII
-  characters), or a bad `--ttl-days` (above). The message names the flag and the
-  reason, never the value.
+  characters), a value starting with `ct_` (reserved for generated tokens), or a
+  bad `--ttl-days` (above). The message names the flag and the reason, never
+  the value.
 - Re-running with the same value, user and team updates the row (new
   `expires_at`), so it is safe to repeat.
 - A value held by another user or team is refused (exit 2); the row is left as
@@ -143,6 +147,9 @@ command runs.
 - The revoked check and the write are two steps, not one transaction: a
   `token revoke` that runs while the same value is being re-issued can be
   overwritten by the re-issue. Check `token list` after revoking such a value.
+- The owner check is two steps as well (lookup, then upsert): two `token issue`
+  runs of the same value for different users or teams at the same time can both
+  pass the check, and the last write wins. Issue a value from one place only.
 - `token list` shows a chosen value as `***`, never a prefix of it.
 
 ## `extensions`

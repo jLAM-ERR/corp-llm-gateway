@@ -487,7 +487,7 @@ def test_token_issue_value_refuses_a_value_another_owner_holds(
 
 
 _ISSUE_PARSER_ERROR = "gateway-admin token issue: error: "
-_CHARSET = "printable ASCII (0x21-0x7E)"
+_CHARSET = "argument --value: must be printable ASCII (0x21-0x7E)"
 
 
 @pytest.mark.parametrize(
@@ -502,6 +502,12 @@ _CHARSET = "printable ASCII (0x21-0x7E)"
         pytest.param("local-team-token\x077Qx2", (), _CHARSET, id="control-char"),
         pytest.param("local-team-token\u200b7Qx2", (), _CHARSET, id="zero-width-format-char"),
         pytest.param("локальный-токен-команды", (), _CHARSET, id="cyrillic"),
+        pytest.param(
+            "ct_local-team-token-7Qx2",
+            (),
+            "argument --value: must not start with 'ct_'",
+            id="generated-token-prefix",
+        ),
         pytest.param(_VALUE, ("--ttl-days", "0"), "--ttl-days: must be at least 1", id="ttl-zero"),
         pytest.param(
             _VALUE, ("--ttl-days", "-1"), "--ttl-days: must be at least 1", id="ttl-negative"
