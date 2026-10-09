@@ -79,8 +79,12 @@ TOKEN      USER   TEAM    SCOPES  EXPIRES     REVOKED
 ct_9f3c1a…  alice  team-x  -       2026-08-07  no
 ```
 
-`token list` masks each token to its first 8 chars. Revocation is bound to the
-≤60 s `AuthMiddleware` cache (see `runbook.md`).
+`token list` masks a random `ct_` token to its first 8 chars and a chosen
+(`--value`) token fully, as `***`. Revocation is bound to the ≤60 s
+`AuthMiddleware` cache (see `runbook.md`).
+
+`--ttl-days` must be at least 1 and stay within the year 9999, on every
+`token issue`; otherwise it is a usage error (exit 2).
 
 ### `token issue --value`
 
@@ -98,16 +102,27 @@ issued corp token for user=local team=local (value from --value)
 expires: 2026-11-08T12:00:00+00:00
 ```
 
+Pass the value through a variable (set from an env file or `read -rs`), never
+typed on the command line: a literal lands in your shell history. Even through a
+variable it is in the process's argv, visible to `ps` on the host, while the
+command runs.
+
 - The value is never printed or logged. Plain output has no `token:` line;
   `--json` reports `user_id`, `team_id`, `scopes` and `expires_at` only.
-- Usage errors (exit 2, before any store call): a value shorter than 16 chars or
-  with whitespace / control characters, `--ttl-days` below 1, or a TTL past the
-  year 9999. The message names the flag, never the value.
-- Re-running with the same value updates the row (new `expires_at`), so it is
-  safe to repeat.
+- Usage errors (exit 2, before any store call): a value that is not 16-256
+  printable ASCII characters (0x21-0x7E: no spaces, control or non-ASCII
+  characters), or a bad `--ttl-days` (above). The message names the flag and the
+  reason, never the value.
+- Re-running with the same value, user and team updates the row (new
+  `expires_at`), so it is safe to repeat.
+- A value held by another user or team is refused (exit 2); the row is left as
+  it is. Pick a new value.
 - A revoked value is refused (exit 2): issuing it again would clear the
   revocation. Pick a new value instead.
-- `token list` still shows the value's first 8 chars, as for every token.
+- The revoked check and the write are two steps, not one transaction: a
+  `token revoke` that runs while the same value is being re-issued can be
+  overwritten by the re-issue. Check `token list` after revoking such a value.
+- `token list` shows a chosen value as `***`, never a prefix of it.
 
 ## `extensions`
 

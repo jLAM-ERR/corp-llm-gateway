@@ -516,6 +516,9 @@ async def _aclose(store: object) -> None:
 
 
 def _mask_token(token: str) -> str:
+    # A chosen (--value) token shows nothing: its prefix is a guessable part of the secret.
+    if not token.startswith("ct_"):
+        return "***"
     return f"{token[:8]}…" if len(token) > 8 else token
 
 
@@ -650,21 +653,35 @@ def _dispatch_team(args: argparse.Namespace) -> int:
 
 
 _MIN_TOKEN_VALUE_CHARS = 16
+_MAX_TOKEN_VALUE_CHARS = 256
 
 
-def _token_value_problem(value: str, ttl_days: int) -> str | None:
-    """Why ``token issue --value`` must refuse its arguments, or None. Never names the value."""
+def _token_value_arg(value: str) -> str:
+    """argparse type for ``--value``. Raises only ArgumentTypeError, whose message
+    argparse prints as is: any other exception would make it echo the value."""
     if len(value) < _MIN_TOKEN_VALUE_CHARS:
-        return f"--value must be at least {_MIN_TOKEN_VALUE_CHARS} characters"
-    if not value.isprintable() or any(ch.isspace() for ch in value):
-        return "--value must not contain whitespace or control characters"
-    if ttl_days < 1:
-        return "--ttl-days must be at least 1"
+        raise argparse.ArgumentTypeError(f"must be at least {_MIN_TOKEN_VALUE_CHARS} characters")
+    if len(value) > _MAX_TOKEN_VALUE_CHARS:
+        raise argparse.ArgumentTypeError(f"must be at most {_MAX_TOKEN_VALUE_CHARS} characters")
+    if not all("!" <= ch <= "~" for ch in value):
+        raise argparse.ArgumentTypeError(
+            "must be printable ASCII (0x21-0x7E): no spaces, control or non-ASCII characters"
+        )
+    return value
+
+
+def _ttl_days_arg(raw: str) -> int:
     try:
-        datetime.now(UTC) + timedelta(days=ttl_days)
+        days = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if days < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    try:
+        datetime.now(UTC) + timedelta(days=days)
     except OverflowError:
-        return "--ttl-days is too large"
-    return None
+        raise argparse.ArgumentTypeError("is too large") from None
+    return days
 
 
 async def _token_issue(store: TokenStore, args: argparse.Namespace) -> int:
@@ -677,6 +694,12 @@ async def _token_issue(store: TokenStore, args: argparse.Namespace) -> int:
             print(
                 "error: that token value was revoked and cannot be issued again; "
                 "choose a new value",
+                file=sys.stderr,
+            )
+            return 2
+        if existing is not None and (existing.user_id, existing.team_id) != (args.user, args.team):
+            print(
+                "error: that token value is held by another user or team; choose a new value",
                 file=sys.stderr,
             )
             return 2
@@ -843,13 +866,14 @@ def build_parser() -> argparse.ArgumentParser:
     token_issue.add_argument("--user", required=True)
     token_issue.add_argument("--team", required=True)
     token_issue.add_argument("--scopes", default="", help="comma-separated scopes")
-    token_issue.add_argument("--ttl-days", type=int, default=DEFAULT_TOKEN_TTL_DAYS)
+    token_issue.add_argument("--ttl-days", type=_ttl_days_arg, default=DEFAULT_TOKEN_TTL_DAYS)
     token_issue.add_argument(
         "--value",
         dest="corp_token_value",
+        type=_token_value_arg,
         default=None,
         metavar="VALUE",
-        help="use this token value instead of a random one (>= 16 chars; never printed)",
+        help="a chosen token value instead of a random one (16-256 printable ASCII; never printed)",
     )
     token_issue.add_argument("--json", dest="json_output", action="store_true")
 
@@ -915,12 +939,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    if args.command == "token" and args.token_command == "issue":
-        value = args.corp_token_value
-        problem = None if value is None else _token_value_problem(value, args.ttl_days)
-        if problem is not None:
-            parser.error(problem)
 
     if args.command == "team":
         return _dispatch_team(args)

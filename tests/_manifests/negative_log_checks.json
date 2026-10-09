@@ -2,7 +2,7 @@
  "about": "Hand-reviewed inventory of negative log checks (plan 20260926 Task 0). Discovery: python -m tests._gates.negative_logs; class is the reviewer's: security (into must-keep), behaviour, not-a-log-check.",
  "sites": [
   {
-   "site": "tests/cli/test_admin.py:256",
+   "site": "tests/cli/test_admin.py:274",
    "owner": "tests/cli/test_admin.py::_assert_value_absent",
    "check": "value not in caplog.text",
    "class": "security",
@@ -1055,6 +1055,7 @@
  "security_node_ids": [
   "tests/cli/test_admin.py::test_token_issue_value_never_reaches_stdout_stderr_or_logs",
   "tests/cli/test_admin.py::test_token_issue_value_refuses_a_revoked_value",
+  "tests/cli/test_admin.py::test_token_issue_value_refuses_a_value_another_owner_holds",
   "tests/cli/test_admin.py::test_token_issue_value_usage_errors_never_echo_the_value",
   "tests/corp_ner/test_client.py::test_never_logs_request_or_response_text",
   "tests/detectors/test_corp_ner.py::test_never_logs_request_or_response_text",
