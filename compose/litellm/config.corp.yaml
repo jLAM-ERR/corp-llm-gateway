@@ -1,0 +1,39 @@
+# Data-plane litellm config for the `corp` provider (the corp vLLM, no
+# subscription bridge). Mounted at /etc/litellm/config.yaml on the gateway-corp
+# service, which runs with neither CORP_LLM_FORWARD_*_AUTH flag.
+#
+# One route, `corp-*` -> hosted_vllm/ at the corp vLLM, and no `claude-*` /
+# `gpt-*` / `"*"`: nothing here can carry a request to Anthropic or OpenAI.
+model_list:
+  - model_name: "corp-*"
+    litellm_params:
+      # The corp vLLM exposes a single model; rewrite every corp-* inbound
+      # name to it. Keep this literal in sync with CORP_LLM_MODEL in .env
+      # (used by the gateway's own oracle client too) — see
+      # helm/corp-llm-gateway/values.yaml corpLlm.model for the k8s twin.
+      model: "hosted_vllm/GLM-5.1-AWQ"
+      api_base: "os.environ/CORP_LLM_ENDPOINT"
+      api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
+      # Claude Code sends max_tokens=64000 (Opus default); GLM-5.1-AWQ has a
+      # 65536-token window, so cap here to leave prompt headroom (matches
+      # helm/corp-llm-gateway values.yaml corpLlm.maxTokens).
+      max_tokens: 4096
+
+litellm_settings:
+  # The production composition root, resolved as a FILE under the mounted config
+  # dir (the shim at litellm/corp_llm_gateway/bootstrap.py). Reference the
+  # module-level INSTANCE (`guardrail`), not the class.
+  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+  # Claude Code sends modern Anthropic params the corp vLLM does not accept;
+  # drop them rather than 400-ing the request.
+  drop_params: true
+  # Emit AuditEvent JSON as single-line records.
+  json_logs: true
+general_settings:
+  # A second layer under the route gate's in-flight limiter, which owns the
+  # request cap (CORP_LLM_MAX_INFLIGHT) and cancels on disconnect itself.
+  # litellm's own parallel-request setting is not honoured — do not add it here.
+  cancel_on_disconnect: true
+  # What litellm loads from its database: models only. Never `policies` or
+  # `guardrails` — a DB row there could put a pipeline around our guardrail.
+  supported_db_objects: ["models"]

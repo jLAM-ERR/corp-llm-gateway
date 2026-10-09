@@ -1,0 +1,38 @@
+# Data-plane litellm config for the `codex` provider (ChatGPT/Codex subscription
+# passthrough). Mounted at /etc/litellm/config.yaml on the gateway-codex service,
+# which runs with CORP_LLM_FORWARD_CHATGPT_AUTH=1.
+#
+# The bridge lifts the developer's ChatGPT OAuth token into the per-request
+# api_key. This file is the binding control on where that token goes: one
+# route, and its api_base is a literal, not `os.environ/...`, so no environment
+# value can point the subscription token at another host. Codex picks the model
+# name (for example gpt-5.6-sol); the catch-all keeps it and only switches the
+# provider to the ChatGPT Responses endpoint.
+model_list:
+  # CODEX-ONLY BY DESIGN — do not add a second route here.
+  - model_name: "*"
+    litellm_params:
+      model: "openai/*"
+      api_base: "https://chatgpt.com/backend-api/codex"
+      # OpenAIConfig refuses to boot a deployment without an api_key. The
+      # guardrail replaces this with the developer's OAuth token per request.
+      # Deliberately not token-shaped: with the bridge off this fails upstream.
+      api_key: "oauth-passthrough-placeholder"
+
+litellm_settings:
+  # The production composition root, resolved as a FILE under the mounted config
+  # dir (the shim at litellm/corp_llm_gateway/bootstrap.py). Reference the
+  # module-level INSTANCE (`guardrail`), not the class.
+  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+  # Drop params the upstream does not accept rather than 400-ing the request.
+  drop_params: true
+  # Emit AuditEvent JSON as single-line records.
+  json_logs: true
+general_settings:
+  # A second layer under the route gate's in-flight limiter, which owns the
+  # request cap (CORP_LLM_MAX_INFLIGHT) and cancels on disconnect itself.
+  # litellm's own parallel-request setting is not honoured — do not add it here.
+  cancel_on_disconnect: true
+  # What litellm loads from its database: models only. Never `policies` or
+  # `guardrails` — a DB row there could put a pipeline around our guardrail.
+  supported_db_objects: ["models"]
