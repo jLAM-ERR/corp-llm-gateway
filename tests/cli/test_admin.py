@@ -977,6 +977,100 @@ def test_db_init_postgres_failure_after_connect_closes_and_names_the_type_only(
     assert asyncio.run(_lock_is_free())
 
 
+def test_db_init_postgres_leaves_no_session_state_behind(pg_empty_db: str) -> None:
+    import asyncpg
+
+    from corp_llm_gateway.cli import admin
+
+    async def _run() -> None:
+        conn = await asyncpg.connect(pg_empty_db, timeout=5.0)
+        try:
+            default = await conn.fetchval("SHOW lock_timeout")
+            await admin._apply_schemas(conn)
+            assert await conn.fetchval("SHOW lock_timeout") == default
+            assert not conn.is_in_transaction()
+            held = await conn.fetchval(
+                "SELECT count(*) FROM pg_locks "
+                "WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+            )
+            assert held == 0
+            tables = await conn.fetch(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+            )
+            assert {"corp_tokens", "team_config"} <= {r["table_name"] for r in tables}
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
+
+
+def test_db_init_postgres_gives_up_waiting_for_another_db_init(
+    pg_empty_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import threading
+    import time
+
+    import asyncpg
+
+    from corp_llm_gateway.cli import admin
+
+    monkeypatch.setattr(admin, "_DB_INIT_LOCK_WAIT_MS", 500)
+    held = threading.Event()
+    release = threading.Event()
+
+    def _hold_key() -> None:
+        async def _hold() -> None:
+            conn = await asyncpg.connect(pg_empty_db, timeout=5.0)
+            try:
+                await conn.execute("SELECT pg_advisory_lock($1)", admin._DB_INIT_LOCK_KEY)
+                held.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.05)
+            finally:
+                await conn.close()
+
+        asyncio.run(_hold())
+
+    holder = threading.Thread(target=_hold_key)
+    holder.start()
+    try:
+        assert held.wait(10)
+        started = time.monotonic()
+        rc = main(["db", "init"])
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        holder.join(10)
+    assert rc == 2
+    assert elapsed < 10
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "error: db init failed: another db init holds the lock (LockNotAvailableError)\n"
+    )
+    assert asyncio.run(_pg_table_names(pg_empty_db)) == set()
+
+
+def test_db_init_names_a_pooler_rejecting_startup_parameters(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    require_asyncpg()
+    from tests.postgres_support import RejectingPgBouncer
+
+    bouncer = RejectingPgBouncer()
+    try:
+        dsn = f"postgresql://gateway:{_DSN_PASSWORD}@127.0.0.1:{bouncer.port}/gateway"
+        monkeypatch.setenv("CORP_LLM_PG_DSN", dsn)
+        rc = main(["db", "init"])
+    finally:
+        bouncer.close()
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert captured.err == "error: db init failed: StartupParameterRejectedError\n"
+    assert _DSN_PASSWORD not in captured.out + captured.err
+
+
 def test_db_init_with_a_broken_asyncpg_names_the_extra(
     hermetic_gateway_config: None,
     tmp_path: Path,

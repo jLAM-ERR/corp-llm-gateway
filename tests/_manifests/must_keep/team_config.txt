@@ -1,5 +1,14 @@
 # Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
 # notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
+tests/team_config/test_postgres_store.py::test_create_if_absent_concurrent_callers_create_once
+tests/team_config/test_postgres_store.py::test_create_if_absent_concurrent_callers_create_once[in_memory]
+tests/team_config/test_postgres_store.py::test_create_if_absent_concurrent_callers_create_once[postgres]
+tests/team_config/test_postgres_store.py::test_create_if_absent_creates_a_missing_team
+tests/team_config/test_postgres_store.py::test_create_if_absent_creates_a_missing_team[in_memory]
+tests/team_config/test_postgres_store.py::test_create_if_absent_creates_a_missing_team[postgres]
+tests/team_config/test_postgres_store.py::test_create_if_absent_leaves_an_existing_team_unchanged
+tests/team_config/test_postgres_store.py::test_create_if_absent_leaves_an_existing_team_unchanged[in_memory]
+tests/team_config/test_postgres_store.py::test_create_if_absent_leaves_an_existing_team_unchanged[postgres]
 tests/team_config/test_postgres_store.py::test_init_schema_adds_profile_ids_to_preexisting_table
 tests/team_config/test_postgres_store.py::test_pg_a_pool_held_past_the_acquire_timeout_raises_timeout
 tests/team_config/test_store.py::test_default_fail_policy_matches_matrix

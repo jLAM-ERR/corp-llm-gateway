@@ -26,7 +26,7 @@ from corp_llm_gateway.auth.rbac import OperatorDenied, get_admin_token, verify_o
 from corp_llm_gateway.corp_llm import CorpLlmClient, CorpLlmHttpError
 from corp_llm_gateway.extensions import ExtensionKind, ExtensionRegistry, ExtensionSpec
 from corp_llm_gateway.payload import OversizeContentError
-from corp_llm_gateway.pg_session import KEEPALIVE_SERVER_SETTINGS
+from corp_llm_gateway.pg_session import connect_with_keepalives
 from corp_llm_gateway.rules import Rules, RulesLoader
 from corp_llm_gateway.sanitizer import SanitizationOrchestrator, SanitizeResult
 from corp_llm_gateway.sanitizer.engine import AllStrategiesFailedError
@@ -651,7 +651,8 @@ def _dispatch_team(args: argparse.Namespace) -> int:
         return 2
 
 
-# Session advisory lock serialising concurrent `db init` runs ("corp_dbi" in ASCII).
+# Transaction-scoped advisory lock serialising concurrent `db init` runs
+# ("corp_dbi" in ASCII). lock_timeout bounds the wait for it, then each DDL lock wait.
 _DB_INIT_LOCK_KEY = 0x636F72705F646269
 _DB_INIT_LOCK_WAIT_MS = 60_000
 # The schema's ALTER TABLE / DROP TRIGGER take ACCESS EXCLUSIVE even when nothing
@@ -661,24 +662,48 @@ _DB_INIT_CONNECT_TIMEOUT_S = 5.0
 _DB_INIT_CLOSE_TIMEOUT_S = 5.0
 
 
+class _DbInitLockBusyError(Exception):
+    pass
+
+
+async def _apply_schema(conn: Any, store: PostgresTokenStore | PostgresTeamConfigStore) -> None:
+    import asyncpg
+
+    # Only transaction-scoped settings and locks, and no bound parameters: nothing
+    # outlives the transaction, so this also holds behind a transaction-mode pooler.
+    async with conn.transaction():
+        await conn.execute(
+            f"SELECT set_config('lock_timeout', '{int(_DB_INIT_LOCK_WAIT_MS)}', true)"
+        )
+        try:
+            await conn.execute(f"SELECT pg_advisory_xact_lock({int(_DB_INIT_LOCK_KEY)})")
+        except asyncpg.exceptions.LockNotAvailableError:
+            raise _DbInitLockBusyError from None
+        await conn.execute(
+            f"SELECT set_config('lock_timeout', '{int(_DB_INIT_DDL_LOCK_TIMEOUT_MS)}', true)"
+        )
+        await store.init_schema(conn)
+
+
+async def _apply_schemas(conn: Any, dsn: str = "") -> None:
+    # One transaction per file, so corp_tokens' ACCESS EXCLUSIVE lock is released
+    # before team_config's DDL waits for its own.
+    await _apply_schema(conn, PostgresTokenStore(dsn))
+    await _apply_schema(conn, PostgresTeamConfigStore(dsn))
+
+
 async def _db_init(dsn: str) -> None:
     import asyncpg
 
-    conn = await asyncpg.connect(
-        dsn, timeout=_DB_INIT_CONNECT_TIMEOUT_S, server_settings=KEEPALIVE_SERVER_SETTINGS
-    )
+    conn = await connect_with_keepalives(asyncpg.connect, dsn, timeout=_DB_INIT_CONNECT_TIMEOUT_S)
     try:
-        await conn.execute(f"SET lock_timeout = {int(_DB_INIT_LOCK_WAIT_MS)}")
-        await conn.execute("SELECT pg_advisory_lock($1)", _DB_INIT_LOCK_KEY)
-        await conn.execute(f"SET lock_timeout = {int(_DB_INIT_DDL_LOCK_TIMEOUT_MS)}")
-        await PostgresTokenStore(dsn).init_schema(conn)
-        await PostgresTeamConfigStore(dsn).init_schema(conn)
+        await _apply_schemas(conn, dsn)
     finally:
-        # Closing the session releases the advisory lock.
         try:
             await conn.close(timeout=_DB_INIT_CLOSE_TIMEOUT_S)
-        except Exception:
+        except BaseException:
             conn.terminate()
+            raise
 
 
 def _dispatch_db(args: argparse.Namespace) -> int:
@@ -696,6 +721,12 @@ def _dispatch_db(args: argparse.Namespace) -> int:
         return 2
     try:
         asyncio.run(_db_init(dsn))
+    except _DbInitLockBusyError:
+        print(
+            "error: db init failed: another db init holds the lock (LockNotAvailableError)",
+            file=sys.stderr,
+        )
+        return 2
     except Exception as exc:
         # The DSN may carry a password and driver errors can quote it: name the type only.
         print(f"error: db init failed: {type(exc).__name__}", file=sys.stderr)

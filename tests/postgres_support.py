@@ -66,8 +66,10 @@ async def scratch_schema_connection() -> AsyncIterator[tuple[Any, str]]:
         finally:
             await conn.close()
     finally:
-        await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        await admin.close()
+        try:
+            await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            await admin.close()
 
 
 async def schema_tables(conn: Any, schema: str) -> set[str]:

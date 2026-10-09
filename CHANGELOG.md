@@ -10,26 +10,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added — `gateway-admin` bootstrap for a fixed team token
 
 - **`token issue --value VALUE`** stores a value you choose instead of a random `ct_…` token
-  (for a fixed team token such as the Local setup's). The value is never printed or logged: plain
-  output has no `token:` line and `--json` omits it. It must be 16-256 printable ASCII characters
-  (0x21-0x7E) and must not start with `ct_` (reserved for generated tokens); otherwise it is a
-  usage error (exit 2) that names the flag and the reason, never the value. Re-issuing the same
-  value for the same user and team updates its `expires_at`; a value held by another user or
-  team, or a revoked value, is refused (exit 2). The global `--token` (operator JWT) and RBAC
-  are unchanged.
+  (for a fixed team token such as the Local setup's). The value never appears in the command's
+  output or logs: plain output has no `token:` line and `--json` omits it. It does appear in the
+  process's argv, and a misspelled flag makes argparse echo it (see `docs/ops/admin-cli.md`).
+  It must be 16-256 printable ASCII characters (0x21-0x7E) and must not start with `ct_`
+  (reserved for generated tokens); otherwise it is a usage error (exit 2) that names the flag
+  and the reason, never the value. Re-issuing the same value for the same user and team
+  replaces its `expires_at`, `issued_at` and `scopes` (re-issuing without `--scopes` resets them
+  to the default, none). A value held by another user or team, or a revoked value, is refused
+  (exit 2); the check and the write are two steps, not one transaction (see
+  `docs/ops/admin-cli.md`). The global `--token` (operator JWT) and RBAC are unchanged.
+- **`gateway-admin db init`** applies the token and team-config schemas to the database
+  `CORP_LLM_PG_DSN` names. Idempotent, RBAC-gated. Each schema file runs in its own transaction
+  under a transaction-scoped advisory lock, so concurrent runs take turns, and it works through
+  a transaction-mode pooler (PgBouncer). `lock_timeout` bounds each lock wait: 60 s for another
+  `db init` (`another db init holds the lock (LockNotAvailableError)`), 5 s for each table lock
+  (`LockNotAvailableError`). A re-run against serving gateways can stall their token lookups
+  for up to about 5 s per transaction. No DSN or no `postgres` extra prints a named message; a
+  connection or SQL failure exits 2 with the error type only. The DSN is never printed.
+- **`team create --if-absent`** exits 0 and changes nothing when the team exists (without the
+  flag it still exits 2).
+
+### Changed — `gateway-admin`
+
 - **`token list` masks a chosen value fully, as `***`**; a generated `ct_` token still shows
   its first 8 chars.
-- **`--ttl-days` is validated on every `token issue`**: below 1, or past the year 9999, is a
-  usage error (exit 2).
-- **`gateway-admin db init`** applies the token and team-config schemas to the database
-  `CORP_LLM_PG_DSN` names. Idempotent, RBAC-gated. It runs on one connection under a session
-  advisory lock (waits at most 60 s), so concurrent runs take turns, and sets `lock_timeout`
-  to 5 s for the DDL, so a held table lock ends in exit 2 (`LockNotAvailableError`) instead of
-  queueing every serving gateway's token lookups. No DSN, no `postgres` extra, or a connection or
-  SQL failure exits 2 with the error type only — the DSN is never printed.
-- **`team create --if-absent`** exits 0 and changes nothing when the team exists (without the
-  flag it still exits 2). The create is now one atomic insert, so a concurrent `create` never
-  overwrites an existing team's settings.
+- **`--ttl-days` is validated on every `token issue`**, random or `--value`: below 1, or past
+  the year 9999, is a usage error (exit 2).
+- **`team create` is one atomic insert**, so a concurrent `create` never overwrites an existing
+  team's settings.
 
 ## [1.0.0] — GA (2026-10-09)
 

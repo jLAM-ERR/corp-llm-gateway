@@ -36,21 +36,38 @@ db init: schema applied (corp_tokens, team_config)
 
 Applies the token and team-config schemas (the `schema.sql` files the wheel
 ships) to the database `CORP_LLM_PG_DSN` names. Idempotent: re-running it on an
-initialised database exits 0 and keeps every row. A connection or SQL failure
-exits 2 with the error type only (`error: db init failed: ConnectionRefusedError`):
-the DSN can carry a password, so it is never printed.
+initialised database exits 0 and keeps every row.
 
-It runs on one connection and holds the session advisory lock
-`pg_advisory_lock(7165071359132066409)` (`0x636F72705F646269`, "corp_dbi")
-while it applies both files, so concurrent runs take turns instead of
-deadlocking. It waits at most 60 s for that lock.
+Errors (all exit 2):
 
-Some schema statements (`ALTER TABLE … ADD COLUMN IF NOT EXISTS`, the
-`team_config` trigger's drop and create) take an `ACCESS EXCLUSIVE` table lock
-even when nothing changes. `db init` sets `lock_timeout` to 5 s for them: if a
-long transaction holds `corp_tokens` or `team_config`, it gives up with
-`error: db init failed: LockNotAvailableError` (exit 2) rather than queue every
-serving gateway's token lookups behind it. Re-run it when the table is free.
+- No `CORP_LLM_PG_DSN`, or the `postgres` extra missing or broken: a named
+  message (`error: db init requires Postgres: set CORP_LLM_PG_DSN`,
+  `error: db init requires asyncpg: install the 'postgres' extra`).
+- A connection or SQL failure: the error type only
+  (`error: db init failed: ConnectionRefusedError`). The DSN can carry a
+  password, so it is never printed. A pooler that refuses the connection's
+  keepalive startup parameters gives `StartupParameterRejectedError`.
+- Another `db init` holds the lock past the wait (below):
+  `error: db init failed: another db init holds the lock (LockNotAvailableError)`.
+- A table lock not granted within `lock_timeout` (below):
+  `error: db init failed: LockNotAvailableError`. Re-run it when the table is free.
+
+Each schema file is applied in its own transaction, the token schema first.
+Each transaction takes the advisory lock
+`pg_advisory_xact_lock(7165071359132066409)` (`0x636F72705F646269`, "corp_dbi"),
+so concurrent runs take turns instead of deadlocking. Settings and locks are
+transaction-scoped (`set_config(..., true)`, no session `SET`) and no statement
+uses bound parameters, so `db init` also works through a transaction-mode
+pooler such as PgBouncer and leaves nothing set on the server session.
+
+`lock_timeout` bounds each lock wait: 60 s for the advisory lock, then 5 s for
+each table lock the schema statements need. Some of them
+(`ALTER TABLE … ADD COLUMN IF NOT EXISTS`, the `team_config` trigger's drop and
+create) take an `ACCESS EXCLUSIVE` lock even when nothing changes. While that
+lock waits, new queries on the table queue behind it, so a re-run against
+serving gateways can stall their token lookups for up to about 5 s per
+transaction; a lock it cannot get in 5 s ends the run (exit 2) instead of
+stalling them longer.
 
 ## `team`
 
@@ -145,15 +162,16 @@ command runs. A misspelled flag (say `--vlaue`) makes argparse print the
 unrecognised arguments, the value among them, to stderr: check the command
 before you run it.
 
-- The value is never printed or logged. Plain output has no `token:` line;
-  `--json` reports `user_id`, `team_id`, `scopes` and `expires_at` only.
+- The command never prints or logs the value (its argv is another matter, above).
+  Plain output has no `token:` line; `--json` reports `user_id`, `team_id`, `scopes` and `expires_at` only.
 - Usage errors (exit 2, before any store call): a value that is not 16-256
   printable ASCII characters (0x21-0x7E: no spaces, control or non-ASCII
   characters), a value starting with `ct_` (reserved for generated tokens), or a
   bad `--ttl-days` (above). The message names the flag and the reason, never
   the value.
-- Re-running with the same value, user and team updates the row (new
-  `expires_at`), so it is safe to repeat.
+- Re-running with the same value, user and team replaces the row's
+  `expires_at`, `issued_at` and `scopes`, so it is safe to repeat. Pass the same
+  `--scopes` again: re-issuing without it resets them to the default (none).
 - A value held by another user or team is refused (exit 2); the row is left as
   it is. Pick a new value.
 - A revoked value is refused (exit 2): issuing it again would clear the

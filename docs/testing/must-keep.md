@@ -331,8 +331,11 @@ claims accepted; HS256, forged, expired, wrong audience / issuer, missing role r
 never drops a secret's label), `deploy/test_bootstrap_server_script.py::test_env_file_contents_are_never_read_or_printed`
 and its `deploy/test_deploy_script.py` twin, the five NEVER-field tests of
 `audit/test_logger.py` (`test_assert_no_never_fields_*` ×4 and
-`test_never_fields_set_includes_critical_keys`, lines 135-163 at `807831a`), and the four
-e2e security checks of the open finding above.
+`test_never_fields_set_includes_critical_keys`, lines 135-163 at `807831a`), the four
+e2e security checks of the open finding above, and the three `create_if_absent` contract
+tests of `team_config/test_postgres_store.py` (`test_create_if_absent_*`, both stores:
+`team create` relies on them never overwriting an existing team; added by plan 20261009
+Task 2).
 
 **Security-policy defaults** that look trivial: `test_config.py::test_corp_llm_verify_defaults_to_true`,
 `test_settings.py::test_forward_anthropic_auth_defaults_off`, `::test_route_gate_extras_default_to_empty`,
