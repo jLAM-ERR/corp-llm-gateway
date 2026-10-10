@@ -64,7 +64,9 @@ filter of the 5,922 they held before gave 3,956; Task 10's three new classify te
 3,972 at the 1.0.0 tag, 4,050 after plan 20261009 Tasks 1-2 (the `gateway-admin` additions),
 4,091 after its Task 5 (one gateway per provider: 43 approved must-keep deletions, listed in
 [deleted-tests.md](deleted-tests.md), and the new provider, profile-guard and upstream tests),
-4,109 after the Task 5 review fixes (additions only).
+4,109 after the Task 5 review fixes (additions only), 4,145 after its Task 6 (the container suite
+on provider fixtures: 56 approved must-keep deletions in [deleted-tests.md](deleted-tests.md), 81
+re-parametrised cases and the new corp-token and corp-bearer tests).
 A parametrised test is there as its cases, so the 457 function-level must-keep ids of
 parametrised tests have no line of their own.
 `ledger check` fails when a recorded id is missing, gains or loses a case, or changes

@@ -283,6 +283,8 @@
   "tests/compose/test_providers.py::test_the_merged_stack_mounts_the_oauth_config_as_the_only_litellm_config": "tests/compose/test_oauth_overlay.py::test_the_merged_stack_mounts_the_oauth_config_as_the_only_litellm_config",
   "tests/compose/test_providers.py::test_the_merged_stack_arms_the_bridge_and_injects_no_master_key": "tests/compose/test_oauth_overlay.py::test_the_merged_stack_arms_the_bridge_and_injects_no_master_key",
   "tests/test_litellm_config_guards.py::test_compose_litellm_has_no_database_to_read_a_config_table_from": "tests/test_litellm_config_guards.py::test_compose_litellm_reads_its_config_table",
-  "tests/compose/test_nginx_runtime.py::test_the_allow_list_holds_under_both_routings_on_the_subscription_stack": "tests/compose/test_nginx_runtime.py::test_the_allow_list_holds_under_both_routings_and_the_oauth_overlay"
+  "tests/compose/test_nginx_runtime.py::test_the_allow_list_holds_under_both_routings_on_the_subscription_stack": "tests/compose/test_nginx_runtime.py::test_the_allow_list_holds_under_both_routings_and_the_oauth_overlay",
+  "tests/integration/test_route_gate_container.py::test_every_generation_route_is_rewritten": "tests/integration/test_route_gate_container.py::test_mode_a_rewrites_every_generation_route",
+  "tests/integration/test_route_gate_container.py::test_anthropic_rewrites_messages_with_the_developers_own_token": "tests/integration/test_route_gate_container.py::test_mode_b_rewrites_messages_with_the_developers_own_token"
  }
 }

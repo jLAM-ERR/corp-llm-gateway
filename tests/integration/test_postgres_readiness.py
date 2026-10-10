@@ -109,7 +109,7 @@ def test_run_sql_does_not_retry_a_missing_database(
 ) -> None:
     # A config bug, not a timing one: retrying would hide it.
     monkeypatch.setenv("FAKE_FAILURES", "99")
-    monkeypatch.setenv("FAKE_STDERR", 'psql: error: FATAL:  database "litellm" does not exist')
+    monkeypatch.setenv("FAKE_STDERR", 'psql: error: FATAL:  database "gateway" does not exist')
 
     with pytest.raises(pytest.fail.Exception, match="does not exist"):
         harness._run_sql("pg", "SELECT 1;")

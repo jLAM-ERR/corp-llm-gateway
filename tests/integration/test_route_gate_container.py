@@ -1,4 +1,4 @@
-"""The route gate on the real gateway image, in both auth modes.
+"""The route gate on the real gateway image, once per provider.
 
 Every other route-gate test reads the table, the classifier or the middleware in
 process. This one runs the image the cluster runs — ``python -m
@@ -7,25 +7,24 @@ corp_llm_gateway.serve`` inside ``Dockerfile.gateway`` — on a docker network w
 only reachable upstream. A refusal that leaked would show up as a capture in the
 stub's log; there is nowhere else for it to go.
 
-Two modes, the two the deployment supports:
+Three providers, the three the compose stack runs (``compose/litellm/config.*.yaml``),
+each its own gateway with no ``LITELLM_MASTER_KEY`` and no litellm database:
 
-* **Mode A** — litellm virtual keys, a **test posture only** since the admin
-  surface (``/key/*`` included) is refused. ``LITELLM_MASTER_KEY`` is set,
-  Postgres is attached so the entrypoint's Prisma schema sequence runs, and
-  requests carry a synthetic ``sk-…`` key whose sha256 is inserted straight into
-  litellm's ``LiteLLM_VerificationToken`` — litellm authenticates by that hash.
-* **Mode B** — Anthropic subscription (OAuth) passthrough. No master key at all
-  (``settings.master_key_conflict`` refuses the combination), one native
-  ``anthropic/`` route, and the developer's own bearer as the credential.
+* **anthropic** — Claude Code subscription passthrough: one native ``anthropic/``
+  route and ``CORP_LLM_FORWARD_ANTHROPIC_AUTH=1``; the developer's own bearer is
+  the upstream credential.
+* **codex** — ChatGPT/Codex subscription passthrough: the ``"*"`` -> ``openai/*``
+  catch-all and ``CORP_LLM_FORWARD_CHATGPT_AUTH=1``.
+* **corp** — the corp vLLM: ``corp-*`` -> ``hosted_vllm/``, no bridge, the route's
+  own ``CORP_LLM_AUTH_TOKEN`` (empty, as compose ships it).
 
-Both carry ``X-Corp-Auth``; the gate runs before litellm's auth, so a refusal here
+All carry ``X-Corp-Auth``; the gate runs before litellm's auth, so a refusal here
 is provably the gate's and not a 401.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import re
 import socket
@@ -54,41 +53,29 @@ from tests.integration.conftest import (
 CANARY = "route.gate.canary.a41f@corp.lan"
 
 CORP_TOKEN = "route-gate-team-token"
-MASTER_KEY = "sk-corp-route-gate-master"
-# Seeded, never minted: POST /key/generate is refused by the gate.
-VIRTUAL_KEY = "sk-corp-route-gate-virtual-7c2e"
-# Obvious fake; the `sk-ant-oat` prefix is the only part litellm reads.
+# What a client sends to litellm's admin surface. No gateway sets a master key,
+# so litellm itself would accept any bearer — or none — there.
+ADMIN_BEARER = "sk-corp-route-gate-admin-probe"
+# Obvious fakes; the `sk-ant-oat` prefix is the only part litellm reads.
 OAUTH_TOKEN = "sk-ant-oat01-fake-route-gate-container"
+# Shaped like a ChatGPT OAuth access token (a JWT); the codex bridge takes any bearer.
+CHATGPT_TOKEN = (
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJzdWIiOiJyb3V0ZS1nYXRlLWNvZGV4In0."
+    "ZmFrZS1yb3V0ZS1nYXRlLWNvZGV4LXNpZw"
+)
+# What the corp client files send: an explicit, non-subscription bearer.
+CORP_CLIENT_BEARER = "corp-route-gate-client"
 
 ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"
 OPENAI_MODEL = "gpt-4o-mini"
+CORP_MODEL = "corp-glm"
 
 STUB_BASE = "http://stub:8000"
 
-MODE_A_CONFIG = f"""
-model_list:
-  - model_name: "claude-*"
-    litellm_params:
-      model: "anthropic/{ANTHROPIC_MODEL}"
-      api_base: "{STUB_BASE}"
-      api_key: "stub-anthropic-key"
-  - model_name: "gpt-*"
-    litellm_params:
-      model: "openai/{OPENAI_MODEL}"
-      api_base: "{STUB_BASE}/v1"
-      api_key: "stub-openai-key"
-litellm_settings:
-  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
-  drop_params: true
-  json_logs: true
-general_settings:
-  # As the shipped configs pin it: litellm loads models, never policies/guardrails.
-  supported_db_objects: ["models"]
-"""
-
-# The shape compose/litellm/config.oauth.yaml ships: one native anthropic route,
-# no catch-all, no gateway-held key.
-MODE_B_CONFIG = f"""
+# The shape compose/litellm/config.anthropic.yaml ships: one native anthropic
+# route, no catch-all, no gateway-held key.
+ANTHROPIC_CONFIG = f"""
 model_list:
   - model_name: "claude-*"
     litellm_params:
@@ -100,6 +87,43 @@ litellm_settings:
   drop_params: true
   json_logs: true
 general_settings:
+  cancel_on_disconnect: true
+  supported_db_objects: ["models"]
+"""
+
+# compose/litellm/config.codex.yaml with the stub as its one api_base.
+CODEX_CONFIG = f"""
+model_list:
+  - model_name: "*"
+    litellm_params:
+      model: "openai/*"
+      api_base: "{STUB_BASE}/v1"
+      api_key: "oauth-passthrough-placeholder"
+litellm_settings:
+  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+  drop_params: true
+  json_logs: true
+general_settings:
+  cancel_on_disconnect: true
+  supported_db_objects: ["models"]
+"""
+
+# compose/litellm/config.corp.yaml verbatim in its routing and credential: the
+# api_base and api_key are read from the environment the compose service sets.
+CORP_CONFIG = """
+model_list:
+  - model_name: "corp-*"
+    litellm_params:
+      model: "hosted_vllm/GLM-5.1-AWQ"
+      api_base: "os.environ/CORP_LLM_ENDPOINT"
+      api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
+      max_tokens: 4096
+litellm_settings:
+  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
+  drop_params: true
+  json_logs: true
+general_settings:
+  cancel_on_disconnect: true
   supported_db_objects: ["models"]
 """
 
@@ -133,12 +157,14 @@ BASE_ENV = {
 
 
 @dataclass
-class Mode:
-    """A running stack plus the credentials that mode authenticates with."""
+class Provider:
+    """A running stack plus the bearer and the generation route its client uses."""
 
     name: str
     stack: Stack
     key: str
+    path: str
+    payload: dict[str, Any]
 
     def headers(self, **extra: str) -> dict[str, str]:
         return {
@@ -164,15 +190,15 @@ class Mode:
 
 
 def _raw_get(
-    mode: Mode, path: str, *, extra_headers: tuple[tuple[str, str], ...] = ()
+    provider: Provider, path: str, *, extra_headers: tuple[tuple[str, str], ...] = ()
 ) -> tuple[int, str]:
     """A GET written byte by byte, so the request line reaches uvicorn verbatim."""
-    url = httpx.URL(mode.stack.base_url)
+    url = httpx.URL(provider.stack.base_url)
     lines = [
         f"GET {path} HTTP/1.1",
         f"Host: {url.host}:{url.port}",
         "Connection: close",
-        f"Authorization: Bearer {mode.key}",
+        f"Authorization: Bearer {provider.key}",
         f"X-Corp-Auth: {CORP_TOKEN}",
         *(f"{name}: {value}" for name, value in extra_headers),
     ]
@@ -215,42 +241,67 @@ def _write(tmp_path_factory: pytest.TempPathFactory, name: str, text: str) -> Pa
     return path
 
 
-@pytest.fixture(scope="module")
-def mode_a(gateway_image: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Mode]:
-    config = _write(tmp_path_factory, "route-gate-a", MODE_A_CONFIG)
-    env = {**BASE_ENV, "LITELLM_MASTER_KEY": MASTER_KEY}
-    with running_stack(gateway_image, config, env, with_postgres=True) as stack:
-        _seed_virtual_key(stack, VIRTUAL_KEY)
-        yield Mode(name="A", stack=stack, key=VIRTUAL_KEY)
+def _messages(model: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": f"escalate to {CANARY}"}],
+    }
 
 
-def _seed_virtual_key(stack: Stack, key: str) -> None:
-    """What ``POST /key/generate`` used to write, minus everything with a default.
-
-    litellm hashes an ``sk-`` bearer with sha256 and looks the hex digest up as
-    ``LiteLLM_VerificationToken.token`` (``proxy/auth/user_api_key_auth.py:1895-1906``).
-    The insert only succeeds once the entrypoint's Prisma sequence built the table.
-    """
-    digest = hashlib.sha256(key.encode()).hexdigest()
-    stack.psql(
-        'INSERT INTO "LiteLLM_VerificationToken" (token, key_alias, models, expires) '
-        f"VALUES ('{digest}', 'route-gate-mode-a', ARRAY['claude-*', 'gpt-*'], "
-        "now() + interval '1 hour')"
-    )
+def _chat(model: str) -> dict[str, Any]:
+    return {"model": model, "messages": [{"role": "user", "content": f"escalate to {CANARY}"}]}
 
 
 @pytest.fixture(scope="module")
-def mode_b(gateway_image: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Mode]:
-    config = _write(tmp_path_factory, "route-gate-b", MODE_B_CONFIG)
-    # No LITELLM_MASTER_KEY at all: present-but-empty is still a conflict.
+def provider_anthropic(
+    gateway_image: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Provider]:
+    config = _write(tmp_path_factory, "route-gate-anthropic", ANTHROPIC_CONFIG)
     env = {**BASE_ENV, "CORP_LLM_FORWARD_ANTHROPIC_AUTH": "1"}
     with running_stack(gateway_image, config, env) as stack:
-        yield Mode(name="B", stack=stack, key=OAUTH_TOKEN)
+        yield Provider("anthropic", stack, OAUTH_TOKEN, "/v1/messages", _messages(ANTHROPIC_MODEL))
 
 
-@pytest.fixture(params=["mode_a", "mode_b"])
-def mode(request: pytest.FixtureRequest) -> Mode:
-    return request.getfixturevalue(request.param)
+@pytest.fixture(scope="module")
+def provider_codex(
+    gateway_image: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Provider]:
+    config = _write(tmp_path_factory, "route-gate-codex", CODEX_CONFIG)
+    env = {**BASE_ENV, "CORP_LLM_FORWARD_CHATGPT_AUTH": "1"}
+    with running_stack(gateway_image, config, env) as stack:
+        yield Provider(
+            "codex",
+            stack,
+            CHATGPT_TOKEN,
+            "/v1/responses",
+            {"model": OPENAI_MODEL, "input": f"escalate to {CANARY}"},
+        )
+
+
+CORP_ENV = {
+    **BASE_ENV,
+    "CORP_LLM_ENDPOINT": f"{STUB_BASE}/v1",
+    # What compose passes when .env leaves it blank: `${CORP_LLM_AUTH_TOKEN:-}`.
+    "CORP_LLM_AUTH_TOKEN": "",
+}
+
+
+@pytest.fixture(scope="module")
+def provider_corp(
+    gateway_image: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Provider]:
+    config = _write(tmp_path_factory, "route-gate-corp", CORP_CONFIG)
+    with running_stack(gateway_image, config, CORP_ENV) as stack:
+        yield Provider("corp", stack, CORP_CLIENT_BEARER, "/v1/chat/completions", _chat(CORP_MODEL))
+
+
+PROVIDERS = ("anthropic", "codex", "corp")
+
+
+@pytest.fixture(params=PROVIDERS)
+def provider(request: pytest.FixtureRequest) -> Provider:
+    return request.getfixturevalue(f"provider_{request.param}")
 
 
 # ── the harness's own premise: the gateway has no route off the network ──────
@@ -266,13 +317,13 @@ _NETWORK_ERRORS = ("OSError", "gaierror", "timed out", "Network is unreachable")
 
 
 @pytest.mark.parametrize("probe", [_CONNECT_PROBE, _DNS_PROBE], ids=["connect", "dns"])
-def test_the_gateway_container_cannot_reach_the_internet(mode: Mode, probe: str) -> None:
+def test_the_gateway_container_cannot_reach_the_internet(provider: Provider, probe: str) -> None:
     # Everything else in this file reads "the stub saw nothing" as "nothing
     # leaked". That only holds while the gateway's only network is `--internal`:
     # if docker ever attached a default bridge as well, a refusal that leaked
     # would reach the real provider and every assertion here would still pass.
     control = docker(
-        "exec", mode.stack.gateway, "/app/.venv/bin/python", "-c", "print(1)", timeout=60
+        "exec", provider.stack.gateway, "/app/.venv/bin/python", "-c", "print(1)", timeout=60
     )
     assert control.returncode == 0, (
         f"`docker exec` itself cannot run in this container, so the probe below "
@@ -280,7 +331,9 @@ def test_the_gateway_container_cannot_reach_the_internet(mode: Mode, probe: str)
     )
     assert control.stdout.strip() == "1"
 
-    result = docker("exec", mode.stack.gateway, "/app/.venv/bin/python", "-c", probe, timeout=60)
+    result = docker(
+        "exec", provider.stack.gateway, "/app/.venv/bin/python", "-c", probe, timeout=60
+    )
 
     assert result.returncode != 0, (
         f"the gateway container reached off its network: {probe}\n{result.stdout}"
@@ -317,66 +370,18 @@ def test_a_config_without_the_callback_exits_70(
         assert wait_for_exit(name, timeout=300) == 70
 
 
-def test_mode_a_ran_the_prisma_schema_setup_at_boot(mode_a: Mode) -> None:
-    # DATABASE_URL is set, so the entrypoint replicates the CLI's Prisma
-    # sequence; the seeded key row reading back proves the schema is there.
-    # The line is read as a JSON record, not as a substring: this config sets
-    # `json_logs: true` and Vector parses this stdout, so a boot line that is
-    # plain text there is a defect of its own.
-    messages = [
-        record.get("message")
-        for record in _json_log_records(mode_a.stack.gateway_logs())
-        if isinstance(record, dict)
-    ]
-
-    assert "prisma schema setup complete" in messages
-
-    digest = hashlib.sha256(mode_a.key.encode()).hexdigest()
-    stored = mode_a.stack.psql(
-        f"SELECT count(*) FROM \"LiteLLM_VerificationToken\" WHERE token = '{digest}'"
-    )
-    assert stored == "1"
-
-
-def test_mode_a_authenticates_the_seeded_key_and_refuses_an_unknown_one(mode_a: Mode) -> None:
-    # The seeded row is what admits the request: the same call with a key litellm
-    # has no row for is a 401 from litellm's own auth, and reaches no provider.
-    payload = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "ping"}],
-    }
-    mode_a.stack.mark()
-
-    admitted = mode_a.post("/v1/messages", payload)
-
-    assert admitted.status_code == 200, admitted.text
-    assert len(mode_a.stack.new_captures()) == 1
-
-    mode_a.stack.mark()
-    stranger = httpx.post(
-        f"{mode_a.stack.base_url}/v1/messages",
-        json=payload,
-        headers={**mode_a.headers(), "Authorization": "Bearer sk-corp-route-gate-unknown"},
-        timeout=90,
-    )
-
-    assert stranger.status_code == 401, stranger.text
-    assert mode_a.stack.new_captures() == []
-
-
 _ACCESS_LINE = re.compile(r'"(GET|POST|HEAD) \S+ HTTP/1\.1" \d{3}')
 
 
-def test_uvicorns_own_lines_are_json_records_too(mode: Mode) -> None:
+def test_uvicorns_own_lines_are_json_records_too(provider: Provider) -> None:
     # Vector parses this container's stdout record by record, so uvicorn's
     # access and error lines have to be JSON as well — that is what `serve.py`
     # passes litellm's JSON `log_config` for. A plain access line would be an
     # unparseable record between parseable ones.
-    probe = httpx.get(f"{mode.stack.base_url}/healthz/live", timeout=60)
+    probe = httpx.get(f"{provider.stack.base_url}/healthz/live", timeout=60)
     assert probe.status_code == 200
 
-    logs = mode.stack.gateway_logs()
+    logs = provider.stack.gateway_logs()
     records = [record for record in _json_log_records(logs) if isinstance(record, dict)]
 
     access = [r for r in records if _ACCESS_LINE.search(str(r.get("message", "")))]
@@ -393,7 +398,30 @@ def test_uvicorns_own_lines_are_json_records_too(mode: Mode) -> None:
     )
 
 
-# ── the bypass routes: refused, in both modes ────────────────────────────────
+# ── who may use the gateway at all ───────────────────────────────────────────
+
+
+def test_an_unknown_corp_token_is_refused_and_reaches_no_provider(provider: Provider) -> None:
+    # No provider has litellm key auth any more: X-Corp-Auth is the only thing
+    # that admits a request, on every provider's own generation route.
+    unknown = "route-gate-unknown-team-token"
+    provider.stack.mark()
+
+    response = httpx.post(
+        f"{provider.stack.base_url}{provider.path}",
+        json=provider.payload,
+        headers=provider.headers(**{"X-Corp-Auth": unknown}),
+        timeout=90,
+    )
+
+    assert response.status_code == 401, response.text
+    assert "E_TOKEN_INVALID" in response.text
+    assert unknown not in response.text
+    assert CANARY not in response.text
+    assert provider.stack.new_captures() == []
+
+
+# ── the bypass routes: refused, on every provider ────────────────────────────
 
 BYPASS_ROUTES: tuple[tuple[str, dict[str, Any]], ...] = (
     (
@@ -426,28 +454,28 @@ BYPASS_ROUTES: tuple[tuple[str, dict[str, Any]], ...] = (
 
 @pytest.mark.parametrize("path,payload", BYPASS_ROUTES, ids=[row[0] for row in BYPASS_ROUTES])
 def test_the_bypass_routes_are_refused_and_reach_no_provider(
-    mode: Mode, path: str, payload: dict[str, Any]
+    provider: Provider, path: str, payload: dict[str, Any]
 ) -> None:
-    mode.stack.mark()
-    before = mode.stack.block_count("route_gate_listed")
+    provider.stack.mark()
+    before = provider.stack.block_count("route_gate_listed")
 
-    response = mode.post(path, payload)
+    response = provider.post(path, payload)
 
     assert response.status_code == 403, response.text
     body = response.json()
     assert body["error"]["code"] == "E_ROUTE_BLOCKED"
     assert body["error"]["reason"] == "route_gate_listed"
     assert CANARY not in response.text
-    assert mode.stack.new_captures() == []
-    assert mode.stack.block_count("route_gate_listed") > before
+    assert provider.stack.new_captures() == []
+    assert provider.stack.block_count("route_gate_listed") > before
 
 
-def test_a_refusal_is_audited_without_a_never_field(mode_a: Mode) -> None:
-    mode_a.post("/v1/messages/count_tokens", {"model": ANTHROPIC_MODEL, "messages": []})
+def test_a_refusal_is_audited_without_a_never_field(provider_anthropic: Provider) -> None:
+    provider_anthropic.post("/v1/messages/count_tokens", {"model": ANTHROPIC_MODEL, "messages": []})
 
     blocked = [
         record
-        for record in mode_a.stack.audit_records()
+        for record in provider_anthropic.stack.audit_records()
         if record.get("block_reason") == "route_gate_listed"
     ]
 
@@ -464,16 +492,16 @@ WEBSOCKET_PATHS = ("/v1/responses", "/v1/realtime", "/openai/v1/realtime")
 
 
 @pytest.mark.parametrize("path", WEBSOCKET_PATHS)
-def test_a_websocket_handshake_is_refused(mode: Mode, path: str) -> None:
+def test_a_websocket_handshake_is_refused(provider: Provider, path: str) -> None:
     # Every `response.create` frame after a successful handshake would never
     # reach the hook, so the handshake itself is where this has to end.
     # A raw socket, not httpx: httpx rewrites `Connection`, so uvicorn would
     # never build a websocket scope and the request would arrive as plain HTTP.
-    mode.stack.mark()
+    provider.stack.mark()
     key = base64.b64encode(uuid.uuid4().bytes).decode()
 
     status, body = _raw_get(
-        mode,
+        provider,
         path,
         extra_headers=(
             ("Connection", "Upgrade"),
@@ -485,7 +513,7 @@ def test_a_websocket_handshake_is_refused(mode: Mode, path: str) -> None:
 
     assert status == 403, body
     assert json.loads(body)["error"]["reason"] == "route_gate_websocket"
-    assert mode.stack.new_captures() == []
+    assert provider.stack.new_captures() == []
 
 
 REFUSED_POSTS: tuple[tuple[str, dict[str, Any], int, str], ...] = (
@@ -523,16 +551,16 @@ REFUSED_POSTS: tuple[tuple[str, dict[str, Any], int, str], ...] = (
     "path,payload,status,reason", REFUSED_POSTS, ids=[row[0] for row in REFUSED_POSTS]
 )
 def test_the_no_rewrite_and_unlisted_routes_are_refused(
-    mode: Mode, path: str, payload: dict[str, Any], status: int, reason: str
+    provider: Provider, path: str, payload: dict[str, Any], status: int, reason: str
 ) -> None:
-    mode.stack.mark()
+    provider.stack.mark()
 
-    response = mode.post(path, payload)
+    response = provider.post(path, payload)
 
     assert response.status_code == status, response.text
     assert response.json()["error"]["reason"] == reason
     assert CANARY not in response.text
-    assert mode.stack.new_captures() == []
+    assert provider.stack.new_captures() == []
 
 
 MALFORMED_PATHS = (
@@ -543,79 +571,129 @@ MALFORMED_PATHS = (
 
 
 @pytest.mark.parametrize("path", MALFORMED_PATHS)
-def test_a_malformed_path_is_refused_with_its_own_reason(mode_a: Mode, path: str) -> None:
+def test_a_malformed_path_is_refused_with_its_own_reason(
+    provider_anthropic: Provider, path: str
+) -> None:
     # Raw again: httpx normalises `..` out of the path before it leaves, so the
     # request line uvicorn parses has to be written by hand — that is also what
     # an attacker sends.
-    mode_a.stack.mark()
+    provider_anthropic.stack.mark()
 
-    status, body = _raw_get(mode_a, path)
+    status, body = _raw_get(provider_anthropic, path)
 
     assert status == 403, body
     assert json.loads(body)["error"]["reason"] == "route_gate_malformed"
-    assert mode_a.stack.new_captures() == []
+    assert provider_anthropic.stack.new_captures() == []
 
 
 # ── the routes that must keep working ────────────────────────────────────────
 
 
-def test_mode_a_rewrites_every_generation_route(mode_a: Mode) -> None:
+def test_every_generation_route_is_rewritten(
+    provider_anthropic: Provider, provider_codex: Provider, provider_corp: Provider
+) -> None:
+    # Each provider's own client routes: Claude Code's messages (and the chat
+    # adapter) on anthropic, Codex's responses on codex, and both shapes on corp.
     calls = (
+        (provider_anthropic, "/v1/messages", _messages(ANTHROPIC_MODEL)),
+        (provider_anthropic, "/v1/chat/completions", _chat(ANTHROPIC_MODEL)),
         (
-            "/v1/messages",
-            {
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 64,
-                "messages": [{"role": "user", "content": f"escalate to {CANARY}"}],
-            },
+            provider_codex,
+            "/v1/responses",
+            {"model": OPENAI_MODEL, "input": f"escalate to {CANARY}"},
         ),
-        (
-            "/v1/chat/completions",
-            {
-                "model": OPENAI_MODEL,
-                "messages": [{"role": "user", "content": f"escalate to {CANARY}"}],
-            },
-        ),
-        ("/v1/responses", {"model": OPENAI_MODEL, "input": f"escalate to {CANARY}"}),
+        (provider_corp, "/v1/chat/completions", _chat(CORP_MODEL)),
+        (provider_corp, "/v1/messages", _messages(CORP_MODEL)),
     )
-    for path, payload in calls:
-        mode_a.stack.mark()
+    for provider, path, payload in calls:
+        where = f"{provider.name} {path}"
+        provider.stack.mark()
 
-        response = mode_a.post(path, payload)
+        response = provider.post(path, payload)
 
-        assert response.status_code == 200, f"{path}: {response.text}"
-        captured = mode_a.stack.new_captures()
-        assert len(captured) == 1, f"{path}: {captured}"
+        assert response.status_code == 200, f"{where}: {response.text}"
+        captured = provider.stack.new_captures()
+        assert len(captured) == 1, f"{where}: {captured}"
         sent = json.dumps(captured[0]["body"])
-        assert CANARY not in sent, f"{path} put the original on the wire"
-        assert "EMAIL" in sent, f"{path} sent no placeholder: {sent[:400]}"
+        assert CANARY not in sent, f"{where} put the original on the wire"
+        assert "EMAIL" in sent, f"{where} sent no placeholder: {sent[:400]}"
 
 
-def test_mode_b_rewrites_messages_with_the_developers_own_token(mode_b: Mode) -> None:
-    mode_b.stack.mark()
+def test_anthropic_rewrites_messages_with_the_developers_own_token(
+    provider_anthropic: Provider,
+) -> None:
+    provider_anthropic.stack.mark()
 
-    response = mode_b.post(
-        "/v1/messages",
-        {
-            "model": ANTHROPIC_MODEL,
-            "max_tokens": 64,
-            "messages": [{"role": "user", "content": f"escalate to {CANARY}"}],
-        },
-    )
+    response = provider_anthropic.post("/v1/messages", _messages(ANTHROPIC_MODEL))
 
     assert response.status_code == 200, response.text
-    captured = mode_b.stack.new_captures()
+    captured = provider_anthropic.stack.new_captures()
     assert len(captured) == 1, captured
     assert CANARY not in json.dumps(captured[0]["body"])
     assert "EMAIL" in json.dumps(captured[0]["body"])
-    # The bridge is what makes this Mode B: the developer's bearer is the
-    # upstream credential, and the corp identity header never egresses.
+    # The bridge: the developer's bearer is the upstream credential, and the
+    # corp identity header never egresses.
     headers = captured[0]["headers"]
     assert OAUTH_TOKEN in json.dumps(headers)
     assert "x-corp-auth" not in headers
 
 
-def test_streaming_is_not_buffered_by_the_gate(mode_a: Mode) -> None:
+# A subscription bearer sent to the corp gateway by a misconfigured client. The
+# corp provider has no bridge, so nothing may lift it into the upstream call.
+CORP_PROBE_BEARERS = {
+    "anthropic-oauth": "sk-ant-oat01-fake-corp-bearer-probe",
+    "chatgpt-jwt": (
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiJjb3JwLWJlYXJlci1wcm9iZSJ9."
+        "ZmFrZS1jb3JwLWJlYXJlci1wcm9iZS1zaWc"
+    ),
+}
+CORP_PROBE_LITELLM_KEY = "sk-corp-route-gate-litellm-key-probe"
+
+
+@pytest.mark.parametrize(
+    "litellm_key_header", [False, True], ids=["bearer-only", "with-x-litellm-api-key"]
+)
+@pytest.mark.parametrize("bearer", list(CORP_PROBE_BEARERS), ids=list(CORP_PROBE_BEARERS))
+@pytest.mark.parametrize(
+    "path,payload",
+    [("/v1/chat/completions", _chat(CORP_MODEL)), ("/v1/messages", _messages(CORP_MODEL))],
+    ids=["/v1/chat/completions", "/v1/messages"],
+)
+def test_a_subscription_bearer_never_reaches_the_corp_upstream(
+    provider_corp: Provider,
+    path: str,
+    payload: dict[str, Any],
+    bearer: str,
+    litellm_key_header: bool,
+) -> None:
+    # `x-litellm-api-key` moves litellm's idea of which header authenticated the
+    # caller off `Authorization`, which is what makes its header cleaner keep an
+    # Anthropic OAuth bearer. The stub records every header line it got, so a
+    # second Authorization next to the route's own would show up here.
+    token = CORP_PROBE_BEARERS[bearer]
+    headers = provider_corp.headers(Authorization=f"Bearer {token}")
+    if litellm_key_header:
+        headers["x-litellm-api-key"] = CORP_PROBE_LITELLM_KEY
+    provider_corp.stack.mark()
+
+    response = httpx.post(
+        f"{provider_corp.stack.base_url}{path}", json=payload, headers=headers, timeout=90
+    )
+
+    assert response.status_code == 200, response.text
+    captured = provider_corp.stack.new_captures()
+    assert len(captured) == 1, captured
+    authorization = [
+        value for name, value in captured[0]["raw_headers"] if name.lower() == "authorization"
+    ]
+    assert len(authorization) == 1, authorization
+    assert token not in json.dumps(captured[0])
+    assert CORP_PROBE_LITELLM_KEY not in json.dumps(captured[0])
+    assert "x-corp-auth" not in captured[0]["headers"]
+
+
+def test_streaming_is_not_buffered_by_the_gate(provider_anthropic: Provider) -> None:
     # The stub waits between SSE events; a middleware that buffered the body
     # would deliver them all at once at the end.
     arrivals: list[float] = []
@@ -624,14 +702,9 @@ def test_streaming_is_not_buffered_by_the_gate(mode_a: Mode) -> None:
         httpx.Client(timeout=120) as client,
         client.stream(
             "POST",
-            f"{mode_a.stack.base_url}/v1/messages",
-            headers=mode_a.headers(),
-            json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 64,
-                "stream": True,
-                "messages": [{"role": "user", "content": f"escalate to {CANARY}"}],
-            },
+            f"{provider_anthropic.stack.base_url}/v1/messages",
+            headers=provider_anthropic.headers(),
+            json={**_messages(ANTHROPIC_MODEL), "stream": True},
         ) as response,
     ):
         assert response.status_code == 200
@@ -654,39 +727,47 @@ PASSTHROUGH_GETS = (
 
 
 @pytest.mark.parametrize("path", PASSTHROUGH_GETS)
-def test_the_passthrough_routes_answer(mode_a: Mode, path: str) -> None:
-    assert mode_a.get(path).status_code == 200
+def test_the_passthrough_routes_answer(provider_anthropic: Provider, path: str) -> None:
+    assert provider_anthropic.get(path).status_code == 200
 
 
-def test_head_follows_get_on_a_gateway_owned_route(mode_a: Mode) -> None:
+def test_head_follows_get_on_a_gateway_owned_route(provider_anthropic: Provider) -> None:
     response = httpx.head(
-        f"{mode_a.stack.base_url}/healthz/live", headers=mode_a.headers(), timeout=60
+        f"{provider_anthropic.stack.base_url}/healthz/live",
+        headers=provider_anthropic.headers(),
+        timeout=60,
     )
 
     assert response.status_code == 200
     assert response.content == b""
 
 
-def test_head_reaches_litellm_on_a_passthrough_route(mode_a: Mode) -> None:
+def test_head_reaches_litellm_on_a_passthrough_route(provider_anthropic: Provider) -> None:
     # The gate's rule is that HEAD inherits its path's GET verdict. litellm then
     # answers 405, because FastAPI's APIRoute — unlike a plain Starlette Route —
     # does NOT add HEAD to a GET route. That is litellm's answer, not a refusal.
     response = httpx.head(
-        f"{mode_a.stack.base_url}/health/liveliness", headers=mode_a.headers(), timeout=60
+        f"{provider_anthropic.stack.base_url}/health/liveliness",
+        headers=provider_anthropic.headers(),
+        timeout=60,
     )
 
     assert response.status_code == 405
     assert "E_ROUTE_BLOCKED" not in response.text
 
 
-def test_metrics_is_scrapable_without_a_litellm_credential(mode_a: Mode) -> None:
-    # litellm's PrometheusAuthMiddleware 401s any path containing /metrics when a
-    # master key is set, and it wraps the router — so the gateway-owned route has
-    # to sit above it, or Helm's ServiceMonitor could never scrape.
-    response = httpx.get(f"{mode_a.stack.base_url}/metrics", timeout=60)
+def test_metrics_is_scrapable_without_a_litellm_credential(provider_anthropic: Provider) -> None:
+    # /metrics is gateway-owned and answered above litellm's app, so Helm's
+    # ServiceMonitor scrapes it with no credential at all. litellm's own
+    # exporter (its `litellm_*` series, behind PrometheusAuthMiddleware) must
+    # never be what answers here.
+    response = httpx.get(f"{provider_anthropic.stack.base_url}/metrics", timeout=60)
 
     assert response.status_code == 200, response.text
     assert "corp_llm_gateway_blocked_requests_total" in response.text
+    series = [line for line in response.text.splitlines() if line and not line.startswith("#")]
+    assert series
+    assert not [line for line in series if line.startswith("litellm_")], series[:5]
 
 
 ADMIN_SURFACE: tuple[tuple[str, str], ...] = (
@@ -704,17 +785,17 @@ ADMIN_SURFACE: tuple[tuple[str, str], ...] = (
 
 
 @pytest.mark.parametrize("method,path", ADMIN_SURFACE, ids=[f"{m} {p}" for m, p in ADMIN_SURFACE])
-def test_the_litellm_admin_surface_is_refused(mode: Mode, method: str, path: str) -> None:
-    # The master key is the strongest litellm credential there is; the gate
-    # answers before litellm's auth ever reads it.
-    mode.stack.mark()
+def test_the_litellm_admin_surface_is_refused(provider: Provider, method: str, path: str) -> None:
+    # With no master key litellm accepts an empty identity on its management
+    # routes, so the gate is the only thing between any bearer and them.
+    provider.stack.mark()
 
     response = httpx.request(
         method,
-        f"{mode.stack.base_url}{path}",
+        f"{provider.stack.base_url}{path}",
         json={"models": ["claude-*"], "text": CANARY} if method != "GET" else None,
         headers={
-            "Authorization": f"Bearer {MASTER_KEY}",
+            "Authorization": f"Bearer {ADMIN_BEARER}",
             "X-Corp-Auth": CORP_TOKEN,
             "content-type": "application/json",
         },
@@ -725,15 +806,17 @@ def test_the_litellm_admin_surface_is_refused(mode: Mode, method: str, path: str
     assert response.json()["error"]["code"] == "E_ROUTE_BLOCKED"
     assert response.json()["error"]["reason"] == "route_gate_listed"
     assert CANARY not in response.text
-    assert mode.stack.new_captures() == []
+    assert provider.stack.new_captures() == []
 
 
-def test_nothing_reached_a_provider_the_gate_refused(mode_a: Mode, mode_b: Mode) -> None:
+def test_nothing_reached_a_provider_the_gate_refused(
+    provider_anthropic: Provider, provider_codex: Provider, provider_corp: Provider
+) -> None:
     # The whole point of the egress-blocked network: the stub is the only thing
-    # reachable, so this is the complete list of what left the gateway.
-    for stack in (mode_a.stack, mode_b.stack):
-        for capture in stack.stub_captures():
-            assert CANARY not in json.dumps(capture), capture["path"]
+    # reachable, so this is the complete list of what left each gateway.
+    for provider in (provider_anthropic, provider_codex, provider_corp):
+        for capture in provider.stack.stub_captures():
+            assert CANARY not in json.dumps(capture), (provider.name, capture["path"])
             assert "/count_tokens" not in capture["path"]
             assert "/input_tokens" not in capture["path"]
 
@@ -742,7 +825,7 @@ def test_nothing_reached_a_provider_the_gate_refused(mode_a: Mode, mode_b: Mode)
 
 
 def test_background_responses_are_sanitized_but_their_round_trip_is_unsupported(
-    mode_a: Mode,
+    provider_codex: Provider,
 ) -> None:
     """``background: true`` re-runs under a different request id.
 
@@ -753,22 +836,22 @@ def test_background_responses_are_sanitized_but_their_round_trip_is_unsupported(
     a new id has no mapping to undo. Background responses are therefore recorded
     as unsupported (the Task 3 note's second option), not as a leak.
     """
-    mode_a.stack.mark()
+    provider_codex.stack.mark()
 
-    created = mode_a.post(
+    created = provider_codex.post(
         "/v1/responses",
         {"model": OPENAI_MODEL, "input": f"escalate to {CANARY}", "background": True},
     )
 
     assert created.status_code in (200, 400, 500), created.text
     assert "E_ROUTE_BLOCKED" not in created.text
-    for capture in mode_a.stack.new_captures():
+    for capture in provider_codex.stack.new_captures():
         assert CANARY not in json.dumps(capture["body"])
 
     if created.status_code != 200:
         # skip_or_fail, not pytest.skip: on a machine where this harness must
         # run, a silently skipped half of the round trip is not a passed gate.
         skip_or_fail(f"litellm refused the background request itself: {created.text[:200]}")
-    polled = mode_a.get(f"/v1/responses/{created.json()['id']}")
+    polled = provider_codex.get(f"/v1/responses/{created.json()['id']}")
     assert "E_ROUTE_BLOCKED" not in polled.text
     assert CANARY not in polled.text

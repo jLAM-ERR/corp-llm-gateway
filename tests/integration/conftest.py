@@ -155,7 +155,7 @@ class Stack:
             "-U",
             "gw",
             "-d",
-            "litellm",
+            POSTGRES_DB,
             "-v",
             "ON_ERROR_STOP=1",
             "-At",
@@ -206,13 +206,14 @@ def _wait_for_health(stack: Stack) -> None:
 
 
 POSTGRES_IMAGE = "postgres:16-alpine"
-POSTGRES_DSN = "postgresql://gw:gw@pg:5432/litellm"
+# The gateway's own database (tokens, team config, issuance). litellm gets none.
+POSTGRES_DB = "gateway"
 POSTGRES_BOOT_SECONDS = 120
 
 POSTGRES_INIT_DONE = "PostgreSQL init process complete; ready for start up."
 POSTGRES_READY = "database system is ready to accept connections"
 # Only a server that is not (or no longer) listening; any other psql error,
-# `database "litellm" does not exist` included, is a real failure.
+# `database "gateway" does not exist` included, is a real failure.
 PSQL_TRANSIENT_ERRORS = (
     "Connection refused",
     "server closed the connection unexpectedly",
@@ -228,7 +229,7 @@ def postgres_init_done(log: str) -> bool:
     ``POSTGRES_DB`` and run the init scripts, stops it, then starts the real
     one. Both answer ``pg_isready``, so the probe alone can pass on the
     temporary server. Two CI failures came from that window: psql connecting
-    before ``POSTGRES_DB`` existed (``database "litellm" does not exist``), and
+    before ``POSTGRES_DB`` existed (``database "gateway" does not exist``), and
     psql connecting just as the temporary server shut down (``server closed
     the connection unexpectedly``). The final server's ready line only follows
     the init marker, so this gate closes both.
@@ -268,13 +269,12 @@ def _start_postgres(name: str, network: str) -> None:
             "-e",
             "POSTGRES_PASSWORD=gw",
             "-e",
-            "POSTGRES_DB=litellm",
+            f"POSTGRES_DB={POSTGRES_DB}",
             POSTGRES_IMAGE,
         ],
     )
-    # The entrypoint runs the Prisma schema sequence at import, so the database
-    # has to answer before the gateway starts or the boot warns and continues
-    # with no schema.
+    # The gateway probes its store at boot, and `postgres_sql` seeds a schema,
+    # so the database has to answer before either.
     deadline = time.monotonic() + POSTGRES_BOOT_SECONDS
     while time.monotonic() < deadline:
         if (
@@ -290,7 +290,7 @@ def _run_sql(name: str, sql: str) -> None:
     """Retries only a server that is not listening, for a bounded window: a
     restart after the init gate above passed. Any other error fails at once.
     One transaction, so a retry never re-runs half-applied SQL."""
-    psql = ["psql", "-U", "gw", "-d", "litellm", "-v", "ON_ERROR_STOP=1", "--single-transaction"]
+    psql = ["psql", "-U", "gw", "-d", POSTGRES_DB, "-v", "ON_ERROR_STOP=1", "--single-transaction"]
     for attempt in range(1, RUN_SQL_ATTEMPTS + 1):
         result = subprocess.run(
             ["docker", "exec", "-i", name, *psql],
@@ -330,7 +330,6 @@ def running_stack(
     gateway = f"corp-rg-gw-{suffix}"
     relay = f"corp-rg-relay-{suffix}"
     postgres = f"corp-rg-pg-{suffix}"
-    extra: list[str] = []
 
     created = docker("network", "create", "--internal", network, timeout=60)
     if created.returncode != 0:
@@ -353,7 +352,6 @@ def running_stack(
         )
         if with_postgres:
             _start_postgres(postgres, network)
-            extra = ["-e", f"DATABASE_URL={POSTGRES_DSN}"]
             if postgres_sql is not None:
                 _run_sql(postgres, postgres_sql)
         _run_detached(
@@ -366,7 +364,6 @@ def running_stack(
                 "-v",
                 f"{config_path}:/etc/litellm/config.yaml:ro",
                 *_env_args(env),
-                *extra,
                 *gateway_args,
                 image,
             ],

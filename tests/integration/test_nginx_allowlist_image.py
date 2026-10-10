@@ -197,7 +197,7 @@ ISSUANCE_ENV = {
     "CORP_GATEWAY_ISSUE_OIDC_ISSUER": ISSUER,
     "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE": "corp-gateway-issuance",
     "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID": "corp-gateway-cli",
-    "CORP_LLM_PG_DSN": "postgresql://gw:gw@pg:5432/litellm",
+    "CORP_LLM_PG_DSN": "postgresql://gw:gw@pg:5432/gateway",
 }
 
 
