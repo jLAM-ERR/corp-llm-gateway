@@ -319,7 +319,7 @@ def _running_stack(image: str, upstream: _CaptureServer, *, bridge: bool) -> Ite
         _require_upstream_reachable(name, upstream_port)
         yield _Stack(name=name, base_url=base_url, upstream=upstream)
     finally:
-        _docker("rm", "-f", name, timeout=120)
+        _docker("rm", "-f", "-v", name, timeout=120)
 
 
 @pytest.fixture(scope="module")

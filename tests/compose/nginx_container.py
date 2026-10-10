@@ -215,7 +215,7 @@ def started(
             running.ports[target] = int(mapped.rsplit(":", 1)[1])
         yield running
     finally:
-        docker("rm", "-f", running.name)
+        docker("rm", "-f", "-v", running.name)
 
 
 def wait_until_healthy(running: Running) -> None:

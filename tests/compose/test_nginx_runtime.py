@@ -198,7 +198,7 @@ def launched_stub(network: Network) -> Iterator[Stub]:
             time.sleep(0.2)
         yield stub
     finally:
-        docker("rm", "-f", stub.name)
+        docker("rm", "-f", "-v", stub.name)
 
 
 @pytest.fixture(scope="module")
@@ -262,7 +262,7 @@ def run_to_exit(
     try:
         return docker(*argv, timeout=EXIT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        docker("rm", "-f", name)
+        docker("rm", "-f", "-v", name)
         pytest.fail("the entrypoint did not exit: nginx started on a config it should refuse")
 
 
@@ -2507,7 +2507,7 @@ def tls_terminator(
         }
         yield Terminator(name, address, ports)
     finally:
-        docker("rm", "-f", name)
+        docker("rm", "-f", "-v", name)
 
 
 @pytest.mark.parametrize("routing", ["host", "port"])

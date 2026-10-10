@@ -376,7 +376,7 @@ def running_stack(
         _wait_for_health(stack)
         yield stack
     finally:
-        docker("rm", "-f", stub, gateway, relay, postgres, timeout=240)
+        docker("rm", "-f", "-v", stub, gateway, relay, postgres, timeout=240)
         docker("network", "rm", network, timeout=60)
 
 
@@ -394,7 +394,7 @@ def booting_gateway(image: str, config_path: Path | str, env: Mapping[str, str])
         _run_detached(name, [*args, image])
         yield name
     finally:
-        docker("rm", "-f", name, timeout=120)
+        docker("rm", "-f", "-v", name, timeout=120)
         docker("network", "rm", network, timeout=60)
 
 
