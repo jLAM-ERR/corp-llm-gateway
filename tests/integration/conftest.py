@@ -144,29 +144,6 @@ class Stack:
                     records.append(record)
         return records
 
-    def psql(self, sql: str) -> str:
-        """Run one statement in the stack's Postgres; the unaligned result rows."""
-        if self.postgres is None:
-            pytest.fail("this stack runs without Postgres")
-        result = docker(
-            "exec",
-            self.postgres,
-            "psql",
-            "-U",
-            "gw",
-            "-d",
-            POSTGRES_DB,
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-At",
-            "-c",
-            sql,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            pytest.fail(f"psql failed:\n{result.stderr}")
-        return result.stdout.strip()
-
     def metrics(self) -> str:
         return httpx.get(f"{self.base_url}/metrics", timeout=30).text
 

@@ -37,8 +37,10 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 
 from tests.integration.conftest import (
+    ROOT,
     Stack,
     booting_gateway,
     docker,
@@ -73,59 +75,18 @@ CORP_MODEL = "corp-glm"
 
 STUB_BASE = "http://stub:8000"
 
-# The shape compose/litellm/config.anthropic.yaml ships: one native anthropic
-# route, no catch-all, no gateway-held key.
-ANTHROPIC_CONFIG = f"""
-model_list:
-  - model_name: "claude-*"
-    litellm_params:
-      model: "anthropic/{ANTHROPIC_MODEL}"
-      api_base: "{STUB_BASE}"
-      api_key: "oauth-passthrough-placeholder"
-litellm_settings:
-  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
-  drop_params: true
-  json_logs: true
-general_settings:
-  cancel_on_disconnect: true
-  supported_db_objects: ["models"]
-"""
+SHIPPED_CONFIGS = ROOT / "compose" / "litellm"
 
-# compose/litellm/config.codex.yaml with the stub as its one api_base.
-CODEX_CONFIG = f"""
-model_list:
-  - model_name: "*"
-    litellm_params:
-      model: "openai/*"
-      api_base: "{STUB_BASE}/v1"
-      api_key: "oauth-passthrough-placeholder"
-litellm_settings:
-  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
-  drop_params: true
-  json_logs: true
-general_settings:
-  cancel_on_disconnect: true
-  supported_db_objects: ["models"]
-"""
 
-# compose/litellm/config.corp.yaml verbatim in its routing and credential: the
-# api_base and api_key are read from the environment the compose service sets.
-CORP_CONFIG = """
-model_list:
-  - model_name: "corp-*"
-    litellm_params:
-      model: "hosted_vllm/GLM-5.1-AWQ"
-      api_base: "os.environ/CORP_LLM_ENDPOINT"
-      api_key: "os.environ/CORP_LLM_AUTH_TOKEN"
-      max_tokens: 4096
-litellm_settings:
-  callbacks: ["corp_llm_gateway.bootstrap.guardrail"]
-  drop_params: true
-  json_logs: true
-general_settings:
-  cancel_on_disconnect: true
-  supported_db_objects: ["models"]
-"""
+def _shipped_config(provider: str, api_base: str | None = None) -> str:
+    """compose/litellm/config.<provider>.yaml as shipped, every route's ``api_base``
+    pointed at the stub when one is given, so the suite cannot drift from the files."""
+    config = yaml.safe_load((SHIPPED_CONFIGS / f"config.{provider}.yaml").read_text())
+    if api_base is not None:
+        for route in config["model_list"]:
+            route["litellm_params"]["api_base"] = api_base
+    return yaml.safe_dump(config, sort_keys=False)
+
 
 NO_CALLBACK_CONFIG = f"""
 model_list:
@@ -165,6 +126,12 @@ class Provider:
     key: str
     path: str
     payload: dict[str, Any]
+    # A model name this provider's config routes, so a request the gate let
+    # through would reach the stub instead of dying in litellm's router.
+    model: str
+
+    def routed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {**payload, "model": self.model} if "model" in payload else payload
 
     def headers(self, **extra: str) -> dict[str, str]:
         return {
@@ -257,17 +224,28 @@ def _chat(model: str) -> dict[str, Any]:
 def provider_anthropic(
     gateway_image: str, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[Provider]:
-    config = _write(tmp_path_factory, "route-gate-anthropic", ANTHROPIC_CONFIG)
+    config = _write(
+        tmp_path_factory, "route-gate-anthropic", _shipped_config("anthropic", STUB_BASE)
+    )
     env = {**BASE_ENV, "CORP_LLM_FORWARD_ANTHROPIC_AUTH": "1"}
     with running_stack(gateway_image, config, env) as stack:
-        yield Provider("anthropic", stack, OAUTH_TOKEN, "/v1/messages", _messages(ANTHROPIC_MODEL))
+        yield Provider(
+            "anthropic",
+            stack,
+            OAUTH_TOKEN,
+            "/v1/messages",
+            _messages(ANTHROPIC_MODEL),
+            ANTHROPIC_MODEL,
+        )
 
 
 @pytest.fixture(scope="module")
 def provider_codex(
     gateway_image: str, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[Provider]:
-    config = _write(tmp_path_factory, "route-gate-codex", CODEX_CONFIG)
+    config = _write(
+        tmp_path_factory, "route-gate-codex", _shipped_config("codex", f"{STUB_BASE}/v1")
+    )
     env = {**BASE_ENV, "CORP_LLM_FORWARD_CHATGPT_AUTH": "1"}
     with running_stack(gateway_image, config, env) as stack:
         yield Provider(
@@ -276,9 +254,12 @@ def provider_codex(
             CHATGPT_TOKEN,
             "/v1/responses",
             {"model": OPENAI_MODEL, "input": f"escalate to {CANARY}"},
+            OPENAI_MODEL,
         )
 
 
+# The shipped corp config reads its api_base and api_key from the environment the
+# compose service sets, so the stub goes in through that environment, not the file.
 CORP_ENV = {
     **BASE_ENV,
     "CORP_LLM_ENDPOINT": f"{STUB_BASE}/v1",
@@ -291,9 +272,16 @@ CORP_ENV = {
 def provider_corp(
     gateway_image: str, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[Provider]:
-    config = _write(tmp_path_factory, "route-gate-corp", CORP_CONFIG)
+    config = _write(tmp_path_factory, "route-gate-corp", _shipped_config("corp"))
     with running_stack(gateway_image, config, CORP_ENV) as stack:
-        yield Provider("corp", stack, CORP_CLIENT_BEARER, "/v1/chat/completions", _chat(CORP_MODEL))
+        yield Provider(
+            "corp",
+            stack,
+            CORP_CLIENT_BEARER,
+            "/v1/chat/completions",
+            _chat(CORP_MODEL),
+            CORP_MODEL,
+        )
 
 
 PROVIDERS = ("anthropic", "codex", "corp")
@@ -459,7 +447,7 @@ def test_the_bypass_routes_are_refused_and_reach_no_provider(
     provider.stack.mark()
     before = provider.stack.block_count("route_gate_listed")
 
-    response = provider.post(path, payload)
+    response = provider.post(path, provider.routed(payload))
 
     assert response.status_code == 403, response.text
     body = response.json()
@@ -555,7 +543,7 @@ def test_the_no_rewrite_and_unlisted_routes_are_refused(
 ) -> None:
     provider.stack.mark()
 
-    response = provider.post(path, payload)
+    response = provider.post(path, provider.routed(payload))
 
     assert response.status_code == status, response.text
     assert response.json()["error"]["reason"] == reason
@@ -589,11 +577,23 @@ def test_a_malformed_path_is_refused_with_its_own_reason(
 # ── the routes that must keep working ────────────────────────────────────────
 
 
+# The stub path each provider's upstream call lands on, per client route.
+UPSTREAM_PATHS = {
+    ("anthropic", "/v1/messages"): "/v1/messages",
+    ("anthropic", "/v1/chat/completions"): "/v1/messages",
+    ("codex", "/v1/responses"): "/v1/responses",
+    ("codex", "/v1/chat/completions"): "/v1/chat/completions",
+    ("corp", "/v1/chat/completions"): "/v1/chat/completions",
+    ("corp", "/v1/messages"): "/v1/chat/completions",
+}
+
+
 def test_every_generation_route_is_rewritten(
     provider_anthropic: Provider, provider_codex: Provider, provider_corp: Provider
 ) -> None:
     # Each provider's own client routes: Claude Code's messages (and the chat
-    # adapter) on anthropic, Codex's responses on codex, and both shapes on corp.
+    # adapter) on anthropic, Codex's responses and chat completions (the
+    # `openai/` chat upstream) on codex, and both shapes on corp.
     calls = (
         (provider_anthropic, "/v1/messages", _messages(ANTHROPIC_MODEL)),
         (provider_anthropic, "/v1/chat/completions", _chat(ANTHROPIC_MODEL)),
@@ -602,6 +602,7 @@ def test_every_generation_route_is_rewritten(
             "/v1/responses",
             {"model": OPENAI_MODEL, "input": f"escalate to {CANARY}"},
         ),
+        (provider_codex, "/v1/chat/completions", _chat(OPENAI_MODEL)),
         (provider_corp, "/v1/chat/completions", _chat(CORP_MODEL)),
         (provider_corp, "/v1/messages", _messages(CORP_MODEL)),
     )
@@ -617,6 +618,10 @@ def test_every_generation_route_is_rewritten(
         sent = json.dumps(captured[0]["body"])
         assert CANARY not in sent, f"{where} put the original on the wire"
         assert "EMAIL" in sent, f"{where} sent no placeholder: {sent[:400]}"
+        upstream_path = captured[0]["path"]
+        assert upstream_path.endswith(UPSTREAM_PATHS[(provider.name, path)]), (
+            f"{where} reached {upstream_path}"
+        )
 
 
 def test_anthropic_rewrites_messages_with_the_developers_own_token(
@@ -813,9 +818,14 @@ def test_nothing_reached_a_provider_the_gate_refused(
     provider_anthropic: Provider, provider_codex: Provider, provider_corp: Provider
 ) -> None:
     # The whole point of the egress-blocked network: the stub is the only thing
-    # reachable, so this is the complete list of what left each gateway.
+    # reachable, so this is the complete list of what left each gateway. One
+    # admitted request each first, so the list is never empty whatever ran before:
+    # an empty list would pass the loop below without reading anything.
     for provider in (provider_anthropic, provider_codex, provider_corp):
-        for capture in provider.stack.stub_captures():
+        assert provider.post(provider.path, provider.payload).status_code == 200
+        captures = provider.stack.stub_captures()
+        assert captures, f"{provider.name}: the stub saw nothing, so this proves nothing"
+        for capture in captures:
             assert CANARY not in json.dumps(capture), (provider.name, capture["path"])
             assert "/count_tokens" not in capture["path"]
             assert "/input_tokens" not in capture["path"]
