@@ -286,11 +286,16 @@ When adding a new tunable, plumb it through this loader — don't read
    the subscription bridges (`CORP_LLM_FORWARD_ANTHROPIC_AUTH` /
    `CORP_LLM_FORWARD_CHATGPT_AUTH`) lift the developer's `Authorization:
    Bearer ...` into the request's `api_key` and put their own header
-   allowlists in `extra_headers`. `data["headers"]` — the bucket litellm
-   sends upstream, unsanitized and outside the Stage-5 scan — is the
-   allowlist projection `_UPSTREAM_HEADER_ALLOWLIST` (empty), never a
-   deny-list; adding a name is a security decision. Nothing else is passed
-   through. Don't log the token, don't rewrite it.
+   allowlists in `extra_headers` — exact names, each value checked against
+   its format (`_BRIDGE_HEADER_FORMATS`) and dropped if it does not match.
+   `data["headers"]` — the bucket litellm sends upstream, unsanitized and
+   outside the Stage-5 scan — is the allowlist projection
+   `_UPSTREAM_HEADER_ALLOWLIST` (empty), never a deny-list; adding a name is
+   a security decision. The pre-call removes the request-body keys litellm
+   turns into upstream headers or a credential (`_CLIENT_CONTROL_BODY_KEYS`).
+   No other client header is passed through; unknown request-body fields are
+   not sanitized (accepted risk, docs/security.md §2). Don't log the token,
+   don't rewrite it.
 4. **X-Corp-Auth never logged**: corp tokens are stripped in pre_call
    (`AuthMiddleware.strip_corp_token`) and never appear in the audit
    pipeline.
