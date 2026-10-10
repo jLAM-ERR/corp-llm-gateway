@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -379,9 +380,20 @@ _PROVIDER_ROUTES = {
     "codex": [("*", "openai/*")],
     "corp": [("corp-*", "hosted_vllm/GLM-5.1-AWQ")],
 }
-_SUBSCRIPTION_PROVIDERS = ("anthropic", "codex")
 _CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
-_FORBIDDEN_KEYS = ("master_key", "set_verbose")
+_PLACEHOLDER = "oauth-passthrough-placeholder"
+_SUBSCRIPTION_PARAMS = {
+    "anthropic": {"model": "anthropic/claude-*", "api_key": _PLACEHOLDER},
+    "codex": {"model": "openai/*", "api_key": _PLACEHOLDER, "api_base": _CODEX_API_BASE},
+}
+_FORBIDDEN_KEYS = ("master_key", "LITELLM_MASTER_KEY", "set_verbose")
+_EXTRA_PIPELINE_KEYS = (
+    "success_callback",
+    "failure_callback",
+    "input_callback",
+    "service_callback",
+    "guardrails",
+)
 _providers = pytest.mark.parametrize("provider", sorted(_PROVIDER_CONFIGS))
 
 
@@ -411,10 +423,11 @@ def test_each_provider_config_routes_only_its_own_provider(provider: str) -> Non
 
 @_providers
 def test_each_provider_config_runs_only_the_production_callback(provider: str) -> None:
-    settings_ = _provider_config(provider)["litellm_settings"]
+    document = _provider_config(provider)
+    settings_ = document["litellm_settings"]
 
     assert settings_["callbacks"] == ["corp_llm_gateway.bootstrap.guardrail"]
-    assert "success_callback" not in settings_ and "failure_callback" not in settings_
+    assert not _keys_anywhere(document) & set(_EXTRA_PIPELINE_KEYS)
     assert settings_["drop_params"] is True
     assert settings_["json_logs"] is True
 
@@ -437,9 +450,7 @@ def _strings_anywhere(node: object) -> list[str]:
 
 
 @_providers
-def test_no_provider_config_reads_a_gateway_held_api_key(provider: str) -> None:
-    import re
-
+def test_no_provider_config_reads_an_api_key_env_var(provider: str) -> None:
     values = _strings_anywhere(_provider_config(provider))
 
     assert values
@@ -456,9 +467,12 @@ def test_the_config_walks_find_nested_keys_and_values() -> None:
         "general_settings": {"master_key": "sk-1"},
         "router_settings": {"set_verbose": False},
         "model_list": [{"litellm_params": {"master_key": "x"}}],
+        "environment_variables": {"LITELLM_MASTER_KEY": "sk-2"},
+        "guardrails": [{"litellm_settings": {"input_callback": [], "service_callback": []}}],
+        "litellm_settings": {"success_callback": [], "failure_callback": []},
     }
 
-    assert _keys_anywhere(nested) >= set(_FORBIDDEN_KEYS)
+    assert _keys_anywhere(nested) >= set(_FORBIDDEN_KEYS) | set(_EXTRA_PIPELINE_KEYS)
     assert "os.environ/OPENAI_API_KEY" in _strings_anywhere(
         {"model_list": [{"litellm_params": {"api_key": "os.environ/OPENAI_API_KEY"}}]}
     )
@@ -466,10 +480,21 @@ def test_the_config_walks_find_nested_keys_and_values() -> None:
     assert _keys_anywhere([]) == set()
 
 
-@pytest.mark.parametrize("provider", _SUBSCRIPTION_PROVIDERS)
-def test_subscription_configs_hold_only_the_passthrough_placeholder(provider: str) -> None:
-    for entry in _provider_config(provider)["model_list"]:
-        assert entry["litellm_params"]["api_key"] == "oauth-passthrough-placeholder"
+@pytest.mark.parametrize("provider", sorted(_SUBSCRIPTION_PARAMS))
+def test_subscription_routes_carry_only_the_placeholder_and_a_fixed_destination(
+    provider: str,
+) -> None:
+    (entry,) = _provider_config(provider)["model_list"]
+
+    assert entry["litellm_params"] == _SUBSCRIPTION_PARAMS[provider]
+
+
+@pytest.mark.parametrize("provider", sorted(_SUBSCRIPTION_PARAMS))
+def test_no_subscription_config_reads_the_environment(provider: str) -> None:
+    values = _strings_anywhere(_provider_config(provider))
+
+    assert values
+    assert not [v for v in values if v.startswith("os.environ/")]
 
 
 def test_the_codex_config_sends_to_the_literal_chatgpt_url() -> None:
