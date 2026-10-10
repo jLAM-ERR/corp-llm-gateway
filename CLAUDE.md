@@ -109,7 +109,8 @@ pre_call:  Stage 0 — payload classifier: config/log shape → refuse before eg
            ↓
            Stage 5 — DLP egress guard: re-scan the SANITIZED request → block on canary/raw secret
            ↓
-           upstream (api.anthropic.com / api.openai.com) with BYOK Authorization
+           upstream (api.anthropic.com / api.openai.com) with the bridge's credential
+           (the developer's token via api_key, or the route's own key)
            ↓
 post_call: NOT in the callback. route_gate/desanitize_middleware.py, inside the in-flight limiter and in
            front of litellm's app, restores originals in the response litellm sends (keyed by the
@@ -281,9 +282,15 @@ When adding a new tunable, plumb it through this loader — don't read
 2. **NEVER fields gate** (`audit/invariants.py`): the audit logger refuses
    to emit a record containing any NEVER field key (mapping/original/
    credentials). Vector VRL provides defense-in-depth for the same set.
-3. **BYOK Authorization passthrough**: the developer's `Authorization:
-   Bearer ...` header is forwarded untouched to upstream. Don't log it,
-   don't rewrite it.
+3. **Client headers reach a provider only through a bridge's allowlist**:
+   the subscription bridges (`CORP_LLM_FORWARD_ANTHROPIC_AUTH` /
+   `CORP_LLM_FORWARD_CHATGPT_AUTH`) lift the developer's `Authorization:
+   Bearer ...` into the request's `api_key` and put their own header
+   allowlists in `extra_headers`. `data["headers"]` — the bucket litellm
+   sends upstream, unsanitized and outside the Stage-5 scan — is the
+   allowlist projection `_UPSTREAM_HEADER_ALLOWLIST` (empty), never a
+   deny-list; adding a name is a security decision. Nothing else is passed
+   through. Don't log the token, don't rewrite it.
 4. **X-Corp-Auth never logged**: corp tokens are stripped in pre_call
    (`AuthMiddleware.strip_corp_token`) and never appear in the audit
    pipeline.
