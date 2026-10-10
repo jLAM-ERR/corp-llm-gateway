@@ -505,8 +505,10 @@ async def test_a_grown_sanitized_body_goes_upstream_without_the_inbound_length()
     ):
         assert not [name for name in bucket if name.lower() == "content-length"]
         assert not [name for name in bucket if name.lower() == "host"]
-    # The one header the strip must never take (invariant 3).
-    assert out["headers"]["Authorization"] == "Bearer byok-developer-key"
+    # The one header the strip must never take from litellm's copies: the bridges
+    # read the developer's token there. The upstream bucket holds nothing.
+    assert out["proxy_server_request"]["headers"]["Authorization"] == "Bearer byok-developer-key"
+    assert out["headers"] == {}
 
 
 def test_strip_inbound_headers_explicit_argument_overrides_config(

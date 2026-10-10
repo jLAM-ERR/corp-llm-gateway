@@ -266,14 +266,15 @@ CORP_ENV = {
     # What compose passes when .env leaves it blank: `${CORP_LLM_AUTH_TOKEN:-}`.
     "CORP_LLM_AUTH_TOKEN": "",
 }
+# A corp vLLM that does want a credential: the route's own, never the client's.
+CORP_UPSTREAM_TOKEN = "corp-route-gate-upstream-token"
 
 
-@pytest.fixture(scope="module")
-def provider_corp(
-    gateway_image: str, tmp_path_factory: pytest.TempPathFactory
+def _corp_stack(
+    gateway_image: str, tmp_path_factory: pytest.TempPathFactory, env: dict[str, str]
 ) -> Iterator[Provider]:
     config = _write(tmp_path_factory, "route-gate-corp", _shipped_config("corp"))
-    with running_stack(gateway_image, config, CORP_ENV) as stack:
+    with running_stack(gateway_image, config, env) as stack:
         yield Provider(
             "corp",
             stack,
@@ -282,6 +283,21 @@ def provider_corp(
             _chat(CORP_MODEL),
             CORP_MODEL,
         )
+
+
+@pytest.fixture(scope="module")
+def provider_corp(
+    gateway_image: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Provider]:
+    yield from _corp_stack(gateway_image, tmp_path_factory, CORP_ENV)
+
+
+@pytest.fixture(scope="module")
+def provider_corp_with_token(
+    gateway_image: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Provider]:
+    env = {**CORP_ENV, "CORP_LLM_AUTH_TOKEN": CORP_UPSTREAM_TOKEN}
+    yield from _corp_stack(gateway_image, tmp_path_factory, env)
 
 
 PROVIDERS = ("anthropic", "codex", "corp")
@@ -654,32 +670,28 @@ CORP_PROBE_BEARERS = {
     ),
 }
 CORP_PROBE_LITELLM_KEY = "sk-corp-route-gate-litellm-key-probe"
+CORP_PROBE_X_API_KEY = "sk-corp-route-gate-x-api-key-probe"
+# The credential headers a client may send next to its bearer. `x-litellm-api-key`
+# moves litellm's idea of which header authenticated the caller off
+# `Authorization`, which is what makes its header cleaner keep an Anthropic OAuth
+# bearer; `x-api-key` is the other provider-key spelling litellm knows.
+CORP_CREDENTIAL_HEADERS: dict[str, dict[str, str]] = {
+    "bearer-only": {},
+    "with-x-litellm-api-key": {"x-litellm-api-key": CORP_PROBE_LITELLM_KEY},
+    "with-x-api-key": {"x-api-key": CORP_PROBE_X_API_KEY},
+}
+CORP_ROUTES = (("/v1/chat/completions", _chat(CORP_MODEL)), ("/v1/messages", _messages(CORP_MODEL)))
+# What hosted_vllm sends when the route's api_key resolves to an empty string.
+LITELLM_EMPTY_KEY_BEARER = "Bearer fake-api-key"
 
 
-@pytest.mark.parametrize(
-    "litellm_key_header", [False, True], ids=["bearer-only", "with-x-litellm-api-key"]
-)
-@pytest.mark.parametrize("bearer", list(CORP_PROBE_BEARERS), ids=list(CORP_PROBE_BEARERS))
-@pytest.mark.parametrize(
-    "path,payload",
-    [("/v1/chat/completions", _chat(CORP_MODEL)), ("/v1/messages", _messages(CORP_MODEL))],
-    ids=["/v1/chat/completions", "/v1/messages"],
-)
-def test_a_subscription_bearer_never_reaches_the_corp_upstream(
-    provider_corp: Provider,
-    path: str,
-    payload: dict[str, Any],
-    bearer: str,
-    litellm_key_header: bool,
-) -> None:
-    # `x-litellm-api-key` moves litellm's idea of which header authenticated the
-    # caller off `Authorization`, which is what makes its header cleaner keep an
-    # Anthropic OAuth bearer. The stub records every header line it got, so a
-    # second Authorization next to the route's own would show up here.
-    token = CORP_PROBE_BEARERS[bearer]
-    headers = provider_corp.headers(Authorization=f"Bearer {token}")
-    if litellm_key_header:
-        headers["x-litellm-api-key"] = CORP_PROBE_LITELLM_KEY
+def _corp_upstream_authorization(
+    provider_corp: Provider, path: str, payload: dict[str, Any], bearer: str, credential: str
+) -> list[str]:
+    """Send one corp request; every Authorization value the stub got."""
+    headers = provider_corp.headers(
+        Authorization=f"Bearer {bearer}", **CORP_CREDENTIAL_HEADERS[credential]
+    )
     provider_corp.stack.mark()
 
     response = httpx.post(
@@ -689,13 +701,191 @@ def test_a_subscription_bearer_never_reaches_the_corp_upstream(
     assert response.status_code == 200, response.text
     captured = provider_corp.stack.new_captures()
     assert len(captured) == 1, captured
-    authorization = [
-        value for name, value in captured[0]["raw_headers"] if name.lower() == "authorization"
-    ]
-    assert len(authorization) == 1, authorization
-    assert token not in json.dumps(captured[0])
-    assert CORP_PROBE_LITELLM_KEY not in json.dumps(captured[0])
-    assert "x-corp-auth" not in captured[0]["headers"]
+    capture = captured[0]
+    wire = json.dumps(capture)
+    assert bearer not in wire
+    assert CORP_PROBE_LITELLM_KEY not in wire
+    assert CORP_PROBE_X_API_KEY not in wire
+    assert "REDACTED" not in wire, "litellm's logging copy of a header went upstream"
+    assert "x-corp-auth" not in capture["headers"]
+    assert "x-api-key" not in capture["headers"]
+    return [value for name, value in capture["raw_headers"] if name.lower() == "authorization"]
+
+
+@pytest.mark.parametrize(
+    "credential", list(CORP_CREDENTIAL_HEADERS), ids=list(CORP_CREDENTIAL_HEADERS)
+)
+@pytest.mark.parametrize("bearer", list(CORP_PROBE_BEARERS), ids=list(CORP_PROBE_BEARERS))
+@pytest.mark.parametrize("path,payload", CORP_ROUTES, ids=[row[0] for row in CORP_ROUTES])
+def test_a_subscription_bearer_never_reaches_the_corp_upstream(
+    provider_corp: Provider,
+    path: str,
+    payload: dict[str, Any],
+    bearer: str,
+    credential: str,
+) -> None:
+    # The exact value, not a count of Authorization lines: the transport folds two
+    # same-named headers into one comma-joined value, so a client credential riding
+    # next to the route's own still arrives as a single line.
+    authorization = _corp_upstream_authorization(
+        provider_corp, path, payload, CORP_PROBE_BEARERS[bearer], credential
+    )
+
+    assert authorization == [LITELLM_EMPTY_KEY_BEARER]
+
+
+@pytest.mark.parametrize(
+    "credential", list(CORP_CREDENTIAL_HEADERS), ids=list(CORP_CREDENTIAL_HEADERS)
+)
+@pytest.mark.parametrize("path,payload", CORP_ROUTES, ids=[row[0] for row in CORP_ROUTES])
+def test_the_corp_upstream_gets_exactly_its_configured_token(
+    provider_corp_with_token: Provider, path: str, payload: dict[str, Any], credential: str
+) -> None:
+    authorization = _corp_upstream_authorization(
+        provider_corp_with_token,
+        path,
+        payload,
+        CORP_PROBE_BEARERS["anthropic-oauth"],
+        credential,
+    )
+
+    assert authorization == [f"Bearer {CORP_UPSTREAM_TOKEN}"]
+
+
+# Client headers no upstream needs. Each value is unique, so finding it anywhere in
+# what the stub received is a header that went through unsanitized.
+PROBE_HEADERS = {
+    "x-probe-secret": "alice.probe@corp.lan",
+    "cookie": "session=route-gate-cookie-probe",
+    "x-api-key": "sk-route-gate-x-api-key-probe",
+    "x-litellm-api-key": "sk-route-gate-litellm-key-probe",
+    "x-forwarded-for": "198.51.100.23",
+}
+CLIENT_USER_AGENT = "route-gate-client/1.0 (probe)"
+# The client headers each provider's bridge forwards (the allowlists in
+# litellm_hook.py), sent with values the upstream could not have made up.
+ALLOWLISTED_CLIENT_HEADERS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "anthropic-version": "2023-06-01",
+        # A beta litellm knows: it drops the ones it does not, on 1.0.0 as well.
+        "anthropic-beta": "interleaved-thinking-2025-05-14",
+        "user-agent": CLIENT_USER_AGENT,
+    },
+    "codex": {
+        "chatgpt-account-id": "route-gate-account",
+        "originator": "codex_cli_rs",
+        "session-id": "route-gate-session",
+        "x-codex-beta-features": "route-gate-feature",
+        "user-agent": CLIENT_USER_AGENT,
+    },
+    "corp": {},
+}
+# Every header line that reaches the stub, per provider and client route: the
+# allowlisted client headers above, the upstream credential, and what litellm and
+# its HTTP transport add on their own.
+TRANSPORT_HEADERS = frozenset(
+    {"accept", "accept-encoding", "connection", "content-length", "content-type", "host"}
+)
+ANTHROPIC_UPSTREAM_HEADERS = TRANSPORT_HEADERS | {
+    "authorization",
+    "anthropic-beta",
+    "anthropic-version",
+    "user-agent",
+    # litellm's own OAuth branch adds it.
+    "anthropic-dangerous-direct-browser-access",
+}
+CODEX_UPSTREAM_HEADERS = TRANSPORT_HEADERS | {
+    "authorization",
+    "chatgpt-account-id",
+    "originator",
+    "session-id",
+    "x-codex-beta-features",
+    "user-agent",
+}
+# The OpenAI SDK's own telemetry on litellm's `openai/` chat path.
+OPENAI_SDK_HEADERS = frozenset(
+    {
+        "x-stainless-arch",
+        "x-stainless-async",
+        "x-stainless-lang",
+        "x-stainless-os",
+        "x-stainless-package-version",
+        "x-stainless-raw-response",
+        "x-stainless-read-timeout",
+        "x-stainless-retry-count",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version",
+    }
+)
+# `user-agent` here is litellm's own, never the client's (checked below).
+CORP_UPSTREAM_HEADERS = TRANSPORT_HEADERS | {"authorization", "user-agent"}
+EXPECTED_UPSTREAM_HEADERS: dict[tuple[str, str], frozenset[str]] = {
+    ("anthropic", "/v1/messages"): ANTHROPIC_UPSTREAM_HEADERS,
+    ("anthropic", "/v1/chat/completions"): ANTHROPIC_UPSTREAM_HEADERS,
+    ("codex", "/v1/responses"): CODEX_UPSTREAM_HEADERS,
+    ("codex", "/v1/chat/completions"): CODEX_UPSTREAM_HEADERS | OPENAI_SDK_HEADERS,
+    ("corp", "/v1/chat/completions"): CORP_UPSTREAM_HEADERS,
+    ("corp", "/v1/messages"): CORP_UPSTREAM_HEADERS,
+}
+HEADER_CASES = (
+    ("anthropic", "/v1/messages"),
+    ("anthropic", "/v1/chat/completions"),
+    ("codex", "/v1/responses"),
+    ("codex", "/v1/chat/completions"),
+    ("corp", "/v1/chat/completions"),
+    ("corp", "/v1/messages"),
+)
+GENERATION_PAYLOADS = {
+    "/v1/messages": _messages,
+    "/v1/chat/completions": _chat,
+    "/v1/responses": lambda model: {"model": model, "input": f"escalate to {CANARY}"},
+}
+
+
+@pytest.mark.parametrize(
+    "provider_name,path", HEADER_CASES, ids=[f"{name}-{path}" for name, path in HEADER_CASES]
+)
+def test_only_allowlisted_client_headers_reach_the_upstream(
+    request: pytest.FixtureRequest, provider_name: str, path: str
+) -> None:
+    provider: Provider = request.getfixturevalue(f"provider_{provider_name}")
+    allowlisted = ALLOWLISTED_CLIENT_HEADERS[provider_name]
+    sent = {**provider.headers(), **PROBE_HEADERS, "user-agent": CLIENT_USER_AGENT, **allowlisted}
+    provider.stack.mark()
+
+    response = httpx.post(
+        f"{provider.stack.base_url}{path}",
+        json=GENERATION_PAYLOADS[path](provider.model),
+        headers=sent,
+        timeout=90,
+    )
+
+    assert response.status_code == 200, response.text
+    captured = provider.stack.new_captures()
+    assert len(captured) == 1, captured
+    raw = captured[0]["raw_headers"]
+    received = {name.lower(): value for name, value in raw}
+    names = sorted(name.lower() for name, _ in raw)
+    assert len(names) == len(set(names)), f"a header arrived twice: {names}"
+    assert frozenset(names) == EXPECTED_UPSTREAM_HEADERS[(provider_name, path)], " ".join(names)
+
+    for name, value in allowlisted.items():
+        assert value in received.get(name, ""), f"allowlisted {name} did not arrive: {received}"
+    # Every other client header value: nowhere on the wire, body included.
+    wire = json.dumps(captured[0])
+    forwarded = {name.lower() for name in allowlisted}
+    for name, value in sent.items():
+        if name.lower() in forwarded or name.lower() in ("authorization", "content-type"):
+            continue
+        assert value not in wire, f"client header {name} reached the upstream"
+    assert "REDACTED" not in wire, "litellm's logging copy of a header went upstream"
+    assert CORP_TOKEN not in wire
+
+    if provider_name == "corp":
+        assert received["authorization"] == LITELLM_EMPTY_KEY_BEARER
+        assert received["user-agent"].startswith("litellm/"), received["user-agent"]
+    else:
+        assert received["authorization"] == f"Bearer {provider.key}"
 
 
 def test_streaming_is_not_buffered_by_the_gate(provider_anthropic: Provider) -> None:

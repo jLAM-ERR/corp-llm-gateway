@@ -29,12 +29,12 @@ Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances
 
 ## Overview
 
-A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. The gateway is a LiteLLM proxy with a custom guardrail (`corp_llm_gateway.litellm_hook.CorpLlmGuardrail`) registered as a callback. Every request is sanitized in `pre_call`, forwarded to Anthropic / OpenAI with the developer's BYOK key intact, de-sanitized on the way back by the gateway's own ASGI layer (outside LiteLLM, so LiteLLM and its callbacks only see placeholders), and audited. The image serves LiteLLM's app through the gateway's own entrypoint (`python -m corp_llm_gateway.serve`), which puts a default-deny **route gate** in front of LiteLLM's router — the callback only runs on the routes LiteLLM sends through it, so everything else is refused. Two headers matter on the wire:
+A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. The gateway is a LiteLLM proxy with a custom guardrail (`corp_llm_gateway.litellm_hook.CorpLlmGuardrail`) registered as a callback. Every request is sanitized in `pre_call`, forwarded to Anthropic / OpenAI with the developer's own subscription token (carried by the gateway's subscription bridge, the only client credential that leaves), de-sanitized on the way back by the gateway's own ASGI layer (outside LiteLLM, so LiteLLM and its callbacks only see placeholders), and audited. The image serves LiteLLM's app through the gateway's own entrypoint (`python -m corp_llm_gateway.serve`), which puts a default-deny **route gate** in front of LiteLLM's router — the callback only runs on the routes LiteLLM sends through it, so everything else is refused. Two headers matter on the wire:
 
 | Header | Source | Purpose |
 |---|---|---|
 | `X-Corp-Auth` | `~/.corp-llm-gateway/token` (laptop) | corp identity / team resolution; **stripped** before egress |
-| `Authorization: Bearer …` | dev's Anthropic / OpenAI key | BYOK passthrough; forwarded **untouched** |
+| `Authorization: Bearer …` | dev's Anthropic / OpenAI subscription token | lifted into the upstream call by the subscription bridge only; no other client header reaches a provider |
 
 ## Features
 

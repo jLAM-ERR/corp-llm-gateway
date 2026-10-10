@@ -111,11 +111,9 @@ KEYS: tuple[Key, ...] = (
         "CORP_LLM_STRIP_INBOUND_HEADERS",
         flag=True,
         default="1",
-        help="strip inbound wire headers (Host, User-Agent, Content-Length, ...) before "
-        "forwarding to upstream; the guardrail sets data['headers'] unconditionally, so "
-        "this matters regardless of litellm's forward_client_headers_to_llm_api. Off "
-        "sends the client's Content-Length with a longer sanitized body and the provider "
-        "truncates the request",
+        help="strip inbound wire headers (Host, User-Agent, Content-Length, ...) from "
+        "litellm's own header copies; what goes upstream (data['headers']) is the "
+        "guardrail's allowlist projection either way",
     ),
     Key(
         "CORP_LLM_FORWARD_ANTHROPIC_AUTH",

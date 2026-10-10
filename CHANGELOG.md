@@ -7,6 +7,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.1.0]
 
+### Security — client headers no longer reach the provider (1.0.0 is affected)
+
+- **1.0.0 sent every inbound client header upstream, unsanitized, on every provider.**
+  litellm sends `data["headers"]` to the provider, and the guardrail filled it with litellm's
+  logging copy of all inbound headers, dropping only the wire headers (`_WIRE_HEADERS_TO_DROP`),
+  with `CORP_LLM_STRIP_INBOUND_HEADERS=1`. Header values skip the sanitizer and the Stage-5 scan,
+  so this broke invariant 1: an arbitrary header carrying an email reached the Anthropic, Codex
+  and corp upstreams verbatim; a cookie arrived as `***REDACTED***`; on corp, a client
+  `sk-ant-oat…` bearer sent with `x-litellm-api-key` arrived folded into the route's own
+  credential as `Authorization: ***REDACTED***, Bearer fake-api-key`. Confirmed on the real
+  image against a capturing upstream. Upgrade every 1.0.0 deployment.
+- **`data["headers"]` is now an allowlist projection (`_UPSTREAM_HEADER_ALLOWLIST`), and the
+  allowlist is empty.** The subscription bridges carry the developer's token in `api_key` and
+  their own allowlists in `extra_headers` (Anthropic: `anthropic-beta`, `anthropic-version`,
+  `user-agent`; Codex: `chatgpt-account-id`, `originator`, `session-id`, `thread-id`,
+  `user-agent`, `x-openai-internal-codex-responses-lite`, `x-codex-*`); the corp route gets
+  only its own `CORP_LLM_AUTH_TOKEN`. The client's `Authorization` is no longer passed through
+  on a route without a bridge. `docs/security.md` §13 has the per-provider list; the container
+  suite pins the exact header set each provider receives.
+
 ### Added — `gateway-admin` bootstrap for a fixed team token
 
 - **`token issue --value VALUE`** stores a value you choose instead of a random `ct_…` token

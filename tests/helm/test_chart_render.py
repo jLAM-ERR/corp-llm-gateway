@@ -101,8 +101,8 @@ def _env_of(deployment: dict[str, Any], container: str) -> dict[str, Any]:
 def test_the_gateway_strips_inbound_wire_headers_by_default(
     rendered_docs: list[dict[str, Any]],
 ) -> None:
-    # Without it the client's Content-Length is forwarded with litellm's own,
-    # longer, sanitized body and the provider truncates the request. The chart
+    # Up to 1.0.0, without it the client's Content-Length was forwarded with litellm's own,
+    # longer, sanitized body and the provider truncated the request. The chart
     # never set it, so every Helm deploy ran with it off.
     deployment = _first_of_kind(rendered_docs, "Deployment")
 

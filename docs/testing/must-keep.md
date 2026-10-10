@@ -66,8 +66,9 @@ filter of the 5,922 they held before gave 3,956; Task 10's three new classify te
 [deleted-tests.md](deleted-tests.md), and the new provider, profile-guard and upstream tests),
 4,109 after the Task 5 review fixes (additions only), 4,145 after its Task 6 (the container suite
 on provider fixtures: 56 approved must-keep deletions in [deleted-tests.md](deleted-tests.md), 81
-re-parametrised cases and the new corp-token and corp-bearer tests).
-A parametrised test is there as its cases, so the 484 function-level must-keep ids of
+re-parametrised cases and the new corp-token and corp-bearer tests), 4,171 after its Task 6b
+(the upstream header allowlist: additions only).
+A parametrised test is there as its cases, so the 488 function-level must-keep ids of
 parametrised tests have no line of their own.
 `ledger check` fails when a recorded id is missing, gains or loses a case, or changes
 outcome or skip reason, or when a module that holds one stops collecting. Any other test

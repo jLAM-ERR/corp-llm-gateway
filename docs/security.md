@@ -23,7 +23,7 @@ gateway and never enters litellm (§15).
 |---|---|
 | Success criterion | **Zero confirmed leak incidents** in the 90 days post-GA (non-negotiable) |
 | Failure posture | **Fail-closed** for the sanitization path: if the corp-LLM can't run, the request is rejected (503 `E_CORP_LLM_DOWN`) rather than forwarded unsanitized (`litellm_hook.py` `pre_call`) |
-| BYOK `Authorization` | The developer's `Authorization: Bearer …` (Anthropic/OpenAI key) is forwarded **untouched** to upstream and is **never logged** — it is a NEVER field in the audit gate. The opt-in subscription-auth bridges also read that bearer without rewriting it; see §13 |
+| Client headers and the developer's token | The developer's `Authorization: Bearer …` reaches a provider **only through a subscription-auth bridge**, which lifts it into the request's `api_key` (§13), and it is **never logged** — a NEVER field in the audit gate. No other client header reaches a provider: `data["headers"]`, the bucket litellm sends upstream, is an allowlist projection and the allowlist is empty (§13, "Client headers upstream") |
 | `X-Corp-Auth` | The corp token is consumed in `pre_call` (`AuthMiddleware.strip_corp_token`), stripped from forwarded headers, and **never enters the audit pipeline** — NEVER field |
 
 Defense in depth: the no-leak guarantee is enforced at multiple independent
@@ -480,6 +480,7 @@ scoped by the k8s log collector, and a different trust model applies.
 | ID | Invariant | Enforced by |
 |---|---|---|
 | M1-14 | **No originals leak** across six surfaces: (i) logger emissions, (ii) error bodies, (iii) exception traces, (iv) metric labels, (v) forwarded headers, (vi) pod stdout | `tests/invariants/test_no_originals_leak.py` |
+| 3 | **Client headers reach a provider only through a bridge's allowlist**: `data["headers"]` is the allowlist projection `_UPSTREAM_HEADER_ALLOWLIST` (empty), never a deny-list; the bridges carry the developer's token in `api_key` and their own allowlists in `extra_headers`; the corp route gets only its `CORP_LLM_AUTH_TOKEN` (§13). Broken in 1.0.0 | `litellm_hook.py` + `tests/litellm_hook/test_pre_call_headers.py` + `tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream` |
 | M2-7 | **No BYOK credential in audit**: the `Authorization` value never appears in any audit surface (invariant 3). Outside the audit, litellm's "[PROXY] returned data from litellm_pre_call_utils" DEBUG line prints the whole request, bearer included, before our hook: litellm DEBUG refuses to arm (§15) | same test corpus + NEVER gate; `route_gate/arm_checks.py` (exit 70) |
 | 4 | **`X-Corp-Auth` is never logged**: stripped in the pre-call before anything can refuse the request, from every header bucket and from litellm's logging snapshot — log kwargs, `StandardLoggingPayload`, the spend-log row, failure-hook `request_data` (§15, hazard 18). Two litellm DEBUG lines before our hook print it; the DEBUG refusal is their only guard | `tests/invariants/test_no_originals_leak.py` + `tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py` + `tests/test_desanitize_served_stack.py` |
 | M3-10 | **Vector drops NEVER**: an injected NEVER-key record reaches no sink | integration assertion |
@@ -527,7 +528,7 @@ by construction; if one appears to, that is an M1-14 regression.
 | (e) | **`_corp_gateway_request_id` reaches the outbound Anthropic body on `/v1/chat/completions`.** `pre_call` writes this correlation key to four places in `data`, one of them the top level, and litellm's chat-completions adapter carries unknown top-level keys into the request it sends. Observed with the subscription bridge **off** as well as on, so it is independent of that bridge. The value is a request id (litellm's call id or a generated UUID), never user content, so it is not an M1-14 leak. The primary `/v1/messages` route — the one Claude Code uses — is unaffected. Not fixed opportunistically because the key is the audit-attribution fallback chain (`_REQUEST_ID_LOOKUP_PATHS`), which has its own regression history. | **Low** — correlation id only; affects the chat-completions route's acceptance upstream, not confidentiality |
 | (f) | **F9 only guards the corp-LLM oracle client, not litellm's own global TLS switch.** `corp_llm_verify()` (`config.py`) is reached only through `bootstrap.build_corp_llm_client()`, itself called only when `CORP_LLM_ORACLE_ENABLED=1`. But litellm reads the SAME `SSL_VERIFY` env var directly, via `get_ssl_verify()` — at higher priority than `SSL_CERT_FILE` — for every upstream provider (`anthropic/`, `openai/`, `hosted_vllm/`), with no `CORP_ENV=prod` guard on that read. `SSL_VERIFY=false` therefore disables certificate verification stack-wide on any deployment fronted by litellm with the oracle off (the default posture — see `compose/docker-compose.yml`). Widening F9 to cover litellm's read is a `src` follow-up; `compose/` mitigates today by not exposing `SSL_VERIFY` as an operator-set `.env` key and hardcoding it `true`. | **Medium** — silent TLS-verification bypass for any deployment that sets `SSL_VERIFY=false` outside the documented `.env` surface |
 | (g) | **A payment card buried between stray digits on both sides is not detected.** `BANK_CARD` scans inside a glued digit run, but only for a PAN that reaches at least one end of the run (`_CARD_STRAY_MARGIN = 0`, `detectors/regex_checksum.py`). A PAN with junk digits on BOTH sides — `123` + PAN + `123` — is missed, and so is any deliberately padded one. The threat model for this detector is **accidental paste** (a developer drops a card into a prompt), not a determined insider: every realistic paste shape is still caught — a bare PAN, a PAN with a CVV or amount glued to either end, a grouped PAN with a glued tail, and a PAN glued to letters. Closing the gap needs unbounded-depth scanning, measured at **65.8% false positives on random 32-digit runs** (79.3% at 40) and climbing with run length, while a finite margin closes nothing — 7 junk digits in front escape at margin 6 exactly as at 0. Margin 6 cost 2-3x the false positives of 0 on ordinary long digit runs (19-digit nanosecond timestamps 27.9% → 18.4%; 20-digit 24.1% → 10.4%; 23-digit 34.1% → 11.9%) and bought no coverage against a padder, so it was dropped. Anyone deliberately obfuscating a card would equally defeat a regex with base64 or unusual spacing, so chasing depth in `regex_checksum` is unbounded work for no real adversary gain. The layers that can catch a card in prose context are **corp NER** (Workstream B, in progress) and the **Stage 5 DLP egress guard**. Pinned by `test_card_buried_between_stray_digits_is_a_known_limitation`. | **Low** — accepted; accidental paste is covered, deliberate obfuscation is out of this detector's scope |
-| (h) | ✅ **FIXED** — **Helm deploys sent the client's `Content-Length` upstream with a longer, sanitized body.** `CORP_LLM_STRIP_INBOUND_HEADERS` was absent from the chart and defaulted to `0`, so the guardrail's `data["headers"]` bucket carried the inbound wire headers into litellm's upstream call; the provider then read the request truncated at the client's length (wire-captured on `/v1/messages` and `/v1/chat/completions` — a `"stream": true` cut off that way came back non-streamed). Every request whose sanitized body grew was corrupted. The flag now defaults **on** (`bootstrap.build_guardrail`) and the chart sets it explicitly. The dropped set (`_WIRE_HEADERS_TO_DROP`) is hop-by-hop / wire-level only and never includes `authorization` — BYOK passthrough (invariant 3) is unaffected, and `X-Corp-Auth` was already stripped unconditionally one step earlier (invariant 4). | **Resolved** |
+| (h) | ✅ **FIXED** — **Helm deploys sent the client's `Content-Length` upstream with a longer, sanitized body.** `CORP_LLM_STRIP_INBOUND_HEADERS` was absent from the chart and defaulted to `0`, so the guardrail's `data["headers"]` bucket carried the inbound wire headers into litellm's upstream call; the provider then read the request truncated at the client's length (wire-captured on `/v1/messages` and `/v1/chat/completions` — a `"stream": true` cut off that way came back non-streamed). Every request whose sanitized body grew was corrupted. The flag now defaults **on** (`bootstrap.build_guardrail`) and the chart sets it explicitly. The dropped set (`_WIRE_HEADERS_TO_DROP`) is hop-by-hop / wire-level only, and `X-Corp-Auth` was already stripped unconditionally one step earlier (invariant 4). The same deny-list let every other client header through, unsanitized, until 1.1.0 made `data["headers"]` an empty allowlist projection (§13, "Client headers upstream"); the flag now only cleans litellm's own header copies. | **Resolved** |
 | (i) | **Pre-flight token counting is unavailable — accepted, not a gap to close here.** `POST /v1/messages/count_tokens`, `POST /v1/responses/input_tokens` and `POST /utils/token_counter` (refused whatever the query string — `?call_endpoint=true` is the shape that leaks, but the gate classifies `(method, path)` only) are refused at the route gate (§14), so a client cannot ask the gateway what a prompt will cost before sending it. Reasons: litellm's upstream counter cannot carry the per-request credential (it uses the deployment key and the hard-coded public URL) and its local counter uses an OpenAI/Claude-2 vocabulary that undercounts current Claude models by 15-35 %. `usage.input_tokens` on every real turn is an exact, post-sanitization count, and Claude Code falls back to its own estimate for the context indicator. A gateway-side adapter that runs the pre-call pipeline and then calls the provider's counter with the request's own credential is on the backlog. | **Accepted** — no confidentiality impact; a client-side estimate replaces an exact pre-flight count |
 | (j) | **A bridge-supplied provider key sits raw in litellm's log kwargs. Open — follow-up.** litellm keeps the provider credential of each call raw in the kwargs it hands a success log callback. With a subscription bridge (§13) on, that credential is the developer's own bearer (`data["api_key"]`). Measured on litellm 1.101.0: ChatGPT bridge on `/v1/chat/completions` — `api_key` and `litellm_params.api_key`; on `/v1/responses` — none unary, the upstream `Authorization` header in `additional_args` on a stream. Anthropic bridge on `/v1/messages` — the upstream `authorization` header in `httpx_response` (and `additional_args` on a stream). Without a bridge the deployment key sits at the same places, so this is litellm's behaviour, not a copy the gateway makes. The token is NOT in `StandardLoggingPayload` and NOT in the spend-log row; only a callback registered in litellm sees the kwargs, so it is config-gated like the logging-snapshot and `X-Corp-Auth` hazards (a callback added through litellm's config or database, §15). Follow-up: scrub the logging object's `litellm_params.api_key` copy (and the header copies) after the bridge if it is a separate dict from what the provider call uses — investigate in the follow-up. Pinned by `tests/litellm_hook/test_bearer_is_hashed_before_logging.py` (exact site lists). | **Low** — config-gated: the shipped configs register only the gateway's own callback; a log callback an operator adds would receive the developer's subscription credential |
 
@@ -632,14 +633,49 @@ litellm adds `x-api-key` while the inbound `Authorization` is still merged in,
 so the outbound request would carry two competing auth schemes. Plain-API-key
 BYOK on this bridge is a separate decision that has not been made.
 
+### Client headers upstream
+
+litellm sends `data["headers"]` to the provider on every route, and no header
+value passes the sanitizer or the Stage-5 scan. The pre-call therefore writes an
+allowlist projection there (`_UPSTREAM_HEADER_ALLOWLIST` in `litellm_hook.py`),
+and the allowlist is empty: whatever an upstream needs from the client, a bridge
+carries from its own allowlist. Wire-captured on the real image (container
+suite, below):
+
+| Provider | Client headers that reach the upstream | `Authorization` upstream |
+|---|---|---|
+| anthropic (`CORP_LLM_FORWARD_ANTHROPIC_AUTH`) | `anthropic-beta` (litellm keeps only the betas it knows and adds `oauth-2025-04-20`), `anthropic-version`, `user-agent` | the developer's `sk-ant-oat…`, from `api_key` |
+| codex (`CORP_LLM_FORWARD_CHATGPT_AUTH`) | `chatgpt-account-id`, `originator`, `session-id`, `thread-id`, `user-agent`, `x-openai-internal-codex-responses-lite`, `x-codex-*` | the developer's ChatGPT token, from `api_key` |
+| corp (no bridge) | none | the route's `CORP_LLM_AUTH_TOKEN`; `Bearer fake-api-key` when it is empty |
+
+Every other header on the wire is added by litellm or its HTTP client: `host`,
+`accept`, `accept-encoding`, `connection`, `content-type`, `content-length`;
+litellm's own `user-agent` on corp; `anthropic-dangerous-direct-browser-access`
+from litellm's OAuth branch; the OpenAI SDK's `x-stainless-*` on the codex chat
+route. A cookie, `x-api-key`, `x-litellm-api-key`, `X-Corp-Auth` or any other
+client header reaches no provider. Adding a name to the allowlist sends that
+header's value to every provider unsanitized — a security decision, like a
+route-table row. Pinned by
+`tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream`
+(the exact header set, per provider and route) and
+`tests/litellm_hook/test_pre_call_headers.py` (the projection, in process).
+
+**Fixed in 1.1.0; 1.0.0 is affected.** 1.0.0 wrote litellm's logging copy of
+every inbound header into `data["headers"]` and dropped only the wire headers
+(`_WIRE_HEADERS_TO_DROP`), with `CORP_LLM_STRIP_INBOUND_HEADERS=1`. An arbitrary
+client header reached all three providers verbatim, so a value carrying PII
+bypassed the sanitizer (invariant 1); a cookie arrived as `***REDACTED***`; on
+corp, a client `sk-ant-oat…` bearer sent with `x-litellm-api-key` arrived folded
+into the route's own credential as `Authorization: ***REDACTED***, Bearer
+fake-api-key`.
+
 ### Invariant 3 on this route
 
-Invariant 3 (BYOK `Authorization` passthrough) holds unchanged: the inbound
-`Authorization` header is left in every header bucket exactly as it arrived, and
-the bridge only *reads* it. The upstream `Authorization` header litellm builds
-from `api_key` is the token's **one authorized destination**; the token
-appearing anywhere else — another header, the request body, the router's model
-list, the proxy's log stream — is a leak.
+The inbound `Authorization` header stays in litellm's own header copies, where
+the bridge *reads* it; it does not go into `data["headers"]`. The upstream
+`Authorization` header litellm builds from `api_key` is the token's **one
+authorized destination**; the token appearing anywhere else — another header,
+the request body, the router's model list, the proxy's log stream — is a leak.
 
 That rule is pinned on both sides of the process boundary, because no single
 harness sees both:
@@ -1455,8 +1491,8 @@ by construction:
   hook. The pre-call now strips `X-Corp-Auth` first, before anything can refuse
   the request, from every header copy — `requester_metadata`, the body snapshot's
   metadata and litellm's logging object — so no log kwargs, payload, spend-log
-  row or failure-hook request holds it. Pre-existing on `release/1.0.x`. BYOK
-  `Authorization` is untouched (invariant 3).
+  row or failure-hook request holds it. Pre-existing on `release/1.0.x`. The
+  developer's `Authorization` stays in litellm's copies, where the bridges read it.
 - **The DEBUG lines before our hook.** Two litellm DEBUG lines run before the
   pre-call and print the raw corp token: "Request Headers" and "[PROXY] returned
   data from litellm_pre_call_utils" (`proxy/litellm_pre_call_utils.py`). The second

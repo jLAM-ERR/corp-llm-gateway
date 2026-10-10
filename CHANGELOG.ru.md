@@ -7,6 +7,27 @@
 
 ## [1.1.0]
 
+### Безопасность — заголовки клиента больше не доходят до провайдера (затронута 1.0.0)
+
+- **1.0.0 отправляла наверх все входящие заголовки клиента, без санитизации, на всех
+  провайдерах.** litellm отправляет провайдеру `data["headers"]`, а guardrail клал туда
+  логируемую копию litellm со всеми входящими заголовками и убирал только wire-заголовки
+  (`_WIRE_HEADERS_TO_DROP`), при `CORP_LLM_STRIP_INBOUND_HEADERS=1`. Значения заголовков не
+  проходят ни санитайзер, ни скан Stage 5, так что нарушался инвариант 1: произвольный заголовок
+  с email доходил до upstream Anthropic, Codex и corp без изменений; cookie приходила как
+  `***REDACTED***`; на corp клиентский bearer `sk-ant-oat…` вместе с `x-litellm-api-key`
+  приходил слитым с собственным креденшелом маршрута как
+  `Authorization: ***REDACTED***, Bearer fake-api-key`. Подтверждено на реальном образе против
+  перехватывающего upstream. Обновите каждое развёртывание 1.0.0.
+- **`data["headers"]` теперь проекция по allowlist (`_UPSTREAM_HEADER_ALLOWLIST`), и этот
+  allowlist пуст.** Мосты подписочной аутентификации несут токен разработчика в `api_key`, а
+  свои allowlist-ы — в `extra_headers` (Anthropic: `anthropic-beta`, `anthropic-version`,
+  `user-agent`; Codex: `chatgpt-account-id`, `originator`, `session-id`, `thread-id`,
+  `user-agent`, `x-openai-internal-codex-responses-lite`, `x-codex-*`); маршрут corp получает
+  только собственный `CORP_LLM_AUTH_TOKEN`. `Authorization` клиента на маршруте без моста больше
+  не пробрасывается. Список по провайдерам — в `docs/security.ru.md` §13; контейнерный набор
+  тестов фиксирует точный набор заголовков, который получает каждый провайдер.
+
 ### Добавлено — `gateway-admin`: начальная настройка с фиксированным токеном команды
 
 - **`token issue --value VALUE`** сохраняет выбранное вами значение вместо случайного токена

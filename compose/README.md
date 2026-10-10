@@ -164,28 +164,22 @@ Those providers build their upstream credential from the configured
 image) and independently against 1.90.1; see `examples/compose/README.md`
 "BYOK in local mode (SPIKE finding)".
 
-**(b) Our own guardrail forwards inbound wire headers regardless of
-litellm's own gate — that's what `CORP_LLM_STRIP_INBOUND_HEADERS` is for.**
-litellm's `forward_client_headers_to_llm_api` gate (`litellm/proxy/
-litellm_pre_call_utils.py`, `add_litellm_data_for_backend_llm_call` /
-`add_headers_to_llm_call_by_model_group`) is correctly unset in
-`litellm/config.yaml` — litellm itself does not copy client headers into
-`data["headers"]`. But `CorpLlmGuardrail._pre_call_impl` (reached via
-`async_pre_call_hook`) sets `data["headers"]` **unconditionally**,
-independent of that gate, and litellm forwards whatever ends up in
-`data["headers"]` to the upstream HTTP call regardless of how it got
-there. Wire-captured
-against a stand-in upstream: `host`, `user-agent`, `accept`, `connection`,
-`content-type`, `content-length` and an arbitrary probe header all reached
-the upstream call, on **both** `corp-*` and `claude-*` routes, with the
-strip flag off; none did with it on. So `CORP_LLM_STRIP_INBOUND_HEADERS` is
-load-bearing on this stack, not a reserved no-op — it's set `1` in
-`docker-compose.yml`/`.env.example`. It never touches `Authorization` (see
-`litellm_hook.py` `_WIRE_HEADERS_TO_DROP` — BYOK passthrough, invariant #3,
-is preserved for deployments that DO forward it).
+**(b) No client header reaches a provider through `data["headers"]`.**
+litellm sends `data["headers"]` upstream on every route, and its own
+`forward_client_headers_to_llm_api` gate is correctly unset here, so the only
+inbound copy the guardrail could put there is litellm's logging copy of every
+client header. In 1.0.0 it did, dropping only the wire headers listed in
+`_WIRE_HEADERS_TO_DROP`: wire-captured on the real image, an arbitrary client
+header (an email in it) reached the Anthropic, Codex and corp upstreams
+verbatim with `CORP_LLM_STRIP_INBOUND_HEADERS=1`. Since 1.1.0
+`CorpLlmGuardrail._pre_call_impl` writes an allowlist projection there, and the
+allowlist is empty (`_UPSTREAM_HEADER_ALLOWLIST` in `litellm_hook.py`;
+per-provider list in `docs/security.md` §13). `CORP_LLM_STRIP_INBOUND_HEADERS`
+still drops the wire headers from litellm's own header copies; it no longer
+decides what goes upstream.
 
-BYOK (the developer's own key forwarded untouched — CLAUDE.md invariant #3)
-is nonetheless **not available on this compose stack at all**, on any
+BYOK (the developer's own provider key forwarded upstream)
+is **not available on this compose stack at all**, on any
 route: developers authenticate with the litellm virtual key described
 above, and the `corp-*`/`hosted_vllm/` route builds its upstream request
 from the configured `api_key`/model params the same way `anthropic/` and

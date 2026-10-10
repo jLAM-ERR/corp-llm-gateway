@@ -180,7 +180,8 @@ async def test_pre_call_strips_corp_token_from_headers() -> None:
     data = _data_with_token("tok-1")
     out = await g.pre_call(data)
     assert "X-Corp-Auth" not in out["headers"]
-    assert out["headers"]["Authorization"] == "Bearer byok"
+    # Nothing else either: the developer's bearer reaches no upstream through it.
+    assert out["headers"] == {}
 
 
 async def test_pre_call_secret_fields_raw_headers_not_declassified_into_data_headers() -> None:
@@ -204,7 +205,7 @@ async def test_pre_call_secret_fields_raw_headers_not_declassified_into_data_hea
     out = await g.pre_call(data)
     assert "Cookie" not in out["headers"], "secret_fields.raw_headers declassified"
     assert "X-Internal-Credential" not in out["headers"]
-    assert out["headers"]["Authorization"] == "Bearer byok"
+    assert out["headers"] == {}
 
 
 async def test_pre_call_strips_corp_token_from_litellm_params_proxy_server_request() -> None:
@@ -229,36 +230,6 @@ async def test_pre_call_strips_corp_token_from_litellm_params_proxy_server_reque
     assert proxy_headers["Authorization"] == "Bearer byok"
 
 
-def test_extract_headers_write_path_matches_release_semantics() -> None:
-    """The WRITE-path `_extract_headers` (data["headers"] at pre_call ~:312) must
-    stay byte-identical to release/1.0.x: first non-empty of data["headers"] then
-    proxy_server_request, unwrapping a nested "headers" key — no merge across
-    buckets. Verified against `git show release/1.0.x:src/corp_llm_gateway/litellm_hook.py`."""
-    from corp_llm_gateway.litellm_hook import _extract_headers
-
-    # data["headers"] wins even when other buckets carry MORE headers -- no merge.
-    assert _extract_headers(
-        {
-            "headers": {"Authorization": "Bearer byok"},
-            "proxy_server_request": {"headers": {"Cookie": "session=secret"}},
-            "secret_fields": {"raw_headers": {"X-Internal-Credential": "cred"}},
-        }
-    ) == {"Authorization": "Bearer byok"}
-
-    # data["headers"] empty/missing falls back to proxy_server_request, unwrapping
-    # its own nested "headers" key.
-    assert _extract_headers(
-        {"proxy_server_request": {"headers": {"Authorization": "Bearer byok"}}}
-    ) == {"Authorization": "Bearer byok"}
-
-    # proxy_server_request without a nested "headers" key IS the header dict itself.
-    assert _extract_headers({"proxy_server_request": {"Authorization": "Bearer byok"}}) == {
-        "Authorization": "Bearer byok"
-    }
-
-    assert _extract_headers({}) == {}
-
-
 async def test_pre_call_handles_proxy_server_request_headers_shape() -> None:
     """LiteLLM passes headers via `proxy_server_request.headers` in some paths."""
     g, _ = _build_guardrail([("alice", "[N1]")])
@@ -275,13 +246,13 @@ async def test_pre_call_handles_proxy_server_request_headers_shape() -> None:
 
 
 async def test_pre_call_strips_corp_token_from_all_header_locations() -> None:
-    """F6: the corp token must not survive in ANY header-bearing location, and the
-    BYOK Authorization header must pass through untouched (invariant 3)."""
+    """F6: the corp token must not survive in ANY header-bearing location. litellm's
+    own copies keep the developer's Authorization; the upstream bucket holds nothing."""
     g, _ = _build_guardrail()
     data = _data_all_header_locations("tok-1")
     out = await g.pre_call(data)
+    assert out["headers"] == {}
     for loc in (
-        out["headers"],
         out["proxy_server_request"]["headers"],
         out["metadata"]["headers"],
         out["litellm_metadata"]["headers"],
@@ -318,8 +289,8 @@ async def test_pre_call_strips_corp_token_case_insensitive_all_locations() -> No
         "litellm_metadata": {"headers": dict(hdrs)},
     }
     out = await g.pre_call(data)
+    assert out["headers"] == {}
     for loc in (
-        out["headers"],
         out["proxy_server_request"]["headers"],
         out["metadata"]["headers"],
         out["litellm_metadata"]["headers"],
@@ -345,3 +316,103 @@ async def test_pre_call_strips_corp_token_from_litellm_params_metadata_headers()
     hdrs = out["litellm_params"]["metadata"]["headers"]
     assert not any(k.lower() == "x-corp-auth" for k in hdrs)
     assert hdrs["Authorization"] == "Bearer byok"
+
+
+# Every kind of inbound header a client can send: the corp token, the provider
+# credentials, litellm's own key header, protocol headers, wire headers, and an
+# arbitrary one whose value is PII the sanitizer never sees.
+_CLIENT_HEADERS = {
+    "X-Corp-Auth": "tok-1",
+    "Authorization": "Bearer byok",
+    "Cookie": "session=secret",
+    "X-Probe-Secret": "alice.probe@corp.lan",
+    "x-api-key": "sk-client-key",
+    "x-litellm-api-key": "sk-litellm-key",
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "beta-1",
+    "User-Agent": "claude-cli/1.0",
+    "Content-Length": "42",
+    "Host": "127.0.0.1:4000",
+}
+
+
+def _request_with_headers_in(bucket: str, model: str) -> dict[str, Any]:
+    data: dict[str, Any] = {"model": model, "messages": [{"role": "user", "content": "hi"}]}
+    if bucket == "headers":
+        data["headers"] = dict(_CLIENT_HEADERS)
+    elif bucket == "proxy_server_request":
+        # litellm's own forwarding off: the logging copy is the only inbound copy.
+        data["proxy_server_request"] = {"headers": dict(_CLIENT_HEADERS)}
+    else:
+        data["headers"] = {"X-Corp-Auth": "tok-1"}
+        data["secret_fields"] = {"raw_headers": dict(_CLIENT_HEADERS)}
+    return data
+
+
+@pytest.mark.parametrize("strip_inbound", [True, False], ids=["strip-on", "strip-off"])
+@pytest.mark.parametrize("bucket", ["headers", "proxy_server_request", "secret_fields"])
+async def test_pre_call_forwards_no_client_header_through_data_headers(
+    bucket: str, strip_inbound: bool
+) -> None:
+    """litellm sends ``data["headers"]`` upstream on every provider, unsanitized and
+    outside the Stage-5 scan, so the hook puts no client header there, whichever
+    bucket the headers came in and whatever the wire-header strip says."""
+    g, _ = _build_guardrail()
+    g._strip_inbound_headers_to_upstream = strip_inbound
+
+    out = await g.pre_call(_request_with_headers_in(bucket, "corp-glm-5.1"))
+
+    assert out["headers"] == {}
+
+
+@pytest.mark.parametrize(
+    "bridge,model,api_key,forwarded",
+    [
+        pytest.param(
+            "forward_anthropic_auth",
+            "claude-sonnet-4-5",
+            "sk-ant-oat01-unit",
+            {"anthropic-version", "anthropic-beta", "user-agent"},
+            id="anthropic",
+        ),
+        pytest.param(
+            "forward_chatgpt_auth", "gpt-5.6-sol", "oauth-unit", {"user-agent"}, id="codex"
+        ),
+    ],
+)
+async def test_a_bridge_carries_its_allowlist_in_extra_headers_and_nothing_in_data_headers(
+    bridge: str, model: str, api_key: str, forwarded: set[str]
+) -> None:
+    g, _ = _build_guardrail(**{bridge: True})
+    data = _request_with_headers_in("proxy_server_request", model)
+    data["proxy_server_request"]["headers"]["Authorization"] = f"Bearer {api_key}"
+
+    out = await g.pre_call(data)
+
+    assert out["headers"] == {}
+    assert out["api_key"] == api_key
+    assert {name.lower() for name in out["extra_headers"]} == forwarded
+
+
+def test_the_upstream_header_allowlist_is_empty() -> None:
+    """Adding a name here sends that client header's value to every provider,
+    unsanitized: a security decision, like a route-table row, not a config change."""
+    from corp_llm_gateway.litellm_hook import _UPSTREAM_HEADER_ALLOWLIST
+
+    assert frozenset() == _UPSTREAM_HEADER_ALLOWLIST
+
+
+def test_the_upstream_projection_keeps_only_allowlisted_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from corp_llm_gateway import litellm_hook
+
+    monkeypatch.setattr(
+        litellm_hook, "_UPSTREAM_HEADER_ALLOWLIST", frozenset({"anthropic-version", "x-corp-auth"})
+    )
+
+    projected = litellm_hook._upstream_headers(dict(_CLIENT_HEADERS))
+
+    # Case-insensitive on the name, value untouched; the corp token never, listed or not.
+    assert projected == {"anthropic-version": "2023-06-01"}
+    assert litellm_hook._upstream_headers({}) == {}

@@ -262,12 +262,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # vLLM's 65536-token total context window. Default None = no
         # clamp; behaviour is unchanged in production.
         self._max_output_tokens_cap = max_output_tokens_cap
-        # When True, strip inbound HTTP client headers from `data` before
-        # litellm's provider layer forwards them to the upstream LLM.
-        # Some providers (e.g. hosted_vllm) silently pass
-        # `proxy_server_request.headers` through, so the upstream sees
-        # `Host: 127.0.0.1:4000` and the corp ingress 503s on the unknown
-        # vhost. Off by default to preserve existing behaviour.
+        # When True, drop the inbound wire headers (Host, Content-Length, ...) from
+        # litellm's own header copies too. What goes upstream, data["headers"], is
+        # the allowlist projection below whatever this says.
         self._strip_inbound_headers_to_upstream = strip_inbound_headers_to_upstream
         # Opt-in bridge for a Codex custom provider with
         # ``requires_openai_auth = true``. LiteLLM consumes the client
@@ -456,7 +453,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # Read for auth, then stripped before anything can refuse: litellm hands a
         # refused request, as it stands, to every failure hook (invariant 4).
         inbound_headers = _extract_auth_headers(data)
-        data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
+        # litellm sends data["headers"] upstream on every provider, outside the
+        # sanitizer and the Stage-5 scan: only the allowlist goes there.
+        data["headers"] = self._auth.strip_corp_token(_upstream_headers(inbound_headers))
         # The corp token arrives duplicated across every header-bearing location
         # and some providers forward proxy_server_request.headers upstream, so
         # strip it from ALL of them, not just data["headers"] (invariant 4).
@@ -557,12 +556,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             ctx.user_id,
         )
 
-        # Optional: strip inbound HTTP wire headers from data so litellm
-        # providers (notably hosted_vllm) don't forward them upstream.
-        # `Host: 127.0.0.1:4000` going to the corp ingress earns a
-        # vhost-not-found 503. Only nuke the hop-by-hop / wire-level
-        # headers; preserve protocol-meaningful ones like
-        # `anthropic-version` and `authorization` (BYOK passthrough).
+        # Optional: drop the inbound wire headers from litellm's own header copies
+        # as well. data["headers"] is already the allowlist projection.
         if self._strip_inbound_headers_to_upstream:
             _drop_wire_headers(data.get("headers"))
             proxy_req = data.get("proxy_server_request")
@@ -2195,11 +2190,12 @@ def _resolve_request_data(kwargs: dict[str, Any]) -> dict[str, Any]:
 # The internal corp auth header — never egress it (invariant 4, M1-14).
 _CORP_AUTH_HEADER_LOWER = AuthMiddleware.HEADER_NAME.lower()
 
-# Inbound HTTP wire-level headers that must NOT be forwarded to upstream
-# LLMs by any provider. Mostly hop-by-hop or request-scoped values that
-# describe the LiteLLM proxy's own connection from the client. Includes
-# x-corp-auth as defense-in-depth; the unconditional strip below is the
-# primary guard. Never add `authorization` here — BYOK passthrough (invariant 3).
+# Inbound HTTP wire-level headers dropped from litellm's own header copies when
+# CORP_LLM_STRIP_INBOUND_HEADERS is on: hop-by-hop or request-scoped values that
+# describe the client's connection to the gateway. Includes x-corp-auth as
+# defense-in-depth; the unconditional strip below is the primary guard. Not
+# `authorization`: the bridges read the developer's token from these copies.
+# What goes upstream is decided by _UPSTREAM_HEADER_ALLOWLIST, not by this list.
 _WIRE_HEADERS_TO_DROP = frozenset(
     {
         "host",
@@ -2246,8 +2242,8 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
     forbids. Each metadata bucket's ``requester_metadata`` copy and the body
     snapshot's metadata are covered too. The rule: every bucket
     ``_extract_auth_headers`` reads for auth must be strippable here too.
-    ``_drop_corp_token`` only removes ``x-corp-auth``; the developer's BYOK
-    ``Authorization`` header is left untouched (invariant 3).
+    ``_drop_corp_token`` only removes ``x-corp-auth``; the developer's
+    ``Authorization`` stays in litellm's copies, where the bridges read it.
     """
     _drop_corp_token(data.get("headers"))
     _drop_corp_token_from_request(data)
@@ -2684,22 +2680,27 @@ def _response_mapping(state: _RequestState, *, include_bare_aliases: bool) -> St
     )
 
 
-def _extract_headers(data: dict[str, Any]) -> dict[str, str]:
-    """Byte-identical to release/1.0.x's ``_extract_headers`` — the WRITE path.
+# The inbound headers litellm may send upstream through ``data["headers"]``.
+# Empty: each bridge puts what its upstream needs in ``extra_headers`` from its own
+# allowlist (``_ANTHROPIC_HEADER_ALLOWLIST``, ``_CHATGPT_HEADER_ALLOWLIST``) and
+# carries the developer's token in ``api_key``; litellm adds its own protocol
+# headers; the corp route needs none. A name added here sends that client header's
+# value to every provider unsanitized — a security decision, not a config change.
+_UPSTREAM_HEADER_ALLOWLIST: frozenset[str] = frozenset()
 
-    Used ONLY to compute what gets written back to ``data["headers"]``
-    (litellm forwards/logs that bucket). An allowlist projection here would
-    risk dropping BYOK ``Authorization`` (invariant 3), ``anthropic-version``,
-    or whatever ``_drop_wire_headers`` deliberately preserves, so this stays
-    exactly release's "first non-empty bucket" logic rather than the merge
-    ``_extract_auth_headers`` below does for auth resolution.
+
+def _upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
+    """The ``data["headers"]`` write path: the allowlisted names of *inbound* only.
+
+    Never the corp token, listed or not (invariant 4). Without litellm's own
+    ``forward_client_headers_to_llm_api`` the only inbound copy here is litellm's
+    logging copy of every client header, so a deny-list would send the rest upstream.
     """
-    raw = data.get("headers") or data.get("proxy_server_request") or {}
-    if isinstance(raw, dict):
-        if "headers" in raw and isinstance(raw["headers"], dict):
-            return {str(k): str(v) for k, v in raw["headers"].items()}
-        return {str(k): str(v) for k, v in raw.items()}
-    return {}
+    return {
+        name: value
+        for name, value in inbound.items()
+        if name.lower() in _UPSTREAM_HEADER_ALLOWLIST and name.lower() != _CORP_AUTH_HEADER_LOWER
+    }
 
 
 def _extract_auth_headers(data: dict[str, Any]) -> dict[str, str]:
@@ -2711,9 +2712,9 @@ def _extract_auth_headers(data: dict[str, Any]) -> dict[str, str]:
     merge is case-insensitive so a later, more complete wire-request copy
     replaces an earlier normalized copy instead of creating duplicate headers.
 
-    Used ONLY by ``authenticate_headers`` and ``_chatgpt_upstream_headers`` —
-    NEVER for the ``data["headers"]`` write path (see ``_extract_headers``
-    above), because litellm deliberately excludes some of these buckets
+    Used by ``authenticate_headers`` and the bridges' header selection; the
+    ``data["headers"]`` write path sees it only through ``_upstream_headers``'
+    allowlist, because litellm deliberately excludes some of these buckets
     (``secret_fields.raw_headers``) from logs and upstream request snapshots;
     writing the merge back there would declassify them.
     """

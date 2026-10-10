@@ -62,14 +62,14 @@ x-gateway-environment: &gateway-environment
   # local-first are off — don't set CORP_LLM_LOCAL_FIRST=0 in .env
   # without also flipping this to 1, or the container won't start.
   CORP_LLM_ORACLE_ENABLED: ${CORP_LLM_ORACLE_ENABLED:-0}
-  # Load-bearing, not reserved: our own guardrail sets data["headers"]
-  # UNCONDITIONALLY in CorpLlmGuardrail._pre_call_impl, independent of
-  # litellm's own forward_client_headers_to_llm_api gate. Wire-captured against a
-  # stand-in upstream: host/user-agent/accept/connection/content-type/
-  # content-length (plus an arbitrary probe header) all reached the
-  # upstream call on BOTH corp-* and claude-* routes with this off;
-  # none did with it on. Keep "1". See settings.py
-  # CORP_LLM_STRIP_INBOUND_HEADERS / bootstrap.build_guardrail().
+  # What reaches a provider from the client is decided elsewhere: the guardrail
+  # writes data["headers"] (the bucket litellm forwards) as an allowlist
+  # projection, and the allowlist is empty (litellm_hook.py
+  # _UPSTREAM_HEADER_ALLOWLIST). Each bridge carries its own allowlist in
+  # extra_headers; the corp route gets only its CORP_LLM_AUTH_TOKEN
+  # (docs/security.md §13). This flag only drops the inbound wire headers
+  # (host, content-length, ...) from litellm's own header copies as well.
+  # Keep "1". See settings.py CORP_LLM_STRIP_INBOUND_HEADERS.
   CORP_LLM_STRIP_INBOUND_HEADERS: ${CORP_LLM_STRIP_INBOUND_HEADERS:-1}
   # F9 guard (config.py is_prod()): arms the refusal of SSL_VERIFY=false
   # on the corp-LLM ORACLE call specifically — reached only through

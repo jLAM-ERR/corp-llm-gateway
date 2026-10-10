@@ -1096,8 +1096,9 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
     litellm_params.metadata.headers (litellm's logging-metadata dict, F6
     completeness), litellm_params.proxy_server_request.headers (defect #4), and
     secret_fields.raw_headers (defect #3) — every bucket `_extract_auth_headers`
-    reads; the BYOK Authorization header survives; the token never hits a log
-    line."""
+    reads; litellm's own copies keep the developer's Authorization, the upstream
+    bucket data["headers"] holds no client header at all; the token never hits a
+    log line."""
     guardrail, _ = _header_strip_guardrail()
     byok = "Bearer byok-developer-key"
     hdrs = {"X-Corp-Auth": _CORP_TOKEN, "Authorization": byok}
@@ -1117,8 +1118,9 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
     with caplog.at_level(logging.DEBUG):
         out = await guardrail.pre_call(data)  # type: ignore[attr-defined]
 
-    forwarded_header_dicts = [
-        out["headers"],
+    # The bucket litellm sends upstream: an allowlist projection that is empty.
+    assert out["headers"] == {}, "a client header reaches the upstream unsanitized"
+    litellm_header_dicts = [
         out["proxy_server_request"]["headers"],
         out["metadata"]["headers"],
         out["litellm_metadata"]["headers"],
@@ -1126,11 +1128,11 @@ async def test_corp_token_never_egresses_from_any_forwarded_header(
         out["litellm_params"]["proxy_server_request"]["headers"],
         out["secret_fields"]["raw_headers"],
     ]
-    for loc in forwarded_header_dicts:
+    for loc in litellm_header_dicts:
         serialized = json.dumps(loc)
         assert _CORP_TOKEN not in serialized, "corp token egressed in a forwarded header"
         assert not any(k.lower() == "x-corp-auth" for k in loc), "X-Corp-Auth survived a strip"
-        assert byok in serialized, "BYOK Authorization dropped (invariant 3 violation)"
+        assert byok in serialized, "Authorization dropped from litellm's copy (the bridges read it)"
 
     assert _CORP_TOKEN not in caplog.text, "corp token leaked into a log line (invariant 4)"
 
@@ -1198,8 +1200,10 @@ async def test_corp_token_never_reaches_litellms_logging_snapshot(
     for view in views:
         assert _CORP_TOKEN not in view, "corp token left in litellm's logging snapshot"
         assert "x-corp-auth" not in view.lower()
-    # Invariant 3: only the corp token goes; each of the 20 / 9 / 9 header dicts keeps BYOK.
-    assert [view.count(byok) for view in views] == [20, 9, 9]
+    # Only the corp token goes from litellm's copies: each of its 19 / 9 / 9 header
+    # dicts keeps the developer's Authorization. The upstream bucket holds nothing.
+    assert data["headers"] == {}
+    assert [view.count(byok) for view in views] == [19, 9, 9]
     assert _CORP_TOKEN not in caplog.text
 
 
@@ -1522,7 +1526,8 @@ async def test_anthropic_oauth_token_never_leaves_its_authorized_destination(
 ) -> None:
     """Success path: the bearer reaches `api_key` (litellm's OAuth branch reads it
     there) and no other header bucket, no log line and no audit record carries it.
-    The inbound Authorization header itself still survives — invariant 3."""
+    litellm's own copies keep the inbound Authorization, where the bridge read it;
+    the upstream bucket data["headers"] holds nothing."""
     guardrail, sink, _ = _anthropic_oauth_guardrail()
     data = _anthropic_request(f"Bearer {_ANTHROPIC_OAUTH_TOKEN}")
 
@@ -1539,8 +1544,8 @@ async def test_anthropic_oauth_token_never_leaves_its_authorized_destination(
     assert _ANTHROPIC_OAUTH_TOKEN not in json.dumps(upstream), "bearer copied into extra_headers"
     assert "x-corp-auth" not in upstream
 
+    assert out["headers"] == {}, "a client header reaches the upstream unsanitized"
     for bucket in (
-        out["headers"],
         out["proxy_server_request"]["headers"],
         out["litellm_metadata"]["headers"],
         out["secret_fields"]["raw_headers"],
@@ -1549,7 +1554,7 @@ async def test_anthropic_oauth_token_never_leaves_its_authorized_destination(
             name.lower() for name, value in bucket.items() if _ANTHROPIC_OAUTH_TOKEN in value
         }
         assert carriers <= {"authorization"}, f"bearer egressed in {carriers}"
-        assert carriers == {"authorization"}, "BYOK Authorization dropped (invariant 3 violation)"
+        assert carriers == {"authorization"}, "Authorization dropped from litellm's copy"
         assert not any(name.lower() == "x-corp-auth" for name in bucket)
 
     assert len(sink.records) == 1

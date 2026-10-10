@@ -610,13 +610,10 @@ def build_guardrail(
         else configured_forward_anthropic_auth
     )
     # Independent of the chatgpt/anthropic pair: not part of their mutual exclusivity.
-    # Defaults ON. The guardrail writes the inbound wire headers into
-    # data["headers"] and litellm forwards that bucket, so with the flag off the
-    # client's `content-length` rides along beside litellm's own, longer,
-    # sanitized body and the provider reads the request truncated at the client's
-    # length (wire-captured on /v1/messages and /v1/chat/completions). Any request
-    # whose sanitized body grew is corrupted. The dropped set is hop-by-hop /
-    # wire-level only and never `authorization` (invariant 3).
+    # Defaults ON: drops the inbound wire headers (the client's `content-length`
+    # among them) from litellm's own header copies. data["headers"], the bucket
+    # litellm forwards, is the guardrail's allowlist projection with the flag on or
+    # off. Never `authorization`: the bridges read the developer's token there.
     resolved_strip_inbound_headers_to_upstream = (
         strip_inbound_headers_to_upstream
         if strip_inbound_headers_to_upstream is not None

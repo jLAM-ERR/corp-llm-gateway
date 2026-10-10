@@ -165,27 +165,23 @@ README, — читайте внимательно, механизмы разны
 (запинованный образ) и независимо на 1.90.1; см. `examples/compose/README.md`,
 раздел «BYOK in local mode (SPIKE finding)».
 
-**(b) Наш собственный guardrail форвардит входящие wire-заголовки независимо от
-гейта самого litellm — именно для этого существует
-`CORP_LLM_STRIP_INBOUND_HEADERS`.** Гейт litellm
-`forward_client_headers_to_llm_api` (`litellm/proxy/litellm_pre_call_utils.py`,
-`add_litellm_data_for_backend_llm_call` / `add_headers_to_llm_call_by_model_group`)
-в `litellm/config.yaml` корректно не задан — сам litellm клиентские заголовки в
-`data["headers"]` не копирует. Но `CorpLlmGuardrail._pre_call_impl` (вызываемый
-из `async_pre_call_hook`) выставляет `data["headers"]` **безусловно**, независимо
-от этого гейта, а litellm форвардит наверх всё, что оказалось в
-`data["headers"]`, как бы оно туда ни попало. Снято с провода против
-подставного upstream: `host`, `user-agent`, `accept`, `connection`,
-`content-type`, `content-length` и произвольный пробный заголовок доходили до
-upstream-вызова на **обоих** маршрутах, `corp-*` и `claude-*`, при выключённом
-флаге; при включённом — ни один. То есть `CORP_LLM_STRIP_INBOUND_HEADERS` на
-этом стеке несущий, а не зарезервированный no-op — он выставлен в `1` в
-`docker-compose.yml`/`.env.example`. `Authorization` он не трогает никогда (см.
-`_WIRE_HEADERS_TO_DROP` в `litellm_hook.py` — passthrough BYOK, инвариант #3,
-сохранён для тех развёртываний, которые его действительно форвардят).
+**(b) Никакой заголовок клиента не доходит до провайдера через `data["headers"]`.**
+litellm отправляет `data["headers"]` наверх на каждом маршруте, а его собственный
+гейт `forward_client_headers_to_llm_api` здесь корректно не задан, так что
+единственная входящая копия, которую guardrail мог туда положить, — логируемая
+копия litellm со всеми заголовками клиента. В 1.0.0 он так и делал
+и убирал только wire-заголовки из `_WIRE_HEADERS_TO_DROP`: снято с провода на
+реальном образе — произвольный заголовок клиента (с email внутри) доходил до
+upstream Anthropic, Codex и corp без изменений при
+`CORP_LLM_STRIP_INBOUND_HEADERS=1`. С 1.1.0 `CorpLlmGuardrail._pre_call_impl`
+пишет туда проекцию по allowlist, и этот allowlist пуст
+(`_UPSTREAM_HEADER_ALLOWLIST` в `litellm_hook.py`; список по провайдерам — в
+`docs/security.ru.md` §13). `CORP_LLM_STRIP_INBOUND_HEADERS` по-прежнему убирает
+wire-заголовки из собственных копий заголовков litellm, но больше не решает, что
+уходит наверх.
 
-BYOK (собственный ключ разработчика, пробрасываемый без изменений — инвариант #3
-из CLAUDE.md) тем не менее **на этом compose-стеке недоступен вовсе**, ни на
+BYOK (собственный ключ провайдера у разработчика, пробрасываемый наверх)
+**на этом compose-стеке недоступен вовсе**, ни на
 одном маршруте: разработчики аутентифицируются описанным выше виртуальным ключом
 litellm, а маршрут `corp-*`/`hosted_vllm/` строит запрос наверх из настроенного
 `api_key`/параметров модели ровно так же, как `anthropic/` и `openai/`, а не из

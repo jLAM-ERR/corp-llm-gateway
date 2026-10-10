@@ -283,6 +283,19 @@ deleted. FI numbers refer to the fault injections run on the Task 6 tree, each r
 | plan 20261009 Task 6 | `tests/integration/test_route_gate_container.py::test_uvicorns_own_lines_are_json_records_too[mode_a]` | passed / passed | asserts 4: uvicorn's access and startup lines in the gateway's stdout are JSON records, none plain | `tests/integration/test_route_gate_container.py::test_uvicorns_own_lines_are_json_records_too[anthropic]`, `[codex]`, `[corp]` | Re-parametrised from the `mode` fixture to `provider`: the Mode A (master key, seeded virtual key, litellm DB) stack is gone, and the same body now runs on the anthropic, codex and corp stacks, each with no master key and no litellm database. `moves.json` cannot carry a suffix change. | n/a (same body on each provider; FI1 shows the provider cases run on every stack) | auto-review (pending) |
 | plan 20261009 Task 6 | `tests/integration/test_route_gate_container.py::test_uvicorns_own_lines_are_json_records_too[mode_b]` | passed / passed | asserts 4: uvicorn's access and startup lines in the gateway's stdout are JSON records, none plain | `tests/integration/test_route_gate_container.py::test_uvicorns_own_lines_are_json_records_too[anthropic]`, `[codex]`, `[corp]` | Re-parametrised from the `mode` fixture to `provider`: the Mode B stack (the Anthropic bridge) is the `anthropic` provider now, and the same body also runs on the codex and corp stacks, each with no master key and no litellm database. `moves.json` cannot carry a suffix change. | n/a (same body on each provider; FI1 shows the provider cases run on every stack) | auto-review (pending) |
 
+## Removed with the behaviour it pinned (plan 20261009 Task 6b)
+
+Task 6b replaces the `data["headers"]` deny-list with an allowlist projection
+(`_UPSTREAM_HEADER_ALLOWLIST`, empty) and deletes `_extract_headers`. The one test that pinned
+that function goes with it; it is not must-keep, and its `moves.json` entry is dropped. FI: line
+458 of `litellm_hook.py` set back to the deny-list shape
+(`self._auth.strip_corp_token(dict(inbound_headers))`) fails 15 tests, the survivors below
+among them; reverted.
+
+| PR | deleted node id | baseline outcome (minimal / full) | the check it made | survivor node id(s) | semantic note | fault injection | reviewer |
+|---|---|---|---|---|---|---|---|
+| plan 20261009 Task 6b | `tests/litellm_hook/test_pre_call_headers.py::test_extract_headers_write_path_matches_release_semantics` | passed / passed | asserts 4: `_extract_headers` returns the first non-empty of `data["headers"]` / `proxy_server_request` (unwrapping a nested `headers`), never merges buckets, and returns `{}` for `{}` | `tests/litellm_hook/test_pre_call_headers.py::test_pre_call_forwards_no_client_header_through_data_headers`, `::test_the_upstream_projection_keeps_only_allowlisted_names`, `::test_the_upstream_header_allowlist_is_empty` | the write path it pinned is gone: `data["headers"]` is now the allowlist projection of the merged inbound headers, so "first non-empty bucket, no merge" has nothing left to pin; the survivors pin the new write path, `{}` for `{}` included | the deny-list FI above: all 6 cases of `test_pre_call_forwards_no_client_header_through_data_headers` fail; the two projection tests call `_upstream_headers` directly, which the FI bypasses | auto-review (pending) |
+
 ## How to fill a row
 
 - **baseline outcome**: from `git show 8936dc6:tests/_manifests/expected_outcomes.<env>.json`

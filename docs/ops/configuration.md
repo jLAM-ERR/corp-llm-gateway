@@ -115,13 +115,13 @@ cascade above, on the already-sanitized request.
 |-----|---------|---------|----------|
 | `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Length`, `Content-Type`, ...) before forwarding to upstream | `1` | no |
 
-`CorpLlmGuardrail._pre_call_impl` (reached via `async_pre_call_hook`) sets
-`data["headers"]` **unconditionally**, independent of litellm's own
-`forward_client_headers_to_llm_api` gate — litellm forwards whatever ends up
-in `data["headers"]` regardless of how it got there. This flag is
-load-bearing wherever the guardrail runs in front of any litellm provider,
-not a no-op reserved for a future config: see `compose/README.md` "Why not
-BYOK" for a wire-verified writeup. It never touches `Authorization`.
+Since 1.1.0 this flag does not decide what reaches a provider.
+`CorpLlmGuardrail._pre_call_impl` writes `data["headers"]` — the bucket
+litellm forwards upstream — as an allowlist projection, and the allowlist is
+empty (`_UPSTREAM_HEADER_ALLOWLIST`, `docs/security.md` §13). The flag drops
+the inbound wire headers from litellm's own header copies as well. It never
+touches `Authorization` there: the subscription bridges read the developer's
+token from those copies.
 
 It defaults **on** because it is a correctness knob as well as a
 confidentiality one: with it off, the client's `Content-Length` is forwarded

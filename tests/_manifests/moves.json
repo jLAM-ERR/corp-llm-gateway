@@ -73,7 +73,6 @@
   "tests/litellm_hook/test_payload_limits.py::test_pre_call_oversize_on_instructions_second_field_fails_closed": "tests/test_litellm_hook.py::test_pre_call_oversize_on_instructions_second_field_fails_closed",
   "tests/litellm_hook/test_payload_limits.py::test_pre_call_oversize_unmanaged_input_fails_closed_before_scanning": "tests/test_litellm_hook.py::test_pre_call_oversize_unmanaged_input_fails_closed_before_scanning",
   "tests/litellm_hook/test_payload_limits.py::test_system_oversize_deliver_flag_logs_system_oversize_delivered": "tests/test_litellm_hook.py::test_system_oversize_deliver_flag_logs_system_oversize_delivered",
-  "tests/litellm_hook/test_pre_call_headers.py::test_extract_headers_write_path_matches_release_semantics": "tests/test_litellm_hook.py::test_extract_headers_write_path_matches_release_semantics",
   "tests/litellm_hook/test_pre_call_headers.py::test_pre_call_chatgpt_auth_bridge_forwards_only_required_headers": "tests/test_litellm_hook.py::test_pre_call_chatgpt_auth_bridge_forwards_only_required_headers",
   "tests/litellm_hook/test_pre_call_headers.py::test_pre_call_chatgpt_auth_bridge_merges_litellm_header_buckets": "tests/test_litellm_hook.py::test_pre_call_chatgpt_auth_bridge_merges_litellm_header_buckets",
   "tests/litellm_hook/test_pre_call_headers.py::test_pre_call_chatgpt_auth_bridge_reads_litellm_secret_headers": "tests/test_litellm_hook.py::test_pre_call_chatgpt_auth_bridge_reads_litellm_secret_headers",
