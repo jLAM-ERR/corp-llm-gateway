@@ -2,9 +2,10 @@
 # One exact location per admitted (method, path) pair, each forwarding a
 # literal path; everything else is 404 before a byte of body is read.
 
-# A variable, so nginx starts before litellm exists and re-resolves it after a
-# restart (the resolver line is in 00-http).
-set $gateway_upstream http://litellm:4000;
+# A variable, so nginx starts before the gateway exists and re-resolves it after
+# a restart (the resolver line is in 00-http). NGINX_GATEWAY_UPSTREAM is one of
+# the three gateway service names (the entrypoint checks it); each listens on 4000.
+set $gateway_upstream http://${NGINX_GATEWAY_UPSTREAM}:4000;
 
 # Streaming is mandatory: Claude Code and Codex use SSE, and a buffered stream
 # looks like a hung gateway.

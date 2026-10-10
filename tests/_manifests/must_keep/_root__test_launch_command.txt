@@ -6,7 +6,8 @@ tests/test_launch_command.py::test_every_dockerfile_entrypoint_runs_the_gate[doc
 tests/test_launch_command.py::test_every_dockerfile_entrypoint_runs_the_gate[docker/chatgpt-codex/Dockerfile]
 tests/test_launch_command.py::test_every_dockerfile_entrypoint_runs_the_gate[docker/demo-litellm/Dockerfile]
 tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli
-tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[compose/docker-compose.oauth.yml]
+tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[compose/docker-compose.build.yml]
+tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[compose/docker-compose.issuance.yml]
 tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[compose/docker-compose.yml]
 tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[docker-compose.anthropic-oauth.yml]
 tests/test_launch_command.py::test_no_compose_file_starts_the_litellm_cli[docker-compose.chatgpt-codex.yml]

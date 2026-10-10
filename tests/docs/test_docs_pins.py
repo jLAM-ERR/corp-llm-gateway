@@ -111,11 +111,13 @@ def test_each_capacity_key_is_documented_with_its_default(key: str) -> None:
 
 @pytest.mark.parametrize("key", CAPACITY_KEYS)
 def test_each_capacity_key_reaches_both_deploy_targets(key: str) -> None:
-    compose = yaml.safe_load((ROOT / "compose/docker-compose.yml").read_text())
-    environment = compose["services"]["litellm"]["environment"]
+    services = yaml.safe_load((ROOT / "compose/docker-compose.yml").read_text())["services"]
+    gateways = [name for name in services if name.startswith("gateway-")]
     values = yaml.safe_load((ROOT / "helm/corp-llm-gateway/values.yaml").read_text())
 
-    assert any(item == key or item.startswith(f"{key}=") for item in environment), key
+    assert len(gateways) == 3
+    for name in gateways:
+        assert key in services[name]["environment"], (name, key)
     assert key in values["config"], key
     assert key in (ROOT / "compose/.env.example").read_text(), key
 

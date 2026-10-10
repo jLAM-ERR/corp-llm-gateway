@@ -25,10 +25,17 @@
 # the EN engine on the first request and every request then 503s with
 # E_NER_UNAVAILABLE — a dead gateway. `ru-en` is the profile that matches the
 # compose posture: both engines present, nothing degraded.
+#
+# Every provider's gateway builds the same image under the same tag, so
+# profile-guard (on that tag too) runs the branch's image as well.
+x-gateway-build: &gateway-build
+  build:
+    context: ..
+    dockerfile: Dockerfile.gateway
+    args:
+      NER_PROFILE: ru-en
+
 services:
-  litellm:
-    build:
-      context: ..
-      dockerfile: Dockerfile.gateway
-      args:
-        NER_PROFILE: ru-en
+  gateway-anthropic: *gateway-build
+  gateway-codex: *gateway-build
+  gateway-corp: *gateway-build

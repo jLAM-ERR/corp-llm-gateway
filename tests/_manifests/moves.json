@@ -273,6 +273,15 @@
   "tests/sanitizer/test_streaming.py::test_tool_use_input_json_delta_json_escape_correctness": "tests/sanitizer/test_streaming_adversarial.py::test_tool_use_input_json_delta_json_escape_correctness",
   "tests/sanitizer/test_streaming.py::test_tool_use_input_json_delta_no_placeholders_passes_through": "tests/sanitizer/test_streaming_adversarial.py::test_tool_use_input_json_delta_no_placeholders_passes_through",
   "tests/sanitizer/test_streaming.py::test_tool_use_input_json_delta_placeholder_split_across_two_deltas": "tests/sanitizer/test_streaming_adversarial.py::test_tool_use_input_json_delta_placeholder_split_across_two_deltas",
-  "tests/sanitizer/test_streaming.py::test_two_text_blocks_each_placeholder_restored_independently": "tests/sanitizer/test_streaming_adversarial.py::test_two_text_blocks_each_placeholder_restored_independently"
+  "tests/sanitizer/test_streaming.py::test_two_text_blocks_each_placeholder_restored_independently": "tests/sanitizer/test_streaming_adversarial.py::test_two_text_blocks_each_placeholder_restored_independently",
+  "tests/compose/test_providers.py::test_oauth_config_routes_only_native_anthropic_without_a_static_secret": "tests/compose/test_oauth_overlay.py::test_oauth_config_routes_only_native_anthropic_without_a_static_secret",
+  "tests/compose/test_providers.py::test_oauth_config_has_no_wildcard_and_no_foreign_provider_route": "tests/compose/test_oauth_overlay.py::test_oauth_config_has_no_wildcard_and_no_foreign_provider_route",
+  "tests/compose/test_providers.py::test_oauth_config_never_reads_a_gateway_held_provider_key": "tests/compose/test_oauth_overlay.py::test_oauth_config_never_reads_a_gateway_held_provider_key",
+  "tests/compose/test_providers.py::test_oauth_config_uses_the_production_composition_root": "tests/compose/test_oauth_overlay.py::test_oauth_config_uses_the_production_composition_root",
+  "tests/compose/test_providers.py::test_the_base_stack_hands_both_bridge_flags_to_the_container": "tests/compose/test_oauth_overlay.py::test_the_base_stack_hands_both_bridge_flags_to_the_container",
+  "tests/compose/test_providers.py::test_the_autostart_unit_runs_a_bare_compose_up_so_mode_b_needs_compose_file": "tests/compose/test_oauth_overlay.py::test_the_autostart_unit_runs_a_bare_compose_up_so_mode_b_needs_compose_file",
+  "tests/compose/test_providers.py::test_the_merged_stack_mounts_the_oauth_config_as_the_only_litellm_config": "tests/compose/test_oauth_overlay.py::test_the_merged_stack_mounts_the_oauth_config_as_the_only_litellm_config",
+  "tests/compose/test_providers.py::test_the_merged_stack_arms_the_bridge_and_injects_no_master_key": "tests/compose/test_oauth_overlay.py::test_the_merged_stack_arms_the_bridge_and_injects_no_master_key",
+  "tests/test_litellm_config_guards.py::test_compose_litellm_has_no_database_to_read_a_config_table_from": "tests/test_litellm_config_guards.py::test_compose_litellm_reads_its_config_table"
  }
 }

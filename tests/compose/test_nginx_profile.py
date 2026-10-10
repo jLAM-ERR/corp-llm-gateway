@@ -32,7 +32,6 @@ from tests.compose.nginx_support import (
     ENTRYPOINT_KEYS,
     ISSUANCE,
     NGINX_DIR,
-    OAUTH,
     PROFILES,
     ROOT,
     ROUTING,
@@ -92,7 +91,7 @@ def test_each_profile_brings_up_its_own_service_alone(tmp_path: Path, profile: s
     assert NGINX_SERVICES & set(services) == {profile}
 
 
-@pytest.mark.parametrize("files", [(COMPOSE,), (COMPOSE, OAUTH)], ids=["virtual-keys", "oauth"])
+@pytest.mark.parametrize("files", [(COMPOSE,), (COMPOSE, ISSUANCE)], ids=["base", "production"])
 @pytest.mark.parametrize("profile", [None, *PROFILES])
 def test_the_render_needs_no_nginx_key(
     tmp_path: Path, files: tuple[Path, ...], profile: str | None
@@ -147,9 +146,11 @@ def test_nginx_publishes_where_the_env_says(tmp_path: Path, profile: str) -> Non
 
     assert {p["host_ip"] for p in ports} == {"10.1.2.3"}
     assert {int(p["published"]) for p in ports} <= {9443, 9444}
-    # The bind address moves nginx only, never the gateway's own port.
-    litellm_ports = services["litellm"]["ports"]
-    assert [p["host_ip"] for p in litellm_ports] == ["127.0.0.1"]
+    # The bind address moves nginx only, never a gateway's own port.
+    gateways = [name for name in services if name.startswith("gateway-")]
+    assert gateways
+    for name in gateways:
+        assert [p["host_ip"] for p in services[name]["ports"]] == ["127.0.0.1"], name
 
 
 @pytest.mark.parametrize("profile", PROFILES)
@@ -163,16 +164,18 @@ def test_a_bracketed_ipv6_bind_address_renders(tmp_path: Path, profile: str) -> 
 
 @pytest.mark.parametrize("profile", PROFILES)
 def test_the_litellm_port_stays_on_loopback_with_a_profile_on(tmp_path: Path, profile: str) -> None:
-    ports = render(tmp_path, profiles=profile).services["litellm"]["ports"]
+    services = render(tmp_path, profiles=profile, providers="anthropic,codex,corp").services
 
-    assert [(p["host_ip"], p["target"]) for p in ports] == [("127.0.0.1", 4000)]
+    for name in ("gateway-anthropic", "gateway-codex", "gateway-corp"):
+        ports = services[name]["ports"]
+        assert [(p["host_ip"], p["target"]) for p in ports] == [("127.0.0.1", 4000)], name
 
 
 @pytest.mark.parametrize("profile", PROFILES)
 def test_the_production_stack_with_a_profile_renders_clean_and_leaves_config_toml_alone(
     tmp_path: Path, profile: str
 ) -> None:
-    result = render(tmp_path, COMPOSE, OAUTH, ISSUANCE, profiles=profile, check=False)
+    result = render(tmp_path, COMPOSE, ISSUANCE, profiles=profile, check=False)
 
     assert result.returncode == 0, result.stderr
     assert _unset_warnings(result.stderr) == []
@@ -226,8 +229,11 @@ def test_the_service_passes_every_entrypoint_key(tmp_path: Path, profile: str) -
 
     assert set(environment) == set(ENTRYPOINT_KEYS)
     assert environment["NGINX_BIND_ADDR"] == "127.0.0.1"
-    assert {k: v for k, v in environment.items() if k != "NGINX_BIND_ADDR"} == dict.fromkeys(
-        set(ENTRYPOINT_KEYS) - {"NGINX_BIND_ADDR"}, ""
+    # The provider check reads the same line compose selected the services from.
+    assert environment["COMPOSE_PROFILES"] == f"anthropic,{profile}"
+    set_here = {"NGINX_BIND_ADDR", "COMPOSE_PROFILES"}
+    assert {k: v for k, v in environment.items() if k not in set_here} == dict.fromkeys(
+        set(ENTRYPOINT_KEYS) - set_here, ""
     )
 
 
@@ -255,8 +261,13 @@ def test_the_healthcheck_probes_nginx_itself(tmp_path: Path, profile: str) -> No
 
     assert service["healthcheck"]["test"] == HEALTHCHECK
     # Start order only: the variable upstreams mean nginx never waits for health.
-    assert set(service["depends_on"]) == {"litellm", "langfuse-web"}
+    gateways = {"gateway-anthropic", "gateway-codex", "gateway-corp"}
+    assert set(service["depends_on"]) == {*gateways, "langfuse-web"}
     assert {d["condition"] for d in service["depends_on"].values()} == {"service_started"}
+    # A provider whose profile is off is no dependency.
+    assert {name for name, d in service["depends_on"].items() if d.get("required") is False} == (
+        gateways
+    )
 
 
 def test_both_services_share_one_definition() -> None:
@@ -330,7 +341,7 @@ def _proxied(path: str) -> str:
 
 # The one copy of the proxy settings, inherited by every location below.
 GATEWAY_SERVER_DIRECTIVES = [
-    "set $gateway_upstream http://litellm:4000",
+    "set $gateway_upstream http://${NGINX_GATEWAY_UPSTREAM}:4000",
     "proxy_http_version 1.1",
     "proxy_buffering off",
     "proxy_request_buffering off",
@@ -657,9 +668,9 @@ def test_no_snippet_forwards_the_scheme_nginx_spoke(which: str) -> None:
     assert not [str(d) for d in every if "$scheme" in str(d)]
 
 
-PRODUCTION_FILES = (COMPOSE, OAUTH, ISSUANCE)
+PRODUCTION_FILES = (COMPOSE, ISSUANCE)
 STACKS = pytest.mark.parametrize(
-    "files", [(COMPOSE,), (COMPOSE, OAUTH), PRODUCTION_FILES], ids=["base", "oauth", "production"]
+    "files", [(COMPOSE,), PRODUCTION_FILES], ids=["base", "production"]
 )
 
 
@@ -729,19 +740,17 @@ def _portable_service(tmp_path: Path, files: tuple[Path, ...], profile: str) -> 
 
 @pytest.mark.parametrize("profile", PROFILES)
 def test_no_auth_overlay_touches_the_nginx_service(tmp_path: Path, profile: str) -> None:
-    # Mode A (base) and Mode B (OAuth, with and without issuance) must start the
-    # same front door: the auth modes differ behind nginx, never in it.
-    base, oauth, production = (
+    # The stack with and without developer token issuance must start the same
+    # front door: issuance differs behind nginx, never in it.
+    base, production = (
         _portable_service(tmp_path / stack, files, profile)
         for stack, files in (
             ("base", (COMPOSE,)),
-            ("oauth", (COMPOSE, OAUTH)),
             ("production", PRODUCTION_FILES),
         )
     )
 
     assert "corp.example" in base and "9443" in base
-    assert oauth == base
     assert production == base
 
 
@@ -1267,6 +1276,7 @@ def test_the_certs_readme_covers_what_an_operator_must_supply() -> None:
 
 ENV_EXAMPLE_KEYS = (
     "COMPOSE_PROFILES",
+    "NGINX_GATEWAY_UPSTREAM",
     "NGINX_TLS_MODE",
     "GATEWAY_DOMAIN",
     "NGINX_TLS_CERT",
@@ -1294,7 +1304,7 @@ def test_the_env_example_offers_each_key_commented(key: str) -> None:
 def test_the_env_example_block_sits_beside_the_compose_file_line() -> None:
     lines = ENV_EXAMPLE.read_text().splitlines()
     compose_file = max(i for i, line in enumerate(lines) if line.startswith("# COMPOSE_FILE="))
-    profiles = lines.index("# COMPOSE_PROFILES=nginx")
+    profiles = lines.index("# COMPOSE_PROFILES=anthropic,nginx")
 
     assert compose_file < profiles
     between = lines[compose_file + 1 : profiles]

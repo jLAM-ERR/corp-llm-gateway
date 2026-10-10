@@ -18,11 +18,16 @@ ROOT = Path(__file__).resolve().parents[2]
 OVERLAY = ROOT / "compose" / "docker-compose.build.yml"
 COMPOSE = ROOT / "compose" / "docker-compose.yml"
 DOCKERFILE = ROOT / "Dockerfile.gateway"
+GATEWAYS = ("gateway-anthropic", "gateway-codex", "gateway-corp")
 
 
 def _build_args() -> dict[str, str]:
-    build = yaml.safe_load(OVERLAY.read_text())["services"]["litellm"]["build"]
-    args = build.get("args") or {}
+    """The one build every provider's gateway shares."""
+    services = yaml.safe_load(OVERLAY.read_text())["services"]
+    assert set(services) == set(GATEWAYS)
+    builds = [services[name]["build"] for name in GATEWAYS]
+    assert all(build == builds[0] for build in builds), builds
+    args = builds[0].get("args") or {}
     if isinstance(args, list):
         args = dict(item.split("=", 1) for item in args)
     return {key: str(value) for key, value in args.items()}
@@ -35,8 +40,9 @@ def _profile_arm(profile: str) -> str:
     return match.group(1)
 
 
-def _litellm_environment() -> list[str]:
-    return yaml.safe_load(COMPOSE.read_text())["services"]["litellm"]["environment"]
+def _gateway_environments() -> dict[str, dict[str, str]]:
+    services = yaml.safe_load(COMPOSE.read_text())["services"]
+    return {name: services[name]["environment"] for name in GATEWAYS}
 
 
 def test_build_overlay_names_the_ner_profile_instead_of_taking_the_default() -> None:
@@ -57,4 +63,5 @@ def test_the_dockerfile_default_would_ship_no_en_model() -> None:
 def test_the_compose_stack_fails_closed_on_a_missing_ner_engine() -> None:
     # The other half of the coupling: with this at 1 a degraded EN engine is a 503,
     # not a quiet fallback to the regex floor.
-    assert "CORP_LLM_REQUIRE_NER=${CORP_LLM_REQUIRE_NER:-1}" in _litellm_environment()
+    for name, environment in _gateway_environments().items():
+        assert environment["CORP_LLM_REQUIRE_NER"] == "${CORP_LLM_REQUIRE_NER:-1}", name

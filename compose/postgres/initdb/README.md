@@ -3,10 +3,6 @@
 `docker-entrypoint-initdb.d` scripts for the `postgres` service run once, in
 filename order, the first time the `gateway-postgres-data` volume is empty.
 
-- `00-create-litellm-db.sh` — **committed**. Creates the `litellm` database
-  (litellm's own virtual-key store + UI accounts — see `compose/README.md`
-  "Virtual keys"), on the same postgres instance as `$POSTGRES_DB`. It
-  creates structure only, no data, so committing it carries no drift risk.
 - `01-schema.sql` — **staged at deploy time, never committed** (`*.sql` in
   this directory is git-ignored so it cannot drift from source).
   `scripts/deploy/deploy.sh` (Workstream D) copies
@@ -24,21 +20,14 @@ Or, equivalently, from `compose/` (the form used in `compose/README.md`):
 cp ../src/corp_llm_gateway/tokens/schema.sql postgres/initdb/01-schema.sql
 ```
 
-## Upgrading a pre-existing deployment
+## litellm has no database (1.1.0)
 
-`docker-entrypoint-initdb.d` scripts run only the first time
-`gateway-postgres-data` is empty. If you already started this stack before
-`00-create-litellm-db.sh` existed (i.e. before the litellm virtual-key
-rework), your volume has no `litellm` database and the `litellm` container
-will fail at boot. Two ways to fix it:
-
-- **Recreate** (loses `$POSTGRES_DB` data too — fine for a throwaway/test
-  deploy): `docker compose down -v && docker compose up -d`, so initdb runs
-  again on an empty volume.
-- **Migrate in place** (keeps existing tokens/team-config): run
-  `00-create-litellm-db.sh`'s `CREATE DATABASE litellm;` by hand against the
-  running `postgres` service, then `docker compose up -d litellm`:
+Until 1.0.x, `00-create-litellm-db.sh` created a second database, `litellm`,
+for litellm's virtual keys and admin UI (Mode A). 1.1.0 removed Mode A and
+gives litellm no database at all, so the script is gone. On a volume created
+before 1.1.0 the `litellm` database is still there but nothing connects to it.
+It is inert; to drop it:
 
 ```
-docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE DATABASE litellm;"
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DROP DATABASE litellm;"
 ```

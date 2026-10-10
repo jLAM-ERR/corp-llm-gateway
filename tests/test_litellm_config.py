@@ -302,8 +302,9 @@ def test_config_check_accepts_the_default_serve_port(
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SERVING_LITELLM_CONFIGS = (
-    _ROOT / "compose" / "litellm" / "config.yaml",
-    _ROOT / "compose" / "litellm" / "config.oauth.yaml",
+    _ROOT / "compose" / "litellm" / "config.anthropic.yaml",
+    _ROOT / "compose" / "litellm" / "config.codex.yaml",
+    _ROOT / "compose" / "litellm" / "config.corp.yaml",
 )
 # Everything a deploy renders litellm's config or env from.
 _DEPLOY_INPUTS = ("compose", "docker", "examples", "helm")
@@ -358,20 +359,25 @@ def test_no_deploy_input_sets_litellms_dead_concurrency_knobs() -> None:
 def test_the_compose_gateway_carries_the_in_flight_cap() -> None:
     import yaml
 
-    compose = yaml.safe_load((_ROOT / "compose" / "docker-compose.yml").read_text())
-    environment = compose["services"]["litellm"]["environment"]
+    services = yaml.safe_load((_ROOT / "compose" / "docker-compose.yml").read_text())["services"]
+    gateways = [name for name in services if name.startswith("gateway-")]
 
-    assert "CORP_LLM_MAX_INFLIGHT=${CORP_LLM_MAX_INFLIGHT:-64}" in environment
-    assert "CORP_LLM_CANCEL_GRACE_SECONDS=${CORP_LLM_CANCEL_GRACE_SECONDS:-5}" in environment
-    # The compose default is production, where a cap of 0 refuses to boot.
-    assert "CORP_ENV=${CORP_ENV:-production}" in environment
+    assert len(gateways) == 3
+    for name in gateways:
+        environment = services[name]["environment"]
+        assert environment["CORP_LLM_MAX_INFLIGHT"] == "${CORP_LLM_MAX_INFLIGHT:-64}", name
+        assert environment["CORP_LLM_CANCEL_GRACE_SECONDS"] == (
+            "${CORP_LLM_CANCEL_GRACE_SECONDS:-5}"
+        ), name
+        # The compose default is production, where a cap of 0 refuses to boot.
+        assert environment["CORP_ENV"] == "${CORP_ENV:-production}", name
 
 
 # ── one litellm config per compose provider ──────────────────────────────────
 
 _LITELLM_DIR = _ROOT / "compose" / "litellm"
 _PROVIDER_CONFIGS = {
-    "anthropic": _LITELLM_DIR / "config.oauth.yaml",
+    "anthropic": _LITELLM_DIR / "config.anthropic.yaml",
     "codex": _LITELLM_DIR / "config.codex.yaml",
     "corp": _LITELLM_DIR / "config.corp.yaml",
 }

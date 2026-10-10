@@ -1,9 +1,9 @@
 # Developer token issuance (POST /internal/issue-token) on the production stack.
-# Optional, and layered on the subscription mode:
+# Optional, and layered on every enabled provider's gateway (tokens live in the
+# shared `gateway` database, so a token issued through one works on all):
 #
 #   cp gateway/config.toml.example gateway/config.toml   # then edit the team map
-#   docker compose -f docker-compose.yml -f docker-compose.oauth.yml \
-#                  -f docker-compose.issuance.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.issuance.yml up -d
 #
 # The team map (CORP_GATEWAY_ISSUE_OIDC_TEAM_MAP) is a TOML table, and env vars
 # carry scalars only, so it reaches the gateway in a config file. This overlay
@@ -20,28 +20,36 @@
 # schema from src/corp_llm_gateway/tokens/schema.sql applied to that database
 # (docs/ops/upgrade.md), and every mapped team_id created with
 # `gateway-admin team create`. The boot refuses (exit 78) a partial config.
+#
+# The issuance caps (CORP_GATEWAY_ISSUE_MAX_INFLIGHT, _RATE_PER_MINUTE) are per
+# gateway process; only the nginx upstream is reachable from outside anyway.
+x-issuance: &issuance
+  volumes:
+    # Long syntax for create_host_path: a missing file fails `up` instead of
+    # becoming an empty directory that the loader skips (issuance silently off).
+    - type: bind
+      source: ./gateway/config.toml
+      target: /etc/corp-llm-gateway/config.toml
+      read_only: true
+      bind:
+        create_host_path: false
+  environment:
+    - CORP_LLM_GATEWAY_CONFIG_FILE=/etc/corp-llm-gateway/config.toml
+    - CORP_GATEWAY_ISSUE_OIDC_ISSUER
+    - CORP_GATEWAY_ISSUE_OIDC_AUDIENCE
+    - CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID
+    - CORP_GATEWAY_ISSUE_OIDC_JWKS_URL
+    - CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM
+    - CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM
+    - CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS
+    - CORP_GATEWAY_ISSUE_MAX_ACTIVE
+    - CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS
+    - CORP_GATEWAY_ISSUE_MAX_INFLIGHT
+    - CORP_GATEWAY_ISSUE_RATE_PER_MINUTE
+    - CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS
+
+# A profile-off provider's entry here merges into a disabled service: harmless.
 services:
-  litellm:
-    volumes:
-      # Long syntax for create_host_path: a missing file fails `up` instead of
-      # becoming an empty directory that the loader skips (issuance silently off).
-      - type: bind
-        source: ./gateway/config.toml
-        target: /etc/corp-llm-gateway/config.toml
-        read_only: true
-        bind:
-          create_host_path: false
-    environment:
-      - CORP_LLM_GATEWAY_CONFIG_FILE=/etc/corp-llm-gateway/config.toml
-      - CORP_GATEWAY_ISSUE_OIDC_ISSUER
-      - CORP_GATEWAY_ISSUE_OIDC_AUDIENCE
-      - CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID
-      - CORP_GATEWAY_ISSUE_OIDC_JWKS_URL
-      - CORP_GATEWAY_ISSUE_OIDC_TEAM_CLAIM
-      - CORP_GATEWAY_ISSUE_OIDC_USER_CLAIM
-      - CORP_GATEWAY_ISSUE_TOKEN_TTL_DAYS
-      - CORP_GATEWAY_ISSUE_MAX_ACTIVE
-      - CORP_GATEWAY_ISSUE_MIN_INTERVAL_SECONDS
-      - CORP_GATEWAY_ISSUE_MAX_INFLIGHT
-      - CORP_GATEWAY_ISSUE_RATE_PER_MINUTE
-      - CORP_GATEWAY_ISSUE_STORE_TIMEOUT_SECONDS
+  gateway-anthropic: *issuance
+  gateway-codex: *issuance
+  gateway-corp: *issuance

@@ -132,9 +132,9 @@ HAZARDS: dict[str, tuple[str, ...]] = {
         f"{SERVED}::test_a_body_naming_policies_is_refused_at_the_gate",
         f"{SERVED}::test_a_form_body_is_refused_at_the_gate",
     ),
-    # Not closed (DRI options in the plan); these pin what the overlay can and cannot do.
+    # Closed in the shipped setups (no litellm DB since 1.1.0); the rest pin an added DB.
     "14c": (
-        f"{GUARDS}::test_compose_litellm_reads_its_config_table",
+        f"{GUARDS}::test_compose_litellm_has_no_database_to_read_a_config_table_from",
         f"{GUARDS}::test_helm_litellm_has_no_database_to_read_a_config_table_from",
         f"{GUARDS}::test_a_db_litellm_settings_row_appends_callbacks_and_starts_no_guardrail",
         f"{GUARDS}::test_a_db_general_settings_row_turns_on_prompts_in_spend_logs",

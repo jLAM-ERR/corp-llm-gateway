@@ -674,7 +674,7 @@ def test_the_one_shot_list_is_every_restart_no_service(script_text: str) -> None
                 restart[name] = spec["restart"]
     one_shots = {name for name, value in restart.items() if value in ("no", False)}
 
-    assert one_shots == {"minio-init"}
+    assert one_shots == {"minio-init", "profile-guard"}
     assert set(_shell_array(script_text, "ONE_SHOT_SERVICES")) == one_shots
 
 
@@ -1672,12 +1672,8 @@ def test_the_boot_time_unit_still_runs_a_bare_compose_up() -> None:
 
 @pytest.mark.parametrize(
     "compose_file",
-    [
-        None,
-        "docker-compose.yml:docker-compose.oauth.yml",
-        "docker-compose.yml:docker-compose.oauth.yml:docker-compose.issuance.yml",
-    ],
-    ids=["mode-a", "mode-b", "mode-b-issuance"],
+    [None, "docker-compose.yml:docker-compose.issuance.yml"],
+    ids=["base", "mode-b-issuance"],
 )
 @pytest.mark.parametrize("profiles", [None, "nginx", "nginx-ports"])
 def test_the_reboot_path_starts_what_the_env_file_selects(
@@ -1698,8 +1694,7 @@ def test_the_reboot_path_starts_what_the_env_file_selects(
     lines = [f"{key}=render-fixture" for key in REQUIRED_ENV]
     if compose_file is not None:
         lines.append(f"COMPOSE_FILE={compose_file}")
-    if profiles is not None:
-        lines.append(f"COMPOSE_PROFILES={profiles}")
+    lines.append(f"COMPOSE_PROFILES={','.join(p for p in ('anthropic', profiles) if p)}")
     (project / ".env").write_text("\n".join(lines) + "\n")
 
     result = subprocess.run(
@@ -1713,5 +1708,6 @@ def test_the_reboot_path_starts_what_the_env_file_selects(
 
     assert result.returncode == 0, result.stderr
     services = set(result.stdout.split())
-    assert "litellm" in services
+    assert {name for name in services if name.startswith("gateway-")} == {"gateway-anthropic"}
+    assert "profile-guard" in services
     assert services & {"nginx", "nginx-ports"} == ({profiles} if profiles else set())

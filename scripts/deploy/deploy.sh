@@ -59,7 +59,7 @@ CONTAINER_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 # The `restart: "no"` services: the only ones that are done once they exit 0.
 # Compose prints an empty Health for every exited container, so the state alone
 # cannot tell a finished one-shot from a service that stopped.
-ONE_SHOT_SERVICES=(minio-init)
+ONE_SHOT_SERVICES=(minio-init profile-guard)
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/compose"

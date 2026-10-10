@@ -1,9 +1,8 @@
-# Data-plane litellm config for Mode B (Anthropic subscription / OAuth
-# passthrough) on the PRODUCTION stack. Mounted over /etc/litellm/config.yaml by
-# `docker-compose.oauth.yml`; `config.yaml` next to it is the Mode A (virtual
-# keys) file. Only one of the two is ever mounted.
+# Data-plane litellm config for the `anthropic` provider (Claude Code
+# subscription / OAuth passthrough). Mounted at /etc/litellm/config.yaml on the
+# gateway-anthropic service, which runs with CORP_LLM_FORWARD_ANTHROPIC_AUTH=1.
 #
-# Differences from config.yaml, all of them load-bearing:
+# Load-bearing properties:
 #
 #   1. One route, native `anthropic/`, and no `gpt-*` / `corp-*` / `"*"`.
 #      CORP_LLM_FORWARD_ANTHROPIC_AUTH lifts the developer's `sk-ant-oat...`
@@ -14,16 +13,15 @@
 #      foreign-provider route, no alias can carry the subscription token
 #      anywhere but api.anthropic.com. Same property as
 #      docker/anthropic-oauth/litellm-config.yaml, pinned by
-#      tests/compose/test_oauth_overlay.py.
+#      tests/compose/test_providers.py.
 #
 #   2. No `api_key: os.environ/ANTHROPIC_API_KEY`. There is no gateway-held
-#      Anthropic key in this mode at all; the developer's own token is the
-#      upstream credential.
+#      Anthropic key at all; the developer's own token is the upstream
+#      credential.
 #
-# The corp vLLM oracle is unaffected by dropping the `corp-*` route: it is
-# reached through the gateway's own httpx client (CORP_LLM_ENDPOINT), not
-# through a litellm deployment. Dropping the route only means clients cannot
-# address corp models directly on this stack.
+# The corp vLLM oracle does not need a `corp-*` route here: it is reached
+# through the gateway's own httpx client (CORP_LLM_ENDPOINT), not through a
+# litellm deployment. Corp models have their own provider (config.corp.yaml).
 model_list:
   # ANTHROPIC-ONLY BY DESIGN — do not add a second route here. See (1) above.
   - model_name: "claude-*"
