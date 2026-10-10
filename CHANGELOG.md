@@ -22,10 +22,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   allowlist is empty.** The subscription bridges carry the developer's token in `api_key` and
   their own allowlists in `extra_headers` (Anthropic: `anthropic-beta`, `anthropic-version`,
   `user-agent`; Codex: `chatgpt-account-id`, `originator`, `session-id`, `thread-id`,
-  `user-agent`, `x-openai-internal-codex-responses-lite`, `x-codex-*`); the corp route gets
-  only its own `CORP_LLM_AUTH_TOKEN`. The client's `Authorization` is no longer passed through
-  on a route without a bridge. `docs/security.md` §13 has the per-provider list; the container
-  suite pins the exact header set each provider receives.
+  `user-agent`, `x-codex-beta-features`, `x-openai-internal-codex-responses-lite`); the corp
+  route gets only its own `CORP_LLM_AUTH_TOKEN`. On a route without a bridge no copy of the
+  client's `Authorization` reaches the upstream: in 1.0.0 litellm's redacted copy of it did,
+  next to the route's own credential. `docs/security.md` §13 has the per-provider list; the
+  container suite pins the exact header set each provider receives.
+- **Request-body keys litellm turns into upstream headers or the upstream credential are
+  removed** (`extra_headers`, `provider_specific_header`, `api_key`, `organization`), silently;
+  the request goes on. In 1.0.0 a client could put any header on every upstream call through
+  `extra_headers` or `provider_specific_header`, and a body `api_key` on the corp route became
+  the upstream `Authorization` and stayed on the router for later requests from other callers.
+- **Bridge headers are forwarded by exact name and only with a value in the header's format**
+  (dropped silently otherwise). 1.0.0 forwarded any `x-codex-*` name and any value, so an
+  `anthropic-version`, `user-agent` or `thread-id` carrying an email reached the provider.
+  `chatgpt-account-id` and `x-codex-beta-features` have no recorded value to derive a format
+  from and are still forwarded as sent. Unknown request-body fields are not sanitized: an
+  accepted risk, documented in `docs/security.md` §2.
 
 ### Added — `gateway-admin` bootstrap for a fixed team token
 

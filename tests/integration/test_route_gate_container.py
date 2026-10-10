@@ -766,7 +766,8 @@ CLIENT_USER_AGENT = "route-gate-client/1.0 (probe)"
 # litellm_hook.py), sent with values the upstream could not have made up.
 ALLOWLISTED_CLIENT_HEADERS: dict[str, dict[str, str]] = {
     "anthropic": {
-        "anthropic-version": "2023-06-01",
+        # Not litellm's own default (2023-06-01), so arriving proves it is the client's.
+        "anthropic-version": "2023-01-01",
         # A beta litellm knows: it drops the ones it does not, on 1.0.0 as well.
         "anthropic-beta": "interleaved-thinking-2025-05-14",
         "user-agent": CLIENT_USER_AGENT,
@@ -774,8 +775,10 @@ ALLOWLISTED_CLIENT_HEADERS: dict[str, dict[str, str]] = {
     "codex": {
         "chatgpt-account-id": "route-gate-account",
         "originator": "codex_cli_rs",
-        "session-id": "route-gate-session",
+        "session-id": "0199a0f2-6d1c-7c43-9a6e-2f4b8c1d5e60",
+        "thread-id": "0199a0f2-6d1c-7c43-9a6e-2f4b8c1d5e61",
         "x-codex-beta-features": "route-gate-feature",
+        "x-openai-internal-codex-responses-lite": "true",
         "user-agent": CLIENT_USER_AGENT,
     },
     "corp": {},
@@ -799,7 +802,9 @@ CODEX_UPSTREAM_HEADERS = TRANSPORT_HEADERS | {
     "chatgpt-account-id",
     "originator",
     "session-id",
+    "thread-id",
     "x-codex-beta-features",
+    "x-openai-internal-codex-responses-lite",
     "user-agent",
 }
 # The OpenAI SDK's own telemetry on litellm's `openai/` chat path.
@@ -835,6 +840,11 @@ HEADER_CASES = (
     ("corp", "/v1/chat/completions"),
     ("corp", "/v1/messages"),
 )
+# Allowlisted client headers litellm itself overwrites on a route: on the chat
+# adapter it always sends its own anthropic-version.
+LITELLM_REPLACES: dict[tuple[str, str], dict[str, str]] = {
+    ("anthropic", "/v1/chat/completions"): {"anthropic-version": "2023-06-01"},
+}
 GENERATION_PAYLOADS = {
     "/v1/messages": _messages,
     "/v1/chat/completions": _chat,
@@ -869,8 +879,10 @@ def test_only_allowlisted_client_headers_reach_the_upstream(
     assert len(names) == len(set(names)), f"a header arrived twice: {names}"
     assert frozenset(names) == EXPECTED_UPSTREAM_HEADERS[(provider_name, path)], " ".join(names)
 
+    replaced = LITELLM_REPLACES.get((provider_name, path), {})
     for name, value in allowlisted.items():
-        assert value in received.get(name, ""), f"allowlisted {name} did not arrive: {received}"
+        expected = replaced.get(name, value)
+        assert expected in received.get(name, ""), f"allowlisted {name} did not arrive: {received}"
     # Every other client header value: nowhere on the wire, body included.
     wire = json.dumps(captured[0])
     forwarded = {name.lower() for name in allowlisted}
@@ -1055,3 +1067,101 @@ def test_background_responses_are_sanitized_but_their_round_trip_is_unsupported(
     polled = provider_codex.get(f"/v1/responses/{created.json()['id']}")
     assert "E_ROUTE_BLOCKED" not in polled.text
     assert CANARY not in polled.text
+
+
+BODY_SECRET = "alice.bodykey@corp.lan"
+LITELLM_PROVIDER = {"anthropic": "anthropic", "codex": "openai", "corp": "hosted_vllm"}
+
+
+def _control_body_value(key: str, provider_name: str) -> Any:
+    if key == "extra_headers":
+        return {"x-body-probe": BODY_SECRET}
+    if key == "provider_specific_header":
+        return {
+            "custom_llm_provider": LITELLM_PROVIDER[provider_name],
+            "extra_headers": {"x-psh-probe": BODY_SECRET},
+        }
+    return BODY_SECRET
+
+
+def _upstream_authorization(provider: Provider) -> str:
+    return LITELLM_EMPTY_KEY_BEARER if provider.name == "corp" else f"Bearer {provider.key}"
+
+
+CONTROL_BODY_KEYS = ("extra_headers", "provider_specific_header", "api_key", "organization")
+
+
+def _wire(provider: Provider, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    provider.stack.mark()
+    response = provider.post(path, payload)
+    assert response.status_code == 200, response.text
+    (captured,) = provider.stack.new_captures()
+    return captured
+
+
+@pytest.mark.parametrize("key", CONTROL_BODY_KEYS)
+@pytest.mark.parametrize(
+    "provider_name,path", HEADER_CASES, ids=[f"{name}-{path}" for name, path in HEADER_CASES]
+)
+def test_a_client_control_body_key_never_reaches_the_upstream(
+    request: pytest.FixtureRequest, provider_name: str, path: str, key: str
+) -> None:
+    # litellm turns each of these request-body keys into an upstream header or the
+    # upstream credential. The gateway drops them silently: the request succeeds,
+    # and the stub sees the same header lines it sees without the key. No
+    # anthropic-* client header is sent: litellm rebuilds provider_specific_header
+    # from those, which would hide the client's own.
+    provider: Provider = request.getfixturevalue(f"provider_{provider_name}")
+    baseline = _wire(provider, path, GENERATION_PAYLOADS[path](provider.model))
+    payload = GENERATION_PAYLOADS[path](provider.model)
+    payload[key] = _control_body_value(key, provider_name)
+
+    keyed = _wire(provider, path, payload)
+
+    assert BODY_SECRET not in json.dumps(keyed)
+    sent = sorted(name.lower() for name, _ in keyed["raw_headers"])
+    assert sent == sorted(name.lower() for name, _ in baseline["raw_headers"]), " ".join(sent)
+    authorization = [v for n, v in keyed["raw_headers"] if n.lower() == "authorization"]
+    assert authorization == [_upstream_authorization(provider)]
+    # litellm keeps the deployment a client-side api_key builds: the next request
+    # must not go out with it either.
+    after = _wire(provider, path, GENERATION_PAYLOADS[path](provider.model))
+    assert BODY_SECRET not in json.dumps(after)
+
+
+FREE_TEXT = "alice.freetext@corp.lan"
+# Bridge headers with a value format, plus a name the codex bridge no longer
+# matches by prefix. Each carries an email: dropped, and the request goes on.
+FREE_TEXT_HEADERS = (
+    ("anthropic", "anthropic-version"),
+    ("anthropic", "anthropic-beta"),
+    ("anthropic", "user-agent"),
+    ("codex", "user-agent"),
+    ("codex", "originator"),
+    ("codex", "session-id"),
+    ("codex", "thread-id"),
+    ("codex", "x-openai-internal-codex-responses-lite"),
+    ("codex", "x-codex-anything"),
+)
+
+
+@pytest.mark.parametrize(
+    "provider_name,header", FREE_TEXT_HEADERS, ids=[f"{p}-{h}" for p, h in FREE_TEXT_HEADERS]
+)
+def test_a_bridge_drops_a_free_text_header_value(
+    request: pytest.FixtureRequest, provider_name: str, header: str
+) -> None:
+    provider: Provider = request.getfixturevalue(f"provider_{provider_name}")
+    provider.stack.mark()
+
+    response = httpx.post(
+        f"{provider.stack.base_url}{provider.path}",
+        json=provider.payload,
+        headers=provider.headers(**{header: FREE_TEXT}),
+        timeout=90,
+    )
+
+    assert response.status_code == 200, response.text
+    captured = provider.stack.new_captures()
+    assert len(captured) == 1, captured
+    assert FREE_TEXT not in json.dumps(captured[0])

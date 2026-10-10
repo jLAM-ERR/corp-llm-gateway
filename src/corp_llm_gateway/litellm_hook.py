@@ -31,6 +31,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import re
 import time
 import uuid
 import weakref
@@ -447,6 +448,7 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         `pre_call()` call site/test) preserves today's behavior; only the real
         `async_pre_call_hook` wiring supplies a call_type.
         """
+        _drop_client_control_keys(data)
         request_id = self._ensure_request_id(data)
         pre_call_started = time.monotonic()
         pre_call_wall = time.time()
@@ -2313,6 +2315,57 @@ def _scrub_retained_request_metadata(data: dict[str, Any]) -> None:
             bucket.pop("user", None)
 
 
+_CLIENT_CONTROL_BODY_KEYS: frozenset[str] = frozenset(
+    {"extra_headers", "provider_specific_header", "api_key", "organization"}
+)
+"""Request-body keys litellm 1.101.0 turns into an upstream header or the upstream
+credential. The pre-call removes them from the client's request, silently, before
+anything reads them; the bridges then write their own ``extra_headers`` / ``api_key``.
+
+- ``extra_headers``: merged into the upstream headers (``main.py``, the HTTP handler).
+- ``provider_specific_header``: merged into the upstream headers for its provider;
+  litellm rebuilds it only when the client sent ``anthropic-*`` headers.
+- ``api_key``: a client-side credential. It becomes the upstream ``Authorization``,
+  and the router keeps the deployment it builds from it, so later requests from
+  other callers can be sent with it too.
+- ``organization``: the ``OpenAI-Organization`` header on ``openai/`` routes.
+
+litellm itself refuses ``api_base``, ``base_url`` and the rest of its banned body
+params (``proxy/auth/auth_utils.py``), and the pre-call overwrites ``headers``.
+"""
+
+
+def _drop_client_control_keys(data: dict[str, Any]) -> None:
+    for key in _CLIENT_CONTROL_BODY_KEYS:
+        data.pop(key, None)
+
+
+# A bridge forwards a header only by its exact name, and only a value in the
+# header's format; any other value is dropped, the request goes on. ``None``: no
+# real value is recorded to derive a format from, so the name alone is checked.
+_TOKEN = r"[A-Za-z0-9._+-]+"
+# RFC 9110 product/version tokens and (comments), no `@`, no quotes; every
+# product carries a version ("claude-cli/2.1.220 (external, cli)").
+_USER_AGENT = re.compile(
+    rf"^{_TOKEN}/{_TOKEN}(?: (?:{_TOKEN}/{_TOKEN}|\([A-Za-z0-9._+;:,/ -]*\)))*$"
+)
+_BRIDGE_HEADER_FORMATS: dict[str, re.Pattern[str] | None] = {
+    # "2023-06-01" (scripts/install.sh, the Claude Code client config).
+    "anthropic-version": re.compile(r"^\d{4}-\d{2}-\d{2}$"),
+    # "oauth-2025-04-20", "interleaved-thinking-2025-05-14": a comma-separated list.
+    "anthropic-beta": re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*(?: *, *[a-z0-9]+(?:-[a-z0-9]+)*)*$"),
+    "user-agent": _USER_AGENT,
+    # "codex_cli_rs"; litellm also knows "codex-tui", "codex_exec", "Codex ...".
+    "originator": re.compile(r"^[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)*$"),
+    # litellm's own format for these Codex conversation ids
+    # (proxy/litellm_pre_call_utils.py `_SESSION_ID_VALUE_RE`).
+    "session-id": re.compile(r"^[a-zA-Z0-9_\-]{8,}$"),
+    "thread-id": re.compile(r"^[a-zA-Z0-9_\-]{8,}$"),
+    "x-openai-internal-codex-responses-lite": re.compile(r"^(?:true|false)$"),
+    "chatgpt-account-id": None,
+    "x-codex-beta-features": None,
+}
+
 _CHATGPT_HEADER_ALLOWLIST = frozenset(
     {
         "authorization",
@@ -2321,9 +2374,17 @@ _CHATGPT_HEADER_ALLOWLIST = frozenset(
         "session-id",
         "thread-id",
         "user-agent",
+        "x-codex-beta-features",
         "x-openai-internal-codex-responses-lite",
     }
 )
+
+
+def _bridge_header_value_ok(lower: str, value: str) -> bool:
+    if lower == "authorization":
+        return True
+    pattern = _BRIDGE_HEADER_FORMATS[lower]
+    return pattern is None or pattern.fullmatch(value) is not None
 
 
 def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
@@ -2334,7 +2395,7 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
         lower = name.lower()
         if lower == _CORP_AUTH_HEADER_LOWER:
             continue
-        if lower in _CHATGPT_HEADER_ALLOWLIST or lower.startswith("x-codex-"):
+        if lower in _CHATGPT_HEADER_ALLOWLIST and _bridge_header_value_ok(lower, value):
             selected[name] = value
         if lower == "authorization":
             authorization = value
@@ -2390,7 +2451,7 @@ def _anthropic_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
         lower = name.lower()
         if lower == _CORP_AUTH_HEADER_LOWER:
             continue
-        if lower in _ANTHROPIC_HEADER_ALLOWLIST:
+        if lower in _ANTHROPIC_HEADER_ALLOWLIST and _bridge_header_value_ok(lower, value):
             selected[name] = value
         if lower == "authorization":
             authorization = value

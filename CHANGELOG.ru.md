@@ -23,10 +23,24 @@
   allowlist пуст.** Мосты подписочной аутентификации несут токен разработчика в `api_key`, а
   свои allowlist-ы — в `extra_headers` (Anthropic: `anthropic-beta`, `anthropic-version`,
   `user-agent`; Codex: `chatgpt-account-id`, `originator`, `session-id`, `thread-id`,
-  `user-agent`, `x-openai-internal-codex-responses-lite`, `x-codex-*`); маршрут corp получает
-  только собственный `CORP_LLM_AUTH_TOKEN`. `Authorization` клиента на маршруте без моста больше
-  не пробрасывается. Список по провайдерам — в `docs/security.ru.md` §13; контейнерный набор
-  тестов фиксирует точный набор заголовков, который получает каждый провайдер.
+  `user-agent`, `x-codex-beta-features`, `x-openai-internal-codex-responses-lite`); маршрут corp
+  получает только собственный `CORP_LLM_AUTH_TOKEN`. На маршруте без моста никакая копия
+  клиентского `Authorization` до upstream не доходит: в 1.0.0 доходила редактированная копия
+  litellm рядом с собственным креденшелом маршрута. Список по провайдерам — в
+  `docs/security.ru.md` §13; контейнерный набор тестов фиксирует точный набор заголовков,
+  который получает каждый провайдер.
+- **Ключи тела запроса, которые litellm превращает в заголовки upstream или в креденшел
+  upstream, удаляются** (`extra_headers`, `provider_specific_header`, `api_key`,
+  `organization`), молча; запрос идёт дальше. В 1.0.0 клиент мог через `extra_headers` или
+  `provider_specific_header` поставить любой заголовок на каждый вызов наверх, а `api_key` в
+  теле на маршруте corp становился `Authorization` наверху и оставался в роутере для
+  последующих запросов других клиентов.
+- **Заголовки мостов пробрасываются по точному имени и только со значением в формате
+  заголовка** (иначе молча отбрасываются). 1.0.0 пробрасывала любое имя `x-codex-*` и любое
+  значение, так что `anthropic-version`, `user-agent` или `thread-id` с email доходили до
+  провайдера. Для `chatgpt-account-id` и `x-codex-beta-features` нет записанного значения, из
+  которого вывести формат, и они по-прежнему уходят как присланы. Неизвестные поля тела
+  запроса не санитизируются: это принятый риск, описанный в `docs/security.ru.md` §2.
 
 ### Добавлено — `gateway-admin`: начальная настройка с фиксированным токеном команды
 

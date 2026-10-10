@@ -1,6 +1,7 @@
 """Pre-call header handling: corp-token auth and strip from every header location, header
 declassification, and the ChatGPT auth bridge."""
 
+import json
 from typing import Any
 
 import pytest
@@ -416,3 +417,114 @@ def test_the_upstream_projection_keeps_only_allowlisted_names(
     # Case-insensitive on the name, value untouched; the corp token never, listed or not.
     assert projected == {"anthropic-version": "2023-06-01"}
     assert litellm_hook._upstream_headers({}) == {}
+
+
+_BODY_SECRET = "alice.bodykey@corp.lan"
+_CONTROL_BODY_VALUES: dict[str, Any] = {
+    "extra_headers": {"x-body-probe": _BODY_SECRET},
+    "provider_specific_header": {
+        "custom_llm_provider": "anthropic",
+        "extra_headers": {"x-psh-probe": _BODY_SECRET},
+    },
+    "api_key": _BODY_SECRET,
+    "organization": _BODY_SECRET,
+}
+_BRIDGED_REQUESTS = {
+    "corp": ({}, "corp-glm-5.1", "Bearer corp-client"),
+    "anthropic": (
+        {"forward_anthropic_auth": True},
+        "claude-sonnet-4-5",
+        "Bearer sk-ant-oat01-unit",
+    ),
+    "codex": ({"forward_chatgpt_auth": True}, "gpt-5.6-sol", "Bearer oauth-unit"),
+}
+
+
+@pytest.mark.parametrize("route", list(_BRIDGED_REQUESTS))
+@pytest.mark.parametrize("key", list(_CONTROL_BODY_VALUES))
+async def test_a_client_control_body_key_is_dropped_without_refusing(key: str, route: str) -> None:
+    """litellm turns these body keys into upstream headers or the upstream credential;
+    the client's values go, silently, and the request goes on."""
+    kwargs, model, bearer = _BRIDGED_REQUESTS[route]
+    g, _ = _build_guardrail(**kwargs)
+    data = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "headers": {"X-Corp-Auth": "tok-1", "Authorization": bearer},
+        key: _CONTROL_BODY_VALUES[key],
+    }
+
+    out = await g.pre_call(data)
+
+    assert _BODY_SECRET not in json.dumps(
+        {k: v for k, v in out.items() if k in _CONTROL_BODY_VALUES}
+    )
+    if route == "corp":
+        assert all(k not in out for k in _CONTROL_BODY_VALUES)
+    else:
+        assert out["api_key"] == bearer[7:]
+
+
+def test_the_control_body_keys_are_exactly_the_four_litellm_reads() -> None:
+    from corp_llm_gateway.litellm_hook import _CLIENT_CONTROL_BODY_KEYS
+
+    assert (
+        frozenset({"extra_headers", "provider_specific_header", "api_key", "organization"})
+        == _CLIENT_CONTROL_BODY_KEYS
+    )
+
+
+_FREE_TEXT = "alice.header@corp.lan"
+
+
+_ANTHROPIC = ("forward_anthropic_auth", "claude-sonnet-4-5", "sk-ant-oat01-unit")
+_CODEX = ("forward_chatgpt_auth", "gpt-5.6-sol", "oauth-unit")
+# A value each format must keep (a real recorded sample where the repo has one).
+_FORMAT_CASES: dict[str, tuple[tuple[str, str, str], str, str]] = {
+    "anthropic-version": (_ANTHROPIC, "anthropic-version", "2023-01-01"),
+    "anthropic-beta": (
+        _ANTHROPIC,
+        "anthropic-beta",
+        "oauth-2025-04-20, interleaved-thinking-2025-05-14",
+    ),
+    "anthropic-user-agent": (_ANTHROPIC, "user-agent", "claude-cli/2.1.220 (external, cli)"),
+    "codex-user-agent": (_CODEX, "user-agent", "codex_cli_rs/0.46.0 (Mac OS 15.6.1; arm64)"),
+    "originator": (_CODEX, "originator", "codex_cli_rs"),
+    "session-id": (_CODEX, "session-id", "0199a0f2-6d1c-7c43-9a6e-2f4b8c1d5e60"),
+    "thread-id": (_CODEX, "thread-id", "0199a0f2-6d1c-7c43-9a6e-2f4b8c1d5e61"),
+    "responses-lite": (_CODEX, "x-openai-internal-codex-responses-lite", "true"),
+}
+
+
+@pytest.mark.parametrize("case", list(_FORMAT_CASES))
+async def test_a_bridge_drops_a_header_value_outside_its_format(case: str) -> None:
+    (bridge, model, bearer), header, good = _FORMAT_CASES[case]
+    g, _ = _build_guardrail(**{bridge: True})
+    for value, kept in ((good, True), (_FREE_TEXT, False)):
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "headers": {"X-Corp-Auth": "tok-1", "Authorization": f"Bearer {bearer}", header: value},
+        }
+
+        out = await g.pre_call(data)
+
+        assert (out["extra_headers"].get(header) == value) is kept, (header, value)
+
+
+async def test_the_codex_bridge_forwards_exact_names_only() -> None:
+    g, _ = _build_guardrail(forward_chatgpt_auth=True)
+    data = {
+        "model": "gpt-5.6-sol",
+        "input": "hi",
+        "headers": {
+            "X-Corp-Auth": "tok-1",
+            "Authorization": "Bearer oauth-unit",
+            "x-codex-beta-features": "unified_exec",
+            "x-codex-anything": _FREE_TEXT,
+        },
+    }
+
+    out = await g.pre_call(data)
+
+    assert set(out["extra_headers"]) == {"x-codex-beta-features"}

@@ -10,6 +10,8 @@ skips, CI's 3.12 job runs them.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from corp_llm_gateway.litellm_hook import _NON_CHAT_INPUT_CALL_TYPES
@@ -159,3 +161,30 @@ def test_non_chat_input_call_types_all_exist_in_litellm() -> None:
     values = {call_type.value for call_type in utils.CallTypes}
 
     assert values >= _NON_CHAT_INPUT_CALL_TYPES
+
+
+def test_every_client_side_credential_key_is_removed_or_refused_by_litellm() -> None:
+    # The pre-call removes `_CLIENT_CONTROL_BODY_KEYS` and leaves the rest of
+    # litellm's client-side credential keys to litellm's own body ban. A key
+    # litellm adds to either list without the other shows up here.
+    from corp_llm_gateway.litellm_hook import _CLIENT_CONTROL_BODY_KEYS
+
+    handler = pytest.importorskip(
+        "litellm.router_utils.clientside_credential_handler", reason=_SKIP_REASON
+    )
+    auth_utils = pytest.importorskip("litellm.proxy.auth.auth_utils", reason=_SKIP_REASON)
+    banned = set(auth_utils._BANNED_REQUEST_BODY_PARAMS)
+
+    assert {"api_base", "base_url"} <= banned
+    assert set(handler.clientside_credential_keys) <= _CLIENT_CONTROL_BODY_KEYS | banned
+    for key in _CLIENT_CONTROL_BODY_KEYS:
+        assert key not in banned, f"litellm now refuses {key}; the removal is redundant"
+
+
+def test_litellm_still_reads_the_removed_body_keys_into_the_upstream_call() -> None:
+    # If litellm stopped reading one of these, the removal list is stale, not unsafe;
+    # if it starts reading a new header or destination key, extend the list.
+    main = pytest.importorskip("litellm.main", reason=_SKIP_REASON)
+    source = inspect.getsource(main)
+    for key in ("extra_headers", "provider_specific_header", "organization"):
+        assert f'kwargs.get("{key}"' in source, key

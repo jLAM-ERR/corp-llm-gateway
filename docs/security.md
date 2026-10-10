@@ -101,6 +101,7 @@ count; Claude Code falls back to its own estimate for the indicator.
 | Chat `messages[].name` (any role) | Participant name, free text; not rewritten and not in the Stage-5 scan, so it reaches the provider as sent. **Open — follow-up.** |
 | Chat `prediction.content` (Predicted Outputs) | Free text; not rewritten and not in the Stage-5 scan, so it reaches the provider as sent. **Open — follow-up.** |
 | Responses `prompt.variables` (stored-prompt template values) | Free text; not rewritten and not in the Stage-5 scan, so it reaches the provider as sent. **Open — follow-up.** |
+| Request-body fields the content walker does not know (any top-level key outside the shapes above, e.g. `user`, `extra_body`, `project`) | **Accepted risk, not a gap to close** (user decision 2026-10-10, for support cost): no schema validation and no generic sanitizing of unknown fields. They are not rewritten and not in the Stage-5 scan, and litellm carries some of them into the upstream body as sent (wire-captured on the chat routes: `extra_body`, `extra_query`, `project`, `openai_project`, `ssl_verify`; `user` on codex). The keys litellm turns into upstream headers or a credential are removed instead (§13, "Request-body keys removed"). |
 | Anthropic text-block `citations[]` (`cited_text`, `document_title`) | Not rewritten and not in the Stage-5 scan on the request side (a client-built citation egresses raw); not restored on the response side (a provider-built citation reaches the client with placeholders). **Open — follow-up.** |
 
 Response-side de-sanitization (the reverse path) restores originals in streamed
@@ -480,7 +481,7 @@ scoped by the k8s log collector, and a different trust model applies.
 | ID | Invariant | Enforced by |
 |---|---|---|
 | M1-14 | **No originals leak** across six surfaces: (i) logger emissions, (ii) error bodies, (iii) exception traces, (iv) metric labels, (v) forwarded headers, (vi) pod stdout | `tests/invariants/test_no_originals_leak.py` |
-| 3 | **Client headers reach a provider only through a bridge's allowlist**: `data["headers"]` is the allowlist projection `_UPSTREAM_HEADER_ALLOWLIST` (empty), never a deny-list; the bridges carry the developer's token in `api_key` and their own allowlists in `extra_headers`; the corp route gets only its `CORP_LLM_AUTH_TOKEN` (§13). Broken in 1.0.0 | `litellm_hook.py` + `tests/litellm_hook/test_pre_call_headers.py` + `tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream` |
+| 3 | **Client headers reach a provider only through a bridge's allowlist**: `data["headers"]` is the allowlist projection `_UPSTREAM_HEADER_ALLOWLIST` (empty), never a deny-list; the bridges carry the developer's token in `api_key` and their own allowlists in `extra_headers` (exact names, each value in its format); the request-body keys litellm turns into headers or a credential are removed; the corp route gets only its `CORP_LLM_AUTH_TOKEN` (§13). Broken in 1.0.0 | `litellm_hook.py` + `tests/litellm_hook/test_pre_call_headers.py` + `tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream` |
 | M2-7 | **No BYOK credential in audit**: the `Authorization` value never appears in any audit surface (invariant 3). Outside the audit, litellm's "[PROXY] returned data from litellm_pre_call_utils" DEBUG line prints the whole request, bearer included, before our hook: litellm DEBUG refuses to arm (§15) | same test corpus + NEVER gate; `route_gate/arm_checks.py` (exit 70) |
 | 4 | **`X-Corp-Auth` is never logged**: stripped in the pre-call before anything can refuse the request, from every header bucket and from litellm's logging snapshot — log kwargs, `StandardLoggingPayload`, the spend-log row, failure-hook `request_data` (§15, hazard 18). Two litellm DEBUG lines before our hook print it; the DEBUG refusal is their only guard | `tests/invariants/test_no_originals_leak.py` + `tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py` + `tests/test_desanitize_served_stack.py` |
 | M3-10 | **Vector drops NEVER**: an injected NEVER-key record reaches no sink | integration assertion |
@@ -611,8 +612,9 @@ when the flag is on, `pre_call`:
 - copies the allowlisted **non-auth** inbound headers into
   `data["extra_headers"]`. The allowlist is exactly `anthropic-beta`,
   `anthropic-version`, `user-agent` (plus `authorization`, which is selected for
-  validation and then excluded from `extra_headers`). Every other inbound header
-  is dropped;
+  validation and then excluded from `extra_headers`), each by exact name and only
+  with a value in its format ("Client headers upstream", below). Every other
+  inbound header, and a value outside its format, is dropped;
 - **never** selects `X-Corp-Auth` — the corp token is skipped before the
   allowlist is consulted, on top of the normal `strip_corp_token` path
   (invariant 4);
@@ -644,20 +646,60 @@ suite, below):
 
 | Provider | Client headers that reach the upstream | `Authorization` upstream |
 |---|---|---|
-| anthropic (`CORP_LLM_FORWARD_ANTHROPIC_AUTH`) | `anthropic-beta` (litellm keeps only the betas it knows and adds `oauth-2025-04-20`), `anthropic-version`, `user-agent` | the developer's `sk-ant-oat…`, from `api_key` |
-| codex (`CORP_LLM_FORWARD_CHATGPT_AUTH`) | `chatgpt-account-id`, `originator`, `session-id`, `thread-id`, `user-agent`, `x-openai-internal-codex-responses-lite`, `x-codex-*` | the developer's ChatGPT token, from `api_key` |
+| anthropic (`CORP_LLM_FORWARD_ANTHROPIC_AUTH`) | `anthropic-beta` (litellm keeps only the betas it knows and adds `oauth-2025-04-20`), `anthropic-version` (on `/v1/messages`; the chat adapter sends litellm's own), `user-agent` | the developer's `sk-ant-oat…`, from `api_key` |
+| codex (`CORP_LLM_FORWARD_CHATGPT_AUTH`) | `chatgpt-account-id`, `originator`, `session-id`, `thread-id`, `user-agent`, `x-codex-beta-features`, `x-openai-internal-codex-responses-lite` | the developer's ChatGPT token, from `api_key` |
 | corp (no bridge) | none | the route's `CORP_LLM_AUTH_TOKEN`; `Bearer fake-api-key` when it is empty |
+
+**Exact names and value formats.** A bridge forwards a header only by its exact
+name (no prefix match) and only with a value in that header's format
+(`_BRIDGE_HEADER_FORMATS`). A value outside its format is dropped, silently; the
+request goes on without it. Each format comes from a real recorded value, and
+must accept every one the repo holds:
+
+| Header | Format | Real value it was derived from |
+|---|---|---|
+| `anthropic-version` | a date, `YYYY-MM-DD` | `2023-06-01` (`scripts/install.sh`, the Claude Code client config) |
+| `anthropic-beta` | a comma-separated list of lowercase `a-z0-9` words joined by `-` | `oauth-2025-04-20`, `interleaved-thinking-2025-05-14` |
+| `user-agent` | RFC 9110 `product/version` tokens and `( … )` comments; every product has a version; no `@`, no quotes | `claude-cli/2.1.220` |
+| `originator` | `A-Za-z0-9._-` words, space-separated | `codex_cli_rs` |
+| `session-id`, `thread-id` | `[a-zA-Z0-9_-]{8,}` | litellm's own format for these Codex ids (`_SESSION_ID_VALUE_RE`, `proxy/litellm_pre_call_utils.py`); no Codex value is recorded in the repo |
+| `x-openai-internal-codex-responses-lite` | `true` or `false` | `true` |
+| `chatgpt-account-id`, `x-codex-beta-features` | **name only** | none recorded in the repo, so no format is enforced and the value is forwarded as sent |
+
+A real Codex or Claude Code value outside these formats loses that header
+upstream; the live smoke run before merge is where that shows.
+
+**Request-body keys removed.** litellm also turns some request-body keys into
+upstream headers or the upstream credential, so the pre-call removes them from
+the client's request before anything reads them (`_CLIENT_CONTROL_BODY_KEYS`),
+silently, and the request goes on. The bridges then write their own
+`extra_headers` and `api_key`.
+
+| Body key | What litellm 1.101.0 does with it |
+|---|---|
+| `extra_headers` | merges it into the upstream headers |
+| `provider_specific_header` | merges its `extra_headers` into the upstream headers for its provider; litellm rebuilds the key itself only when the client sent `anthropic-*` headers |
+| `api_key` | a client-side credential: it becomes the upstream `Authorization`, and the router keeps the deployment it builds from it, so later requests from other callers went out with it too (wire-captured on corp) |
+| `organization` | the `OpenAI-Organization` header on `openai/` routes |
+
+litellm itself refuses `api_base`, `base_url` and the rest of its banned body
+params with a 400, and the pre-call overwrites `headers`.
+`tests/litellm_hook/test_litellm_route_assumptions.py` fails if litellm's
+client-side credential keys grow past those two lists.
 
 Every other header on the wire is added by litellm or its HTTP client: `host`,
 `accept`, `accept-encoding`, `connection`, `content-type`, `content-length`;
 litellm's own `user-agent` on corp; `anthropic-dangerous-direct-browser-access`
 from litellm's OAuth branch; the OpenAI SDK's `x-stainless-*` on the codex chat
 route. A cookie, `x-api-key`, `x-litellm-api-key`, `X-Corp-Auth` or any other
-client header reaches no provider. Adding a name to the allowlist sends that
-header's value to every provider unsanitized — a security decision, like a
-route-table row. Pinned by
+client header reaches no provider. Request-body fields the content walker does
+not know are a different matter: they are not sanitized (§2, "Not sanitized /
+deferred"). Adding a name to the allowlist sends that header's value to every
+provider unsanitized — a security decision, like a route-table row. Pinned by
 `tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream`
-(the exact header set, per provider and route) and
+(the exact header set, per provider and route),
+`::test_a_client_control_body_key_never_reaches_the_upstream`,
+`::test_a_bridge_drops_a_free_text_header_value` and
 `tests/litellm_hook/test_pre_call_headers.py` (the projection, in process).
 
 **Fixed in 1.1.0; 1.0.0 is affected.** 1.0.0 wrote litellm's logging copy of

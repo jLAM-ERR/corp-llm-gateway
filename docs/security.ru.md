@@ -90,6 +90,7 @@ API (`api.anthropic.com` / `api.openai.com`). На `pre_call` он направ�
 | Chat `messages[].name` (любая роль) | Имя участника, свободный текст; не переписывается и не входит в скан Stage 5, поэтому доходит до провайдера как есть. **Открыто — доработка.** |
 | Chat `prediction.content` (Predicted Outputs) | Свободный текст; не переписывается и не входит в скан Stage 5, поэтому доходит до провайдера как есть. **Открыто — доработка.** |
 | Responses `prompt.variables` (значения шаблона сохранённого промпта) | Свободный текст; не переписывается и не входит в скан Stage 5, поэтому доходит до провайдера как есть. **Открыто — доработка.** |
+| Поля тела запроса, которых не знает обходчик контента (любой ключ верхнего уровня вне форм выше, например `user`, `extra_body`, `project`) | **Принятый риск, а не пробел к закрытию** (решение пользователя 2026-10-10, ради стоимости поддержки): ни валидации по схеме, ни общей санитизации неизвестных полей. Они не переписываются и не входят в скан Stage 5, а litellm переносит часть из них в тело upstream как прислано (снято с провода на chat-маршрутах: `extra_body`, `extra_query`, `project`, `openai_project`, `ssl_verify`; `user` на codex). Ключи, которые litellm превращает в заголовки upstream или в креденшел, вместо этого удаляются (§13, «Удаляемые ключи тела запроса»). |
 | `citations[]` текстового блока Anthropic (`cited_text`, `document_title`) | На стороне запроса не переписывается и не входит в скан Stage 5 (цитата, собранная клиентом, уходит как есть); на стороне ответа не восстанавливается (цитата от провайдера приходит клиенту с плейсхолдерами). **Открыто — доработка.** |
 
 Де-санитизация на стороне ответа (обратный путь) восстанавливает оригиналы в
@@ -457,7 +458,7 @@ NEVER-гейт и `audit_only` и попадёт в Langfuse как настоя
 | ID | Инвариант | Обеспечивается |
 |---|---|---|
 | M1-14 | **Оригиналы не утекают** через шесть поверхностей: (i) эмиссии логгера, (ii) тела ошибок, (iii) трейсы исключений, (iv) лейблы метрик, (v) пробрасываемые заголовки, (vi) stdout пода | `tests/invariants/test_no_originals_leak.py` |
-| 3 | **Заголовки клиента доходят до провайдера только через allowlist моста**: `data["headers"]` — проекция по allowlist `_UPSTREAM_HEADER_ALLOWLIST` (пустому), никогда не deny-list; мосты несут токен разработчика в `api_key`, а свои allowlist-ы — в `extra_headers`; маршрут corp получает только свой `CORP_LLM_AUTH_TOKEN` (§13). Нарушен в 1.0.0 | `litellm_hook.py` + `tests/litellm_hook/test_pre_call_headers.py` + `tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream` |
+| 3 | **Заголовки клиента доходят до провайдера только через allowlist моста**: `data["headers"]` — проекция по allowlist `_UPSTREAM_HEADER_ALLOWLIST` (пустому), никогда не deny-list; мосты несут токен разработчика в `api_key`, а свои allowlist-ы — в `extra_headers` (точные имена, каждое значение в своём формате); ключи тела запроса, которые litellm превращает в заголовки или креденшел, удаляются; маршрут corp получает только свой `CORP_LLM_AUTH_TOKEN` (§13). Нарушен в 1.0.0 | `litellm_hook.py` + `tests/litellm_hook/test_pre_call_headers.py` + `tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream` |
 | M2-7 | **Никаких BYOK-кредов в аудите**: значение `Authorization` никогда не появляется ни на одной аудит-поверхности (инвариант 3). Вне аудита DEBUG-строка litellm «[PROXY] returned data from litellm_pre_call_utils» печатает весь запрос вместе с bearer до нашего хука: DEBUG litellm не даёт взвести шлюз (§15) | тот же корпус тестов + NEVER-гейт; `route_gate/arm_checks.py` (exit 70) |
 | 4 | **`X-Corp-Auth` никогда не логируется**: срезается в pre-call до того, как что-либо может отклонить запрос, из каждой копии заголовков и из снимка логирования litellm — kwargs логирования, `StandardLoggingPayload`, строка spend-log, `request_data` failure-хука (§15, hazard 18). Две DEBUG-строки litellm до нашего хука печатают его; их закрывает только отказ DEBUG | `tests/invariants/test_no_originals_leak.py` + `tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py` + `tests/test_desanitize_served_stack.py` |
 | M3-10 | **Vector отбрасывает NEVER**: внедрённая запись с NEVER-ключом не достигает ни одного sink | интеграционная проверка |
@@ -564,8 +565,9 @@ compose- и demo-загрузки, на которых эти мосты и ез
 - копирует разрешённые **не-аутентификационные** входящие заголовки в
   `data["extra_headers"]`. Allowlist — ровно `anthropic-beta`,
   `anthropic-version`, `user-agent` (плюс `authorization`, который выбирается
-  для валидации, а затем исключается из `extra_headers`). Все остальные
-  входящие заголовки отбрасываются;
+  для валидации, а затем исключается из `extra_headers`), каждый по точному имени
+  и только со значением в своём формате («Заголовки клиента наверху», ниже). Все
+  остальные входящие заголовки и значение вне формата отбрасываются;
 - **никогда** не выбирает `X-Corp-Auth` — корп-токен пропускается ещё до
   проверки по allowlist, вдобавок к обычному пути `strip_corp_token`
   (инвариант 4);
@@ -598,9 +600,46 @@ litellm отправляет `data["headers"]` провайдеру на каж�
 
 | Провайдер | Заголовки клиента, доходящие до upstream | `Authorization` наверху |
 |---|---|---|
-| anthropic (`CORP_LLM_FORWARD_ANTHROPIC_AUTH`) | `anthropic-beta` (litellm оставляет только известные ему beta и добавляет `oauth-2025-04-20`), `anthropic-version`, `user-agent` | `sk-ant-oat…` разработчика, из `api_key` |
-| codex (`CORP_LLM_FORWARD_CHATGPT_AUTH`) | `chatgpt-account-id`, `originator`, `session-id`, `thread-id`, `user-agent`, `x-openai-internal-codex-responses-lite`, `x-codex-*` | токен ChatGPT разработчика, из `api_key` |
+| anthropic (`CORP_LLM_FORWARD_ANTHROPIC_AUTH`) | `anthropic-beta` (litellm оставляет только известные ему beta и добавляет `oauth-2025-04-20`), `anthropic-version` (на `/v1/messages`; chat-адаптер шлёт собственный от litellm), `user-agent` | `sk-ant-oat…` разработчика, из `api_key` |
+| codex (`CORP_LLM_FORWARD_CHATGPT_AUTH`) | `chatgpt-account-id`, `originator`, `session-id`, `thread-id`, `user-agent`, `x-codex-beta-features`, `x-openai-internal-codex-responses-lite` | токен ChatGPT разработчика, из `api_key` |
 | corp (без моста) | никакие | `CORP_LLM_AUTH_TOKEN` маршрута; `Bearer fake-api-key`, когда он пуст |
+
+**Точные имена и форматы значений.** Мост пересылает заголовок только по точному
+имени (без совпадения по префиксу) и только со значением в формате этого
+заголовка (`_BRIDGE_HEADER_FORMATS`). Значение вне формата молча отбрасывается;
+запрос идёт дальше без него. Каждый формат выведен из реального записанного
+значения и должен принимать все такие значения, что есть в репозитории:
+
+| Заголовок | Формат | Реальное значение, из которого он выведен |
+|---|---|---|
+| `anthropic-version` | дата `YYYY-MM-DD` | `2023-06-01` (`scripts/install.sh`, конфиг клиента Claude Code) |
+| `anthropic-beta` | список через запятую из слов `a-z0-9` в нижнем регистре, соединённых `-` | `oauth-2025-04-20`, `interleaved-thinking-2025-05-14` |
+| `user-agent` | токены `product/version` и комментарии `( … )` по RFC 9110; у каждого продукта есть версия; без `@` и кавычек | `claude-cli/2.1.220` |
+| `originator` | слова из `A-Za-z0-9._-` через пробел | `codex_cli_rs` |
+| `session-id`, `thread-id` | `[a-zA-Z0-9_-]{8,}` | собственный формат litellm для этих id Codex (`_SESSION_ID_VALUE_RE`, `proxy/litellm_pre_call_utils.py`); значения Codex в репозитории не записано |
+| `x-openai-internal-codex-responses-lite` | `true` или `false` | `true` |
+| `chatgpt-account-id`, `x-codex-beta-features` | **только имя** | в репозитории не записано ни одного значения, поэтому формат не проверяется и значение уходит как прислано |
+
+Реальное значение Codex или Claude Code вне этих форматов теряет этот заголовок
+наверху; это покажет живой smoke-прогон перед merge.
+
+**Удаляемые ключи тела запроса.** litellm превращает некоторые ключи тела запроса
+в заголовки upstream или в креденшел upstream, поэтому pre-call удаляет их из
+запроса клиента до того, как их кто-либо прочтёт (`_CLIENT_CONTROL_BODY_KEYS`),
+молча, и запрос идёт дальше. Затем мосты пишут собственные `extra_headers` и
+`api_key`.
+
+| Ключ тела | Что с ним делает litellm 1.101.0 |
+|---|---|
+| `extra_headers` | вливает в заголовки upstream |
+| `provider_specific_header` | вливает свои `extra_headers` в заголовки upstream для своего провайдера; сам litellm пересобирает этот ключ, только если клиент прислал заголовки `anthropic-*` |
+| `api_key` | клиентский креденшел: становится `Authorization` наверху, а роутер сохраняет построенный из него deployment, так что с ним уходили и последующие запросы других клиентов (снято с провода на corp) |
+| `organization` | заголовок `OpenAI-Organization` на маршрутах `openai/` |
+
+`api_base`, `base_url` и остальные запрещённые параметры тела litellm сам
+отклоняет с 400, а `headers` pre-call перезаписывает.
+`tests/litellm_hook/test_litellm_route_assumptions.py` падает, если ключи
+клиентского креденшела litellm выйдут за эти два списка.
 
 Все остальные заголовки на проводе добавляют litellm или его HTTP-клиент:
 `host`, `accept`, `accept-encoding`, `connection`, `content-type`,
@@ -608,11 +647,14 @@ litellm отправляет `data["headers"]` провайдеру на каж�
 `anthropic-dangerous-direct-browser-access` из OAuth-ветки litellm; `x-stainless-*`
 OpenAI SDK на chat-маршруте codex. Cookie, `x-api-key`, `x-litellm-api-key`,
 `X-Corp-Auth` и любой другой заголовок клиента ни до какого провайдера не доходят.
-Добавить имя в allowlist — значит отправлять значение этого заголовка каждому
-провайдеру без санитизации: это решение безопасности, как строка таблицы
-маршрутов. Закреплено
+С полями тела запроса, которых не знает обходчик контента, иначе: они не
+санитизируются (§2, «Не санитизируется / отложено»). Добавить имя в allowlist —
+значит отправлять значение этого заголовка каждому провайдеру без санитизации:
+это решение безопасности, как строка таблицы маршрутов. Закреплено
 `tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream`
-(точный набор заголовков по провайдеру и маршруту) и
+(точный набор заголовков по провайдеру и маршруту),
+`::test_a_client_control_body_key_never_reaches_the_upstream`,
+`::test_a_bridge_drops_a_free_text_header_value` и
 `tests/litellm_hook/test_pre_call_headers.py` (проекция, в процессе).
 
 **Исправлено в 1.1.0; 1.0.0 затронута.** 1.0.0 писала в `data["headers"]`
