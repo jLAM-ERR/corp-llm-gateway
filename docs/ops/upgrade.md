@@ -344,9 +344,15 @@ affected.
 
 It now defaults **on** (`bootstrap.build_guardrail`) and the chart sets it
 explicitly. The dropped set (`_WIRE_HEADERS_TO_DROP`) is hop-by-hop / wire-level
-only and never contains `authorization`, so BYOK passthrough is untouched, and
-`X-Corp-Auth` was already stripped unconditionally one step earlier. Set it to
-`0` only to reproduce the old behaviour. Recorded as `../security.md` §11 (h).
+only, and `X-Corp-Auth` was already stripped unconditionally one step earlier.
+Recorded as `../security.md` §11 (h).
+
+**1.1.0:** client headers no longer reach a provider at all, so this flag no
+longer decides what goes upstream (it only cleans litellm's own header copies).
+The subscription bridges forward their own short header lists, by exact name
+and value format, and the request-body keys litellm would turn into headers or
+a credential are removed (`../security.md` §13). Nothing to change in your
+configuration; the full 1.0 → 1.1 notes come with the 1.1 upgrade section.
 
 ## The `ner` extra now carries pymorphy3: RU gazetteer terms are lemmatised
 

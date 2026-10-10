@@ -157,12 +157,13 @@ on every request:
 Two independent findings, both narrower than an earlier revision of this
 README claimed — read carefully, the mechanisms are different.
 
-**(a) Native `anthropic/`/`openai/` credentials never come from the client.**
-Those providers build their upstream credential from the configured
-`api_key` (`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`) and never read the inbound
-`Authorization` header. Verified twice: against litellm 1.85.0 (the pinned
-image) and independently against 1.90.1; see `examples/compose/README.md`
-"BYOK in local mode (SPIKE finding)".
+**(a) The upstream credential is the bridge's or the route's, never a raw
+client value.** The anthropic and codex gateways hold no provider key: their
+subscription bridge lifts the developer's OAuth bearer into the request's
+`api_key` (`docs/security.md` §13). The corp gateway sends its configured
+`CORP_LLM_AUTH_TOKEN`. A client `api_key` in the request body is removed before
+litellm reads it; litellm would otherwise make it the upstream credential and
+keep it for later requests.
 
 **(b) No client header reaches a provider through `data["headers"]`.**
 litellm sends `data["headers"]` upstream on every route, and its own
@@ -178,12 +179,12 @@ per-provider list in `docs/security.md` §13). `CORP_LLM_STRIP_INBOUND_HEADERS`
 still drops the wire headers from litellm's own header copies; it no longer
 decides what goes upstream.
 
-BYOK (the developer's own provider key forwarded upstream)
-is **not available on this compose stack at all**, on any
-route: developers authenticate with the litellm virtual key described
-above, and the `corp-*`/`hosted_vllm/` route builds its upstream request
-from the configured `api_key`/model params the same way `anthropic/` and
-`openai/` do, not from a forwarded client `Authorization`. Full stop.
+BYOK in the API-key sense (the developer's own provider *API key* forwarded
+upstream) is not available on this stack, on any route: the Anthropic bridge
+accepts OAuth tokens only (`sk-ant-oat…`), the Codex bridge forwards the ChatGPT
+OAuth token, and the corp route builds its upstream request from its configured
+`api_key`, never from a client `Authorization`. litellm virtual keys are gone in
+1.1.0.
 
 ## TLS to the corp vLLM
 

@@ -109,10 +109,9 @@ BASE_ENV = {
     "CORP_METRICS_EXPORTER": "prometheus",
     "CORP_LLM_DEV_TEAM_TOKEN": CORP_TOKEN,
     "CORP_ENV": "dev",
-    # What compose/.env.example sets. The guardrail puts the inbound wire headers
-    # into `data["headers"]` and litellm forwards them, so without this the
-    # client's `content-length` rides along and the upstream body is cut to that
-    # length whenever sanitization made it longer (wire-verified here).
+    # What compose/.env.example sets: the wire headers go from litellm's own header
+    # copies as well. What reaches the stub does not depend on it (the guardrail's
+    # data["headers"] is an empty allowlist projection either way).
     "CORP_LLM_STRIP_INBOUND_HEADERS": "1",
 }
 

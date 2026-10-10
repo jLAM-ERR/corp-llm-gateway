@@ -113,7 +113,7 @@ cascade above, on the already-sanitized request.
 
 | Key | Purpose | Default | Required |
 |-----|---------|---------|----------|
-| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Length`, `Content-Type`, ...) before forwarding to upstream | `1` | no |
+| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Length`, `Content-Type`, ...) from litellm's own header copies; not what reaches a provider | `1` | no |
 
 Since 1.1.0 this flag does not decide what reaches a provider.
 `CorpLlmGuardrail._pre_call_impl` writes `data["headers"]` — the bucket
@@ -123,13 +123,12 @@ the inbound wire headers from litellm's own header copies as well. It never
 touches `Authorization` there: the subscription bridges read the developer's
 token from those copies.
 
-It defaults **on** because it is a correctness knob as well as a
-confidentiality one: with it off, the client's `Content-Length` is forwarded
-beside litellm's own, longer, sanitized body, and the provider reads the
-request truncated at the client's length — a `"stream": true` cut off that way
-comes back non-streamed. Any request whose sanitized body grew (a placeholder
-longer than the original it replaced) is corrupted on the wire. Set it to `0`
-only to reproduce that.
+It defaults **on**. Up to 1.0.0 it was also a correctness knob: the client's
+`Content-Length` rode upstream in `data["headers"]` beside litellm's own,
+longer, sanitized body, and the provider read the request truncated. Since
+1.1.0 no client header goes there with the flag on or off, so turning it off
+only leaves the wire headers in litellm's own copies (what a logging callback
+sees). Keep it on.
 
 ### Subscription-auth bridges
 

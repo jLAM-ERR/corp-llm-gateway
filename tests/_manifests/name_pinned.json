@@ -445,8 +445,8 @@
   ],
   "tests/compose/test_nginx_allowlist_routes.py": [
    "CLAUDE.md:72",
-   "compose/README.md:888",
-   "compose/README.ru.md:909",
+   "compose/README.md:889",
+   "compose/README.ru.md:910",
    "compose/nginx/README.md:20",
    "docs/security.md:1282",
    "docs/security.ru.md:1264"
@@ -650,7 +650,7 @@
    "CLAUDE.md:346"
   ],
   "tests/test_anthropic_oauth_profile.py": [
-   "docs/ops/configuration.md:182",
+   "docs/ops/configuration.md:181",
    "docs/security.md:750",
    "docs/security.ru.md:707"
   ],
