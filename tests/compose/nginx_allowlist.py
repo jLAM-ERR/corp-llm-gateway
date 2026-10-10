@@ -29,7 +29,9 @@ WEBSOCKET = "WEBSOCKET"
 # body, Retry-After, and HSTS when the connection is TLS).
 RATE_LIMITED = "@rate_limited"
 # The only placeholders the gateway snippet may carry: the edge limits, which
-# the entrypoint renders as bare positive integers (never a path or a method).
+# the entrypoint renders as bare positive integers, and the upstream gateway's
+# service name, which it renders only as one of the three gateway-* literals
+# (never a path or a method).
 SNIPPET_PLACEHOLDERS = frozenset(
     {"NGINX_TOKEN_BURST", "NGINX_TOKEN_CONN", "NGINX_GATEWAY_UPSTREAM"}
 )

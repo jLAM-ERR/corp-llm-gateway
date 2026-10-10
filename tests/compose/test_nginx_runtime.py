@@ -535,6 +535,10 @@ REFUSALS = [
         _upstream("gateway-corp", UPSTREAM_PROFILE_OFF, COMPOSE_PROFILES="corporate,nginx"),
         id="upstream-inexact-profile",
     ),
+    pytest.param(
+        _upstream("gateway-corp", UPSTREAM_PROFILE_OFF, COMPOSE_PROFILES=" corporate , nginx"),
+        id="upstream-padded-inexact-profile",
+    ),
 ]
 
 
@@ -555,6 +559,35 @@ def test_the_entrypoint_refuses(specs: dict[str, Spec], project: Path, refusal: 
 
     assert result.returncode == refusal.code, result.stderr
     _assert_one_line_naming(result, refusal.names)
+
+
+@pytest.mark.parametrize(
+    ("upstream", "profiles", "rendered"),
+    [
+        (UNSET, "anthropic,nginx", "gateway-anthropic"),
+        ("gateway-codex", "anthropic,codex,nginx", "gateway-codex"),
+        ("gateway-corp", "corp,nginx", "gateway-corp"),
+        # Compose trims each token, so this line does enable codex.
+        ("gateway-codex", "anthropic, codex ,nginx", "gateway-codex"),
+    ],
+    ids=["default-anthropic", "codex", "corp", "codex-padded-profiles"],
+)
+def test_the_entrypoint_accepts_an_enabled_gateway_and_renders_its_upstream(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    upstream: str | None,
+    profiles: str,
+    rendered: str,
+) -> None:
+    env = {**VALID_BEHIND_PROXY, "NGINX_GATEWAY_UPSTREAM": upstream, "COMPOSE_PROFILES": profiles}
+    with started(specs["host"], project, network, env) as nginx:
+        snippet = nginx.exec("cat", f"{RENDERED}/snippets/gateway-locations.inc").stdout
+
+    upstream_lines = [
+        line for line in snippet.splitlines() if line.startswith("set $gateway_upstream")
+    ]
+    assert upstream_lines == [f"set $gateway_upstream http://{rendered}:4000;"]
 
 
 LEAK_CANARY = "LEAK-CANARY-9c1e"
@@ -1447,9 +1480,10 @@ def test_the_gateway_never_sees_a_path_nginx_did_not_admit(
         assert (records[0]["method"], records[0]["target"]) in DECLARED, (target, records[0])
 
 
+# One value, kept so the must-keep case ids ([host-base], [port-base]) stay as recorded.
 @pytest.mark.parametrize("overlay", ["base"])
 @pytest.mark.parametrize("routing", ["host", "port"])
-def test_the_allow_list_holds_under_both_routings_and_the_oauth_overlay(
+def test_the_allow_list_holds_under_both_routings_on_the_subscription_stack(
     specs: dict[str, Spec],
     project: Path,
     network: Network,

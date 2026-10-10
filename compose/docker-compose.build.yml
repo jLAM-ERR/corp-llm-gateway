@@ -26,16 +26,24 @@
 # E_NER_UNAVAILABLE — a dead gateway. `ru-en` is the profile that matches the
 # compose posture: both engines present, nothing degraded.
 #
-# Every provider's gateway builds the same image under the same tag, so
-# profile-guard (on that tag too) runs the branch's image as well.
-x-gateway-build: &gateway-build
-  build:
-    context: ..
-    dockerfile: Dockerfile.gateway
-    args:
-      NER_PROFILE: ru-en
-
+# ONE build, whatever providers are on. Every gateway-image service runs the
+# same tag, so the build lives on profile-guard — the one gateway-image service
+# that is never profiled off — and `pull_policy: build` makes it build instead
+# of pulling the published tag. The gateways get `pull_policy: never`: they run
+# the tag profile-guard just built, and never fetch the published one over it.
+# Putting the build on each gateway instead would build the same image three
+# times in parallel, to the same tag, with all three providers on.
 services:
-  gateway-anthropic: *gateway-build
-  gateway-codex: *gateway-build
-  gateway-corp: *gateway-build
+  profile-guard:
+    build:
+      context: ..
+      dockerfile: Dockerfile.gateway
+      args:
+        NER_PROFILE: ru-en
+    pull_policy: build
+  gateway-anthropic:
+    pull_policy: never
+  gateway-codex:
+    pull_policy: never
+  gateway-corp:
+    pull_policy: never

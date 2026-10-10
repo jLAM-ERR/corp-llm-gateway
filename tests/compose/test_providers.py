@@ -290,6 +290,8 @@ def test_a_master_key_left_in_env_reaches_no_gateway(tmp_path: Path) -> None:
     leftovers = "".join(f"{key}=left-over-{key.lower()}\n" for key in FORBIDDEN_ENV)
     services = _gateway_image_services(_rendered(tmp_path, env_extra=leftovers))
 
+    assert set(services) == {*GATEWAYS.values(), "profile-guard"}
+
     for name, service in services.items():
         assert not set(service.get("environment") or {}) & set(FORBIDDEN_ENV), name
 
@@ -382,7 +384,18 @@ def _run_guard(profiles: str | None) -> subprocess.CompletedProcess[str]:
 
 @pytest.mark.parametrize(
     "profiles",
-    ["anthropic", "codex", "corp", "anthropic,codex", "nginx,corp", "codex,nginx-ports"],
+    [
+        "anthropic",
+        "codex",
+        "corp",
+        "anthropic,codex",
+        "nginx,corp",
+        "codex,nginx-ports",
+        # Compose trims whitespace around each token and starts the gateway.
+        pytest.param("nginx, corp", id="padded-after-comma"),
+        pytest.param(" corp ", id="padded-both-sides"),
+        pytest.param("corp\t,nginx", id="padded-tab"),
+    ],
 )
 def test_the_profile_guard_accepts_a_provider_token(profiles: str) -> None:
     result = _run_guard(profiles)
@@ -393,7 +406,17 @@ def test_the_profile_guard_accepts_a_provider_token(profiles: str) -> None:
 
 @pytest.mark.parametrize(
     "profiles",
-    [None, "", "nginx", "nginx-ports", "corporate", "Anthropic", "anthropic codex", " corp", "*"],
+    [
+        None,
+        "",
+        "nginx",
+        "nginx-ports",
+        "corporate",
+        "Anthropic",
+        "anthropic codex",
+        " corporate ",
+        "*",
+    ],
     ids=["unset", "empty", "nginx", "nginx-ports", "corporate", "case", "space", "padded", "glob"],
 )
 def test_the_profile_guard_refuses_without_an_exact_provider_token(profiles: str | None) -> None:
@@ -402,6 +425,29 @@ def test_the_profile_guard_refuses_without_an_exact_provider_token(profiles: str
     assert result.returncode != 0
     assert NO_PROVIDER_MESSAGE in result.stderr
     assert "COMPOSE_PROFILES" in result.stderr
+
+
+@needs_compose_cli
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        "nginx, corp",
+        " corp ",
+        "corp\t,nginx",
+        "corporate",
+        " corporate ",
+        "nginx",
+        "anthropic codex",
+    ],
+    ids=["after-comma", "both-sides", "tab", "corporate", "padded-corporate", "nginx", "space"],
+)
+def test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts(
+    tmp_path: Path, profiles: str
+) -> None:
+    services = _rendered(tmp_path, providers=profiles)
+    started = any(name.startswith("gateway-") for name in services)
+
+    assert (_run_guard(profiles).returncode == 0) is started
 
 
 # A small image with /bin/sh stands in for the gateway image (the guard script is

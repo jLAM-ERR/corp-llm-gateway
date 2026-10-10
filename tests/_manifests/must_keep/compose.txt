@@ -1,6 +1,10 @@
 # Must-keep node ids (plan 20260926 Task 0, baseline 807831a). Rules and per-file
 # notes: docs/testing/must-keep.md. Regenerate only on a re-baseline.
 tests/compose/test_build_overlay.py::test_build_overlay_names_the_ner_profile_instead_of_taking_the_default
+tests/compose/test_build_overlay.py::test_the_build_lives_on_the_one_service_never_profiled_off
+tests/compose/test_build_overlay.py::test_the_build_overlay_builds_the_image_once
+tests/compose/test_build_overlay.py::test_the_build_overlay_builds_the_image_once[anthropic,codex,corp]
+tests/compose/test_build_overlay.py::test_the_build_overlay_builds_the_image_once[corp]
 tests/compose/test_build_overlay.py::test_the_compose_stack_fails_closed_on_a_missing_ner_engine
 tests/compose/test_build_overlay.py::test_the_dockerfile_default_would_ship_no_en_model
 tests/compose/test_build_overlay.py::test_the_overlay_profile_bakes_the_en_model_wheel
@@ -312,6 +316,11 @@ tests/compose/test_nginx_runtime.py::test_the_edges_429_carries_hsts_in_terminat
 tests/compose/test_nginx_runtime.py::test_the_edges_429_carries_hsts_in_terminate_alone[behind-proxy-port]
 tests/compose/test_nginx_runtime.py::test_the_edges_429_carries_hsts_in_terminate_alone[terminate-host]
 tests/compose/test_nginx_runtime.py::test_the_edges_429_carries_hsts_in_terminate_alone[terminate-port]
+tests/compose/test_nginx_runtime.py::test_the_entrypoint_accepts_an_enabled_gateway_and_renders_its_upstream
+tests/compose/test_nginx_runtime.py::test_the_entrypoint_accepts_an_enabled_gateway_and_renders_its_upstream[codex-padded-profiles]
+tests/compose/test_nginx_runtime.py::test_the_entrypoint_accepts_an_enabled_gateway_and_renders_its_upstream[codex]
+tests/compose/test_nginx_runtime.py::test_the_entrypoint_accepts_an_enabled_gateway_and_renders_its_upstream[corp]
+tests/compose/test_nginx_runtime.py::test_the_entrypoint_accepts_an_enabled_gateway_and_renders_its_upstream[default-anthropic]
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[bind-0.0.0.0]
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[bind-0:0:0:0:0:0:0:0]
@@ -428,6 +437,7 @@ tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[upstream-case]
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[upstream-default-profile-off]
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[upstream-inexact-profile]
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[upstream-litellm]
+tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[upstream-padded-inexact-profile]
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[upstream-port]
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[upstream-profile-off]
 tests/compose/test_nginx_runtime.py::test_the_entrypoint_refuses[upstream-semicolon]
@@ -512,6 +522,17 @@ tests/compose/test_providers.py::test_the_profile_guard_accepts_a_provider_token
 tests/compose/test_providers.py::test_the_profile_guard_accepts_a_provider_token[codex]
 tests/compose/test_providers.py::test_the_profile_guard_accepts_a_provider_token[corp]
 tests/compose/test_providers.py::test_the_profile_guard_accepts_a_provider_token[nginx,corp]
+tests/compose/test_providers.py::test_the_profile_guard_accepts_a_provider_token[padded-after-comma]
+tests/compose/test_providers.py::test_the_profile_guard_accepts_a_provider_token[padded-both-sides]
+tests/compose/test_providers.py::test_the_profile_guard_accepts_a_provider_token[padded-tab]
+tests/compose/test_providers.py::test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts
+tests/compose/test_providers.py::test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts[after-comma]
+tests/compose/test_providers.py::test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts[both-sides]
+tests/compose/test_providers.py::test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts[corporate]
+tests/compose/test_providers.py::test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts[nginx]
+tests/compose/test_providers.py::test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts[padded-corporate]
+tests/compose/test_providers.py::test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts[space]
+tests/compose/test_providers.py::test_the_profile_guard_agrees_with_compose_on_whether_a_gateway_starts[tab]
 tests/compose/test_providers.py::test_the_profile_guard_refuses_without_an_exact_provider_token
 tests/compose/test_providers.py::test_the_profile_guard_refuses_without_an_exact_provider_token[case]
 tests/compose/test_providers.py::test_the_profile_guard_refuses_without_an_exact_provider_token[corporate]

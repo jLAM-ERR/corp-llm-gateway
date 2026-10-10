@@ -288,7 +288,8 @@ x-gateway: &gateway
 services:
   # One-shot, on every `up`: refuses a stack with no provider. COMPOSE_PROFILES
   # must hold at least one exact token from anthropic|codex|corp (`corporate`
-  # is not `corp`); otherwise it names the cause and exits non-zero, and
+  # is not `corp`), each token trimmed of whitespace the way compose trims it
+  # (`nginx, corp` starts gateway-corp); otherwise it names the cause and exits non-zero, and
   # postgres — which every gateway and the issuance path need — never starts,
   # so `up` fails loudly instead of serving nothing. Runs on the gateway image
   # (no extra pull) and is not profiled, so it runs whatever is selected. No
@@ -306,6 +307,8 @@ services:
         set -f
         IFS=,
         for profile in $${COMPOSE_PROFILES:-}; do
+          profile="$${profile#"$${profile%%[![:space:]]*}"}"
+          profile="$${profile%"$${profile##*[![:space:]]}"}"
           case $$profile in
             anthropic | codex | corp) exit 0 ;;
           esac

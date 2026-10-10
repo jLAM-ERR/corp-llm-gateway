@@ -210,36 +210,48 @@ def _mounts_at(gateway: dict[str, Any], target: str) -> list[dict[str, Any]]:
 def test_the_merged_stack_mounts_the_config_file_beside_the_oauth_config(
     tmp_path: Path,
 ) -> None:
-    for provider, bridge in (
-        ("anthropic", "CORP_LLM_FORWARD_ANTHROPIC_AUTH"),
-        ("codex", "CORP_LLM_FORWARD_CHATGPT_AUTH"),
+    # (CORP_LLM_FORWARD_ANTHROPIC_AUTH, CORP_LLM_FORWARD_CHATGPT_AUTH) per provider.
+    for provider, bridges in (
+        ("anthropic", ("1", "0")),
+        ("codex", ("0", "1")),
+        ("corp", ("0", "0")),
     ):
         gateway = _render(tmp_path / provider, COMPOSE, OVERLAY, provider=provider)
+        environment = gateway["environment"]
 
         (mount,) = _mounts_at(gateway, TARGET)
         assert Path(mount["source"]) == gateway["_project_dir"] / "gateway" / "config.toml"
         assert mount["read_only"] is True
         (config,) = _mounts_at(gateway, "/etc/litellm/config.yaml")
         assert Path(config["source"]).name == f"config.{provider}.yaml"
-        assert gateway["environment"][bridge] == "1"
+        assert (
+            environment["CORP_LLM_FORWARD_ANTHROPIC_AUTH"],
+            environment["CORP_LLM_FORWARD_CHATGPT_AUTH"],
+        ) == bridges, provider
 
 
 @needs_compose_cli
 def test_the_merged_stack_leaves_unset_scalars_absent_and_passes_set_ones(
     tmp_path: Path,
 ) -> None:
-    gateway = _render(
-        tmp_path,
-        COMPOSE,
-        OVERLAY,
-        env_extra="CORP_GATEWAY_ISSUE_OIDC_ISSUER=https://keycloak.corp.lan/realms/dev\n",
-    )
-    environment = gateway["environment"]
+    for provider in ("anthropic", "codex", "corp"):
+        gateway = _render(
+            tmp_path / provider,
+            COMPOSE,
+            OVERLAY,
+            env_extra="CORP_GATEWAY_ISSUE_OIDC_ISSUER=https://keycloak.corp.lan/realms/dev\n",
+            provider=provider,
+        )
+        environment = gateway["environment"]
 
-    assert environment["CORP_LLM_GATEWAY_CONFIG_FILE"] == TARGET
-    assert environment["CORP_GATEWAY_ISSUE_OIDC_ISSUER"] == "https://keycloak.corp.lan/realms/dev"
-    # `null` is compose's rendering of an unresolved bare name: not set in the container.
-    assert environment["CORP_GATEWAY_ISSUE_MAX_ACTIVE"] is None
+        assert environment["CORP_LLM_GATEWAY_CONFIG_FILE"] == TARGET, provider
+        assert environment["CORP_GATEWAY_ISSUE_OIDC_ISSUER"] == (
+            "https://keycloak.corp.lan/realms/dev"
+        ), provider
+        # `null` is compose's rendering of an unresolved bare name: not set in the container.
+        for key in ISSUE_SCALARS:
+            if key != "CORP_GATEWAY_ISSUE_OIDC_ISSUER":
+                assert environment[key] is None, (provider, key)
 
 
 @needs_compose_cli

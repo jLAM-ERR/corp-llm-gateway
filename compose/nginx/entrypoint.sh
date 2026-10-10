@@ -339,6 +339,9 @@ saved_ifs=$IFS
 IFS=,
 # shellcheck disable=SC2086 # a comma-separated list; globbing is off
 for profile in ${COMPOSE_PROFILES:-}; do
+    # Trimmed the way compose trims a profile token: `anthropic, codex` enables codex.
+    profile=${profile#"${profile%%[![:space:]]*}"}
+    profile=${profile%"${profile##*[![:space:]]}"}
     if [ "$profile" = "$upstream_provider" ]; then
         upstream_enabled=1
     fi
