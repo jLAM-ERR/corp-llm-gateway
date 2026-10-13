@@ -34,7 +34,7 @@ A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. 
 | Header | Source | Purpose |
 |---|---|---|
 | `X-Corp-Auth` | `~/.corp-llm-gateway/token` (laptop) | corp identity / team resolution; **stripped** before egress |
-| `Authorization: Bearer …` | dev's Anthropic / OpenAI subscription token | lifted into the upstream call by the subscription bridge only; no other client header reaches a provider |
+| `Authorization: Bearer …` | dev's Anthropic / OpenAI subscription token | lifted into the upstream call by the subscription bridge only; the only other client headers that reach a provider are the bridge's allowlist (exact names, checked value formats) |
 
 ## Features
 
@@ -74,7 +74,7 @@ There is no off switch. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` can add PASSTHRO
 ### Auth & compliance
 
 - **X-Corp-Auth + Postgres token store** — `AuthMiddleware` validates tokens against `PostgresTokenStore` (asyncpg); 60 s revocation-propagation upper bound
-- **Subscription passthrough is the production mode** — the subscription bridge carries the developer's own Anthropic or ChatGPT OAuth token as the upstream credential, and no corp `ANTHROPIC_API_KEY` exists at all. No other client header reaches a provider, and the request-body keys litellm would turn into headers or a credential are removed ([`docs/security.md`](docs/security.md) §13). Corp API-key mode (LiteLLM virtual keys) is removed in 1.1.0 — [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md)
+- **Subscription passthrough is the production mode** — the subscription bridge carries the developer's own Anthropic or ChatGPT OAuth token as the upstream credential, and no corp `ANTHROPIC_API_KEY` exists at all. Beyond the bridge's own header allowlist (exact names, checked value formats) no client header reaches a provider, and the request-body keys litellm would turn into headers or a credential are removed ([`docs/security.md`](docs/security.md) §13). Corp API-key mode (LiteLLM virtual keys) is removed in 1.1.0 — [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md)
 - **`gateway:operator` RBAC** — admin CLI commands gated on JWT claim `gateway:operator`; verified via PyJWT against Keycloak realm roles
 - **Audit pipeline** — rich `AuditEvent` schema (ALWAYS / CONDITIONAL field tiers) + NEVER-fields gate: the logger refuses records containing `mapping`, `original`, or `credentials`
 - **SIEM sink** — Vector HTTP sink with inherited NEVER-gate + Helm alerts (`AuditVectorDropHigh`, `LeakAttemptDetected`)

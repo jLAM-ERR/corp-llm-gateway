@@ -79,9 +79,11 @@ systemd-юнит не перезаписываются.
 | `CORP_LANGFUSE_PUBLIC_KEY` | ключ проекта Langfuse `pk-lf-…`, см. ниже |
 | `CORP_LANGFUSE_SECRET_KEY` | ключ проекта Langfuse `sk-lf-…`, см. ниже |
 
-Никаких `LITELLM_MASTER_KEY`, `UI_USERNAME`, `UI_PASSWORD`, `ANTHROPIC_API_KEY`
-и `OPENAI_API_KEY`: 1.1.0 удалила режим A, и любая строка `LITELLM_MASTER_KEY`,
-пустая в том числе, не даёт стартовать.
+`LITELLM_MASTER_KEY`, `UI_USERNAME`, `UI_PASSWORD`, `ANTHROPIC_API_KEY` и
+`OPENAI_API_KEY` ушли вместе с режимом A (1.1.0): стек не передаёт шлюзу ни один
+из них, так что их не задавайте. Мастер-ключ, заданный там, откуда шлюз его
+читает (его файл конфигурации, переопределение окружения), не даёт стартовать,
+пустой в том числе.
 
 ### Про пару ключей Langfuse — прочитать до первого старта
 

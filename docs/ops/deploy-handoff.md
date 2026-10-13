@@ -78,9 +78,11 @@ Without these keys `docker compose` refuses to start with an explicit
 | `CORP_LANGFUSE_PUBLIC_KEY` | a Langfuse **project** key `pk-lf-…`, see below |
 | `CORP_LANGFUSE_SECRET_KEY` | a Langfuse **project** key `sk-lf-…`, see below |
 
-No `LITELLM_MASTER_KEY`, `UI_USERNAME`, `UI_PASSWORD`, `ANTHROPIC_API_KEY` or
-`OPENAI_API_KEY`: 1.1.0 removed Mode A, and any `LITELLM_MASTER_KEY` line, blank
-included, refuses to boot.
+`LITELLM_MASTER_KEY`, `UI_USERNAME`, `UI_PASSWORD`, `ANTHROPIC_API_KEY` and
+`OPENAI_API_KEY` are gone with Mode A (1.1.0): the stack passes none of them to a
+gateway, so leave them out. A master key set anywhere a gateway does read it
+(its config file, an environment override) refuses to boot, a blank one
+included.
 
 ### About the Langfuse key pair — read this before the first start
 

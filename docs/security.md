@@ -23,7 +23,7 @@ gateway and never enters litellm (§15).
 |---|---|
 | Success criterion | **Zero confirmed leak incidents** in the 90 days post-GA (non-negotiable) |
 | Failure posture | **Fail-closed** for the sanitization path: if the corp-LLM can't run, the request is rejected (503 `E_CORP_LLM_DOWN`) rather than forwarded unsanitized (`litellm_hook.py` `pre_call`) |
-| Client headers and the developer's token | The developer's `Authorization: Bearer …` reaches a provider **only through a subscription-auth bridge**, which lifts it into the request's `api_key` (§13), and it is **never logged** — a NEVER field in the audit gate. No other client header reaches a provider: `data["headers"]`, the bucket litellm sends upstream, is an allowlist projection and the allowlist is empty (§13, "Client headers upstream") |
+| Client headers and the developer's token | The developer's `Authorization: Bearer …` reaches a provider **only through a subscription-auth bridge**, which lifts it into the request's `api_key` (§13), and it is **never logged** — a NEVER field in the audit gate. No other client header reaches a provider except a bridge's own allowlist, by exact name and checked value format: `data["headers"]`, the bucket litellm sends upstream, is an allowlist projection and the allowlist is empty (§13, "Client headers upstream") |
 | `X-Corp-Auth` | The corp token is consumed in `pre_call` (`AuthMiddleware.strip_corp_token`), stripped from forwarded headers, and **never enters the audit pipeline** — NEVER field |
 
 Defense in depth: the no-leak guarantee is enforced at multiple independent
@@ -1599,7 +1599,8 @@ Two things come from litellm's database without an HTTP request through the gate
   before litellm routes it; the UI is REFUSE. What does not hold: nothing notices
   such a callback after the arm check, and it gets what any callback after ours
   gets — placeholders, counts, request metadata, and the provider key of 19b.
-  The DRI closed it on 2026-10-09 by dropping litellm's database (Mode B never
-  used it). Pinned by `tests/test_litellm_config_guards.py`
+  The DRI closed it on 2026-10-09 by dropping litellm's database: the
+  subscription setup never used it, and Mode A, its only user, went in 1.1.0.
+  Pinned by `tests/test_litellm_config_guards.py`
   (`test_compose_litellm_has_no_database_to_read_a_config_table_from`, the Helm
   twin, and the added-database rows) and `tests/test_desanitize_served_stack.py`.

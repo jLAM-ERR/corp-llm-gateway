@@ -89,8 +89,10 @@ also the binding control on where the developer's token goes:
   Codex URL, not an environment value, so no setting can point the token at
   another host.
 - **`corp`** has one `corp-*` route to the corp vLLM and no bridge. The
-  client's `Authorization` never reaches the vLLM: no client header goes
-  upstream on any provider (`../security.md` §13). Clients of this port still
+  client's `Authorization` never reaches the vLLM, and neither does any other
+  client header: only a subscription bridge carries client values upstream (the
+  token, plus its header allowlist by exact name and value format), and `corp`
+  has none (`../security.md` §13). Clients of this port still
   should not send a subscription token here; it has no use on a corp host.
 
 The corp vLLM oracle works on every provider: it is reached through the
@@ -110,9 +112,14 @@ litellm config of your own is refused at startup too (exit 78).
 
 > **Trap:** a blank `LITELLM_MASTER_KEY=` line **counts as set** — litellm keeps
 > the empty value and enables proxy auth for anything that is not `None`. Delete
-> the line entirely. On the demo stack the usual source is a leftover key in a
-> git-ignored `.env.demo` picked up via `env_file:`; on a production host it is a
-> 1.0 `compose/.env` that still has the line.
+> the line entirely. The production compose stack passes no `LITELLM_MASTER_KEY`
+> to a gateway (each gateway's environment is an explicit list, with no
+> `env_file:`), so a line in `compose/.env` never reaches one. When the refusal
+> fires anyway, the key comes from the gateway's config file
+> (`CORP_LLM_GATEWAY_CONFIG_FILE`, e.g. the issuance overlay's
+> `gateway/config.toml`), a custom image or an environment override (a Helm
+> value, a compose override file). On the demo stack it is usually a leftover key
+> in a git-ignored `.env.demo`, which that stack does pick up via `env_file:`.
 
 ### What you give up, and what to close
 

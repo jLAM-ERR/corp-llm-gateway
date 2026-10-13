@@ -34,7 +34,7 @@
 | Заголовок | Источник | Назначение |
 |---|---|---|
 | `X-Corp-Auth` | `~/.corp-llm-gateway/token` (ноутбук) | корп-идентичность / определение команды; **срезается** перед egress |
-| `Authorization: Bearer …` | подписочный токен Anthropic / OpenAI разработчика | переносится в upstream-вызов только мостом подписочной аутентификации; никакой другой заголовок клиента до провайдера не доходит |
+| `Authorization: Bearer …` | подписочный токен Anthropic / OpenAI разработчика | переносится в upstream-вызов только мостом подписочной аутентификации; из других заголовков клиента до провайдера доходит только allowlist моста (точные имена, проверяемые форматы значений) |
 
 ## Возможности
 
@@ -74,7 +74,7 @@ Guardrail — это *callback* LiteLLM, и LiteLLM вызывает его то
 ### Аутентификация и соответствие требованиям
 
 - **X-Corp-Auth + хранилище токенов на Postgres** — `AuthMiddleware` валидирует токены против `PostgresTokenStore` (asyncpg); верхняя граница распространения отзыва — 60 s
-- **Проброс подписки — production-режим**: мост подписочной аутентификации несёт собственный OAuth-токен Anthropic или ChatGPT разработчика как креденшел для upstream, а корпоративного `ANTHROPIC_API_KEY` не существует вовсе. Никакой другой заголовок клиента до провайдера не доходит, а ключи тела запроса, которые litellm превратил бы в заголовки или креденшел, удаляются ([`docs/security.ru.md`](docs/security.ru.md) §13). Режим корп-API-ключей (виртуальные ключи LiteLLM) удалён в 1.1.0 — [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md)
+- **Проброс подписки — production-режим**: мост подписочной аутентификации несёт собственный OAuth-токен Anthropic или ChatGPT разработчика как креденшел для upstream, а корпоративного `ANTHROPIC_API_KEY` не существует вовсе. Кроме allowlist заголовков моста (точные имена, проверяемые форматы значений), никакой заголовок клиента до провайдера не доходит, а ключи тела запроса, которые litellm превратил бы в заголовки или креденшел, удаляются ([`docs/security.ru.md`](docs/security.ru.md) §13). Режим корп-API-ключей (виртуальные ключи LiteLLM) удалён в 1.1.0 — [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md)
 - **RBAC `gateway:operator`** — команды admin CLI закрыты гейтом по JWT-claim `gateway:operator`; проверяется через PyJWT против ролей realm в Keycloak
 - **Конвейер аудита** — богатая схема `AuditEvent` (уровни полей ALWAYS / CONDITIONAL) + гейт NEVER-полей: логгер отклоняет записи, содержащие `mapping`, `original` или `credentials`
 - **SIEM-sink** — HTTP-sink Vector с унаследованным NEVER-гейтом + Helm-алерты (`AuditVectorDropHigh`, `LeakAttemptDetected`)

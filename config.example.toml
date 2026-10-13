@@ -68,7 +68,9 @@
 # CORP_LLM_STRIP_INBOUND_HEADERS = "1"  # strip inbound wire headers from litellm's header copies
 #   ON by default. It no longer decides what reaches a provider: since 1.1.0
 #   the guardrail writes data["headers"] (what litellm forwards) as an empty
-#   allowlist projection, so no client header goes upstream either way. The
+#   allowlist projection, so no client header goes upstream through it either
+#   way; only a subscription bridge carries the developer's token and its own
+#   header allowlist (exact names, checked formats; docs/security.md §13). The
 #   flag only drops the wire headers (Host, Content-Length, ...) from litellm's
 #   own copies. See docs/ops/configuration.md, "Header forwarding to upstream".
 # CORP_LLM_FORWARD_ANTHROPIC_AUTH = "0"  # opt-in Anthropic subscription (OAuth) forwarding

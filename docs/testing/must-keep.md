@@ -383,7 +383,7 @@ files) and every test a citation source (`CLAUDE.md`, `README.md`, `docs/*.md`,
 directory is not a source) cites — 47 distinct names in `docs/security.md`,
 `docs/security.ru.md`, `docs/ops/capacity{,.ru}.md` (bare `::name`, `file.py::name`, a
 served `name`, `{a,b}` expansions), 119 ids in all, plus 43 cited test paths (the compose
-READMEs cite paths only: `compose/README.md:883`, `compose/README.ru.md:906`,
+READMEs cite paths only: `compose/README.md:887`, `compose/README.ru.md:910`,
 `compose/nginx/README.md:19-20`).
 `CLAUDE.md`'s `tests/sanitizer/test_engine.py::test_name` is the allow-listed placeholder.
 Renaming or moving one updates the matrix and every citing site in the same PR. Only

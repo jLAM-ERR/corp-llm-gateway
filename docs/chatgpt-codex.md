@@ -5,11 +5,12 @@ API, and lets the gateway authenticate using the developer's live ChatGPT
 subscription OAuth instead of an OpenAI API key. No OpenAI API key is needed
 for this profile.
 
-Request flow:
+Request flow (the demo stack below listens on 4000; on the production compose
+stack the codex gateway is on 4001, see "In production"):
 
 ```text
 Codex (ChatGPT OAuth)
-  -> http://127.0.0.1:4000/v1/responses
+  -> http://127.0.0.1:4000/v1/responses   (production: 4001, GATEWAY_CODEX_PORT)
   -> corp-llm-gateway: policy + sanitization
   -> https://chatgpt.com/backend-api/codex/responses
   -> reverse substitution on the Responses/SSE response
@@ -46,9 +47,21 @@ demo profile unchanged.
 
 ## Install the Codex profile
 
+> **Against a production host, edit the copy first.**
+> `docker/chatgpt-codex/chatgpt-codex.config.toml` is the demo profile: it
+> hardcodes `base_url = "http://127.0.0.1:4000/v1"` and
+> `X-Corp-Auth = "demo-team-token"`. On the production compose stack port 4000
+> is `gateway-anthropic`; the codex gateway listens on `GATEWAY_CODEX_PORT`
+> (default 4001). Set `base_url` to `http://127.0.0.1:4001/v1` (through an SSH
+> tunnel to the server), or to the front door's origin + `/v1` when
+> `NGINX_GATEWAY_UPSTREAM=gateway-codex`, and put the developer's own corp
+> token in `X-Corp-Auth`. Pointed at 4000, Codex reaches the Anthropic gateway,
+> which has no route for its model.
+
 ```bash
 cp docker/chatgpt-codex/chatgpt-codex.config.toml \
   ~/.codex/chatgpt-codex.config.toml
+# production: edit base_url (port 4001) and X-Corp-Auth in the copy
 ```
 
 Run it:

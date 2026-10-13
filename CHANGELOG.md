@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.1.0]
 
-### Security — client headers no longer reach the provider (1.0.0 is affected)
+### Security — client headers no longer reach the provider unchecked (1.0.0 is affected; breaking)
 
 - **1.0.0 sent every inbound client header upstream, unsanitized, on every provider.**
   litellm sends `data["headers"]` to the provider, and the guardrail filled it with litellm's
@@ -29,7 +29,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   container suite pins the exact header set each provider receives.
 - **Request-body keys litellm turns into upstream headers or the upstream credential are
   removed** (`extra_headers`, `provider_specific_header`, `api_key`, `organization`), silently;
-  the request goes on. In 1.0.0 a client could put any header on every upstream call through
+  the request goes on. **Breaking** for a client that relied on one of those keys, or on a
+  custom header, reaching the provider: it gets no error, the value just does not arrive. In 1.0.0 a client could put any header on every upstream call through
   `extra_headers` or `provider_specific_header`, and a body `api_key` on the corp route became
   the upstream `Authorization` and stayed on the router for later requests from other callers.
 - **Bridge headers are forwarded by exact name and only with a value in the header's format**
@@ -39,13 +40,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from and are still forwarded as sent. Unknown request-body fields are not sanitized: an
   accepted risk, documented in `docs/security.md` §2.
 
-### Security — the litellm master key is refused; litellm has no database
+### Security — the litellm master key is refused (breaking); litellm has no database
 
 - **Any `LITELLM_MASTER_KEY` refuses to boot**, with or without a subscription
   bridge, a blank value included. `build_guardrail()` stops the startup (the
   served entrypoint exits 3) with a line starting `LITELLM_MASTER_KEY is set`,
   and `gateway-admin config check` reports it. 1.0.0 refused it only while a
-  bridge was on. `MASTER_KEY_VS_FORWARD_AUTH_MESSAGE` is renamed
+  bridge was on. **Breaking** for any deployment that still sets one: a Helm
+  value, a custom image or deployment, or a gateway config file. `MASTER_KEY_VS_FORWARD_AUTH_MESSAGE` is renamed
   `MASTER_KEY_REFUSED_MESSAGE`.
 - **A master key in litellm's own config is refused too:**
   `general_settings.master_key` and `environment_variables.LITELLM_MASTER_KEY`,
@@ -91,7 +93,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `gateway-*`; removes the container of a gateway or front door the `.env` no
   longer selects; runs `up -d --remove-orphans`, which removes 1.0's `litellm`
   container and frees `127.0.0.1:4000`. `down` also removes leftover gateway
-  containers. After the sync, `up` runs the boot-time unit's bare
+  and front-door containers. After the sync, `up` runs the boot-time unit's bare
   `docker compose config`: it refuses when that cannot resolve the stack (a 1.0
   `COMPOSE_FILE` naming `docker-compose.oauth.yml`) and warns when a reboot
   would start other gateways or front doors, or the same ones with another
@@ -101,7 +103,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Upgrade steps:** `docs/ops/upgrade.md`, "1.0 → 1.1.0". Edit the server's
   `.env` before the first 1.1 `deploy.sh up`.
 
-### Removed
+### Removed (breaking)
 
 - **Mode A** (litellm's master key and virtual keys): `LITELLM_MASTER_KEY`,
   `UI_USERNAME`, `UI_PASSWORD`, the gateway-held `ANTHROPIC_API_KEY` /
@@ -113,8 +115,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`compose/docker-compose.oauth.yml`** (its Anthropic bridge is the base
   file's `anthropic` provider) and **`compose/litellm/config.yaml`** (the
   API-key routes).
-- **`deploy.sh --mode`**: any value is refused before the script touches the
-  server, naming 1.1.0. `--issuance` is unchanged.
+- **`deploy.sh --mode`** (**breaking** for any script or runbook that passes
+  it): any value is refused before the script touches the server, naming 1.1.0.
+  `--issuance` is unchanged.
 
 ### Known limitations
 

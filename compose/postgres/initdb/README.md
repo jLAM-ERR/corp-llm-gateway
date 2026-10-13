@@ -24,10 +24,16 @@ cp ../src/corp_llm_gateway/tokens/schema.sql postgres/initdb/01-schema.sql
 
 Until 1.0.x, `00-create-litellm-db.sh` created a second database, `litellm`,
 for litellm's virtual keys and admin UI (Mode A). 1.1.0 removed Mode A and
-gives litellm no database at all, so the script is gone. On a volume created
-before 1.1.0 the `litellm` database is still there but nothing connects to it.
-It is inert; to drop it (the single quotes make the container's shell, not
-yours, expand the two variables):
+gives litellm no database at all, so the script is gone from the repo. The
+deploy sync never deletes a file, though: on a server deployed before 1.1.0 the
+old `00-create-litellm-db.sh` stays in this directory, and the next time the
+Postgres volume is created empty it runs and creates the `litellm` database
+again. Delete it on the server (`docs/ops/upgrade.md`, "1.0 → 1.1.0", step 3).
+
+On a volume created before 1.1.0 the `litellm` database is still there but
+nothing connects to it. It is inert; to drop it, from the deploy directory (the
+single quotes make the container's shell, not yours, expand the two
+variables):
 
 ```
 docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DROP DATABASE IF EXISTS litellm"'

@@ -50,8 +50,12 @@ turn the corp-LLM oracle and the corp NER service on and off. Short version:
   do not add a second route to `config.anthropic.yaml` or `config.codex.yaml`.
 - **Every client sends `X-Corp-Auth`** (the team identity, checked in
   `pre_call` against the `gateway` database, shared by all gateways). There is
-  no provider API key on the server and no litellm virtual key; no client header
-  reaches the provider ("Why not BYOK" below).
+  no provider API key on the server and no litellm virtual key. A client's
+  headers reach the provider only through a subscription bridge: its
+  `Authorization` token as the upstream credential, plus the bridge's short
+  header allowlist (exact names, checked value formats). Nothing else from the
+  client's headers goes upstream, and nothing at all on `corp` ("Why not BYOK"
+  below, `docs/security.md` §13).
 - **Mode A (API keys, litellm's master key and virtual keys) was removed in
   1.1.0.** Any `LITELLM_MASTER_KEY` refuses to boot (`docs/ops/configuration.md`,
   "Subscription-auth bridges"). Upgrading a 1.0 host: `docs/ops/upgrade.md`,
@@ -975,9 +979,10 @@ evict live mappings and return placeholder text to a developer.
 1.1.0 changed this stack: the `litellm` service became one gateway per
 provider, `docker-compose.oauth.yml` merged into the base file, Mode A and
 litellm's database are gone, and `GATEWAY_PORT` became one port per provider.
-Edit the server's `.env` **before** the first 1.1 `deploy.sh up`
-(`COMPOSE_PROFILES`, the 1.0 `COMPOSE_FILE` line, `GATEWAY_PORT`,
-`LITELLM_MASTER_KEY`). The steps, in order: `docs/ops/upgrade.md`,
+Edit the server's `.env` (`COMPOSE_PROFILES`, the 1.0 `COMPOSE_FILE` line,
+`GATEWAY_PORT`) and run the first 1.1 `deploy.sh up` back to back, in one
+maintenance window; then delete the four files 1.1 removed, which the sync
+leaves on the server. The steps, in order: `docs/ops/upgrade.md`,
 "1.0 → 1.1.0".
 
 ## Environment posture

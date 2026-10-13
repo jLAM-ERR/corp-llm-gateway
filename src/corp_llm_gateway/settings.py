@@ -605,8 +605,9 @@ def _check_forward_auth_exclusive(values: Mapping[str, str | None], problems: li
 
 
 # Shared with bootstrap.build_guardrail(): compose and hand-rolled boots never run
-# `validate()`, and their `env_file:` is a developer-owned file, so this has to be a
-# boot-time refusal rather than a documented convention.
+# `validate()`, and the key can arrive from a source the deployment does not own
+# (a config file, the image, an env override), so this has to be a boot-time
+# refusal rather than a documented convention.
 MASTER_KEY_REFUSED_MESSAGE = (
     "LITELLM_MASTER_KEY is set. litellm's proxy auth (Mode A: master key and virtual keys) "
     "was removed in 1.1.0; the gateway authenticates every client with X-Corp-Auth, so "
@@ -615,9 +616,10 @@ MASTER_KEY_REFUSED_MESSAGE = (
     "CORP_LLM_FORWARD_CHATGPT_AUTH), a master key also makes litellm read the inbound "
     "Authorization header as one of its own virtual keys and answer 401 before pre_call "
     "ever sees the developer's token. A blank value counts as set: litellm keeps the empty "
-    "string and enables proxy auth for anything that is not None. Remove the variable "
-    "entirely; a leftover line in a .env file that docker-compose passes in via `env_file:` "
-    "is the usual source"
+    "string and enables proxy auth for anything that is not None. Remove it entirely from "
+    "wherever it is set: the gateway's config file (CORP_LLM_GATEWAY_CONFIG_FILE, e.g. the "
+    "issuance overlay's gateway/config.toml), the container image, or an environment "
+    "override in the deployment (a Helm value, a compose override or env_file)"
 )
 
 

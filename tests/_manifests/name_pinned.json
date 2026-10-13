@@ -407,7 +407,7 @@
    "tests/litellm_hook/test_acceptance_matrix.py:57"
   ],
   "tests/test_litellm_config_guards.py::test_compose_litellm_has_no_database_to_read_a_config_table_from": [
-   "docs/security.md:1604",
+   "docs/security.md:1605",
    "tests/litellm_hook/test_acceptance_matrix.py:137"
   ],
   "tests/test_litellm_config_guards.py::test_helm_gateway_env_turns_no_litellm_debug_on": [
@@ -438,7 +438,7 @@
  },
  "paths": {
   "tests/_gates/fingerprint.py": [
-   "docs/ops/upgrade.md:290"
+   "docs/ops/upgrade.md:356"
   ],
   "tests/audit/test_guardrail_information_gate.py": [
    "docs/audit-schema.md:153",
@@ -446,8 +446,8 @@
   ],
   "tests/compose/test_nginx_allowlist_routes.py": [
    "CLAUDE.md:78",
-   "compose/README.md:883",
-   "compose/README.ru.md:906",
+   "compose/README.md:887",
+   "compose/README.ru.md:910",
    "compose/nginx/README.md:20",
    "docs/security.md:1294",
    "docs/security.ru.md:1277"
@@ -471,7 +471,7 @@
    "docs/security.ru.md:713"
   ],
   "tests/integration/test_anthropic_oauth_outbound.py": [
-   "docs/ops/upgrade.md:334",
+   "docs/ops/upgrade.md:400",
    "docs/security.md:734",
    "docs/security.ru.md:690"
   ],
@@ -498,8 +498,8 @@
   ],
   "tests/invariants/test_no_originals_leak.py": [
    "CLAUDE.md:284",
-   "docs/harness-integration.md:134",
-   "docs/harness-integration.ru.md:119",
+   "docs/harness-integration.md:140",
+   "docs/harness-integration.ru.md:125",
    "docs/ops/runbook.md:295",
    "docs/ops/runbook.ru.md:304",
    "docs/security.md:483",
@@ -562,7 +562,7 @@
    "docs/security.ru.md:1334"
   ],
   "tests/litellm_hook/test_litellm_route_assumptions.py": [
-   "docs/ops/upgrade.md:331",
+   "docs/ops/upgrade.md:397",
    "docs/security.md:693",
    "docs/security.md:778",
    "docs/security.ru.md:647",
@@ -670,7 +670,7 @@
   ],
   "tests/test_desanitize_served_stack.py": [
    "docs/security.md:486",
-   "docs/security.md:1605",
+   "docs/security.md:1606",
    "docs/security.ru.md:463",
    "docs/security.ru.md:1348"
   ],
@@ -688,15 +688,15 @@
    "docs/security.md:1371",
    "docs/security.md:1381",
    "docs/security.md:1383",
-   "docs/security.md:1603",
+   "docs/security.md:1604",
    "docs/security.ru.md:1336",
    "docs/security.ru.md:1346",
    "docs/security.ru.md:1348"
   ],
   "tests/test_litellm_pin.py": [
    "docs/extending.md:149",
-   "docs/ops/upgrade.md:287",
-   "docs/ops/upgrade.md:325"
+   "docs/ops/upgrade.md:353",
+   "docs/ops/upgrade.md:391"
   ]
  }
 }
