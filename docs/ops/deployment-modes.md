@@ -131,7 +131,7 @@ means clients cannot address corp models directly.
 treats the inbound `Authorization` header as one of its own virtual keys and
 answers 401 *before* `pre_call` ever runs, so the OAuth bearer would never reach
 the bridge. `build_guardrail()` therefore refuses to boot and names the cause
-(`settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE`) rather than serving 401s. The
+(`settings.MASTER_KEY_REFUSED_MESSAGE`) rather than serving 401s. The
 overlay deliberately does not neutralise a leftover key — an override would
 silence the mistake instead of reporting it.
 

@@ -251,7 +251,7 @@ def test_forward_auth_conflict_is_the_single_shared_rule() -> None:
     assert settings.forward_auth_conflict(chatgpt=False, anthropic=False) is None
 
 
-# ── validate(): a litellm master key cancels either bridge ───────────────────
+# ── validate(): any litellm master key is refused (Mode A removed in 1.1.0) ────
 
 
 def test_validate_rejects_a_master_key_next_to_the_anthropic_bridge(
@@ -264,9 +264,9 @@ def test_validate_rejects_a_master_key_next_to_the_anthropic_bridge(
     with pytest.raises(ConfigError) as exc:
         config.validate()
 
-    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc.value.problems
+    assert settings.MASTER_KEY_REFUSED_MESSAGE in exc.value.problems
     # the message must name the symptom (a 401 before pre_call), not just the rule.
-    assert "401" in settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE
+    assert "401" in settings.MASTER_KEY_REFUSED_MESSAGE
     # and must never echo the key it rejects.
     assert "master-key-fixture" not in str(exc.value)
 
@@ -297,7 +297,7 @@ def test_validate_rejects_a_blank_master_key_next_to_a_bridge(
     with pytest.raises(ConfigError) as exc:
         config.validate()
 
-    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc.value.problems
+    assert settings.MASTER_KEY_REFUSED_MESSAGE in exc.value.problems
 
 
 def test_validate_accepts_an_absent_master_key_next_to_a_bridge(
@@ -309,22 +309,27 @@ def test_validate_accepts_an_absent_master_key_next_to_a_bridge(
     assert isinstance(config.validate(), Settings)
 
 
-@pytest.mark.parametrize("master_key", ["", "   "])
-def test_validate_allows_a_blank_master_key_when_no_bridge_is_on(
+@pytest.mark.parametrize("master_key", ["master-key-fixture", "", "   "])
+def test_validate_rejects_a_master_key_when_no_bridge_is_on(
     hermetic: Path, monkeypatch: pytest.MonkeyPatch, master_key: str
 ) -> None:
+    # The corp provider runs with no bridge; a master key there would turn on
+    # litellm's virtual-key auth, which 1.1.0 no longer ships.
     monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
     monkeypatch.setenv("LITELLM_MASTER_KEY", master_key)
 
-    assert isinstance(config.validate(), Settings)
+    with pytest.raises(ConfigError) as exc:
+        config.validate()
+
+    assert exc.value.problems == [settings.MASTER_KEY_REFUSED_MESSAGE]
+    assert "1.1.0" in settings.MASTER_KEY_REFUSED_MESSAGE
+    assert "master-key-fixture" not in str(exc.value)
 
 
-def test_validate_allows_a_master_key_when_no_bridge_is_on(
+def test_validate_accepts_an_absent_master_key_when_no_bridge_is_on(
     hermetic: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A plain litellm deploy with virtual keys and no subscription bridge is fine.
     monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
-    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
 
     assert isinstance(config.validate(), Settings)
 
@@ -335,14 +340,12 @@ def test_master_key_is_registered_as_a_secret_so_config_check_redacts_it() -> No
 
 
 def test_master_key_conflict_is_the_single_shared_rule() -> None:
-    message = settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE
-    assert settings.master_key_conflict(master_key="k", chatgpt=True, anthropic=False) == message
-    assert settings.master_key_conflict(master_key="k", chatgpt=False, anthropic=True) == message
-    assert settings.master_key_conflict(master_key="k", chatgpt=False, anthropic=False) is None
-    assert settings.master_key_conflict(master_key=None, chatgpt=False, anthropic=True) is None
+    message = settings.MASTER_KEY_REFUSED_MESSAGE
+    assert settings.master_key_conflict(master_key="k") == message
+    assert settings.master_key_conflict(master_key=None) is None
     # Set-but-blank is set: litellm enables proxy auth for any non-None value.
-    assert settings.master_key_conflict(master_key="", chatgpt=False, anthropic=True) == message
-    assert settings.master_key_conflict(master_key="   ", chatgpt=False, anthropic=True) == message
+    assert settings.master_key_conflict(master_key="") == message
+    assert settings.master_key_conflict(master_key="   ") == message
 
 
 # ── validate(): malformed choices ────────────────────────────────────────────

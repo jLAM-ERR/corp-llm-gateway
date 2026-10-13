@@ -124,13 +124,13 @@ KEYS: tuple[Key, ...] = (
     ),
     # Not a gateway knob — litellm's own virtual-key switch. Registered so it
     # resolves through the config chain (never a bare os.environ read) and so
-    # `config check` can refuse it alongside a forward-auth bridge.
+    # `config check` and the boot can refuse it.
     # No default: `None` has to mean "absent", because litellm reads a blank
     # assignment as a set-and-empty master key, not as an unset one.
     Key(
         "LITELLM_MASTER_KEY",
         secret=True,
-        help="litellm virtual-key master key; must be unset while a forward-auth bridge is on",
+        help="litellm virtual-key master key; refused when set (Mode A removed in 1.1.0)",
     ),
     # Choices validated by normalize_oversize_policy (see _check_oversize), not
     # the generic choice check, so the canonical error message is used once.
@@ -604,45 +604,35 @@ def _check_forward_auth_exclusive(values: Mapping[str, str | None], problems: li
         problems.append(conflict)
 
 
-# Shared with bootstrap.build_guardrail(); the compose stacks the bridges ship on
-# never run `validate()`, and their `env_file:` is a developer-owned file, so this
-# has to be a boot-time refusal rather than a documented convention.
-MASTER_KEY_VS_FORWARD_AUTH_MESSAGE = (
-    "LITELLM_MASTER_KEY is set while a subscription-auth bridge is on "
-    "(CORP_LLM_FORWARD_ANTHROPIC_AUTH / CORP_LLM_FORWARD_CHATGPT_AUTH). A master key makes "
-    "litellm read the inbound Authorization header as one of its own virtual keys and answer "
-    "401 before pre_call ever sees the developer's OAuth bearer, so the bridge can never run. "
-    "A blank `LITELLM_MASTER_KEY=` counts as set: litellm keeps the empty value and enables "
-    "proxy auth for anything that is not None. Remove the line entirely — a leftover "
-    "LITELLM_MASTER_KEY in the local .env.demo that docker-compose passes in via `env_file:` "
-    "is the usual source — or turn the bridge off"
+# Shared with bootstrap.build_guardrail(): compose and hand-rolled boots never run
+# `validate()`, and their `env_file:` is a developer-owned file, so this has to be a
+# boot-time refusal rather than a documented convention.
+MASTER_KEY_REFUSED_MESSAGE = (
+    "LITELLM_MASTER_KEY is set. Mode A (litellm master key and virtual keys) was removed in "
+    "1.1.0: the gateway serves subscription mode only, so litellm must run without proxy "
+    "auth. With a subscription-auth bridge on (CORP_LLM_FORWARD_ANTHROPIC_AUTH / "
+    "CORP_LLM_FORWARD_CHATGPT_AUTH), a master key also makes litellm read the inbound "
+    "Authorization header as one of its own virtual keys and answer 401 before pre_call "
+    "ever sees the developer's token. A blank value counts as set: litellm keeps the empty "
+    "string and enables proxy auth for anything that is not None. Remove the variable "
+    "entirely; a leftover line in a .env file that docker-compose passes in via `env_file:` "
+    "is the usual source"
 )
 
 
-def master_key_conflict(*, master_key: str | None, chatgpt: bool, anthropic: bool) -> str | None:
-    """The one place the master-key-vs-bridge rule is expressed.
-
-    Takes an already-resolved master key and already-parsed bridge flags so
-    `build_guardrail()` can apply it to values that came from explicit kwargs.
-    A master key on its own is legitimate (a plain BYOK-less litellm deploy uses
-    one); only the combination is unserviceable.
+def master_key_conflict(*, master_key: str | None) -> str | None:
+    """The one place the master-key rule is expressed: any master key is refused.
 
     PRESENT, not truthy: litellm's `get_secret_str` hands `''` and `'   '` back
     unchanged and its proxy auth is skipped only for `master_key is None`, so a
-    bare `LITELLM_MASTER_KEY=` still consumes the developer's bearer and 401s
-    before pre_call. Anything other than absent is a conflict.
+    bare `LITELLM_MASTER_KEY=` still turns proxy auth on. Anything other than
+    absent is refused.
     """
-    if not (chatgpt or anthropic):
-        return None
-    return MASTER_KEY_VS_FORWARD_AUTH_MESSAGE if master_key is not None else None
+    return MASTER_KEY_REFUSED_MESSAGE if master_key is not None else None
 
 
 def _check_master_key_conflict(values: Mapping[str, str | None], problems: list[str]) -> None:
-    conflict = master_key_conflict(
-        master_key=values.get("LITELLM_MASTER_KEY"),
-        chatgpt=_as_flag(values.get("CORP_LLM_FORWARD_CHATGPT_AUTH")),
-        anthropic=_as_flag(values.get("CORP_LLM_FORWARD_ANTHROPIC_AUTH")),
-    )
+    conflict = master_key_conflict(master_key=values.get("LITELLM_MASTER_KEY"))
     if conflict is not None:
         problems.append(conflict)
 

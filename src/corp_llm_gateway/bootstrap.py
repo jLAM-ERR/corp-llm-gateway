@@ -629,11 +629,7 @@ def build_guardrail(
     )
     if conflict is not None:
         raise ConfigError([conflict])
-    master_key_problem = master_key_conflict(
-        master_key=config.get("LITELLM_MASTER_KEY"),
-        chatgpt=resolved_forward_chatgpt_auth,
-        anthropic=resolved_forward_anthropic_auth,
-    )
+    master_key_problem = master_key_conflict(master_key=config.get("LITELLM_MASTER_KEY"))
     if master_key_problem is not None:
         raise ConfigError([master_key_problem])
     _warn_on_disarmed_forward_auth_conflict(

@@ -642,7 +642,7 @@ confirm() {
 # LITELLM_MASTER_KEY line is deliberately NOT pre-checked here: this script never
 # reads the server's .env, not even to test whether a key is present. The stack already refuses
 # that combination at boot with a named cause
-# (settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE), and wait_for_healthcheck below
+# (settings.MASTER_KEY_REFUSED_MESSAGE), and wait_for_healthcheck below
 # surfaces it as a failed deploy. See docs/ops/deployment-modes.md.
 # Runs after the sync, so it checks the compose files `up` is about to start.
 # `config --services` prints service names only, never a value, so the

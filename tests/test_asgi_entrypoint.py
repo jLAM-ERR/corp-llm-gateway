@@ -1716,6 +1716,28 @@ def test_a_clean_boot_arms_and_config_check_raises_no_debug_problem(valid_config
     assert not [p for p in result["config_check"] if p.startswith("litellm_")]
 
 
+@pytest.mark.parametrize(
+    ("master_key", "env"),
+    [
+        ("master-key-fixture", {}),
+        ("", {}),
+        ("master-key-fixture", {"CORP_LLM_FORWARD_ANTHROPIC_AUTH": "1"}),
+    ],
+    ids=["no-bridge", "no-bridge-blank", "anthropic-bridge"],
+)
+def test_the_served_entrypoint_refuses_to_boot_with_a_master_key(
+    valid_config: Path, master_key: str, env: dict[str, str]
+) -> None:
+    # build_guardrail() raises inside litellm's startup, so uvicorn never serves.
+    completed = _serve(valid_config, {"LITELLM_MASTER_KEY": master_key, **env})
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert "LITELLM_MASTER_KEY is set" in output
+    assert "1.1.0" in output
+    assert "master-key-fixture" not in output
+
+
 def test_the_test_only_key_lets_litellm_debug_arm_outside_prod(valid_config: Path) -> None:
     env = {"LITELLM_LOG": "DEBUG", "CORP_LLM_ALLOW_LITELLM_DEBUG": "1"}
 
