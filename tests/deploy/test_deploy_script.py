@@ -120,6 +120,7 @@ def _stub_bin(tmp_path: Path, *, ssh_mode: str = "exec") -> Path:
         "hash=0\n"
         'for a in "$@"; do [ "$a" = "-f" ] && bare=0; [ "$a" = "--hash" ] && hash=1; done\n'
         'for a in "$@"; do\n'
+        '    if [ "$a" = "pull" ] && [ -n "${FAKE_PULL_FAIL:-}" ]; then exit 1; fi\n'
         '    if [ "$a" = "ps" ]; then printf \'%s\\n\' "${FAKE_PS_JSON:-[]}"; exit 0; fi\n'
         '    if [ "$a" = "config" ] && [ "$bare" = 1 ]; then\n'
         '        [ -z "${FAKE_BARE_CONFIG_FAIL:-}" ] || exit 1\n'
@@ -366,9 +367,12 @@ def test_healthcheck_polling_mirrors_demo_sh(script_text: str) -> None:
 
 
 def test_pull_gates_the_up(script_text: str) -> None:
-    assert re.search(r"pull\s*&&\s*docker compose[^\n]*up -d", script_text), (
+    body = _function_body(script_text, "cmd_up")
+    assert re.search(r"compose_remote pull \\\n\s*\|\| fatal ", body), (
         "a failed pull must abort before `up -d`"
     )
+    pull_at = body.index("compose_remote pull")
+    assert pull_at < body.index("remove_left_behind") < body.index("compose_remote up -d")
 
 
 # --------------------------------------------------------------------------- #
@@ -1416,7 +1420,7 @@ def test_up_removes_the_front_door_the_env_no_longer_selects(tmp_path: Path) -> 
     removals = [line for line in lines if line.startswith("rm ")]
     assert removals == ["rm -f corp-llm-gateway-nginx-ports-1"]
     removed_at = _index(lines, "rm -f corp-llm-gateway-nginx-ports-1")
-    assert removed_at < _index(lines, f"compose {BASE_FILES} pull")
+    assert _index(lines, f"compose {BASE_FILES} pull") < removed_at
     assert removed_at < _index(lines, f"compose {BASE_FILES} up -d")
     assert "corp-llm-gateway-nginx-ports-1" in result.stderr  # type: ignore[attr-defined]
 
@@ -1437,7 +1441,8 @@ def test_up_without_a_profile_removes_a_leftover_nginx(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
     lines = _docker_lines(tmp_path)
     assert [line for line in lines if line.startswith("rm ")] == ["rm -f corp-llm-gateway-nginx-1"]
-    assert _index(lines, "rm -f") < _index(lines, f"compose {BASE_FILES} pull")
+    assert _index(lines, f"compose {BASE_FILES} pull") < _index(lines, "rm -f")
+    assert _index(lines, "rm -f") < _index(lines, f"compose {BASE_FILES} up -d")
 
 
 @pytest.mark.parametrize("front_door", ["nginx", "nginx-ports"])
@@ -1825,7 +1830,8 @@ def test_up_removes_the_gateway_of_a_provider_the_env_no_longer_selects(tmp_path
     lines = _docker_lines(tmp_path)
     assert _removals(tmp_path) == ["rm -f corp-llm-gateway-gateway-codex-1"]
     removed_at = _index(lines, "rm -f corp-llm-gateway-gateway-codex-1")
-    assert removed_at < _index(lines, f"compose {BASE_FILES} pull")
+    assert _index(lines, f"compose {BASE_FILES} pull") < removed_at
+    assert removed_at < _index(lines, f"compose {BASE_FILES} up -d")
     assert "corp-llm-gateway-gateway-codex-1" in result.stderr  # type: ignore[attr-defined]
 
 
@@ -1893,7 +1899,7 @@ def test_up_removes_orphans_in_the_same_gated_up(script_text: str, tmp_path: Pat
     # The 1.0 `litellm` container is an orphan that still holds 127.0.0.1:4000,
     # gateway-anthropic's port: without --remove-orphans the upgrade `up` fails.
     assert re.search(
-        r"pull \\\n&& docker compose \$\{COMPOSE_FILE_ARGS\} up -d --remove-orphans\"", script_text
+        r"^\s*compose_remote up -d --remove-orphans$", _function_body(script_text, "cmd_up"), re.M
     )
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
@@ -1902,6 +1908,57 @@ def test_up_removes_orphans_in_the_same_gated_up(script_text: str, tmp_path: Pat
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
     assert f"compose {BASE_FILES} up -d --remove-orphans" in _log(tmp_path, "docker.log")
+
+
+# The dropped provider's gateway and the front door the env no longer selects:
+# both still serve until this deploy removes them.
+STALE_PS = [*HEALTHY_PS, _gateway_row("gateway-codex"), _front_door_row("nginx-ports")]
+STALE_SERVICES = "gateway-anthropic\nnginx\npostgres"
+
+
+def test_a_failed_pull_removes_nothing_and_starts_nothing(tmp_path: Path) -> None:
+    # A registry, auth or network failure must leave the host serving what it served.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=STALE_PS,
+        env_extra={"FAKE_SERVICES": STALE_SERVICES, "FAKE_PULL_FAIL": "1"},
+    )
+
+    assert result.returncode == 1, result.stderr  # type: ignore[attr-defined]
+    assert "pull failed" in result.stderr  # type: ignore[attr-defined]
+    assert f"compose {BASE_FILES} pull" in _log(tmp_path, "docker.log")
+    assert not _removals(tmp_path), "a failed pull must leave the serving containers"
+    assert "up -d" not in _log(tmp_path, "docker.log")
+    assert not (remote / ".deploy.lock").exists()
+
+
+def test_up_pulls_then_removes_the_stale_containers_then_starts(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=STALE_PS,
+        env_extra={"FAKE_SERVICES": STALE_SERVICES},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    lines = _docker_lines(tmp_path)
+    removals = _removals(tmp_path)
+    assert sorted(removals) == [
+        "rm -f corp-llm-gateway-gateway-codex-1",
+        "rm -f corp-llm-gateway-nginx-ports-1",
+    ]
+    pull_at = _index(lines, f"compose {BASE_FILES} pull")
+    up_at = _index(lines, f"compose {BASE_FILES} up -d --remove-orphans")
+    assert all(pull_at < lines.index(removal) < up_at for removal in removals)
 
 
 def test_a_finished_profile_guard_is_done(tmp_path: Path) -> None:

@@ -15,10 +15,10 @@
 #      server's copy. Local key material and the dev-only build overlay are
 #      excluded for the same reason, and so is gateway/config.toml: the
 #      server owns it, a laptop copy must never overwrite it.
-#   3. Over SSH: refuses a stack with no provider, removes the gateway and
-#      front-door containers the server's .env no longer selects, runs
-#      docker compose pull && docker compose up -d --remove-orphans, then polls
-#      the compose healthchecks and prints a status summary.
+#   3. Over SSH: refuses a stack with no provider, runs docker compose pull,
+#      only then removes the gateway and front-door containers the server's
+#      .env no longer selects and runs docker compose up -d --remove-orphans,
+#      then polls the compose healthchecks and prints a status summary.
 #
 # A remote lock directory serializes state-changing runs, so two operators
 # deploying at once get a clean refusal instead of an interleaved deploy.
@@ -59,6 +59,8 @@ GATEWAY_PREFIX="gateway-"
 # with a leading space; set by resolve_enabled_services.
 ENABLED_FRONT_DOORS=""
 ENABLED_GATEWAYS=""
+# "<service><FIELD_SEP><container>" entries; set by find_left_behind.
+STALE_CONTAINERS=()
 # Every refusal after the sync: the server already holds the new compose files.
 SYNCED_NOTHING_ELSE="compose/ was synced; nothing was pulled, started or removed."
 # Container names come back from the server and go into a remote `docker rm`.
@@ -725,11 +727,14 @@ check_the_reboot_path() {
 # Compose profiles only filter what `up` starts, and --remove-orphans spares a
 # service whose profile is off: a gateway or front-door container an earlier
 # profile created keeps running, and keeps its port. `ps --all` still lists it,
-# so it is removed by name. $1 is the services to keep. Every name is checked
-# before the first one is removed. A service gone from the compose files (1.0's
-# `litellm`) is an orphan: `up --remove-orphans` removes that one.
-remove_left_behind() {
-    local keep=" $1 " states service name stale=()
+# so it is removed by name. find_left_behind lists them into STALE_CONTAINERS
+# ($1 is the services to keep) and checks every name; remove_left_behind removes
+# that list, so a refusal comes before anything is pulled or removed. A service
+# gone from the compose files (1.0's `litellm`) is an orphan: `up
+# --remove-orphans` removes that one.
+find_left_behind() {
+    local keep=" $1 " states service name
+    STALE_CONTAINERS=()
     states="$(service_states)" \
         || fatal "could not list the containers in ${HOST}:${REMOTE_DIR} (the error is above)."
     while IFS="$FIELD_SEP" read -r service _ _ _ name; do
@@ -739,11 +744,13 @@ remove_left_behind() {
         [[ "$name" =~ $CONTAINER_NAME_RE ]] \
             || fatal "refusing to remove the ${service} container: its container name has
        characters outside letters, digits and . _ - (got: ${name}). Nothing was removed."
-        stale+=("${service}${FIELD_SEP}${name}")
+        STALE_CONTAINERS+=("${service}${FIELD_SEP}${name}")
     done <<< "$states"
+}
 
-    local entry kind
-    for entry in ${stale+"${stale[@]}"}; do
+remove_left_behind() {
+    local entry service name kind
+    for entry in ${STALE_CONTAINERS+"${STALE_CONTAINERS[@]}"}; do
         service="${entry%%"${FIELD_SEP}"*}"
         name="${entry#*"${FIELD_SEP}"}"
         kind="front-door"
@@ -765,9 +772,13 @@ cmd_up() {
     fi
     resolve_enabled_services
     check_the_reboot_path
-    remove_left_behind "${ENABLED_GATEWAYS} ${ENABLED_FRONT_DOORS}"
-    ssh_run "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} pull \
-&& docker compose ${COMPOSE_FILE_ARGS} up -d --remove-orphans"
+    find_left_behind "${ENABLED_GATEWAYS} ${ENABLED_FRONT_DOORS}"
+    # A failed pull must leave the containers that serve now in place.
+    compose_remote pull \
+        || fatal "docker compose pull failed on ${HOST} (its error is above). Nothing was
+       removed or started: the stack serves what it served before this run."
+    remove_left_behind
+    compose_remote up -d --remove-orphans
     wait_for_healthcheck
     print_status
     info "deployed to ${HOST}:${REMOTE_DIR}"
@@ -784,7 +795,8 @@ cmd_down() {
         return 0
     fi
     # `down` leaves the containers of services outside the active profiles.
-    remove_left_behind ""
+    find_left_behind ""
+    remove_left_behind
     info "stopped ${HOST}:${REMOTE_DIR} (volumes kept)"
 }
 
