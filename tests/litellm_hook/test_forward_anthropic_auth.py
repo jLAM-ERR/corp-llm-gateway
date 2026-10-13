@@ -215,9 +215,11 @@ async def test_non_anthropic_route_never_receives_the_oauth_token(model: str) ->
     """The gate keeps the subscription token off another provider's upstream call.
 
     Scoped to ``api_key`` + ``extra_headers`` on purpose: the inbound
-    ``Authorization`` header itself is deliberately preserved in every header
-    bucket (invariant 3, pinned by tests/invariants/test_no_originals_leak.py),
-    so a blanket "token absent from data" assertion would contradict it.
+    ``Authorization`` header itself stays in litellm's own header copies, where
+    the bridges read it (pinned by tests/invariants/test_no_originals_leak.py), so
+    a blanket "token absent from data" assertion would contradict it. An
+    ``api_key`` in the request at pre-call time is the client's, so it goes too;
+    the deployment's own key is merged in later by litellm's router.
     """
     g, _ = _build_guardrail(forward_anthropic_auth=True, metrics=_RecordingMetrics())
     data = _request(model=model)
@@ -225,6 +227,6 @@ async def test_non_anthropic_route_never_receives_the_oauth_token(model: str) ->
 
     out = await g.pre_call(data)
 
-    assert out["api_key"] == "deployment-key"
+    assert "api_key" not in out
     extra_headers: dict[str, str] = out.get("extra_headers") or {}
     assert _OAUTH_TOKEN not in extra_headers.values()

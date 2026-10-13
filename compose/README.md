@@ -3,44 +3,65 @@
 A production deploy target for non-k8s hosts, alongside `helm/corp-llm-gateway/`
 (the k8s target). Russian mirror: `README.ru.md`. This directory ships:
 
-- the **data plane** — `litellm` (the guardrail-fronted proxy) + `redis`
-  (Cache B, the per-conversation mapping store) + `postgres` (the
-  token/team-config store, plus litellm's own virtual-key/UI database);
+- the **data plane** — one gateway per provider (`gateway-anthropic`,
+  `gateway-codex`, `gateway-corp`, each the guardrail-fronted litellm proxy,
+  switched on by its compose profile) + `redis` (Cache B, the
+  per-conversation mapping store) + `postgres` (the token/team-config store;
+  litellm has no database of its own) + `profile-guard` (a one-shot that
+  refuses a stack with no provider);
 - **self-hosted Langfuse v3** — `langfuse-web`, `langfuse-worker`,
   `langfuse-postgres`, `clickhouse`, `minio`, `minio-init` and
   `langfuse-redis`, publishing no host port (see "Langfuse" below);
-- the **audit pipeline** — `vector`, which tails the gateway's stdout and
+- the **audit pipeline** — `vector`, which tails the gateways' stdout and
   forwards audit records to Langfuse (see "Audit pipeline" below);
 - the optional **HTTPS front door** — `nginx` or `nginx-ports`, an nginx that
-  publishes the gateway and Langfuse over HTTPS. Off unless the server's `.env`
-  sets `COMPOSE_PROFILES` (see "HTTPS front door (nginx)" below).
+  publishes one gateway and Langfuse over HTTPS. Off unless the server's `.env`
+  names it in `COMPOSE_PROFILES` (see "HTTPS front door (nginx)" below).
 
-## Which mode am I deploying?
+## Providers
 
 Read `docs/ops/deployment-modes.md` (RU: `deployment-modes.ru.md`) first. It
-covers the two **mutually exclusive** auth modes — API keys vs subscription/OAuth
-— and exactly how to turn the corp-LLM oracle and the corp NER service on and
-off. Both run **this** stack. Short version:
+covers the providers, how developers authenticate on each, and exactly how to
+turn the corp-LLM oracle and the corp NER service on and off. Short version:
 
-- **Subscription mode — the production mode.** `docker compose -f
-  docker-compose.yml -f docker-compose.oauth.yml up -d`. Requires that no
-  `LITELLM_MASTER_KEY` exist at all, serves `claude-*` only, and forwards the
-  developer's own Anthropic subscription token upstream. `scripts/deploy/deploy.sh`
-  deploys this mode by default. Developers get their `X-Corp-Auth` token from
-  `scripts/install.sh` (Keycloak login → `POST /internal/issue-token`) once
-  issuance is on: add the `docker-compose.issuance.yml` overlay (see "Developer
-  token issuance" below). `gateway-admin token issue` stays as break-glass.
-- **API-key mode (the compose default) — a test posture only.** `docker compose
-  up -d`. `LITELLM_MASTER_KEY` is required and requests carry a LiteLLM virtual
-  key, but there is **no way to issue one**: the route gate refuses `/key/*`, the
-  admin UI and the rest of litellm's management surface
-  (`docs/security.md` §14). The master key exists for the container tests
-  (`tests/integration/test_route_gate_container.py`), which seed a key straight
-  into litellm's database. Do not deploy this mode for developers. Everything
-  below about virtual keys describes this test posture; the rest of this file
-  (audit, NER, oracle, Vector, volumes, TLS) is identical in both.
-  The root-level `docker-compose.anthropic-oauth.yml` is a **demo-only** variant
-  of the same idea over `docker-compose.demo.yml` — not a deployment target.
+| Profile | Service | Serves | Upstream credential | Port on `127.0.0.1` |
+|---|---|---|---|---|
+| `anthropic` | `gateway-anthropic` | Claude Code on an Anthropic subscription: `claude-*` → `anthropic/` (`litellm/config.anthropic.yaml`) | the developer's `sk-ant-oat…` token (`CORP_LLM_FORWARD_ANTHROPIC_AUTH=1`) | `GATEWAY_ANTHROPIC_PORT`, 4000 |
+| `codex` | `gateway-codex` | Codex on a ChatGPT subscription: `"*"` → `openai/` at the literal `https://chatgpt.com/backend-api/codex` (`litellm/config.codex.yaml`) | the developer's ChatGPT token (`CORP_LLM_FORWARD_CHATGPT_AUTH=1`) | `GATEWAY_CODEX_PORT`, 4001 |
+| `corp` | `gateway-corp` | the corp vLLM: `corp-*` → `hosted_vllm/` at `CORP_LLM_ENDPOINT` (`litellm/config.corp.yaml`) | the route's own `CORP_LLM_AUTH_TOKEN`; no bridge | `GATEWAY_CORP_PORT`, 4002 |
+
+- **`COMPOSE_PROFILES` in `.env` is the only switch.** At least one provider,
+  comma-separated, plus at most one front door: `COMPOSE_PROFILES=anthropic`,
+  `COMPOSE_PROFILES=anthropic,codex,nginx`. `.env.example` ships it commented on
+  purpose. `deploy.sh` never sets it, and the boot-time unit runs a bare
+  `docker compose up -d` that reads the same file, so a deploy and a reboot start
+  the same services. `--profile` on the command line is not supported.
+- **`profile-guard` refuses a stack with no provider.** It is a one-shot on the
+  gateway image, not profiled, and `postgres` waits for it to succeed. When
+  `COMPOSE_PROFILES` holds no exact provider token (tokens are trimmed the way
+  compose trims them; `corporate` is not `corp`), it prints a message naming the
+  key and exits 64, so `up` fails instead of starting a stack that serves
+  nothing. A front-door profile alone fails the same way.
+- **One container per provider** because the two subscription bridges read the
+  same inbound bearer and cannot share a process
+  (`settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE`). All three share one definition
+  (a YAML anchor) and differ only in profile, litellm config, bridge flag and
+  port. Each config is the binding control on where a developer's token goes:
+  do not add a second route to `config.anthropic.yaml` or `config.codex.yaml`.
+- **Every client sends `X-Corp-Auth`** (the team identity, checked in
+  `pre_call` against the `gateway` database, shared by all gateways). There is
+  no provider API key on the server and no litellm virtual key. A client's
+  headers reach the provider only through a subscription bridge: its
+  `Authorization` token as the upstream credential, plus the bridge's short
+  header allowlist (exact names, checked value formats). Nothing else from the
+  client's headers goes upstream, and nothing at all on `corp` ("Why not BYOK"
+  below, `docs/security.md` §13).
+- **Mode A (API keys, litellm's master key and virtual keys) was removed in
+  1.1.0.** Any `LITELLM_MASTER_KEY` refuses to boot (`docs/ops/configuration.md`,
+  "Subscription-auth bridges"). Upgrading a 1.0 host: `docs/ops/upgrade.md`,
+  "1.0 → 1.1.0".
+- The root-level `docker-compose.anthropic-oauth.yml` is a **demo-only** variant
+  over `docker-compose.demo.yml` — not a deployment target.
 - **Oracle:** `CORP_LLM_ORACLE_ENABLED` (default `0`), needs `CORP_LLM_ENDPOINT`
   when `1`. **Corp NER:** `CORP_NER_ENABLED` (default `0`), needs
   `CORP_NER_ENDPOINT` when `1`.
@@ -51,9 +72,8 @@ off. Both run **this** stack. Short version:
 cd compose
 cp .env.example .env
 chmod 0600 .env
-# edit .env: GATEWAY_IMAGE_TAG, POSTGRES_PASSWORD, LITELLM_MASTER_KEY,
-# UI_USERNAME, UI_PASSWORD, whichever of ANTHROPIC_API_KEY/OPENAI_API_KEY
-# match the routes you actually use (neither, if only corp-*),
+# edit .env: COMPOSE_PROFILES (at least one of anthropic, codex, corp),
+# GATEWAY_IMAGE_TAG, POSTGRES_PASSWORD, CORP_LLM_ENDPOINT (for corp),
 # the Langfuse secrets (LANGFUSE_POSTGRES_PASSWORD,
 # LANGFUSE_CLICKHOUSE_PASSWORD, MINIO_ROOT_PASSWORD, LANGFUSE_NEXTAUTH_SECRET,
 # LANGFUSE_SALT, LANGFUSE_ENCRYPTION_KEY) and the Langfuse PROJECT API keys the
@@ -64,12 +84,12 @@ docker compose up -d
 docker compose ps                              # wait ~30-60s (start_period) for "healthy";
                                                # langfuse-web/worker take ~2 min on a fresh
                                                # volume while migrations run
-curl http://localhost:4000/health/liveliness
+curl http://localhost:4000/healthz/live        # gateway-anthropic; 4001 codex, 4002 corp
 ```
 
 Skipping the `01-schema.sql` staging step is a silent trap, not an obvious
 failure: `docker compose ps` reports everything healthy and
-`/health/liveliness` answers, but every real request 500s because
+`/healthz/live` answers, but every real request 500s because
 `corp_tokens`/`team_config` don't exist. See
 `compose/postgres/initdb/README.md` for what each init script does and how
 to re-stage after an upgrade.
@@ -77,13 +97,8 @@ to re-stage after an upgrade.
 `GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, `CORP_LANGFUSE_PUBLIC_KEY` and
 `CORP_LANGFUSE_SECRET_KEY` have no default — `docker compose up` refuses to
 start with a clear "set X in .env" error rather than silently booting
-half-configured.
-
-`LITELLM_MASTER_KEY`, `UI_USERNAME` and `UI_PASSWORD` are required too, but the
-check lives in the litellm entrypoint rather than in compose interpolation,
-because it has to be **mode-aware**: subscription mode needs all three absent.
-Missing them in API-key mode is still a boot refusal naming the variable — it
-just happens a second later, when the container starts.
+half-configured. `COMPOSE_PROFILES` without a provider is refused by
+`profile-guard` (above).
 
 ## Building from this branch
 
@@ -109,98 +124,66 @@ work before this stack is production-ready — treat that as a release gate.
 
 ## Upstream routing
 
-`litellm/config.yaml` routes by model-name prefix: `claude-*` → native
-`anthropic/`, `gpt-*` → native `openai/`, `corp-*` → `hosted_vllm/` at
-`CORP_LLM_ENDPOINT`. Provider credentials for the first two come from
-`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in `.env`, held by the gateway, not the
-developer — see "Virtual keys" for why.
+Each provider's litellm config has exactly one route (table in "Providers").
+`claude-*` and `corp-*` are model-name prefixes; the codex route is a `"*"`
+catch-all that keeps the model name Codex sends and only switches the provider
+to the ChatGPT Responses endpoint. A model name another gateway serves gets no
+route on this one.
 
-`CORP_LLM_ENDPOINT` is optional, but leaving it unset does **not** disable
-anything by itself: `CORP_LLM_ORACLE_ENABLED=0` (the `.env.example` default)
-is what keeps the corp-LLM oracle off. With the oracle enabled and no
-endpoint, a gazetteer hit falls through to `bootstrap.py`'s non-routable
-placeholder host and fails the request closed — on **every** route, not
-just `corp-*`. Set `CORP_LLM_ORACLE_ENABLED=1` only once `CORP_LLM_ENDPOINT`
-points at a reachable corp vLLM. The `corp-*` route itself always needs the
-endpoint regardless of the oracle flag; without it, `corp-*` requests fail
-per-request rather than failing config load.
-
-## Virtual keys
-
-**API-key mode only, and that mode is a test posture.** In subscription mode
-there is no master key, so there are no virtual keys; the developer's OAuth
-bearer is the credential and `X-Corp-Auth` remains the team identity. See
-`docs/ops/deployment-modes.md`.
-
-In API-key mode litellm checks a **LiteLLM virtual key**
-(`Authorization: Bearer sk-...`) at the proxy — not forwarded, not logged —
-which is why `LITELLM_MASTER_KEY` + `DATABASE_URL` + `STORE_MODEL_IN_DB=True` +
-`UI_USERNAME`/`UI_PASSWORD` are set on this instance. **Nothing can issue one.**
-The route gate answers `403 E_ROUTE_BLOCKED` on `/key/*`, the admin UI and every
-other litellm management route, in both modes, so there is no per-developer
-revocation or spend accounting through litellm (`docs/security.md` §14,
-"The management surface is refused"). Per-developer revocation is the corp
-token: `gateway-admin token revoke`.
-
-`X-Corp-Auth` is **unchanged** and unrelated to virtual keys — it still
-carries team → profile → rules → audit identity through the guardrail
-(`AuthMiddleware`, untouched by this rework). Clients send **both** headers
-on every request:
-
-- `Authorization: Bearer <litellm virtual key>` — who may call this proxy at
-  all, and litellm's own spend/rate-limit accounting.
-- `X-Corp-Auth: <corp team token>` — which team's profile/rules/audit
-  identity applies inside the guardrail.
+`CORP_LLM_ENDPOINT` is optional on the subscription providers, but leaving it
+unset does **not** disable anything by itself: `CORP_LLM_ORACLE_ENABLED=0` (the
+`.env.example` default) is what keeps the corp-LLM oracle off. With the oracle
+enabled and no endpoint, a gazetteer hit falls through to `bootstrap.py`'s
+non-routable placeholder host and fails the request closed — on **every**
+provider, not just `corp`. Set `CORP_LLM_ORACLE_ENABLED=1` only once
+`CORP_LLM_ENDPOINT` points at a reachable corp vLLM. The `corp` provider's
+`corp-*` route always needs the endpoint regardless of the oracle flag; without
+it, `corp-*` requests fail per-request rather than failing config load.
 
 ## Why not BYOK
 
 Two independent findings, both narrower than an earlier revision of this
 README claimed — read carefully, the mechanisms are different.
 
-**(a) Native `anthropic/`/`openai/` credentials never come from the client.**
-Those providers build their upstream credential from the configured
-`api_key` (`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`) and never read the inbound
-`Authorization` header. Verified twice: against litellm 1.85.0 (the pinned
-image) and independently against 1.90.1; see `examples/compose/README.md`
-"BYOK in local mode (SPIKE finding)".
+**(a) The upstream credential is the bridge's or the route's, never a raw
+client value.** The anthropic and codex gateways hold no provider key: their
+subscription bridge lifts the developer's OAuth bearer into the request's
+`api_key` (`docs/security.md` §13). The corp gateway sends its configured
+`CORP_LLM_AUTH_TOKEN`. A client `api_key` in the request body is removed before
+litellm reads it; litellm would otherwise make it the upstream credential and
+keep it for later requests.
 
-**(b) Our own guardrail forwards inbound wire headers regardless of
-litellm's own gate — that's what `CORP_LLM_STRIP_INBOUND_HEADERS` is for.**
-litellm's `forward_client_headers_to_llm_api` gate (`litellm/proxy/
-litellm_pre_call_utils.py`, `add_litellm_data_for_backend_llm_call` /
-`add_headers_to_llm_call_by_model_group`) is correctly unset in
-`litellm/config.yaml` — litellm itself does not copy client headers into
-`data["headers"]`. But `CorpLlmGuardrail._pre_call_impl` (reached via
-`async_pre_call_hook`) sets `data["headers"]` **unconditionally**,
-independent of that gate, and litellm forwards whatever ends up in
-`data["headers"]` to the upstream HTTP call regardless of how it got
-there. Wire-captured
-against a stand-in upstream: `host`, `user-agent`, `accept`, `connection`,
-`content-type`, `content-length` and an arbitrary probe header all reached
-the upstream call, on **both** `corp-*` and `claude-*` routes, with the
-strip flag off; none did with it on. So `CORP_LLM_STRIP_INBOUND_HEADERS` is
-load-bearing on this stack, not a reserved no-op — it's set `1` in
-`docker-compose.yml`/`.env.example`. It never touches `Authorization` (see
-`litellm_hook.py` `_WIRE_HEADERS_TO_DROP` — BYOK passthrough, invariant #3,
-is preserved for deployments that DO forward it).
+**(b) No client header reaches a provider through `data["headers"]`.**
+litellm sends `data["headers"]` upstream on every route, and its own
+`forward_client_headers_to_llm_api` gate is correctly unset here, so the only
+inbound copy the guardrail could put there is litellm's logging copy of every
+client header. In 1.0.0 it did, dropping only the wire headers listed in
+`_WIRE_HEADERS_TO_DROP`: wire-captured on the real image, an arbitrary client
+header (an email in it) reached the Anthropic, Codex and corp upstreams
+verbatim with `CORP_LLM_STRIP_INBOUND_HEADERS=1`. Since 1.1.0
+`CorpLlmGuardrail._pre_call_impl` writes an allowlist projection there, and the
+allowlist is empty (`_UPSTREAM_HEADER_ALLOWLIST` in `litellm_hook.py`;
+per-provider list in `docs/security.md` §13). `CORP_LLM_STRIP_INBOUND_HEADERS`
+still drops the wire headers from litellm's own header copies; it no longer
+decides what goes upstream.
 
-BYOK (the developer's own key forwarded untouched — CLAUDE.md invariant #3)
-is nonetheless **not available on this compose stack at all**, on any
-route: developers authenticate with the litellm virtual key described
-above, and the `corp-*`/`hosted_vllm/` route builds its upstream request
-from the configured `api_key`/model params the same way `anthropic/` and
-`openai/` do, not from a forwarded client `Authorization`. Full stop.
+BYOK in the API-key sense (the developer's own provider *API key* forwarded
+upstream) is not available on this stack, on any provider: the Anthropic bridge
+accepts OAuth tokens only (`sk-ant-oat…`), the Codex bridge forwards the ChatGPT
+OAuth token, and the corp route builds its upstream request from its configured
+`api_key`, never from a client `Authorization`. litellm virtual keys are gone in
+1.1.0, with Mode A.
 
 ## TLS to the corp vLLM
 
-See `compose/certs/README.md`. Two different HTTP clients in the `litellm`
+See `compose/certs/README.md`. Two different HTTP clients in each gateway
 container read TLS trust differently: our own `CorpLlmClient` (httpx) reads
 `CORP_LLM_CA_BUNDLE` from `.env` (bare-name form, so an unset value is
 absent from the container entirely, not set to an empty string) — scoped to
 calls to the corp vLLM only. litellm's own clients (native `anthropic/`,
 `openai/` AND `hosted_vllm/`, all aiohttp) read `SSL_CERT_FILE`, which is
 **process-global**: pointing it straight at the corp CA would silently
-replace the trust store for `api.anthropic.com`/`api.openai.com` too. So
+replace the trust store for `api.anthropic.com`/`chatgpt.com` too. So
 `SSL_CERT_FILE` is not set from `.env` at all — the container's entrypoint
 builds a combined bundle (certifi's public roots, plus `corp-ca-bundle.pem`
 appended if mounted) at boot and `SSL_CERT_FILE` always points at that.
@@ -282,8 +265,8 @@ Self-hosted Langfuse v3, ported from `docker-compose.demo.yml` and hardened:
   `langfuse-clickhouse-data`, `langfuse-clickhouse-logs`,
   `langfuse-minio-data`, `langfuse-redis-data`);
 - **scoped `environment:`** per service, as everywhere else in this file — no
-  `env_file:`, which would broadcast `POSTGRES_PASSWORD`/`UI_PASSWORD`/
-  provider keys into ClickHouse, MinIO and Langfuse alike.
+  `env_file:`, which would broadcast `POSTGRES_PASSWORD` and the Langfuse
+  secrets into ClickHouse, MinIO and Langfuse alike.
 
 `langfuse-redis` is a **separate** Redis instance, not the gateway's. The
 gateway's `redis` is Cache B — CLAUDE.md calls it *required* for `post_call`
@@ -303,7 +286,7 @@ one**, so `langfuse-redis` is capped twice
   the data cap rather than equal to it.
 
 Without both, an uncapped queue grows until the kernel OOM killer picks a
-victim, and the victim can just as easily be `litellm`, `postgres` or Cache B
+victim, and the victim can just as easily be a gateway, `postgres` or Cache B
 — i.e. observability load becomes a request-path outage. Raise the two
 together; the defaults hold a six-figure job backlog against a steady state
 of a few MB. Both keys are optional in `.env` (the defaults live in
@@ -442,7 +425,7 @@ docker compose up -d
 
 **What step 4 does and does not recover.** `vector` has no read checkpoint yet,
 and its source is `read_from: beginning`, so its first run replays every log file
-the glob matches, from byte 0: the `litellm` container's active `-json.log` **and
+the glob matches, from byte 0: each gateway container's active `-json.log` **and
 its numbered rotations** (`-json.log.1`, `.2`, …, which the glob covers for
 exactly this reason). What it cannot recover is anything docker has already
 discarded — records rotated past `LITELLM_LOG_MAX_FILE` are gone from the host
@@ -508,7 +491,7 @@ gateway stdout (StdoutSink)  ->  docker json-file log  ->  vector  ->  langfuse
 ```
 
 `CORP_AUDIT_SINK` is unset on this stack, so `audit/factory.py`'s default
-`stdout` sink applies: every `AuditEvent` is one JSON line on the `litellm`
+`stdout` sink applies: every `AuditEvent` is one JSON line on its gateway
 container's stdout. `vector` tails that and posts to Langfuse's
 `/api/public/ingestion`, authenticating with the Langfuse **project** API keys
 `CORP_LANGFUSE_PUBLIC_KEY` / `CORP_LANGFUSE_SECRET_KEY` (not the
@@ -543,26 +526,26 @@ consequences worth knowing:
   The patterns stop at two digits on purpose: `…-json.log.*` would also match
   `…-json.log.1.gz`, and Vector's file source cannot decompress. The service
   therefore pins `compress: "false"` — see the last bullet;
-- the source sees **every** container's logs, not just `litellm`, because the
+- the source sees **every** container's logs, not just the gateways', because the
   log directory is keyed by container id and the glob cannot be narrowed. The
   scoping is done one transform later — see "Container identity boundary";
-- it needs the **`json-file` logging driver**, which is why the `litellm`
+- it needs the **`json-file` logging driver**, which is why every gateway
   service pins `logging.driver: json-file` rather than inheriting the host
   default. Under a daemon-wide `local`, `journald` or remote driver the other
-  containers produce no `*-json.log` files, but `litellm` — the only one this
-  pipeline reads — still does;
-- **pinning the driver costs the daemon's rotation policy, so the service sets
-  its own.** Docker merges daemon-level `log-opts` into a container *only when
+  containers produce no `*-json.log` files, but the gateways — the only ones
+  this pipeline reads — still do;
+- **pinning the driver costs the daemon's rotation policy, so the services set
+  their own.** Docker merges daemon-level `log-opts` into a container *only when
   the container's driver equals the daemon's default driver* (moby
   `daemon/logs.go`, `mergeAndVerifyLogConfig` — the copy loop sits inside
   `if cfg.Type == daemon.defaultLogConfig.Type`). On a `local`-default host the
-  pinned service would therefore inherit nothing, and `json-file`'s own
+  pinned services would therefore inherit nothing, and `json-file`'s own
   `max-size` default is `-1`: no rotation at all, an unbounded audit log on the
   same disk as Cache B and Postgres. `logging.options` sets `max-size` /
   `max-file` explicitly (`LITELLM_LOG_MAX_SIZE` / `LITELLM_LOG_MAX_FILE`,
   default `100m` × `10` ≈ the 1 GiB disk buffer). Removing them does **not**
   hand the job back to the daemon;
-- **the same merge runs the other way for `compress`, so the service pins it
+- **the same merge runs the other way for `compress`, so the services pin it
   off.** On a host whose daemon default *is* `json-file` and carries
   `compress=true`, the merge copies that option into any container that has not
   named it — docker then writes rotations as `…-json.log.1.gz`, which Vector's
@@ -576,10 +559,10 @@ consequences worth knowing:
   files Vector still cannot decompress.
 
 **Container identity boundary.** `docker-compose.yml` puts a
-`com.corp-llm-gateway.audit-source: gateway-stdout` label on the `litellm`
-service and names that label in the service's `logging.options.labels`. That
-second half is what makes docker's json-file driver copy the label into every
-log record it writes for that container:
+`com.corp-llm-gateway.audit-source: gateway-stdout` label on every gateway
+service and names that label in its `logging.options.labels`. That second half
+is what makes docker's json-file driver copy the label into every log record it
+writes for those containers:
 
 ```
 {"log":"...","stream":"stdout",
@@ -607,7 +590,7 @@ So: **no untrusted `docker run` on the host that runs this stack.** Treat
 membership of the `docker` group (and any CI runner, agent or sidecar with
 socket access) as equivalent to write access to the audit trail, and restrict it
 accordingly. This is a limitation of reading every container's logs; closing it
-properly needs a private channel only `litellm` can write — a dedicated
+properly needs a private channel only a gateway can write — a dedicated
 bind-mounted audit file or unix socket — which is a change to the gateway's
 audit sink in `src/`, not to this stack. Recorded in `docs/security.md` §8.2.
 
@@ -658,7 +641,7 @@ request-path fail-closed needs a health/buffer gate inside
 That is a deliberate deviation from the matrix default, not an oversight, and it
 is the price of not making the gateway process depend on the audit forwarder's
 health. The residual risk: while Langfuse is unreachable, accepted audit records
-live **only in the `litellm` container's docker json-file logs** (plus whatever
+live **only in the gateway containers' docker json-file logs** (plus whatever
 already made it into Vector's disk buffer). Log retention — not the disk buffer —
 is therefore what actually bounds durability. Vector's glob does follow the
 numbered rotations (`-json.log.1`, `.2`, …), so a single rotation no longer
@@ -667,15 +650,15 @@ docker, and those audit records are gone permanently.
 
 Two things an operator must configure before going live:
 
-1. **Size the docker log retention** for the `litellm` container against the
+1. **Size the docker log retention** for each gateway container against the
    longest Langfuse outage you intend to survive, at your own audit volume. The
    knobs are `LITELLM_LOG_MAX_SIZE` / `LITELLM_LOG_MAX_FILE` (default `100m` ×
-   `10`), which the service sets on its own `logging.options`. **Do not set them
+   `10`), which each gateway service sets on its own `logging.options`. **Do not set them
    in the daemon's `log-opts` and expect them to apply** — docker merges
    daemon-level log-opts into a container only when the container's driver
-   equals the daemon's default, and this service pins `json-file` because the
+   equals the daemon's default, and these services pin `json-file` because the
    pipeline needs it. On a host defaulting to `local` or `journald` the daemon
-   policy is silently ignored for this container. The product
+   policy is silently ignored for these containers. The product
    `max-size × max-file` must exceed the audit bytes produced during that
    window; `CORP_VECTOR_LANGFUSE_BUFFER_BYTES` should be sized for the same
    window (the defaults match at ~1 GiB).
@@ -690,11 +673,11 @@ docker compose exec vector du -sh /var/lib/vector/buffer
 # dropped outright — a wrong key, or any other non-retriable response
 docker compose logs vector | grep "Events dropped"
 
-# how much rotation headroom is left? one `-json.log` plus N `-json.log.<n>`
+# how much rotation headroom is left? (per gateway; gateway-anthropic shown) one `-json.log` plus N `-json.log.<n>`
 # files; at LITELLM_LOG_MAX_FILE the next rotation DELETES the oldest, and with
 # it any audit record vector has not read yet
 docker compose exec vector ls -l \
-  "$(dirname "$(docker inspect -f '{{.LogPath}}' "$(docker compose ps -q litellm)")")"
+  "$(dirname "$(docker inspect -f '{{.LogPath}}' "$(docker compose ps -q gateway-anthropic)")")"
 
 # how far behind is vector? one {fingerprint, position} per file it has read —
 # offsets only, never log content
@@ -732,43 +715,53 @@ docker run --rm -v "$PWD/vector:/etc/vector:ro" \
 
 ## Postgres
 
-Two databases on the one `postgres` service: `$POSTGRES_DB` (default
-`gateway` — our tokens/team_config schema) and `litellm` (litellm's own
-virtual-key store + UI accounts, created by the committed
-`compose/postgres/initdb/00-create-litellm-db.sh`). See
-`compose/postgres/initdb/README.md` for how `$POSTGRES_DB`'s schema is
-staged (git-ignored — never committed, so it cannot drift from
-`src/corp_llm_gateway/tokens/schema.sql`).
+One database on the `postgres` service: `$POSTGRES_DB` (default `gateway` —
+our tokens/team_config schema), shared by every gateway, so a corp token works
+on all of them. litellm gets no database since 1.1.0: no `DATABASE_URL`, so it
+runs no Prisma step and never re-reads a config table (`docs/security.md` §14,
+14c). A volume created before 1.1.0 still holds an inert `litellm` database;
+`compose/postgres/initdb/README.md` shows how to drop it, and how
+`$POSTGRES_DB`'s schema is staged (git-ignored — never committed, so it cannot
+drift from `src/corp_llm_gateway/tokens/schema.sql`).
 
 ## Loopback bind
 
-The `litellm` port publishes on `127.0.0.1`, not `0.0.0.0`, with or without
-the front door. It speaks plain HTTP, and subscription tokens, virtual keys and
-`X-Corp-Auth` must not cross a server-class network in cleartext: developers
-reach the gateway across the network only through the HTTPS front door, which
-talks to `litellm` over the compose network. With no profile on it is the only
-published port in the stack: no Langfuse service publishes one at all (see
+Each gateway's port publishes on `127.0.0.1`, not `0.0.0.0`, with or without
+the front door: `GATEWAY_ANTHROPIC_PORT` (4000), `GATEWAY_CODEX_PORT` (4001),
+`GATEWAY_CORP_PORT` (4002), one per enabled provider. They speak plain HTTP, and
+subscription tokens and `X-Corp-Auth` must not cross a server-class network in
+cleartext: developers reach a gateway across the network only through the HTTPS
+front door, which talks to it over the compose network. With no front door on
+they are the only published ports in the stack: no Langfuse service publishes one at all (see
 "Langfuse"), and `vector`'s API is bound to `127.0.0.1` *inside* its own
-container, purely so its healthcheck can reach it. The admin path — the SSH
-tunnel to this port — stays as it is.
+container, purely so its healthcheck can reach it. The admin path is an SSH
+tunnel to a gateway's loopback port.
 
 ## HTTPS front door (nginx)
 
-Off by default. With `COMPOSE_PROFILES` unset the stack is exactly the one
-above: no nginx, `litellm` on loopback only, and no `NGINX_*` key is read. With
-a profile on, an nginx (`nginx:1.27-alpine`) publishes the gateway and Langfuse
-over HTTPS. Its configuration is `compose/nginx/`: `entrypoint.sh` validates the
+Off by default. With no front-door profile in `COMPOSE_PROFILES` the stack is
+exactly the one above: no nginx, the gateways on loopback only, and no `NGINX_*`
+key is read. With a profile on, an nginx (`nginx:1.27-alpine`) publishes one
+gateway and Langfuse over HTTPS. Its configuration is `compose/nginx/`: `entrypoint.sh` validates the
 keys, renders one listener from `templates/` and runs `nginx -t` before it
 serves; `nginx.conf` is static. Every key, with its default, is in
 `.env.example` ("nginx front door").
 
 ### Turning it on
 
-One line in the server's `.env` is the only switch:
+One line in the server's `.env` is the only switch, the same line that picks
+the providers:
 
 ```
-COMPOSE_PROFILES=nginx        # or nginx-ports; never both
+COMPOSE_PROFILES=anthropic,nginx        # or nginx-ports; never both
 ```
+
+**One gateway behind the front door.** nginx proxies to
+`NGINX_GATEWAY_UPSTREAM`: `gateway-anthropic` (the default), `gateway-codex` or
+`gateway-corp`. The entrypoint refuses (exit 64) any other name, and a gateway
+whose provider is not in `COMPOSE_PROFILES`, since nginx would answer 502 to
+every request. The other enabled providers are reached on their loopback ports
+or over an SSH tunnel.
 
 `deploy.sh` has no flag for it and never sets it, and the boot-time unit runs a
 bare `docker compose up -d` that reads the same `.env`: a deploy and a reboot
@@ -911,7 +904,8 @@ Worth knowing by name:
   placeholders, not originals.
 - **litellm's admin surface and UI, `/health*`, `/healthz/ready`,
   `/healthz/sanitization`, `/healthz/extensions` and `/metrics`** — these stay
-  on the SSH tunnel to `127.0.0.1:${GATEWAY_PORT:-4000}`, as before.
+  on the SSH tunnel to each gateway's loopback port
+  (`127.0.0.1:${GATEWAY_ANTHROPIC_PORT:-4000}` and its two siblings), as before.
 
 Past a per-token limit nginx answers 429 `E_RATE_LIMITED` itself:
 `docs/ops/capacity.md`, "Edge limits". Streams are not buffered (SSE passes
@@ -935,7 +929,7 @@ The entrypoint writes one line naming the key it refused, then exits:
 
 | Exit | Cause |
 |---|---|
-| 64 | `NGINX_TLS_MODE` is not exactly `terminate` or `behind-proxy`; `GATEWAY_DOMAIN` is missing or not a lowercase DNS name with at least two labels (under `nginx`); an edge-limit key (`NGINX_TOKEN_RATE`, `NGINX_TOKEN_BURST`, `NGINX_TOKEN_CONN`, `NGINX_ISSUE_RATE`) is not a whole number from 1 to 999999; or the service's routing argument is not `host` / `port` (an edited compose file) |
+| 64 | `NGINX_TLS_MODE` is not exactly `terminate` or `behind-proxy`; `NGINX_GATEWAY_UPSTREAM` is not `gateway-anthropic`, `gateway-codex` or `gateway-corp`, or names a provider `COMPOSE_PROFILES` does not enable; `GATEWAY_DOMAIN` is missing or not a lowercase DNS name with at least two labels (under `nginx`); an edge-limit key (`NGINX_TOKEN_RATE`, `NGINX_TOKEN_BURST`, `NGINX_TOKEN_CONN`, `NGINX_ISSUE_RATE`) is not a whole number from 1 to 999999; or the service's routing argument is not `host` / `port` (an edited compose file) |
 | 65 | `terminate`: `NGINX_TLS_CERT` or `NGINX_TLS_KEY` is not a bare file name (`A-Z a-z 0-9 . _ -`), or that file in `compose/nginx/certs/` is missing, not a regular file, or empty |
 | 66 | an `NGINX_TRUSTED_PROXIES` entry is not an IP/CIDR with a prefix of at least `/8` (IPv4) or `/16` (IPv6); or, in `behind-proxy`, the list is empty or has no IPv4 entry |
 | 67 | a template is missing, or names a variable the entrypoint does not render — a damaged `nginx/templates/`, not a setting |
@@ -970,11 +964,11 @@ message is in the same log. Facts that surprise operators:
 ## Durability
 
 Every stateful service uses a named volume, so `docker compose down` (without
-`-v`) keeps mappings, tokens/team-config, virtual keys and the whole Langfuse
-trace/audit history across a restart — unlike `docker-compose.demo.yml`'s
-laptop-walkthrough posture. `litellm`
-itself has no named volume; it is stateless (config/certs are read-only bind
-mounts) and its state already lives in `redis`/`postgres` above. Redis is
+`-v`) keeps mappings, tokens/team-config and the whole Langfuse trace/audit
+history across a restart — unlike `docker-compose.demo.yml`'s
+laptop-walkthrough posture. The gateways themselves have no named volume; they
+are stateless (config/certs are read-only bind mounts) and their state already
+lives in `redis`/`postgres` above. Redis is
 configured `noeviction` (`compose/redis/redis.conf`): Cache B is CLAUDE.md's
 *required* per-conversation mapping store for `post_call` desanitization, so
 an under-memory Redis must fail loudly (`OOM` errors) rather than silently
@@ -982,12 +976,14 @@ evict live mappings and return placeholder text to a developer.
 
 ## Upgrading from an earlier deployment
 
-If you already ran this stack before the litellm virtual-key rework (no
-`compose/postgres/initdb/00-create-litellm-db.sh`), your `postgres` volume
-has no `litellm` database and the `litellm` container fails at boot —
-`docker-entrypoint-initdb.d` scripts only run once, against an empty volume.
-See `compose/postgres/initdb/README.md` "Upgrading a pre-existing
-deployment" for the recreate / manual `CREATE DATABASE` fix.
+1.1.0 changed this stack: the `litellm` service became one gateway per
+provider, `docker-compose.oauth.yml` merged into the base file, Mode A and
+litellm's database are gone, and `GATEWAY_PORT` became one port per provider.
+Edit the server's `.env` (`COMPOSE_PROFILES`, the 1.0 `COMPOSE_FILE` line,
+`GATEWAY_PORT`) and run the first 1.1 `deploy.sh up` back to back, in one
+maintenance window; then delete the four files 1.1 removed, which the sync
+leaves on the server. The steps, in order: `docs/ops/upgrade.md`,
+"1.0 → 1.1.0".
 
 ## Environment posture
 
@@ -1022,13 +1018,15 @@ boot with no other warning.
 
 ## In-flight cap
 
-The `litellm` service passes the route gate's in-flight cap keys
+Every gateway service passes the route gate's in-flight cap keys
 (`docs/ops/capacity.md`, `docs/ops/configuration.md`). Set any of them in `.env`
-to change it; the commented block in `.env.example` shows the defaults.
+to change it; the commented block in `.env.example` shows the defaults. Each
+gateway container has its own cap: two providers on one host admit up to twice
+`CORP_LLM_MAX_INFLIGHT` between them.
 
 | Key | Default here | What it bounds |
 |-----|--------------|----------------|
-| `CORP_LLM_MAX_INFLIGHT` | `64` | concurrent LLM requests on this host, a slot held for the whole stream; 429 `E_CAPACITY` past it. `0` = off, refused at boot under `CORP_ENV=production` |
+| `CORP_LLM_MAX_INFLIGHT` | `64` | concurrent LLM requests per gateway container, a slot held for the whole stream; 429 `E_CAPACITY` past it. `0` = off, refused at boot under `CORP_ENV=production` |
 | `CORP_LLM_CANCEL_GRACE_SECONDS` | `5` | unwind budget after a client disconnect; a slot is back within 2 × this |
 | `CORP_LLM_BODY_READ_SECONDS` | `30` | time for the whole body to arrive, before a slot is taken; 408 `E_BODY_TIMEOUT` past it |
 | `CORP_LLM_MAX_DRAINING` | unset → 4 × the cap | requests reading a body at once; passed by bare name so it follows the cap |
@@ -1040,8 +1038,12 @@ A bad value is a boot refusal (exit 78) with the key named in the log.
 
 `POST /internal/issue-token` is off unless you add the optional
 `docker-compose.issuance.yml` overlay. The base stack passes no
-`CORP_GATEWAY_ISSUE_*` key and mounts no config file, so a subscription deploy
-without Keycloak is unaffected. To turn issuance on:
+`CORP_GATEWAY_ISSUE_*` key and mounts no config file, so a deploy without
+Keycloak is unaffected. The overlay applies to every enabled gateway (tokens
+live in the shared `gateway` database, so a token issued through one works on
+all of them); developers reach it through the front door's gateway. Its caps
+(`CORP_GATEWAY_ISSUE_MAX_INFLIGHT`, `_RATE_PER_MINUTE`) are per gateway process.
+To turn issuance on:
 
 1. On the server, in the deploy directory: `cp gateway/config.toml.example
    gateway/config.toml` and edit the team map
@@ -1056,11 +1058,13 @@ without Keycloak is unaffected. To turn issuance on:
 3. Deploy with the overlay from your laptop:
    `scripts/deploy/deploy.sh --host user@server --issuance up`
    (or `DEPLOY_ISSUANCE=1`). It refuses before it changes anything if
-   `gateway/config.toml` is missing on the server, and refuses `--mode
-   virtual-keys`. Pass `--issuance` to every later `logs`/`status`/`down`/
-   `restart` run too. Without the script, run this on the server:
-   `docker compose -f docker-compose.yml -f docker-compose.oauth.yml -f docker-compose.issuance.yml up -d`.
-   For the autostart unit, uncomment the three-file `COMPOSE_FILE` line in `.env`.
+   `gateway/config.toml` is missing on the server. Pass `--issuance` to every
+   later `logs`/`status`/`down`/`restart` run too. Without the script, run this
+   on the server:
+   `docker compose -f docker-compose.yml -f docker-compose.issuance.yml up -d`.
+   For the autostart unit, uncomment the two-file `COMPOSE_FILE` line in `.env`;
+   `deploy.sh up` warns when that line and `--issuance` disagree, since a
+   reboot would then start the gateways with another configuration.
 
 The overlay mounts `./gateway/config.toml` read-only at
 `/etc/corp-llm-gateway/config.toml` and sets `CORP_LLM_GATEWAY_CONFIG_FILE` to
@@ -1076,7 +1080,7 @@ empty volume: on an existing one, re-run `tokens/schema.sql` first
 
 `gateway-admin team create` / `token issue` and other RBAC-gated mutations
 need either `CORP_GATEWAY_ADMIN_TOKEN` (an operator JWT) or
-`CORP_GATEWAY_RBAC=0` (dev bypass) — **neither is set in the `litellm`
+`CORP_GATEWAY_RBAC=0` (dev bypass) — **neither is set in any gateway
 service's environment today**. Export one of them on the machine running
 `gateway-admin` before issuing tokens or creating teams against this
 deployment; see `docs/ops/admin-cli.md`.

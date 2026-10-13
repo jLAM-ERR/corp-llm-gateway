@@ -505,8 +505,10 @@ async def test_a_grown_sanitized_body_goes_upstream_without_the_inbound_length()
     ):
         assert not [name for name in bucket if name.lower() == "content-length"]
         assert not [name for name in bucket if name.lower() == "host"]
-    # The one header the strip must never take (invariant 3).
-    assert out["headers"]["Authorization"] == "Bearer byok-developer-key"
+    # The one header the strip must never take from litellm's copies: the bridges
+    # read the developer's token there. The upstream bucket holds nothing.
+    assert out["proxy_server_request"]["headers"]["Authorization"] == "Bearer byok-developer-key"
+    assert out["headers"] == {}
 
 
 def test_strip_inbound_headers_explicit_argument_overrides_config(
@@ -643,53 +645,71 @@ def test_no_disarm_warning_when_the_env_pair_is_already_legal(
     assert not [r for r in caplog.records if "mutually exclusive" in r.getMessage()]
 
 
-# ── a litellm master key cancels either bridge: same runtime enforcement, because
-# docker-compose's `env_file:` is a developer-owned file no `config check` sees ──
+# ── any litellm master key is refused at boot (Mode A removed in 1.1.0): runtime
+# enforcement, because docker-compose's `env_file:` is a developer-owned file no
+# `config check` sees ─────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    "bridge", ["CORP_LLM_FORWARD_ANTHROPIC_AUTH", "CORP_LLM_FORWARD_CHATGPT_AUTH"]
+)
 def test_master_key_next_to_a_bridge_raises_from_build_guardrail(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, bridge: str
 ) -> None:
-    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    monkeypatch.setenv(bridge, "1")
     monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
 
     with pytest.raises(ConfigError) as exc_info:
         bootstrap.build_guardrail()
 
-    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc_info.value.problems
+    assert exc_info.value.problems == [settings.MASTER_KEY_REFUSED_MESSAGE]
     assert "master-key-fixture" not in str(exc_info.value)
 
 
-def test_master_key_is_checked_against_the_resolved_flag_not_the_env_var(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("master_key", ["master-key-fixture", "", "   "])
+def test_master_key_without_a_bridge_raises_from_build_guardrail(
+    monkeypatch: pytest.MonkeyPatch, master_key: str
 ) -> None:
-    # The demo shim passes its own resolved flags, so the rule must see those —
-    # a kwarg that turns the bridge on must not slip past an env-only check.
+    monkeypatch.setenv("LITELLM_MASTER_KEY", master_key)
+
+    with pytest.raises(ConfigError) as exc_info:
+        bootstrap.build_guardrail()
+
+    assert exc_info.value.problems == [settings.MASTER_KEY_REFUSED_MESSAGE]
+    assert "1.1.0" in str(exc_info.value)
+    assert "master-key-fixture" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"forward_anthropic_auth": True},
+        {"forward_anthropic_auth": False},
+        {"forward_chatgpt_auth": True},
+        {"forward_chatgpt_auth": False},
+    ],
+    ids=["anthropic-on", "anthropic-off", "chatgpt-on", "chatgpt-off"],
+)
+def test_master_key_is_refused_whatever_the_bridge_kwargs_say(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, bool]
+) -> None:
+    # A caller that resolves its own bridge flags cannot turn the refusal off.
     monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
 
-    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY"):
-        bootstrap.build_guardrail(forward_anthropic_auth=True)
+    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY") as exc_info:
+        bootstrap.build_guardrail(**kwargs)
 
-    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
-
-    assert bootstrap.build_guardrail(forward_anthropic_auth=False) is not None
+    assert "master-key-fixture" not in str(exc_info.value)
 
 
-def test_master_key_alone_still_builds(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
-
-    guardrail = bootstrap.build_guardrail()
-
-    assert guardrail._forward_anthropic_auth is False
-    assert guardrail._forward_chatgpt_auth is False
-
-
+@pytest.mark.parametrize("bridge", [None, "CORP_LLM_FORWARD_ANTHROPIC_AUTH"])
 def test_master_key_refusal_precedes_any_component_construction(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, bridge: str | None
 ) -> None:
     # A misconfigured stack must name the master key, not die first on some
     # unrelated backend the build should never have started.
-    monkeypatch.setenv("CORP_LLM_FORWARD_ANTHROPIC_AUTH", "1")
+    if bridge is not None:
+        monkeypatch.setenv(bridge, "1")
     monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
     monkeypatch.setattr(
         bootstrap,
@@ -702,8 +722,10 @@ def test_master_key_refusal_precedes_any_component_construction(
         lambda: pytest.fail("built the mapping store despite an invalid config"),
     )
 
-    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY"):
+    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY") as exc_info:
         bootstrap.build_guardrail()
+
+    assert "master-key-fixture" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

@@ -160,6 +160,9 @@ class _Handler(BaseHTTPRequestHandler):
                 {
                     "path": self.path,
                     "headers": {name.lower(): value for name, value in self.headers.items()},
+                    # Every header line as sent: the dict above keeps only the
+                    # last of two same-named headers.
+                    "raw_headers": [[name, value] for name, value in self.headers.items()],
                     "body": body,
                 }
             ),

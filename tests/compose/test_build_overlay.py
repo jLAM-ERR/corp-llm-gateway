@@ -9,19 +9,26 @@ wheel, so the overlay has to name the profile itself.
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
+
+from tests.compose.nginx_support import REQUIRED_ENV, bare_compose_env, compose_cli_available
 
 ROOT = Path(__file__).resolve().parents[2]
 OVERLAY = ROOT / "compose" / "docker-compose.build.yml"
 COMPOSE = ROOT / "compose" / "docker-compose.yml"
 DOCKERFILE = ROOT / "Dockerfile.gateway"
+GATEWAYS = ("gateway-anthropic", "gateway-codex", "gateway-corp")
 
 
 def _build_args() -> dict[str, str]:
-    build = yaml.safe_load(OVERLAY.read_text())["services"]["litellm"]["build"]
+    """The one build every gateway-image service runs (it lives on profile-guard)."""
+    build = yaml.safe_load(OVERLAY.read_text())["services"]["profile-guard"]["build"]
     args = build.get("args") or {}
     if isinstance(args, list):
         args = dict(item.split("=", 1) for item in args)
@@ -35,8 +42,9 @@ def _profile_arm(profile: str) -> str:
     return match.group(1)
 
 
-def _litellm_environment() -> list[str]:
-    return yaml.safe_load(COMPOSE.read_text())["services"]["litellm"]["environment"]
+def _gateway_environments() -> dict[str, dict[str, str]]:
+    services = yaml.safe_load(COMPOSE.read_text())["services"]
+    return {name: services[name]["environment"] for name in GATEWAYS}
 
 
 def test_build_overlay_names_the_ner_profile_instead_of_taking_the_default() -> None:
@@ -57,4 +65,65 @@ def test_the_dockerfile_default_would_ship_no_en_model() -> None:
 def test_the_compose_stack_fails_closed_on_a_missing_ner_engine() -> None:
     # The other half of the coupling: with this at 1 a degraded EN engine is a 503,
     # not a quiet fallback to the regex floor.
-    assert "CORP_LLM_REQUIRE_NER=${CORP_LLM_REQUIRE_NER:-1}" in _litellm_environment()
+    for name, environment in _gateway_environments().items():
+        assert environment["CORP_LLM_REQUIRE_NER"] == "${CORP_LLM_REQUIRE_NER:-1}", name
+
+
+def test_the_build_lives_on_the_one_service_never_profiled_off() -> None:
+    overlay = yaml.safe_load(OVERLAY.read_text())["services"]
+    base = yaml.safe_load(COMPOSE.read_text())["services"]
+
+    assert [name for name, service in overlay.items() if "build" in service] == ["profile-guard"]
+    assert "profiles" not in base["profile-guard"]
+    assert overlay["profile-guard"]["pull_policy"] == "build"
+    # Same tag: every gateway runs what profile-guard built, and never pulls over it.
+    for name in GATEWAYS:
+        assert base[name]["image"] == base["profile-guard"]["image"], name
+        assert overlay[name] == {"pull_policy": "never"}, name
+
+
+@pytest.mark.skipif(not compose_cli_available(), reason="docker compose CLI not on PATH")
+@pytest.mark.parametrize("providers", ["anthropic,codex,corp", "corp"])
+def test_the_build_overlay_builds_the_image_once(tmp_path: Path, providers: str) -> None:
+    # Read the merged model compose would run, not a build log: `build` output differs
+    # between compose versions, and a test must not build the image.
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "".join(f"{key}=render-fixture\n" for key in REQUIRED_ENV)
+        + f"COMPOSE_PROFILES={providers}\n"
+    )
+    result = subprocess.run(
+        [
+            *("docker", "compose", "--env-file", str(env_file), "-p", "corp-build-once"),
+            *("-f", COMPOSE.name, "-f", OVERLAY.name, "config", "--format", "json"),
+        ],
+        cwd=COMPOSE.parent,
+        capture_output=True,
+        text=True,
+        env=bare_compose_env(),
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    services = json.loads(result.stdout)["services"]
+    selected = set(providers.split(","))
+    active = {
+        name: service
+        for name, service in services.items()
+        if not service.get("profiles") or selected & set(service["profiles"])
+    }
+    gateways = sorted(name for name in active if name.startswith("gateway-"))
+    assert gateways == sorted(f"gateway-{provider}" for provider in selected)
+
+    assert [name for name, service in active.items() if "build" in service] == ["profile-guard"]
+    guard = active["profile-guard"]
+    assert "profiles" not in guard
+    assert guard["pull_policy"] == "build"
+    assert guard["build"]["dockerfile"] == DOCKERFILE.name
+    assert Path(guard["build"]["context"]).resolve() == ROOT
+    assert guard["build"]["args"]["NER_PROFILE"] == "ru-en"
+    for name in gateways:
+        assert active[name]["image"] == guard["image"], name
+        assert active[name]["pull_policy"] == "never", name
+        assert "build" not in active[name], name

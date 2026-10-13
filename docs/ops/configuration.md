@@ -113,23 +113,22 @@ cascade above, on the already-sanitized request.
 
 | Key | Purpose | Default | Required |
 |-----|---------|---------|----------|
-| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Length`, `Content-Type`, ...) before forwarding to upstream | `1` | no |
+| `CORP_LLM_STRIP_INBOUND_HEADERS` | strip inbound wire headers (`Host`, `User-Agent`, `Content-Length`, `Content-Type`, ...) from litellm's own header copies; not what reaches a provider | `1` | no |
 
-`CorpLlmGuardrail._pre_call_impl` (reached via `async_pre_call_hook`) sets
-`data["headers"]` **unconditionally**, independent of litellm's own
-`forward_client_headers_to_llm_api` gate — litellm forwards whatever ends up
-in `data["headers"]` regardless of how it got there. This flag is
-load-bearing wherever the guardrail runs in front of any litellm provider,
-not a no-op reserved for a future config: see `compose/README.md` "Why not
-BYOK" for a wire-verified writeup. It never touches `Authorization`.
+Since 1.1.0 this flag does not decide what reaches a provider.
+`CorpLlmGuardrail._pre_call_impl` writes `data["headers"]` — the bucket
+litellm forwards upstream — as an allowlist projection, and the allowlist is
+empty (`_UPSTREAM_HEADER_ALLOWLIST`, `docs/security.md` §13). The flag drops
+the inbound wire headers from litellm's own header copies as well. It never
+touches `Authorization` there: the subscription bridges read the developer's
+token from those copies.
 
-It defaults **on** because it is a correctness knob as well as a
-confidentiality one: with it off, the client's `Content-Length` is forwarded
-beside litellm's own, longer, sanitized body, and the provider reads the
-request truncated at the client's length — a `"stream": true` cut off that way
-comes back non-streamed. Any request whose sanitized body grew (a placeholder
-longer than the original it replaced) is corrupted on the wire. Set it to `0`
-only to reproduce that.
+It defaults **on**. Up to 1.0.0 it was also a correctness knob: the client's
+`Content-Length` rode upstream in `data["headers"]` beside litellm's own,
+longer, sanitized body, and the provider read the request truncated. Since
+1.1.0 no client header goes there with the flag on or off, so turning it off
+only leaves the wire headers in litellm's own copies (what a logging callback
+sees). Keep it on.
 
 ### Subscription-auth bridges
 
@@ -137,21 +136,28 @@ only to reproduce that.
 |-----|---------|---------|----------|
 | `CORP_LLM_FORWARD_CHATGPT_AUTH` | lift the inbound Codex OAuth bearer onto the upstream OpenAI Responses call | `0` | no |
 | `CORP_LLM_FORWARD_ANTHROPIC_AUTH` | lift the inbound `sk-ant-oat…` bearer onto the upstream Anthropic call | `0` | no |
-| `LITELLM_MASTER_KEY` | litellm's own virtual-key switch — **not** a gateway knob; registered only so `config check` can refuse it next to a bridge | unset | no |
+| `LITELLM_MASTER_KEY` | litellm's own virtual-key switch — **not** a gateway knob; registered only so `config check` can refuse it | unset | no |
 
 Both bridges consume the **same** inbound `Authorization` bearer, so they are
 **mutually exclusive**: setting both refuses to boot (`build_guardrail()` raises)
 and fails `gateway-admin config check` with one shared message. The runtime check
 matters because compose / demo / bare-litellm boots skip `settings.validate()`
-entirely. Selecting a bridge per provider is a v2 follow-up.
+entirely. The compose stack runs one gateway container per provider for this
+reason, each with at most its own bridge (`compose/README.md`, "Providers").
 
-`LITELLM_MASTER_KEY` is refused the same way while **either** bridge is on. With
-a master key set, litellm reads the inbound `Authorization` as one of its own
-virtual keys and answers `401` before `pre_call` runs, so the bridge could never
-see the developer's token. **Presence** is what counts, not truthiness: litellm
-keeps a blank `LITELLM_MASTER_KEY=` and enables proxy auth for any value that is
-not unset, so remove the line rather than blanking it. A master key with both
-bridges off is perfectly normal.
+`LITELLM_MASTER_KEY` is **refused whenever it is set**, bridge or not.
+litellm's proxy auth (Mode A: master key and virtual keys) was removed in 1.1.0;
+the gateway authenticates every client with `X-Corp-Auth`. `build_guardrail()`
+refuses to boot with a line starting `LITELLM_MASTER_KEY is set`
+(`settings.MASTER_KEY_REFUSED_MESSAGE`; the served entrypoint exits 3) and
+`gateway-admin config check` reports the same problem. With a bridge on, a
+master key would also make litellm read the inbound `Authorization` as one of
+its own virtual keys and answer `401` before `pre_call` runs. **Presence** is
+what counts, not truthiness: litellm keeps a blank `LITELLM_MASTER_KEY=` and
+enables proxy auth for any value that is not unset, so remove the line rather
+than blanking it. A `general_settings.master_key` or
+`environment_variables.LITELLM_MASTER_KEY` in litellm's own config is refused
+too (exit 78, "Server entrypoint" below).
 
 `CORP_LLM_FORWARD_ANTHROPIC_AUTH` accepts only `sk-ant-oat…` OAuth tokens;
 anything else is `401 E_PROVIDER_AUTH`. A plain `sk-ant-api…` key would make
@@ -161,13 +167,16 @@ two competing auth schemes on one upstream request.
 With the bridge on, `pre_call` also drops `metadata` and a top-level `user` from
 the request. Both egress to Anthropic unsanitized otherwise, on the pass-through
 and chat-completions routes alike. litellm's own accounting metadata is lost on
-this route as a result — acceptable here because the route ships without virtual
-keys and therefore without spend tracking. See [`../security.md`](../security.md)
-§13 for the full forward/do-not-forward list.
+this route as a result — acceptable here because there are no virtual keys and
+therefore no spend tracking. See [`../security.md`](../security.md) §13 for the
+full forward/do-not-forward list.
 
-**Supported on the production compose stack with `docker-compose.oauth.yml`, and
-on the demo `anthropic-oauth` overlay.** Enabling it anywhere else risks handing
-the developer's subscription token to the wrong provider:
+**Supported on the production compose stack's `anthropic` provider
+(`gateway-anthropic`, `compose/litellm/config.anthropic.yaml`), and on the demo
+`anthropic-oauth` overlay.** The ChatGPT bridge runs on the `codex` provider
+(`compose/litellm/config.codex.yaml`, one route to the literal ChatGPT Codex
+URL). Enabling a bridge anywhere else risks handing the developer's subscription
+token to the wrong provider:
 
 | Deployment | Why not |
 |-----|-----|
@@ -178,13 +187,16 @@ only the **client-visible model alias**; litellm resolves the real deployment
 after the hook runs. That check is defence-in-depth, not a routing guarantee. The
 binding control is the deployment shape: a litellm config with no `model_name:
 "*"` catch-all and no non-`anthropic/` route, which is what
-`docker/anthropic-oauth/litellm-config.yaml` ships and
-`tests/test_anthropic_oauth_profile.py` pins.
+`compose/litellm/config.anthropic.yaml` ships (pinned by
+`tests/compose/test_providers.py`), as does the demo's
+`docker/anthropic-oauth/litellm-config.yaml` (`tests/test_anthropic_oauth_profile.py`).
+For the ChatGPT bridge the same control is `config.codex.yaml`'s one route,
+whose `api_base` is a literal, not an environment value.
 
 Consequence to accept knowingly: there are no litellm virtual keys, so no native
 budget / rate-limit governance. That is by design: litellm's management surface,
 `/key/*` included, is refused at the route gate (`../security.md` §14), and
-API-key mode survives only as a test posture.
+API-key mode (Mode A) was removed in 1.1.0.
 
 Operationally, note that litellm keeps one deployment per distinct per-request
 `api_key` — raw value included — in `Router.model_list` for the lifetime of the
@@ -341,15 +353,17 @@ serve litellm's routers with no route gate in front. See
 The entrypoint refuses to start (**exit 78**, `EX_CONFIG`) when
 `CORP_LLM_LITELLM_CONFIG` is missing, not a file, not named `.yaml`/`.yml`,
 unreadable, empty, not a YAML mapping, or when it configures
-`general_settings.pass_through_endpoints` or `general_settings.database_url`.
-litellm's own lifespan skips a missing config **in silence**, which starts the
+`general_settings.pass_through_endpoints`, `general_settings.database_url`,
+`general_settings.master_key` or `environment_variables.LITELLM_MASTER_KEY`
+(any value; litellm takes the first ahead of the environment and exports the
+second, and either turns on its virtual-key auth). litellm's own lifespan skips a missing config **in silence**, which starts the
 proxy with no guardrail callback at all — that is the fail-open this check
 closes. `gateway-admin config check` applies the same content checks, but a
 config file that is simply absent is not a `config check` problem (laptops
 mount none).
 
-The shipped litellm configs (compose `config.yaml` / `config.oauth.yaml`, Helm
-`configmap-litellm.yaml`) pin `general_settings.supported_db_objects: ["models"]`:
+The shipped litellm configs (compose `config.anthropic.yaml` /
+`config.codex.yaml` / `config.corp.yaml`, Helm `configmap-litellm.yaml`) pin `general_settings.supported_db_objects: ["models"]`:
 litellm loads only models from its database, never `policies` or `guardrails`
 (without the key it loads every object type). A policy row there could put a
 litellm pipeline around the gateway's guardrail; the route gate already refuses
@@ -471,7 +485,8 @@ boot does).
 **Exit 78 (`EX_CONFIG`), no traffic served:**
 
 - litellm's config missing, unreadable, not a YAML mapping, or configuring
-  `pass_through_endpoints` or `general_settings.database_url`;
+  `pass_through_endpoints`, `general_settings.database_url`,
+  `general_settings.master_key` or `environment_variables.LITELLM_MASTER_KEY`;
   `CORP_LLM_SERVE_PORT` not a port;
 - issuance on (`CORP_GATEWAY_ISSUE_OIDC_ISSUER` set) but partially configured,
   out of range, sharing the operator audience, HTTP in prod, without
@@ -488,6 +503,12 @@ boot does).
 - `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` malformed or naming a refused route.
 
 - `CORP_LLM_ALLOW_LITELLM_DEBUG=1` with `CORP_ENV` prod/production.
+
+**Exit 3**, uvicorn's code for a failed startup: `build_guardrail()` refuses its
+configuration inside litellm's startup and logs the cause. `LITELLM_MASTER_KEY`
+set (any value, blank included: "Subscription-auth bridges"), both bridges on,
+or the oracle and the local-first cascade both off. `config check` reports the
+same problems.
 
 Exit 70 (`EX_SOFTWARE`), after litellm's startup, one log line
 `arm refused (<problem>)` per problem (`route_gate/arm_checks.py`):
@@ -561,3 +582,15 @@ key is deliberately outside it:
 `DATABASE_URL`, `DIRECT_URL` and `JSON_LOGS` are litellm's own variables. The
 entrypoint reads them from the environment the way litellm does ("Server
 entrypoint" above; `litellm_config.py`), not through the config file.
+
+## Compose stack switches (`compose/.env`, not gateway keys)
+
+The production compose stack reads these from the server's `.env`. They pick
+what compose starts; no gateway process reads them, so `config check` does not
+see them. Full reference: `compose/README.md` and `compose/.env.example`.
+
+| Key | Purpose | Default |
+|-----|---------|---------|
+| `COMPOSE_PROFILES` | the providers this host serves — at least one of `anthropic`, `codex`, `corp`, comma-separated — plus at most one front door (`nginx` or `nginx-ports`). The only switch: `--profile` on the command line is not supported, and `deploy.sh` never sets it. With no provider, `profile-guard` exits 64 and `up` fails | unset (refused) |
+| `GATEWAY_ANTHROPIC_PORT`, `GATEWAY_CODEX_PORT`, `GATEWAY_CORP_PORT` | each gateway's port on `127.0.0.1` (replaces 1.0's `GATEWAY_PORT`) | `4000`, `4001`, `4002` |
+| `NGINX_GATEWAY_UPSTREAM` | the one gateway the nginx front door proxies to: `gateway-anthropic`, `gateway-codex` or `gateway-corp`. Its provider must be in `COMPOSE_PROFILES`, or nginx exits 64. The other providers stay on their loopback ports | `gateway-anthropic` |

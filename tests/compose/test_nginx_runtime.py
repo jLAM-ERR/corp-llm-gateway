@@ -6,9 +6,10 @@ per-test copy of ``compose/nginx/`` (``nginx_container.py``). So a wrong mount p
 in compose fails here, not just a wrong template: a static test reads host files
 and cannot see what the container renders.
 
-The tracked gateway snippet proxies to ``http://litellm:4000`` and the Langfuse
-snippet to ``http://langfuse-web:3000``; here the stub upstream answers as both
-on the per-test network.
+The tracked gateway snippet proxies to ``http://gateway-anthropic:4000`` (the
+default ``NGINX_GATEWAY_UPSTREAM``) and the Langfuse snippet to
+``http://langfuse-web:3000``; here the stub upstream answers as both on the
+per-test network.
 
 Skips without Docker on a laptop and FAILS on CI (``nginx_support.skip_or_fail``).
 """
@@ -54,9 +55,7 @@ from tests.compose.nginx_container import (
     user_network,
 )
 from tests.compose.nginx_support import (
-    COMPOSE,
     NGINX_DIR,
-    OAUTH,
     ROOT,
     run_status_cli,
     skip_or_fail,
@@ -73,9 +72,9 @@ TEST_ONLY_PROXY_SNIPPET = FIXTURES / "test-only-proxy-locations.inc.template"
 STUB_UPSTREAM_SCRIPT = FIXTURES / "stub_upstream.py"
 STUB_IMAGE = "python:3.12-slim"
 STUB_ALIAS = "stub-upstream"
-# What the tracked snippets proxy to: http://litellm:4000 and
-# http://langfuse-web:3000.
-GATEWAY_ALIAS = "litellm"
+# What the tracked snippets proxy to: http://gateway-anthropic:4000 (the default
+# NGINX_GATEWAY_UPSTREAM) and http://langfuse-web:3000.
+GATEWAY_ALIAS = "gateway-anthropic"
 LANGFUSE_ALIAS = "langfuse-web"
 GATEWAY_STAND_IN_PORT = 4000
 LANGFUSE_STAND_IN_PORT = 3000
@@ -119,12 +118,6 @@ UNSET = None
 def specs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Spec]:
     """routing ("host" / "port") -> the service compose would start for it."""
     return nginx_specs(tmp_path_factory)
-
-
-@pytest.fixture(scope="module")
-def oauth_specs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Spec]:
-    """The same, from the render with the OAuth overlay — the production mode."""
-    return nginx_specs(tmp_path_factory, COMPOSE, OAUTH)
 
 
 @pytest.fixture(scope="module")
@@ -205,7 +198,7 @@ def launched_stub(network: Network) -> Iterator[Stub]:
             time.sleep(0.2)
         yield stub
     finally:
-        docker("rm", "-f", stub.name)
+        docker("rm", "-f", "-v", stub.name)
 
 
 @pytest.fixture(scope="module")
@@ -269,7 +262,7 @@ def run_to_exit(
     try:
         return docker(*argv, timeout=EXIT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        docker("rm", "-f", name)
+        docker("rm", "-f", "-v", name)
         pytest.fail("the entrypoint did not exit: nginx started on a config it should refuse")
 
 
@@ -317,6 +310,14 @@ def _domain(value: str | None) -> Refusal:
 
 def _limit(key: str, value: str) -> Refusal:
     return Refusal({**VALID_BEHIND_PROXY, key: value}, 64, (key,))
+
+
+UPSTREAM_NAMES = ("NGINX_GATEWAY_UPSTREAM", "gateway-anthropic, gateway-codex or gateway-corp")
+UPSTREAM_PROFILE_OFF = ("NGINX_GATEWAY_UPSTREAM", "COMPOSE_PROFILES", "502")
+
+
+def _upstream(value: str | None, names: tuple[str, ...], **env: str | None) -> Refusal:
+    return Refusal({**VALID_BEHIND_PROXY, "NGINX_GATEWAY_UPSTREAM": value, **env}, 64, names)
 
 
 def _langfuse(value: str | None, routing: str = "host") -> Refusal:
@@ -511,6 +512,33 @@ REFUSALS = [
     pytest.param(_limit("NGINX_TOKEN_CONN", "0"), id="token-conn-zero"),
     pytest.param(_limit("NGINX_ISSUE_RATE", "5r/m"), id="issue-rate-unit"),
     pytest.param(_limit("NGINX_ISSUE_RATE", "5\ninclude /etc/passwd"), id="issue-rate-newline"),
+    # Rendered into the upstream URL; and a provider whose profile is off would 502.
+    *(
+        pytest.param(_upstream(value, UPSTREAM_NAMES), id=f"upstream-{name}")
+        for value, name in (
+            ("litellm", "litellm"),
+            ("gateway-corporate", "unknown-provider"),
+            ("Gateway-Anthropic", "case"),
+            ("gateway-anthropic:4001", "port"),
+            ("gateway-anthropic;", "semicolon"),
+        )
+    ),
+    pytest.param(
+        _upstream("gateway-codex", UPSTREAM_PROFILE_OFF, COMPOSE_PROFILES="anthropic,nginx"),
+        id="upstream-profile-off",
+    ),
+    pytest.param(
+        _upstream(UNSET, UPSTREAM_PROFILE_OFF, COMPOSE_PROFILES="nginx"),
+        id="upstream-default-profile-off",
+    ),
+    pytest.param(
+        _upstream("gateway-corp", UPSTREAM_PROFILE_OFF, COMPOSE_PROFILES="corporate,nginx"),
+        id="upstream-inexact-profile",
+    ),
+    pytest.param(
+        _upstream("gateway-corp", UPSTREAM_PROFILE_OFF, COMPOSE_PROFILES=" corporate , nginx"),
+        id="upstream-padded-inexact-profile",
+    ),
 ]
 
 
@@ -531,6 +559,35 @@ def test_the_entrypoint_refuses(specs: dict[str, Spec], project: Path, refusal: 
 
     assert result.returncode == refusal.code, result.stderr
     _assert_one_line_naming(result, refusal.names)
+
+
+@pytest.mark.parametrize(
+    ("upstream", "profiles", "rendered"),
+    [
+        (UNSET, "anthropic,nginx", "gateway-anthropic"),
+        ("gateway-codex", "anthropic,codex,nginx", "gateway-codex"),
+        ("gateway-corp", "corp,nginx", "gateway-corp"),
+        # Compose trims each token, so this line does enable codex.
+        ("gateway-codex", "anthropic, codex ,nginx", "gateway-codex"),
+    ],
+    ids=["default-anthropic", "codex", "corp", "codex-padded-profiles"],
+)
+def test_the_entrypoint_accepts_an_enabled_gateway_and_renders_its_upstream(
+    specs: dict[str, Spec],
+    project: Path,
+    network: Network,
+    upstream: str | None,
+    profiles: str,
+    rendered: str,
+) -> None:
+    env = {**VALID_BEHIND_PROXY, "NGINX_GATEWAY_UPSTREAM": upstream, "COMPOSE_PROFILES": profiles}
+    with started(specs["host"], project, network, env) as nginx:
+        snippet = nginx.exec("cat", f"{RENDERED}/snippets/gateway-locations.inc").stdout
+
+    upstream_lines = [
+        line for line in snippet.splitlines() if line.startswith("set $gateway_upstream")
+    ]
+    assert upstream_lines == [f"set $gateway_upstream http://{rendered}:4000;"]
 
 
 LEAK_CANARY = "LEAK-CANARY-9c1e"
@@ -1423,20 +1480,20 @@ def test_the_gateway_never_sees_a_path_nginx_did_not_admit(
         assert (records[0]["method"], records[0]["target"]) in DECLARED, (target, records[0])
 
 
-@pytest.mark.parametrize("overlay", ["base", "oauth"])
+# One value, kept so the must-keep case ids ([host-base], [port-base]) stay as recorded.
+@pytest.mark.parametrize("overlay", ["base"])
 @pytest.mark.parametrize("routing", ["host", "port"])
-def test_the_allow_list_holds_under_both_routings_and_the_oauth_overlay(
+def test_the_allow_list_holds_under_both_routings_on_the_subscription_stack(
     specs: dict[str, Spec],
-    oauth_specs: dict[str, Spec],
     project: Path,
     network: Network,
     stub_upstream: Stub,
     routing: str,
     overlay: str,
 ) -> None:
-    # OAuth is the production mode, and the one where litellm's own auth is
+    # The base stack is the subscription stack, where litellm's own auth is
     # weakest: no master key at all.
-    spec = (oauth_specs if overlay == "oauth" else specs)[routing]
+    spec = specs[routing]
     seen = len(stub_upstream.requests())
     with started(spec, project, network, VALID_BEHIND_PROXY) as nginx:
         rendered = nginx.exec("cat", f"{RENDERED}/snippets/gateway-locations.inc").stdout
@@ -2450,7 +2507,7 @@ def tls_terminator(
         }
         yield Terminator(name, address, ports)
     finally:
-        docker("rm", "-f", name)
+        docker("rm", "-f", "-v", name)
 
 
 @pytest.mark.parametrize("routing", ["host", "port"])

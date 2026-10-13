@@ -28,8 +28,9 @@ COMPOSE = ROOT / "compose"
 OUR_CALLBACK = "corp_llm_gateway.bootstrap.guardrail"
 
 LITELLM_CONFIGS = {
-    "compose": COMPOSE / "litellm" / "config.yaml",
-    "compose-oauth": COMPOSE / "litellm" / "config.oauth.yaml",
+    "compose-anthropic": COMPOSE / "litellm" / "config.anthropic.yaml",
+    "compose-codex": COMPOSE / "litellm" / "config.codex.yaml",
+    "compose-corp": COMPOSE / "litellm" / "config.corp.yaml",
 }
 COMPOSE_FILES = sorted(COMPOSE.glob("docker-compose*.yml"))
 
@@ -113,7 +114,7 @@ def test_helm_litellm_config_loads_no_policies_from_the_db() -> None:
 def test_litellm_reads_the_pin_as_models_only() -> None:
     """litellm's own reader of the key (what its DB reconcile consults)."""
     litellm_proxy = pytest.importorskip("litellm.proxy.proxy_server")
-    config = yaml.safe_load(LITELLM_CONFIGS["compose"].read_text())
+    config = yaml.safe_load(LITELLM_CONFIGS["compose-corp"].read_text())
     patched = pytest.MonkeyPatch()
     try:
         patched.setattr(litellm_proxy, "general_settings", config["general_settings"])
@@ -136,20 +137,23 @@ def test_litellm_reads_the_pin_as_models_only() -> None:
 # ``general_settings`` row saying so), litellm's reconcile job re-reads the
 # ``LiteLLM_Config`` table every 30 s and applies two rows: ``litellm_settings``
 # (``_update_config_fields`` + ``_add_callbacks_from_db_config``) and ``general_settings``
-# (``_update_general_settings``); ``supported_db_objects`` gates neither. Compose gives
-# litellm both; the Helm chart gives it no database. The served-stack side (what such a
-# callback sees, the spend-log row, a pass-through route) is
-# ``tests/test_desanitize_served_stack.py``.
+# (``_update_general_settings``); ``supported_db_objects`` gates neither. Since 1.1.0
+# neither compose nor the Helm chart gives litellm a database, so the overlay is closed in
+# the shipped setups; the tests below pin what it would do if an operator added one. The
+# served-stack side (what such a callback sees, the spend-log row, a pass-through route)
+# is ``tests/test_desanitize_served_stack.py``.
 
 GUARDRAIL_INITIALISERS = frozenset({"initialize_guardrails", "init_guardrails_v2"})
 
 
-def test_compose_litellm_reads_its_config_table() -> None:
-    services = yaml.safe_load((COMPOSE / "docker-compose.yml").read_text())["services"]
-    env = _compose_env(services["litellm"].get("environment"))
-
-    assert "DATABASE_URL" in env
-    assert env.get("STORE_MODEL_IN_DB") == "True"
+def test_compose_litellm_has_no_database_to_read_a_config_table_from() -> None:
+    for path in COMPOSE_FILES:
+        services = (yaml.safe_load(path.read_text()) or {}).get("services") or {}
+        for name, service in _gateway_image_services(services).items():
+            env = _compose_env(service.get("environment"))
+            for key in ("DATABASE_URL", "DIRECT_URL", "STORE_MODEL_IN_DB"):
+                assert key not in env, (path.name, name, key)
+    assert not (COMPOSE / "postgres" / "initdb" / "00-create-litellm-db.sh").exists()
 
 
 @pytest.mark.requires_helm
@@ -182,7 +186,7 @@ def test_a_db_litellm_settings_row_appends_callbacks_and_starts_no_guardrail(
 
     ours = object()
     monkeypatch.setattr(litellm, "callbacks", [ours])
-    config = yaml.safe_load(LITELLM_CONFIGS["compose"].read_text())
+    config = yaml.safe_load(LITELLM_CONFIGS["compose-corp"].read_text())
     row = {
         "callbacks": ["db-row-callback"],
         "guardrails": [{"guardrail_name": "db-row", "litellm_params": {"guardrail": "x"}}],
@@ -360,6 +364,19 @@ async def test_litellm_content_filter_masks_one_way_and_logs_its_matches() -> No
     assert term in str(blocked.value.detail)
 
 
+# Every service that runs the gateway image, in any compose file: the provider
+# gateways, profile-guard, and (with the local overlay) local-init.
+GATEWAY_IMAGE_SERVICES = ("profile-guard", "local-init")
+
+
+def _gateway_image_services(services: dict[str, Any]) -> dict[str, Any]:
+    return {
+        name: service or {}
+        for name, service in services.items()
+        if name.startswith("gateway-") or name in GATEWAY_IMAGE_SERVICES
+    }
+
+
 def _compose_env(entries: Any) -> dict[str, Any]:
     if isinstance(entries, dict):
         return dict(entries)
@@ -373,10 +390,14 @@ def _compose_env(entries: Any) -> dict[str, Any]:
 @pytest.mark.parametrize("path", COMPOSE_FILES, ids=lambda p: p.name)
 def test_compose_gateway_env_turns_no_litellm_debug_on(path: Path) -> None:
     services = (yaml.safe_load(path.read_text()) or {}).get("services") or {}
-    gateway = services.get("litellm")
-    if gateway is None:
-        pytest.skip(f"{path.name} does not define the gateway service")
-    _assert_no_debug_env(_compose_env(gateway.get("environment")))
+    gateways = _gateway_image_services(services)
+    if not gateways:
+        pytest.skip(f"{path.name} does not define a gateway service")
+    for name, gateway in gateways.items():
+        try:
+            _assert_no_debug_env(_compose_env(gateway.get("environment")))
+        except AssertionError as exc:
+            raise AssertionError(f"{path.name}:{name}: {exc}") from exc
 
 
 @pytest.mark.requires_helm
@@ -391,7 +412,6 @@ def test_the_compose_file_set_is_the_one_this_guard_expects() -> None:
     # A new overlay is picked up by the glob; this pins that the glob still finds them.
     assert {p.name for p in COMPOSE_FILES} >= {
         "docker-compose.yml",
-        "docker-compose.oauth.yml",
         "docker-compose.issuance.yml",
         "docker-compose.build.yml",
     }

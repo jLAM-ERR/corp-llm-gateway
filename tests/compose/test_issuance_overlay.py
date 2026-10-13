@@ -1,9 +1,9 @@
 """Developer token issuance on the compose stack: `docker-compose.issuance.yml`.
 
 The team map is a TOML table, so it can only reach the gateway in a config file.
-The overlay mounts `gateway/config.toml` and passes the scalar keys by bare name;
-the base stack stays unchanged, so a subscription deploy without Keycloak is not
-affected.
+The overlay mounts `gateway/config.toml` on every provider's gateway and passes
+the scalar keys by bare name; the base stack stays unchanged, so a deploy without
+Keycloak is not affected.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from corp_llm_gateway import settings
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_DIR = ROOT / "compose"
 COMPOSE = COMPOSE_DIR / "docker-compose.yml"
-OAUTH = COMPOSE_DIR / "docker-compose.oauth.yml"
 OVERLAY = COMPOSE_DIR / "docker-compose.issuance.yml"
 ENV_EXAMPLE = COMPOSE_DIR / ".env.example"
 CONFIG_EXAMPLE = COMPOSE_DIR / "gateway" / "config.toml.example"
@@ -38,8 +37,12 @@ ISSUE_SCALARS = tuple(
 )
 
 
-def _litellm(path: Path) -> dict[str, Any]:
-    return yaml.safe_load(path.read_text())["services"]["litellm"]
+GATEWAYS = ("gateway-anthropic", "gateway-codex", "gateway-corp")
+
+
+def _gateways(path: Path) -> dict[str, dict[str, Any]]:
+    services = yaml.safe_load(path.read_text())["services"]
+    return {name: services[name] for name in GATEWAYS}
 
 
 def test_the_scalar_list_covers_every_issuance_key() -> None:
@@ -49,33 +52,33 @@ def test_the_scalar_list_covers_every_issuance_key() -> None:
 def test_the_overlay_mounts_the_config_file_read_only_and_never_creates_it() -> None:
     # create_host_path: false — a missing file must fail `up`, not become an
     # empty directory that the loader skips (issuance silently off).
-    assert _litellm(OVERLAY)["volumes"] == [
-        {
-            "type": "bind",
-            "source": "./gateway/config.toml",
-            "target": TARGET,
-            "read_only": True,
-            "bind": {"create_host_path": False},
-        }
-    ]
+    for name, gateway in _gateways(OVERLAY).items():
+        assert gateway["volumes"] == [
+            {
+                "type": "bind",
+                "source": "./gateway/config.toml",
+                "target": TARGET,
+                "read_only": True,
+                "bind": {"create_host_path": False},
+            }
+        ], name
 
 
 def test_the_overlay_points_the_loader_at_the_file_and_passes_the_scalars_by_bare_name() -> None:
-    environment = _litellm(OVERLAY)["environment"]
-
-    assert f"CORP_LLM_GATEWAY_CONFIG_FILE={TARGET}" in environment
-    # Bare names: unset in .env means absent, so the file's value is not shadowed.
-    for key in ISSUE_SCALARS:
-        assert key in environment, key
-    assert TEAM_MAP_KEY not in " ".join(environment)
+    for name, gateway in _gateways(OVERLAY).items():
+        environment = gateway["environment"]
+        assert f"CORP_LLM_GATEWAY_CONFIG_FILE={TARGET}" in environment, name
+        # Bare names: unset in .env means absent, so the file's value is not shadowed.
+        for key in ISSUE_SCALARS:
+            assert key in environment, (name, key)
+        assert TEAM_MAP_KEY not in " ".join(environment), name
 
 
 def test_the_base_stack_carries_no_issuance_wiring() -> None:
-    litellm = _litellm(COMPOSE)
-
-    assert not [e for e in litellm["environment"] if "CORP_GATEWAY_ISSUE_" in e]
-    assert not [v for v in litellm["volumes"] if TARGET in str(v)]
-    assert "CORP_GATEWAY_ISSUE_" not in OAUTH.read_text()
+    for name, gateway in _gateways(COMPOSE).items():
+        assert not [e for e in gateway["environment"] if "CORP_GATEWAY_ISSUE_" in e], name
+        assert not [v for v in gateway["volumes"] if TARGET in str(v)], name
+    assert "CORP_GATEWAY_ISSUE_" not in COMPOSE.read_text()
 
 
 def test_the_env_example_lists_every_scalar_commented() -> None:
@@ -88,7 +91,7 @@ def test_the_env_example_lists_every_scalar_commented() -> None:
 
 
 def test_the_env_example_offers_the_compose_file_line_with_the_overlay() -> None:
-    line = "# COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml:docker-compose.issuance.yml"
+    line = "# COMPOSE_FILE=docker-compose.yml:docker-compose.issuance.yml"
 
     assert line in ENV_EXAMPLE.read_text().splitlines()
 
@@ -164,15 +167,18 @@ REQUIRED_ENV = (
 )
 
 
-def _render(tmp_path: Path, *files: Path, env_extra: str = "") -> dict[str, Any]:
+def _render(
+    tmp_path: Path, *files: Path, env_extra: str = "", provider: str = "anthropic"
+) -> dict[str, Any]:
     project_dir = tmp_path / "compose"
     shutil.copytree(COMPOSE_DIR, project_dir)
     shutil.copy(CONFIG_EXAMPLE, project_dir / "gateway" / "config.toml")
-    env_text = "".join(f"{key}=render-fixture\n" for key in REQUIRED_ENV) + env_extra
+    env_text = "".join(f"{key}=render-fixture\n" for key in REQUIRED_ENV)
+    env_text += f"COMPOSE_PROFILES={provider}\n" + env_extra
     (project_dir / ".env").write_text(env_text)
     pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)")
     interpolated: set[str] = set()
-    for path in (COMPOSE, OAUTH, OVERLAY):
+    for path in (COMPOSE, OVERLAY):
         interpolated |= set(pattern.findall(path.read_text()))
     env = {
         key: value
@@ -191,51 +197,66 @@ def _render(tmp_path: Path, *files: Path, env_extra: str = "") -> dict[str, Any]
     )
     if result.returncode != 0:
         pytest.fail(f"docker compose config failed (exit {result.returncode}):\n{result.stderr}")
-    litellm = yaml.safe_load(result.stdout)["services"]["litellm"]
-    litellm["_project_dir"] = project_dir.resolve()
-    return litellm
+    gateway = yaml.safe_load(result.stdout)["services"][f"gateway-{provider}"]
+    gateway["_project_dir"] = project_dir.resolve()
+    return gateway
 
 
-def _mounts_at(litellm: dict[str, Any], target: str) -> list[dict[str, Any]]:
-    return [v for v in litellm.get("volumes", []) if v.get("target") == target]
+def _mounts_at(gateway: dict[str, Any], target: str) -> list[dict[str, Any]]:
+    return [v for v in gateway.get("volumes", []) if v.get("target") == target]
 
 
 @needs_compose_cli
 def test_the_merged_stack_mounts_the_config_file_beside_the_oauth_config(
     tmp_path: Path,
 ) -> None:
-    litellm = _render(tmp_path, COMPOSE, OAUTH, OVERLAY)
+    # (CORP_LLM_FORWARD_ANTHROPIC_AUTH, CORP_LLM_FORWARD_CHATGPT_AUTH) per provider.
+    for provider, bridges in (
+        ("anthropic", ("1", "0")),
+        ("codex", ("0", "1")),
+        ("corp", ("0", "0")),
+    ):
+        gateway = _render(tmp_path / provider, COMPOSE, OVERLAY, provider=provider)
+        environment = gateway["environment"]
 
-    (mount,) = _mounts_at(litellm, TARGET)
-    assert Path(mount["source"]) == litellm["_project_dir"] / "gateway" / "config.toml"
-    assert mount["read_only"] is True
-    (oauth,) = _mounts_at(litellm, "/etc/litellm/config.yaml")
-    assert Path(oauth["source"]).name == "config.oauth.yaml"
-    assert litellm["environment"]["CORP_LLM_FORWARD_ANTHROPIC_AUTH"] == "1"
+        (mount,) = _mounts_at(gateway, TARGET)
+        assert Path(mount["source"]) == gateway["_project_dir"] / "gateway" / "config.toml"
+        assert mount["read_only"] is True
+        (config,) = _mounts_at(gateway, "/etc/litellm/config.yaml")
+        assert Path(config["source"]).name == f"config.{provider}.yaml"
+        assert (
+            environment["CORP_LLM_FORWARD_ANTHROPIC_AUTH"],
+            environment["CORP_LLM_FORWARD_CHATGPT_AUTH"],
+        ) == bridges, provider
 
 
 @needs_compose_cli
 def test_the_merged_stack_leaves_unset_scalars_absent_and_passes_set_ones(
     tmp_path: Path,
 ) -> None:
-    litellm = _render(
-        tmp_path,
-        COMPOSE,
-        OAUTH,
-        OVERLAY,
-        env_extra="CORP_GATEWAY_ISSUE_OIDC_ISSUER=https://keycloak.corp.lan/realms/dev\n",
-    )
-    environment = litellm["environment"]
+    for provider in ("anthropic", "codex", "corp"):
+        gateway = _render(
+            tmp_path / provider,
+            COMPOSE,
+            OVERLAY,
+            env_extra="CORP_GATEWAY_ISSUE_OIDC_ISSUER=https://keycloak.corp.lan/realms/dev\n",
+            provider=provider,
+        )
+        environment = gateway["environment"]
 
-    assert environment["CORP_LLM_GATEWAY_CONFIG_FILE"] == TARGET
-    assert environment["CORP_GATEWAY_ISSUE_OIDC_ISSUER"] == "https://keycloak.corp.lan/realms/dev"
-    # `null` is compose's rendering of an unresolved bare name: not set in the container.
-    assert environment["CORP_GATEWAY_ISSUE_MAX_ACTIVE"] is None
+        assert environment["CORP_LLM_GATEWAY_CONFIG_FILE"] == TARGET, provider
+        assert environment["CORP_GATEWAY_ISSUE_OIDC_ISSUER"] == (
+            "https://keycloak.corp.lan/realms/dev"
+        ), provider
+        # `null` is compose's rendering of an unresolved bare name: not set in the container.
+        for key in ISSUE_SCALARS:
+            if key != "CORP_GATEWAY_ISSUE_OIDC_ISSUER":
+                assert environment[key] is None, (provider, key)
 
 
 @needs_compose_cli
 def test_the_stack_without_the_overlay_mounts_no_config_file(tmp_path: Path) -> None:
-    litellm = _render(tmp_path, COMPOSE, OAUTH)
+    gateway = _render(tmp_path, COMPOSE)
 
-    assert _mounts_at(litellm, TARGET) == []
-    assert "CORP_LLM_GATEWAY_CONFIG_FILE" not in litellm["environment"]
+    assert _mounts_at(gateway, TARGET) == []
+    assert "CORP_LLM_GATEWAY_CONFIG_FILE" not in gateway["environment"]

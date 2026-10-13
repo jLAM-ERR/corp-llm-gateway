@@ -1694,6 +1694,25 @@ def test_config_check_malformed_value_exits_nonzero(
     assert "CORP_LLM_OVERSIZE_POLICY" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("bridge", [None, "CORP_LLM_FORWARD_ANTHROPIC_AUTH"])
+def test_config_check_refuses_a_master_key(
+    hermetic_gateway_config: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    bridge: str | None,
+) -> None:
+    monkeypatch.setenv("CORP_LLM_ENDPOINT", "https://x/v1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
+    if bridge is not None:
+        monkeypatch.setenv(bridge, "1")
+    rc = main(["config", "check", "--no-probe"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "LITELLM_MASTER_KEY" in captured.err
+    assert "1.1.0" in captured.err
+    assert "master-key-fixture" not in captured.out + captured.err
+
+
 def test_config_check_json_ok(
     hermetic_gateway_config: None,
     monkeypatch: pytest.MonkeyPatch,

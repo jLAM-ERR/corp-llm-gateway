@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -145,6 +146,42 @@ def test_a_database_url_elsewhere_in_the_config_is_fine(tmp_path: Path) -> None:
     assert litellm_config.problems(path, require_file=True) == []
 
 
+_CONFIG_MASTER_KEY_VALUE = "sk-config-master-key-fixture"
+
+# litellm reads `general_settings.master_key` ahead of LITELLM_MASTER_KEY, resolving an
+# `os.environ/` value; `environment_variables` is exported to os.environ at startup.
+CONFIG_MASTER_KEYS = {
+    "literal": f"general_settings:\n  master_key: {_CONFIG_MASTER_KEY_VALUE}\n",
+    "os-environ": "general_settings:\n  master_key: os.environ/OTHER_MASTER_KEY\n",
+    "null": "general_settings:\n  master_key:\n",
+    "environment-variables": (
+        f"environment_variables:\n  LITELLM_MASTER_KEY: {_CONFIG_MASTER_KEY_VALUE}\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("block", sorted(CONFIG_MASTER_KEYS))
+def test_a_config_master_key_is_refused_without_echoing_it(tmp_path: Path, block: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("model_list: []\n" + CONFIG_MASTER_KEYS[block])
+
+    found = litellm_config.problems(path, require_file=True)
+
+    assert len(found) == 1
+    assert "master" in found[0].lower() and "is refused" in found[0]
+    assert "1.1.0" in found[0]
+    assert _CONFIG_MASTER_KEY_VALUE not in found[0]
+    assert "OTHER_MASTER_KEY" not in found[0]
+
+
+def test_a_master_key_named_elsewhere_in_the_config_is_fine(tmp_path: Path) -> None:
+    # Only general_settings.master_key and the exported variable reach litellm's proxy auth.
+    path = tmp_path / "config.yaml"
+    path.write_text("model_list: []\nlitellm_settings:\n  master_key_hint: x\n")
+
+    assert litellm_config.problems(path, require_file=True) == []
+
+
 UNDER_GENERAL_SETTINGS = """
 model_list: []
 general_settings:
@@ -266,6 +303,19 @@ def test_config_check_refuses_a_config_only_database_url(
     assert any("general_settings.database_url is refused" in problem for problem in problems)
 
 
+@pytest.mark.parametrize("block", ["literal", "os-environ"])
+def test_config_check_refuses_a_config_master_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block: str
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("model_list: []\n" + CONFIG_MASTER_KEYS[block])
+
+    problems = _validate(monkeypatch, CORP_LLM_LITELLM_CONFIG=str(path))
+
+    assert any("general_settings.master_key is refused" in problem for problem in problems)
+    assert _CONFIG_MASTER_KEY_VALUE not in "".join(problems)
+
+
 def test_config_check_passes_on_a_valid_config(
     valid: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -301,8 +351,9 @@ def test_config_check_accepts_the_default_serve_port(
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SERVING_LITELLM_CONFIGS = (
-    _ROOT / "compose" / "litellm" / "config.yaml",
-    _ROOT / "compose" / "litellm" / "config.oauth.yaml",
+    _ROOT / "compose" / "litellm" / "config.anthropic.yaml",
+    _ROOT / "compose" / "litellm" / "config.codex.yaml",
+    _ROOT / "compose" / "litellm" / "config.corp.yaml",
 )
 # Everything a deploy renders litellm's config or env from.
 _DEPLOY_INPUTS = ("compose", "docker", "examples", "helm")
@@ -357,10 +408,160 @@ def test_no_deploy_input_sets_litellms_dead_concurrency_knobs() -> None:
 def test_the_compose_gateway_carries_the_in_flight_cap() -> None:
     import yaml
 
-    compose = yaml.safe_load((_ROOT / "compose" / "docker-compose.yml").read_text())
-    environment = compose["services"]["litellm"]["environment"]
+    services = yaml.safe_load((_ROOT / "compose" / "docker-compose.yml").read_text())["services"]
+    gateways = [name for name in services if name.startswith("gateway-")]
 
-    assert "CORP_LLM_MAX_INFLIGHT=${CORP_LLM_MAX_INFLIGHT:-64}" in environment
-    assert "CORP_LLM_CANCEL_GRACE_SECONDS=${CORP_LLM_CANCEL_GRACE_SECONDS:-5}" in environment
-    # The compose default is production, where a cap of 0 refuses to boot.
-    assert "CORP_ENV=${CORP_ENV:-production}" in environment
+    assert len(gateways) == 3
+    for name in gateways:
+        environment = services[name]["environment"]
+        assert environment["CORP_LLM_MAX_INFLIGHT"] == "${CORP_LLM_MAX_INFLIGHT:-64}", name
+        assert environment["CORP_LLM_CANCEL_GRACE_SECONDS"] == (
+            "${CORP_LLM_CANCEL_GRACE_SECONDS:-5}"
+        ), name
+        # The compose default is production, where a cap of 0 refuses to boot.
+        assert environment["CORP_ENV"] == "${CORP_ENV:-production}", name
+
+
+# ── one litellm config per compose provider ──────────────────────────────────
+
+_LITELLM_DIR = _ROOT / "compose" / "litellm"
+_PROVIDER_CONFIGS = {
+    "anthropic": _LITELLM_DIR / "config.anthropic.yaml",
+    "codex": _LITELLM_DIR / "config.codex.yaml",
+    "corp": _LITELLM_DIR / "config.corp.yaml",
+}
+_PROVIDER_ROUTES = {
+    "anthropic": [("claude-*", "anthropic/claude-*")],
+    "codex": [("*", "openai/*")],
+    "corp": [("corp-*", "hosted_vllm/GLM-5.1-AWQ")],
+}
+_CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
+_PLACEHOLDER = "oauth-passthrough-placeholder"
+_SUBSCRIPTION_PARAMS = {
+    "anthropic": {"model": "anthropic/claude-*", "api_key": _PLACEHOLDER},
+    "codex": {"model": "openai/*", "api_key": _PLACEHOLDER, "api_base": _CODEX_API_BASE},
+}
+_FORBIDDEN_KEYS = ("master_key", "LITELLM_MASTER_KEY", "set_verbose")
+_EXTRA_PIPELINE_KEYS = (
+    "success_callback",
+    "failure_callback",
+    "input_callback",
+    "service_callback",
+    "guardrails",
+)
+_providers = pytest.mark.parametrize("provider", sorted(_PROVIDER_CONFIGS))
+
+
+def _provider_config(provider: str) -> dict:
+    import yaml
+
+    return yaml.safe_load(_PROVIDER_CONFIGS[provider].read_text())
+
+
+def _keys_anywhere(node: object) -> set[str]:
+    if isinstance(node, dict):
+        return set(node) | {key for value in node.values() for key in _keys_anywhere(value)}
+    if isinstance(node, list):
+        return {key for item in node for key in _keys_anywhere(item)}
+    return set()
+
+
+@_providers
+def test_each_provider_config_routes_only_its_own_provider(provider: str) -> None:
+    routes = [
+        (entry["model_name"], entry["litellm_params"]["model"])
+        for entry in _provider_config(provider)["model_list"]
+    ]
+
+    assert routes == _PROVIDER_ROUTES[provider]
+
+
+@_providers
+def test_each_provider_config_runs_only_the_production_callback(provider: str) -> None:
+    document = _provider_config(provider)
+    settings_ = document["litellm_settings"]
+
+    assert settings_["callbacks"] == ["corp_llm_gateway.bootstrap.guardrail"]
+    assert not _keys_anywhere(document) & set(_EXTRA_PIPELINE_KEYS)
+    assert settings_["drop_params"] is True
+    assert settings_["json_logs"] is True
+
+
+@_providers
+def test_each_provider_config_cancels_on_disconnect_and_loads_only_models(provider: str) -> None:
+    general = _provider_config(provider)["general_settings"]
+
+    assert general["cancel_on_disconnect"] is True
+    assert general["supported_db_objects"] == ["models"]
+    assert litellm_config.problems(_PROVIDER_CONFIGS[provider], require_file=True) == []
+
+
+def _strings_anywhere(node: object) -> list[str]:
+    if isinstance(node, dict):
+        return [s for value in node.values() for s in _strings_anywhere(value)]
+    if isinstance(node, list):
+        return [s for item in node for s in _strings_anywhere(item)]
+    return [node] if isinstance(node, str) else []
+
+
+@_providers
+def test_no_provider_config_reads_an_api_key_env_var(provider: str) -> None:
+    values = _strings_anywhere(_provider_config(provider))
+
+    assert values
+    assert not [v for v in values if re.fullmatch(r"os\.environ/\w*API_KEY", v)]
+
+
+@_providers
+def test_no_provider_config_sets_a_master_key_or_verbose_logging(provider: str) -> None:
+    assert not _keys_anywhere(_provider_config(provider)) & set(_FORBIDDEN_KEYS)
+
+
+def test_the_config_walks_find_nested_keys_and_values() -> None:
+    nested = {
+        "general_settings": {"master_key": "sk-1"},
+        "router_settings": {"set_verbose": False},
+        "model_list": [{"litellm_params": {"master_key": "x"}}],
+        "environment_variables": {"LITELLM_MASTER_KEY": "sk-2"},
+        "guardrails": [{"litellm_settings": {"input_callback": [], "service_callback": []}}],
+        "litellm_settings": {"success_callback": [], "failure_callback": []},
+    }
+
+    assert _keys_anywhere(nested) >= set(_FORBIDDEN_KEYS) | set(_EXTRA_PIPELINE_KEYS)
+    assert "os.environ/OPENAI_API_KEY" in _strings_anywhere(
+        {"model_list": [{"litellm_params": {"api_key": "os.environ/OPENAI_API_KEY"}}]}
+    )
+    assert _keys_anywhere({}) == set()
+    assert _keys_anywhere([]) == set()
+
+
+@pytest.mark.parametrize("provider", sorted(_SUBSCRIPTION_PARAMS))
+def test_subscription_routes_carry_only_the_placeholder_and_a_fixed_destination(
+    provider: str,
+) -> None:
+    (entry,) = _provider_config(provider)["model_list"]
+
+    assert entry["litellm_params"] == _SUBSCRIPTION_PARAMS[provider]
+
+
+@pytest.mark.parametrize("provider", sorted(_SUBSCRIPTION_PARAMS))
+def test_no_subscription_config_reads_the_environment(provider: str) -> None:
+    values = _strings_anywhere(_provider_config(provider))
+
+    assert values
+    assert not [v for v in values if v.startswith("os.environ/")]
+
+
+def test_the_codex_config_sends_to_the_literal_chatgpt_url() -> None:
+    (entry,) = _provider_config("codex")["model_list"]
+
+    assert entry["litellm_params"]["api_base"] == _CODEX_API_BASE
+
+
+def test_the_corp_config_reaches_the_corp_vllm_from_the_environment() -> None:
+    (entry,) = _provider_config("corp")["model_list"]
+    params = entry["litellm_params"]
+
+    assert params["api_base"] == "os.environ/CORP_LLM_ENDPOINT"
+    assert params["api_key"] == "os.environ/CORP_LLM_AUTH_TOKEN"
+    assert params["max_tokens"] == 4096

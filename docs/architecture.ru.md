@@ -7,9 +7,10 @@
 LiteLLM как callback; всё остальное (конвейер аудита, аутентификация, наблюдаемость, serving) —
 на эксплуатируемом open-source, а не написано внутри.
 
-Каждый запрос санитизируется в `pre_call`, форвардится в Anthropic / OpenAI с сохранённым
-BYOK-ключом разработчика, де-санитизируется на обратном пути собственным ASGI-слоем шлюза (вне
-LiteLLM) и аудируется.
+Каждый запрос санитизируется в `pre_call`, форвардится своему провайдеру — в Anthropic или
+ChatGPT Codex с подписочным токеном разработчика как креденшелом (его переносит мост провайдера)
+либо в корп-vLLM с собственным токеном шлюза — де-санитизируется на обратном пути собственным
+ASGI-слоем шлюза (вне LiteLLM) и аудируется.
 
 ## Поток данных запроса
 
@@ -37,7 +38,7 @@ flowchart TD
         DLP -->|"canary / secret leak"| B5(["HTTP 422  block_reason"])
     end
 
-    DLP -->|clean| UP["Anthropic / OpenAI  (Authorization:Bearer untouched)"]
+    DLP -->|clean| UP["Anthropic / ChatGPT Codex / corp vLLM  (bridge credential or route token only)"]
     UP --> DS["ASGI desanitiser, outside LiteLLM · route_gate/desanitize_middleware.py  (placeholders longest-first)"]
     DS --> AUD["audit · Vector → Langfuse + S3 + SIEM  (NEVER-fields gate)"]
     DS -->|"originals restored"| Dev

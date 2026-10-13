@@ -213,6 +213,32 @@ def test_a_config_only_database_url_exits_78(tmp_path: Path) -> None:
     assert result["proxy_imported"] is False
 
 
+_CONFIG_MASTER_KEY_VALUE = "sk-config-master-key-fixture"
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        f"general_settings:\n  master_key: {_CONFIG_MASTER_KEY_VALUE}\n",
+        "general_settings:\n  master_key: os.environ/OTHER_MASTER_KEY\n",
+        f"environment_variables:\n  LITELLM_MASTER_KEY: {_CONFIG_MASTER_KEY_VALUE}\n",
+    ],
+    ids=["literal", "os-environ", "environment-variables"],
+)
+def test_the_served_entrypoint_exits_78_on_a_config_master_key(tmp_path: Path, block: str) -> None:
+    # litellm reads general_settings.master_key ahead of LITELLM_MASTER_KEY, so the
+    # env-only check in build_guardrail() would let virtual-key auth boot.
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID_CONFIG + block)
+
+    completed = _serve(path, {"OTHER_MASTER_KEY": _CONFIG_MASTER_KEY_VALUE})
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 78, output
+    assert "master" in output and "is refused" in output
+    assert _CONFIG_MASTER_KEY_VALUE not in output
+
+
 def test_a_config_with_pass_through_endpoints_exits_78(tmp_path: Path) -> None:
     # SafeRouteAdder registers those paths at runtime; the route gate cannot
     # classify them, so default-deny would 404 every one. Refuse the config.
@@ -1714,6 +1740,29 @@ def test_a_clean_boot_arms_and_config_check_raises_no_debug_problem(valid_config
     assert result["armed"] is True
     assert _arm_refusals(result) == []
     assert not [p for p in result["config_check"] if p.startswith("litellm_")]
+
+
+@pytest.mark.parametrize(
+    ("master_key", "env"),
+    [
+        ("master-key-fixture", {}),
+        ("", {}),
+        ("master-key-fixture", {"CORP_LLM_FORWARD_ANTHROPIC_AUTH": "1"}),
+    ],
+    ids=["no-bridge", "no-bridge-blank", "anthropic-bridge"],
+)
+def test_the_served_entrypoint_refuses_to_boot_with_a_master_key(
+    valid_config: Path, master_key: str, env: dict[str, str]
+) -> None:
+    # build_guardrail() raises inside litellm's startup, so uvicorn never serves.
+    completed = _serve(valid_config, {"LITELLM_MASTER_KEY": master_key, **env})
+
+    output = completed.stdout + completed.stderr
+    # uvicorn's exit code when the lifespan startup fails.
+    assert completed.returncode == 3, output
+    assert "LITELLM_MASTER_KEY is set" in output
+    assert "1.1.0" in output
+    assert "master-key-fixture" not in output
 
 
 def test_the_test_only_key_lets_litellm_debug_arm_outside_prod(valid_config: Path) -> None:

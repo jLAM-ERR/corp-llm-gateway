@@ -27,7 +27,6 @@ ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_DIR = ROOT / "compose"
 NGINX_DIR = COMPOSE_DIR / "nginx"
 COMPOSE = COMPOSE_DIR / "docker-compose.yml"
-OAUTH = COMPOSE_DIR / "docker-compose.oauth.yml"
 ISSUANCE = COMPOSE_DIR / "docker-compose.issuance.yml"
 CONFIG_EXAMPLE = COMPOSE_DIR / "gateway" / "config.toml.example"
 
@@ -47,12 +46,19 @@ ENTRYPOINT_KEYS = (
     "NGINX_TOKEN_BURST",
     "NGINX_TOKEN_CONN",
     "NGINX_ISSUE_RATE",
+    "NGINX_GATEWAY_UPSTREAM",
+    "COMPOSE_PROFILES",
 )
 COMPOSE_ONLY_KEYS = ("NGINX_PORT", "NGINX_LANGFUSE_PORT")
 
+# The 1.0 Mode A keys: no compose file reads them any more, and a value left in a
+# shell must not leak into a render either.
 MODE_A_ONLY_KEYS = ("LITELLM_MASTER_KEY", "UI_USERNAME", "UI_PASSWORD")
-# Every `${X:?...}` in the base file, minus the Mode A keys the subscription mode
-# omits. Values are obvious non-credentials; only their presence in the render matters.
+# The provider profile a render selects unless a test names others: every gateway
+# is profiled, and profile-guard refuses a stack without one.
+DEFAULT_PROVIDERS = "anthropic"
+# Every `${X:?...}` in the base file. Values are obvious non-credentials; only
+# their presence in the render matters.
 REQUIRED_ENV = (
     "POSTGRES_PASSWORD",
     "GATEWAY_IMAGE_TAG",
@@ -97,7 +103,7 @@ def require_compose_cli() -> None:
 def _interpolated_names() -> set[str]:
     pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)")
     names: set[str] = set()
-    for path in (COMPOSE, OAUTH, ISSUANCE):
+    for path in (COMPOSE, ISSUANCE):
         names |= set(pattern.findall(path.read_text()))
     return names
 
@@ -134,18 +140,21 @@ def render(
     tmp_path: Path,
     *files: Path,
     profiles: str | None = None,
+    providers: str = DEFAULT_PROVIDERS,
     env_extra: str = "",
     check: bool = True,
 ) -> Render:
     """``docker compose config`` on a copy of ``compose/``; COMPOSE_PROFILES comes from
-    the project ``.env``, which is how the server selects the front door."""
+    the project ``.env``, which is how the server selects the providers and the front
+    door: ``providers`` first, then ``profiles``."""
     project_dir = tmp_path / "compose"
     shutil.copytree(COMPOSE_DIR, project_dir)
     if ISSUANCE in files:
         shutil.copy(CONFIG_EXAMPLE, project_dir / "gateway" / "config.toml")
     env_text = "".join(f"{key}=render-fixture\n" for key in REQUIRED_ENV)
-    if profiles is not None:
-        env_text += f"COMPOSE_PROFILES={profiles}\n"
+    selected = ",".join(part for part in (providers, profiles) if part)
+    if selected:
+        env_text += f"COMPOSE_PROFILES={selected}\n"
     (project_dir / ".env").write_text(env_text + env_extra)
     argv = ["docker", "compose", "--project-name", "corp-nginx-render"]
     for path in files or (COMPOSE,):

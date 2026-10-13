@@ -31,6 +31,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import re
 import time
 import uuid
 import weakref
@@ -262,12 +263,9 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         # vLLM's 65536-token total context window. Default None = no
         # clamp; behaviour is unchanged in production.
         self._max_output_tokens_cap = max_output_tokens_cap
-        # When True, strip inbound HTTP client headers from `data` before
-        # litellm's provider layer forwards them to the upstream LLM.
-        # Some providers (e.g. hosted_vllm) silently pass
-        # `proxy_server_request.headers` through, so the upstream sees
-        # `Host: 127.0.0.1:4000` and the corp ingress 503s on the unknown
-        # vhost. Off by default to preserve existing behaviour.
+        # When True, drop the inbound wire headers (Host, Content-Length, ...) from
+        # litellm's own header copies too. What goes upstream, data["headers"], is
+        # the allowlist projection below whatever this says.
         self._strip_inbound_headers_to_upstream = strip_inbound_headers_to_upstream
         # Opt-in bridge for a Codex custom provider with
         # ``requires_openai_auth = true``. LiteLLM consumes the client
@@ -450,13 +448,16 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
         `pre_call()` call site/test) preserves today's behavior; only the real
         `async_pre_call_hook` wiring supplies a call_type.
         """
+        _drop_client_control_keys(data)
         request_id = self._ensure_request_id(data)
         pre_call_started = time.monotonic()
         pre_call_wall = time.time()
         # Read for auth, then stripped before anything can refuse: litellm hands a
         # refused request, as it stands, to every failure hook (invariant 4).
         inbound_headers = _extract_auth_headers(data)
-        data["headers"] = self._auth.strip_corp_token(_extract_headers(data))
+        # litellm sends data["headers"] upstream on every provider, outside the
+        # sanitizer and the Stage-5 scan: only the allowlist goes there.
+        data["headers"] = self._auth.strip_corp_token(_upstream_headers(inbound_headers))
         # The corp token arrives duplicated across every header-bearing location
         # and some providers forward proxy_server_request.headers upstream, so
         # strip it from ALL of them, not just data["headers"] (invariant 4).
@@ -557,12 +558,8 @@ class CorpLlmGuardrail(_LitellmCustomLogger):
             ctx.user_id,
         )
 
-        # Optional: strip inbound HTTP wire headers from data so litellm
-        # providers (notably hosted_vllm) don't forward them upstream.
-        # `Host: 127.0.0.1:4000` going to the corp ingress earns a
-        # vhost-not-found 503. Only nuke the hop-by-hop / wire-level
-        # headers; preserve protocol-meaningful ones like
-        # `anthropic-version` and `authorization` (BYOK passthrough).
+        # Optional: drop the inbound wire headers from litellm's own header copies
+        # as well. data["headers"] is already the allowlist projection.
         if self._strip_inbound_headers_to_upstream:
             _drop_wire_headers(data.get("headers"))
             proxy_req = data.get("proxy_server_request")
@@ -2195,11 +2192,12 @@ def _resolve_request_data(kwargs: dict[str, Any]) -> dict[str, Any]:
 # The internal corp auth header — never egress it (invariant 4, M1-14).
 _CORP_AUTH_HEADER_LOWER = AuthMiddleware.HEADER_NAME.lower()
 
-# Inbound HTTP wire-level headers that must NOT be forwarded to upstream
-# LLMs by any provider. Mostly hop-by-hop or request-scoped values that
-# describe the LiteLLM proxy's own connection from the client. Includes
-# x-corp-auth as defense-in-depth; the unconditional strip below is the
-# primary guard. Never add `authorization` here — BYOK passthrough (invariant 3).
+# Inbound HTTP wire-level headers dropped from litellm's own header copies when
+# CORP_LLM_STRIP_INBOUND_HEADERS is on: hop-by-hop or request-scoped values that
+# describe the client's connection to the gateway. Includes x-corp-auth as
+# defense-in-depth; the unconditional strip below is the primary guard. Not
+# `authorization`: the bridges read the developer's token from these copies.
+# What goes upstream is decided by _UPSTREAM_HEADER_ALLOWLIST, not by this list.
 _WIRE_HEADERS_TO_DROP = frozenset(
     {
         "host",
@@ -2246,8 +2244,8 @@ def _strip_corp_token_everywhere(data: dict[str, Any]) -> None:
     forbids. Each metadata bucket's ``requester_metadata`` copy and the body
     snapshot's metadata are covered too. The rule: every bucket
     ``_extract_auth_headers`` reads for auth must be strippable here too.
-    ``_drop_corp_token`` only removes ``x-corp-auth``; the developer's BYOK
-    ``Authorization`` header is left untouched (invariant 3).
+    ``_drop_corp_token`` only removes ``x-corp-auth``; the developer's
+    ``Authorization`` stays in litellm's copies, where the bridges read it.
     """
     _drop_corp_token(data.get("headers"))
     _drop_corp_token_from_request(data)
@@ -2317,6 +2315,57 @@ def _scrub_retained_request_metadata(data: dict[str, Any]) -> None:
             bucket.pop("user", None)
 
 
+_CLIENT_CONTROL_BODY_KEYS: frozenset[str] = frozenset(
+    {"extra_headers", "provider_specific_header", "api_key", "organization"}
+)
+"""Request-body keys litellm 1.101.0 turns into an upstream header or the upstream
+credential. The pre-call removes them from the client's request, silently, before
+anything reads them; the bridges then write their own ``extra_headers`` / ``api_key``.
+
+- ``extra_headers``: merged into the upstream headers (``main.py``, the HTTP handler).
+- ``provider_specific_header``: merged into the upstream headers for its provider;
+  litellm rebuilds it only when the client sent ``anthropic-*`` headers.
+- ``api_key``: a client-side credential. It becomes the upstream ``Authorization``,
+  and the router keeps the deployment it builds from it, so later requests from
+  other callers can be sent with it too.
+- ``organization``: the ``OpenAI-Organization`` header on ``openai/`` routes.
+
+litellm itself refuses ``api_base``, ``base_url`` and the rest of its banned body
+params (``proxy/auth/auth_utils.py``), and the pre-call overwrites ``headers``.
+"""
+
+
+def _drop_client_control_keys(data: dict[str, Any]) -> None:
+    for key in _CLIENT_CONTROL_BODY_KEYS:
+        data.pop(key, None)
+
+
+# A bridge forwards a header only by its exact name, and only a value in the
+# header's format; any other value is dropped, the request goes on. ``None``: no
+# real value is recorded to derive a format from, so the name alone is checked.
+_TOKEN = r"[A-Za-z0-9._+-]+"
+# RFC 9110 product/version tokens and (comments), no `@`, no quotes; every
+# product carries a version ("claude-cli/2.1.220 (external, cli)").
+_USER_AGENT = re.compile(
+    rf"^{_TOKEN}/{_TOKEN}(?: (?:{_TOKEN}/{_TOKEN}|\([A-Za-z0-9._+;:,/ -]*\)))*$"
+)
+_BRIDGE_HEADER_FORMATS: dict[str, re.Pattern[str] | None] = {
+    # "2023-06-01" (scripts/install.sh, the Claude Code client config).
+    "anthropic-version": re.compile(r"^\d{4}-\d{2}-\d{2}$"),
+    # "oauth-2025-04-20", "interleaved-thinking-2025-05-14": a comma-separated list.
+    "anthropic-beta": re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*(?: *, *[a-z0-9]+(?:-[a-z0-9]+)*)*$"),
+    "user-agent": _USER_AGENT,
+    # "codex_cli_rs"; litellm also knows "codex-tui", "codex_exec", "Codex ...".
+    "originator": re.compile(r"^[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)*$"),
+    # litellm's own format for these Codex conversation ids
+    # (proxy/litellm_pre_call_utils.py `_SESSION_ID_VALUE_RE`).
+    "session-id": re.compile(r"^[a-zA-Z0-9_\-]{8,}$"),
+    "thread-id": re.compile(r"^[a-zA-Z0-9_\-]{8,}$"),
+    "x-openai-internal-codex-responses-lite": re.compile(r"^(?:true|false)$"),
+    "chatgpt-account-id": None,
+    "x-codex-beta-features": None,
+}
+
 _CHATGPT_HEADER_ALLOWLIST = frozenset(
     {
         "authorization",
@@ -2325,9 +2374,17 @@ _CHATGPT_HEADER_ALLOWLIST = frozenset(
         "session-id",
         "thread-id",
         "user-agent",
+        "x-codex-beta-features",
         "x-openai-internal-codex-responses-lite",
     }
 )
+
+
+def _bridge_header_value_ok(lower: str, value: str) -> bool:
+    if lower == "authorization":
+        return True
+    pattern = _BRIDGE_HEADER_FORMATS[lower]
+    return pattern is None or pattern.fullmatch(value) is not None
 
 
 def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
@@ -2338,7 +2395,7 @@ def _chatgpt_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
         lower = name.lower()
         if lower == _CORP_AUTH_HEADER_LOWER:
             continue
-        if lower in _CHATGPT_HEADER_ALLOWLIST or lower.startswith("x-codex-"):
+        if lower in _CHATGPT_HEADER_ALLOWLIST and _bridge_header_value_ok(lower, value):
             selected[name] = value
         if lower == "authorization":
             authorization = value
@@ -2394,7 +2451,7 @@ def _anthropic_upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
         lower = name.lower()
         if lower == _CORP_AUTH_HEADER_LOWER:
             continue
-        if lower in _ANTHROPIC_HEADER_ALLOWLIST:
+        if lower in _ANTHROPIC_HEADER_ALLOWLIST and _bridge_header_value_ok(lower, value):
             selected[name] = value
         if lower == "authorization":
             authorization = value
@@ -2684,22 +2741,27 @@ def _response_mapping(state: _RequestState, *, include_bare_aliases: bool) -> St
     )
 
 
-def _extract_headers(data: dict[str, Any]) -> dict[str, str]:
-    """Byte-identical to release/1.0.x's ``_extract_headers`` — the WRITE path.
+# The inbound headers litellm may send upstream through ``data["headers"]``.
+# Empty: each bridge puts what its upstream needs in ``extra_headers`` from its own
+# allowlist (``_ANTHROPIC_HEADER_ALLOWLIST``, ``_CHATGPT_HEADER_ALLOWLIST``) and
+# carries the developer's token in ``api_key``; litellm adds its own protocol
+# headers; the corp route needs none. A name added here sends that client header's
+# value to every provider unsanitized — a security decision, not a config change.
+_UPSTREAM_HEADER_ALLOWLIST: frozenset[str] = frozenset()
 
-    Used ONLY to compute what gets written back to ``data["headers"]``
-    (litellm forwards/logs that bucket). An allowlist projection here would
-    risk dropping BYOK ``Authorization`` (invariant 3), ``anthropic-version``,
-    or whatever ``_drop_wire_headers`` deliberately preserves, so this stays
-    exactly release's "first non-empty bucket" logic rather than the merge
-    ``_extract_auth_headers`` below does for auth resolution.
+
+def _upstream_headers(inbound: dict[str, str]) -> dict[str, str]:
+    """The ``data["headers"]`` write path: the allowlisted names of *inbound* only.
+
+    Never the corp token, listed or not (invariant 4). Without litellm's own
+    ``forward_client_headers_to_llm_api`` the only inbound copy here is litellm's
+    logging copy of every client header, so a deny-list would send the rest upstream.
     """
-    raw = data.get("headers") or data.get("proxy_server_request") or {}
-    if isinstance(raw, dict):
-        if "headers" in raw and isinstance(raw["headers"], dict):
-            return {str(k): str(v) for k, v in raw["headers"].items()}
-        return {str(k): str(v) for k, v in raw.items()}
-    return {}
+    return {
+        name: value
+        for name, value in inbound.items()
+        if name.lower() in _UPSTREAM_HEADER_ALLOWLIST and name.lower() != _CORP_AUTH_HEADER_LOWER
+    }
 
 
 def _extract_auth_headers(data: dict[str, Any]) -> dict[str, str]:
@@ -2711,9 +2773,9 @@ def _extract_auth_headers(data: dict[str, Any]) -> dict[str, str]:
     merge is case-insensitive so a later, more complete wire-request copy
     replaces an earlier normalized copy instead of creating duplicate headers.
 
-    Used ONLY by ``authenticate_headers`` and ``_chatgpt_upstream_headers`` —
-    NEVER for the ``data["headers"]`` write path (see ``_extract_headers``
-    above), because litellm deliberately excludes some of these buckets
+    Used by ``authenticate_headers`` and the bridges' header selection; the
+    ``data["headers"]`` write path sees it only through ``_upstream_headers``'
+    allowlist, because litellm deliberately excludes some of these buckets
     (``secret_fields.raw_headers``) from logs and upstream request snapshots;
     writing the merge back there would declassify them.
     """

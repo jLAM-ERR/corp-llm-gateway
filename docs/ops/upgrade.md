@@ -1,12 +1,215 @@
 # Upgrade notes
 
 Read before upgrading an existing deployment. Items that need operator action:
-the `team_config` schema change, the issuance columns on `corp_tokens` (before
-enabling developer token issuance), the RS256 operator-token breaking change,
-the new launch command (`python -m corp_llm_gateway.serve`) that the route gate
-requires, the refused litellm management surface, the in-flight cap now on by
-default, `deploy.sh` defaulting to subscription mode, and litellm DEBUG output
-now refusing to boot.
+the 1.0 → 1.1.0 compose changes (one gateway per provider, Mode A and litellm's
+database removed, the server `.env` edited first), the `team_config` schema
+change, the issuance columns on `corp_tokens` (before enabling developer token
+issuance), the RS256 operator-token breaking change, the new launch command
+(`python -m corp_llm_gateway.serve`) that the route gate requires, the refused
+litellm management surface, the in-flight cap now on by default, and litellm
+DEBUG output now refusing to boot.
+
+## 1.0 → 1.1.0: one gateway per provider, Mode A removed
+
+**Breaking for every compose deployment.** The compose stack no longer has one
+`litellm` service. It runs one gateway container per provider, each switched on
+by its compose profile:
+
+| Profile | Service | Serves | Loopback port |
+|---|---|---|---|
+| `anthropic` | `gateway-anthropic` | Claude Code on an Anthropic subscription (`claude-*`) | `GATEWAY_ANTHROPIC_PORT`, default 4000 |
+| `codex` | `gateway-codex` | Codex on a ChatGPT subscription (any model name) | `GATEWAY_CODEX_PORT`, default 4001 |
+| `corp` | `gateway-corp` | the corp vLLM (`corp-*`), no subscription bridge | `GATEWAY_CORP_PORT`, default 4002 |
+
+Mode A (litellm's master key and virtual keys) is removed, and litellm has no
+database of its own. The gateway's own `gateway` database (tokens, team config,
+issuance) is unchanged.
+
+**Steps 1-5 are actions**, in this order. **"What changed"** below them is
+reference: read it before the window, act on it only where it says so.
+
+### Before you start: one maintenance window
+
+Do steps 1 and 2 back to back. Once step 1 has changed the server's `.env`, the
+running 1.0 stack does not come back on a reboot, or on a bare `docker compose
+up -d`, until step 2 has deployed 1.1: the 1.0 compose files with the new `.env`
+resolve to 1.0's base stack (Mode A), the wrong stack, which refuses to boot
+once its master key line is gone. Step 2 also recreates `postgres` and the
+gateways: expect a short outage while they restart and turn healthy.
+
+### 1. Edit the server's `.env`
+
+`deploy.sh` never reads the server's `.env`, so it cannot fix the file for you.
+Its checks run after the sync: when one refuses, `compose/` is already synced on
+the server, and nothing was pulled, started or removed. Edit
+`/opt/corp-llm-gateway/.env` (or your `--dir`):
+
+- **Set `COMPOSE_PROFILES`** to at least one provider, comma-separated:
+  `anthropic`, `codex`, `corp`. A 1.0 subscription host is
+  `COMPOSE_PROFILES=anthropic`. If the host has the front door, keep `nginx` or
+  `nginx-ports` on the same line: `COMPOSE_PROFILES=anthropic,nginx`. With no
+  provider, the `profile-guard` one-shot exits 64 and `up` fails, and
+  `deploy.sh up` refuses with `no provider`. `COMPOSE_PROFILES` in `.env` is the
+  only switch; `--profile` on the command line is not supported.
+- **Remove the 1.0 `COMPOSE_FILE` line**
+  (`COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml`, with or without
+  `:docker-compose.issuance.yml`). A host you deploy with `--issuance` needs
+  exactly `COMPOSE_FILE=docker-compose.yml:docker-compose.issuance.yml`; any
+  other host has no `COMPOSE_FILE` line.
+- **Remove `GATEWAY_PORT`.** Nothing reads it. Each provider has its own port
+  (table above). If you had set `GATEWAY_PORT` to something other than 4000, set
+  `GATEWAY_ANTHROPIC_PORT` to that value. A 1.0 port of 4001 or 4002 collides
+  with the `codex` / `corp` defaults: when you enable those providers, move
+  `GATEWAY_CODEX_PORT` / `GATEWAY_CORP_PORT` too.
+- **Tidy up the Mode A keys**: `LITELLM_MASTER_KEY`, `UI_USERNAME`,
+  `UI_PASSWORD`, `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. The 1.1 stack passes
+  none of them to a container (each gateway's environment is an explicit list,
+  with no `env_file:`), so they are dead lines, not a boot failure. Delete them
+  so nobody mistakes them for live settings.
+
+### 2. Deploy 1.1 from your laptop
+
+From a 1.1 checkout:
+
+```
+scripts/deploy/deploy.sh --host user@server up              # add --issuance if the host issues tokens
+```
+
+It syncs `compose/`, refuses a `.env` with no provider or a `COMPOSE_FILE` line
+the boot-time unit cannot resolve ("What changed", e and f), removes the 1.0
+`litellm` container (`--remove-orphans`, b), recreates `postgres` and the
+gateways, and waits until every service is healthy. Then check each enabled
+gateway on the server: `curl -fsS http://127.0.0.1:4000/healthz/live` (4001
+codex, 4002 corp). Without the script, run
+`docker compose up -d --remove-orphans` in the deploy directory; a plain
+`up -d` leaves the 1.0 container on port 4000 and `gateway-anthropic` fails to
+bind it.
+
+### 3. Delete the files 1.1 removed
+
+The sync copies new files but never deletes old ones, so four files 1.1 removed
+stay in the deploy directory. Delete them once step 2 has succeeded (until then
+the 1.0 containers still mount some of them). On the server, from the deploy
+directory:
+
+```
+cd /opt/corp-llm-gateway
+rm -f docker-compose.oauth.yml postgres/initdb/00-create-litellm-db.sh \
+  litellm/config.yaml litellm/config.oauth.yaml
+```
+
+- `docker-compose.oauth.yml`: a `COMPOSE_FILE` line that still names it makes
+  the boot-time unit's bare `docker compose up -d` fail ("What changed", f).
+- `postgres/initdb/00-create-litellm-db.sh`: init scripts run on an empty
+  Postgres volume, so left in place it creates the `litellm` database again the
+  next time the volume is recreated.
+- `litellm/config.yaml` and `litellm/config.oauth.yaml`: no gateway mounts
+  them; they would only mislead the next reader.
+
+### 4. Optional: back up and drop the old `litellm` database
+
+A Postgres volume created before 1.1.0 still has a `litellm` database. Nothing
+connects to it any more. It held litellm's virtual keys, admin UI accounts and
+spend logs. On the server, from the deploy directory, after step 2 (the 1.0
+container, its only client, is gone by then):
+
+```
+cd /opt/corp-llm-gateway
+# a copy, if you need those records
+docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" litellm' > litellm.sql
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DROP DATABASE IF EXISTS litellm"'
+```
+
+`litellm.sql` holds spend logs and key hashes: keep it with the same care as the
+server's `.env`, or skip the dump.
+
+### 5. Update scripts, monitors and clients
+
+- Replace the service name `litellm` with `gateway-<provider>` ("What
+  changed", a).
+- Drop `--mode` from every `deploy.sh` command (d).
+- Tell client owners that custom headers and body keys no longer reach the
+  provider (c).
+
+### What changed
+
+#### a. The `litellm` service is now `gateway-<provider>`
+
+Anything that names the old service breaks: `docker compose logs litellm`,
+`deploy.sh logs litellm`, `docker compose ps -q litellm`, a monitor that
+matches the container name. Use `gateway-anthropic`, `gateway-codex` or
+`gateway-corp`. The nginx front door proxies to one gateway,
+`NGINX_GATEWAY_UPSTREAM` (default `gateway-anthropic`); its provider must be in
+`COMPOSE_PROFILES`, or nginx exits 64 (`compose/README.md`, "HTTPS front
+door"). The other providers are reached on their loopback ports or over an SSH
+tunnel.
+
+#### b. The 1.0 `litellm` container is an orphan
+
+After the upgrade no service in the compose files owns the 1.0 `litellm`
+container, and it still holds `127.0.0.1:4000`. `deploy.sh up` runs
+`docker compose up -d --remove-orphans`, which removes it. `deploy.sh up` also
+removes the container of a provider or front door you drop from
+`COMPOSE_PROFILES` later, and `deploy.sh down` removes any gateway or
+front-door container `docker compose down` leaves behind.
+
+#### c. Client headers reach the provider only through a bridge
+
+In 1.0.0 every inbound client header went upstream, unsanitized (CHANGELOG
+1.1.0, Security). Now the only client values that go upstream are what a
+subscription bridge carries: the developer's `Authorization` token as the
+upstream credential, and the bridge's short header list, forwarded by exact
+name and only with a value in the header's format. The corp route sends only
+its own `CORP_LLM_AUTH_TOKEN`. The request-body keys `extra_headers`,
+`provider_specific_header`, `api_key` and `organization` are removed before
+litellm reads them. Both happen silently: a client that relied on a custom
+header or one of those keys reaching the provider gets no error, the value just
+does not arrive. The per-provider lists are in `../security.md` §13.
+
+#### d. `deploy.sh --mode` is removed
+
+Any `--mode` value is refused before the script touches the server. A 1.0
+`--mode virtual-keys` host has no 1.1 equivalent (e). `--issuance`
+(`DEPLOY_ISSUANCE=1`) is unchanged: pass it to every run against a host that
+issues tokens.
+
+#### e. Mode A and litellm's database are gone
+
+- **Mode A (API keys, litellm virtual keys) has no 1.1 equivalent.** It was a
+  test posture only. Move developers to a subscription provider (`anthropic`,
+  `codex`) or to `corp`; they authenticate with `X-Corp-Auth` as before.
+- **Any `LITELLM_MASTER_KEY` a gateway reads refuses to boot**, on compose,
+  Helm and any other deployment: `build_guardrail()` stops the startup (uvicorn
+  exits 3) with a line starting `LITELLM_MASTER_KEY is set`, and
+  `gateway-admin config check` reports it. On compose the key can only come from
+  the gateway's config file (`CORP_LLM_GATEWAY_CONFIG_FILE`, e.g. the issuance
+  overlay's `gateway/config.toml`), a custom image or an override file — not
+  from `.env`. On Helm, remove it from the values. A
+  `general_settings.master_key` or `environment_variables.LITELLM_MASTER_KEY`
+  in a litellm config of your own exits 78.
+- **litellm has no database.** Compose no longer sets `DATABASE_URL` or
+  `STORE_MODEL_IN_DB`, so litellm runs no Prisma step and never re-reads a
+  config table (`../security.md` §14, 14c). If you add `DATABASE_URL` back,
+  that exposure returns. The old `litellm` database: step 4.
+
+#### f. `deploy.sh up` checks what a reboot would start
+
+The boot-time unit (`scripts/deploy/corp-llm-gateway.service`) runs a bare
+`docker compose up -d`, so the `COMPOSE_FILE` line in `.env`, not the
+script's file list, decides what comes back after a reboot. After the sync,
+`deploy.sh up` runs the same bare resolve on the server:
+
+- **It refuses** when the bare `docker compose` cannot resolve the stack. On a
+  1.0 host the cause is a `COMPOSE_FILE` line that still names
+  `docker-compose.oauth.yml` (step 1).
+- **It warns** (and goes on) when a reboot would start other gateways or front
+  doors than this deploy, or the same ones with another configuration. It
+  compares the service names and `docker compose config --hash` of each
+  gateway and front door (hashes only, no values). The usual cause is a
+  `COMPOSE_FILE` line that does not match `--issuance`: without the issuance
+  line a reboot turns token issuance off, and with it a host deployed without
+  `--issuance` turns it on. Fix the line (step 1) or the flags, then run
+  `deploy.sh up` again.
 
 ## Database schema
 
@@ -291,10 +494,10 @@ probes `/health/liveliness`, `/health/liveness`, `/health/readiness` now answers
 `GET /health` and the other `/health/*` routes. Rationale and the health-row
 review: `../security.md` §14, "The management surface is refused".
 
-- **API-key mode (virtual keys) is a test posture only.** Nothing can mint a
-  virtual key any more. Move developers to subscription mode
-  (`deployment-modes.md`); corp tokens come from `scripts/install.sh` and are
-  revoked with `gateway-admin token revoke`.
+- **API-key mode (virtual keys) was a test posture only, and 1.1.0 removed it**
+  (see "1.0 → 1.1.0" above). Nothing can mint a virtual key. Move developers to
+  a subscription provider (`deployment-modes.md`); corp tokens come from
+  `scripts/install.sh` and are revoked with `gateway-admin token revoke`.
 - **A probe or dashboard on `GET /health` breaks.** Use `/healthz/live` and
   `/healthz/ready`, which the shipped Helm and compose probes already do.
 - **`CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` naming a refused route now exits 78
@@ -321,14 +524,17 @@ rollout.
 "Backends"): the gateway's Postgres pools now send them, and PgBouncer refuses
 the connection otherwise — every LLM request would answer 503.
 
-## `deploy.sh` defaults to subscription mode
+## `deploy.sh` defaults to subscription mode (1.0.0)
 
-`scripts/deploy/deploy.sh` without `--mode` now deploys `--mode oauth`
+**Superseded in 1.1.0:** `--mode` and `docker-compose.oauth.yml` are removed
+(see "1.0 → 1.1.0" above).
+
+In 1.0.0, `scripts/deploy/deploy.sh` without `--mode` deployed `--mode oauth`
 (`docker-compose.yml` + `docker-compose.oauth.yml`), the production mode. A host
-deployed in API-key mode must now be driven with `--mode virtual-keys` on
+deployed in API-key mode had to be driven with `--mode virtual-keys` on
 **every** run — `up`, `logs`, `status`, `down`, `restart`. A bare run against
-such a host would recreate the stack in subscription mode, which then refuses to
-boot because its `.env` still has `LITELLM_MASTER_KEY`.
+such a host would recreate the stack in subscription mode, which then refused to
+boot because its `.env` still had `LITELLM_MASTER_KEY`.
 
 ## `CORP_LLM_STRIP_INBOUND_HEADERS` now defaults to `1`
 
@@ -344,9 +550,15 @@ affected.
 
 It now defaults **on** (`bootstrap.build_guardrail`) and the chart sets it
 explicitly. The dropped set (`_WIRE_HEADERS_TO_DROP`) is hop-by-hop / wire-level
-only and never contains `authorization`, so BYOK passthrough is untouched, and
-`X-Corp-Auth` was already stripped unconditionally one step earlier. Set it to
-`0` only to reproduce the old behaviour. Recorded as `../security.md` §11 (h).
+only, and `X-Corp-Auth` was already stripped unconditionally one step earlier.
+Recorded as `../security.md` §11 (h).
+
+**1.1.0:** client headers no longer reach a provider except through a
+subscription bridge's allowlist, so this flag no longer decides what goes upstream (it only cleans litellm's own header copies).
+The subscription bridges forward their own short header lists, by exact name
+and value format, and the request-body keys litellm would turn into headers or
+a credential are removed (`../security.md` §13). Nothing to change in your
+configuration; see "1.0 → 1.1.0", "What changed" (c), above.
 
 ## The `ner` extra now carries pymorphy3: RU gazetteer terms are lemmatised
 

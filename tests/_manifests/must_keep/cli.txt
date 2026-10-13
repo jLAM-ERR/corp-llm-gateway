@@ -9,6 +9,9 @@ tests/cli/test_admin.py::test_config_check_ok
 tests/cli/test_admin.py::test_config_check_passes_a_servable_issuance_config
 tests/cli/test_admin.py::test_config_check_probe_ok_only_configured_deps
 tests/cli/test_admin.py::test_config_check_probe_unreachable_exits_nonzero
+tests/cli/test_admin.py::test_config_check_refuses_a_master_key
+tests/cli/test_admin.py::test_config_check_refuses_a_master_key[CORP_LLM_FORWARD_ANTHROPIC_AUTH]
+tests/cli/test_admin.py::test_config_check_refuses_a_master_key[None]
 tests/cli/test_admin.py::test_config_check_refuses_an_issuance_bound_past_its_ceiling
 tests/cli/test_admin.py::test_config_check_refuses_the_body_limits_the_boot_refuses
 tests/cli/test_admin.py::test_config_check_refuses_the_body_limits_the_boot_refuses[body-deadline-past-the-ceiling]

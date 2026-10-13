@@ -7,9 +7,10 @@ Design choice: **Architecture B — assemble best-of-breed.** A single custom Py
 callback; everything else (audit pipeline, auth, observability, serving) is provided by
 operated open-source components rather than built in-house.
 
-Every request is sanitized in `pre_call`, forwarded to Anthropic / OpenAI with the developer's
-BYOK key intact, de-sanitized on the way back by the gateway's own ASGI layer (outside LiteLLM),
-and audited.
+Every request is sanitized in `pre_call`, forwarded to its provider — Anthropic or ChatGPT Codex
+with the developer's subscription token as the upstream credential (lifted by the provider's
+bridge), or the corp vLLM with the gateway's own token — de-sanitized on the way back by the
+gateway's own ASGI layer (outside LiteLLM), and audited.
 
 ## Request data flow
 
@@ -37,7 +38,7 @@ flowchart TD
         DLP -->|"canary / secret leak"| B5(["HTTP 422  block_reason"])
     end
 
-    DLP -->|clean| UP["Anthropic / OpenAI  (Authorization:Bearer untouched)"]
+    DLP -->|clean| UP["Anthropic / ChatGPT Codex / corp vLLM  (bridge credential or route token only)"]
     UP --> DS["ASGI desanitiser, outside LiteLLM · route_gate/desanitize_middleware.py  (placeholders longest-first)"]
     DS --> AUD["audit · Vector → Langfuse + S3 + SIEM  (NEVER-fields gate)"]
     DS -->|"originals restored"| Dev

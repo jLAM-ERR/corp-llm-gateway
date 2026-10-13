@@ -17,7 +17,7 @@ in the 90 days post-GA.
 
 ```
 src/corp_llm_gateway/
-  asgi.py       THE serve target: checks litellm's config (exit 78), runs its Prisma sequence, sets WORKER_CONFIG,
+  asgi.py       THE serve target: checks litellm's config (exit 78), runs its Prisma sequence only with a DATABASE_URL (no shipped setup sets one), sets WORKER_CONFIG,
                 imports litellm's app, mounts it behind DesanitizeMiddleware, wraps its lifespan (arm the gate or
                 exit 70, route_gate/arm_checks.py), wraps it all in RouteGateMiddleware
   serve.py      `python -m corp_llm_gateway.serve` — uvicorn.run(asgi:app), workers=1; the image/compose/Helm ENTRYPOINT
@@ -63,17 +63,23 @@ src/corp_llm_gateway/
                 ticket; no response hook (docs/security.md §15)
 helm/corp-llm-gateway/   Helm chart (gateway image + guardrail callback + Secret + HPA/PDB/SA + ServiceMonitor + config-check
                           initContainer + env passthrough + NetworkPolicy + CoreDNS sinkhole)
-compose/                 production compose stack for non-k8s hosts (data plane + Langfuse + Vector audit);
-                         compose/nginx/ is the opt-in HTTPS front door (COMPOSE_PROFILES=nginx|nginx-ports):
-                         entrypoint.sh validates the NGINX_*, GATEWAY_DOMAIN and LANGFUSE_PUBLIC_URL keys
-                         (exit 64-69) and renders one listener config (TLS mode × routing);
+compose/                 production compose stack for non-k8s hosts: one gateway per provider
+                         (gateway-anthropic / gateway-codex / gateway-corp, one shared definition, each
+                         switched by its COMPOSE_PROFILES profile, with its own litellm/config.<provider>.yaml,
+                         bridge flag and 127.0.0.1 port 4000/4001/4002) + profile-guard (one-shot, exits 64
+                         when COMPOSE_PROFILES names no provider; postgres waits for it) + redis + postgres
+                         (the `gateway` DB only; litellm has no DB) + Langfuse + Vector audit;
+                         compose/nginx/ is the opt-in HTTPS front door (COMPOSE_PROFILES=…,nginx|nginx-ports),
+                         proxying to one gateway, NGINX_GATEWAY_UPSTREAM (default gateway-anthropic):
+                         entrypoint.sh validates the NGINX_*, GATEWAY_DOMAIN, LANGFUSE_PUBLIC_URL and
+                         NGINX_GATEWAY_UPSTREAM keys (exit 64-69) and renders one listener config (TLS mode × routing);
                          templates/snippets/gateway-locations.inc.template is the exact-path allow-list, the
-                         only copy; certs/ is server-only, gitignored; pinned by
-                         tests/compose/test_nginx_{profile,runtime,allowlist_routes}.py
+                         only copy; certs/ is server-only, gitignored; pinned by tests/compose/test_providers.py
+                         and tests/compose/test_nginx_{profile,runtime,allowlist_routes}.py
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
 tests/                   pytest, pytest-asyncio mode=auto; one directory per component or layer (table: docs/testing/README.md);
-                         4,712 passed / 419 skipped in the minimal env (.venv-test-minimal), 5,930 / 16 in the full one
+                         5,048 passed / 455 skipped in the minimal env (.venv-test-minimal), 6,301 / 17 in the full one
                          (.venv-test-full: every extra, litellm, Postgres, CI=true), both from scripts/test-env.sh
 ```
 
@@ -109,7 +115,8 @@ pre_call:  Stage 0 — payload classifier: config/log shape → refuse before eg
            ↓
            Stage 5 — DLP egress guard: re-scan the SANITIZED request → block on canary/raw secret
            ↓
-           upstream (api.anthropic.com / api.openai.com) with BYOK Authorization
+           upstream (api.anthropic.com / api.openai.com) with the bridge's credential
+           (the developer's token via api_key, or the route's own key)
            ↓
 post_call: NOT in the callback. route_gate/desanitize_middleware.py, inside the in-flight limiter and in
            front of litellm's app, restores originals in the response litellm sends (keyed by the
@@ -157,11 +164,11 @@ Two caches:
 # one once (scripts/test-gates.sh full) and never minimal: minimal is a local check. Run it
 # before changing optional-extra imports, lazy-import / graceful-degradation code, or the
 # laptop CLI / proxy install.
-scripts/test-env.sh minimal && scripts/test-gates.sh minimal   # 4,712 passed / 419 skipped, ~10 min
+scripts/test-env.sh minimal && scripts/test-gates.sh minimal   # 5,048 passed / 455 skipped, ~10 min
 docker run --rm -d --name pg-test -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=gateway \
   -e POSTGRES_DB=gateway -p 55432:5432 postgres:16
 scripts/test-env.sh full && CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
-  scripts/test-gates.sh full                                    # 5,930 passed / 16 skipped, ~21 min
+  scripts/test-gates.sh full                                    # 6,301 passed / 17 skipped, ~21 min
 
 # Run the full environment before every commit; minimal too when the cases above apply.
 
@@ -230,7 +237,7 @@ REDIS_URL=redis://localhost:6379/0 CORP_LLM_ENDPOINT=http://localhost:8000 CORP_
 - `Dockerfile.gateway`'s `python:3.12-slim` build stage tracks the litellm runtime
   image's interpreter, not CI — don't bump it with CI's Python.
 - Async-first (LiteLLM hooks are async); pytest-asyncio mode = "auto"
-- Default branch: `main`; the live release line is `release/1.0.x`
+- Default branch: `main`; the live release line is `release/1.1.x`
 - CI: GitHub Actions (`.github/workflows/`)
 - httpx for HTTP, Redis via `redis.asyncio`, fakeredis for tests
 - First-time setup: `pip install -e ".[dev]" && pre-commit install` — `dev` pulls
@@ -281,8 +288,19 @@ When adding a new tunable, plumb it through this loader — don't read
 2. **NEVER fields gate** (`audit/invariants.py`): the audit logger refuses
    to emit a record containing any NEVER field key (mapping/original/
    credentials). Vector VRL provides defense-in-depth for the same set.
-3. **BYOK Authorization passthrough**: the developer's `Authorization:
-   Bearer ...` header is forwarded untouched to upstream. Don't log it,
+3. **Client headers reach a provider only through a bridge's allowlist**:
+   the subscription bridges (`CORP_LLM_FORWARD_ANTHROPIC_AUTH` /
+   `CORP_LLM_FORWARD_CHATGPT_AUTH`) lift the developer's `Authorization:
+   Bearer ...` into the request's `api_key` and put their own header
+   allowlists in `extra_headers` — exact names, each value checked against
+   its format (`_BRIDGE_HEADER_FORMATS`) and dropped if it does not match.
+   `data["headers"]` — the bucket litellm sends upstream, unsanitized and
+   outside the Stage-5 scan — is the allowlist projection
+   `_UPSTREAM_HEADER_ALLOWLIST` (empty), never a deny-list; adding a name is
+   a security decision. The pre-call removes the request-body keys litellm
+   turns into upstream headers or a credential (`_CLIENT_CONTROL_BODY_KEYS`).
+   No other client header is passed through; unknown request-body fields are
+   not sanitized (accepted risk, docs/security.md §2). Don't log the token,
    don't rewrite it.
 4. **X-Corp-Auth never logged**: corp tokens are stripped in pre_call
    (`AuthMiddleware.strip_corp_token`) and never appear in the audit
@@ -315,11 +333,15 @@ When adding a new tunable, plumb it through this loader — don't read
      be started with `spawn_shared`, or one request's disconnect cancels it
      under every other waiter (`docs/extending.md`).
 
-**Mode A (API keys / litellm virtual keys) is a test posture only; subscription
-mode is production** (DRI decision 2026-09-27). The route gate refuses litellm's
-whole management surface, so nothing can issue a virtual key; `deploy.sh`
-defaults to `--mode oauth`. The container suite seeds a key straight into
-litellm's DB to keep Mode A covered.
+**Mode A (litellm master key / virtual keys) and litellm's own database were removed in
+1.1.0** (DRI decisions 2026-09-27 and 2026-10-09). Any `LITELLM_MASTER_KEY` refuses to boot,
+bridge or not (`settings.master_key_conflict`; the served entrypoint exits 3), and
+`general_settings.master_key` / `environment_variables.LITELLM_MASTER_KEY` in litellm's config
+exit 78. No shipped setup gives litellm a `DATABASE_URL` (hazard 14c closed). Subscription
+mode is production: one gateway container per provider, because the two bridges cannot share
+a process. `deploy.sh` has no `--mode`; the providers are `COMPOSE_PROFILES` in the server's
+`.env`. The route-gate container suite runs on each shipped provider config
+(`provider_anthropic` / `provider_codex` / `provider_corp`), with no master key and no litellm DB.
 
 **Rewrite-vs-scan carve-out** (`sanitizer/identity_preamble.py`): a fixed client
 protocol literal may be exempt from *rewriting* when the provider matches it

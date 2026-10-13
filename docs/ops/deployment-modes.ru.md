@@ -1,30 +1,30 @@
 # Режимы развёртывания
 
-Какой стек поднимать, как аутентифицируются разработчики и как включать/выключать
-две опциональные сетевые зависимости (корп-LLM-оракул и сервис корп-NER).
-Английский оригинал: `deployment-modes.md`.
+Каких провайдеров поднимать, как аутентифицируются разработчики и как
+включать/выключать две опциональные сетевые зависимости (корп-LLM-оракул и
+сервис корп-NER). Английский оригинал: `deployment-modes.md`.
 
-Режима аутентификации два, и они **взаимоисключающие**. Выбирайте до того, как
-писать `.env`.
+Production-стек один — `compose/` (для k8s — Helm: `install.md`). Он запускает
+по контейнеру шлюза на каждого **провайдера**, а провайдеров вы выбираете для
+каждого хоста. Каждый шлюз идёт по одному и тому же production-пути:
+`bootstrap.guardrail`, route gate, хранилище токенов в Postgres, mapping-store в
+Redis и одна и та же цепочка аудита. Различаются маршрут litellm и credential
+для похода наверх.
 
-**Режим B — production. Режим A — только тестовая поза** (решение DRI,
-2026-09-27): route gate отклоняет весь management-контур litellm, включая
-`POST /key/generate` и admin UI, так что выдать разработчику виртуальный ключ
-нечем (`../security.md` §14). Стек, каскад санитизации и цепочка аудита у обоих
-режимов одни и те же; различается только credential для похода наверх.
+| Провайдер (профиль) | Сервис | Порт на `127.0.0.1` | Конфиг litellm | Credential наверх |
+|---|---|---|---|---|
+| `anthropic` | `gateway-anthropic` | `GATEWAY_ANTHROPIC_PORT` (4000) | `config.anthropic.yaml`: `claude-*` → `anthropic/` | подписочный токен Anthropic разработчика (`sk-ant-oat…`), его поднимает `CORP_LLM_FORWARD_ANTHROPIC_AUTH=1` |
+| `codex` | `gateway-codex` | `GATEWAY_CODEX_PORT` (4001) | `config.codex.yaml`: `"*"` → `openai/` на `https://chatgpt.com/backend-api/codex` | подписочный токен ChatGPT разработчика, его поднимает `CORP_LLM_FORWARD_CHATGPT_AUTH=1` |
+| `corp` | `gateway-corp` | `GATEWAY_CORP_PORT` (4002) | `config.corp.yaml`: `corp-*` → `hosted_vllm/` на `CORP_LLM_ENDPOINT` | собственный `CORP_LLM_AUTH_TOKEN` маршрута (пустой для vLLM без аутентификации); моста нет |
 
-| | Режим A — API-ключи | Режим B — подписка (OAuth) |
-|---|---|---|
-| Стек | `compose/` | `compose/` + `docker-compose.oauth.yml` |
-| Credential наверх | собственные `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` шлюза | OAuth-токен самого разработчика, пробрасывается |
-| Разработчик шлёт | `Authorization: Bearer <виртуальный ключ litellm>` | `Authorization: Bearer <OAuth-токен>` |
-| Идентичность команды | `X-Corp-Auth: <corp-токен>` | `X-Corp-Auth: <corp-токен>`, выданный `scripts/install.sh` через Keycloak |
-| `LITELLM_MASTER_KEY` | **обязателен** | **должен отсутствовать** |
-| Обслуживаемые маршруты | `claude-*`, `gpt-*`, `corp-*` | только `claude-*` |
-| Отзыв доступа разработчика | только corp-токен (`gateway-admin token revoke`) — `/key/*` и admin UI отклоняются | corp-токен (`gateway-admin token revoke`) |
-| Учёт расходов / бюджеты по разработчику | нет | нет |
-| Статус | **только тестовая поза** | **production** |
-| Аудит | Vector → Langfuse / S3 / SIEM | так же |
+На любом провайдере разработчик шлёт `X-Corp-Auth: <corp-токен>` — идентичность
+команды, которую шлюз проверяет в `pre_call`. Ключей API провайдеров нет нигде,
+и виртуальных ключей litellm тоже нет.
+
+**Режим A (мастер-ключ и виртуальные ключи litellm) удалён в 1.1.0** вместе с
+собственной базой данных litellm. Любой `LITELLM_MASTER_KEY` не даёт стартовать
+(ниже). Бывший «режим B» 1.0 — это теперь провайдер `anthropic`. Обновление хоста
+1.0: `upgrade.md`, «1.0 → 1.1.0».
 
 Есть ещё **демо-стек** с OAuth — `docker-compose.demo.yml` +
 `docker-compose.anthropic-oauth.yml` в корне репозитория. Он нужен, чтобы
@@ -34,131 +34,115 @@
 
 ---
 
-## Режим A — API-ключи (только тестовая поза)
+## Выбор провайдеров
 
-Стек в `compose/`. Запросы аутентифицируются **виртуальным ключом LiteLLM**;
-провайдерские credential'ы держит шлюз. Выдать такой ключ нечем: `/key/*`, admin
-UI и все остальные management-маршруты litellm отвечают `403 E_ROUTE_BLOCKED` на
-route gate. Контейнерные тесты пишут хеш ключа прямо в таблицу litellm
-`LiteLLM_VerificationToken`; больше так никто делать не должен. Для разработчиков
-этот режим не разворачивать.
+Единственный переключатель — `COMPOSE_PROFILES` в `compose/.env`: хотя бы один
+из `anthropic`, `codex`, `corp`, через запятую. Некоторые разработчики держат
+два сразу, например `COMPOSE_PROFILES=anthropic,codex` для перекрёстного ревью.
 
 ```
 cd compose
 cp .env.example .env
 chmod 0600 .env
-# заполнить обязательные секреты, затем:
+# заполнить обязательные секреты и задать COMPOSE_PROFILES, затем:
 docker compose up -d
 ```
 
-Обязательны в `.env` (без них compose не стартует):
-`POSTGRES_PASSWORD`, `LITELLM_MASTER_KEY`, `UI_USERNAME`, `UI_PASSWORD`,
-`CORP_LANGFUSE_PUBLIC_KEY`, `CORP_LANGFUSE_SECRET_KEY` и секреты `LANGFUSE_*`.
-См. `compose/README.md`.
-
-**Ключи провайдеров — опциональны.** В `docker-compose.yml` они объявлены как
-`${ANTHROPIC_API_KEY:-}` / `${OPENAI_API_KEY:-}`, то есть пустое значение
-допустимо. Задавайте только то, куда реально ходите:
-
-- `ANTHROPIC_API_KEY` — нужен для маршрута `claude-*`;
-- `OPENAI_API_KEY` — нужен для маршрута `gpt-*`;
-- ни одного — нормально, если используете только маршрут `corp-*` на корп-vLLM.
-
-**BYOK в этом режиме недоступен ни на одном маршруте.** Нативные провайдеры
-`anthropic/` и `openai/` строят upstream-credential из настроенного `api_key` и
-инбаундный заголовок `Authorization` не читают вообще; маршрут `corp-*` /
-`hosted_vllm/` ведёт себя так же. Собственный ключ разработчика сюда не доедет —
-для этого существует режим B.
-
-## Режим B — подписка (проброс OAuth)
-
-Токен подписки Anthropic разработчика пробрасывается на `api.anthropic.com` без
-изменений. **Никакого `ANTHROPIC_API_KEY` в этом режиме нет вообще.**
+С ноутбука, на сервер, подготовленный `scripts/deploy/bootstrap-server.sh`,
+провайдеры берутся из той же строки в `.env` сервера; флага для них у скрипта
+нет:
 
 ```
-cd compose
-cp .env.example .env
-chmod 0600 .env
-# заполнить обязательные секреты, затем УДАЛИТЬ строки LITELLM_MASTER_KEY,
-# UI_USERNAME и UI_PASSWORD целиком (см. ловушку ниже), затем:
-docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d
+scripts/deploy/deploy.sh --host user@server up
 ```
 
-С ноутбука, на сервер, подготовленный `scripts/deploy/bootstrap-server.sh`
-(`--mode oauth` — режим по умолчанию, его можно не указывать):
+- **Без провайдера — отказ.** One-shot `profile-guard`, которого ждёт
+  `postgres`, завершается с кодом 64 и называет `COMPOSE_PROFILES`, если в
+  строке нет точного токена провайдера (`corporate` — не `corp`), так что `up`
+  падает, а не поднимает стек, который ничего не обслуживает. `deploy.sh up`
+  отказывает тому же стеку с `no provider`.
+- **`--profile` в командной строке не поддерживается.** `profile-guard` читает
+  `COMPOSE_PROFILES`, а юнит автозапуска
+  (`scripts/deploy/corp-llm-gateway.service`, голый `docker compose up -d`)
+  читает тот же `.env`, поэтому деплой и перезагрузка поднимают одних и тех же
+  провайдеров.
+- **Убрать провайдера:** удалите его из строки и выполните `deploy.sh up` — он
+  удалит контейнер этого шлюза. Голый `docker compose up -d` этого не делает, и
+  старый шлюз остаётся на своём порту.
+- **Фронт** (`nginx` или `nginx-ports` в той же строке) проксирует на один шлюз,
+  `NGINX_GATEWAY_UPSTREAM` (по умолчанию `gateway-anthropic`); его провайдер
+  должен быть включён, иначе nginx завершается с кодом 64. Остальные провайдеры
+  остаются на своих loopback-портах или за SSH-туннелем (`compose/README.ru.md`,
+  «HTTPS-фронт (nginx)»).
+- **`--mode` больше нет.** `deploy.sh --mode` (с любым значением) отклоняется с
+  упоминанием 1.1.0.
 
-```
-scripts/deploy/deploy.sh --host user@server --mode oauth up
-```
+## Почему по шлюзу на провайдера
 
-Все последующие запуски по этому хосту должны резолвить тот же список файлов,
-включая `logs`, `status`, `down` и `restart`. Для этого режима это делает
-значение по умолчанию; хостом в режиме A нужно управлять с `--mode virtual-keys`
-в каждом запуске, иначе голый запуск пересоздаст его в этом режиме.
+Оба подписочных моста читают один и тот же входящий bearer из `Authorization`,
+поэтому в одном процессе может работать не больше одного из них
+(`build_guardrail()` отказывает обоим сразу,
+`settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE`). Конфиг litellm каждого провайдера
+к тому же — несущий контроль того, куда уходит токен разработчика:
 
-**Для автозапуска при загрузке хоста раскомментируйте `COMPOSE_FILE` в `.env`:**
+- **`anthropic`**: один маршрут, нативный `anthropic/`, без `gpt-*`, без `corp-*`
+  и без catch-all `"*"`. Guardrail разрешает подстановку OAuth-токена по
+  видимому клиенту алиасу модели, но litellm резолвит фактический deployment
+  *после* хука, поэтому один только gate по алиасу не может доказать, куда
+  уйдёт запрос. Anthropic-only таблица маршрутов — может. Второй маршрут не
+  добавлять.
+- **`codex`**: один catch-all маршрут, чей `api_base` — литерал URL ChatGPT
+  Codex, а не значение из окружения, так что никакая настройка не направит
+  токен на другой хост.
+- **`corp`**: один маршрут `corp-*` на корп-vLLM, без моста. `Authorization`
+  клиента до vLLM не доходит, как и любой другой заголовок клиента: значения
+  клиента несёт наверх только подписочный мост (токен плюс свой allowlist
+  заголовков по точному имени и формату значения), а у `corp` моста нет
+  (`../security.ru.md` §13). Подписочный токен на этот порт
+  всё равно слать не стоит: на корп-хосте ему делать нечего.
 
-```
-COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml
-```
+Оракул на корп-vLLM работает на любом провайдере: до него ходят собственным
+HTTP-клиентом шлюза (`CORP_LLM_ENDPOINT`), а не через маршрут litellm.
 
-`scripts/deploy/corp-llm-gateway.service` выполняет голый `docker compose up -d`,
-который без этой строки резолвит только базовый файл — то есть режим с
-виртуальными ключами. Он падает громко, а не поднимает не тот режим (в `.env`
-режима B нет мастер-ключа, и guard в entrypoint отказывает), но стек так и
-останется лежать, пока его не поднимут руками. Явный `-f` в командной строке
-по-прежнему главнее `COMPOSE_FILE`, поэтому эта строка и `deploy.sh --mode oauth`
-не конфликтуют.
+## Мастер-ключ отклоняется
 
-Оверлей меняет ровно две вещи: включает `CORP_LLM_FORWARD_ANTHROPIC_AUTH=1` и
-монтирует `litellm/config.oauth.yaml` поверх `/etc/litellm/config.yaml`. Токены
-команд в Postgres, mapping-store в Redis, Langfuse и пайплайн аудита Vector — всё
-без изменений: callback тот же production'ный
-`corp_llm_gateway.bootstrap.guardrail`, что и в режиме A.
-
-**Обслуживается только `claude-*`.** В `litellm/config.oauth.yaml` один маршрут,
-нативный `anthropic/`, без `gpt-*`, без `corp-*` и без catch-all `"*"` — и это
-несущий контроль, а не упрощение. Guardrail разрешает подстановку OAuth-токена по
-видимому клиенту алиасу модели, но litellm резолвит фактический deployment *после*
-хука, поэтому один только gate по алиасу не может доказать, куда уйдёт запрос.
-Anthropic-only таблица маршрутов — может. Второй маршрут не добавлять.
-
-Оракул на корп-vLLM при этом работает: до него ходят собственным HTTP-клиентом
-шлюза (`CORP_LLM_ENDPOINT`), а не через маршрут litellm. Отсутствие `corp-*`
-означает лишь, что клиенты не могут адресовать корп-модели напрямую.
-
-**Мастер-ключ и мост несовместимы.** При заданном мастер-ключе litellm трактует
-входящий `Authorization` как один из своих виртуальных ключей и отвечает 401
-*до* того, как отработает `pre_call`, — OAuth-токен до моста не дойдёт никогда.
-Поэтому `build_guardrail()` отказывается стартовать и называет причину
-(`settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE`), вместо того чтобы молча отдавать
-401. Оверлей намеренно не «затирает» забытый ключ: подмена заглушила бы ошибку
-вместо того, чтобы о ней сообщить.
+`LITELLM_MASTER_KEY` с любым значением не даёт стартовать, с мостом или без:
+`build_guardrail()` останавливает запуск (exit 3) и называет причину
+(`settings.MASTER_KEY_REFUSED_MESSAGE`); `gateway-admin config check` тоже о ней
+сообщает. Proxy-аутентификация litellm ушла вместе с режимом A; шлюз
+аутентифицирует каждого клиента по `X-Corp-Auth`. При включённом мосте
+мастер-ключ ещё и заставил бы litellm трактовать входящий `Authorization` как
+один из своих виртуальных ключей и отвечать 401 *до* того, как отработает
+`pre_call`, — подписочный токен до моста не дошёл бы никогда.
+`general_settings.master_key` или `environment_variables.LITELLM_MASTER_KEY` в
+собственном конфиге litellm тоже отклоняются на старте (exit 78).
 
 > **Ловушка:** пустая строка `LITELLM_MASTER_KEY=` **считается заданной** —
 > litellm сохраняет пустое значение и включает proxy-auth для всего, что не
-> `None`. Удаляйте строку целиком. На демо-стеке обычный источник — забытый ключ
-> в git-ignored `.env.demo`, который подтягивается через `env_file:`; на
-> production-стеке — `compose/.env`, скопированный с `.env.example` без удаления
-> строки.
-
-`UI_USERNAME` / `UI_PASSWORD` можно удалить заодно: без мастер-ключа admin UI
-litellm всё равно никого не аутентифицирует, и охранять им нечего.
+> `None`. Удаляйте строку целиком. Production compose-стек не передаёт шлюзу
+> `LITELLM_MASTER_KEY` (окружение каждого шлюза — явный список, без
+> `env_file:`), так что строка в `compose/.env` до шлюза не доходит. Если отказ
+> всё же срабатывает, ключ приходит из файла конфигурации шлюза
+> (`CORP_LLM_GATEWAY_CONFIG_FILE`, например `gateway/config.toml` оверлея выдачи
+> токенов), собственного образа или переопределения окружения (значение Helm,
+> override-файл compose). На демо-стеке это обычно забытый ключ в git-ignored
+> `.env.demo`, который этот стек подтягивает через `env_file:`.
 
 ### Чем платим и что нужно закрыть
 
-В режиме B **нет виртуальных ключей на разработчика**, а значит нет учёта
-расходов по конкретному человеку через UI LiteLLM. Идентичность, санитизация и
-аудит не меняются: разработчики шлют `X-Corp-Auth: <corp-токен>`, шлюз
-проверяет его в `pre_call` по Postgres-хранилищу токенов, и запрос без валидного
-токена отклоняется (`MissingTokenError` / `InvalidTokenError`). Corp-токен —
-личный: `scripts/install.sh` выпускает его через Keycloak на
+**Виртуальных ключей на разработчика нет**, а значит нет учёта расходов по
+конкретному человеку через UI LiteLLM. Идентичность, санитизация и аудит от них
+не зависят: разработчики шлют `X-Corp-Auth: <corp-токен>`, шлюз проверяет его в
+`pre_call` по Postgres-хранилищу токенов, и запрос без валидного токена
+отклоняется (`MissingTokenError` / `InvalidTokenError`). Corp-токен — личный и
+работает на всех провайдерах хоста (одна общая база `gateway`):
+`scripts/install.sh` выпускает его через Keycloak на
 `POST /internal/issue-token`, когда выдача настроена (`install.md`, «Developer
 onboarding»), а `gateway-admin token revoke --user` отзывает. На этом
-compose-стеке выдача — необязательный оверлей `docker-compose.issuance.yml`
-поверх `docker-compose.oauth.yml`; он монтирует `gateway/config.toml` с картой
-команд (`compose/README.ru.md`, «Выдача токенов разработчикам»). В Helm это
-значения `issuance.*` (`install.md`, «Developer onboarding»). Без неё
+compose-стеке выдача — необязательный оверлей `docker-compose.issuance.yml`,
+который ложится на каждый включённый шлюз; он монтирует `gateway/config.toml` с
+картой команд (`compose/README.ru.md`, «Выдача токенов разработчикам»). В Helm
+это значения `issuance.*` (`install.md`, «Developer onboarding»). Без неё
 corp-токены выдаёт `gateway-admin token issue` (аварийный путь).
 
 **Postgres за PgBouncer.** Пулы шлюза передают параметры TCP keepalive при
@@ -170,8 +154,8 @@ corp-токены выдаёт `gateway-admin token issue` (аварийный �
 называет `ignore_startup_parameters` и три параметра, которые туда нужно
 вписать.
 
-**Собственные management-эндпоинты litellm отклоняются, в обоих режимах.** Без
-мастер-ключа litellm принимает любого как internal user
+**Собственные management-эндпоинты litellm отклоняются, на любом провайдере.**
+Без мастер-ключа litellm принимает любого как internal user
 (`user_api_key_auth.py:1622-1633` в 1.101.0), так что значительная часть `/key/*`,
 `/model/*`, `/user/*`, `/policies*`, `/guardrails*` и UI иначе отвечала бы любому,
 кто дошёл до порта. Route gate отклоняет их все (`403 E_ROUTE_BLOCKED`) раньше,
@@ -179,13 +163,13 @@ corp-токены выдаёт `gateway-admin token issue` (аварийный �
 фронт на nginx. LLM-маршруты по-прежнему закрывает проверка `X-Corp-Auth`
 в `pre_call`. См. `../security.md` §14.
 
-Фронт (`COMPOSE_PROFILES=nginx` или `nginx-ports`, `compose/README.ru.md`,
+Фронт (`COMPOSE_PROFILES=…,nginx` или `…,nginx-ports`, `compose/README.ru.md`,
 «HTTPS-фронт (nginx)») **дополнительно** отвечает на всю эту поверхность 404 на
-периметре, безусловно и в обоих режимах: его allow-list по точным путям
-пропускает только `POST /v1/messages`, `POST /v1/chat/completions`,
-`POST /v1/responses`, `GET /v1/models`, `GET /healthz/live` и
-`POST /internal/issue-token`. Это эшелонированная защита — отказ выше действует и
-без nginx, — а администрирование остаётся на SSH-туннеле к `127.0.0.1:4000`.
+периметре, безусловно: его allow-list по точным путям пропускает только
+`POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
+`GET /v1/models`, `GET /healthz/live` и `POST /internal/issue-token`. Это
+эшелонированная защита — отказ выше действует и без nginx, — а
+администрирование остаётся на SSH-туннеле к loopback-порту каждого шлюза.
 
 ---
 
@@ -212,7 +196,7 @@ CORP_LLM_ENDPOINT=https://<хост-корп-vllm>/v1   # обязателен, 
   маршрутах**, а не только на `corp-*`: попадание в газеттир уходит на
   немаршрутизируемый placeholder-хост. Сначала направьте `CORP_LLM_ENDPOINT` на
   живой vLLM.
-- **Маршруту `corp-*` `CORP_LLM_ENDPOINT` нужен независимо от этого флага.** Без
+- **Маршруту `corp-*` провайдера `corp` `CORP_LLM_ENDPOINT` нужен независимо от этого флага.** Без
   него запросы `corp-*` падают по одному, а не на загрузке конфига.
 - **Нельзя выключить одновременно оракул и локальный каскад.**
   `build_guardrail()` на старте бросит `ConfigError(NO_OP_SANITIZER_MESSAGE)`,

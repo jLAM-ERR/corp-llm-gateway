@@ -128,6 +128,13 @@ STEP1_MODIFIED_TOUCHED = (
     "tests/tokens/test_postgres_store.py",
     "tests/tokens/test_token_store_contract.py",
 )
+# Tests the step-1 touched rule still reads from 807831a that the user approved deleting
+# with the behaviour they pinned (docs/testing/deleted-tests.md). Every other rule reads the
+# current tree, so only this one can name a deleted test.
+STEP1_RETIRED = (
+    # plan 20261009 Task 8: deploy.sh --mode removed in 1.1.0.
+    "tests/deploy/test_deploy_script.py::test_virtual_keys_mode_keeps_the_base_file_alone",
+)
 # tests/test_litellm_hook.py: the plan also names its ticket / terminal-audit section.
 HOOK_FILE = "tests/test_litellm_hook.py"
 HOOK_SECTION_FROM_LINE = 5975
@@ -273,7 +280,8 @@ def _rule_ids() -> dict[str, str]:
     for path in STEP1_MODIFIED_TOUCHED:
         if history:
             for node_id, _, _ in _step1_touched(path):
-                add(node_id, "step1:touched")
+                if node_id not in STEP1_RETIRED:
+                    add(node_id, "step1:touched")
         else:
             for node_id in _committed_in(path):
                 add(node_id, "step1:touched (committed list)")
@@ -362,6 +370,11 @@ def problems(*, strict: bool = False) -> list[str]:
         else:
             warnings.warn(NO_HISTORY, stacklevel=2)
     functions = {node_id for ids in _functions().values() for node_id, _, _ in ids}
+    found += [
+        f"a retired test is back in the tree, outside the step-1 rule (STEP1_RETIRED): {node_id}"
+        for node_id in STEP1_RETIRED
+        if node_id in functions
+    ]
     recorded = {env: ledger.ids_with_outcome(env) for env in ledger.ENVS}
     outcomes = {
         env: ledger.flat(json.loads(ledger.expected_path(env).read_text())) for env in ledger.ENVS

@@ -10,10 +10,13 @@ The gateway expects two headers on every request:
 | Header | Source | Purpose |
 |---|---|---|
 | `X-Corp-Auth: <corp-token>` | `~/.corp-llm-gateway/token` | corp identity / team resolution |
-| `Authorization: Bearer <byok-key>` | dev's Anthropic / OpenAI key | BYOK passthrough to upstream |
+| `Authorization: Bearer <subscription-token>` | the harness's own login: the dev's Anthropic or ChatGPT subscription token | the upstream credential on a subscription provider, lifted by its bridge; never forwarded on `corp` |
 
-Every harness already knows how to send `Authorization` — that's the
-standard API key. The trick is `X-Corp-Auth`. Three patterns work, in
+No provider accepts a client API key: since 1.1.0 the client authenticates to
+the gateway with `X-Corp-Auth`, and on the `anthropic` / `codex` providers the
+subscription bridge carries the `Authorization` token upstream
+(`docs/security.md` §13). Every harness already knows how to send
+`Authorization` — that's its own login. The trick is `X-Corp-Auth`. Three patterns work, in
 order of friction:
 
 ## Pattern 1 — env-var custom headers (Claude Code only)
@@ -76,7 +79,8 @@ The proxy:
 
 - Re-reads the token file on every request (no shell-restart on rotation).
 - Streams SSE responses through unmodified.
-- Forwards the developer's `Authorization: Bearer <byok-key>` untouched.
+- Forwards the developer's `Authorization: Bearer <subscription-token>` to the
+  gateway untouched.
 - Logs nothing about request bodies — the gateway is the audit boundary,
   not the proxy.
 
@@ -124,9 +128,11 @@ For Codex / Cursor / others, dev edits the relevant config file once
 
 ## What still leaks vs. what doesn't
 
-- `Authorization: Bearer <byok-key>` is the developer's personal
-  Anthropic / OpenAI key. The gateway forwards it untouched to upstream
-  (BYOK). It is **never logged** by the gateway and the proxy doesn't
+- `Authorization: Bearer <subscription-token>` is the developer's own
+  Anthropic or ChatGPT subscription token. On the `anthropic` / `codex`
+  providers the subscription bridge lifts it into the upstream call as the
+  credential; on `corp` it never leaves the gateway. No provider accepts a
+  client API key. It is **never logged** by the gateway and the proxy doesn't
   touch it either.
 - `X-Corp-Auth` is a corp token, scoped per user, expires in 30 days,
   revocable in ≤60 s. The gateway strips it before forwarding upstream

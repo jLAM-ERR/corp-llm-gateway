@@ -324,6 +324,33 @@ check_limit NGINX_TOKEN_BURST "$NGINX_TOKEN_BURST" "requests over the rate per c
 check_limit NGINX_TOKEN_CONN "$NGINX_TOKEN_CONN" "concurrent requests per corp token"
 check_limit NGINX_ISSUE_RATE "$NGINX_ISSUE_RATE" "issuance requests per minute per client address"
 
+# ---- 7b. gateway upstream -------------------------------------------------------
+# One gateway behind the front door (interim, until routing per provider). The
+# name is rendered into the upstream URL, so it is one of three literals; its
+# provider must be enabled, or every request would be a 502.
+NGINX_GATEWAY_UPSTREAM=${NGINX_GATEWAY_UPSTREAM:-gateway-anthropic}
+case $NGINX_GATEWAY_UPSTREAM in
+    gateway-anthropic | gateway-codex | gateway-corp) ;;
+    *) fail 64 "NGINX_GATEWAY_UPSTREAM must be gateway-anthropic, gateway-codex or gateway-corp, got '$NGINX_GATEWAY_UPSTREAM'" ;;
+esac
+upstream_provider=${NGINX_GATEWAY_UPSTREAM#gateway-}
+upstream_enabled=0
+saved_ifs=$IFS
+IFS=,
+# shellcheck disable=SC2086 # a comma-separated list; globbing is off
+for profile in ${COMPOSE_PROFILES:-}; do
+    # Trimmed the way compose trims a profile token: `anthropic, codex` enables codex.
+    profile=${profile#"${profile%%[![:space:]]*}"}
+    profile=${profile%"${profile##*[![:space:]]}"}
+    if [ "$profile" = "$upstream_provider" ]; then
+        upstream_enabled=1
+    fi
+done
+IFS=$saved_ifs
+if [ "$upstream_enabled" -eq 0 ]; then
+    fail 64 "NGINX_GATEWAY_UPSTREAM=$NGINX_GATEWAY_UPSTREAM, but COMPOSE_PROFILES does not enable the '$upstream_provider' provider: nginx would answer 502"
+fi
+
 # ---- 8. expand the trusted list -------------------------------------------------
 newline='
 '
@@ -337,9 +364,9 @@ done
 
 # ---- 9. render ----------------------------------------------------------------
 export GATEWAY_DOMAIN NGINX_TLS_CERT NGINX_TLS_KEY TRUSTED_SET_REAL_IP_LINES TRUSTED_GEO_LINES \
-    NGINX_TOKEN_RATE NGINX_TOKEN_BURST NGINX_TOKEN_CONN NGINX_ISSUE_RATE
+    NGINX_TOKEN_RATE NGINX_TOKEN_BURST NGINX_TOKEN_CONN NGINX_ISSUE_RATE NGINX_GATEWAY_UPSTREAM
 # shellcheck disable=SC2016 # the names envsubst may substitute, not expansions
-substitutions='${GATEWAY_DOMAIN} ${NGINX_TLS_CERT} ${NGINX_TLS_KEY} ${TRUSTED_SET_REAL_IP_LINES} ${TRUSTED_GEO_LINES} ${NGINX_TOKEN_RATE} ${NGINX_TOKEN_BURST} ${NGINX_TOKEN_CONN} ${NGINX_ISSUE_RATE}'
+substitutions='${GATEWAY_DOMAIN} ${NGINX_TLS_CERT} ${NGINX_TLS_KEY} ${TRUSTED_SET_REAL_IP_LINES} ${TRUSTED_GEO_LINES} ${NGINX_TOKEN_RATE} ${NGINX_TOKEN_BURST} ${NGINX_TOKEN_CONN} ${NGINX_ISSUE_RATE} ${NGINX_GATEWAY_UPSTREAM}'
 
 render() {
     template=$1

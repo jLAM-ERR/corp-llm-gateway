@@ -7,6 +7,127 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.1.0]
 
+### Security — client headers no longer reach the provider unchecked (1.0.0 is affected; breaking)
+
+- **1.0.0 sent every inbound client header upstream, unsanitized, on every provider.**
+  litellm sends `data["headers"]` to the provider, and the guardrail filled it with litellm's
+  logging copy of all inbound headers, dropping only the wire headers (`_WIRE_HEADERS_TO_DROP`),
+  with `CORP_LLM_STRIP_INBOUND_HEADERS=1`. Header values skip the sanitizer and the Stage-5 scan,
+  so this broke invariant 1: an arbitrary header carrying an email reached the Anthropic, Codex
+  and corp upstreams verbatim; a cookie arrived as `***REDACTED***`; on corp, a client
+  `sk-ant-oat…` bearer sent with `x-litellm-api-key` arrived folded into the route's own
+  credential as `Authorization: ***REDACTED***, Bearer fake-api-key`. Confirmed on the real
+  image against a capturing upstream. Upgrade every 1.0.0 deployment.
+- **`data["headers"]` is now an allowlist projection (`_UPSTREAM_HEADER_ALLOWLIST`), and the
+  allowlist is empty.** The subscription bridges carry the developer's token in `api_key` and
+  their own allowlists in `extra_headers` (Anthropic: `anthropic-beta`, `anthropic-version`,
+  `user-agent`; Codex: `chatgpt-account-id`, `originator`, `session-id`, `thread-id`,
+  `user-agent`, `x-codex-beta-features`, `x-openai-internal-codex-responses-lite`); the corp
+  route gets only its own `CORP_LLM_AUTH_TOKEN`. On a route without a bridge no copy of the
+  client's `Authorization` reaches the upstream: in 1.0.0 litellm's redacted copy of it did,
+  next to the route's own credential. `docs/security.md` §13 has the per-provider list; the
+  container suite pins the exact header set each provider receives.
+- **Request-body keys litellm turns into upstream headers or the upstream credential are
+  removed** (`extra_headers`, `provider_specific_header`, `api_key`, `organization`), silently;
+  the request goes on. **Breaking** for a client that relied on one of those keys, or on a
+  custom header, reaching the provider: it gets no error, the value just does not arrive. In 1.0.0 a client could put any header on every upstream call through
+  `extra_headers` or `provider_specific_header`, and a body `api_key` on the corp route became
+  the upstream `Authorization` and stayed on the router for later requests from other callers.
+- **Bridge headers are forwarded by exact name and only with a value in the header's format**
+  (dropped silently otherwise). 1.0.0 forwarded any `x-codex-*` name and any value, so an
+  `anthropic-version`, `user-agent` or `thread-id` carrying an email reached the provider.
+  `chatgpt-account-id` and `x-codex-beta-features` have no recorded value to derive a format
+  from and are still forwarded as sent. Unknown request-body fields are not sanitized: an
+  accepted risk, documented in `docs/security.md` §2.
+
+### Security — the litellm master key is refused (breaking); litellm has no database
+
+- **Any `LITELLM_MASTER_KEY` refuses to boot**, with or without a subscription
+  bridge, a blank value included. `build_guardrail()` stops the startup (the
+  served entrypoint exits 3) with a line starting `LITELLM_MASTER_KEY is set`,
+  and `gateway-admin config check` reports it. 1.0.0 refused it only while a
+  bridge was on. **Breaking** for any deployment that still sets one: a Helm
+  value, a custom image or deployment, or a gateway config file. `MASTER_KEY_VS_FORWARD_AUTH_MESSAGE` is renamed
+  `MASTER_KEY_REFUSED_MESSAGE`.
+- **A master key in litellm's own config is refused too:**
+  `general_settings.master_key` and `environment_variables.LITELLM_MASTER_KEY`,
+  whatever the value (an `os.environ/` reference included), exit 78 at serve time
+  and are a `config check` problem; the value is never echoed. litellm takes the
+  first ahead of the environment and exports the second at startup, so in 1.0.0
+  virtual-key auth could boot from the YAML.
+- **litellm has no database on the compose stack** (`docs/security.md` §14,
+  hazard 14c, now closed in the shipped setups; Helm never gave it one). No
+  `DATABASE_URL`, no `STORE_MODEL_IN_DB`, so litellm never re-reads its
+  `LiteLLM_Config` table, whose rows could add log callbacks or turn on prompts
+  in spend logs. The risk returns only if an operator adds `DATABASE_URL`.
+
+### Changed — compose: one gateway per provider (breaking)
+
+- **The `litellm` service is replaced by `gateway-anthropic`, `gateway-codex`
+  and `gateway-corp`**, each switched on by its compose profile and built from
+  one shared definition. Each has its own litellm config, bridge flag and
+  loopback port: `GATEWAY_ANTHROPIC_PORT` (4000), `GATEWAY_CODEX_PORT` (4001),
+  `GATEWAY_CORP_PORT` (4002), replacing `GATEWAY_PORT`. One container per
+  provider because the two subscription bridges cannot share a process. All
+  three share the `gateway` database, so a corp token works on each.
+- **Per-provider litellm configs**, each with one route: `config.anthropic.yaml`
+  (renamed from `config.oauth.yaml`; `claude-*` → `anthropic/`),
+  `config.codex.yaml` (new; `"*"` → `openai/` at the literal
+  `https://chatgpt.com/backend-api/codex`, so no environment value can send the
+  developer's ChatGPT token elsewhere), `config.corp.yaml` (new; `corp-*` →
+  `hosted_vllm/`). The production compose stack now serves Codex.
+- **`COMPOSE_PROFILES` in the server's `.env` is the only switch** for the
+  providers (`anthropic`, `codex`, `corp`) and the front door; `--profile` on
+  the command line is not supported. `.env.example` ships it commented.
+- **`profile-guard`**: a one-shot on the gateway image that `postgres` waits
+  for. When `COMPOSE_PROFILES` holds no exact provider token (trimmed like
+  compose trims it; `corporate` is not `corp`) it names the key and exits 64,
+  so `up` fails instead of starting a stack that serves nothing.
+- **The nginx front door proxies to one gateway, `NGINX_GATEWAY_UPSTREAM`**
+  (default `gateway-anthropic`). Its entrypoint exits 64 on any other name or on
+  a gateway whose provider is off. The other providers stay on their loopback
+  ports. `vector` and `nginx` depend on the gateways with `required: false`.
+- **The issuance and build overlays target all three gateways**; the build
+  overlay builds the image once, whatever providers are on.
+- **`deploy.sh up`** refuses a stack whose `config --services` holds no
+  `gateway-*`; removes the container of a gateway or front door the `.env` no
+  longer selects; runs `up -d --remove-orphans`, which removes 1.0's `litellm`
+  container and frees `127.0.0.1:4000`. `down` also removes leftover gateway
+  and front-door containers. After the sync, `up` runs the boot-time unit's bare
+  `docker compose config`: it refuses when that cannot resolve the stack (a 1.0
+  `COMPOSE_FILE` naming `docker-compose.oauth.yml`) and warns when a reboot
+  would start other gateways or front doors, or the same ones with another
+  configuration (`config --hash`, hashes only). A refusal after the sync says
+  `compose/` was synced and nothing was pulled, started or removed. The script
+  still never reads the server's `.env`.
+- **Upgrade steps:** `docs/ops/upgrade.md`, "1.0 → 1.1.0". Edit the server's
+  `.env` before the first 1.1 `deploy.sh up`.
+
+### Removed (breaking)
+
+- **Mode A** (litellm's master key and virtual keys): `LITELLM_MASTER_KEY`,
+  `UI_USERNAME`, `UI_PASSWORD`, the gateway-held `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` and the compose entrypoint's Mode-A guard. It was a test
+  posture only since 1.0.0.
+- **litellm's own database on compose:** `DATABASE_URL`, `STORE_MODEL_IN_DB`
+  and `postgres/initdb/00-create-litellm-db.sh`. A `litellm` database in an
+  existing volume is inert; `docs/ops/upgrade.md` shows how to drop it.
+- **`compose/docker-compose.oauth.yml`** (its Anthropic bridge is the base
+  file's `anthropic` provider) and **`compose/litellm/config.yaml`** (the
+  API-key routes).
+- **`deploy.sh --mode`** (**breaking** for any script or runbook that passes
+  it): any value is refused before the script touches the server, naming 1.1.0.
+  `--issuance` is unchanged.
+
+### Known limitations
+
+- **One gateway behind the front door.** nginx serves only the
+  `NGINX_GATEWAY_UPSTREAM` gateway; the other providers are reached on their
+  loopback ports or over an SSH tunnel.
+- **`_corp_gateway_request_id` also reaches the corp vLLM's request body** on
+  the `corp` provider, as it does Anthropic's on `/v1/chat/completions`
+  (`docs/security.md` §11 (e)). It is a request id, never content.
+
 ### Added — `gateway-admin` bootstrap for a fixed team token
 
 - **`token issue --value VALUE`** stores a value you choose instead of a random `ct_…` token

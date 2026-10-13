@@ -29,8 +29,12 @@ WEBSOCKET = "WEBSOCKET"
 # body, Retry-After, and HSTS when the connection is TLS).
 RATE_LIMITED = "@rate_limited"
 # The only placeholders the gateway snippet may carry: the edge limits, which
-# the entrypoint renders as bare positive integers (never a path or a method).
-SNIPPET_PLACEHOLDERS = frozenset({"NGINX_TOKEN_BURST", "NGINX_TOKEN_CONN"})
+# the entrypoint renders as bare positive integers, and the upstream gateway's
+# service name, which it renders only as one of the three gateway-* literals
+# (never a path or a method).
+SNIPPET_PLACEHOLDERS = frozenset(
+    {"NGINX_TOKEN_BURST", "NGINX_TOKEN_CONN", "NGINX_GATEWAY_UPSTREAM"}
+)
 LIMIT_DIRECTIVES = frozenset({"limit_req", "limit_conn"})
 
 # Every (method, path) litellm registers at an admitted path that nginx does not

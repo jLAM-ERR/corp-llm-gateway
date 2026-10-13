@@ -314,6 +314,6 @@ def test_a_master_key_in_env_demo_reaches_the_container_and_stops_the_boot(
     finally:
         config.reset_cache()
 
-    assert settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE in exc.value.problems
+    assert settings.MASTER_KEY_REFUSED_MESSAGE in exc.value.problems
     # A boot diagnostic is a log line; it must not print the key it complains about.
     assert POISON_MASTER_KEY not in str(exc.value)

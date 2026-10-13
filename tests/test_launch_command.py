@@ -29,7 +29,8 @@ DOCKERFILES = (
 
 COMPOSE_FILES = (
     ROOT / "compose/docker-compose.yml",
-    ROOT / "compose/docker-compose.oauth.yml",
+    ROOT / "compose/docker-compose.build.yml",
+    ROOT / "compose/docker-compose.issuance.yml",
     ROOT / "docker-compose.demo.yml",
     ROOT / "docker-compose.anthropic-oauth.yml",
     ROOT / "docker-compose.chatgpt-codex.yml",
@@ -66,9 +67,12 @@ def test_no_compose_file_starts_the_litellm_cli(path: Path) -> None:
 )
 def test_the_serving_compose_files_exec_the_gate(path: Path) -> None:
     services = yaml.safe_load(path.read_text())["services"]
-    rendered = _flatten(services["litellm"].get("command"))
+    # The production stack serves one gateway per provider; the demo one `litellm`.
+    serving = [name for name in services if name.startswith("gateway-") or name == "litellm"]
 
-    assert SERVE_MODULE in rendered
+    assert serving
+    for name in serving:
+        assert SERVE_MODULE in _flatten(services[name].get("command")), name
 
 
 def test_no_tracked_file_targets_litellms_app_directly() -> None:

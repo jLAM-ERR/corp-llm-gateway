@@ -50,7 +50,7 @@ from tests.compose.nginx_container import (
     started,
     user_network,
 )
-from tests.compose.nginx_support import COMPOSE, OAUTH, run_status_cli
+from tests.compose.nginx_support import run_status_cli
 from tests.integration.conftest import ROOT, Stack, running_stack, skip_or_fail
 from tests.integration.route_gate_stub_provider import SSE_DELAY_SECONDS
 
@@ -197,7 +197,7 @@ ISSUANCE_ENV = {
     "CORP_GATEWAY_ISSUE_OIDC_ISSUER": ISSUER,
     "CORP_GATEWAY_ISSUE_OIDC_AUDIENCE": "corp-gateway-issuance",
     "CORP_GATEWAY_ISSUE_OIDC_CLIENT_ID": "corp-gateway-cli",
-    "CORP_LLM_PG_DSN": "postgresql://gw:gw@pg:5432/litellm",
+    "CORP_LLM_PG_DSN": "postgresql://gw:gw@pg:5432/gateway",
 }
 
 
@@ -227,8 +227,8 @@ class FrontDoor:
 
 @pytest.fixture(scope="module")
 def front_door_spec(tmp_path_factory: pytest.TempPathFactory) -> Spec:
-    # The OAuth overlay's merged render, host routing.
-    return nginx_specs(tmp_path_factory, COMPOSE, OAUTH)["host"]
+    # The base stack's merged render (the anthropic provider), host routing.
+    return nginx_specs(tmp_path_factory)["host"]
 
 
 @contextlib.contextmanager
@@ -241,7 +241,8 @@ def front_door(
     gateway_args: Sequence[str] = (),
     postgres_sql: str | None = None,
 ) -> Iterator[FrontDoor]:
-    """The gateway stack, answering as ``litellm``, with nginx joined to its network."""
+    """The gateway stack, answering as ``gateway-anthropic`` (nginx's default
+    upstream), with nginx joined to its network."""
     config = tmp_path / "config.yaml"
     config.write_text(GATEWAY_CONFIG)
     with (
@@ -251,7 +252,7 @@ def front_door(
             env,
             with_postgres=postgres_sql is not None,
             postgres_sql=postgres_sql,
-            gateway_args=["--network-alias", "litellm", *gateway_args],
+            gateway_args=["--network-alias", "gateway-anthropic", *gateway_args],
         ) as stack,
         user_network(spec.image) as network,
         started(spec, copy_nginx_dir(tmp_path), network, NGINX_ENV) as nginx,

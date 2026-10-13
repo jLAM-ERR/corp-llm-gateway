@@ -29,12 +29,12 @@ Corporate LLM gateway. Sanitizes traffic between developer Claude Code instances
 
 ## Overview
 
-A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. The gateway is a LiteLLM proxy with a custom guardrail (`corp_llm_gateway.litellm_hook.CorpLlmGuardrail`) registered as a callback. Every request is sanitized in `pre_call`, forwarded to Anthropic / OpenAI with the developer's BYOK key intact, de-sanitized on the way back by the gateway's own ASGI layer (outside LiteLLM, so LiteLLM and its callbacks only see placeholders), and audited. The image serves LiteLLM's app through the gateway's own entrypoint (`python -m corp_llm_gateway.serve`), which puts a default-deny **route gate** in front of LiteLLM's router — the callback only runs on the routes LiteLLM sends through it, so everything else is refused. Two headers matter on the wire:
+A laptop harness (Claude Code, Codex, Cursor) talks HTTP to `gateway.corp.lan`. The gateway is a LiteLLM proxy with a custom guardrail (`corp_llm_gateway.litellm_hook.CorpLlmGuardrail`) registered as a callback. Every request is sanitized in `pre_call`, forwarded to Anthropic / OpenAI with the developer's own subscription token (carried by the gateway's subscription bridge, the only client credential that leaves), de-sanitized on the way back by the gateway's own ASGI layer (outside LiteLLM, so LiteLLM and its callbacks only see placeholders), and audited. The image serves LiteLLM's app through the gateway's own entrypoint (`python -m corp_llm_gateway.serve`), which puts a default-deny **route gate** in front of LiteLLM's router — the callback only runs on the routes LiteLLM sends through it, so everything else is refused. Two headers matter on the wire:
 
 | Header | Source | Purpose |
 |---|---|---|
 | `X-Corp-Auth` | `~/.corp-llm-gateway/token` (laptop) | corp identity / team resolution; **stripped** before egress |
-| `Authorization: Bearer …` | dev's Anthropic / OpenAI key | BYOK passthrough; forwarded **untouched** |
+| `Authorization: Bearer …` | dev's Anthropic / OpenAI subscription token | lifted into the upstream call by the subscription bridge only; the only other client headers that reach a provider are the bridge's allowlist (exact names, checked value formats) |
 
 ## Features
 
@@ -74,7 +74,7 @@ There is no off switch. `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` can add PASSTHRO
 ### Auth & compliance
 
 - **X-Corp-Auth + Postgres token store** — `AuthMiddleware` validates tokens against `PostgresTokenStore` (asyncpg); 60 s revocation-propagation upper bound
-- **Subscription passthrough is the production mode** — the developer's own Anthropic OAuth bearer is forwarded untouched and no corp `ANTHROPIC_API_KEY` exists at all. Corp API-key mode (LiteLLM virtual keys) survives only as a test posture: the route gate refuses `/key/*`, so no virtual key can be issued — [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md)
+- **Subscription passthrough is the production mode** — the subscription bridge carries the developer's own Anthropic or ChatGPT OAuth token as the upstream credential, and no corp `ANTHROPIC_API_KEY` exists at all. Beyond the bridge's own header allowlist (exact names, checked value formats) no client header reaches a provider, and the request-body keys litellm would turn into headers or a credential are removed ([`docs/security.md`](docs/security.md) §13). Corp API-key mode (LiteLLM virtual keys) is removed in 1.1.0 — [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md)
 - **`gateway:operator` RBAC** — admin CLI commands gated on JWT claim `gateway:operator`; verified via PyJWT against Keycloak realm roles
 - **Audit pipeline** — rich `AuditEvent` schema (ALWAYS / CONDITIONAL field tiers) + NEVER-fields gate: the logger refuses records containing `mapping`, `original`, or `credentials`
 - **SIEM sink** — Vector HTTP sink with inherited NEVER-gate + Helm alerts (`AuditVectorDropHigh`, `LeakAttemptDetected`)
@@ -117,9 +117,9 @@ src/corp_llm_gateway/   Python guardrail (LiteLLM custom hooks + sanitizer engin
   tokens/               schema.sql + AuthMiddleware + TokenIssuer + stores
   litellm_hook.py       CorpLlmGuardrail — LiteLLM callback adapter (incl. OpenAI tool_calls + streaming)
 helm/corp-llm-gateway/  Helm chart (gateway image + guardrail callback, Secret, HPA/PDB/SA, ServiceMonitor, config-check initContainer, NetworkPolicy, CoreDNS sinkhole)
-compose/                production single-host deploy target — data plane (litellm + redis + postgres) + self-hosted
-                        Langfuse v3 + Vector audit pipeline; docker-compose.oauth.yml (subscription mode) and
-                        docker-compose.build.yml (build from source) overlays
+compose/                production single-host deploy target — one gateway per provider (anthropic / codex / corp,
+                        picked by COMPOSE_PROFILES) + redis + postgres + self-hosted Langfuse v3 + Vector audit
+                        pipeline; docker-compose.issuance.yml and docker-compose.build.yml (build from source) overlays
 examples/compose/       lightweight local sanitizing proxy (one container, oracle off) — not a deploy target
 docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      laptop installer (bash/zsh/fish, macOS/Linux)
@@ -206,54 +206,48 @@ Four things in this repo run the gateway. Only the first two are deploy targets.
 
 ## Run on a server (docker compose)
 
-[`compose/`](compose/) is the production target for hosts without Kubernetes. It ships the **data plane** (`litellm` — the guardrail-fronted proxy — plus `redis` for Cache B and `postgres` for tokens/team config), **self-hosted Langfuse v3** (`langfuse-web`/`-worker`, ClickHouse, MinIO, its own Redis) and the **audit pipeline** (`vector`, tailing the gateway's stdout into Langfuse, with the NEVER-fields VRL gate byte-identical to the Helm chart's).
+[`compose/`](compose/) is the production target for hosts without Kubernetes. It ships the **data plane** (one gateway per provider — `gateway-anthropic`, `gateway-codex`, `gateway-corp`, each the guardrail-fronted litellm proxy — plus `redis` for Cache B and `postgres` for tokens/team config), **self-hosted Langfuse v3** (`langfuse-web`/`-worker`, ClickHouse, MinIO, its own Redis) and the **audit pipeline** (`vector`, tailing the gateways' stdout into Langfuse, with the NEVER-fields VRL gate byte-identical to the Helm chart's).
 
-### Pick an auth mode first
+### Pick the providers first
 
-Two modes, **mutually exclusive** — decide before you write `.env`. **Mode B is the production mode; Mode A is a test posture only**: the route gate refuses LiteLLM's management surface, `/key/*` included, so nothing can issue the virtual key Mode A needs. They run the same stack, the same cascade and the same audit chain; only the upstream credential differs.
+Each provider is its own gateway container, switched on by `COMPOSE_PROFILES` in the server's `.env` (at least one, comma-separated). Every gateway runs the same cascade and the same audit chain; developers send `X-Corp-Auth` on each.
 
-| | **Mode A** — corp API keys | **Mode B** — subscription (OAuth) |
-|---|---|---|
-| Stack | `docker compose up -d` | `-f docker-compose.yml -f docker-compose.oauth.yml` |
-| Upstream credential | the gateway's `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | the developer's own Anthropic OAuth bearer, forwarded untouched |
-| Developer sends | `Authorization: Bearer <litellm virtual key>` | `Authorization: Bearer <sk-ant-oat…>` |
-| Team identity | `X-Corp-Auth: <team token>` | same |
-| `LITELLM_MASTER_KEY` | **required** | **must be absent** (a blank line counts as set — delete it) |
-| Routes served | `claude-*`, `gpt-*`, `corp-*` | `claude-*` only, and that is a load-bearing control, not a simplification |
-| Per-developer revocation / spend | no — `/key/*` and the admin UI are refused | no |
-| Status | **test posture only** | **production** |
+| Profile | Serves | Upstream credential | Port on `127.0.0.1` |
+|---|---|---|---|
+| `anthropic` | Claude Code on an Anthropic subscription (`claude-*`) | the developer's own `sk-ant-oat…` token | 4000 |
+| `codex` | Codex on a ChatGPT subscription | the developer's own ChatGPT token | 4001 |
+| `corp` | the corp vLLM (`corp-*`) | the route's `CORP_LLM_AUTH_TOKEN`; no bridge | 4002 |
 
-Full matrix, every failure mode, and why the two cannot coexist: [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md) · RU: [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md).
+Mode A (litellm's master key and virtual keys) and litellm's own database were removed in 1.1.0; any `LITELLM_MASTER_KEY` refuses to boot. Without a provider, `profile-guard` stops `up` with a message naming `COMPOSE_PROFILES`. Details, and why each provider has its own container and one route: [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md) · RU: [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md). Upgrading a 1.0 host: [`docs/ops/upgrade.md`](docs/ops/upgrade.md), "1.0 → 1.1.0".
 
 ### Quickstart
 
 ```bash
 # day 0, on the server (installs docker if missing, creates /opt/corp-llm-gateway
-# and a 0600 .env, then exits 1 so you fill the .env in — that exit is expected)
+# and a 0600 .env, then exits 1 so you fill the .env in — that exit is expected;
+# set COMPOSE_PROFILES there, e.g. COMPOSE_PROFILES=anthropic)
 sudo scripts/deploy/bootstrap-server.sh
 
 # stage the token-store schema — postgres init scripts only run on an empty volume
 cp src/corp_llm_gateway/tokens/schema.sql compose/postgres/initdb/01-schema.sql
 
-cd compose && docker compose up -d          # Mode A
+cd compose && docker compose up -d
 docker compose ps                           # healthy in ~30-60s; langfuse ~2 min on a fresh volume
-curl -fsS http://127.0.0.1:4000/health/liveliness
+curl -fsS http://127.0.0.1:4000/healthz/live   # gateway-anthropic; 4001 codex, 4002 corp
 ```
 
-Skipping the schema step is a silent trap, not a visible failure: every service reports healthy and `/health/liveliness` answers, but every real request 500s because `corp_tokens` / `team_config` don't exist.
+Skipping the schema step is a silent trap, not a visible failure: every service reports healthy and `/healthz/live` answers, but every real request 500s because `corp_tokens` / `team_config` don't exist.
 
 Secrets with no default (`GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, the `LANGFUSE_*` infrastructure secrets, `CORP_LANGFUSE_PUBLIC_KEY` / `CORP_LANGFUSE_SECRET_KEY`) make `docker compose up` refuse to start naming the variable, rather than booting half-configured. Full annotated template: [`compose/.env.example`](compose/.env.example).
 
 ### Deploy from an operator laptop
 
 ```bash
-scripts/deploy/deploy.sh --host user@server up               # Mode A
-scripts/deploy/deploy.sh --host user@server --mode oauth up  # Mode B
+scripts/deploy/deploy.sh --host user@server up               # the providers in the server's COMPOSE_PROFILES
+scripts/deploy/deploy.sh --host user@server --issuance up    # plus developer token issuance
 ```
 
-It stages the SQL schema, syncs `compose/`, pulls, brings the stack up and waits for healthchecks. The local `.env` is never uploaded and the server's `.env` is never read, printed or overwritten; keys and certificates are excluded from the sync. Other subcommands: `down` (volumes survive, asks first), `restart`, `logs`, `status`; useful flags `--dry-run`, `--yes`, `--dir`, `--force-unlock`. **Pass the same `--mode` on every later run against that host** — `logs`/`status`/`down` resolve the stack through the same file list, and a run without it reports on (or recreates) a different stack.
-
-For boot-time autostart in Mode B, also uncomment `COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml` in `.env`: the systemd unit runs a bare `docker compose up -d`, which would otherwise resolve the base file alone.
+It stages the SQL schema, syncs `compose/`, pulls, brings the stack up and waits for healthchecks. The local `.env` is never uploaded and the server's `.env` is never read, printed or overwritten; keys and certificates are excluded from the sync. `up` refuses a stack with no provider, removes the container of a provider the `.env` no longer selects, and warns when a reboot would start the stack differently. Other subcommands: `down` (volumes survive, asks first), `restart`, `logs`, `status`; useful flags `--dry-run`, `--yes`, `--dir`, `--force-unlock`. There is no `--mode` (removed in 1.1.0). **Pass `--issuance` on every later run against a host that issues tokens** — `logs`/`status`/`down` resolve the stack through the same file list — and for boot-time autostart uncomment `COMPOSE_FILE=docker-compose.yml:docker-compose.issuance.yml` in its `.env`.
 
 ### The two optional network dependencies
 
@@ -274,12 +268,12 @@ Don't confuse `CORP_NER_ENABLED` (the remote service) with `CORP_LLM_REQUIRE_NER
 
 ### Know before going live
 
-- **HTTPS reaches the stack only through the front door.** `127.0.0.1:4000` is plain HTTP on loopback. For developers across the network, turn on the opt-in nginx front door with `COMPOSE_PROFILES=nginx` (or `nginx-ports` without DNS) in the server's `.env`: HTTPS only, `NGINX_TLS_MODE` `terminate` (nginx holds the certificate) or `behind-proxy` (your load balancer terminates TLS), and an exact-path allow-list — the LLM routes, `/v1/models`, `/healthz/live` and `POST /internal/issue-token`; everything else is 404. Without it, developers use an SSH tunnel. Reference: [`compose/README.md`](compose/README.md), "HTTPS front door (nginx)".
-- **litellm's management endpoints are refused, in both modes** (`/key/*`, `/model/*`, `/user/*`, `/policies*`, `/guardrails*`, the UI) — without a master key litellm accepts any caller as an internal user, so the route gate answers them with `403 E_ROUTE_BLOCKED` before litellm sees the request, on every path in. The LLM routes are gated by the guardrail's `X-Corp-Auth` check.
+- **HTTPS reaches the stack only through the front door.** The gateway ports (`127.0.0.1:4000`-`4002`) are plain HTTP on loopback. For developers across the network, add the opt-in nginx front door to the same line, `COMPOSE_PROFILES=anthropic,nginx` (or `nginx-ports` without DNS), in the server's `.env`. It proxies to one gateway, `NGINX_GATEWAY_UPSTREAM` (default `gateway-anthropic`): HTTPS only, `NGINX_TLS_MODE` `terminate` (nginx holds the certificate) or `behind-proxy` (your load balancer terminates TLS), and an exact-path allow-list — the LLM routes, `/v1/models`, `/healthz/live` and `POST /internal/issue-token`; everything else is 404. Without it, developers use an SSH tunnel. Reference: [`compose/README.md`](compose/README.md), "HTTPS front door (nginx)".
+- **litellm's management endpoints are refused, on every provider** (`/key/*`, `/model/*`, `/user/*`, `/policies*`, `/guardrails*`, the UI) — without a master key litellm accepts any caller as an internal user, so the route gate answers them with `403 E_ROUTE_BLOCKED` before litellm sees the request, on every path in. The LLM routes are gated by the guardrail's `X-Corp-Auth` check.
 - **No untrusted `docker run` on that host.** Vector selects audit records by a public container label, so anyone who can start a container there can forge audit records. That is a deployment-model requirement, not advice.
 - **Audit is buffered but not fail-closed** — a documented deviation from the `vectorBufferFull` default in [`docs/security.md`](docs/security.md) §8. A stalled audit path does not stop egress; durability is bounded by docker log rotation, not by Vector's disk buffer.
 
-**Full stack reference** (routing, virtual keys, why BYOK isn't available here, Langfuse, the audit pipeline, TLS to the corp vLLM, recovery procedures): [`compose/README.md`](compose/README.md) · RU: [`compose/README.ru.md`](compose/README.ru.md). **Step-by-step handoff** for whoever does the deploy: [`docs/ops/deploy-handoff.md`](docs/ops/deploy-handoff.md) · RU: [`docs/ops/deploy-handoff.ru.md`](docs/ops/deploy-handoff.ru.md).
+**Full stack reference** (providers, routing, why BYOK isn't available here, Langfuse, the audit pipeline, TLS to the corp vLLM, recovery procedures): [`compose/README.md`](compose/README.md) · RU: [`compose/README.ru.md`](compose/README.ru.md). **Step-by-step handoff** for whoever does the deploy: [`docs/ops/deploy-handoff.md`](docs/ops/deploy-handoff.md) · RU: [`docs/ops/deploy-handoff.ru.md`](docs/ops/deploy-handoff.ru.md).
 
 ## Run locally (docker compose)
 
