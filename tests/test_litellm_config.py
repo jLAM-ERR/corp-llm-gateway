@@ -146,6 +146,42 @@ def test_a_database_url_elsewhere_in_the_config_is_fine(tmp_path: Path) -> None:
     assert litellm_config.problems(path, require_file=True) == []
 
 
+_CONFIG_MASTER_KEY_VALUE = "sk-config-master-key-fixture"
+
+# litellm reads `general_settings.master_key` ahead of LITELLM_MASTER_KEY, resolving an
+# `os.environ/` value; `environment_variables` is exported to os.environ at startup.
+CONFIG_MASTER_KEYS = {
+    "literal": f"general_settings:\n  master_key: {_CONFIG_MASTER_KEY_VALUE}\n",
+    "os-environ": "general_settings:\n  master_key: os.environ/OTHER_MASTER_KEY\n",
+    "null": "general_settings:\n  master_key:\n",
+    "environment-variables": (
+        f"environment_variables:\n  LITELLM_MASTER_KEY: {_CONFIG_MASTER_KEY_VALUE}\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("block", sorted(CONFIG_MASTER_KEYS))
+def test_a_config_master_key_is_refused_without_echoing_it(tmp_path: Path, block: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("model_list: []\n" + CONFIG_MASTER_KEYS[block])
+
+    found = litellm_config.problems(path, require_file=True)
+
+    assert len(found) == 1
+    assert "master" in found[0].lower() and "is refused" in found[0]
+    assert "1.1.0" in found[0]
+    assert _CONFIG_MASTER_KEY_VALUE not in found[0]
+    assert "OTHER_MASTER_KEY" not in found[0]
+
+
+def test_a_master_key_named_elsewhere_in_the_config_is_fine(tmp_path: Path) -> None:
+    # Only general_settings.master_key and the exported variable reach litellm's proxy auth.
+    path = tmp_path / "config.yaml"
+    path.write_text("model_list: []\nlitellm_settings:\n  master_key_hint: x\n")
+
+    assert litellm_config.problems(path, require_file=True) == []
+
+
 UNDER_GENERAL_SETTINGS = """
 model_list: []
 general_settings:
@@ -265,6 +301,19 @@ def test_config_check_refuses_a_config_only_database_url(
     problems = _validate(monkeypatch, CORP_LLM_LITELLM_CONFIG=str(path))
 
     assert any("general_settings.database_url is refused" in problem for problem in problems)
+
+
+@pytest.mark.parametrize("block", ["literal", "os-environ"])
+def test_config_check_refuses_a_config_master_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block: str
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("model_list: []\n" + CONFIG_MASTER_KEYS[block])
+
+    problems = _validate(monkeypatch, CORP_LLM_LITELLM_CONFIG=str(path))
+
+    assert any("general_settings.master_key is refused" in problem for problem in problems)
+    assert _CONFIG_MASTER_KEY_VALUE not in "".join(problems)
 
 
 def test_config_check_passes_on_a_valid_config(

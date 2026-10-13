@@ -68,9 +68,9 @@ filter of the 5,922 they held before gave 3,956; Task 10's three new classify te
 on provider fixtures: 56 approved must-keep deletions in [deleted-tests.md](deleted-tests.md), 81
 re-parametrised cases and the new corp-token and corp-bearer tests), 4,171 after its Task 6b
 (the upstream header allowlist: additions only), 4,228 after the Task 6b review round (removed
-body keys and bridge header formats: additions only), 4,233 after its Task 7 (any
-`LITELLM_MASTER_KEY` refused: additions only).
-A parametrised test is there as its cases, so the 492 function-level must-keep ids of
+body keys and bridge header formats: additions only), 4,236 after its Task 7 (any
+`LITELLM_MASTER_KEY`, and `master_key` in litellm's config, refused: additions only).
+A parametrised test is there as its cases, so the 495 function-level must-keep ids of
 parametrised tests have no line of their own.
 `ledger check` fails when a recorded id is missing, gains or loses a case, or changes
 outcome or skip reason, or when a module that holds one stops collecting. Any other test

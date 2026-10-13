@@ -696,8 +696,10 @@ def test_master_key_is_refused_whatever_the_bridge_kwargs_say(
     # A caller that resolves its own bridge flags cannot turn the refusal off.
     monkeypatch.setenv("LITELLM_MASTER_KEY", "master-key-fixture")
 
-    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY"):
+    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY") as exc_info:
         bootstrap.build_guardrail(**kwargs)
+
+    assert "master-key-fixture" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize("bridge", [None, "CORP_LLM_FORWARD_ANTHROPIC_AUTH"])
@@ -720,8 +722,10 @@ def test_master_key_refusal_precedes_any_component_construction(
         lambda: pytest.fail("built the mapping store despite an invalid config"),
     )
 
-    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY"):
+    with pytest.raises(ConfigError, match="LITELLM_MASTER_KEY") as exc_info:
         bootstrap.build_guardrail()
+
+    assert "master-key-fixture" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

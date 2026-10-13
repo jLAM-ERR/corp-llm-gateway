@@ -20,6 +20,11 @@ Two blocks are refused outright:
   ``asgi.py`` replicates the sequence but reads ``DATABASE_URL``/``DIRECT_URL``
   only, so a config-only DSN would boot a proxy that connects to a database whose
   schema was never set up. Refuse it; ``DATABASE_URL`` is the supported source.
+* ``general_settings.master_key`` and ``environment_variables.LITELLM_MASTER_KEY`` —
+  litellm takes its proxy master key from the first ahead of the environment
+  (``proxy_server.py:5681``, an ``os.environ/`` value included) and exports the
+  second at startup. Either turns on virtual-key auth (Mode A, removed in 1.1.0),
+  which ``settings.master_key_conflict`` refuses in the environment only.
 """
 
 from __future__ import annotations
@@ -46,6 +51,13 @@ _YAML_SUFFIXES = (".yaml", ".yml")
 PASS_THROUGH_KEY = "pass_through_endpoints"
 
 DATABASE_URL_KEY = "database_url"
+
+MASTER_KEY_KEY = "master_key"
+
+_MASTER_KEY_REFUSED_TAIL = (
+    "litellm reads it as its proxy master key, which turns on its virtual-key auth "
+    "(Mode A, removed in 1.1.0; the gateway authenticates with X-Corp-Auth); remove it"
+)
 
 
 def config_path() -> Path:
@@ -114,6 +126,17 @@ def content_problems(path: Path) -> list[str]:
             "The entrypoint's Prisma schema setup reads the DATABASE_URL / DIRECT_URL "
             "environment only, so a DSN that lives only in this file would let litellm "
             "connect to a database whose schema was never set up; set DATABASE_URL instead"
+        ]
+    if MASTER_KEY_KEY in general:
+        return [
+            f"{CONFIG_PATH_KEY}={path}: general_settings.{MASTER_KEY_KEY} is refused. "
+            + _MASTER_KEY_REFUSED_TAIL
+        ]
+    exported = document.get("environment_variables")
+    if isinstance(exported, dict) and "LITELLM_MASTER_KEY" in exported:
+        return [
+            f"{CONFIG_PATH_KEY}={path}: environment_variables.LITELLM_MASTER_KEY is refused. "
+            "litellm exports it at startup; " + _MASTER_KEY_REFUSED_TAIL
         ]
     return []
 

@@ -86,14 +86,12 @@
 #   inbound Authorization bearer, so setting both refuses to boot (and fails
 #   `gateway-admin config check`). Picking a bridge per provider is a v2 follow-up.
 # LITELLM_MASTER_KEY = ""   # litellm's own virtual-key switch — NOT a gateway knob
-#   Listed here only because it is INCOMPATIBLE with either bridge above: with a
-#   master key set, litellm reads the inbound Authorization header as one of its
-#   own virtual keys and answers 401 before pre_call runs, so the bridge never
-#   sees the developer's OAuth bearer. That pair refuses to boot and fails
-#   `gateway-admin config check`. A master key with both bridges off is fine.
-#   PRESENCE is what counts: litellm keeps a blank value and enables proxy auth
-#   for anything that is not unset, so `LITELLM_MASTER_KEY = ""` next to a bridge
-#   is refused too. Remove the line rather than blanking it.
+#   Listed here only because it is REFUSED: litellm's proxy auth (Mode A) was
+#   removed in 1.1.0, so any master key refuses to boot and fails `gateway-admin
+#   config check`, bridge or not (so does `general_settings.master_key` in
+#   litellm's config). With a bridge on it would also 401 the developer's bearer
+#   before pre_call. PRESENCE is what counts: litellm keeps a blank value, so
+#   `LITELLM_MASTER_KEY = ""` is refused too. Remove the line rather than blanking it.
 
 # ── Oversize content policy (payload/size_threshold.py) ─────────────────────
 #

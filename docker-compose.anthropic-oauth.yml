@@ -10,9 +10,9 @@
 #
 # The demo stack's `env_file: .env.demo` is developer-owned and git-ignored, so a
 # master key can still arrive from there. It is NOT neutralised here on purpose:
-# an override would silence the mistake. build_guardrail() refuses to boot with a
-# master key while a bridge is on (settings.MASTER_KEY_VS_FORWARD_AUTH_MESSAGE),
-# so the container dies with a named cause instead of serving 401s.
+# an override would silence the mistake. build_guardrail() refuses to boot with any
+# master key, bridge or not (settings.MASTER_KEY_REFUSED_MESSAGE), so the container
+# dies with a named cause instead of serving 401s.
 
 services:
   litellm:

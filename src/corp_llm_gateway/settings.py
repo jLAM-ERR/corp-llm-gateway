@@ -608,9 +608,10 @@ def _check_forward_auth_exclusive(values: Mapping[str, str | None], problems: li
 # `validate()`, and their `env_file:` is a developer-owned file, so this has to be a
 # boot-time refusal rather than a documented convention.
 MASTER_KEY_REFUSED_MESSAGE = (
-    "LITELLM_MASTER_KEY is set. Mode A (litellm master key and virtual keys) was removed in "
-    "1.1.0: the gateway serves subscription mode only, so litellm must run without proxy "
-    "auth. With a subscription-auth bridge on (CORP_LLM_FORWARD_ANTHROPIC_AUTH / "
+    "LITELLM_MASTER_KEY is set. litellm's proxy auth (Mode A: master key and virtual keys) "
+    "was removed in 1.1.0; the gateway authenticates every client with X-Corp-Auth, so "
+    "litellm must run without a master key. With a subscription-auth bridge on "
+    "(CORP_LLM_FORWARD_ANTHROPIC_AUTH / "
     "CORP_LLM_FORWARD_CHATGPT_AUTH), a master key also makes litellm read the inbound "
     "Authorization header as one of its own virtual keys and answer 401 before pre_call "
     "ever sees the developer's token. A blank value counts as set: litellm keeps the empty "
