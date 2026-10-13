@@ -370,6 +370,11 @@ def problems(*, strict: bool = False) -> list[str]:
         else:
             warnings.warn(NO_HISTORY, stacklevel=2)
     functions = {node_id for ids in _functions().values() for node_id, _, _ in ids}
+    found += [
+        f"a retired test is back in the tree, outside the step-1 rule (STEP1_RETIRED): {node_id}"
+        for node_id in STEP1_RETIRED
+        if node_id in functions
+    ]
     recorded = {env: ledger.ids_with_outcome(env) for env in ledger.ENVS}
     outcomes = {
         env: ledger.flat(json.loads(ledger.expected_path(env).read_text())) for env in ledger.ENVS

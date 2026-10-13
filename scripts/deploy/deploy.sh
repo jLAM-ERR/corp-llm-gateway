@@ -59,6 +59,8 @@ GATEWAY_PREFIX="gateway-"
 # with a leading space; set by resolve_enabled_services.
 ENABLED_FRONT_DOORS=""
 ENABLED_GATEWAYS=""
+# Every refusal after the sync: the server already holds the new compose files.
+SYNCED_NOTHING_ELSE="compose/ was synced; nothing was pulled, started or removed."
 # Container names come back from the server and go into a remote `docker rm`.
 CONTAINER_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 # The `restart: "no"` services: the only ones that are done once they exit 0.
@@ -631,7 +633,7 @@ resolve_enabled_services() {
     ENABLED_GATEWAYS=""
     services="$(ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} config --services")" \
         || fatal "docker compose could not resolve the stack in ${HOST}:${REMOTE_DIR} (its
-       error is above); nothing was pulled or started."
+       error is above). ${SYNCED_NOTHING_ELSE}"
     while IFS= read -r name; do
         if is_front_door "$name"; then
             enabled+=("$name")
@@ -644,12 +646,12 @@ resolve_enabled_services() {
         fatal "no provider: COMPOSE_PROFILES in ${HOST}:${REMOTE_DIR}/.env enables none of
        anthropic, codex, corp, so the stack would serve nothing (profile-guard
        refuses it too). Add the provider(s) this host serves to that line,
-       comma-separated. Nothing was pulled or started."
+       comma-separated. ${SYNCED_NOTHING_ELSE}"
     fi
     if (( ${#enabled[@]} > 1 )); then
         fatal "COMPOSE_PROFILES in ${HOST}:${REMOTE_DIR}/.env enables both ${enabled[*]}.
        Pick ONE: nginx (host routing) or nginx-ports (no DNS). Both publish
-       NGINX_PORT, so the second would fail to start. Nothing was pulled or started."
+       NGINX_PORT, so the second would fail to start. ${SYNCED_NOTHING_ELSE}"
     fi
 }
 
@@ -664,27 +666,59 @@ serving_services() {
     printf '%s\n' ${selected+"${selected[@]}"} | sort | tr '\n' ' ' | sed 's/ *$//'
 }
 
+# Column 1 of `config --hash` output: the service names.
+hashed_names() {
+    printf '%s\n' "$1" | cut -d' ' -f1
+}
+
+# The gateway and front-door lines of `config --hash` output, sorted.
+serving_hashes() {
+    local name hash
+    while IFS=' ' read -r name hash; do
+        if is_gateway "$name" || is_front_door "$name"; then
+            printf '%s %s\n' "$name" "$hash"
+        fi
+    done <<< "$1" | sort
+}
+
 # The boot-time unit runs a bare `docker compose up -d` here, so whatever
 # COMPOSE_FILE the server's .env names decides what comes back after a reboot,
 # not this script's -f list. Compose resolves it; this script reads no .env.
+# `config --hash` prints a service name and a hash of its resolved config per
+# line, never a value: the issuance overlay changes no name, only the gateways'
+# hashes. Only what serves traffic is compared, gateways and front doors.
 check_the_reboot_path() {
-    local bare deployed rebooted
-    bare="$(ssh_capture "cd ${REMOTE_DIR} && docker compose config --services")" \
+    local bare deployed_hashes deployed rebooted differing
+    bare="$(ssh_capture "cd ${REMOTE_DIR} && docker compose config --hash '*'")" \
         || fatal "after a reboot the stack in ${HOST}:${REMOTE_DIR} would not come back: the
        boot-time unit's bare \`docker compose up -d\` cannot resolve it (the error
        is above). On a 1.0 host the cause is usually a COMPOSE_FILE line in the
        server's .env that still names docker-compose.oauth.yml, removed in 1.1.0.
        Drop that file from the line (keep docker-compose.issuance.yml if this host
        issues tokens) and remove the old docker-compose.oauth.yml from the deploy
-       directory, then re-run. Nothing was pulled or started."
+       directory, then re-run. ${SYNCED_NOTHING_ELSE}"
+    deployed_hashes="$(ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} config --hash '*'")" \
+        || fatal "docker compose could not hash the stack in ${HOST}:${REMOTE_DIR} (its
+       error is above). ${SYNCED_NOTHING_ELSE}"
     deployed="$(serving_services "$(printf '%s' "${ENABLED_GATEWAYS}${ENABLED_FRONT_DOORS}" | tr ' ' '\n')")"
-    rebooted="$(serving_services "$bare")"
+    rebooted="$(serving_services "$(hashed_names "$bare")")"
     if [[ "$deployed" != "$rebooted" ]]; then
         warn "a reboot would start other gateways or front doors than this deploy:
        this deploy: ${deployed:-none}; the boot-time unit: ${rebooted:-none}.
        The unit runs a bare \`docker compose up -d\`, so COMPOSE_FILE in the
        server's .env picks its files. Make that line name the same files as
        this deploy (docs/ops/upgrade.md)."
+        return 0
+    fi
+    differing="$(comm -3 <(serving_hashes "$deployed_hashes") <(serving_hashes "$bare") \
+        | tr -d '\t' | cut -d' ' -f1 | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+    if [[ -n "$differing" ]]; then
+        warn "a reboot would start ${differing} with another configuration than this
+       deploy. The usual cause: the COMPOSE_FILE line in the server's .env does
+       not match --issuance. A host deployed with --issuance needs the line
+       COMPOSE_FILE=docker-compose.yml:docker-compose.issuance.yml, or a reboot
+       turns token issuance off; a host deployed without it must not have that
+       line. Fix the line, or this command's flags (docs/ops/upgrade.md)."
     fi
 }
 

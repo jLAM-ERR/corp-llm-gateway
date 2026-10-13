@@ -145,6 +145,17 @@ def test_dropping_a_must_keep_id_needs_a_rule_change(monkeypatch: pytest.MonkeyP
     assert f"the rules select a test missing from must_keep/: {dropped}" in must_keep.problems()
 
 
+def test_a_retired_must_keep_test_cannot_come_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A test re-added under a retired name would escape the step-1 rule.
+    back = "tests/deploy/test_deploy_script.py::test_remote_dir_default_matches_bootstrap_server"
+    monkeypatch.setattr(must_keep, "STEP1_RETIRED", (*must_keep.STEP1_RETIRED, back))
+    message = f"a retired test is back in the tree, outside the step-1 rule (STEP1_RETIRED): {back}"
+    assert message in must_keep.problems()
+    assert not [
+        line for line in must_keep.problems() if "STEP1_RETIRED" in line and back not in line
+    ]
+
+
 def test_a_clone_without_the_step1_history_fails_on_ci_and_warns_elsewhere(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

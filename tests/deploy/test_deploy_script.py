@@ -109,16 +109,27 @@ def _stub_bin(tmp_path: Path, *, ssh_mode: str = "exec") -> Path:
         'if [ -n "${COMPOSE_PROFILES+set}" ]; then\n'
         '    printf \'%s\\n\' "COMPOSE_PROFILES=${COMPOSE_PROFILES}" >> "$DOCKER_ENV_LOG"\n'
         "fi\n"
+        # `config --hash`: one "<service> <hash>" line per service; the hash is
+        # FAKE_HASH (FAKE_BARE_HASH for the bare call) unless FAKE_*_HASHES says.
+        "hashes() {\n"
+        "    printf '%s\\n' \"$1\" | while IFS= read -r svc; do\n"
+        '        [ -z "$svc" ] || printf \'%s %s\\n\' "$svc" "$2"\n'
+        "    done\n"
+        "}\n"
         "bare=1\n"
-        'for a in "$@"; do [ "$a" = "-f" ] && bare=0; done\n'
+        "hash=0\n"
+        'for a in "$@"; do [ "$a" = "-f" ] && bare=0; [ "$a" = "--hash" ] && hash=1; done\n'
         'for a in "$@"; do\n'
         '    if [ "$a" = "ps" ]; then printf \'%s\\n\' "${FAKE_PS_JSON:-[]}"; exit 0; fi\n'
         '    if [ "$a" = "config" ] && [ "$bare" = 1 ]; then\n'
         '        [ -z "${FAKE_BARE_CONFIG_FAIL:-}" ] || exit 1\n'
-        "        printf '%s\\n' \"${FAKE_BARE_SERVICES-$FAKE_SERVICES}\"; exit 0\n"
+        '        services="${FAKE_BARE_SERVICES-$FAKE_SERVICES}"\n'
+        '        if [ "$hash" = 1 ]; then hashes "$services" "${FAKE_BARE_HASH:-h0}"; exit 0; fi\n'
+        "        printf '%s\\n' \"$services\"; exit 0\n"
         "    fi\n"
         '    if [ "$a" = "config" ]; then\n'
         '        [ -z "${FAKE_CONFIG_FAIL:-}" ] || exit 1\n'
+        '        if [ "$hash" = 1 ]; then hashes "$FAKE_SERVICES" "${FAKE_HASH:-h0}"; exit 0; fi\n'
         "        printf '%s\\n' \"$FAKE_SERVICES\"; exit 0\n"
         "    fi\n"
         "done\n",
@@ -923,6 +934,9 @@ def test_dry_run_touches_nothing_on_the_remote(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 BASE_FILES = "-f docker-compose.yml"
+# What the boot-time unit would resolve, as the docker stub logs it.
+BARE_HASH_CALL = "compose config --hash *"
+SYNCED_NOTHING_ELSE = "compose/ was synced; nothing was pulled, started or removed."
 MODE_REMOVED = "--mode was removed in 1.1.0"
 
 
@@ -941,10 +955,10 @@ def test_every_remote_compose_call_carries_the_base_file_list(tmp_path: Path) ->
     assert f"compose {BASE_FILES} ps --all" in docker_log
     assert "docker-compose.oauth.yml" not in docker_log
     # The one bare call is the reboot-path check, which runs what the unit runs.
-    for line in _compose_lines(tmp_path):
-        assert line.startswith(f"compose {BASE_FILES} ") or line == "compose config --services", (
-            line
-        )
+    lines = _compose_lines(tmp_path)
+    assert lines.count(BARE_HASH_CALL) == 1, lines
+    for line in lines:
+        assert line.startswith(f"compose {BASE_FILES} ") or line == BARE_HASH_CALL, line
 
 
 def test_the_usage_says_mode_was_removed_in_1_1_0(script_text: str) -> None:
@@ -1047,10 +1061,9 @@ def test_issuance_layers_the_third_overlay_after_oauth_on_every_call(
     lines = _compose_lines(tmp_path)
     assert lines
     # The one bare call is the reboot-path check, which runs what the unit runs.
+    assert lines.count(BARE_HASH_CALL) == 1, lines
     for line in lines:
-        assert (
-            line.startswith(f"compose {ISSUANCE_FILES} ") or line == "compose config --services"
-        ), line
+        assert line.startswith(f"compose {ISSUANCE_FILES} ") or line == BARE_HASH_CALL, line
     assert (remote / "docker-compose.issuance.yml").exists()
 
 
@@ -1732,6 +1745,7 @@ def test_up_refuses_a_stack_with_no_provider_before_the_pull(services: str, tmp_
     stderr = result.stderr  # type: ignore[attr-defined]
     assert "no provider" in stderr
     assert "COMPOSE_PROFILES" in stderr
+    assert SYNCED_NOTHING_ELSE in stderr
     for provider in ("anthropic", "codex", "corp"):
         assert provider in stderr, provider
     docker_log = _log(tmp_path, "docker.log")
@@ -1938,6 +1952,7 @@ def test_up_refuses_when_a_bare_compose_up_cannot_resolve_the_stack(tmp_path: Pa
     # A 1.0 host's .env may still say COMPOSE_FILE=…:docker-compose.oauth.yml, and the
     # sync never deletes the old overlay: this deploy's -f list works, but the
     # boot-time unit's bare command fails and the stack stays down after a reboot.
+    # A stale gateway-codex is listed: refusing must come before any removal.
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
 
@@ -1945,7 +1960,7 @@ def test_up_refuses_when_a_bare_compose_up_cannot_resolve_the_stack(tmp_path: Pa
         repo,
         tmp_path,
         ["--host", HOST, "--dir", str(remote), "up"],
-        ps=HEALTHY_PS,
+        ps=[*HEALTHY_PS, _gateway_row("gateway-codex")],
         env_extra={"FAKE_BARE_CONFIG_FAIL": "1"},
     )
 
@@ -1954,8 +1969,12 @@ def test_up_refuses_when_a_bare_compose_up_cannot_resolve_the_stack(tmp_path: Pa
     assert "reboot" in stderr
     assert "COMPOSE_FILE" in stderr
     assert "docker-compose.oauth.yml" in stderr
+    assert SYNCED_NOTHING_ELSE in stderr
+    # The unit runs in the deploy directory; so must the check.
+    ssh_lines = _log(tmp_path, "ssh.log").splitlines()
+    assert f"{HOST} cd {remote} && docker compose config --hash '*'" in ssh_lines
     docker_log = _log(tmp_path, "docker.log")
-    assert "compose config --services" in docker_log.splitlines()
+    assert BARE_HASH_CALL in docker_log.splitlines()
     assert "pull" not in docker_log
     assert "up -d" not in docker_log
     assert not _removals(tmp_path)
@@ -2003,6 +2022,63 @@ def test_up_is_quiet_when_a_reboot_starts_the_same_gateways_and_front_doors(
         env_extra={
             "FAKE_SERVICES": "gateway-anthropic\ngateway-corp\nnginx\npostgres\nvector",
             "FAKE_BARE_SERVICES": "nginx\ngateway-corp\npostgres\ngateway-anthropic",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert "WARN:" not in result.stderr  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("argv", "deployed_hash", "bare_hash"),
+    [
+        (["--issuance"], "issuance", "base"),
+        ([], "base", "issuance"),
+    ],
+    ids=["issuance-without-the-env-line", "env-line-without-issuance"],
+)
+def test_up_warns_when_a_reboot_would_start_the_gateways_with_another_config(
+    argv: list[str], deployed_hash: str, bare_hash: str, tmp_path: Path
+) -> None:
+    # The issuance overlay renames nothing: only the gateways' config hashes tell an
+    # --issuance deploy from a .env whose COMPOSE_FILE line lacks the overlay, or the
+    # reverse. A reboot would recreate the gateways with issuance turned off (or on).
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    _server_config(remote)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), *argv, "up"],
+        ps=HEALTHY_PS,
+        env_extra={"FAKE_HASH": deployed_hash, "FAKE_BARE_HASH": bare_hash},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    stderr = result.stderr  # type: ignore[attr-defined]
+    warning = stderr[stderr.index("WARN: a reboot would start") :]
+    assert "gateway-anthropic with another configuration" in warning
+    assert "COMPOSE_FILE" in warning and "--issuance" in warning
+    files = ISSUANCE_FILES if argv else BASE_FILES
+    assert f"compose {files} config --hash *" in _log(tmp_path, "docker.log").splitlines()
+    assert f"compose {files} up -d --remove-orphans" in _log(tmp_path, "docker.log")
+
+
+def test_a_config_difference_outside_the_gateways_and_front_doors_is_not_warned(
+    tmp_path: Path,
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=HEALTHY_PS,
+        env_extra={
+            "FAKE_SERVICES": "gateway-anthropic\npostgres",
+            "FAKE_BARE_SERVICES": "gateway-anthropic\npostgres\nvector",
         },
     )
 

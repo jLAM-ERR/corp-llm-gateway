@@ -319,7 +319,8 @@ gate failure, elsewhere a Python warning (pytest shows it), and `--write` refuse
   (`tests/_gates/must_keep.py`), which that rule skips, and recorded in
   [deleted-tests.md](deleted-tests.md): plan 20261009 Task 8's
   `deploy/test_deploy_script.py::test_virtual_keys_mode_keeps_the_base_file_alone`
-  (`deploy.sh --mode` removed in 1.1.0).
+  (`deploy.sh --mode` removed in 1.1.0). The must-keep gate fails when a retired id is back in
+  the tree, so a test re-added under that name cannot escape the rule.
 - Reviewer notes, per file, for the modified modules inside the prunable universe — only
   the tests the diff added or changed are must-keep; the rest predates PR #16-#18 and is
   in only where step 2 or the lists below put it:
