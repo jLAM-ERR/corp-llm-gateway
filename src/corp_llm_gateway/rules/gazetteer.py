@@ -94,6 +94,7 @@ def _en_lemmatizer_identity() -> str:
     return f"spacy:{_package_version('spacy')}:{_EN_MODEL}:{model_version}"
 
 
+# Per-language memo: two memos (RU, EN), so the process holds at most 2 x this many words.
 _LEMMA_CACHE_SIZE = 65536
 # Longer words bypass the memo: an entry costs about twice the word's size.
 _LEMMA_CACHE_MAX_WORD = 64

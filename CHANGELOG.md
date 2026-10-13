@@ -123,10 +123,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **The gazetteer ran spaCy / pymorphy3 on every word occurrence**, and every identifier
   sub-token, and checked every term at every token: about 4 s for 25 KB of English prose with
-  the shipped default terms. Lemmas are now memoised per word (up to 65,536 words of at most
-  64 characters, per process; `docs/security.md` §11 (k)), and terms are looked up by their
-  first lemma. Findings are unchanged. Repeated words cost nothing after the first; a message
-  full of words the process has never seen still pays spaCy once per new word.
+  the shipped default terms. Lemmas are now memoised per word (up to 65,536 words per language,
+  131,072 in total, each at most 64 characters, per process; `docs/security.md` §11 (k)), and
+  terms are looked up by their first lemma. Findings are unchanged. Repeated words cost nothing
+  after the first; a message full of words the process has never seen still pays spaCy once per
+  new word.
 
 ### Known limitations
 
