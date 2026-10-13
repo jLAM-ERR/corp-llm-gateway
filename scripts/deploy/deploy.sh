@@ -15,8 +15,10 @@
 #      server's copy. Local key material and the dev-only build overlay are
 #      excluded for the same reason, and so is gateway/config.toml: the
 #      server owns it, a laptop copy must never overwrite it.
-#   3. Over SSH: docker compose pull && docker compose up -d, then polls the
-#      compose healthchecks and prints a status summary.
+#   3. Over SSH: refuses a stack with no provider, removes the gateway and
+#      front-door containers the server's .env no longer selects, runs
+#      docker compose pull && docker compose up -d --remove-orphans, then polls
+#      the compose healthchecks and prints a status summary.
 #
 # A remote lock directory serializes state-changing runs, so two operators
 # deploying at once get a clean refusal instead of an interleaved deploy.
@@ -26,18 +28,18 @@ set -euo pipefail
 DEFAULT_REMOTE_DIR="/opt/corp-llm-gateway"
 REMOTE_DIR="${CORP_GATEWAY_DEPLOY_DIR:-$DEFAULT_REMOTE_DIR}"
 COMPOSE_FILE="docker-compose.yml"
-# The default mode is oauth (subscription, the production mode): it layers
-# docker-compose.oauth.yml on top. virtual-keys (the base file alone) is a test
-# posture and has to be asked for. Every remote `docker compose` call has to
-# carry the SAME file list: a `logs` or `status` run with only the base file
-# resolves a different config than the running stack, and `up -d` with the wrong
-# list would silently recreate the containers in the other mode. Hence one
-# variable, used everywhere.
-DEPLOY_MODE="oauth"
-OAUTH_OVERLAY_FILE="docker-compose.oauth.yml"
-COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE} -f ${OAUTH_OVERLAY_FILE}"
+# Every remote `docker compose` call carries the SAME file list: a `logs` or
+# `status` run with another list resolves a different config than the running
+# stack. Hence one variable, used everywhere. The providers are not a file but
+# the COMPOSE_PROFILES line in the server's .env (see NGINX_SERVICES below).
+COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE}"
+# 1.0's --mode picked docker-compose.oauth.yml; 1.1.0 removed both.
+MODE_REMOVED="--mode was removed in 1.1.0: there is one stack now, and the providers
+       it serves (anthropic, codex, corp) are the COMPOSE_PROFILES line in the
+       server's .env. Drop --mode from this command; docs/ops/upgrade.md has the
+       1.0 -> 1.1 steps."
 # --issuance (or DEPLOY_ISSUANCE=1) layers the developer token issuance overlay
-# on top of the oauth one. It mounts gateway/config.toml, which only the server
+# on top of the base file. It mounts gateway/config.toml, which only the server
 # holds.
 DEPLOY_ISSUANCE="${DEPLOY_ISSUANCE:-0}"
 ISSUANCE_OVERLAY_FILE="docker-compose.issuance.yml"
@@ -47,13 +49,16 @@ ISSUANCE_CONFIG="gateway/config.toml"
 NGINX_CERTS_DIR="nginx/certs"
 NGINX_CERTS_README="${NGINX_CERTS_DIR}/README.md"
 # The two front-door services. COMPOSE_PROFILES in the server's .env picks at
-# most one of them; this script never sets, exports or clears it, because a
-# value here would override that file and diverge from what the boot-time
-# unit (a bare `docker compose up -d`) starts.
+# most one of them, and at least one provider gateway; this script never sets,
+# exports or clears it, because a value here would override that file and
+# diverge from what the boot-time unit (a bare `docker compose up -d`) starts.
 NGINX_SERVICES=(nginx nginx-ports)
-# The front doors the current compose files enable, space-separated; set by
-# ensure_one_front_door.
+# One gateway service per provider, all named gateway-<provider>.
+GATEWAY_PREFIX="gateway-"
+# The front doors and gateways the current compose files enable, each name
+# with a leading space; set by resolve_enabled_services.
 ENABLED_FRONT_DOORS=""
+ENABLED_GATEWAYS=""
 # Container names come back from the server and go into a remote `docker rm`.
 CONTAINER_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 # The `restart: "no"` services: the only ones that are done once they exit 0.
@@ -112,21 +117,17 @@ Subcommands:
 Options:
   --host USER@SERVER  SSH destination (required)
   --dir PATH          Remote deploy directory (default /opt/corp-llm-gateway)
-  --mode MODE         oauth (default) or virtual-keys. `oauth` is the
-                      production subscription mode: it adds
-                      docker-compose.oauth.yml, developers authenticate with
-                      their own Anthropic subscription token, and the server's
-                      .env must contain NO LITELLM_MASTER_KEY line at all.
-                      `virtual-keys` is the base file alone, a test posture
-                      only (nothing can issue a litellm virtual key). Pass the
-                      SAME --mode to every later run against that host —
-                      logs/status/down resolve the stack through this file list.
+  --mode              removed in 1.1.0 and refused. The providers (anthropic,
+                      codex, corp) are the COMPOSE_PROFILES line in the server's
+                      .env; `up` refuses a stack that enables none of them.
   --issuance          Also apply docker-compose.issuance.yml (developer token
-                      issuance). oauth mode only. `up` refuses to start unless
+                      issuance). `up` refuses to start unless
                       gateway/config.toml already exists in the remote deploy
                       directory; start from compose/gateway/config.toml.example.
                       The sync never uploads that file. Env equivalent:
-                      DEPLOY_ISSUANCE=1. Pass it to every later run, like --mode.
+                      DEPLOY_ISSUANCE=1. Pass it to every later run against
+                      that host: logs/status/down resolve the stack through
+                      this file list.
   --tail N            Lines of history for `logs` (default 200)
   --dry-run           Print what would change; transfers and starts nothing
   --yes               Skip the confirmation prompt (needed for `down`)
@@ -167,14 +168,8 @@ parse_args() {
                 REMOTE_DIR="${1#*=}"
                 shift
                 ;;
-            --mode)
-                (( $# >= 2 )) || fatal "--mode needs virtual-keys or oauth"
-                DEPLOY_MODE="$2"
-                shift 2
-                ;;
-            --mode=*)
-                DEPLOY_MODE="${1#*=}"
-                shift
+            --mode|--mode=*)
+                fatal "$MODE_REMOVED"
                 ;;
             --issuance)
                 DEPLOY_ISSUANCE=1
@@ -235,30 +230,11 @@ parse_args() {
     [[ -n "$REMOTE_DIR" ]] || fatal "--dir must not be the filesystem root"
     [[ "$TAIL_LINES" =~ ^[0-9]+$ ]] || fatal "--tail needs a number (got: ${TAIL_LINES})"
 
-    # Resolved here, not at parse time, so `--mode` is order-independent. A
-    # typo must be a refusal: falling back to the default would silently switch
-    # a host to the other mode, and the stack would then refuse to boot with a
-    # message about a variable the operator never meant to touch.
-    case "$DEPLOY_MODE" in
-        virtual-keys)
-            COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE}"
-            ;;
-        oauth)
-            COMPOSE_FILE_ARGS="-f ${COMPOSE_FILE} -f ${OAUTH_OVERLAY_FILE}"
-            ;;
-        *)
-            fatal "--mode must be virtual-keys or oauth (got: ${DEPLOY_MODE})"
-            ;;
-    esac
-
     case "$DEPLOY_ISSUANCE" in
         0|"")
             DEPLOY_ISSUANCE=0
             ;;
         1)
-            [[ "$DEPLOY_MODE" == "oauth" ]] \
-                || fatal "--issuance needs --mode oauth (got: ${DEPLOY_MODE}); the issuance
-       overlay mints X-Corp-Auth tokens for the subscription mode only."
             COMPOSE_FILE_ARGS="${COMPOSE_FILE_ARGS} -f ${ISSUANCE_OVERLAY_FILE}"
             ;;
         *)
@@ -276,7 +252,6 @@ parse_args() {
 
     SELF_FLAGS=""
     [[ "$REMOTE_DIR" == "$DEFAULT_REMOTE_DIR" ]] || SELF_FLAGS+=" --dir ${REMOTE_DIR}"
-    [[ "$DEPLOY_MODE" == "oauth" ]] || SELF_FLAGS+=" --mode ${DEPLOY_MODE}"
     (( DEPLOY_ISSUANCE == 0 )) || SELF_FLAGS+=" --issuance"
 }
 
@@ -493,6 +468,10 @@ is_front_door() {
     return 1
 }
 
+is_gateway() {
+    [[ "$1" == "${GATEWAY_PREFIX}"* ]]
+}
+
 is_one_shot() {
     local name
     for name in "${ONE_SHOT_SERVICES[@]}"; do
@@ -638,18 +617,18 @@ confirm() {
 # subcommands
 # --------------------------------------------------------------------------- #
 
-# oauth mode (the default) against a server whose .env still has a
-# LITELLM_MASTER_KEY line is deliberately NOT pre-checked here: this script never
-# reads the server's .env, not even to test whether a key is present. The stack already refuses
-# that combination at boot with a named cause
-# (settings.MASTER_KEY_REFUSED_MESSAGE), and wait_for_healthcheck below
-# surfaces it as a failed deploy. See docs/ops/deployment-modes.md.
+# A LITELLM_MASTER_KEY line in the server's .env is deliberately NOT pre-checked
+# here: this script never reads the server's .env, not even to test whether a key
+# is present. The stack refuses any master key at boot with a named cause
+# (settings.MASTER_KEY_REFUSED_MESSAGE), and wait_for_healthcheck below surfaces
+# it as a failed deploy. See docs/ops/deployment-modes.md.
 # Runs after the sync, so it checks the compose files `up` is about to start.
 # `config --services` prints service names only, never a value, so the
 # server's .env stays unread here too.
-ensure_one_front_door() {
+resolve_enabled_services() {
     local services name enabled=()
     ENABLED_FRONT_DOORS=""
+    ENABLED_GATEWAYS=""
     services="$(ssh_capture "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} config --services")" \
         || fatal "docker compose could not resolve the stack in ${HOST}:${REMOTE_DIR} (its
        error is above); nothing was pulled or started."
@@ -657,8 +636,16 @@ ensure_one_front_door() {
         if is_front_door "$name"; then
             enabled+=("$name")
             ENABLED_FRONT_DOORS+=" ${name}"
+        elif is_gateway "$name"; then
+            ENABLED_GATEWAYS+=" ${name}"
         fi
     done <<< "$services"
+    if [[ -z "$ENABLED_GATEWAYS" ]]; then
+        fatal "no provider: COMPOSE_PROFILES in ${HOST}:${REMOTE_DIR}/.env enables none of
+       anthropic, codex, corp, so the stack would serve nothing (profile-guard
+       refuses it too). Add the provider(s) this host serves to that line,
+       comma-separated. Nothing was pulled or started."
+    fi
     if (( ${#enabled[@]} > 1 )); then
         fatal "COMPOSE_PROFILES in ${HOST}:${REMOTE_DIR}/.env enables both ${enabled[*]}.
        Pick ONE: nginx (host routing) or nginx-ports (no DNS). Both publish
@@ -666,17 +653,54 @@ ensure_one_front_door() {
     fi
 }
 
-# Compose profiles only filter what `up` starts: a front-door container an
-# earlier profile created keeps running, and keeps NGINX_PORT. `ps --all` still
-# lists it, so it is removed by name. $1 is the front doors to keep. Every name
-# is checked before the first one is removed.
-remove_front_doors() {
+# The gateways and front doors in a service list, sorted, one line.
+serving_services() {
+    local name selected=()
+    while IFS= read -r name; do
+        if is_gateway "$name" || is_front_door "$name"; then
+            selected+=("$name")
+        fi
+    done <<< "$1"
+    printf '%s\n' ${selected+"${selected[@]}"} | sort | tr '\n' ' ' | sed 's/ *$//'
+}
+
+# The boot-time unit runs a bare `docker compose up -d` here, so whatever
+# COMPOSE_FILE the server's .env names decides what comes back after a reboot,
+# not this script's -f list. Compose resolves it; this script reads no .env.
+check_the_reboot_path() {
+    local bare deployed rebooted
+    bare="$(ssh_capture "cd ${REMOTE_DIR} && docker compose config --services")" \
+        || fatal "after a reboot the stack in ${HOST}:${REMOTE_DIR} would not come back: the
+       boot-time unit's bare \`docker compose up -d\` cannot resolve it (the error
+       is above). On a 1.0 host the cause is usually a COMPOSE_FILE line in the
+       server's .env that still names docker-compose.oauth.yml, removed in 1.1.0.
+       Drop that file from the line (keep docker-compose.issuance.yml if this host
+       issues tokens) and remove the old docker-compose.oauth.yml from the deploy
+       directory, then re-run. Nothing was pulled or started."
+    deployed="$(serving_services "$(printf '%s' "${ENABLED_GATEWAYS}${ENABLED_FRONT_DOORS}" | tr ' ' '\n')")"
+    rebooted="$(serving_services "$bare")"
+    if [[ "$deployed" != "$rebooted" ]]; then
+        warn "a reboot would start other gateways or front doors than this deploy:
+       this deploy: ${deployed:-none}; the boot-time unit: ${rebooted:-none}.
+       The unit runs a bare \`docker compose up -d\`, so COMPOSE_FILE in the
+       server's .env picks its files. Make that line name the same files as
+       this deploy (docs/ops/upgrade.md)."
+    fi
+}
+
+# Compose profiles only filter what `up` starts, and --remove-orphans spares a
+# service whose profile is off: a gateway or front-door container an earlier
+# profile created keeps running, and keeps its port. `ps --all` still lists it,
+# so it is removed by name. $1 is the services to keep. Every name is checked
+# before the first one is removed. A service gone from the compose files (1.0's
+# `litellm`) is an orphan: `up --remove-orphans` removes that one.
+remove_left_behind() {
     local keep=" $1 " states service name stale=()
     states="$(service_states)" \
         || fatal "could not list the containers in ${HOST}:${REMOTE_DIR} (the error is above)."
     while IFS="$FIELD_SEP" read -r service _ _ _ name; do
         [[ -n "$service" ]] || continue
-        is_front_door "$service" || continue
+        is_front_door "$service" || is_gateway "$service" || continue
         [[ "$keep" == *" ${service} "* ]] && continue
         [[ "$name" =~ $CONTAINER_NAME_RE ]] \
             || fatal "refusing to remove the ${service} container: its container name has
@@ -684,11 +708,13 @@ remove_front_doors() {
         stale+=("${service}${FIELD_SEP}${name}")
     done <<< "$states"
 
-    local entry
+    local entry kind
     for entry in ${stale+"${stale[@]}"}; do
         service="${entry%%"${FIELD_SEP}"*}"
         name="${entry#*"${FIELD_SEP}"}"
-        info "removing the ${service} front-door container ${name}"
+        kind="front-door"
+        is_gateway "$service" && kind="gateway"
+        info "removing the ${service} ${kind} container ${name}"
         ssh_run "docker rm -f ${name}"
     done
 }
@@ -703,10 +729,11 @@ cmd_up() {
         info "[dry-run] would pull images and start the stack in ${REMOTE_DIR}"
         return 0
     fi
-    ensure_one_front_door
-    remove_front_doors "$ENABLED_FRONT_DOORS"
+    resolve_enabled_services
+    check_the_reboot_path
+    remove_left_behind "${ENABLED_GATEWAYS} ${ENABLED_FRONT_DOORS}"
     ssh_run "cd ${REMOTE_DIR} && docker compose ${COMPOSE_FILE_ARGS} pull \
-&& docker compose ${COMPOSE_FILE_ARGS} up -d"
+&& docker compose ${COMPOSE_FILE_ARGS} up -d --remove-orphans"
     wait_for_healthcheck
     print_status
     info "deployed to ${HOST}:${REMOTE_DIR}"
@@ -719,11 +746,11 @@ cmd_down() {
     # Volumes are kept: the token store and audit spool live in them.
     compose_remote down
     if (( DRY_RUN )); then
-        info "[dry-run] would remove any front-door container compose down leaves"
+        info "[dry-run] would remove any gateway or front-door container compose down leaves"
         return 0
     fi
     # `down` leaves the containers of services outside the active profiles.
-    remove_front_doors ""
+    remove_left_behind ""
     info "stopped ${HOST}:${REMOTE_DIR} (volumes kept)"
 }
 
@@ -731,8 +758,8 @@ cmd_restart() {
     ensure_remote_ready
     confirm "This restarts the gateway on ${HOST} — in-flight requests will fail."
     acquire_lock
-    # Restarts only the active profile's services. A front door an old profile
-    # left behind is not touched here; `up` removes it.
+    # Restarts only the active profile's services. A gateway or front door an
+    # old profile left behind is not touched here; `up` removes it.
     compose_remote restart ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"}
     if (( DRY_RUN )); then
         return 0

@@ -284,6 +284,9 @@
   "tests/test_litellm_config_guards.py::test_compose_litellm_has_no_database_to_read_a_config_table_from": "tests/test_litellm_config_guards.py::test_compose_litellm_reads_its_config_table",
   "tests/compose/test_nginx_runtime.py::test_the_allow_list_holds_under_both_routings_on_the_subscription_stack": "tests/compose/test_nginx_runtime.py::test_the_allow_list_holds_under_both_routings_and_the_oauth_overlay",
   "tests/integration/test_route_gate_container.py::test_every_generation_route_is_rewritten": "tests/integration/test_route_gate_container.py::test_mode_a_rewrites_every_generation_route",
-  "tests/integration/test_route_gate_container.py::test_anthropic_rewrites_messages_with_the_developers_own_token": "tests/integration/test_route_gate_container.py::test_mode_b_rewrites_messages_with_the_developers_own_token"
+  "tests/integration/test_route_gate_container.py::test_anthropic_rewrites_messages_with_the_developers_own_token": "tests/integration/test_route_gate_container.py::test_mode_b_rewrites_messages_with_the_developers_own_token",
+  "tests/deploy/test_deploy_script.py::test_every_remote_compose_call_carries_the_base_file_list": "tests/deploy/test_deploy_script.py::test_the_default_mode_is_the_subscription_mode",
+  "tests/deploy/test_deploy_script.py::test_the_usage_says_mode_was_removed_in_1_1_0": "tests/deploy/test_deploy_script.py::test_the_usage_names_oauth_as_the_default",
+  "tests/deploy/test_deploy_script.py::test_deploy_issuance_off_values_add_no_issuance_overlay": "tests/deploy/test_deploy_script.py::test_deploy_issuance_off_values_keep_two_files"
  }
 }

@@ -30,8 +30,8 @@ HOST = "deploy@example.test"
 
 HEALTHY_PS = [
     {
-        "Service": "litellm",
-        "Name": "corp-llm-gateway-litellm-1",
+        "Service": "gateway-anthropic",
+        "Name": "corp-llm-gateway-gateway-anthropic-1",
         "State": "running",
         "Health": "healthy",
     },
@@ -109,8 +109,14 @@ def _stub_bin(tmp_path: Path, *, ssh_mode: str = "exec") -> Path:
         'if [ -n "${COMPOSE_PROFILES+set}" ]; then\n'
         '    printf \'%s\\n\' "COMPOSE_PROFILES=${COMPOSE_PROFILES}" >> "$DOCKER_ENV_LOG"\n'
         "fi\n"
+        "bare=1\n"
+        'for a in "$@"; do [ "$a" = "-f" ] && bare=0; done\n'
         'for a in "$@"; do\n'
         '    if [ "$a" = "ps" ]; then printf \'%s\\n\' "${FAKE_PS_JSON:-[]}"; exit 0; fi\n'
+        '    if [ "$a" = "config" ] && [ "$bare" = 1 ]; then\n'
+        '        [ -z "${FAKE_BARE_CONFIG_FAIL:-}" ] || exit 1\n'
+        "        printf '%s\\n' \"${FAKE_BARE_SERVICES-$FAKE_SERVICES}\"; exit 0\n"
+        "    fi\n"
         '    if [ "$a" = "config" ]; then\n'
         '        [ -z "${FAKE_CONFIG_FAIL:-}" ] || exit 1\n'
         "        printf '%s\\n' \"$FAKE_SERVICES\"; exit 0\n"
@@ -193,7 +199,6 @@ def _fake_repo(tmp_path: Path) -> Path:
     (compose / ".env.example").write_text("POSTGRES_PASSWORD=\n")
     (compose / "docker-compose.yml").write_text("services: {}\n")
     (compose / "docker-compose.build.yml").write_text("services: {}\n")
-    (compose / "docker-compose.oauth.yml").write_text("services: {}\n")
     (compose / "docker-compose.issuance.yml").write_text("services: {}\n")
     (compose / "gateway").mkdir()
     (compose / "gateway" / "config.toml.example").write_text("# example team map\n")
@@ -743,18 +748,18 @@ def test_a_failed_service_that_is_not_a_one_shot_fails_without_blaming_dependent
 @pytest.mark.parametrize(
     ("flags", "expected"),
     [
-        (["--mode", "virtual-keys", "--dir", "/x"], "--dir /x --mode virtual-keys"),
+        (["--dir", "/x"], "--dir /x"),
         (["--issuance", "--dir", "/x/"], "--dir /x --issuance"),
-        (["--mode", "oauth", "--dir", "/opt/corp-llm-gateway"], ""),
+        (["--dir", "/opt/corp-llm-gateway"], ""),
     ],
-    ids=["virtual-keys", "issuance", "defaults"],
+    ids=["dir", "issuance", "defaults"],
 )
 @pytest.mark.parametrize(
     ("ps", "service"),
     [
         ([{"Service": "nginx", "State": "exited", "Health": ""}], "nginx"),
         ([{"Service": "minio-init", "State": "exited", "Health": "", "ExitCode": 3}], "minio-init"),
-        ([{"Service": "litellm", "State": "running", "Health": "starting"}], ""),
+        ([{"Service": "gateway-anthropic", "State": "running", "Health": "starting"}], ""),
     ],
     ids=["front-door", "one-shot", "timeout"],
 )
@@ -794,7 +799,7 @@ def test_status_summary_lists_services_without_env_values(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     combined = result.stdout + result.stderr
-    assert "litellm" in combined and "healthy" in combined
+    assert "gateway-anthropic" in combined and "healthy" in combined
     assert "PASSWORD" not in combined and "secret" not in combined.lower()
 
 
@@ -839,8 +844,8 @@ def test_up_stages_syncs_pulls_and_reports(tmp_path: Path) -> None:
     assert (remote / "postgres" / "initdb" / "01-schema.sql").exists()
     assert (remote / ".env").read_text() == "POSTGRES_PASSWORD=real-server-secret\n"
     docker_log = _log(tmp_path, "docker.log")
-    assert f"compose {BOTH_FILES} pull" in docker_log
-    assert f"compose {BOTH_FILES} up -d" in docker_log
+    assert f"compose {BASE_FILES} pull" in docker_log
+    assert f"compose {BASE_FILES} up -d" in docker_log
     assert not (remote / ".deploy.lock").exists(), "the lock must be released on exit"
 
 
@@ -866,7 +871,7 @@ def test_down_needs_confirmation_and_never_removes_volumes(tmp_path: Path) -> No
     assert "--yes" in refused.stderr  # type: ignore[attr-defined]
     assert "down" not in after_refusal, "an unconfirmed run must not touch the stack"
     assert confirmed.returncode == 0, confirmed.stderr  # type: ignore[attr-defined]
-    assert f"compose {BOTH_FILES} down" in _log(tmp_path, "docker.log")
+    assert f"compose {BASE_FILES} down" in _log(tmp_path, "docker.log")
     assert " -v" not in _log(tmp_path, "docker.log")
 
 
@@ -883,7 +888,7 @@ def test_restart_without_a_service_argument_works(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
-    assert f"compose {BOTH_FILES} restart" in _log(tmp_path, "docker.log")
+    assert f"compose {BASE_FILES} restart" in _log(tmp_path, "docker.log")
 
 
 def test_a_service_argument_that_could_inject_a_command_is_refused(tmp_path: Path) -> None:
@@ -914,40 +919,16 @@ def test_dry_run_touches_nothing_on_the_remote(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# --mode: which compose file list every remote call carries
+# one stack: every remote call carries the same file list; --mode is gone
 # --------------------------------------------------------------------------- #
 
-BOTH_FILES = "-f docker-compose.yml -f docker-compose.oauth.yml"
+BASE_FILES = "-f docker-compose.yml"
+MODE_REMOVED = "--mode was removed in 1.1.0"
 
 
-def test_oauth_mode_layers_the_overlay_on_every_remote_compose_call(tmp_path: Path) -> None:
+def test_every_remote_compose_call_carries_the_base_file_list(tmp_path: Path) -> None:
     # A logs/status/down run that resolved a different file list than the `up`
-    # would report on a stack that is not the running one — and an `up` with the
-    # base file alone would recreate the containers in the virtual-key mode.
-    repo = _fake_repo(tmp_path)
-    remote = _remote_dir(tmp_path)
-
-    result = _run(
-        repo,
-        tmp_path,
-        ["--host", HOST, "--dir", str(remote), "--mode", "oauth", "up"],
-        ps=HEALTHY_PS,
-    )
-
-    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
-    docker_log = _log(tmp_path, "docker.log")
-    assert f"compose {BOTH_FILES} pull" in docker_log
-    assert f"compose {BOTH_FILES} up -d" in docker_log
-    assert f"compose {BOTH_FILES} ps --all" in docker_log
-    # No call may fall back to the base file alone.
-    for line in docker_log.splitlines():
-        if line.startswith("compose "):
-            assert line.startswith(f"compose {BOTH_FILES}"), line
-
-
-def test_the_default_mode_is_the_subscription_mode(tmp_path: Path) -> None:
-    # Subscription mode is the production one; a bare `up` must deploy it, not
-    # the virtual-key test posture.
+    # would report on a stack that is not the running one.
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
 
@@ -955,74 +936,61 @@ def test_the_default_mode_is_the_subscription_mode(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
     docker_log = _log(tmp_path, "docker.log")
-    assert f"compose {BOTH_FILES} up -d" in docker_log
-    for line in docker_log.splitlines():
-        if line.startswith("compose "):
-            assert line.startswith(f"compose {BOTH_FILES}"), line
-    assert (remote / "docker-compose.oauth.yml").exists()
-
-
-def test_virtual_keys_mode_keeps_the_base_file_alone(tmp_path: Path) -> None:
-    repo = _fake_repo(tmp_path)
-    remote = _remote_dir(tmp_path)
-
-    result = _run(
-        repo,
-        tmp_path,
-        ["--host", HOST, "--dir", str(remote), "--mode", "virtual-keys", "status"],
-        ps=HEALTHY_PS,
-    )
-
-    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
-    docker_log = _log(tmp_path, "docker.log")
-    assert "compose -f docker-compose.yml ps --all" in docker_log
+    assert f"compose {BASE_FILES} pull" in docker_log
+    assert f"compose {BASE_FILES} up -d" in docker_log
+    assert f"compose {BASE_FILES} ps --all" in docker_log
     assert "docker-compose.oauth.yml" not in docker_log
+    # The one bare call is the reboot-path check, which runs what the unit runs.
+    for line in _compose_lines(tmp_path):
+        assert line.startswith(f"compose {BASE_FILES} ") or line == "compose config --services", (
+            line
+        )
 
 
-def test_the_usage_names_oauth_as_the_default(script_text: str) -> None:
-    assert re.search(r"^DEPLOY_MODE=\"oauth\"$", script_text, re.M)
-    assert "oauth (default) or virtual-keys" in script_text
+def test_the_usage_says_mode_was_removed_in_1_1_0(script_text: str) -> None:
+    assert "DEPLOY_MODE" not in script_text
+    assert "virtual-keys" not in _code_lines(script_text)
+    result = subprocess.run([str(SCRIPT), "--help"], capture_output=True, text=True)
+    assert result.returncode == 0
+    assert re.search(r"^\s+--mode\b.*removed in 1\.1\.0", result.stderr, re.M), result.stderr
 
 
-def test_the_oauth_overlay_is_synced_unlike_the_dev_only_build_overlay(tmp_path: Path) -> None:
-    # Mode B is a deployable mode, so its overlay has to reach the server;
-    # docker-compose.build.yml is a laptop convenience and must not.
-    repo = _fake_repo(tmp_path)
-    remote = _remote_dir(tmp_path)
-
-    _run(
-        repo,
-        tmp_path,
-        ["--host", HOST, "--dir", str(remote), "--mode", "oauth", "up"],
-        ps=HEALTHY_PS,
-    )
-
-    assert (remote / "docker-compose.oauth.yml").exists()
-    assert not (remote / "docker-compose.build.yml").exists()
-
-
-@pytest.mark.parametrize("mode", ["", "prod", "oauth2", "VIRTUAL-KEYS"])
-def test_an_unknown_mode_is_refused_before_anything_remote_happens(
-    mode: str, tmp_path: Path
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--mode", "oauth"],
+        ["--mode", "virtual-keys"],
+        ["--mode=oauth"],
+        ["--mode="],
+        ["--mode", ""],
+        ["--mode"],
+    ],
+    ids=["oauth", "virtual-keys", "equals-oauth", "equals-empty", "empty", "no-value"],
+)
+@pytest.mark.parametrize("subcommand", ["up", "status"])
+def test_any_mode_is_refused_naming_1_1_0_before_anything_remote_happens(
+    argv: list[str], subcommand: str, tmp_path: Path
 ) -> None:
-    # Falling back to the default would deploy the virtual-key mode onto a host
-    # whose .env has no master key, and the stack would then refuse to boot
-    # citing a variable the operator never meant to use.
+    # Silently ignoring it would let an old runbook line deploy without saying
+    # that the file list it named is gone.
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
 
-    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "--mode", mode, "status"])
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), *argv, subcommand])
 
     assert result.returncode == 1  # type: ignore[attr-defined]
-    assert "--mode must be virtual-keys or oauth" in result.stderr  # type: ignore[attr-defined]
+    assert MODE_REMOVED in result.stderr  # type: ignore[attr-defined]
+    assert "COMPOSE_PROFILES" in result.stderr  # type: ignore[attr-defined]
     assert _log(tmp_path, "ssh.log") == ""
+    assert _log(tmp_path, "rsync.log") == ""
+    assert not (remote / "postgres").exists()
 
 
 # --------------------------------------------------------------------------- #
-# --issuance: the third overlay and the server-owned gateway/config.toml
+# --issuance: the issuance overlay and the server-owned gateway/config.toml
 # --------------------------------------------------------------------------- #
 
-THREE_FILES = f"{BOTH_FILES} -f docker-compose.issuance.yml"
+ISSUANCE_FILES = f"{BASE_FILES} -f docker-compose.issuance.yml"
 
 
 def _server_config(remote: Path) -> Path:
@@ -1044,7 +1012,7 @@ def test_the_default_run_carries_no_issuance_overlay(tmp_path: Path) -> None:
     result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "up"], ps=HEALTHY_PS)
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
-    assert f"compose {BOTH_FILES} up -d" in _log(tmp_path, "docker.log")
+    assert f"compose {BASE_FILES} up -d" in _log(tmp_path, "docker.log")
     assert "docker-compose.issuance.yml" not in _log(tmp_path, "docker.log")
 
 
@@ -1052,10 +1020,9 @@ def test_the_default_run_carries_no_issuance_overlay(tmp_path: Path) -> None:
     ("argv", "env_extra"),
     [
         (["--issuance"], {}),
-        (["--issuance", "--mode", "oauth"], {}),
         ([], {"DEPLOY_ISSUANCE": "1"}),
     ],
-    ids=["flag", "flag-explicit-oauth", "env"],
+    ids=["flag", "env"],
 )
 def test_issuance_layers_the_third_overlay_after_oauth_on_every_call(
     argv: list[str], env_extra: dict[str, str], tmp_path: Path
@@ -1074,13 +1041,16 @@ def test_issuance_layers_the_third_overlay_after_oauth_on_every_call(
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
     docker_log = _log(tmp_path, "docker.log")
-    assert f"compose {THREE_FILES} pull" in docker_log
-    assert f"compose {THREE_FILES} up -d" in docker_log
-    assert f"compose {THREE_FILES} ps --all" in docker_log
+    assert f"compose {ISSUANCE_FILES} pull" in docker_log
+    assert f"compose {ISSUANCE_FILES} up -d" in docker_log
+    assert f"compose {ISSUANCE_FILES} ps --all" in docker_log
     lines = _compose_lines(tmp_path)
     assert lines
+    # The one bare call is the reboot-path check, which runs what the unit runs.
     for line in lines:
-        assert line.startswith(f"compose {THREE_FILES} "), line
+        assert (
+            line.startswith(f"compose {ISSUANCE_FILES} ") or line == "compose config --services"
+        ), line
     assert (remote / "docker-compose.issuance.yml").exists()
 
 
@@ -1093,7 +1063,7 @@ def test_issuance_keeps_the_file_list_on_read_only_runs(tmp_path: Path) -> None:
     result = _run(repo, tmp_path, argv, ps=HEALTHY_PS)
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
-    assert f"compose {THREE_FILES} ps --all" in _log(tmp_path, "docker.log")
+    assert f"compose {ISSUANCE_FILES} ps --all" in _log(tmp_path, "docker.log")
 
 
 @pytest.mark.parametrize(
@@ -1116,8 +1086,9 @@ def test_issuance_is_refused_outside_the_subscription_mode(
         repo, tmp_path, ["--host", HOST, "--dir", str(remote), *argv, "up"], env_extra=env_extra
     )
 
+    # No mode is left for issuance to need: --mode itself is refused, in any order.
     assert result.returncode == 1  # type: ignore[attr-defined]
-    assert "--issuance needs --mode oauth" in result.stderr  # type: ignore[attr-defined]
+    assert MODE_REMOVED in result.stderr  # type: ignore[attr-defined]
     assert _log(tmp_path, "ssh.log") == ""
     assert _log(tmp_path, "rsync.log") == ""
 
@@ -1140,7 +1111,7 @@ def test_a_bad_deploy_issuance_value_is_refused(value: str, tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("value", ["0", ""])
-def test_deploy_issuance_off_values_keep_two_files(value: str, tmp_path: Path) -> None:
+def test_deploy_issuance_off_values_add_no_issuance_overlay(value: str, tmp_path: Path) -> None:
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
 
@@ -1153,7 +1124,7 @@ def test_deploy_issuance_off_values_keep_two_files(value: str, tmp_path: Path) -
     )
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
-    assert f"compose {BOTH_FILES} ps --all" in _log(tmp_path, "docker.log")
+    assert f"compose {BASE_FILES} ps --all" in _log(tmp_path, "docker.log")
     assert "docker-compose.issuance.yml" not in _log(tmp_path, "docker.log")
 
 
@@ -1363,7 +1334,7 @@ def test_up_refuses_both_front_doors_before_the_pull(tmp_path: Path) -> None:
         tmp_path,
         ["--host", HOST, "--dir", str(remote), "up"],
         ps=HEALTHY_PS,
-        env_extra={"FAKE_SERVICES": "litellm\nnginx\npostgres\nnginx-ports"},
+        env_extra={"FAKE_SERVICES": "gateway-anthropic\nnginx\npostgres\nnginx-ports"},
     )
 
     assert result.returncode == 1  # type: ignore[attr-defined]
@@ -1371,7 +1342,7 @@ def test_up_refuses_both_front_doors_before_the_pull(tmp_path: Path) -> None:
     assert "both nginx nginx-ports" in stderr
     assert "Pick ONE" in stderr
     docker_log = _log(tmp_path, "docker.log")
-    assert f"compose {BOTH_FILES} config --services" in docker_log
+    assert f"compose {BASE_FILES} config --services" in docker_log
     assert "pull" not in docker_log
     assert "up -d" not in docker_log
     assert not (remote / ".deploy.lock").exists(), "the lock must be released on a refusal"
@@ -1388,11 +1359,11 @@ def test_up_accepts_one_front_door(front_door: str, tmp_path: Path) -> None:
         tmp_path,
         ["--host", HOST, "--dir", str(remote), "up"],
         ps=ps,
-        env_extra={"FAKE_SERVICES": f"litellm\n{front_door}\npostgres"},
+        env_extra={"FAKE_SERVICES": f"gateway-anthropic\n{front_door}\npostgres"},
     )
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
-    assert f"compose {BOTH_FILES} up -d" in _log(tmp_path, "docker.log")
+    assert f"compose {BASE_FILES} up -d" in _log(tmp_path, "docker.log")
 
 
 def _front_door_row(service: str, name: str | None = None) -> dict[str, str]:
@@ -1424,7 +1395,7 @@ def test_up_removes_the_front_door_the_env_no_longer_selects(tmp_path: Path) -> 
         tmp_path,
         ["--host", HOST, "--dir", str(remote), "up"],
         ps=ps,
-        env_extra={"FAKE_SERVICES": "litellm\nnginx\npostgres"},
+        env_extra={"FAKE_SERVICES": "gateway-anthropic\nnginx\npostgres"},
     )
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
@@ -1432,8 +1403,8 @@ def test_up_removes_the_front_door_the_env_no_longer_selects(tmp_path: Path) -> 
     removals = [line for line in lines if line.startswith("rm ")]
     assert removals == ["rm -f corp-llm-gateway-nginx-ports-1"]
     removed_at = _index(lines, "rm -f corp-llm-gateway-nginx-ports-1")
-    assert removed_at < _index(lines, f"compose {BOTH_FILES} pull")
-    assert removed_at < _index(lines, f"compose {BOTH_FILES} up -d")
+    assert removed_at < _index(lines, f"compose {BASE_FILES} pull")
+    assert removed_at < _index(lines, f"compose {BASE_FILES} up -d")
     assert "corp-llm-gateway-nginx-ports-1" in result.stderr  # type: ignore[attr-defined]
 
 
@@ -1453,7 +1424,7 @@ def test_up_without_a_profile_removes_a_leftover_nginx(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
     lines = _docker_lines(tmp_path)
     assert [line for line in lines if line.startswith("rm ")] == ["rm -f corp-llm-gateway-nginx-1"]
-    assert _index(lines, "rm -f") < _index(lines, f"compose {BOTH_FILES} pull")
+    assert _index(lines, "rm -f") < _index(lines, f"compose {BASE_FILES} pull")
 
 
 @pytest.mark.parametrize("front_door", ["nginx", "nginx-ports"])
@@ -1466,7 +1437,7 @@ def test_up_keeps_the_front_door_the_env_selects(front_door: str, tmp_path: Path
         tmp_path,
         ["--host", HOST, "--dir", str(remote), "up"],
         ps=[*HEALTHY_PS, _front_door_row(front_door)],
-        env_extra={"FAKE_SERVICES": f"litellm\n{front_door}\npostgres"},
+        env_extra={"FAKE_SERVICES": f"gateway-anthropic\n{front_door}\npostgres"},
     )
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
@@ -1474,17 +1445,19 @@ def test_up_keeps_the_front_door_the_env_selects(front_door: str, tmp_path: Path
 
 
 def test_down_removes_every_front_door_container_compose_down_leaves(tmp_path: Path) -> None:
-    # `compose down` only stops the services of the active profiles.
+    # `compose down` only stops the services of the active profiles. The stub's
+    # `ps` answer is static, so the gateway `down` already stopped is left out.
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
-    ps = [*HEALTHY_PS, _front_door_row("nginx"), _front_door_row("nginx-ports")]
+    others = [row for row in HEALTHY_PS if not row["Service"].startswith("gateway-")]
+    ps = [*others, _front_door_row("nginx"), _front_door_row("nginx-ports")]
 
     result = _run(
         repo,
         tmp_path,
         ["--host", HOST, "--dir", str(remote), "--yes", "down"],
         ps=ps,
-        env_extra={"FAKE_SERVICES": "litellm\nnginx\npostgres"},
+        env_extra={"FAKE_SERVICES": "gateway-anthropic\nnginx\npostgres"},
     )
 
     assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
@@ -1494,7 +1467,7 @@ def test_down_removes_every_front_door_container_compose_down_leaves(tmp_path: P
         "rm -f corp-llm-gateway-nginx-1",
         "rm -f corp-llm-gateway-nginx-ports-1",
     ]
-    down_at = _index(lines, f"compose {BOTH_FILES} down")
+    down_at = _index(lines, f"compose {BASE_FILES} down")
     assert all(_index(lines, removal) > down_at for removal in removals)
 
 
@@ -1516,7 +1489,7 @@ def test_a_container_name_outside_the_charset_is_refused(
         tmp_path,
         ["--host", HOST, "--dir", str(remote), *argv],
         ps=ps,
-        env_extra={"FAKE_SERVICES": "litellm\npostgres"},
+        env_extra={"FAKE_SERVICES": "gateway-anthropic\npostgres"},
     )
 
     assert result.returncode == 1  # type: ignore[attr-defined]
@@ -1592,9 +1565,9 @@ def test_up_fails_at_once_on_a_dead_front_door_and_names_it(
 ) -> None:
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
-    # litellm still starting sorts first: the dead front door must be named anyway.
+    # A gateway still starting sorts first: the dead front door must be named anyway.
     ps = [
-        {"Service": "litellm", "State": "running", "Health": "starting"},
+        {"Service": "gateway-anthropic", "State": "running", "Health": "starting"},
         {"Service": service, "State": state, "Health": health},
     ]
 
@@ -1603,7 +1576,10 @@ def test_up_fails_at_once_on_a_dead_front_door_and_names_it(
         tmp_path,
         ["--host", HOST, "--dir", str(remote), "up"],
         ps=ps,
-        env_extra={"FAKE_SERVICES": f"litellm\n{service}", "CORP_GATEWAY_HEALTH_MAX_WAIT": "10"},
+        env_extra={
+            "FAKE_SERVICES": f"gateway-anthropic\n{service}",
+            "CORP_GATEWAY_HEALTH_MAX_WAIT": "10",
+        },
     )
 
     assert result.returncode == 1  # type: ignore[attr-defined]
@@ -1711,3 +1687,341 @@ def test_the_reboot_path_starts_what_the_env_file_selects(
     assert {name for name in services if name.startswith("gateway-")} == {"gateway-anthropic"}
     assert "profile-guard" in services
     assert services & {"nginx", "nginx-ports"} == ({profiles} if profiles else set())
+
+
+# --------------------------------------------------------------------------- #
+# providers: one gateway per COMPOSE_PROFILES provider, chosen by the server's .env
+# --------------------------------------------------------------------------- #
+
+GATEWAYS = ("gateway-anthropic", "gateway-codex", "gateway-corp")
+
+
+def _gateway_row(service: str, name: str | None = None) -> dict[str, str]:
+    return {
+        "Service": service,
+        "Name": f"corp-llm-gateway-{service}-1" if name is None else name,
+        "State": "running",
+        "Health": "healthy",
+    }
+
+
+def _removals(tmp_path: Path) -> list[str]:
+    return [line for line in _docker_lines(tmp_path) if line.startswith("rm ")]
+
+
+@pytest.mark.parametrize(
+    "services",
+    ["postgres\nprofile-guard\nvector", "nginx\npostgres\nprofile-guard", ""],
+    ids=["no-front-door", "front-door-only", "nothing"],
+)
+def test_up_refuses_a_stack_with_no_provider_before_the_pull(services: str, tmp_path: Path) -> None:
+    # profile-guard would refuse too, but only after the pull and with the stack
+    # half replaced; refusing here changes nothing on the server.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=HEALTHY_PS,
+        env_extra={"FAKE_SERVICES": services},
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    stderr = result.stderr  # type: ignore[attr-defined]
+    assert "no provider" in stderr
+    assert "COMPOSE_PROFILES" in stderr
+    for provider in ("anthropic", "codex", "corp"):
+        assert provider in stderr, provider
+    docker_log = _log(tmp_path, "docker.log")
+    assert f"compose {BASE_FILES} config --services" in docker_log
+    assert "pull" not in docker_log
+    assert "up -d" not in docker_log
+    assert not _removals(tmp_path)
+    assert not (remote / ".deploy.lock").exists(), "the lock must be released on a refusal"
+
+
+@pytest.mark.parametrize(
+    "enabled",
+    [["gateway-anthropic"], ["gateway-codex"], ["gateway-corp"], list(GATEWAYS)],
+    ids=["anthropic", "codex", "corp", "all-three"],
+)
+def test_up_accepts_any_provider_set_and_waits_for_each_gateway(
+    enabled: list[str], tmp_path: Path
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    others = [row for row in HEALTHY_PS if not row["Service"].startswith("gateway-")]
+    ps = [*others, *(_gateway_row(service) for service in enabled)]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": "\n".join(["postgres", *enabled])},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert not _removals(tmp_path)
+
+
+def test_up_waits_out_a_gateway_that_is_still_starting(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    ps = [*HEALTHY_PS, {**_gateway_row("gateway-codex"), "Health": "starting"}]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=ps,
+        env_extra={
+            "FAKE_SERVICES": "gateway-anthropic\ngateway-codex\npostgres",
+            "CORP_GATEWAY_HEALTH_MAX_WAIT": "1",
+        },
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    assert "stuck: gateway-codex (state=running health=starting)" in result.stderr  # type: ignore[attr-defined]
+
+
+def test_up_removes_the_gateway_of_a_provider_the_env_no_longer_selects(tmp_path: Path) -> None:
+    # Profiles only filter what `up` starts, and --remove-orphans spares a service
+    # whose profile is off: the dropped provider would keep serving its port.
+    # The 1.0 `litellm` container is an orphan; --remove-orphans removes it.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    ps = [
+        *HEALTHY_PS,
+        _gateway_row("gateway-codex"),
+        {**_gateway_row("litellm"), "Name": "corp-llm-gateway-litellm-1"},
+    ]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": "gateway-anthropic\npostgres"},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    lines = _docker_lines(tmp_path)
+    assert _removals(tmp_path) == ["rm -f corp-llm-gateway-gateway-codex-1"]
+    removed_at = _index(lines, "rm -f corp-llm-gateway-gateway-codex-1")
+    assert removed_at < _index(lines, f"compose {BASE_FILES} pull")
+    assert "corp-llm-gateway-gateway-codex-1" in result.stderr  # type: ignore[attr-defined]
+
+
+def test_up_keeps_every_gateway_the_env_selects(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    ps = [*HEALTHY_PS, _gateway_row("gateway-codex"), _gateway_row("gateway-corp")]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": "\n".join(["postgres", *GATEWAYS])},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert not _removals(tmp_path)
+
+
+@pytest.mark.parametrize("argv", [["up"], ["--yes", "down"]], ids=["up", "down"])
+def test_a_gateway_container_name_outside_the_charset_is_refused(
+    argv: list[str], tmp_path: Path
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    ps = [*HEALTHY_PS, _gateway_row("gateway-corp"), _gateway_row("gateway-codex", "x;id")]
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), *argv],
+        ps=ps,
+        env_extra={"FAKE_SERVICES": "gateway-anthropic\npostgres"},
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    assert "container name" in result.stderr  # type: ignore[attr-defined]
+    assert not _removals(tmp_path), "nothing may be removed once one name is refused"
+    assert "pull" not in _log(tmp_path, "docker.log")
+
+
+def test_down_removes_every_gateway_container_compose_down_leaves(tmp_path: Path) -> None:
+    # `compose down` only stops the active profiles' gateways; a dropped provider's
+    # would keep serving its loopback port on a stack the operator took down.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    others = [row for row in HEALTHY_PS if not row["Service"].startswith("gateway-")]
+    ps = [*others, _gateway_row("gateway-codex"), _gateway_row("gateway-corp")]
+
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "--yes", "down"], ps=ps)
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    lines = _docker_lines(tmp_path)
+    removals = _removals(tmp_path)
+    assert sorted(removals) == [
+        "rm -f corp-llm-gateway-gateway-codex-1",
+        "rm -f corp-llm-gateway-gateway-corp-1",
+    ]
+    down_at = _index(lines, f"compose {BASE_FILES} down")
+    assert all(_index(lines, removal) > down_at for removal in removals)
+
+
+def test_up_removes_orphans_in_the_same_gated_up(script_text: str, tmp_path: Path) -> None:
+    # The 1.0 `litellm` container is an orphan that still holds 127.0.0.1:4000,
+    # gateway-anthropic's port: without --remove-orphans the upgrade `up` fails.
+    assert re.search(
+        r"pull \\\n&& docker compose \$\{COMPOSE_FILE_ARGS\} up -d --remove-orphans\"", script_text
+    )
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "up"], ps=HEALTHY_PS)
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert f"compose {BASE_FILES} up -d --remove-orphans" in _log(tmp_path, "docker.log")
+
+
+def test_a_finished_profile_guard_is_done(tmp_path: Path) -> None:
+    ps = [
+        *HEALTHY_PS,
+        {"Service": "profile-guard", "State": "exited", "Health": "", "ExitCode": 0},
+    ]
+
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=ps,  # type: ignore[arg-type]
+        extra="HEALTH_MAX_WAIT=1\nHEALTH_INTERVAL=1\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_refusing_profile_guard_fails_at_once_and_names_it(tmp_path: Path) -> None:
+    # Exit 64 is its "no provider in COMPOSE_PROFILES": postgres, and so every
+    # gateway, waits for it and would sit `created` until the timeout.
+    ps = [
+        {"Service": "postgres", "State": "created", "Health": ""},
+        {"Service": "profile-guard", "State": "exited", "Health": "", "ExitCode": 64},
+    ]
+
+    result = _call(
+        "wait_for_healthcheck",
+        tmp_path,
+        ssh_mode="ps",
+        ps=ps,  # type: ignore[arg-type]
+        extra="HEALTH_MAX_WAIT=10\nHEALTH_INTERVAL=1\n",
+    )
+
+    assert result.returncode == 1
+    assert "profile-guard exited with code 64; the services that wait for it" in result.stderr
+    assert f"scripts/deploy/deploy.sh --host {HOST} logs profile-guard\n" in result.stderr
+    assert _log(tmp_path, "ssh.log").count("ps --all") == 2
+
+
+# --------------------------------------------------------------------------- #
+# the reboot path: a bare `docker compose up -d` must resolve the same stack
+# --------------------------------------------------------------------------- #
+
+
+def test_up_refuses_when_a_bare_compose_up_cannot_resolve_the_stack(tmp_path: Path) -> None:
+    # A 1.0 host's .env may still say COMPOSE_FILE=…:docker-compose.oauth.yml, and the
+    # sync never deletes the old overlay: this deploy's -f list works, but the
+    # boot-time unit's bare command fails and the stack stays down after a reboot.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=HEALTHY_PS,
+        env_extra={"FAKE_BARE_CONFIG_FAIL": "1"},
+    )
+
+    assert result.returncode == 1  # type: ignore[attr-defined]
+    stderr = result.stderr  # type: ignore[attr-defined]
+    assert "reboot" in stderr
+    assert "COMPOSE_FILE" in stderr
+    assert "docker-compose.oauth.yml" in stderr
+    docker_log = _log(tmp_path, "docker.log")
+    assert "compose config --services" in docker_log.splitlines()
+    assert "pull" not in docker_log
+    assert "up -d" not in docker_log
+    assert not _removals(tmp_path)
+    assert not (remote / ".deploy.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "bare",
+    ["gateway-codex\npostgres", "gateway-anthropic\nnginx\npostgres"],
+    ids=["other-gateway", "extra-front-door"],
+)
+def test_up_warns_when_a_reboot_would_start_other_gateways_or_front_doors(
+    bare: str, tmp_path: Path
+) -> None:
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=HEALTHY_PS,
+        env_extra={"FAKE_SERVICES": "gateway-anthropic\npostgres", "FAKE_BARE_SERVICES": bare},
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    warnings = [line for line in result.stderr.splitlines() if line.startswith("WARN:")]  # type: ignore[attr-defined]
+    assert any("reboot" in line for line in warnings), result.stderr  # type: ignore[attr-defined]
+    assert "COMPOSE_FILE" in result.stderr  # type: ignore[attr-defined]
+    assert f"compose {BASE_FILES} up -d --remove-orphans" in _log(tmp_path, "docker.log")
+
+
+def test_up_is_quiet_when_a_reboot_starts_the_same_gateways_and_front_doors(
+    tmp_path: Path,
+) -> None:
+    # Order and the other services do not matter, only what serves traffic.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+
+    result = _run(
+        repo,
+        tmp_path,
+        ["--host", HOST, "--dir", str(remote), "up"],
+        ps=HEALTHY_PS,
+        env_extra={
+            "FAKE_SERVICES": "gateway-anthropic\ngateway-corp\nnginx\npostgres\nvector",
+            "FAKE_BARE_SERVICES": "nginx\ngateway-corp\npostgres\ngateway-anthropic",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    assert "WARN:" not in result.stderr  # type: ignore[attr-defined]
+
+
+def test_an_up_run_never_reads_the_servers_env_file(tmp_path: Path) -> None:
+    # The only remote command that names .env tests that it exists.
+    repo = _fake_repo(tmp_path)
+    remote = _remote_dir(tmp_path)
+    (remote / ".env").write_text("COMPOSE_PROFILES=anthropic\nPOSTGRES_PASSWORD=sentinel-9f3c\n")
+
+    result = _run(repo, tmp_path, ["--host", HOST, "--dir", str(remote), "up"], ps=HEALTHY_PS)
+
+    assert result.returncode == 0, result.stderr  # type: ignore[attr-defined]
+    output = result.stdout + result.stderr  # type: ignore[attr-defined]
+    assert "sentinel-9f3c" not in output
+    env_lines = [line for line in _log(tmp_path, "ssh.log").splitlines() if ".env" in line]
+    assert env_lines
+    for line in env_lines:
+        assert line.count(".env") == 1 and f"[ ! -f {remote}/.env ]" in line, line

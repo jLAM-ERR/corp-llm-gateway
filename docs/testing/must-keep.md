@@ -69,7 +69,9 @@ on provider fixtures: 56 approved must-keep deletions in [deleted-tests.md](dele
 re-parametrised cases and the new corp-token and corp-bearer tests), 4,171 after its Task 6b
 (the upstream header allowlist: additions only), 4,228 after the Task 6b review round (removed
 body keys and bridge header formats: additions only), 4,236 after its Task 7 (any
-`LITELLM_MASTER_KEY`, and `master_key` in litellm's config, refused: additions only).
+`LITELLM_MASTER_KEY`, and `master_key` in litellm's config, refused: additions only), 4,234
+after its Task 8 (`deploy.sh --mode` removed: 5 approved must-keep deletions and 3 new `[*-dir]`
+cases, listed in [deleted-tests.md](deleted-tests.md)).
 A parametrised test is there as its cases, so the 495 function-level must-keep ids of
 parametrised tests have no line of their own.
 `ledger check` fails when a recorded id is missing, gains or loses a case, or changes
@@ -312,6 +314,12 @@ gate failure, elsewhere a Python warning (pytest shows it), and `--write` refuse
   `integration/test_route_gate_container.py`, `invariants/test_no_originals_leak.py`,
   `metrics/test_metrics.py`, `route_gate/test_{classify,middleware,table}.py`,
   `sanitizer/test_profile_orchestrator.py`, `test_asgi_entrypoint.py`, `tokens/test_middleware.py`.
+- The step-1 touched rule reads `807831a`, so it still names a test that is gone. A test the
+  user approved deleting with the behaviour it pinned is listed in `STEP1_RETIRED`
+  (`tests/_gates/must_keep.py`), which that rule skips, and recorded in
+  [deleted-tests.md](deleted-tests.md): plan 20261009 Task 8's
+  `deploy/test_deploy_script.py::test_virtual_keys_mode_keeps_the_base_file_alone`
+  (`deploy.sh --mode` removed in 1.1.0).
 - Reviewer notes, per file, for the modified modules inside the prunable universe — only
   the tests the diff added or changed are must-keep; the rest predates PR #16-#18 and is
   in only where step 2 or the lists below put it:
@@ -324,7 +332,7 @@ gate failure, elsewhere a Python warning (pytest shows it), and `--write` refuse
   | `test_bootstrap_edges.py` | 0 | the diff changed a helper, no test |
   | `test_litellm_config.py` | 3 | |
   | `test_litellm_hook_adversarial.py` | 1 | the harness swap touched one test |
-  | `deploy/test_deploy_script.py` | 44 | the deploy flow PR #17 added (43) + the `$ENV_FILE` never-read check (step 2) |
+  | `deploy/test_deploy_script.py` | 43 | the deploy flow PR #17 added (43) + the `$ENV_FILE` never-read check (step 2), less `test_virtual_keys_mode_keeps_the_base_file_alone` (`STEP1_RETIRED`, above) |
   | `tokens/test_token_store_contract.py` | 29 | the issuance races and the jti contract |
   | `tokens/test_postgres_store.py` | 7 | the Postgres races |
   | `team_config/test_postgres_store.py` | 5 | + the three `create_if_absent` contract tests (by id, step 2) |
