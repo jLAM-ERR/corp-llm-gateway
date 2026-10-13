@@ -12,6 +12,8 @@ so the module stays importable on Python 3.14 without those deps.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from functools import lru_cache, partial
 from pathlib import Path
 
 from corp_llm_gateway.detectors.base import Finding, PIIDetector
@@ -92,18 +94,54 @@ def _en_lemmatizer_identity() -> str:
     return f"spacy:{_package_version('spacy')}:{_EN_MODEL}:{model_version}"
 
 
+_LEMMA_CACHE_SIZE = 65536
+# Longer words bypass the memo: an entry costs about twice the word's size.
+_LEMMA_CACHE_MAX_WORD = 64
+
+
+class _LemmaCache:
+    """Bounded word → lemma memo for ONE lemmatizer; a different one starts a fresh memo."""
+
+    def __init__(self, compute: Callable[[object, str], str]) -> None:
+        self._compute = compute
+        self._bound: tuple[object, Callable[[str], str]] | None = None
+
+    def lemma(self, lemmatizer: object, word: str) -> str:
+        if len(word) > _LEMMA_CACHE_MAX_WORD:
+            return self._compute(lemmatizer, word)
+        bound = self._bound
+        if bound is None or bound[0] is not lemmatizer:
+            memo = lru_cache(maxsize=_LEMMA_CACHE_SIZE)(partial(self._compute, lemmatizer))
+            bound = (lemmatizer, memo)
+            self._bound = bound
+        return bound[1](word)
+
+
+def _ru_lemma(morph: object, word: str) -> str:
+    return morph.parse(word)[0].normal_form  # type: ignore[attr-defined]
+
+
+def _en_lemma(nlp: object, word: str) -> str:
+    doc = nlp(word)  # type: ignore[operator]
+    if doc:
+        return doc[0].lemma_.lower()
+    return word.lower()
+
+
+_ru_lemmas = _LemmaCache(_ru_lemma)
+_en_lemmas = _LemmaCache(_en_lemma)
+
+
 def _lemmatize_word(word: str) -> str:
     """Return the lowercase lemma for a single word token; falls back to lower()."""
     if _is_cyrillic(word):
         morph = _try_load_ru_morph()
         if morph is not None:
-            return morph.parse(word)[0].normal_form  # type: ignore[union-attr]
+            return _ru_lemmas.lemma(morph, word)
     else:
         nlp = _try_load_en_nlp()
         if nlp is not None:
-            doc = nlp(word)  # type: ignore[operator]
-            if doc:
-                return doc[0].lemma_.lower()
+            return _en_lemmas.lemma(nlp, word)
     return word.lower()
 
 
@@ -171,6 +209,11 @@ class Gazetteer(PIIDetector):
                 self._index[seq] = label
             if len(seq) == 1:
                 self._single_lemmas.setdefault(seq[0], label)
+        # First lemma → (term rank, seq, label): detect() looks up the terms that
+        # can start at a token instead of scanning every term at every token.
+        self._by_first_lemma: dict[str, list[tuple[int, tuple[str, ...], str]]] = {}
+        for rank, (seq, label) in enumerate(self._index.items()):
+            self._by_first_lemma.setdefault(seq[0], []).append((rank, seq, label))
 
     def term_signature(self) -> tuple[str, ...]:
         """Sorted "lemma lemma…\\x1flabel" strings — the coverage this instance has.
@@ -210,24 +253,27 @@ class Gazetteer(PIIDetector):
 
         findings: list[Finding] = []
 
-        # --- whole-token / multi-word matching (original logic) ---
-        for seq, label in self._index.items():
-            seq_len = len(seq)
-            if seq_len > n:
-                continue
-            for i in range(n - seq_len + 1):
-                if all(lemmas[i + j][0] == seq[j] for j in range(seq_len)):
-                    start = lemmas[i][1]
-                    end = lemmas[i + seq_len - 1][2]
-                    findings.append(
-                        Finding(
-                            text=text[start:end],
-                            label=label,
-                            start=start,
-                            end=end,
-                            score=0.95,
-                        )
-                    )
+        # --- whole-token / multi-word matching ---
+        hits: list[tuple[int, int, int, str]] = []
+        for i, (lemma, _start, _end) in enumerate(lemmas):
+            for rank, seq, label in self._by_first_lemma.get(lemma, ()):
+                seq_len = len(seq)
+                if i + seq_len <= n and all(lemmas[i + j][0] == seq[j] for j in range(1, seq_len)):
+                    hits.append((rank, i, seq_len, label))
+        # Ordered by term registration, then position, so the raw list is deterministic.
+        hits.sort(key=lambda hit: (hit[0], hit[1]))
+        for _rank, i, seq_len, label in hits:
+            start = lemmas[i][1]
+            end = lemmas[i + seq_len - 1][2]
+            findings.append(
+                Finding(
+                    text=text[start:end],
+                    label=label,
+                    start=start,
+                    end=end,
+                    score=0.95,
+                )
+            )
 
         # --- identifier sub-token scanning ---
         if self._single_lemmas:
