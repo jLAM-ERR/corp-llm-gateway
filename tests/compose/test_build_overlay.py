@@ -9,6 +9,7 @@ wheel, so the overlay has to name the profile itself.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -84,6 +85,8 @@ def test_the_build_lives_on_the_one_service_never_profiled_off() -> None:
 @pytest.mark.skipif(not compose_cli_available(), reason="docker compose CLI not on PATH")
 @pytest.mark.parametrize("providers", ["anthropic,codex,corp", "corp"])
 def test_the_build_overlay_builds_the_image_once(tmp_path: Path, providers: str) -> None:
+    # Read the merged model compose would run, not a build log: `build` output differs
+    # between compose versions, and a test must not build the image.
     env_file = tmp_path / ".env"
     env_file.write_text(
         "".join(f"{key}=render-fixture\n" for key in REQUIRED_ENV)
@@ -92,7 +95,7 @@ def test_the_build_overlay_builds_the_image_once(tmp_path: Path, providers: str)
     result = subprocess.run(
         [
             *("docker", "compose", "--env-file", str(env_file), "-p", "corp-build-once"),
-            *("-f", COMPOSE.name, "-f", OVERLAY.name, "--dry-run", "build"),
+            *("-f", COMPOSE.name, "-f", OVERLAY.name, "config", "--format", "json"),
         ],
         cwd=COMPOSE.parent,
         capture_output=True,
@@ -103,7 +106,24 @@ def test_the_build_overlay_builds_the_image_once(tmp_path: Path, providers: str)
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    building = [
-        line for line in (result.stdout + result.stderr).splitlines() if " Building" in line
-    ]
-    assert len(building) == 1, building
+    services = json.loads(result.stdout)["services"]
+    selected = set(providers.split(","))
+    active = {
+        name: service
+        for name, service in services.items()
+        if not service.get("profiles") or selected & set(service["profiles"])
+    }
+    gateways = sorted(name for name in active if name.startswith("gateway-"))
+    assert gateways == sorted(f"gateway-{provider}" for provider in selected)
+
+    assert [name for name, service in active.items() if "build" in service] == ["profile-guard"]
+    guard = active["profile-guard"]
+    assert "profiles" not in guard
+    assert guard["pull_policy"] == "build"
+    assert guard["build"]["dockerfile"] == DOCKERFILE.name
+    assert Path(guard["build"]["context"]).resolve() == ROOT
+    assert guard["build"]["args"]["NER_PROFILE"] == "ru-en"
+    for name in gateways:
+        assert active[name]["image"] == guard["image"], name
+        assert active[name]["pull_policy"] == "never", name
+        assert "build" not in active[name], name
