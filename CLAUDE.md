@@ -17,7 +17,7 @@ in the 90 days post-GA.
 
 ```
 src/corp_llm_gateway/
-  asgi.py       THE serve target: checks litellm's config (exit 78), runs its Prisma sequence, sets WORKER_CONFIG,
+  asgi.py       THE serve target: checks litellm's config (exit 78), runs its Prisma sequence only with a DATABASE_URL (no shipped setup sets one), sets WORKER_CONFIG,
                 imports litellm's app, mounts it behind DesanitizeMiddleware, wraps its lifespan (arm the gate or
                 exit 70, route_gate/arm_checks.py), wraps it all in RouteGateMiddleware
   serve.py      `python -m corp_llm_gateway.serve` — uvicorn.run(asgi:app), workers=1; the image/compose/Helm ENTRYPOINT
