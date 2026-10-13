@@ -445,7 +445,7 @@
    "docs/audit-schema.ru.md:157"
   ],
   "tests/compose/test_nginx_allowlist_routes.py": [
-   "CLAUDE.md:72",
+   "CLAUDE.md:78",
    "compose/README.md:883",
    "compose/README.ru.md:906",
    "compose/nginx/README.md:20",
@@ -453,7 +453,7 @@
    "docs/security.ru.md:1277"
   ],
   "tests/compose/test_nginx_profile.py": [
-   "CLAUDE.md:72",
+   "CLAUDE.md:78",
    "compose/nginx/README.md:19",
    "docs/ops/capacity.md:240",
    "docs/ops/capacity.ru.md:181",
@@ -461,10 +461,11 @@
    "docs/security.ru.md:1188"
   ],
   "tests/compose/test_nginx_runtime.py": [
-   "CLAUDE.md:72",
+   "CLAUDE.md:78",
    "compose/nginx/README.md:19"
   ],
   "tests/compose/test_providers.py": [
+   "CLAUDE.md:77",
    "docs/ops/configuration.md:191",
    "docs/security.md:756",
    "docs/security.ru.md:713"
@@ -475,7 +476,7 @@
    "docs/security.ru.md:690"
   ],
   "tests/integration/test_route_gate_container.py": [
-   "CLAUDE.md:182",
+   "CLAUDE.md:188",
    "docs/security.md:484",
    "docs/security.md:705",
    "docs/security.md:1152",
@@ -496,7 +497,7 @@
    "docs/security.ru.md:1010"
   ],
   "tests/invariants/test_no_originals_leak.py": [
-   "CLAUDE.md:278",
+   "CLAUDE.md:284",
    "docs/harness-integration.md:134",
    "docs/harness-integration.ru.md:119",
    "docs/ops/runbook.md:295",
@@ -640,8 +641,8 @@
    "docs/security.md:1499"
   ],
   "tests/sanitizer/test_engine.py": [
-   "CLAUDE.md:187",
-   "CLAUDE.md:188"
+   "CLAUDE.md:193",
+   "CLAUDE.md:194"
   ],
   "tests/sanitizer/test_oauth_system_preamble.py": [
    "docs/security.md:834",
@@ -651,7 +652,7 @@
    "docs/security.md:1454"
   ],
   "tests/storage/test_mapping_store.py": [
-   "CLAUDE.md:351"
+   "CLAUDE.md:361"
   ],
   "tests/test_anthropic_oauth_profile.py": [
    "docs/ops/configuration.md:192",
@@ -659,13 +660,13 @@
    "docs/security.ru.md:714"
   ],
   "tests/test_asgi_entrypoint.py": [
-   "CLAUDE.md:238",
+   "CLAUDE.md:244",
    "docs/extending.md:166",
    "docs/security.md:1372",
    "docs/security.md:1378"
   ],
   "tests/test_ci_workflow.py": [
-   "CLAUDE.md:251"
+   "CLAUDE.md:257"
   ],
   "tests/test_desanitize_served_stack.py": [
    "docs/security.md:486",
@@ -678,7 +679,7 @@
    "docs/security.ru.md:471"
   ],
   "tests/test_launch_command.py": [
-   "CLAUDE.md:132"
+   "CLAUDE.md:138"
   ],
   "tests/test_litellm_config_guards.py": [
    "docs/extending.md:261",
