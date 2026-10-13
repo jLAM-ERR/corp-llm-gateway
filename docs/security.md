@@ -413,7 +413,7 @@ stops Vector reading. Closing the gap needs a health/buffer gate in `src/`
 feeding the hook — not built.
 
 Residual risk, and what bounds it: while the sink is stalled, accepted audit
-records live only in the `litellm` container's docker json-file logs plus
+records live only in the gateway containers' docker json-file logs plus
 whatever already reached Vector's disk buffer. Vector's file glob covers the
 active `-json.log` **and** its numbered rotations (`-json.log.[0-9]`, two-digit
 form too), so a rotation no longer discards records on its own — but a file
@@ -426,12 +426,12 @@ deleting the source's checkpoint under `data_dir`; records already rotated away
 are unrecoverable.
 
 Operators of that stack must therefore size docker log retention
-(`LITELLM_LOG_MAX_SIZE` × `LITELLM_LOG_MAX_FILE`, set on the `litellm` service's
+(`LITELLM_LOG_MAX_SIZE` × `LITELLM_LOG_MAX_FILE`, set on each gateway service's
 own `logging.options`) against the longest tolerated Langfuse outage, and alert
 on buffer growth and on Vector's `Events dropped` errors. Note that setting these
 in the **daemon's** `log-opts` does not work: docker merges daemon-level log-opts
 into a container only when the container's log driver equals the daemon's default
-driver, and that service pins `json-file` because the audit pipeline requires it.
+driver, and those services pin `json-file` because the audit pipeline requires it.
 Concrete commands: `compose/README.md` "Audit buffering is not fail-closed".
 
 The Helm deployment is not covered by this note; it is a separate composition.
@@ -445,7 +445,7 @@ deployment, and changes nothing in the matrix above.
 read-only bind of `/var/lib/docker/containers`, chosen over mounting the docker
 socket, which is host root). Its `gateway_container_only` filter scopes the
 pipeline to the gateway by requiring the docker json-file `attrs` stamp that the
-`litellm` service's `com.corp-llm-gateway.audit-source` label plus its
+gateway services' `com.corp-llm-gateway.audit-source` label plus their
 `logging.options.labels` produce.
 
 **That filter is a misconfiguration guard, not a security boundary.** The label
@@ -526,7 +526,7 @@ by construction; if one appears to, that is an M1-14 regression.
 | (b) | **SIEM sink enabled in values but not defined in the configmap.** `audit.sinks.siem.enabled: true` has no corresponding `sinks.siem` in the Vector configmap; `audit_drop` alerting (M3-9) also pending. | **Medium** — SIEM monitoring (incl. leak-attempt alerts) not yet active |
 | (c) | ✅ **FIXED** — streamed `tool_use` `input_json_delta` is now desanitized (JSON-escaped) in `sanitizer/streaming.py`, so the developer's tool receives real values, not `[LABEL_NNN]` tokens. | **Resolved** |
 | (d) | ✅ **By design (not a gap)** — `thinking` / `redacted_thinking` are passed through UNMODIFIED: Anthropic signs thinking blocks and rejects modified ones on multi-turn replay, and the model only ever sees placeholders (no original reaches them). | **Resolved (by design)** |
-| (e) | **`_corp_gateway_request_id` reaches the outbound Anthropic body on `/v1/chat/completions`.** `pre_call` writes this correlation key to four places in `data`, one of them the top level, and litellm's chat-completions adapter carries unknown top-level keys into the request it sends. Observed with the subscription bridge **off** as well as on, so it is independent of that bridge. The value is a request id (litellm's call id or a generated UUID), never user content, so it is not an M1-14 leak. The primary `/v1/messages` route — the one Claude Code uses — is unaffected. Not fixed opportunistically because the key is the audit-attribution fallback chain (`_REQUEST_ID_LOOKUP_PATHS`), which has its own regression history. | **Low** — correlation id only; affects the chat-completions route's acceptance upstream, not confidentiality |
+| (e) | **`_corp_gateway_request_id` reaches the outbound Anthropic body on `/v1/chat/completions`, and the corp vLLM's body on the corp provider.** `pre_call` writes this correlation key to four places in `data`, one of them the top level, and litellm's chat-completions adapter carries unknown top-level keys into the request it sends. Observed with the subscription bridge **off** as well as on, so it is independent of that bridge. On the `corp` provider (`hosted_vllm/`) the container suite's upstream captures carry it too. The value is a request id (litellm's call id or a generated UUID), never user content, so it is not an M1-14 leak. The primary `/v1/messages` route to Anthropic — the one Claude Code uses on the `anthropic` provider — is unaffected. Not fixed opportunistically because the key is the audit-attribution fallback chain (`_REQUEST_ID_LOOKUP_PATHS`), which has its own regression history. | **Low** — correlation id only; affects the chat-completions route's acceptance upstream, not confidentiality |
 | (f) | **F9 only guards the corp-LLM oracle client, not litellm's own global TLS switch.** `corp_llm_verify()` (`config.py`) is reached only through `bootstrap.build_corp_llm_client()`, itself called only when `CORP_LLM_ORACLE_ENABLED=1`. But litellm reads the SAME `SSL_VERIFY` env var directly, via `get_ssl_verify()` — at higher priority than `SSL_CERT_FILE` — for every upstream provider (`anthropic/`, `openai/`, `hosted_vllm/`), with no `CORP_ENV=prod` guard on that read. `SSL_VERIFY=false` therefore disables certificate verification stack-wide on any deployment fronted by litellm with the oracle off (the default posture — see `compose/docker-compose.yml`). Widening F9 to cover litellm's read is a `src` follow-up; `compose/` mitigates today by not exposing `SSL_VERIFY` as an operator-set `.env` key and hardcoding it `true`. | **Medium** — silent TLS-verification bypass for any deployment that sets `SSL_VERIFY=false` outside the documented `.env` surface |
 | (g) | **A payment card buried between stray digits on both sides is not detected.** `BANK_CARD` scans inside a glued digit run, but only for a PAN that reaches at least one end of the run (`_CARD_STRAY_MARGIN = 0`, `detectors/regex_checksum.py`). A PAN with junk digits on BOTH sides — `123` + PAN + `123` — is missed, and so is any deliberately padded one. The threat model for this detector is **accidental paste** (a developer drops a card into a prompt), not a determined insider: every realistic paste shape is still caught — a bare PAN, a PAN with a CVV or amount glued to either end, a grouped PAN with a glued tail, and a PAN glued to letters. Closing the gap needs unbounded-depth scanning, measured at **65.8% false positives on random 32-digit runs** (79.3% at 40) and climbing with run length, while a finite margin closes nothing — 7 junk digits in front escape at margin 6 exactly as at 0. Margin 6 cost 2-3x the false positives of 0 on ordinary long digit runs (19-digit nanosecond timestamps 27.9% → 18.4%; 20-digit 24.1% → 10.4%; 23-digit 34.1% → 11.9%) and bought no coverage against a padder, so it was dropped. Anyone deliberately obfuscating a card would equally defeat a regex with base64 or unusual spacing, so chasing depth in `regex_checksum` is unbounded work for no real adversary gain. The layers that can catch a card in prose context are **corp NER** (Workstream B, in progress) and the **Stage 5 DLP egress guard**. Pinned by `test_card_buried_between_stray_digits_is_a_known_limitation`. | **Low** — accepted; accidental paste is covered, deliberate obfuscation is out of this detector's scope |
 | (h) | ✅ **FIXED** — **Helm deploys sent the client's `Content-Length` upstream with a longer, sanitized body.** `CORP_LLM_STRIP_INBOUND_HEADERS` was absent from the chart and defaulted to `0`, so the guardrail's `data["headers"]` bucket carried the inbound wire headers into litellm's upstream call; the provider then read the request truncated at the client's length (wire-captured on `/v1/messages` and `/v1/chat/completions` — a `"stream": true` cut off that way came back non-streamed). Every request whose sanitized body grew was corrupted. The flag now defaults **on** (`bootstrap.build_guardrail`) and the chart sets it explicitly. The dropped set (`_WIRE_HEADERS_TO_DROP`) is hop-by-hop / wire-level only, and `X-Corp-Auth` was already stripped unconditionally one step earlier (invariant 4). The same deny-list let every other client header through, unsanitized, until 1.1.0 made `data["headers"]` an empty allowlist projection (§13, "Client headers upstream"); the flag now only cleans litellm's own header copies. | **Resolved** |
@@ -588,11 +588,17 @@ Both read the same inbound `Authorization` bearer, so **exactly one may be on**.
 Both flags set is refused at boot by `build_guardrail()` and by
 `gateway-admin config check` (`settings.forward_auth_conflict`). The runtime
 refusal is the load-bearing one: the compose and demo boots these bridges ship
-on never call `settings.validate()`. A set `LITELLM_MASTER_KEY` is refused the
-same way while either bridge is on — with a master key, litellm reads the
-inbound `Authorization` as one of its own virtual keys and answers 401 before
+on never call `settings.validate()`. The compose stack therefore runs one
+gateway container per provider (`gateway-anthropic`, `gateway-codex`,
+`gateway-corp`), each with at most its own bridge. A set `LITELLM_MASTER_KEY` is
+refused at boot the same way, bridge or not (`settings.master_key_conflict`):
+litellm's proxy auth (Mode A: master key and virtual keys) was removed in
+1.1.0, and with a bridge on a master key would also make litellm read the
+inbound `Authorization` as one of its own virtual keys and answer 401 before
 `pre_call` runs, so the bridge could never see the token. Presence counts, not
-truthiness: litellm treats a blank `LITELLM_MASTER_KEY=` as set.
+truthiness: litellm treats a blank `LITELLM_MASTER_KEY=` as set. A
+`general_settings.master_key` or `environment_variables.LITELLM_MASTER_KEY` in
+litellm's config is refused too (exit 78, `litellm_config.py`).
 
 The rest of this section is the Anthropic bridge (`litellm_hook.py`,
 `_anthropic_upstream_headers` + the `forward_anthropic_auth` branch in
@@ -746,9 +752,13 @@ land on a non-Anthropic upstream, taking the subscription token with it.
 The gate is therefore a cheap second line of defence against copying the token
 onto an OpenAI or corp-vLLM call. **The binding control is the deployment
 shape**: a litellm config in which every route is `anthropic/` and there is no
-wildcard. `docker/anthropic-oauth/litellm-config.yaml` is such a config, and
-`tests/test_anthropic_oauth_profile.py` pins both properties. Do not read the
-gate as a guarantee it cannot make.
+wildcard. `compose/litellm/config.anthropic.yaml` (the `anthropic` provider,
+pinned by `tests/compose/test_providers.py`) and the demo's
+`docker/anthropic-oauth/litellm-config.yaml` (`tests/test_anthropic_oauth_profile.py`)
+are such configs. For the ChatGPT bridge the shape is
+`compose/litellm/config.codex.yaml`: one route, whose `api_base` is the literal
+ChatGPT Codex URL, not an environment value. Do not read the gate as a
+guarantee it cannot make.
 
 ### The `metadata` / `user` scrub
 
@@ -775,8 +785,8 @@ to; sanitizing would mint placeholders in fields the response path never
 reverses, leaving pairs no reverse pass consumes; and a key-specific scrub would
 silently reopen the hole the day litellm copies one more metadata key into the
 body. The cost is litellm's own accounting metadata on this route, which is
-acceptable because the route ships without virtual keys and therefore without
-spend tracking anyway. Audit attribution is unaffected — `user_id` / `team_id`
+acceptable because there are no virtual keys and therefore no spend tracking
+anyway. Audit attribution is unaffected — `user_id` / `team_id`
 come from `AuthMiddleware`, and `request_id` keys on `litellm_call_id`.
 
 ### The identity-preamble carve-out
@@ -852,21 +862,22 @@ Bounds and mitigation:
 ### Topology
 
 Subscription auth is the production mode. It runs on the production compose
-stack with the `docker-compose.oauth.yml` override, and on the demo
-`anthropic-oauth` overlay (`docker-compose.demo.yml` +
-`docker-compose.anthropic-oauth.yml`).
+stack's `anthropic` and `codex` providers (`COMPOSE_PROFILES`, one gateway
+container each), and on the demo `anthropic-oauth` overlay
+(`docker-compose.demo.yml` + `docker-compose.anthropic-oauth.yml`).
 
 | Deployment | Status | Why |
 |---|---|---|
-| Production compose + `docker-compose.oauth.yml` | **Supported** | Anthropic-only routes, no wildcard, no `LITELLM_MASTER_KEY`, so the inbound bearer reaches `pre_call` |
+| Production compose, `anthropic` provider (`gateway-anthropic`) | **Supported** | `config.anthropic.yaml`: Anthropic-only routes, no wildcard; no `LITELLM_MASTER_KEY` anywhere, so the inbound bearer reaches `pre_call` |
+| Production compose, `codex` provider (`gateway-codex`) | **Supported** | `config.codex.yaml`: one route, to the literal ChatGPT Codex URL; same master-key rule |
 | `anthropic-oauth` demo overlay | **Supported (demo)** | Same shape over the demo stack |
 | Helm chart | **Unsupported** | Its litellm ConfigMap routes `"*"` to the corp vLLM and has no `anthropic/` route, so litellm's OAuth branch is unreachable — and that wildcard is exactly the shape the alias gate cannot protect |
 
 **Consequence to accept knowingly:** there are no litellm virtual keys, and
 therefore no native budget, rate-limit or quota enforcement. That is by design,
 not a gap waiting for a header decision: litellm's management surface, `/key/*`
-included, is refused at the route gate (§14), so no virtual key can be minted.
-API-key mode (virtual keys) survives only as a test posture.
+included, is refused at the route gate (§14), and API-key mode (Mode A) was
+removed in 1.1.0.
 
 ## 14. The route gate
 
@@ -1109,11 +1120,12 @@ have their own gate, the third is open:
   turns a UTF-16/32 body with a BOM (or bytes that are not UTF-8) into an empty
   body and answers the rest with 400, so nothing leaks there today; a parser
   that decodes like `json.loads(bytes)` would find the key.
-- **14c, litellm's `LiteLLM_Config` table — open.** On compose (litellm has a
-  database and `STORE_MODEL_IN_DB=True`; the Helm chart gives it no database) a
-  row there can add log callbacks or turn on prompts in spend logs;
-  `supported_db_objects` does not gate it. What such a callback gets is
-  placeholders only (§15, "litellm's database").
+- **14c, litellm's `LiteLLM_Config` table — closed in the shipped setups
+  (1.1.0).** Neither compose nor the Helm chart gives litellm a database any
+  more, so there is no table to read. It returns only if an operator adds
+  `DATABASE_URL`: a row there can add log callbacks or turn on prompts in spend
+  logs, and `supported_db_objects` does not gate it. What such a callback gets
+  is placeholders only (§15, "litellm's database").
 
 None of the three is the primary control: the guardrail is a plain
 `CustomLogger`, which litellm never skips for a policy (§15, hazard 14).
@@ -1132,14 +1144,14 @@ None of the three is the primary control: the guardrail is a plain
 `GET /health/services` and `POST /health/test_connection` were already refused
 (they reach providers).
 
-**API-key mode is a test posture** (DRI decision, 2026-09-27). Its developers
-held a litellm virtual key minted through `POST /key/generate`; with `/key/*`
-refused there is no onboarding path, and handing developers the master key is
-not an option. Subscription mode is the production mode. The container suite
-(`tests/integration/test_route_gate_container.py`) keeps API-key mode covered —
-exit 70 and the route gate — by inserting the sha256 of a synthetic `sk-…` key
-straight into litellm's `LiteLLM_VerificationToken`, which is how litellm looks
-a key up.
+**API-key mode (Mode A) was removed in 1.1.0.** It was a test posture since
+the DRI decision of 2026-09-27: its developers held a litellm virtual key minted
+through `POST /key/generate`, and with `/key/*` refused there was no onboarding
+path. Any `LITELLM_MASTER_KEY` now refuses to boot (§13), and litellm has no
+database to hold a key. The container suite
+(`tests/integration/test_route_gate_container.py`) runs the route gate on each
+shipped provider (`anthropic`, `codex`, `corp`), with no master key and no
+litellm database.
 
 `CORP_LLM_ROUTE_GATE_EXTRA_PASSTHROUGH` cannot re-open any of this (see
 "Widening it").
@@ -1368,7 +1380,7 @@ class stays.
 | 14 | A policy pipeline naming the guardrail, in any mode, makes the pre-call loop skip it: zero sanitizer calls, originals egress | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` (pre-call loop) | Only a `CustomGuardrail` is skipped; ours is a plain callback. `/polic*` and `/guardrail*` are REFUSE (§14); 14a-c below | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies`, `::test_migrated_pipeline_skip_egresses_originals` |
 | 14a | A policy row in litellm's database is loaded at boot and at every reconcile when `supported_db_objects` is unset | `proxy/proxy_server.py` (`_init_non_llm_objects_in_db`), `proxy/policy_engine/policy_registry.py` | Shipped configs pin `general_settings.supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_{compose,helm}_litellm_config_loads_no_policies_from_the_db`, `::test_litellm_reads_the_pin_as_models_only` |
 | 14b | A top-level `policies` list in the client body applies those policies with no attachment | `proxy/litellm_pre_call_utils.py` (`add_guardrails_from_policy_engine`) | The gate refuses a JSON body with a top-level `policies` key (403 `route_gate_body_policies`) and any body that is not UTF-8 JSON (415 `route_gate_body_not_json`: media type, charset, or `json.detect_encoding` other than utf-8, or bytes that do not decode as UTF-8), before litellm parses it | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`), served `test_a_body_naming_policies_is_refused_at_the_gate` |
-| 14c | **Open.** With a database and `store_model_in_db`, litellm applies `litellm_settings` and `general_settings` rows from `LiteLLM_Config` every 30 s; `supported_db_objects` gates neither | `proxy/proxy_server.py` (`_add_deployment_locked`, `_update_config_fields`, `_update_general_settings`) | Characterised (below): an added callback gets placeholders only | `test_litellm_config_guards.py` (5 rows), served DB-overlay rows (5) |
+| 14c | **Closed in the shipped setups (1.1.0).** With a database and `store_model_in_db`, litellm applies `litellm_settings` and `general_settings` rows from `LiteLLM_Config` every 30 s; `supported_db_objects` gates neither | `proxy/proxy_server.py` (`_add_deployment_locked`, `_update_config_fields`, `_update_general_settings`) | Compose and Helm give litellm no database. If an operator adds one: characterised (below), an added callback gets placeholders only | `test_litellm_config_guards.py` (5 rows), served DB-overlay rows (5) |
 | 15 | `post_call_response_headers_hook` hands every callback the restored response | `proxy/common_request_processing.py`, `proxy/utils.py` | No reversal inside litellm | as 10 |
 | 15b | Guardrail-name load balancing runs another callback under our name | `proxy/utils.py` | A plain callback is not load-balanced; guardrail CRUD is REFUSE; the arm check finds ours by type | `test_proxy_dispatch.py::test_duplicate_guardrail_name_substitutes_callback`, `::test_a_stand_in_answering_to_our_name_is_not_our_guardrail` |
 | 16 | `guardrail_information` written to request metadata only would miss the logging object | `integrations/custom_guardrail.py`, `litellm_core_utils/litellm_logging.py` | Did not reproduce on 1.101.0; the sync into the logging object is kept as defence in depth. Timing is separate: litellm dispatches a Responses stream's payload at `response.completed` unless a post_call `CustomGuardrail` defers it, so a write after that stream ended misses it, synced or not; ours is written at pre-call | `test_guardrail_information.py::test_the_entry_lands_without_the_sync_too`, `::test_the_payload_carries_exactly_our_entry`, `test_logging_surfaces.py::test_a_write_after_a_responses_stream_ended_misses_the_payload` |
@@ -1514,7 +1526,7 @@ litellm snapshots the request into its logging object before any pre-call hook,
 and every `litellm.callbacks` entry receives what is built from that snapshot —
 log kwargs, `StandardLoggingPayload` (success and failure), the spend-log row. The
 shipped configs register no other callback, but one added through litellm's
-config or database (14c) gets all of it, so each surface must hold placeholders
+config, or through a database an operator gives litellm (14c), gets all of it, so each surface must hold placeholders
 by construction:
 
 - **Request content (17).** The pre-call replaces the logging object's
@@ -1555,13 +1567,15 @@ Two things come from litellm's database without an HTTP request through the gate
 
 - **Policy and guardrail rows (14a).** Without `supported_db_objects` litellm
   loads every object type at boot and at every reconcile. The shipped configs
-  (compose `config.yaml` / `config.oauth.yaml`, Helm `configmap-litellm.yaml`)
-  pin it to `["models"]`, so no policy or guardrail row is ever loaded. Keep the
+  (compose `config.anthropic.yaml` / `config.codex.yaml` / `config.corp.yaml`,
+  Helm `configmap-litellm.yaml`) pin it to `["models"]`, so no policy or guardrail row is ever loaded. Keep the
   pin in any config of your own.
-- **The config table (14c, open).** With a database and `store_model_in_db` on,
-  litellm's reconcile re-reads `LiteLLM_Config` every 30 s and applies two rows;
-  `supported_db_objects` gates neither. Compose gives litellm both
-  (`DATABASE_URL`, `STORE_MODEL_IN_DB=True`); the Helm chart gives it no database.
+- **The config table (14c, closed in the shipped setups).** With a database and
+  `store_model_in_db` on, litellm's reconcile re-reads `LiteLLM_Config` every
+  30 s and applies two rows; `supported_db_objects` gates neither. Since 1.1.0
+  neither compose nor the Helm chart gives litellm a database (no
+  `DATABASE_URL`, no `STORE_MODEL_IN_DB`), so there is no table to re-read. The
+  rest of this bullet is what happens if an operator adds `DATABASE_URL`.
   - The `litellm_settings` row is merged into litellm's config and its
     `callbacks`, `success_callback` and `failure_callback` names are added. A
     name litellm knows as an integration is instantiated into its success and
@@ -1585,8 +1599,7 @@ Two things come from litellm's database without an HTTP request through the gate
   before litellm routes it; the UI is REFUSE. What does not hold: nothing notices
   such a callback after the arm check, and it gets what any callback after ours
   gets — placeholders, counts, request metadata, and the provider key of 19b.
-  Options for the DRI: drop `STORE_MODEL_IN_DB=True` from compose (a DB
-  `general_settings` row can still turn it on), or pin `supported_db_objects: []`
-  there (Mode A then has no DB models; the `litellm_settings` row is no longer
-  applied, the `general_settings` row still is). Pinned by
-  `tests/test_litellm_config_guards.py` and `tests/test_desanitize_served_stack.py`.
+  The DRI closed it on 2026-10-09 by dropping litellm's database (Mode B never
+  used it). Pinned by `tests/test_litellm_config_guards.py`
+  (`test_compose_litellm_has_no_database_to_read_a_config_table_from`, the Helm
+  twin, and the added-database rows) and `tests/test_desanitize_served_stack.py`.

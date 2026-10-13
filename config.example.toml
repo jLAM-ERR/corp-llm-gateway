@@ -61,15 +61,16 @@
 # CORP_LLM_DLP_GUARD        = "1"      # Stage 5 DLP egress guard (re-scan sanitized request)
 # CORP_LLM_DLP_CANARIES     = "canary-abc,canary-def"   # comma-separated canary regexes
 # CORP_LLM_FORWARD_CHATGPT_AUTH = "0"  # opt-in allowlisted Codex OAuth forwarding
-#   Resolved by bootstrap.build_guardrail() in every deployment (k8s/Helm
-#   included), not just the docker-compose Codex demo overlay. See
+#   Resolved by bootstrap.build_guardrail() in every deployment. On the
+#   production compose stack the `codex` provider (gateway-codex) turns it on,
+#   with a litellm config whose one route goes to the ChatGPT Codex URL. See
 #   docs/chatgpt-codex.md.
-# CORP_LLM_STRIP_INBOUND_HEADERS = "1"  # strip inbound wire headers before upstream
-#   ON by default, and it is a correctness knob, not a preference: litellm
-#   forwards the headers the guardrail puts in data["headers"], so with this
-#   off the client's Content-Length travels with litellm's own, longer,
-#   sanitized body and the provider truncates the request. Also what keeps an
-#   inbound Host off the corp ingress on the hosted_vllm/ (corp-*) route.
+# CORP_LLM_STRIP_INBOUND_HEADERS = "1"  # strip inbound wire headers from litellm's header copies
+#   ON by default. It no longer decides what reaches a provider: since 1.1.0
+#   the guardrail writes data["headers"] (what litellm forwards) as an empty
+#   allowlist projection, so no client header goes upstream either way. The
+#   flag only drops the wire headers (Host, Content-Length, ...) from litellm's
+#   own copies. See docs/ops/configuration.md, "Header forwarding to upstream".
 # CORP_LLM_FORWARD_ANTHROPIC_AUTH = "0"  # opt-in Anthropic subscription (OAuth) forwarding
 #   Lifts the developer's `sk-ant-oat…` bearer into the upstream Anthropic call,
 #   so no ANTHROPIC_API_KEY is needed on the laptop.
@@ -84,7 +85,8 @@
 #   this flag there risks handing the credential to the wrong provider.
 #   MUTUALLY EXCLUSIVE with CORP_LLM_FORWARD_CHATGPT_AUTH: both consume the same
 #   inbound Authorization bearer, so setting both refuses to boot (and fails
-#   `gateway-admin config check`). Picking a bridge per provider is a v2 follow-up.
+#   `gateway-admin config check`). The compose stack runs one gateway container
+#   per provider for this reason (compose/README.md, "Providers").
 # LITELLM_MASTER_KEY = ""   # litellm's own virtual-key switch — NOT a gateway knob
 #   Listed here only because it is REFUSED: litellm's proxy auth (Mode A) was
 #   removed in 1.1.0, so any master key refuses to boot and fails `gateway-admin

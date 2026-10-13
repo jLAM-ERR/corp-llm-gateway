@@ -88,24 +88,42 @@ The profile uses:
 
 ## In production
 
+On the production compose stack (`compose/`) this is the `codex` provider.
+`COMPOSE_PROFILES=codex` (alone or with other providers) starts `gateway-codex`
+on `127.0.0.1:${GATEWAY_CODEX_PORT:-4001}`, with
+`CORP_LLM_FORWARD_CHATGPT_AUTH=1` and `compose/litellm/config.codex.yaml`: one
+catch-all route to the literal `https://chatgpt.com/backend-api/codex`, so no
+setting can send the token to another host. It runs the production guardrail
+(Postgres token store, audit chain), so `X-Corp-Auth` carries a real corp
+token, not `demo-team-token`. Point the profile's `base_url` at that port, or at
+the front door when `NGINX_GATEWAY_UPSTREAM=gateway-codex`. See
+[`ops/deployment-modes.md`](ops/deployment-modes.md).
+
 `CORP_LLM_FORWARD_CHATGPT_AUTH` is a normal `settings.KEYS` flag: it is
 resolved by `bootstrap.build_guardrail()` from the environment or the TOML
 config file like every other gateway setting (see
-[`config.example.toml`](../config.example.toml)), not just from the demo
-compose overlay above. Setting it via a Helm value / k8s env var enables the
-same header bridge on a real cluster deployment — no code change needed.
+[`config.example.toml`](../config.example.toml)). The bridge does not check
+where litellm routes the request, so set it only where every route goes to the
+ChatGPT Codex backend, as `config.codex.yaml` does. The Helm chart in this
+release routes `"*"` to the corp vLLM: do not set the flag there, or the
+developer's ChatGPT token goes to the corp vLLM.
 
-Two constraints apply wherever you set it:
+Two more constraints apply wherever you set it:
 
-- **`LITELLM_MASTER_KEY` must be unset.** With a master key, litellm reads the
-  inbound `Authorization` as one of its own virtual keys and answers `401`
-  before `pre_call` runs, so the bridge could never see the Codex token. The
-  gateway now **refuses to boot** on that combination rather than serving
-  unexplained 401s. Presence counts, not truthiness — remove the line, do not
-  blank it.
+- **`LITELLM_MASTER_KEY` must be unset.** Any master key refuses to boot, bridge
+  or not: litellm's proxy auth (Mode A) was removed in 1.1.0. With the bridge on,
+  litellm would also read the inbound `Authorization` as one of its own virtual
+  keys and answer `401` before `pre_call` runs, so the bridge could never see the
+  Codex token. Presence counts, not truthiness — remove the line, do not blank
+  it.
 - **Mutually exclusive with `CORP_LLM_FORWARD_ANTHROPIC_AUTH`.** Both bridges
   read the same inbound bearer; setting both refuses to boot and fails
-  `gateway-admin config check`.
+  `gateway-admin config check`. That is why the compose stack runs one gateway
+  per provider.
+
+Only the bridge's own headers reach ChatGPT, by exact name and only with a
+value in the header's format; no other client header goes upstream
+([`security.md`](security.md) §13).
 
 Note also that litellm retains one deployment per distinct per-request
 `api_key` — raw value included — for the lifetime of the proxy process, with no

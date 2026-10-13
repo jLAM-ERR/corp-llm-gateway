@@ -85,24 +85,42 @@ codex exec --profile chatgpt-codex \
 
 ## В продакшене
 
+На production compose-стеке (`compose/`) это провайдер `codex`.
+`COMPOSE_PROFILES=codex` (отдельно или вместе с другими провайдерами) поднимает
+`gateway-codex` на `127.0.0.1:${GATEWAY_CODEX_PORT:-4001}` с
+`CORP_LLM_FORWARD_CHATGPT_AUTH=1` и `compose/litellm/config.codex.yaml`: один
+catch-all маршрут на литеральный `https://chatgpt.com/backend-api/codex`, так
+что никакая настройка не отправит токен на другой хост. Там работает
+production-guardrail (хранилище токенов в Postgres, цепочка аудита), поэтому
+`X-Corp-Auth` несёт настоящий corp-токен, а не `demo-team-token`. Направьте
+`base_url` профиля на этот порт или на фронт, если
+`NGINX_GATEWAY_UPSTREAM=gateway-codex`. См.
+[`ops/deployment-modes.ru.md`](ops/deployment-modes.ru.md).
+
 `CORP_LLM_FORWARD_CHATGPT_AUTH` — обычный флаг из `settings.KEYS`:
 `bootstrap.build_guardrail()` резолвит его из окружения или TOML-конфига,
-как и любую другую настройку шлюза (см. [`config.example.toml`](../config.example.toml)),
-а не только из demo-overlay compose выше. Установка через Helm value / env
-var в k8s включает тот же header bridge на реальном кластере — без изменений
-кода.
+как и любую другую настройку шлюза (см. [`config.example.toml`](../config.example.toml)).
+Мост не проверяет, куда litellm направит запрос, поэтому включайте его только
+там, где каждый маршрут ведёт в бэкенд ChatGPT Codex, как в `config.codex.yaml`.
+Helm-чарт в этом релизе маршрутизирует `"*"` в корп-vLLM: не включайте там
+флаг, иначе токен ChatGPT разработчика уйдёт в корп-vLLM.
 
-Где бы вы его ни включали, действуют два ограничения:
+Где бы вы его ни включали, действуют ещё два ограничения:
 
-- **`LITELLM_MASTER_KEY` должен быть не установлен.** С master key litellm
-  читает входящий `Authorization` как один из своих virtual key и отвечает
-  `401` ещё до `pre_call`, так что мост никогда не увидит токен Codex. Теперь
-  шлюз **отказывается стартовать** на такой комбинации, вместо того чтобы
-  отдавать необъяснимые 401. Считается наличие, а не «истинность» — удалите
-  строку, а не обнуляйте её.
+- **`LITELLM_MASTER_KEY` должен быть не установлен.** Любой master key не даёт
+  стартовать, с мостом или без: proxy-аутентификация litellm (режим A) удалена
+  в 1.1.0. При включённом мосте litellm к тому же читал бы входящий
+  `Authorization` как один из своих virtual key и отвечал `401` ещё до
+  `pre_call`, так что мост никогда не увидел бы токен Codex. Считается
+  наличие, а не «истинность» — удалите строку, а не обнуляйте её.
 - **Взаимоисключающий с `CORP_LLM_FORWARD_ANTHROPIC_AUTH`.** Оба моста читают
   один и тот же входящий bearer; оба сразу — отказ на старте и провал
-  `gateway-admin config check`.
+  `gateway-admin config check`. Поэтому compose-стек запускает по шлюзу на
+  провайдера.
+
+До ChatGPT доходят только собственные заголовки моста, по точному имени и только
+со значением в формате заголовка; никакой другой заголовок клиента наверх не
+уходит ([`security.md`](security.ru.md) §13).
 
 Учтите также, что litellm удерживает по одному деплойменту на каждое отдельное
 значение per-request `api_key` — вместе с сырым значением — всё время жизни

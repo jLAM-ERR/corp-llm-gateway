@@ -8,10 +8,10 @@ re-signing egress proxy — which is a **build-time** file, baked into the image
 Different directory, different lifecycle. See
 [`../../crt/README.md`](../../crt/README.md).
 
-The data-plane litellm container verifies TLS to the corp vLLM against a
-corporate CA bundle. This directory is mounted read-only into the container
-at `/etc/corp-llm-gateway/certs`; its contents are site-specific PKI material
-and are **not committed** — `*.pem` / `*.crt` in this directory are
+Each gateway container (`gateway-anthropic`, `gateway-codex`, `gateway-corp`)
+verifies TLS to the corp vLLM against a corporate CA bundle. This directory is
+mounted read-only into each of them at `/etc/corp-llm-gateway/certs`; its
+contents are site-specific PKI material and are **not committed** — `*.pem` / `*.crt` in this directory are
 git-ignored.
 
 If the corp vLLM presents a certificate signed by an internal CA, drop the
@@ -22,7 +22,7 @@ uncomment and set:
 CORP_LLM_CA_BUNDLE=/etc/corp-llm-gateway/certs/corp-ca-bundle.pem
 ```
 
-Two different HTTP clients read TLS trust inside the litellm container: our
+Two different HTTP clients read TLS trust inside each gateway container: our
 own `CorpLlmClient` (httpx) reads `CORP_LLM_CA_BUNDLE` above, scoped to calls
 to the corp vLLM only. litellm's own clients (native `anthropic/`, `openai/`
 AND `hosted_vllm/`, all aiohttp) read `SSL_CERT_FILE` — a **process-global**

@@ -33,6 +33,6 @@ No secret, and no `.env`. Every credential (`LANGFUSE_POSTGRES_PASSWORD`,
 comes from `compose/.env`, which is git-ignored. The demo stack's
 `change-in-production` placeholders are deliberately absent.
 
-The admin-only LiteLLM instance this used to sit alongside is dropped — see
-`compose/README.md` "Virtual keys"; `litellm` itself now owns
-`LITELLM_MASTER_KEY`.
+The admin-only LiteLLM instance this used to sit alongside is dropped, and
+since 1.1.0 there is no `LITELLM_MASTER_KEY` at all (Mode A was removed; see
+`compose/README.md` "Providers").

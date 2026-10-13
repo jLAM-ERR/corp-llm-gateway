@@ -8,7 +8,7 @@ sidecar, and mounts detection in-process — there is no separate pre-pass pod.
 
 For **non-k8s hosts** use the compose stack in `compose/` instead. Either way,
 read `deployment-modes.md` (RU: `deployment-modes.ru.md`) first: it covers the
-two mutually exclusive auth modes (API keys vs subscription/OAuth) and how to
+providers (`anthropic`, `codex`, `corp`) and how developers authenticate, and how to
 toggle the corp-LLM oracle (`CORP_LLM_ORACLE_ENABLED`) and the corp NER service
 (`CORP_NER_ENABLED`).
 
@@ -253,7 +253,7 @@ Before the first issuance:
 - `ANTHROPIC_AUTH_TOKEN` — the developer's subscription token; it drives the
   smoke test at the end, which is skipped with a message when it is unset.
 - `CORP_GATEWAY_URL` (default `https://gateway.corp.lan`). On a compose
-  deployment it is the front door's origin once a profile is on:
+  deployment it is the front door's origin once a front-door profile is on:
   `https://gateway.<domain>` under `nginx`, `https://<address>:<NGINX_PORT>`
   under `nginx-ports`. The installer's `POST /internal/issue-token` goes through
   nginx, which admits it (header only, a body over 1 KiB is 413, at most
@@ -282,11 +282,11 @@ This runs `claude` through the gateway with **no `ANTHROPIC_API_KEY` anywhere** 
 the developer's own Max/Pro OAuth token pays for the upstream call.
 
 The steps below use the **demo** overlay, which is the quickest way to try it on
-a laptop. For a server, use the production stack in subscription mode instead —
-`compose/` + `docker-compose.oauth.yml`, which keeps the Postgres token store and
-the audit pipeline the demo stack does not have. See
-[`deployment-modes.md`](deployment-modes.md) "Mode B"; everything about the
-client side below applies unchanged to it.
+a laptop. For a server, use the production compose stack's `anthropic` provider
+instead (`COMPOSE_PROFILES=anthropic` in `compose/.env`, the `gateway-anthropic`
+service), which keeps the Postgres token store and the audit pipeline the demo
+stack does not have. See [`deployment-modes.md`](deployment-modes.md)
+"Providers"; everything about the client side below applies unchanged to it.
 
 **Helm does not support this route.** It routes `"*"` to the corp vLLM and has no
 `anthropic/` route at all, so litellm's Anthropic OAuth branch is never reached —
@@ -296,7 +296,7 @@ subscription token to the wrong upstream.
 There is no litellm virtual-key governance (budgets, rate limits, quotas) in any
 stack: litellm's management surface, `/key/*` included, is refused at the route
 gate, so no virtual key can be issued ([`../security.md`](../security.md) §14).
-API-key mode survives only as a test posture. See `configuration.md` for the operator view and
+API-key mode (Mode A) was removed in 1.1.0. See `configuration.md` for the operator view and
 [`../security.md`](../security.md) §13 for what the bridge does and does not
 forward.
 
@@ -355,10 +355,11 @@ Notes:
   the Codex flag in `~/.corp-llm-gateway/config.toml` or in your environment,
   turn it off before starting this overlay — the overlay itself only sets the
   Anthropic one.
-- The overlay deliberately sets no `LITELLM_MASTER_KEY`. With one, litellm
-  consumes the inbound `Authorization` as a virtual key and rejects the request
-  before `pre_call` runs — so there are also no litellm virtual keys, and no
-  native budget or rate-limit enforcement, on this route.
+- The overlay deliberately sets no `LITELLM_MASTER_KEY`, and the gateway refuses
+  to boot with one (any value; Mode A was removed in 1.1.0). With a master key,
+  litellm would consume the inbound `Authorization` as a virtual key and reject
+  the request before `pre_call` runs — so there are also no litellm virtual
+  keys, and no native budget or rate-limit enforcement, on this route.
 - **Restart the proxy to clear retained tokens.** litellm treats a per-request
   `api_key` as a clientside credential and keeps one deployment per distinct
   token — raw value included — in `Router.model_list` for the lifetime of the
@@ -370,9 +371,9 @@ Notes:
   older stack and it carries `LITELLM_MASTER_KEY`, the copy step above is a
   no-op and the demo stack passes that key straight into the litellm container
   via `env_file:`. The container then **refuses to start** and logs
-  `invalid gateway configuration: - LITELLM_MASTER_KEY is set while a
-  subscription-auth bridge is on …`. Symptom: `docker compose up` never becomes
-  healthy and `curl http://127.0.0.1:4000/health/liveliness` gets a connection
+  `invalid gateway configuration: - LITELLM_MASTER_KEY is set. litellm's proxy
+  auth (Mode A: master key and virtual keys) was removed in 1.1.0 …`. Symptom:
+  `docker compose up` never becomes healthy and `curl http://127.0.0.1:4000/health/liveliness` gets a connection
   refused. Fix: delete the line from `.env.demo` (or re-copy from
   `.env.demo.example`) and bring the stack up again. The boot-time refusal is
   deliberate — without it you would instead get an unexplained `401` on every

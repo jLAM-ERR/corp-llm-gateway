@@ -1,31 +1,29 @@
 # Deployment modes
 
-Which stack to run, how developers authenticate, and how to turn the two
+Which providers to run, how developers authenticate, and how to turn the two
 optional network dependencies (the corp-LLM oracle, the corp NER service) on and
 off. Russian mirror: `deployment-modes.ru.md`.
 
-There are two authentication modes and they are **mutually exclusive**. Pick one
-before you write `.env`.
+There is one production stack, `compose/` (Helm for k8s: `install.md`). It runs
+one gateway container per **provider**, and you pick the providers per host.
+Every gateway runs the same production code path: `bootstrap.guardrail`, the
+route gate, the Postgres token store, the Redis mapping store and the same
+audit chain. What differs is the litellm route and the upstream credential.
 
-**Mode B is the production mode. Mode A is a test posture only** (DRI decision,
-2026-09-27): the route gate refuses litellm's whole management surface,
-`POST /key/generate` and the admin UI included, so there is no way to hand a
-developer a virtual key (`../security.md` §14). Both modes run the same stack,
-the same sanitization cascade and the same audit chain; what differs is the
-upstream credential.
+| Provider (profile) | Service | Port on `127.0.0.1` | litellm config | Upstream credential |
+|---|---|---|---|---|
+| `anthropic` | `gateway-anthropic` | `GATEWAY_ANTHROPIC_PORT` (4000) | `config.anthropic.yaml`: `claude-*` → `anthropic/` | the developer's Anthropic subscription token (`sk-ant-oat…`), lifted by `CORP_LLM_FORWARD_ANTHROPIC_AUTH=1` |
+| `codex` | `gateway-codex` | `GATEWAY_CODEX_PORT` (4001) | `config.codex.yaml`: `"*"` → `openai/` at `https://chatgpt.com/backend-api/codex` | the developer's ChatGPT subscription token, lifted by `CORP_LLM_FORWARD_CHATGPT_AUTH=1` |
+| `corp` | `gateway-corp` | `GATEWAY_CORP_PORT` (4002) | `config.corp.yaml`: `corp-*` → `hosted_vllm/` at `CORP_LLM_ENDPOINT` | the route's own `CORP_LLM_AUTH_TOKEN` (empty for an auth-less vLLM); no bridge |
 
-| | Mode A — API keys | Mode B — subscription (OAuth) |
-|---|---|---|
-| Stack | `compose/` | `compose/` + `docker-compose.oauth.yml` |
-| Upstream credential | the gateway's own `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | the developer's own OAuth bearer, forwarded |
-| Developer sends | `Authorization: Bearer <litellm virtual key>` | `Authorization: Bearer <OAuth token>` |
-| Team identity | `X-Corp-Auth: <corp token>` | `X-Corp-Auth: <corp token>`, minted by `scripts/install.sh` through Keycloak |
-| `LITELLM_MASTER_KEY` | **required** | **must be absent** |
-| Routes served | `claude-*`, `gpt-*`, `corp-*` | `claude-*` only |
-| Per-developer revocation | corp token only (`gateway-admin token revoke`) — `/key/*` and the admin UI are refused | corp token (`gateway-admin token revoke`) |
-| Per-developer spend / budgets | no | no |
-| Status | **test posture only** | **production** |
-| Audit trail | Vector → Langfuse / S3 / SIEM | same |
+On every provider the developer sends `X-Corp-Auth: <corp token>`, the team
+identity the gateway checks in `pre_call`. No provider API key is held anywhere,
+and there are no litellm virtual keys.
+
+**Mode A (litellm master key and virtual keys) was removed in 1.1.0**, together
+with litellm's own database. Any `LITELLM_MASTER_KEY` refuses to boot (below).
+The 1.0 "Mode B" is what the `anthropic` provider runs now. Upgrading a 1.0
+host: `upgrade.md`, "1.0 → 1.1.0".
 
 There is also a **demo-only** OAuth stack — `docker-compose.demo.yml` +
 `docker-compose.anthropic-oauth.yml` at the repo root. It exists to try the
@@ -35,130 +33,103 @@ subscription bridge on a laptop and is **not** a deployment target: it runs
 
 ---
 
-## Mode A — API keys (test posture only)
+## Picking the providers
 
-The stack in `compose/`. Requests authenticate with a **LiteLLM virtual key**;
-the gateway holds the provider credentials. There is no onboarding path for that
-key: `/key/*`, the admin UI and every other litellm management route answer
-`403 E_ROUTE_BLOCKED` at the route gate. The container tests write a key's hash
-straight into litellm's `LiteLLM_VerificationToken` table; nothing else should.
-Do not deploy this mode for developers.
+`COMPOSE_PROFILES` in `compose/.env` is the only switch: at least one of
+`anthropic`, `codex`, `corp`, comma-separated. Some developers run two at once,
+for example `COMPOSE_PROFILES=anthropic,codex` for cross-review.
 
 ```
 cd compose
 cp .env.example .env
 chmod 0600 .env
-# fill in the required secrets, then:
+# fill in the required secrets and set COMPOSE_PROFILES, then:
 docker compose up -d
 ```
 
-Required in `.env` (compose refuses to start without them):
-`POSTGRES_PASSWORD`, `LITELLM_MASTER_KEY`, `UI_USERNAME`, `UI_PASSWORD`,
-`CORP_LANGFUSE_PUBLIC_KEY`, `CORP_LANGFUSE_SECRET_KEY` and the `LANGFUSE_*`
-secrets. See `compose/README.md`.
-
-**Provider keys are optional.** `docker-compose.yml` declares them as
-`${ANTHROPIC_API_KEY:-}` / `${OPENAI_API_KEY:-}`, so an empty value is
-accepted. Set only what you actually route to:
-
-- `ANTHROPIC_API_KEY` — needed for the `claude-*` route;
-- `OPENAI_API_KEY` — needed for the `gpt-*` route;
-- neither — fine if you only use the `corp-*` route against the corp vLLM.
-
-**BYOK is not available in this mode, on any route.** The native `anthropic/`
-and `openai/` providers build the upstream credential from the configured
-`api_key` and never read the inbound `Authorization` header; the `corp-*` /
-`hosted_vllm/` route does the same. A developer's own key cannot reach upstream
-here — that is what Mode B is for.
-
-## Mode B — subscription (OAuth passthrough)
-
-The developer's Anthropic subscription token is forwarded to `api.anthropic.com`
-untouched. **No `ANTHROPIC_API_KEY` exists anywhere in this mode.**
+From a laptop, against a server prepared by `scripts/deploy/bootstrap-server.sh`,
+the providers come from the same line in the server's `.env`; the script has no
+flag for them:
 
 ```
-cd compose
-cp .env.example .env
-chmod 0600 .env
-# fill in the required secrets, then DELETE the LITELLM_MASTER_KEY,
-# UI_USERNAME and UI_PASSWORD lines entirely (see the trap below), then:
-docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d
+scripts/deploy/deploy.sh --host user@server up
 ```
 
-From a laptop, against a server prepared by `scripts/deploy/bootstrap-server.sh`
-(`--mode oauth` is the default and may be omitted):
+- **No provider is a refusal.** The `profile-guard` one-shot, which `postgres`
+  waits for, exits 64 and names `COMPOSE_PROFILES` when the line has no exact
+  provider token (`corporate` is not `corp`), so `up` fails instead of serving
+  nothing. `deploy.sh up` refuses the same stack with `no provider`.
+- **`--profile` on the command line is not supported.** `profile-guard` reads
+  `COMPOSE_PROFILES`, and the boot-time unit
+  (`scripts/deploy/corp-llm-gateway.service`, a bare `docker compose up -d`)
+  reads the same `.env`, so a deploy and a reboot start the same providers.
+- **Dropping a provider:** remove it from the line and run `deploy.sh up`; it
+  removes that gateway's container. A bare `docker compose up -d` does not, and
+  the old gateway keeps its port.
+- **The front door** (`nginx` or `nginx-ports` on the same line) proxies to one
+  gateway, `NGINX_GATEWAY_UPSTREAM` (default `gateway-anthropic`), whose provider
+  must be enabled, or nginx exits 64. The other providers stay on their
+  loopback ports or an SSH tunnel (`compose/README.md`, "HTTPS front door").
+- **There is no `--mode`.** `deploy.sh --mode` (any value) is refused, naming
+  1.1.0.
 
-```
-scripts/deploy/deploy.sh --host user@server --mode oauth up
-```
+## Why one gateway per provider
 
-Every later run against that host must resolve the same file list — `logs`,
-`status`, `down` and `restart` included. The default does that for this mode; a
-Mode A host has to be driven with `--mode virtual-keys` on every run, or a bare
-run would recreate it in this mode.
+Both subscription bridges read the same inbound `Authorization` bearer, so one
+process can run at most one of them (`build_guardrail()` refuses both,
+`settings.FORWARD_AUTH_EXCLUSIVE_MESSAGE`). Each provider's litellm config is
+also the binding control on where the developer's token goes:
 
-**For boot-time autostart, uncomment `COMPOSE_FILE` in `.env`:**
+- **`anthropic`** has one route, native `anthropic/`, with no `gpt-*`, no
+  `corp-*` and no `"*"` catch-all. The guardrail gates the OAuth lift on the
+  client-visible model alias, but litellm resolves the actual deployment
+  *after* the hook runs, so the alias gate alone cannot prove where a request
+  lands. An Anthropic-only routing table can. Do not add a second route.
+- **`codex`** has one catch-all route whose `api_base` is the literal ChatGPT
+  Codex URL, not an environment value, so no setting can point the token at
+  another host.
+- **`corp`** has one `corp-*` route to the corp vLLM and no bridge. The
+  client's `Authorization` never reaches the vLLM: no client header goes
+  upstream on any provider (`../security.md` §13). Clients of this port still
+  should not send a subscription token here; it has no use on a corp host.
 
-```
-COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml
-```
+The corp vLLM oracle works on every provider: it is reached through the
+gateway's own HTTP client (`CORP_LLM_ENDPOINT`), not through a litellm route.
 
-`scripts/deploy/corp-llm-gateway.service` runs a bare `docker compose up -d`,
-which without this line resolves the base file alone — i.e. the virtual-key
-mode. It fails loudly rather than serving the wrong one (Mode B's `.env` has no
-master key, so the entrypoint guard refuses), but the stack stays down until
-someone starts it by hand. An explicit `-f` on the command line still wins over
-`COMPOSE_FILE`, so this and `deploy.sh --mode oauth` agree rather than fight.
+## The master key is refused
 
-The overlay changes exactly two things: it turns on
-`CORP_LLM_FORWARD_ANTHROPIC_AUTH=1`, and it mounts `litellm/config.oauth.yaml`
-over `/etc/litellm/config.yaml`. Postgres-backed team tokens, the Redis mapping
-store, Langfuse and the Vector audit pipeline are all untouched — the callback is
-the production `corp_llm_gateway.bootstrap.guardrail`, exactly as in Mode A.
-
-**Only `claude-*` is served.** `litellm/config.oauth.yaml` has one route, native
-`anthropic/`, with no `gpt-*`, no `corp-*` and no `"*"` catch-all — and that is
-the binding control, not a simplification. The guardrail gates the OAuth lift on
-the client-visible model alias, but litellm resolves the actual deployment
-*after* the hook runs, so the alias gate alone cannot prove where a request
-lands. An Anthropic-only routing table can. Do not add a second route.
-
-The corp vLLM oracle still works: it is reached through the gateway's own HTTP
-client (`CORP_LLM_ENDPOINT`), not through a litellm route. Dropping `corp-*` only
-means clients cannot address corp models directly.
-
-**The master key and the bridge cannot coexist.** With a master key set, litellm
-treats the inbound `Authorization` header as one of its own virtual keys and
-answers 401 *before* `pre_call` ever runs, so the OAuth bearer would never reach
-the bridge. `build_guardrail()` therefore refuses to boot and names the cause
-(`settings.MASTER_KEY_REFUSED_MESSAGE`) rather than serving 401s. The
-overlay deliberately does not neutralise a leftover key — an override would
-silence the mistake instead of reporting it.
+`LITELLM_MASTER_KEY` set to anything refuses to boot, with or without a bridge:
+`build_guardrail()` stops the startup (exit 3) and names the cause
+(`settings.MASTER_KEY_REFUSED_MESSAGE`); `gateway-admin config check` reports
+it too. litellm's proxy auth is gone with Mode A; the gateway authenticates every
+client with `X-Corp-Auth`. With a bridge on, a master key would also make litellm
+read the inbound `Authorization` as one of its own virtual keys and answer 401
+*before* `pre_call` runs, so the subscription token would never reach the bridge.
+A `general_settings.master_key` or `environment_variables.LITELLM_MASTER_KEY` in a
+litellm config of your own is refused at startup too (exit 78).
 
 > **Trap:** a blank `LITELLM_MASTER_KEY=` line **counts as set** — litellm keeps
 > the empty value and enables proxy auth for anything that is not `None`. Delete
 > the line entirely. On the demo stack the usual source is a leftover key in a
-> git-ignored `.env.demo` picked up via `env_file:`; on the production stack it
-> is `compose/.env` copied from `.env.example` without removing the line.
-
-`UI_USERNAME` / `UI_PASSWORD` can go with it: without a master key the LiteLLM
-admin UI cannot authenticate anyone, so they have nothing to guard.
+> git-ignored `.env.demo` picked up via `env_file:`; on a production host it is a
+> 1.0 `compose/.env` that still has the line.
 
 ### What you give up, and what to close
 
-Mode B has **no per-developer virtual keys**, so no spend accounting through the
-LiteLLM UI. Identity, sanitization and audit are unchanged: developers send
-`X-Corp-Auth: <corp token>`, which the gateway validates in `pre_call` against
-the Postgres token store, and a request without a valid one is refused
-(`MissingTokenError` / `InvalidTokenError`). The corp token is per developer:
+There are **no per-developer virtual keys**, so no spend accounting through the
+LiteLLM UI. Identity, sanitization and audit do not depend on them: developers
+send `X-Corp-Auth: <corp token>`, which the gateway validates in `pre_call`
+against the Postgres token store, and a request without a valid one is refused
+(`MissingTokenError` / `InvalidTokenError`). The corp token is per developer and
+works on every provider of the host (one shared `gateway` database):
 `scripts/install.sh` mints it through Keycloak at `POST /internal/issue-token`
 once issuance is configured (`install.md`, "Developer onboarding"), and
 `gateway-admin token revoke --user` revokes it. On this compose stack issuance
-is the optional `docker-compose.issuance.yml` overlay, layered on top of
-`docker-compose.oauth.yml`; it mounts `gateway/config.toml` with the team map
-(`compose/README.md`, "Developer token issuance"). On Helm it is the
-`issuance.*` values (`install.md`, "Developer onboarding"). Without it, corp
-tokens come from `gateway-admin token issue` (break-glass).
+is the optional `docker-compose.issuance.yml` overlay, applied to every enabled
+gateway; it mounts `gateway/config.toml` with the team map (`compose/README.md`,
+"Developer token issuance"). On Helm it is the `issuance.*` values (`install.md`,
+"Developer onboarding"). Without it, corp tokens come from
+`gateway-admin token issue` (break-glass).
 
 **Postgres behind PgBouncer.** The gateway's pools send TCP keepalive startup
 parameters; PgBouncer refuses them unless `ignore_startup_parameters` lists them
@@ -168,7 +139,7 @@ leaves rotation. With issuance on, the gateway does not start: it
 exits 78, and the log line names `ignore_startup_parameters` and the three
 parameters to list.
 
-**Litellm's own management endpoints are refused, in both modes.** Without a
+**Litellm's own management endpoints are refused, on every provider.** Without a
 master key litellm accepts any caller as an internal user
 (`user_api_key_auth.py:1622-1633` in 1.101.0), so much of `/key/*`, `/model/*`,
 `/user/*`, `/policies*`, `/guardrails*` and the UI would otherwise answer anyone
@@ -177,13 +148,14 @@ E_ROUTE_BLOCKED`) before litellm sees the request, on every path in — loopback
 SSH tunnel or the nginx front door. The LLM routes are still gated by the
 gateway's `X-Corp-Auth` check in `pre_call`. See `../security.md` §14.
 
-The front door (`COMPOSE_PROFILES=nginx` or `nginx-ports`, `compose/README.md`,
-"HTTPS front door (nginx)") **additionally** answers the whole surface with 404
-at the edge, unconditionally and in both modes: its exact-path allow-list admits
-only `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
-`GET /v1/models`, `GET /healthz/live` and `POST /internal/issue-token`. That is
-defence in depth — the refusal above holds without nginx — and administration
-stays on the SSH tunnel to `127.0.0.1:4000`.
+The front door (`COMPOSE_PROFILES=…,nginx` or `…,nginx-ports`,
+`compose/README.md`, "HTTPS front door (nginx)") **additionally** answers the
+whole surface with 404 at the edge, unconditionally: its exact-path allow-list
+admits only `POST /v1/messages`, `POST /v1/chat/completions`,
+`POST /v1/responses`, `GET /v1/models`, `GET /healthz/live` and
+`POST /internal/issue-token`. That is defence in depth — the refusal above holds
+without nginx — and administration stays on the SSH tunnel to each gateway's
+loopback port.
 
 ---
 
@@ -209,7 +181,7 @@ Three things that bite:
 - **Enabling without a reachable endpoint fails requests closed on *every*
   route**, not just `corp-*` — a gazetteer hit falls through to a non-routable
   placeholder host. Point `CORP_LLM_ENDPOINT` at a live vLLM first.
-- **The `corp-*` route needs `CORP_LLM_ENDPOINT` regardless of this flag.**
+- **The `corp` provider's `corp-*` route needs `CORP_LLM_ENDPOINT` regardless of this flag.**
   Without it, `corp-*` requests fail per-request rather than failing config load.
 - **Do not turn off both the oracle and the local-first cascade.**
   `build_guardrail()` raises `ConfigError(NO_OP_SANITIZER_MESSAGE)` at boot if

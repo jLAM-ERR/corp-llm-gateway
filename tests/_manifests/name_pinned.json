@@ -7,30 +7,30 @@
   "tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level": [
    "docs/ops/capacity.md:240",
    "docs/ops/capacity.ru.md:181",
-   "docs/security.md:1202",
-   "docs/security.ru.md:1175"
+   "docs/security.md:1214",
+   "docs/security.ru.md:1188"
   ],
   "tests/detectors/test_regex_checksum.py::test_card_buried_between_stray_digits_is_a_known_limitation": [
    "docs/security.md:531",
    "docs/security.ru.md:509"
   ],
   "tests/integration/test_anthropic_oauth_outbound.py::test_each_distinct_token_retains_exactly_one_router_deployment": [
-   "docs/security.md:837",
-   "docs/security.ru.md:801"
+   "docs/security.md:847",
+   "docs/security.ru.md:811"
   ],
   "tests/integration/test_route_gate_container.py::test_a_bridge_drops_a_free_text_header_value": [
-   "docs/security.md:702",
-   "docs/security.ru.md:657"
+   "docs/security.md:708",
+   "docs/security.ru.md:663"
   ],
   "tests/integration/test_route_gate_container.py::test_a_client_control_body_key_never_reaches_the_upstream": [
-   "docs/security.md:701",
-   "docs/security.ru.md:656"
+   "docs/security.md:707",
+   "docs/security.ru.md:662"
   ],
   "tests/integration/test_route_gate_container.py::test_only_allowlisted_client_headers_reach_the_upstream": [
    "docs/security.md:484",
-   "docs/security.md:699",
+   "docs/security.md:705",
    "docs/security.ru.md:461",
-   "docs/security.ru.md:654"
+   "docs/security.ru.md:660"
   ],
   "tests/integration/test_route_gate_container.py::test_the_litellm_admin_surface_is_refused": [
    "tests/litellm_hook/test_acceptance_matrix.py:226"
@@ -39,25 +39,25 @@
    "tests/litellm_hook/test_acceptance_matrix.py:187"
   ],
   "tests/invariants/test_no_originals_leak.py::test_corp_token_never_reaches_litellms_logging_snapshot": [
-   "docs/security.md:1377",
+   "docs/security.md:1389",
    "tests/litellm_hook/test_acceptance_matrix.py:186"
   ],
   "tests/litellm_hook/test_acceptance_matrix.py::test_every_policy_and_guardrail_route_is_refused": [
-   "docs/security.md:1363",
+   "docs/security.md:1375",
    "tests/litellm_hook/test_acceptance_matrix.py:230"
   ],
   "tests/litellm_hook/test_acceptance_matrix.py::test_the_guardrail_stays_a_plain_custom_logger": [
-   "docs/security.md:1329",
-   "docs/security.md:1359",
-   "docs/security.ru.md:1301",
+   "docs/security.md:1341",
+   "docs/security.md:1371",
+   "docs/security.ru.md:1314",
    "tests/litellm_hook/test_acceptance_matrix.py:56"
   ],
   "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_a_bearer_of_any_other_shape_is_logged_raw": [
    "tests/litellm_hook/test_acceptance_matrix.py:195"
   ],
   "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_a_shipped_bearer_shape_is_logged_only_hashed": [
-   "docs/security.md:1378",
-   "docs/security.ru.md:1342",
+   "docs/security.md:1390",
+   "docs/security.ru.md:1355",
    "tests/litellm_hook/test_acceptance_matrix.py:193"
   ],
   "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_an_anthropic_x_api_key_is_logged_only_hashed": [
@@ -67,8 +67,8 @@
    "tests/litellm_hook/test_acceptance_matrix.py:200"
   ],
   "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_the_chatgpt_bridge_bearer_sits_raw_in_litellms_log_kwargs": [
-   "docs/security.md:1379",
-   "docs/security.ru.md:1343",
+   "docs/security.md:1391",
+   "docs/security.ru.md:1356",
    "tests/litellm_hook/test_acceptance_matrix.py:199"
   ],
   "tests/litellm_hook/test_bearer_is_hashed_before_logging.py::test_the_sites_are_where_litellm_keeps_any_provider_key": [
@@ -84,8 +84,8 @@
    "tests/litellm_hook/test_acceptance_matrix.py:184"
   ],
   "tests/litellm_hook/test_fail_open_probes.py::test_m4_status_codes_through_proxy": [
-   "docs/security.md:1358",
-   "docs/security.ru.md:1322",
+   "docs/security.md:1370",
+   "docs/security.ru.md:1335",
    "tests/litellm_hook/test_acceptance_matrix.py:53"
   ],
   "tests/litellm_hook/test_fail_open_probes.py::test_migrated_pipeline_skip_egresses_originals_via_body_version_id": [
@@ -95,17 +95,17 @@
    "tests/litellm_hook/test_acceptance_matrix.py:121"
   ],
   "tests/litellm_hook/test_fail_open_probes.py::test_opt_out_metadata_overwritten": [
-   "docs/security.md:1356",
-   "docs/security.ru.md:1320",
+   "docs/security.md:1368",
+   "docs/security.ru.md:1333",
    "tests/litellm_hook/test_acceptance_matrix.py:47"
   ],
   "tests/litellm_hook/test_fail_open_probes.py::test_scan_raw_request_and_run_in_parallel_refused": [
-   "docs/security.md:1365",
+   "docs/security.md:1377",
    "tests/litellm_hook/test_acceptance_matrix.py:88"
   ],
   "tests/litellm_hook/test_fail_open_probes.py::test_sentinel_does_not_catch_scan_raw_request": [
-   "docs/security.md:1340",
-   "docs/security.ru.md:1308",
+   "docs/security.md:1352",
+   "docs/security.ru.md:1321",
    "tests/litellm_hook/test_acceptance_matrix.py:89"
   ],
   "tests/litellm_hook/test_failure_hook_request_data_on_refusal.py::test_a_dlp_rejection_hands_the_failure_hook_the_sanitised_request": [
@@ -124,8 +124,8 @@
    "tests/litellm_hook/test_acceptance_matrix.py:176"
   ],
   "tests/litellm_hook/test_guardrail_information.py::test_a_raising_writer_is_logged_by_type_and_leaves_no_entry": [
-   "docs/security.md:1362",
-   "docs/security.ru.md:1326",
+   "docs/security.md:1374",
+   "docs/security.ru.md:1339",
    "tests/litellm_hook/test_acceptance_matrix.py:74"
   ],
   "tests/litellm_hook/test_guardrail_information.py::test_an_entry_written_after_ours_still_reaches_a_shared_list": [
@@ -135,16 +135,16 @@
    "tests/litellm_hook/test_acceptance_matrix.py:75"
   ],
   "tests/litellm_hook/test_guardrail_information.py::test_the_entry_lands_without_the_sync_too": [
-   "docs/security.md:1374",
-   "docs/security.ru.md:1338",
+   "docs/security.md:1386",
+   "docs/security.ru.md:1351",
    "tests/litellm_hook/test_acceptance_matrix.py:162"
   ],
   "tests/litellm_hook/test_guardrail_information.py::test_the_otel_span_is_built_from_our_entry_only": [
    "tests/litellm_hook/test_acceptance_matrix.py:76"
   ],
   "tests/litellm_hook/test_guardrail_information.py::test_the_payload_carries_exactly_our_entry": [
-   "docs/security.md:1374",
-   "docs/security.ru.md:1338",
+   "docs/security.md:1386",
+   "docs/security.ru.md:1351",
    "tests/litellm_hook/test_acceptance_matrix.py:45"
   ],
   "tests/litellm_hook/test_guardrail_information.py::test_the_writer_is_never_a_registered_callback": [
@@ -172,8 +172,8 @@
    "tests/litellm_hook/test_acceptance_matrix.py:96"
   ],
   "tests/litellm_hook/test_logging_surfaces.py::test_a_write_after_a_responses_stream_ended_misses_the_payload": [
-   "docs/security.md:1374",
-   "docs/security.ru.md:1338"
+   "docs/security.md:1386",
+   "docs/security.ru.md:1351"
   ],
   "tests/litellm_hook/test_logging_surfaces.py::test_debug_and_set_verbose_are_refused_at_arm": [
    "tests/litellm_hook/test_acceptance_matrix.py:97"
@@ -182,7 +182,7 @@
    "tests/litellm_hook/test_acceptance_matrix.py:95"
   ],
   "tests/litellm_hook/test_logging_surfaces.py::test_decorated_apply_guardrail_logs_exception_text": [
-   "docs/security.md:1362",
+   "docs/security.md:1374",
    "tests/litellm_hook/test_acceptance_matrix.py:73"
   ],
   "tests/litellm_hook/test_logging_surfaces.py::test_native_guardrail_endpoints_stay_refused": [
@@ -192,58 +192,58 @@
    "tests/litellm_hook/test_acceptance_matrix.py:170"
   ],
   "tests/litellm_hook/test_logging_surfaces.py::test_standard_logging_payload_is_content_free": [
-   "docs/security.md:1355",
-   "docs/security.ru.md:1319",
+   "docs/security.md:1367",
+   "docs/security.ru.md:1332",
    "tests/litellm_hook/test_acceptance_matrix.py:43"
   ],
   "tests/litellm_hook/test_proxy_dispatch.py::test_a_stand_in_answering_to_our_name_is_not_our_guardrail": [
-   "docs/security.md:1373",
+   "docs/security.md:1385",
    "tests/litellm_hook/test_acceptance_matrix.py:154"
   ],
   "tests/litellm_hook/test_proxy_dispatch.py::test_apply_guardrail_flips_dispatch": [
-   "docs/security.md:1361",
-   "docs/security.ru.md:1325",
+   "docs/security.md:1373",
+   "docs/security.ru.md:1338",
    "tests/litellm_hook/test_acceptance_matrix.py:67"
   ],
   "tests/litellm_hook/test_proxy_dispatch.py::test_capture_positions_unary_and_streaming": [
-   "docs/security.md:1364",
-   "docs/security.ru.md:1328",
+   "docs/security.md:1376",
+   "docs/security.ru.md:1341",
    "tests/litellm_hook/test_acceptance_matrix.py:84"
   ],
   "tests/litellm_hook/test_proxy_dispatch.py::test_client_gets_originals_back_on_every_flow": [
    "tests/litellm_hook/test_acceptance_matrix.py:213"
   ],
   "tests/litellm_hook/test_proxy_dispatch.py::test_duplicate_guardrail_name_substitutes_callback": [
-   "docs/security.md:1373",
-   "docs/security.ru.md:1337",
+   "docs/security.md:1385",
+   "docs/security.ru.md:1350",
    "tests/litellm_hook/test_acceptance_matrix.py:153"
   ],
   "tests/litellm_hook/test_proxy_dispatch.py::test_migrated_pipeline_skip_egresses_originals": [
-   "docs/security.md:1368",
+   "docs/security.md:1380",
    "tests/litellm_hook/test_acceptance_matrix.py:115"
   ],
   "tests/litellm_hook/test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies": [
-   "docs/security.md:1368",
-   "docs/security.ru.md:1332",
+   "docs/security.md:1380",
+   "docs/security.ru.md:1345",
    "tests/litellm_hook/test_acceptance_matrix.py:114"
   ],
   "tests/route_gate/test_arm_checks.py::test_a_logger_at_debug_is_refused": [
-   "docs/security.md:1366",
-   "docs/security.ru.md:1330",
+   "docs/security.md:1378",
+   "docs/security.ru.md:1343",
    "tests/litellm_hook/test_acceptance_matrix.py:98"
   ],
   "tests/route_gate/test_arm_checks.py::test_an_unsafe_flag_is_refused": [
-   "docs/security.md:1365",
-   "docs/security.ru.md:1329",
+   "docs/security.md:1377",
+   "docs/security.ru.md:1342",
    "tests/litellm_hook/test_acceptance_matrix.py:90"
   ],
   "tests/route_gate/test_arm_checks.py::test_apply_guardrail_anywhere_in_the_mro_is_refused": [
-   "docs/security.md:1361",
+   "docs/security.md:1373",
    "tests/litellm_hook/test_acceptance_matrix.py:68"
   ],
   "tests/route_gate/test_arm_checks.py::test_no_guardrail_of_ours_is_absent": [
-   "docs/security.md:1360",
-   "docs/security.ru.md:1324",
+   "docs/security.md:1372",
+   "docs/security.ru.md:1337",
    "tests/litellm_hook/test_acceptance_matrix.py:63"
   ],
   "tests/route_gate/test_arm_checks.py::test_set_verbose_is_refused": [
@@ -256,12 +256,12 @@
    "tests/litellm_hook/test_acceptance_matrix.py:131"
   ],
   "tests/route_gate/test_body_policies.py::test_a_body_that_is_not_utf8_is_refused_before_litellm_or_a_slot": [
-   "docs/security.md:951",
-   "docs/security.ru.md:917"
+   "docs/security.md:962",
+   "docs/security.ru.md:929"
   ],
   "tests/route_gate/test_body_policies.py::test_a_charset_other_than_utf8_is_refused_before_litellm_or_a_slot": [
-   "docs/security.md:951",
-   "docs/security.ru.md:917"
+   "docs/security.md:962",
+   "docs/security.ru.md:929"
   ],
   "tests/route_gate/test_body_policies.py::test_a_key_split_across_body_chunks_is_seen": [
    "tests/litellm_hook/test_acceptance_matrix.py:130"
@@ -273,22 +273,22 @@
    "tests/litellm_hook/test_acceptance_matrix.py:129"
   ],
   "tests/route_gate/test_body_policies.py::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate": [
-   "docs/security.md:951",
-   "docs/security.md:1370",
-   "docs/security.ru.md:917",
-   "docs/security.ru.md:1334"
+   "docs/security.md:962",
+   "docs/security.md:1382",
+   "docs/security.ru.md:929",
+   "docs/security.ru.md:1347"
   ],
   "tests/route_gate/test_body_policies.py::test_two_content_types_are_not_json": [
    "tests/litellm_hook/test_acceptance_matrix.py:229"
   ],
   "tests/route_gate/test_desanitize_middleware.py::test_after_start_failure_tears_the_upstream_down": [
-   "docs/security.md:1409"
+   "docs/security.md:1421"
   ],
   "tests/route_gate/test_desanitize_middleware.py::test_cancellation_resistant_requests_leave_nothing_behind": [
-   "docs/security.md:1402"
+   "docs/security.md:1414"
   ],
   "tests/route_gate/test_desanitize_middleware.py::test_restoration_does_not_depend_on_cache_b": [
-   "docs/security.md:1403"
+   "docs/security.md:1415"
   ],
   "tests/route_gate/test_litellm_route_guard.py::test_every_collected_route_is_listed": [
    "tests/litellm_hook/test_acceptance_matrix.py:224"
@@ -300,15 +300,15 @@
    "tests/litellm_hook/test_acceptance_matrix.py:223"
   ],
   "tests/route_gate/test_table.py::test_the_bypass_routes_are_refused": [
-   "docs/security.md:1363",
-   "docs/security.ru.md:1327",
+   "docs/security.md:1375",
+   "docs/security.ru.md:1340",
    "tests/litellm_hook/test_acceptance_matrix.py:80"
   ],
   "tests/route_gate/test_table.py::test_the_management_routes_are_refused": [
    "tests/litellm_hook/test_acceptance_matrix.py:118"
   ],
   "tests/sanitizer/test_streaming_chat_sse.py::test_interleaved_tool_call_fragments_degrade_to_placeholders_never_originals": [
-   "docs/security.md:1442"
+   "docs/security.md:1454"
   ],
   "tests/test_asgi_entrypoint.py::test_a_bypass_route_is_refused_on_the_real_app": [
    "tests/litellm_hook/test_acceptance_matrix.py:81"
@@ -320,11 +320,11 @@
    "tests/litellm_hook/test_acceptance_matrix.py:62"
   ],
   "tests/test_asgi_entrypoint.py::test_litellm_debug_exits_70_and_config_check_reports_it": [
-   "docs/security.md:1366",
+   "docs/security.md:1378",
    "tests/litellm_hook/test_acceptance_matrix.py:100"
   ],
   "tests/test_asgi_entrypoint.py::test_the_process_exits_70_when_the_guardrail_is_not_registered": [
-   "docs/security.md:1360",
+   "docs/security.md:1372",
    "tests/litellm_hook/test_acceptance_matrix.py:61"
   ],
   "tests/test_asgi_entrypoint.py::test_the_test_only_key_exits_78_in_prod_before_litellm_is_imported": [
@@ -340,7 +340,7 @@
    "tests/litellm_hook/test_acceptance_matrix.py:218"
   ],
   "tests/test_desanitize_served_stack.py::test_a_body_naming_policies_is_refused_at_the_gate": [
-   "docs/security.md:1370",
+   "docs/security.md:1382",
    "tests/litellm_hook/test_acceptance_matrix.py:132"
   ],
   "tests/test_desanitize_served_stack.py::test_a_db_added_callback_sees_placeholders_only": [
@@ -362,15 +362,15 @@
    "tests/litellm_hook/test_acceptance_matrix.py:144"
   ],
   "tests/test_desanitize_served_stack.py::test_exactly_one_terminal_record_with_todays_fields": [
-   "docs/security.md:1488",
+   "docs/security.md:1500",
    "tests/litellm_hook/test_acceptance_matrix.py:212"
   ],
   "tests/test_desanitize_served_stack.py::test_litellms_debug_output_after_the_pre_call_holds_no_original": [
    "tests/litellm_hook/test_acceptance_matrix.py:104"
   ],
   "tests/test_desanitize_served_stack.py::test_no_litellm_capture_holds_an_original": [
-   "docs/security.md:1355",
-   "docs/security.md:1364",
+   "docs/security.md:1367",
+   "docs/security.md:1376",
    "tests/litellm_hook/test_acceptance_matrix.py:44"
   ],
   "tests/test_desanitize_served_stack.py::test_no_logging_surface_holds_the_corp_token": [
@@ -380,7 +380,7 @@
    "tests/litellm_hook/test_acceptance_matrix.py:142"
   ],
   "tests/test_desanitize_served_stack.py::test_the_openai_sdk_chat_stream_gets_the_original": [
-   "docs/security.md:1420",
+   "docs/security.md:1432",
    "tests/litellm_hook/test_acceptance_matrix.py:211"
   ],
   "tests/test_desanitize_served_stack.py::test_the_provider_gets_placeholders_and_the_client_its_originals": [
@@ -396,39 +396,40 @@
    "tests/litellm_hook/test_acceptance_matrix.py:102"
   ],
   "tests/test_litellm_config_guards.py::test_compose_litellm_config_loads_no_policies_from_the_db": [
-   "docs/security.md:1369",
+   "docs/security.md:1381",
    "tests/litellm_hook/test_acceptance_matrix.py:122"
   ],
   "tests/test_litellm_config_guards.py::test_compose_litellm_config_logs_no_request_content": [
    "tests/litellm_hook/test_acceptance_matrix.py:179"
   ],
   "tests/test_litellm_config_guards.py::test_compose_litellm_config_starts_no_litellm_guardrail": [
-   "docs/security.md:1359",
+   "docs/security.md:1371",
    "tests/litellm_hook/test_acceptance_matrix.py:57"
   ],
   "tests/test_litellm_config_guards.py::test_compose_litellm_has_no_database_to_read_a_config_table_from": [
+   "docs/security.md:1604",
    "tests/litellm_hook/test_acceptance_matrix.py:137"
   ],
   "tests/test_litellm_config_guards.py::test_helm_gateway_env_turns_no_litellm_debug_on": [
    "tests/litellm_hook/test_acceptance_matrix.py:103"
   ],
   "tests/test_litellm_config_guards.py::test_helm_litellm_config_loads_no_policies_from_the_db": [
-   "docs/security.md:1369",
+   "docs/security.md:1381",
    "tests/litellm_hook/test_acceptance_matrix.py:123"
   ],
   "tests/test_litellm_config_guards.py::test_helm_litellm_config_logs_no_request_content": [
    "tests/litellm_hook/test_acceptance_matrix.py:180"
   ],
   "tests/test_litellm_config_guards.py::test_helm_litellm_config_starts_no_litellm_guardrail": [
-   "docs/security.md:1359",
+   "docs/security.md:1371",
    "tests/litellm_hook/test_acceptance_matrix.py:58"
   ],
   "tests/test_litellm_config_guards.py::test_helm_litellm_has_no_database_to_read_a_config_table_from": [
    "tests/litellm_hook/test_acceptance_matrix.py:138"
   ],
   "tests/test_litellm_config_guards.py::test_litellm_reads_the_pin_as_models_only": [
-   "docs/security.md:1369",
-   "docs/security.ru.md:1333",
+   "docs/security.md:1381",
+   "docs/security.ru.md:1346",
    "tests/litellm_hook/test_acceptance_matrix.py:124"
   ],
   "tests/test_litellm_config_guards.py::test_only_litellms_startup_config_load_starts_guardrails": [
@@ -437,7 +438,7 @@
  },
  "paths": {
   "tests/_gates/fingerprint.py": [
-   "docs/ops/upgrade.md:153"
+   "docs/ops/upgrade.md:290"
   ],
   "tests/audit/test_guardrail_information_gate.py": [
    "docs/audit-schema.md:153",
@@ -445,174 +446,177 @@
   ],
   "tests/compose/test_nginx_allowlist_routes.py": [
    "CLAUDE.md:72",
-   "compose/README.md:889",
-   "compose/README.ru.md:910",
+   "compose/README.md:883",
+   "compose/README.ru.md:906",
    "compose/nginx/README.md:20",
-   "docs/security.md:1282",
-   "docs/security.ru.md:1264"
+   "docs/security.md:1294",
+   "docs/security.ru.md:1277"
   ],
   "tests/compose/test_nginx_profile.py": [
    "CLAUDE.md:72",
    "compose/nginx/README.md:19",
    "docs/ops/capacity.md:240",
    "docs/ops/capacity.ru.md:181",
-   "docs/security.md:1202",
-   "docs/security.ru.md:1175"
+   "docs/security.md:1214",
+   "docs/security.ru.md:1188"
   ],
   "tests/compose/test_nginx_runtime.py": [
    "CLAUDE.md:72",
    "compose/nginx/README.md:19"
   ],
+  "tests/compose/test_providers.py": [
+   "docs/ops/configuration.md:191",
+   "docs/security.md:756",
+   "docs/security.ru.md:713"
+  ],
   "tests/integration/test_anthropic_oauth_outbound.py": [
-   "docs/ops/upgrade.md:197",
-   "docs/security.md:728",
-   "docs/security.ru.md:684"
+   "docs/ops/upgrade.md:334",
+   "docs/security.md:734",
+   "docs/security.ru.md:690"
   ],
   "tests/integration/test_route_gate_container.py": [
    "CLAUDE.md:182",
-   "compose/README.md:38",
-   "compose/README.ru.md:39",
    "docs/security.md:484",
-   "docs/security.md:699",
-   "docs/security.md:1139",
+   "docs/security.md:705",
+   "docs/security.md:1152",
    "docs/security.ru.md:461",
-   "docs/security.ru.md:654",
-   "docs/security.ru.md:1112"
+   "docs/security.ru.md:660",
+   "docs/security.ru.md:1126"
   ],
   "tests/invariants/test_issuance_error_codes.py": [
    "docs/security.md:493",
-   "docs/security.md:1029",
+   "docs/security.md:1040",
    "docs/security.ru.md:470",
-   "docs/security.ru.md:999"
+   "docs/security.ru.md:1011"
   ],
   "tests/invariants/test_issuance_no_leak.py": [
    "docs/security.md:493",
-   "docs/security.md:1028",
+   "docs/security.md:1039",
    "docs/security.ru.md:470",
-   "docs/security.ru.md:998"
+   "docs/security.ru.md:1010"
   ],
   "tests/invariants/test_no_originals_leak.py": [
    "CLAUDE.md:278",
    "docs/harness-integration.md:134",
    "docs/harness-integration.ru.md:119",
-   "docs/ops/runbook.md:292",
-   "docs/ops/runbook.ru.md:300",
+   "docs/ops/runbook.md:295",
+   "docs/ops/runbook.ru.md:304",
    "docs/security.md:483",
    "docs/security.md:486",
-   "docs/security.md:631",
-   "docs/security.md:727",
-   "docs/security.md:962",
-   "docs/security.md:1377",
+   "docs/security.md:637",
+   "docs/security.md:733",
+   "docs/security.md:973",
+   "docs/security.md:1389",
    "docs/security.ru.md:460",
    "docs/security.ru.md:463",
-   "docs/security.ru.md:585",
-   "docs/security.ru.md:683",
-   "docs/security.ru.md:928",
+   "docs/security.ru.md:591",
+   "docs/security.ru.md:689",
+   "docs/security.ru.md:940",
    "docs/x-corp-auth.md:154",
    "docs/x-corp-auth.ru.md:151"
   ],
   "tests/litellm_hook/test_acceptance_matrix.py": [
-   "docs/security.md:1329",
-   "docs/security.md:1348",
-   "docs/security.ru.md:1301",
-   "docs/security.ru.md:1314"
+   "docs/security.md:1341",
+   "docs/security.md:1360",
+   "docs/security.ru.md:1314",
+   "docs/security.ru.md:1327"
   ],
   "tests/litellm_hook/test_bearer_is_hashed_before_logging.py": [
    "docs/security.md:534",
-   "docs/security.md:1378",
-   "docs/security.md:1379",
+   "docs/security.md:1390",
+   "docs/security.md:1391",
    "docs/security.ru.md:512",
-   "docs/security.ru.md:1342",
-   "docs/security.ru.md:1343"
+   "docs/security.ru.md:1355",
+   "docs/security.ru.md:1356"
   ],
   "tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py": [
    "docs/security.md:486",
-   "docs/security.md:1377",
+   "docs/security.md:1389",
    "docs/security.ru.md:463",
-   "docs/security.ru.md:1341"
+   "docs/security.ru.md:1354"
   ],
   "tests/litellm_hook/test_fail_open_probes.py": [
-   "docs/security.md:1340",
-   "docs/security.md:1356",
-   "docs/security.md:1358",
-   "docs/security.md:1365",
-   "docs/security.ru.md:1308",
-   "docs/security.ru.md:1320",
-   "docs/security.ru.md:1322"
+   "docs/security.md:1352",
+   "docs/security.md:1368",
+   "docs/security.md:1370",
+   "docs/security.md:1377",
+   "docs/security.ru.md:1321",
+   "docs/security.ru.md:1333",
+   "docs/security.ru.md:1335"
   ],
   "tests/litellm_hook/test_failure_hook_request_data_on_refusal.py": [
-   "docs/security.md:1376",
-   "docs/security.ru.md:1340"
+   "docs/security.md:1388",
+   "docs/security.ru.md:1353"
   ],
   "tests/litellm_hook/test_guardrail_information.py": [
    "docs/audit-schema.md:153",
    "docs/audit-schema.ru.md:157",
-   "docs/security.md:1362",
    "docs/security.md:1374",
-   "docs/security.ru.md:1326",
-   "docs/security.ru.md:1338"
+   "docs/security.md:1386",
+   "docs/security.ru.md:1339",
+   "docs/security.ru.md:1351"
   ],
   "tests/litellm_hook/test_guardrails_only_dispatch.py": [
-   "docs/security.md:1357",
-   "docs/security.ru.md:1321"
+   "docs/security.md:1369",
+   "docs/security.ru.md:1334"
   ],
   "tests/litellm_hook/test_litellm_route_assumptions.py": [
-   "docs/ops/upgrade.md:194",
-   "docs/security.md:687",
-   "docs/security.md:768",
-   "docs/security.ru.md:641",
-   "docs/security.ru.md:725"
+   "docs/ops/upgrade.md:331",
+   "docs/security.md:693",
+   "docs/security.md:778",
+   "docs/security.ru.md:647",
+   "docs/security.ru.md:735"
   ],
   "tests/litellm_hook/test_logging_snapshot_is_content_free.py": [
-   "docs/security.md:1375",
-   "docs/security.ru.md:1339"
+   "docs/security.md:1387",
+   "docs/security.ru.md:1352"
   ],
   "tests/litellm_hook/test_logging_surfaces.py": [
-   "docs/security.md:1355",
-   "docs/security.md:1362",
+   "docs/security.md:1367",
    "docs/security.md:1374",
-   "docs/security.ru.md:1319",
-   "docs/security.ru.md:1338"
+   "docs/security.md:1386",
+   "docs/security.ru.md:1332",
+   "docs/security.ru.md:1351"
   ],
   "tests/litellm_hook/test_pre_call_headers.py": [
    "docs/security.md:484",
-   "docs/security.md:703",
+   "docs/security.md:709",
    "docs/security.ru.md:461",
-   "docs/security.ru.md:658"
+   "docs/security.ru.md:664"
   ],
   "tests/litellm_hook/test_proxy_dispatch.py": [
-   "docs/security.md:1361",
-   "docs/security.md:1364",
-   "docs/security.md:1368",
    "docs/security.md:1373",
-   "docs/security.ru.md:1325",
-   "docs/security.ru.md:1328",
-   "docs/security.ru.md:1332",
-   "docs/security.ru.md:1337"
+   "docs/security.md:1376",
+   "docs/security.md:1380",
+   "docs/security.md:1385",
+   "docs/security.ru.md:1338",
+   "docs/security.ru.md:1341",
+   "docs/security.ru.md:1345",
+   "docs/security.ru.md:1350"
   ],
   "tests/litellm_hook/test_walker_oracle.py": [
-   "docs/security.md:1305",
-   "docs/security.ru.md:1286"
+   "docs/security.md:1317",
+   "docs/security.ru.md:1299"
   ],
   "tests/route_gate/litellm_routes.py": [
    "docs/extending.md:144",
-   "docs/security.md:930",
-   "docs/security.ru.md:896"
+   "docs/security.md:941",
+   "docs/security.ru.md:908"
   ],
   "tests/route_gate/test_arm_checks.py": [
-   "docs/security.md:1360",
-   "docs/security.md:1361",
-   "docs/security.md:1365",
-   "docs/security.md:1366",
-   "docs/security.ru.md:1324",
-   "docs/security.ru.md:1329",
-   "docs/security.ru.md:1330"
+   "docs/security.md:1372",
+   "docs/security.md:1373",
+   "docs/security.md:1377",
+   "docs/security.md:1378",
+   "docs/security.ru.md:1337",
+   "docs/security.ru.md:1342",
+   "docs/security.ru.md:1343"
   ],
   "tests/route_gate/test_body_policies.py": [
-   "docs/security.md:951",
-   "docs/security.md:1370",
-   "docs/security.ru.md:917",
-   "docs/security.ru.md:1334"
+   "docs/security.md:962",
+   "docs/security.md:1382",
+   "docs/security.ru.md:929",
+   "docs/security.ru.md:1347"
   ],
   "tests/route_gate/test_inflight.py": [
    "docs/security.md:494",
@@ -622,52 +626,52 @@
    "docs/extending.md:133",
    "docs/extending.md:153",
    "docs/security.md:492",
-   "docs/security.md:931",
+   "docs/security.md:942",
    "docs/security.ru.md:469",
-   "docs/security.ru.md:897"
+   "docs/security.ru.md:909"
   ],
   "tests/route_gate/test_table.py": [
-   "docs/security.md:1069",
-   "docs/security.md:1363",
-   "docs/security.ru.md:1041",
-   "docs/security.ru.md:1327"
+   "docs/security.md:1080",
+   "docs/security.md:1375",
+   "docs/security.ru.md:1053",
+   "docs/security.ru.md:1340"
   ],
   "tests/route_gate/test_terminal_audit.py": [
-   "docs/security.md:1487"
+   "docs/security.md:1499"
   ],
   "tests/sanitizer/test_engine.py": [
    "CLAUDE.md:187",
    "CLAUDE.md:188"
   ],
   "tests/sanitizer/test_oauth_system_preamble.py": [
-   "docs/security.md:824",
-   "docs/security.ru.md:786"
+   "docs/security.md:834",
+   "docs/security.ru.md:796"
   ],
   "tests/sanitizer/test_streaming_chat_sse.py": [
-   "docs/security.md:1442"
+   "docs/security.md:1454"
   ],
   "tests/storage/test_mapping_store.py": [
-   "CLAUDE.md:346"
+   "CLAUDE.md:351"
   ],
   "tests/test_anthropic_oauth_profile.py": [
-   "docs/ops/configuration.md:181",
-   "docs/security.md:750",
-   "docs/security.ru.md:707"
+   "docs/ops/configuration.md:192",
+   "docs/security.md:757",
+   "docs/security.ru.md:714"
   ],
   "tests/test_asgi_entrypoint.py": [
    "CLAUDE.md:238",
    "docs/extending.md:166",
-   "docs/security.md:1360",
-   "docs/security.md:1366"
+   "docs/security.md:1372",
+   "docs/security.md:1378"
   ],
   "tests/test_ci_workflow.py": [
    "CLAUDE.md:251"
   ],
   "tests/test_desanitize_served_stack.py": [
    "docs/security.md:486",
-   "docs/security.md:1592",
+   "docs/security.md:1605",
    "docs/security.ru.md:463",
-   "docs/security.ru.md:1335"
+   "docs/security.ru.md:1348"
   ],
   "tests/test_inflight_served_stack.py": [
    "docs/security.md:494",
@@ -679,19 +683,19 @@
   "tests/test_litellm_config_guards.py": [
    "docs/extending.md:261",
    "docs/extending.ru.md:218",
-   "docs/security.md:1315",
-   "docs/security.md:1359",
-   "docs/security.md:1369",
+   "docs/security.md:1327",
    "docs/security.md:1371",
-   "docs/security.md:1592",
-   "docs/security.ru.md:1323",
-   "docs/security.ru.md:1333",
-   "docs/security.ru.md:1335"
+   "docs/security.md:1381",
+   "docs/security.md:1383",
+   "docs/security.md:1603",
+   "docs/security.ru.md:1336",
+   "docs/security.ru.md:1346",
+   "docs/security.ru.md:1348"
   ],
   "tests/test_litellm_pin.py": [
    "docs/extending.md:149",
-   "docs/ops/upgrade.md:150",
-   "docs/ops/upgrade.md:188"
+   "docs/ops/upgrade.md:287",
+   "docs/ops/upgrade.md:325"
   ]
  }
 }

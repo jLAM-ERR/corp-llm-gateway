@@ -34,8 +34,8 @@ Three things in `vector.yaml` must not be edited casually:
   for CLAUDE.md invariant #2. Do not paraphrase or restructure them.
 - **`gateway_container_only`** is the container identity boundary. The file
   source reads every container's log on the host; this filter is what limits
-  the pipeline to the `litellm` container, by requiring the docker json-file
-  `attrs` stamp that `compose/docker-compose.yml` produces from that service's
+  the pipeline to the gateway containers, by requiring the docker json-file
+  `attrs` stamp that `compose/docker-compose.yml` produces from each gateway service's
   `com.corp-llm-gateway.audit-source` label plus its
   `logging.options.labels`. The label, the log option and this filter are one
   mechanism in three files — change them together. `audit_only` is a schema
@@ -49,7 +49,7 @@ Three things in `vector.yaml` must not be edited casually:
   loses every record that rotated away while Vector was down. Widening them to
   `…-json.log.*` is worse, not better: it pulls in gzipped rotations Vector
   cannot decompress. The other half of that pair lives in
-  `compose/docker-compose.yml`: the `litellm` service pins `compress: "false"`
+  `compose/docker-compose.yml`: every gateway service pins `compress: "false"`
   in its `logging.options`, because a daemon whose own default is json-file
   *with* `compress=true` would otherwise have that option merged in and every
   rotation would arrive as `.gz` — unreadable here, and silent audit loss. Glob

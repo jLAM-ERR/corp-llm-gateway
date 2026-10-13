@@ -117,9 +117,9 @@ src/corp_llm_gateway/   Python-guardrail (кастомные хуки LiteLLM + 
   tokens/               schema.sql + AuthMiddleware + TokenIssuer + хранилища
   litellm_hook.py       CorpLlmGuardrail — адаптер callback-ов LiteLLM (вкл. OpenAI tool_calls + streaming)
 helm/corp-llm-gateway/  Helm-чарт (образ шлюза + callback guardrail, Secret, HPA/PDB/SA, ServiceMonitor, config-check initContainer, NetworkPolicy, CoreDNS sinkhole)
-compose/                production-развёртывание на одном хосте — data plane (litellm + redis + postgres) +
-                        self-hosted Langfuse v3 + конвейер аудита на Vector; оверлеи docker-compose.oauth.yml
-                        (режим подписки) и docker-compose.build.yml (сборка из исходников)
+compose/                production-развёртывание на одном хосте — по шлюзу на провайдера (anthropic / codex / corp,
+                        выбираются COMPOSE_PROFILES) + redis + postgres + self-hosted Langfuse v3 + конвейер аудита
+                        на Vector; оверлеи docker-compose.issuance.yml и docker-compose.build.yml (сборка из исходников)
 examples/compose/       лёгкий локальный санитизирующий прокси (один контейнер, оракул выключен) — не боевой вариант
 docs/                   architecture + security + audit-schema + ops/* (install/configuration/admin-cli/deployment-modes/deploy-handoff/upgrade/profiles/runbook/capacity) + rbac-matrix + harness-integration + x-corp-auth
 scripts/install.sh      установщик для ноутбука (bash/zsh/fish, macOS/Linux)
@@ -207,54 +207,48 @@ export OPENAI_BASE_URL='http://127.0.0.1:9999/v1'
 
 ## Запуск на сервере (docker compose)
 
-[`compose/`](compose/) — боевой вариант для хостов без Kubernetes. В него входят **data plane** (`litellm` — прокси со встроенным guardrail — плюс `redis` под Cache B и `postgres` под токены/конфиг команд), **self-hosted Langfuse v3** (`langfuse-web`/`-worker`, ClickHouse, MinIO, отдельный Redis) и **конвейер аудита** (`vector`, читает stdout шлюза и доставляет в Langfuse; VRL-гейт NEVER-полей побайтово совпадает с тем, что в Helm-чарте).
+[`compose/`](compose/) — боевой вариант для хостов без Kubernetes. В него входят **data plane** (по шлюзу на провайдера — `gateway-anthropic`, `gateway-codex`, `gateway-corp`, каждый — прокси litellm со встроенным guardrail — плюс `redis` под Cache B и `postgres` под токены/конфиг команд), **self-hosted Langfuse v3** (`langfuse-web`/`-worker`, ClickHouse, MinIO, отдельный Redis) и **конвейер аудита** (`vector`, читает stdout шлюзов и доставляет в Langfuse; VRL-гейт NEVER-полей побайтово совпадает с тем, что в Helm-чарте).
 
-### Сначала — выбрать режим аутентификации
+### Сначала — выбрать провайдеров
 
-Режима два, **взаимоисключающие** — решение принимается до заполнения `.env`. **Режим B — production; режим A — только тестовая поза**: route gate отклоняет management-контур LiteLLM, включая `/key/*`, так что выдать нужный режиму A виртуальный ключ нечем. Стек, каскад детекции и цепочка аудита у них одинаковые; отличается только креденшел, с которым идёт запрос наверх.
+Каждый провайдер — отдельный контейнер шлюза, его включает `COMPOSE_PROFILES` в `.env` сервера (хотя бы один, через запятую). Каскад детекции и цепочка аудита у всех шлюзов одинаковые; разработчики на каждом шлют `X-Corp-Auth`.
 
-| | **Режим A** — корп-API-ключи | **Режим B** — подписка (OAuth) |
-|---|---|---|
-| Запуск | `docker compose up -d` | `-f docker-compose.yml -f docker-compose.oauth.yml` |
-| Креденшел наверх | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` шлюза | OAuth-токен подписки разработчика, пробрасывается без изменений |
-| Разработчик шлёт | `Authorization: Bearer <виртуальный ключ litellm>` | `Authorization: Bearer <sk-ant-oat…>` |
-| Идентичность команды | `X-Corp-Auth: <токен команды>` | так же |
-| `LITELLM_MASTER_KEY` | **обязателен** | **должен отсутствовать** (пустая строка считается заданной — удалять строку целиком) |
-| Обслуживаемые маршруты | `claude-*`, `gpt-*`, `corp-*` | только `claude-*`, и это несущий контроль безопасности, а не упрощение |
-| Отзыв / учёт расходов на человека | нет — `/key/*` и админ-UI отклоняются | нет |
-| Статус | **только тестовая поза** | **production** |
+| Профиль | Что обслуживает | Креденшел наверх | Порт на `127.0.0.1` |
+|---|---|---|---|
+| `anthropic` | Claude Code на подписке Anthropic (`claude-*`) | собственный токен `sk-ant-oat…` разработчика | 4000 |
+| `codex` | Codex на подписке ChatGPT | собственный токен ChatGPT разработчика | 4001 |
+| `corp` | корп-vLLM (`corp-*`) | `CORP_LLM_AUTH_TOKEN` маршрута; моста нет | 4002 |
 
-Полная матрица, все режимы отказа и почему режимы не сосуществуют: [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md) · EN: [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md).
+Режим A (мастер-ключ и виртуальные ключи litellm) и собственная база данных litellm удалены в 1.1.0; любой `LITELLM_MASTER_KEY` не даёт стартовать. Без провайдера `profile-guard` останавливает `up` сообщением с именем `COMPOSE_PROFILES`. Подробности и почему у каждого провайдера свой контейнер и один маршрут: [`docs/ops/deployment-modes.ru.md`](docs/ops/deployment-modes.ru.md) · EN: [`docs/ops/deployment-modes.md`](docs/ops/deployment-modes.md). Обновление хоста 1.0: [`docs/ops/upgrade.md`](docs/ops/upgrade.md), «1.0 → 1.1.0».
 
 ### Быстрый старт
 
 ```bash
 # день 0, на сервере (поставит docker, если его нет, создаст /opt/corp-llm-gateway
-# и .env с правами 0600, затем выйдет с кодом 1, чтобы вы заполнили .env — так и задумано)
+# и .env с правами 0600, затем выйдет с кодом 1, чтобы вы заполнили .env — так и задумано;
+# задайте там COMPOSE_PROFILES, например COMPOSE_PROFILES=anthropic)
 sudo scripts/deploy/bootstrap-server.sh
 
 # положить схему хранилища токенов — init-скрипты postgres отрабатывают только на пустом томе
 cp src/corp_llm_gateway/tokens/schema.sql compose/postgres/initdb/01-schema.sql
 
-cd compose && docker compose up -d          # режим A
+cd compose && docker compose up -d
 docker compose ps                           # healthy через ~30-60 с; langfuse на чистом томе ~2 мин
-curl -fsS http://127.0.0.1:4000/health/liveliness
+curl -fsS http://127.0.0.1:4000/healthz/live   # gateway-anthropic; 4001 codex, 4002 corp
 ```
 
-Пропустить шаг со схемой — тихая ловушка, а не заметный сбой: все сервисы отчитываются healthy, `/health/liveliness` отвечает, но каждый реальный запрос падает с 500, потому что `corp_tokens` / `team_config` не существуют.
+Пропустить шаг со схемой — тихая ловушка, а не заметный сбой: все сервисы отчитываются healthy, `/healthz/live` отвечает, но каждый реальный запрос падает с 500, потому что `corp_tokens` / `team_config` не существуют.
 
 Секреты без значения по умолчанию (`GATEWAY_IMAGE_TAG`, `POSTGRES_PASSWORD`, инфраструктурные `LANGFUSE_*`, `CORP_LANGFUSE_PUBLIC_KEY` / `CORP_LANGFUSE_SECRET_KEY`) заставляют `docker compose up` отказаться стартовать с указанием переменной, а не подняться наполовину настроенным. Полный прокомментированный шаблон: [`compose/.env.example`](compose/.env.example).
 
 ### Развёртывание с ноутбука оператора
 
 ```bash
-scripts/deploy/deploy.sh --host user@server up               # режим A
-scripts/deploy/deploy.sh --host user@server --mode oauth up  # режим B
+scripts/deploy/deploy.sh --host user@server up               # провайдеры из COMPOSE_PROFILES сервера
+scripts/deploy/deploy.sh --host user@server --issuance up    # плюс выдача токенов разработчикам
 ```
 
-Скрипт подкладывает SQL-схему, синхронизирует `compose/`, делает `pull`, поднимает стек и ждёт healthcheck'ов. Локальный `.env` наверх не уезжает никогда, серверный `.env` не читается, не печатается и не перезаписывается; ключи и сертификаты из синхронизации исключены. Остальные подкоманды: `down` (тома сохраняются, спрашивает подтверждение), `restart`, `logs`, `status`; полезные флаги `--dry-run`, `--yes`, `--dir`, `--force-unlock`. **Тот же `--mode` нужно передавать во все последующие запуски по этому хосту** — `logs`/`status`/`down` резолвят стек через тот же список файлов, и запуск без него покажет (или пересоздаст) другой стек.
-
-Для автозапуска после перезагрузки в режиме B дополнительно раскомментируйте `COMPOSE_FILE=docker-compose.yml:docker-compose.oauth.yml` в `.env`: systemd-юнит выполняет голый `docker compose up -d`, который иначе резолвит только базовый файл.
+Скрипт подкладывает SQL-схему, синхронизирует `compose/`, делает `pull`, поднимает стек и ждёт healthcheck'ов. Локальный `.env` наверх не уезжает никогда, серверный `.env` не читается, не печатается и не перезаписывается; ключи и сертификаты из синхронизации исключены. `up` отказывает стеку без провайдера, удаляет контейнер провайдера, которого `.env` больше не выбирает, и предупреждает, если после перезагрузки стек поднимется иначе. Остальные подкоманды: `down` (тома сохраняются, спрашивает подтверждение), `restart`, `logs`, `status`; полезные флаги `--dry-run`, `--yes`, `--dir`, `--force-unlock`. `--mode` больше нет (удалён в 1.1.0). **На хосте с выдачей токенов передавайте `--issuance` во все последующие запуски** — `logs`/`status`/`down` резолвят стек через тот же список файлов, — а для автозапуска после перезагрузки раскомментируйте в его `.env` `COMPOSE_FILE=docker-compose.yml:docker-compose.issuance.yml`.
 
 ### Две опциональные сетевые зависимости
 
@@ -275,12 +269,12 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 ### Что знать до ввода в эксплуатацию
 
-- **HTTPS до стека — только через фронт.** `127.0.0.1:4000` — plain HTTP на loopback. Для разработчиков в сети включите опциональный фронт на nginx строкой `COMPOSE_PROFILES=nginx` (или `nginx-ports` без DNS) в `.env` сервера: только HTTPS, `NGINX_TLS_MODE` `terminate` (сертификат у nginx) или `behind-proxy` (TLS терминирует ваш балансировщик), и allow-list по точным путям — LLM-маршруты, `/v1/models`, `/healthz/live` и `POST /internal/issue-token`; всё остальное — 404. Без фронта разработчики ходят через SSH-туннель. Справочник: [`compose/README.ru.md`](compose/README.ru.md), «HTTPS-фронт (nginx)».
-- **management-эндпоинты litellm отклоняются, в обоих режимах** (`/key/*`, `/model/*`, `/user/*`, `/policies*`, `/guardrails*`, UI) — без мастер-ключа litellm принимает любого как internal user, поэтому route gate отвечает на них `403 E_ROUTE_BLOCKED` раньше, чем запрос увидит litellm, на любом пути внутрь. LLM-маршруты закрывает проверка `X-Corp-Auth` в guardrail.
+- **HTTPS до стека — только через фронт.** Порты шлюзов (`127.0.0.1:4000`-`4002`) — plain HTTP на loopback. Для разработчиков в сети добавьте опциональный фронт на nginx в ту же строку, `COMPOSE_PROFILES=anthropic,nginx` (или `nginx-ports` без DNS), в `.env` сервера. Он проксирует на один шлюз, `NGINX_GATEWAY_UPSTREAM` (по умолчанию `gateway-anthropic`): только HTTPS, `NGINX_TLS_MODE` `terminate` (сертификат у nginx) или `behind-proxy` (TLS терминирует ваш балансировщик), и allow-list по точным путям — LLM-маршруты, `/v1/models`, `/healthz/live` и `POST /internal/issue-token`; всё остальное — 404. Без фронта разработчики ходят через SSH-туннель. Справочник: [`compose/README.ru.md`](compose/README.ru.md), «HTTPS-фронт (nginx)».
+- **management-эндпоинты litellm отклоняются, на любом провайдере** (`/key/*`, `/model/*`, `/user/*`, `/policies*`, `/guardrails*`, UI) — без мастер-ключа litellm принимает любого как internal user, поэтому route gate отвечает на них `403 E_ROUTE_BLOCKED` раньше, чем запрос увидит litellm, на любом пути внутрь. LLM-маршруты закрывает проверка `X-Corp-Auth` в guardrail.
 - **Никакого недоверенного `docker run` на этом хосте.** Vector отбирает записи аудита по публичной метке контейнера, поэтому любой, кто может запускать там контейнеры, может подделать записи аудита. Это требование модели развёртывания, а не рекомендация.
 - **Аудит буферизуется, но не fail-closed** — осознанное отступление от значения `vectorBufferFull` по умолчанию из [`docs/security.ru.md`](docs/security.ru.md) §8. Остановка доставки аудита не останавливает egress; реальная граница долговечности — ротация логов docker'а, а не дисковый буфер Vector.
 
-**Полный справочник по стеку** (маршрутизация, виртуальные ключи, почему здесь нет BYOK, Langfuse, конвейер аудита, TLS до корп-vLLM, процедуры восстановления): [`compose/README.ru.md`](compose/README.ru.md) · EN: [`compose/README.md`](compose/README.md). **Пошаговая инструкция** для того, кто разворачивает: [`docs/ops/deploy-handoff.ru.md`](docs/ops/deploy-handoff.ru.md) · EN: [`docs/ops/deploy-handoff.md`](docs/ops/deploy-handoff.md).
+**Полный справочник по стеку** (провайдеры, маршрутизация, почему здесь нет BYOK, Langfuse, конвейер аудита, TLS до корп-vLLM, процедуры восстановления): [`compose/README.ru.md`](compose/README.ru.md) · EN: [`compose/README.md`](compose/README.md). **Пошаговая инструкция** для того, кто разворачивает: [`docs/ops/deploy-handoff.ru.md`](docs/ops/deploy-handoff.ru.md) · EN: [`docs/ops/deploy-handoff.md`](docs/ops/deploy-handoff.md).
 
 ## Запуск локально (docker compose)
 

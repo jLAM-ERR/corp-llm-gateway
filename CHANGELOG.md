@@ -39,6 +39,92 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from and are still forwarded as sent. Unknown request-body fields are not sanitized: an
   accepted risk, documented in `docs/security.md` §2.
 
+### Security — the litellm master key is refused; litellm has no database
+
+- **Any `LITELLM_MASTER_KEY` refuses to boot**, with or without a subscription
+  bridge, a blank value included. `build_guardrail()` stops the startup (the
+  served entrypoint exits 3) with a line starting `LITELLM_MASTER_KEY is set`,
+  and `gateway-admin config check` reports it. 1.0.0 refused it only while a
+  bridge was on. `MASTER_KEY_VS_FORWARD_AUTH_MESSAGE` is renamed
+  `MASTER_KEY_REFUSED_MESSAGE`.
+- **A master key in litellm's own config is refused too:**
+  `general_settings.master_key` and `environment_variables.LITELLM_MASTER_KEY`,
+  whatever the value (an `os.environ/` reference included), exit 78 at serve time
+  and are a `config check` problem; the value is never echoed. litellm takes the
+  first ahead of the environment and exports the second at startup, so in 1.0.0
+  virtual-key auth could boot from the YAML.
+- **litellm has no database on the compose stack** (`docs/security.md` §14,
+  hazard 14c, now closed in the shipped setups; Helm never gave it one). No
+  `DATABASE_URL`, no `STORE_MODEL_IN_DB`, so litellm never re-reads its
+  `LiteLLM_Config` table, whose rows could add log callbacks or turn on prompts
+  in spend logs. The risk returns only if an operator adds `DATABASE_URL`.
+
+### Changed — compose: one gateway per provider (breaking)
+
+- **The `litellm` service is replaced by `gateway-anthropic`, `gateway-codex`
+  and `gateway-corp`**, each switched on by its compose profile and built from
+  one shared definition. Each has its own litellm config, bridge flag and
+  loopback port: `GATEWAY_ANTHROPIC_PORT` (4000), `GATEWAY_CODEX_PORT` (4001),
+  `GATEWAY_CORP_PORT` (4002), replacing `GATEWAY_PORT`. One container per
+  provider because the two subscription bridges cannot share a process. All
+  three share the `gateway` database, so a corp token works on each.
+- **Per-provider litellm configs**, each with one route: `config.anthropic.yaml`
+  (renamed from `config.oauth.yaml`; `claude-*` → `anthropic/`),
+  `config.codex.yaml` (new; `"*"` → `openai/` at the literal
+  `https://chatgpt.com/backend-api/codex`, so no environment value can send the
+  developer's ChatGPT token elsewhere), `config.corp.yaml` (new; `corp-*` →
+  `hosted_vllm/`). The production compose stack now serves Codex.
+- **`COMPOSE_PROFILES` in the server's `.env` is the only switch** for the
+  providers (`anthropic`, `codex`, `corp`) and the front door; `--profile` on
+  the command line is not supported. `.env.example` ships it commented.
+- **`profile-guard`**: a one-shot on the gateway image that `postgres` waits
+  for. When `COMPOSE_PROFILES` holds no exact provider token (trimmed like
+  compose trims it; `corporate` is not `corp`) it names the key and exits 64,
+  so `up` fails instead of starting a stack that serves nothing.
+- **The nginx front door proxies to one gateway, `NGINX_GATEWAY_UPSTREAM`**
+  (default `gateway-anthropic`). Its entrypoint exits 64 on any other name or on
+  a gateway whose provider is off. The other providers stay on their loopback
+  ports. `vector` and `nginx` depend on the gateways with `required: false`.
+- **The issuance and build overlays target all three gateways**; the build
+  overlay builds the image once, whatever providers are on.
+- **`deploy.sh up`** refuses a stack whose `config --services` holds no
+  `gateway-*`; removes the container of a gateway or front door the `.env` no
+  longer selects; runs `up -d --remove-orphans`, which removes 1.0's `litellm`
+  container and frees `127.0.0.1:4000`. `down` also removes leftover gateway
+  containers. After the sync, `up` runs the boot-time unit's bare
+  `docker compose config`: it refuses when that cannot resolve the stack (a 1.0
+  `COMPOSE_FILE` naming `docker-compose.oauth.yml`) and warns when a reboot
+  would start other gateways or front doors, or the same ones with another
+  configuration (`config --hash`, hashes only). A refusal after the sync says
+  `compose/` was synced and nothing was pulled, started or removed. The script
+  still never reads the server's `.env`.
+- **Upgrade steps:** `docs/ops/upgrade.md`, "1.0 → 1.1.0". Edit the server's
+  `.env` before the first 1.1 `deploy.sh up`.
+
+### Removed
+
+- **Mode A** (litellm's master key and virtual keys): `LITELLM_MASTER_KEY`,
+  `UI_USERNAME`, `UI_PASSWORD`, the gateway-held `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` and the compose entrypoint's Mode-A guard. It was a test
+  posture only since 1.0.0.
+- **litellm's own database on compose:** `DATABASE_URL`, `STORE_MODEL_IN_DB`
+  and `postgres/initdb/00-create-litellm-db.sh`. A `litellm` database in an
+  existing volume is inert; `docs/ops/upgrade.md` shows how to drop it.
+- **`compose/docker-compose.oauth.yml`** (its Anthropic bridge is the base
+  file's `anthropic` provider) and **`compose/litellm/config.yaml`** (the
+  API-key routes).
+- **`deploy.sh --mode`**: any value is refused before the script touches the
+  server, naming 1.1.0. `--issuance` is unchanged.
+
+### Known limitations
+
+- **One gateway behind the front door.** nginx serves only the
+  `NGINX_GATEWAY_UPSTREAM` gateway; the other providers are reached on their
+  loopback ports or over an SSH tunnel.
+- **`_corp_gateway_request_id` also reaches the corp vLLM's request body** on
+  the `corp` provider, as it does Anthropic's on `/v1/chat/completions`
+  (`docs/security.md` §11 (e)). It is a request id, never content.
+
 ### Added — `gateway-admin` bootstrap for a fixed team token
 
 - **`token issue --value VALUE`** stores a value you choose instead of a random `ct_…` token
