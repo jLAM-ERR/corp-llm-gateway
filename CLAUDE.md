@@ -79,8 +79,8 @@ compose/                 production compose stack for non-k8s hosts: one gateway
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
 tests/                   pytest, pytest-asyncio mode=auto; one directory per component or layer (table: docs/testing/README.md);
-                         <TBD Task 6> passed / <TBD Task 6> skipped in the minimal env (.venv-test-minimal),
-                         <TBD Task 6> / <TBD Task 6> in the full one (.venv-test-full: every extra, litellm, Postgres,
+                         4,352 passed / 432 skipped in the minimal env (.venv-test-minimal),
+                         5,575 / 17 in the full one (.venv-test-full: every extra, litellm, Postgres,
                          CI=true), both from scripts/test-env.sh; logic tests only (docs/testing/README.md)
 ```
 
@@ -166,19 +166,19 @@ Two caches:
 # (scripts/test-gates.sh full) and never minimal: minimal is a local check. Run it
 # before changing optional-extra imports, lazy-import / graceful-degradation code, or the
 # laptop CLI / proxy install.
-scripts/test-env.sh minimal && scripts/test-gates.sh minimal   # <TBD Task 6> passed / <TBD Task 6> skipped
+scripts/test-env.sh minimal && scripts/test-gates.sh minimal   # 4,352 passed / 432 skipped, ~9 min
 docker run --rm -d --name pg-test -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=gateway \
   -e POSTGRES_DB=gateway -p 55432:5432 postgres:16
 scripts/test-env.sh full && CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
-  scripts/test-gates.sh full                                    # <TBD Task 6> passed / <TBD Task 6> skipped
+  scripts/test-gates.sh full                                    # 5,575 passed / 17 skipped, ~20 min
 
 # Run the full environment before every commit; minimal too when the cases above apply.
 
 # Local loop without the tests tests/slow_tests.txt lists (CI runs everything):
-CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"  # <TBD Task 6> min
+CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"  # ~7 min
 CI=true CORP_REQUIRE_PROXY_CAPTURE=1 NO_PROXY=127.0.0.1,localhost \
   CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
-  PYTHONPATH=src .venv-test-full/bin/python -m pytest tests/ -q -m "not slow"                  # <TBD Task 6> min
+  PYTHONPATH=src .venv-test-full/bin/python -m pytest tests/ -q -m "not slow"                  # ~14 min
 
 # The older local venvs still work: .venv (Python 3.14, no extras, no litellm) and
 # .venv-bench (every extra + litellm 1.101.0). NO_PROXY: on a machine with a system HTTP
