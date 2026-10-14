@@ -4,7 +4,7 @@ Two things only the shipped image can show:
 
 * **its route table** — litellm's app as the image imports it, with every lazy
   feature warmed (``nginx_route_dump.py``), checked against the allow-list by the
-  same two properties the ``ast`` guard checks (``tests/compose/nginx_allowlist.py``);
+  two properties in ``tests/compose/nginx_allowlist.py``;
 * **the guardrail runs behind nginx** — a canary sent through nginx to the gateway
   container arrives at the stub provider as a placeholder, with an audit record,
   on every admitted ``POST``; and ``POST /internal/issue-token`` terminates in the

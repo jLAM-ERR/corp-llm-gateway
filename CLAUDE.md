@@ -38,8 +38,8 @@ src/corp_llm_gateway/
   payload/      size threshold + gzip + per-team quota + oversize policy (fail-closed default)
   profiles/     plugin bundles — ProfileBundle/PolicyKnobs(merge) + loaders/resolver + DETECTOR_REGISTRY + manifest (hash-integrity) + defaults/
   providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
-  route_gate/   default-deny gate: table.py (hand-classified against litellm's source, guarded by the
-                collector test) + classify.py + middleware.py (also refuses a rewritten-route body that is not
+  route_gate/   default-deny gate: table.py (hand-classified against litellm's source, re-checked by
+                hand per litellm bump: docs/ops/upgrade.md) + classify.py + middleware.py (also refuses a rewritten-route body that is not
                 UTF-8 JSON (415) or has a top-level `policies` key (403)); litellm's admin/auth/spend/public/UI/non-probe
                 health surfaces are REFUSE (litellm rows 26 PASSTHROUGH / 879 REFUSE / 8 REWRITTEN + 6 gateway rows)
                 + inflight.py: the gateway-owned in-flight cap (CORP_LLM_MAX_INFLIGHT), single owner of `receive`,
@@ -175,10 +175,10 @@ scripts/test-env.sh full && CORP_TEST_PG_DSN=postgresql://gateway:gateway@localh
 # Run the full environment before every commit; minimal too when the cases above apply.
 
 # Local loop without the tests tests/slow_tests.txt lists (CI runs everything):
-CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"  # ~5.5 min
+CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"  # <TBD Task 6> min
 CI=true CORP_REQUIRE_PROXY_CAPTURE=1 NO_PROXY=127.0.0.1,localhost \
   CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
-  PYTHONPATH=src .venv-test-full/bin/python -m pytest tests/ -q -m "not slow"                  # ~10.5 min
+  PYTHONPATH=src .venv-test-full/bin/python -m pytest tests/ -q -m "not slow"                  # <TBD Task 6> min
 
 # The older local venvs still work: .venv (Python 3.14, no extras, no litellm) and
 # .venv-bench (every extra + litellm 1.101.0). NO_PROXY: on a machine with a system HTTP

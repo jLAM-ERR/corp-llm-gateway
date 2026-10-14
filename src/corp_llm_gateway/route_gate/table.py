@@ -7,7 +7,7 @@ adds in a future bump cannot reach a provider until someone classifies it.
 ``LITELLM_ROUTE_TABLE`` / ``LITELLM_REGEX_TABLE`` describe routes litellm
 registers; ``GATEWAY_ROUTE_TABLE`` describes the routes the gateway itself
 serves (``/healthz/*``, ``/metrics``, ``POST /internal/issue-token``) and is exempt
-from the source guard.
+from the litellm source check (``docs/ops/upgrade.md``, "Bumping litellm", step 2).
 
 The litellm tables are generated from litellm 1.101.0's own source with an
 ``ast`` route collector (``docs/ops/upgrade.md``, "Bumping litellm", step 2) and
@@ -63,9 +63,9 @@ class Verdict(Enum):
 
 @dataclass(frozen=True)
 class Entry:
-    """One classified route. ``why`` is printed by ``config check --routes`` and
-    by guard failures; ``justification`` is the written no-egress reason a
-    body-carrying PASSTHROUGH route must give."""
+    """One classified route. ``why`` is printed by ``config check --routes``;
+    ``justification`` is the written no-egress reason a body-carrying PASSTHROUGH
+    route must give."""
 
     verdict: Verdict
     why: str
@@ -117,8 +117,9 @@ def _regex(method: str, template: str, entry: Entry) -> RegexEntry:
 
 
 def template_matcher(template: str) -> re.Pattern[str]:
-    """Anchored matcher for a FastAPI path template. Public so the litellm guard
-    can ask whether one registered template also matches another's path."""
+    """Anchored matcher for a FastAPI path template. Public so the route check
+    of ``docs/ops/upgrade.md`` (step 2) can ask whether one registered template also
+    matches another's path."""
     return _anchored(_pattern(template))
 
 
@@ -209,8 +210,9 @@ _WHY_HEALTH_DRAIN_OFF = (
 _WHY_HEALTH_OPS_OFF = "litellm operator diagnostics, not a probe; see docs/security.md §14"
 
 # Rule (c): every PASSTHROUGH route that carries a body says here why it cannot
-# put user text on the wire. The guard re-checks each one against the handler's
-# own `ast` — a written excuse never overrides a provider call it can see.
+# put user text on the wire. Step 2 of the litellm checklist in docs/ops/upgrade.md
+# re-checks each one against the handler's own `ast` — a written excuse never
+# overrides a provider call it can see.
 _JUST_STORED_RESPONSE = "cancels a stored response by id; no request body reaches a provider"
 
 LITELLM_ROUTE_TABLE: dict[tuple[str, str], Entry] = {

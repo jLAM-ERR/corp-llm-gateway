@@ -31,7 +31,7 @@ def test_the_gateway_table_admits_every_pair_nginx_admits(method: str, path: str
         # Terminates in the HealthRouter; issuance refuses any body itself.
         assert entry.verdict is Verdict.PASSTHROUGH, (method, path, entry)
     elif method in BODY_METHODS:
-        # table.py rule 1, pinned against litellm's source by the route guard.
+        # table.py rule 1, checked against litellm's source by docs/ops/upgrade.md step 2.
         assert entry.verdict is Verdict.REWRITTEN, (method, path, entry)
     else:
         assert entry.verdict is Verdict.PASSTHROUGH, (method, path, entry)

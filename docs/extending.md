@@ -165,8 +165,8 @@ The loop:
 5. Re-run the guard, then the rest of the checklist and both test environments.
 
 `GATEWAY_ROUTE_TABLE` (the gateway's own `/healthz/*` and `/metrics`) is
-hand-written and exempt from the source guard — it describes routes litellm does
-not register.
+hand-written and exempt from the step-2 route guard — it describes routes litellm
+does not register.
 
 ## Add a provider (style 2)
 
