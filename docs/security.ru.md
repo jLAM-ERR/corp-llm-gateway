@@ -466,7 +466,7 @@ NEVER-гейт и `audit_only` и попадёт в Langfuse как настоя
 | — | **Per-request биекция плейсхолдеров** (один оригинал → один токен; разные оригиналы → разные токены) | `placeholder_allocator.py` |
 | — | **Depth-guard fail-closed** (`_MAX_JSON_DEPTH=64` → `400 E_BAD_REQUEST` при санитизации) | `content_blocks.py`, `litellm_hook.py` |
 | — | **NEVER-гейт, внутрипроцессный + Vector** (эшелонированная защита) | `audit/invariants.py` + Vector VRL |
-| 7 | **Route gate по умолчанию запрещает**: ни один запрос не доходит до провайдера, если таблица не говорит, что хук переписывает его тело, и шлюз вообще не обслуживает запросы, пока этот хук не зарегистрирован. Неклассифицированная пара `(method, path)` отклоняется; невзведённый гейт отклоняет каждый переписываемый маршрут; старт завершается, а не работает в полусконфигурированном виде (§14) | `route_gate/table.py` + `tests/route_gate/test_litellm_route_guard.py` + `asgi.py` (exit 78 / 70) |
+| 7 | **Route gate по умолчанию запрещает**: ни один запрос не доходит до провайдера, если таблица не говорит, что хук переписывает его тело, и шлюз вообще не обслуживает запросы, пока этот хук не зарегистрирован. Неклассифицированная пара `(method, path)` отклоняется; невзведённый гейт отклоняет каждый переписываемый маршрут; старт завершается, а не работает в полусконфигурированном виде (§14) | `route_gate/table.py` + `tests/route_gate/` + `asgi.py` (exit 78 / 70); при обновлении litellm — ручной чек-лист в `ops/upgrade.md` (§11 (m)) |
 | 7a | **Поверхность выдачи токенов завершается в шлюзе и ограничена**: `POST /internal/issue-token` никогда не доходит до litellm; bearer только из заголовка, без тела, свой лимит одновременных запросов и частоты, выпуск по субъекту под advisory lock, одна граница на хранилище; тела ошибок и логи несут только коды (§14) | `route_gate/table.py` (`GATEWAY_ROUTE_TABLE`) + `healthz/server.py` + `tests/invariants/test_issuance_no_leak.py` + `tests/invariants/test_issuance_error_codes.py` |
 | 7b | **Отказы лимитера никогда не разбирают, не возвращают и не логируют тело, и слот не занимается, пока тело не пришло целиком**: `E_CAPACITY` (429), `E_BODY_TIMEOUT` (408), `oversize:blocked` (422) отвечают раньше аутентификации, litellm и санитайзера; задача, которую ждут несколько запросов, запускается через `inflight.spawn_shared` и не отменяется при отключении одного запроса; лимит — не авторизация (§14) | `route_gate/inflight.py` + `tests/route_gate/test_inflight.py` + `tests/test_inflight_served_stack.py` |
 
@@ -511,9 +511,20 @@ NEVER-поле достигло конвейера, и это первое, за
 | (i) | **Предварительный подсчёт токенов недоступен — принято, это не пробел для закрытия здесь.** `POST /v1/messages/count_tokens`, `POST /v1/responses/input_tokens` и `POST /utils/token_counter` (отклоняется при любой строке запроса — утекает форма `?call_endpoint=true`, но гейт классифицирует только `(method, path)`) отклоняются на route gate (§14), поэтому клиент не может спросить у шлюза, сколько будет стоить промпт, до отправки. Причины: upstream-счётчик litellm не может передать credential запроса (он использует ключ развёртывания и жёстко заданный публичный URL), а его локальный счётчик использует словарь OpenAI/Claude-2, который недосчитывает токены текущих моделей Claude на 15-35 %. `usage.input_tokens` в каждом реальном ходе — точный счёт после санитизации, а для индикатора контекста Claude Code использует собственную оценку. Адаптер на стороне шлюза, который прогоняет pipeline pre-call и затем вызывает счётчик провайдера с credential самого запроса, — в бэклоге. | **Принято** — на конфиденциальность не влияет; клиентская оценка заменяет точный предварительный счёт |
 | (j) | **Ключ провайдера, переданный мостом, лежит в kwargs логирования litellm в сыром виде. Открыто — доработка.** litellm хранит credential провайдера для каждого вызова в сыром виде в kwargs, которые передаёт success-callback-у логирования. При включённом мосте подписки (§13) этот credential — собственный bearer разработчика (`data["api_key"]`). Замерено на litellm 1.101.0: мост ChatGPT на `/v1/chat/completions` — `api_key` и `litellm_params.api_key`; на `/v1/responses` — нигде в unary, заголовок `Authorization` апстрима в `additional_args` в потоке. Мост Anthropic на `/v1/messages` — заголовок `authorization` апстрима в `httpx_response` (и в `additional_args` в потоке). Без моста в тех же местах лежит ключ развёртывания, так что это поведение litellm, а не копия, которую делает шлюз. Токена НЕТ в `StandardLoggingPayload` и НЕТ в строке spend-log; kwargs видит только callback, зарегистрированный в litellm, поэтому это зависит от конфигурации, как и риски снимка логирования и `X-Corp-Auth` (callback, добавленный через конфиг или БД litellm, §15). Доработка: зачистить копию `litellm_params.api_key` в logging object (и копии заголовков) после моста, если это отдельный словарь от того, что использует вызов провайдера, — разобраться в доработке. Закреплено тестом `tests/litellm_hook/test_bearer_is_hashed_before_logging.py` (точные списки мест). | **Низкая** — зависит от конфигурации: поставляемые конфиги регистрируют только собственный callback шлюза; callback логирования, добавленный оператором, получил бы credential подписки разработчика |
 | (k) | **Газеттир держит в процессе memo недавно встреченных слов.** Чтобы spaCy / pymorphy3 запускались один раз на слово, а не на каждое его вхождение, `rules/gazetteer.py` хранит пары «слово → лемма» для не более чем 65 536 недавно встреченных слов на язык (один memo для RU и один для EN, всего 131 072 слова), каждое длиной до 64 символов (более длинные слова не сохраняются), общие для всех пользователей и команд. TTL нет, memo живёт только в памяти процесса; перезапуск его очищает. Ничто не выводит его в логи, метрики, тела ошибок, трейсы или аудит, так что инвариант 1 (M1-14) соблюдён. Слово, уже лежащее в memo, лемматизируется быстрее, поэтому время ответа — слабый сигнал того, что другой пользователь недавно отправил это же слово; он слабее, чем у Cache A (одно слово, а не целый текст, и он смешан с остальной задержкой запроса). | **Низкая** — принято; только в памяти, процесс не покидает |
+| (l) | **Цель запуска не проверяет ни один тест (инвариант 7).** Шлюз должен запускаться через `python -m corp_llm_gateway.serve`; собственное приложение litellm (`proxy_server:app`) и CLI `litellm` запускают роутеры litellm без гейта перед ними. До 1.1.0 тест читал на это каждый Dockerfile, каждый compose-файл и Helm-чарт. Наборы served-stack и контейнерный по-прежнему доказывают, что наша точка входа пропускает запросы через гейт, но ничто не падает, если отслеживаемый файл запускает что-то другое. **Точка ревью:** каждое изменение `ENTRYPOINT`, `command` / `entrypoint` в compose или `command` / `args` контейнера в Helm. | **Низкая** — принято; только ревью |
+| (m) | **Дрейф при обновлении litellm не ловит ни один тест (инвариант 7).** Ни один тест не падает, если обновление litellm добавляет маршрут, который таблица не классифицирует, заставляет REWRITTEN-маршрут обойти хук, даёт маршруту без хука перехватить REWRITTEN-маршрут, запускает guardrail-ы из нового места или добавляет ключ `save_worker_config`. Default-deny по-прежнему отклоняет неклассифицированный маршрут в рантайме. **Точка ревью:** шаги 2, 4 и 5 ручного чек-листа в [`ops/upgrade.md`](ops/upgrade.md), «Bumping litellm», в каждом PR с обновлением litellm. | **Средняя** — принято; пропущенный шаг ничего не открывает, но может оставить REWRITTEN-маршрут без санитизации |
+| (n) | **Конфигурацию из §15 не читает ни один тест.** Ни один тест не падает, если базовым классом `CorpLlmGuardrail` станет `CustomGuardrail` litellm (hazards 12, 14, 15b), если поставляемый конфиг litellm запустит guardrail litellm (hazard 5) или потеряет `supported_db_objects: ["models"]` (14a), или если Helm-чарт даст litellm БД (14c). `apply_guardrail` на нашем классе по-прежнему не даёт взвестись (exit 70, hazard 7), а правило «у compose нет БД» по-прежнему проверяется. **Точка ревью:** каждое изменение строки класса `CorpLlmGuardrail`, `compose/litellm/*.yaml`, `docker/*/litellm-config.yaml` или configmap и env litellm в Helm. | **Средняя** — принято; только ревью |
+| (o) | **Входы инварианта 3 не проверяет ни один тест.** Pre-call удаляет ключи тела запроса, которые litellm превращает в исходящие заголовки или credential (`_CLIENT_CONTROL_BODY_KEYS`). Ни один тест не падает, если litellm перестаёт читать один из них или начинает передавать в исходящий вызов новый; `test_litellm_route_assumptions.py` по-прежнему закрепляет клиентские ключи credential. **Точка ревью:** шаг 3 чек-листа litellm в [`ops/upgrade.md`](ops/upgrade.md). | **Средняя** — принято; новый ключ, который читает litellm, доходил бы до провайдера, пока список не расширят |
+| (p) | **Зеркало на границе проверяется только в одну сторону.** `tests/compose/test_nginx_allowlist_routes.py` по-прежнему падает, если nginx пропускает маршрут, который отклоняет гейт. Ни один тест не падает, если allow-list nginx перестаёт пропускать маршрут, который пропускает гейт, ставит лимит частоты на непропускаемый location или называет путь, который litellm не регистрирует. Рантайм-набор nginx (`test_nginx_runtime.py`) по-прежнему гоняет границу. **Точка ревью:** каждое изменение `compose/nginx/templates/snippets/gateway-locations.inc.template` и шаг 6 чек-листа litellm. | **Низкая** — принято; решает по-прежнему гейт внутри образа |
+| (q) | **Тест, который начал пропускаться в полном окружении, не роняет CI.** Ledger пропусков, сверявший каждый прогон с ожидаемыми исходами, удалён. Пропуск виден только в сводке `-rs` задания `test` в CI. `CI=true` по-прежнему превращает пропуск Postgres в падение, а `CORP_REQUIRE_PROXY_CAPTURE=1` — пропуск capture-набора. **Точка ревью:** сводка пропусков задания `test`, которую читают, когда PR меняет harness, маркеры или extras. | **Низкая** — принято |
+| (r) | **Форму workflow CI не проверяет ни один тест.** Ни один тест не падает, если задание `test` в CI перестаёт запускать полное окружение, теряет `CI=true` или `CORP_REQUIRE_PROXY_CAPTURE=1` (защиту от пропусков) или меняет версию Python. **Точка ревью:** каждое изменение `.github/workflows/ci.yml`. | **Низкая** — принято; только ревью |
+| (s) | **Согласованность пинов litellm не проверяет ни один тест.** Пины `litellm==` / `LITELLM_VERSION` в `pyproject.toml`, `Dockerfile.gateway`, `build-image.yml`, `scripts/release/gates.sh`, трёх `docker/*/Dockerfile` и `scripts/test-env.full.txt` могут разойтись, и ни один тест не упадёт; сборка `Dockerfile.gateway` по-прежнему падает, если её база и пин wheel-а расходятся. **Точка ревью:** шаг 1 чек-листа litellm в [`ops/upgrade.md`](ops/upgrade.md). | **Низкая** — принято |
+| (t) | **`tests/slow_tests.txt` не проверяет ни один тест.** Устаревшая запись ничего не роняет. Это стоит только скорости локального цикла (`-m "not slow"`); CI запускает все тесты. **Точка ревью:** нет; обновляйте файл, как сказано в его заголовке, когда локальный цикл замедлится. | **Низкая** — принято; на безопасность не влияет |
 
 **(a), (c) и (h) исправлены; (d) корректно by design; (g), (i) и (k) приняты,
-чинить не планируется.** Остаются открытыми **(b)** — подключение SIEM-sink (зависит от
+чинить не планируется. (l)-(t) — проверки, которые набор тестов убрал в 1.1.0,
+оставив только тесты, запускающие продакшен-код; каждая строка называет ревью,
+которое её заменяет.** Остаются открытыми **(b)** — подключение SIEM-sink (зависит от
 SIEM-таргета), см. [`remaining-steps.md`](remaining-steps.md), — **(e)**,
 **(f)** — расширение F9 на глобальное чтение `SSL_VERIFY` в litellm, а не только
 на клиент оракула, — и **(j)**, ключ провайдера от моста в kwargs логирования
@@ -694,9 +705,8 @@ litellm, где мост его *читает*; в `data["headers"]` он не �
 доступности хоста из контейнера, поэтому на машине без них набор пропускается.
 CI выставляет `CORP_REQUIRE_PROXY_CAPTURE=1`, и каждый такой пропуск становится
 падением — иначе сбой демона, реестра или сети даёт зелёную сборку, не
-проверившую ничего. Набор сам сверяет эту проводку с
-`.github/workflows/ci.yml`, так что потеря переменной роняет прогон, а не
-заглушает его.
+проверившую ничего. Ни один тест не проверяет, что CI сохраняет эту
+переменную (§11 (r)): изменение workflow проверяется на это ревью.
 
 ### Гейт по провайдеру — эшелонирование, а не гарантия маршрутизации
 
@@ -710,10 +720,10 @@ CI выставляет `CORP_REQUIRE_PROXY_CAPTURE=1`, и каждый тако
 Значит, гейт — это дешёвая вторая линия защиты от копирования токена в вызов
 OpenAI или корп-vLLM. **Несущий контроль — форма деплоймента**: конфиг litellm,
 в котором все маршруты — `anthropic/` и нет wildcard-а.
-`compose/litellm/config.anthropic.yaml` (провайдер `anthropic`, закреплён
-`tests/compose/test_providers.py`) и демо-конфиг
-`docker/anthropic-oauth/litellm-config.yaml` (`tests/test_anthropic_oauth_profile.py`)
-— именно такие конфиги. Для моста ChatGPT эта форма —
+`compose/litellm/config.anthropic.yaml` (провайдер `anthropic`) и демо-конфиг
+`docker/anthropic-oauth/litellm-config.yaml` — именно такие конфиги. Ни один
+тест не читает их маршруты, поэтому изменение любого из них проверяется на эту
+форму ревью, как строка таблицы маршрутов. Для моста ChatGPT эта форма —
 `compose/litellm/config.codex.yaml`: один маршрут, чей `api_base` — литерал
 URL ChatGPT Codex, а не значение из окружения. Не читайте гейт как гарантию,
 которую он дать не может.
@@ -905,14 +915,14 @@ middleware их никогда не видит, так что рукопожат
 
 ### Таблица генерируется, а не пишется руками
 
-`route_gate/table.py` перегенерируется из исходников самого litellm
-`ast`-коллектором (`tests/route_gate/litellm_routes.py`), а
-`tests/route_gate/test_litellm_route_guard.py` на каждом прогоне CI заново
-запускает этот коллектор против установленного litellm. У маршрута, который
-litellm добавит при следующем обновлении, записи нет, поэтому guard падает, пока
-кто-то его не классифицирует, — а в рантайме он тем временем отклоняется по
-default-deny. Маршрут `POST`/`PUT`/`PATCH` без хука может быть PASSTHROUGH только с
-письменным обоснованием, и guard сверяет это обоснование с `ast`: хендлер, тело
+`route_gate/table.py` сгенерирована из исходников litellm 1.101.0
+`ast`-коллектором. Ни один тест его больше не запускает: при обновлении litellm
+его запускают вручную, это шаг 2 чек-листа в [`ops/upgrade.md`](ops/upgrade.md),
+«Bumping litellm» (§11 (m)). У маршрута, который litellm добавит при следующем
+обновлении, записи нет, поэтому коллектор сообщает о нём, пока кто-то его не
+классифицирует, — а в рантайме он тем временем отклоняется по default-deny.
+Маршрут `POST`/`PUT`/`PATCH` без хука может быть PASSTHROUGH только с письменным
+обоснованием, и коллектор сверяет это обоснование с `ast`: хендлер, тело
 которого вызывает `litellm.acompletion`, `aresponses`, `token_counter`,
 `router.a*` или `pass_through_request`, комментарием не оправдать.
 
@@ -1186,8 +1196,10 @@ more than 255 bytes: "<key>"`, у `limit_req` — такая же на 65535 б�
 одна не срабатывает; но будущее изменение, ослабившее `error_log /dev/stderr
 crit` (в `nginx.conf`) или задавшее `limit_req_log_level` / `limit_conn_log_level`,
 превратит следующий длинный ключ в токен в логе контейнера.
-`tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`
-закрепляет оба условия: `error_log` — `crit`, и ни один конфиг не задаёт `*_log_level`.
+`tests/compose/test_nginx_runtime.py::test_a_valid_config_renders_only_the_design`
+закрепляет первое: в отрендеренном конфиге ровно один `error_log`, уровня `crit`.
+Второе не проверяет ни один тест, поэтому изменение `nginx.conf` проверяется на
+это ревью.
 Единственный достижимый у лимитов `[crit]`: заполненная зона `corp_conn` пишет
 `[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone "corp_conn"` на
 каждый отклонённый запрос — без контекста запроса и без ключа, а запрос
@@ -1311,8 +1323,9 @@ callback `CustomLogger`**: `CorpLlmGuardrail` (`litellm_hook.py`), регист�
 `CustomGuardrail` (hazards 14 и 15b); любой зарегистрированный `CustomGuardrail`
 ещё и включает per-chunk хуки для всех callback-ов (hazard 12). Всё, что дал бы
 базовый класс, доступно и без него. Переход ничего не даёт и создаёт три обхода.
-Закреплено тестом
-`tests/litellm_hook/test_acceptance_matrix.py::test_the_guardrail_stays_a_plain_custom_logger`.
+Ни один тест не читает базовый класс (§11 (n)): его изменение проверяется ревью.
+`apply_guardrail` на нашем классе по-прежнему не даёт взвестись (exit 70,
+hazard 7).
 
 **Если переход всё же выберут, sentinel-а мало.** Второй обычный callback после
 нашего, который отказывает запросу без отметки нашего pre-call, ловит все обходы,
@@ -1324,9 +1337,9 @@ callback `CustomLogger`**: `CorpLlmGuardrail` (`litellm_hook.py`), регист�
 
 ### Hazards 1-19
 
-Пути — файлы litellm 1.101.0 относительно пакета `litellm/`. Полный список тестов
-по строкам — `tests/litellm_hook/test_acceptance_matrix.py` (`HAZARDS`); он падает,
-если тест из списка переименован, удалён, пропущен или помечен xfail.
+Пути — файлы litellm 1.101.0 относительно пакета `litellm/`. Тесты строки падают,
+если риск вернётся; «нет» значит, что такого теста нет, и §11 (n) называет ревью,
+которое его заменяет.
 
 | # | Риск | Где в litellm | Защита | Тесты |
 |---|---|---|---|---|
@@ -1334,7 +1347,7 @@ callback `CustomLogger`**: `CorpLlmGuardrail` (`litellm_hook.py`), регист�
 | 2 | Клиентский opt-out через `user_api_key_metadata` | `integrations/custom_guardrail.py` | litellm перезаписывает эти ключи на всех 8 переписываемых маршрутах; у обычного callback opt-out нет | `test_fail_open_probes.py::test_opt_out_metadata_overwritten` |
 | 3 | Диспетчеризация `guardrails_only` пропускает pre-call обычного callback | `proxy/utils.py`, `proxy/openai_files_endpoints/batch_guardrails.py` | Латентно (files и batches — REFUSE); `enforces_request_content = True` всё равно задан | `test_guardrails_only_dispatch.py` |
 | 4 | Обработка ошибок litellm меняет статус отказа | `integrations/custom_guardrail.py`, `proxy/utils.py` | Замерено: 401 / 422 / 503 / 500 и код сохраняются на всех трёх семействах маршрутов | `test_fail_open_probes.py::test_m4_status_codes_through_proxy` |
-| 5 | Потоковый скан litellm не превентивен | потоковые хуки guardrail | Наш pre-call переписывает каждый запрос; guardrail-ы litellm не зарегистрированы | `test_litellm_config_guards.py` |
+| 5 | Потоковый скан litellm не превентивен | потоковые хуки guardrail | Наш pre-call переписывает каждый запрос; guardrail-ы litellm не зарегистрированы | нет (§11 (n)) |
 | 6 | Регистрация через `guardrails:` может молча не запустить guardrail | `proxy/guardrails/guardrail_registry.py`, `proxy/guardrails/init_guardrails.py` | Только `callbacks:`; без `CorpLlmGuardrail` (по типу) шлюз не взводится — exit 70 `guardrail_absent` | `test_arm_checks.py::test_no_guardrail_of_ours_is_absent` |
 | 7 | **Критично.** `apply_guardrail` переключает диспетчеризацию на `unified_guardrail`: наш pre-call не запускается | `proxy/utils.py`, `integrations/custom_guardrail.py` | Не определяется; `apply_guardrail` в MRO — exit 70 | `test_proxy_dispatch.py::test_apply_guardrail_flips_dispatch` |
 | 8 | Авто-декорированный `apply_guardrail` пишет `str(exc)` с контентом в `guardrail_information` | `integrations/custom_guardrail.py` | `apply_guardrail` нет; наша запись по allow-list; сбой логируется только типом | `test_guardrail_information.py::test_a_raising_writer_is_logged_by_type_and_leaves_no_entry` |
@@ -1344,9 +1357,9 @@ callback `CustomLogger`**: `CorpLlmGuardrail` (`litellm_hook.py`), регист�
 | 12 | DEBUG litellm печатает исходный запрос до любого pre-call хука | `proxy/common_request_processing.py`, `proxy/litellm_pre_call_utils.py` | DEBUG / `set_verbose` — exit 70; `CORP_LLM_ALLOW_LITELLM_DEBUG` в prod — exit 78 | `test_arm_checks.py::test_a_logger_at_debug_is_refused` |
 | 13 | Обёртки потокового итератора выстраиваются в порядке callback-ов | `proxy/utils.py` | Обратной подстановки внутри litellm нет | как 10 |
 | 14 | Pipeline политики с нашим guardrail заставляет цикл pre-call его пропустить | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` | Пропускается только `CustomGuardrail`; `/polic*` и `/guardrail*` — REFUSE; 14a-c ниже | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies` |
-| 14a | Строка политики в БД litellm загружается, если `supported_db_objects` не задан | `proxy/proxy_server.py`, `proxy/policy_engine/policy_registry.py` | Поставляемые конфиги: `supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_litellm_reads_the_pin_as_models_only` |
+| 14a | Строка политики в БД litellm загружается, если `supported_db_objects` не задан | `proxy/proxy_server.py`, `proxy/policy_engine/policy_registry.py` | Поставляемые конфиги: `supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_litellm_reads_the_pin_as_models_only`; пин в поставляемых конфигах: нет (§11 (n)) |
 | 14b | Список `policies` верхнего уровня в теле запроса | `proxy/litellm_pre_call_utils.py` | Гейт: 403 `route_gate_body_policies`, 415 `route_gate_body_not_json` (тело не UTF-8 JSON: тип носителя, charset или `json.detect_encoding` не utf-8, либо байты, которые не декодируются как UTF-8) | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`) |
-| 14c | **Закрыто в поставляемых сетапах (1.1.0).** Строки `litellm_settings` / `general_settings` из `LiteLLM_Config` применяются каждые 30 с | `proxy/proxy_server.py` | Compose и Helm не дают litellm БД. Если оператор её добавит: охарактеризовано, добавленный callback видит только плейсхолдеры | `test_litellm_config_guards.py`, `test_desanitize_served_stack.py` |
+| 14c | **Закрыто в поставляемых сетапах (1.1.0).** Строки `litellm_settings` / `general_settings` из `LiteLLM_Config` применяются каждые 30 с | `proxy/proxy_server.py` | Compose и Helm не дают litellm БД. Если оператор её добавит: охарактеризовано, добавленный callback видит только плейсхолдеры | `test_litellm_config_guards.py` (строки с добавленной БД), `compose/test_providers.py`, `test_desanitize_served_stack.py` |
 | 15 | `post_call_response_headers_hook` получает восстановленный ответ | `proxy/common_request_processing.py`, `proxy/utils.py` | Обратной подстановки внутри litellm нет | как 10 |
 | 15b | Балансировка по имени guardrail запускает чужой callback | `proxy/utils.py` | Обычный callback не балансируется; CRUD guardrail-ов — REFUSE | `test_proxy_dispatch.py::test_duplicate_guardrail_name_substitutes_callback` |
 | 16 | `guardrail_information` без синхронизации в logging object | `integrations/custom_guardrail.py`, `litellm_core_utils/litellm_logging.py` | Не воспроизвелось на 1.101.0; синхронизация оставлена как эшелон. Время записи — отдельный вопрос: payload потока Responses litellm отправляет на `response.completed`, до конца потока, если только post_call `CustomGuardrail` не откладывает отправку; запись после конца такого потока в payload не попадает, с синхронизацией или без. Наша запись делается в pre-call | `test_guardrail_information.py::test_the_entry_lands_without_the_sync_too`, `::test_the_payload_carries_exactly_our_entry`, `test_logging_surfaces.py::test_a_write_after_a_responses_stream_ended_misses_the_payload` |
@@ -1430,4 +1443,5 @@ content-ключи снимка тела до Stage 5 (17b) и срезает `X
 `general_settings` — включить промпты в spend-log и другие настройки. Такой
 callback видит только плейсхолдеры. DRI закрыл риск 2026-10-09, убрав БД
 litellm: подписочный сетап её не использовал, а режим A, её единственный
-потребитель, ушёл в 1.1.0. Подробности — EN §15.
+потребитель, ушёл в 1.1.0. Что Helm не даёт litellm БД, не проверяет ни один
+тест (§11 (n)). Подробности — EN §15.

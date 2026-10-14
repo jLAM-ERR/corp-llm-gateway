@@ -1,5 +1,7 @@
 # Task 6b store-contract prune audit (phase 1)
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 The audit of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 15, local only), Task 6b:
 store-contract dedupe, a prune PR over `tests/tokens/test_in_memory.py`, `tests/tokens/test_postgres_store.py`,
 `tests/tokens/test_issuance.py`, `tests/tokens/test_issuance_policy.py`, `tests/team_config/test_store.py` and

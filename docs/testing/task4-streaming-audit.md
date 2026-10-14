@@ -1,5 +1,7 @@
 # Task 4 streaming audit (phase 1)
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 The audit of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 12, local only),
 Task 4: `tests/sanitizer/test_streaming.py` absorbs `tests/sanitizer/test_streaming_adversarial.py`.
 Phase 1 decides move / fold / delete for each of the 44 adversarial ids and changes no test.

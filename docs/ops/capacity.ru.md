@@ -177,8 +177,10 @@ EN [`capacity.md`](capacity.md).
   у `limit_req` — такая же на 65535 байт). Карта по форме токена не даёт им
   сработать сегодня; ослабление `error_log … crit` или
   `limit_req_log_level` / `limit_conn_log_level` отправит токены в лог
-  контейнера. Оба условия закрепляет
-  `tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`.
+  контейнера. Уровень `crit` закрепляет
+  `tests/compose/test_nginx_runtime.py::test_a_valid_config_renders_only_the_design`;
+  две директивы `*_log_level` не проверяет ни один тест, поэтому изменение
+  `nginx.conf` проверяется на них ревью.
   Единственный достижимый у лимитов `[crit]`: заполненная зона `corp_conn`
   пишет `[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone "corp_conn"`
   на каждый отклонённый запрос — без контекста запроса и без ключа; запрос

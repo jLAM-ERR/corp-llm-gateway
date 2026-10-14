@@ -1,5 +1,7 @@
 # Task 9 acceptance check
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 The acceptance check of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 19 when measured, rev 20
 for the fixes; local only), Task 9. Five commits. Commit 1 (`5b91553`) is this report and changes nothing under
 `tests/`. Commit 2 (`cc00051`) adds module docstrings to 8 test files in `tests/litellm_hook/` and

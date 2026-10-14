@@ -1,5 +1,7 @@
 # Task 6a audit — script-conformance fold of `tests/deploy/` (phase 1)
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 Plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 14), Task 6a. Branch
 `chore/test-suite-task6a-script-conformance` from `release/1.0.x` at `c0c4258`. Phase 1 changes no
 test and no manifest: the fold below was applied and gated on a scratch clone only. Phase 2

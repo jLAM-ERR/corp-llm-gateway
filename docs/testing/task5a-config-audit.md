@@ -1,5 +1,7 @@
 # Task 5a config audit (phase 1)
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 The audit of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 12, local only),
 Task 5a: composition-root and config restructuring, a move PR inside `tests/test_bootstrap.py`,
 `tests/test_bootstrap_edges.py`, `tests/test_settings.py` and `tests/test_config.py`. Phase 1

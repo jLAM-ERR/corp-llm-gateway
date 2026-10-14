@@ -489,7 +489,7 @@ scoped by the k8s log collector, and a different trust model applies.
 | — | **Per-request placeholder bijection** (same original → one token; distinct originals → distinct tokens) | `placeholder_allocator.py` |
 | — | **Depth-guard fail-closed** (`_MAX_JSON_DEPTH=64` → `400 E_BAD_REQUEST` on sanitize) | `content_blocks.py`, `litellm_hook.py` |
 | — | **NEVER gate, in-process (recursive, primary) + Vector (flat backstop)** (defense in depth) | `audit/invariants.py` + Vector VRL |
-| 7 | **Default-deny route gate**: no request reaches a provider unless the table says the hook rewrites its body, and the gateway does not serve at all unless that hook is registered. An unclassified `(method, path)` is refused; an unarmed gate refuses every rewritten route; startup exits rather than serve half-configured (§14) | `route_gate/table.py` + `tests/route_gate/test_litellm_route_guard.py` + `asgi.py` (exit 78 / 70) |
+| 7 | **Default-deny route gate**: no request reaches a provider unless the table says the hook rewrites its body, and the gateway does not serve at all unless that hook is registered. An unclassified `(method, path)` is refused; an unarmed gate refuses every rewritten route; startup exits rather than serve half-configured (§14) | `route_gate/table.py` + `tests/route_gate/` + `asgi.py` (exit 78 / 70); at a litellm bump, the manual checklist in `ops/upgrade.md` (§11 (m)) |
 | 7a | **The issuance surface terminates in the gateway and is bounded**: `POST /internal/issue-token` never reaches litellm; header-only bearer, no body, own in-flight cap and rate, per-subject minting under an advisory lock, one store bound; error bodies and logs carry codes only (§14) | `route_gate/table.py` (`GATEWAY_ROUTE_TABLE`) + `healthz/server.py` + `tests/invariants/test_issuance_no_leak.py` + `tests/invariants/test_issuance_error_codes.py` |
 | 7b | **The limiter's refusals never inspect, echo or log the body, and no slot is held before the body is complete**: `E_CAPACITY` (429), `E_BODY_TIMEOUT` (408), `oversize:blocked` (422) answer before auth, litellm and the sanitizer; a task several requests share is started with `inflight.spawn_shared` and never cancelled by one request's disconnect; the cap is not authorization (§14) | `route_gate/inflight.py` + `tests/route_gate/test_inflight.py` + `tests/test_inflight_served_stack.py` |
 
@@ -533,9 +533,20 @@ by construction; if one appears to, that is an M1-14 regression.
 | (i) | **Pre-flight token counting is unavailable — accepted, not a gap to close here.** `POST /v1/messages/count_tokens`, `POST /v1/responses/input_tokens` and `POST /utils/token_counter` (refused whatever the query string — `?call_endpoint=true` is the shape that leaks, but the gate classifies `(method, path)` only) are refused at the route gate (§14), so a client cannot ask the gateway what a prompt will cost before sending it. Reasons: litellm's upstream counter cannot carry the per-request credential (it uses the deployment key and the hard-coded public URL) and its local counter uses an OpenAI/Claude-2 vocabulary that undercounts current Claude models by 15-35 %. `usage.input_tokens` on every real turn is an exact, post-sanitization count, and Claude Code falls back to its own estimate for the context indicator. A gateway-side adapter that runs the pre-call pipeline and then calls the provider's counter with the request's own credential is on the backlog. | **Accepted** — no confidentiality impact; a client-side estimate replaces an exact pre-flight count |
 | (j) | **A bridge-supplied provider key sits raw in litellm's log kwargs. Open — follow-up.** litellm keeps the provider credential of each call raw in the kwargs it hands a success log callback. With a subscription bridge (§13) on, that credential is the developer's own bearer (`data["api_key"]`). Measured on litellm 1.101.0: ChatGPT bridge on `/v1/chat/completions` — `api_key` and `litellm_params.api_key`; on `/v1/responses` — none unary, the upstream `Authorization` header in `additional_args` on a stream. Anthropic bridge on `/v1/messages` — the upstream `authorization` header in `httpx_response` (and `additional_args` on a stream). Without a bridge the deployment key sits at the same places, so this is litellm's behaviour, not a copy the gateway makes. The token is NOT in `StandardLoggingPayload` and NOT in the spend-log row; only a callback registered in litellm sees the kwargs, so it is config-gated like the logging-snapshot and `X-Corp-Auth` hazards (a callback added through litellm's config or database, §15). Follow-up: scrub the logging object's `litellm_params.api_key` copy (and the header copies) after the bridge if it is a separate dict from what the provider call uses — investigate in the follow-up. Pinned by `tests/litellm_hook/test_bearer_is_hashed_before_logging.py` (exact site lists). | **Low** — config-gated: the shipped configs register only the gateway's own callback; a log callback an operator adds would receive the developer's subscription credential |
 | (k) | **The gazetteer keeps a per-process memo of recently seen words.** So that spaCy / pymorphy3 run once per word rather than once per occurrence, `rules/gazetteer.py` keeps word → lemma for up to 65,536 recently seen words per language (one RU and one EN memo, 131,072 words in total), each at most 64 characters (longer words are never stored), across all users and teams. It has no TTL and lives only in the process's memory; a restart clears it. Nothing reads it into logs, metrics, error bodies, traces or the audit pipeline, so invariant 1 (M1-14) holds. A word already in the memo is lemmatized faster, so a request's timing is a weak signal that another user sent the same word recently — weaker than Cache A's (one word, not a whole text, and mixed into the request's other latency). | **Low** — accepted; in memory only, never leaves the process |
+| (l) | **No test checks the launch target (invariant 7).** The gateway must be served by `python -m corp_llm_gateway.serve`; litellm's own app (`proxy_server:app`) and the `litellm` CLI run litellm's routers with no gate in front. Until 1.1.0 a test read every Dockerfile, compose file and the Helm chart for that. The served-stack and container suites still prove that our entrypoint gates requests, but nothing fails if a tracked file starts something else. **Review checkpoint:** every change to an `ENTRYPOINT`, a compose `command` / `entrypoint`, or the Helm container's `command` / `args`. | **Low** — accepted; review only |
+| (m) | **No test catches litellm upgrade drift (invariant 7).** No test fails when a litellm upgrade adds a route the table does not classify, makes a REWRITTEN route skip the hook, lets a hook-less route outrank a REWRITTEN one, starts guardrails from a new place, or adds a `save_worker_config` key. Default-deny still refuses an unclassified route at runtime. **Review checkpoint:** steps 2, 4 and 5 of the manual checklist in [`ops/upgrade.md`](ops/upgrade.md), "Bumping litellm", run in every litellm bump PR. | **Medium** — accepted; a missed step admits nothing, but can leave a REWRITTEN route unsanitized |
+| (n) | **No test reads the §15 configuration.** No test fails if `CorpLlmGuardrail`'s base becomes litellm's `CustomGuardrail` (hazards 12, 14, 15b), if a shipped litellm config starts a litellm guardrail (hazard 5) or drops `supported_db_objects: ["models"]` (14a), or if the Helm chart gives litellm a database (14c). An `apply_guardrail` on our class still refuses to arm (exit 70, hazard 7), and compose's no-database rule is still tested. **Review checkpoint:** every change to the class line of `CorpLlmGuardrail`, to `compose/litellm/*.yaml`, `docker/*/litellm-config.yaml` or the Helm litellm configmap and env. | **Medium** — accepted; review only |
+| (o) | **No test checks the inputs of invariant 3.** The pre-call removes the request-body keys litellm turns into upstream headers or a credential (`_CLIENT_CONTROL_BODY_KEYS`). No test fails when litellm stops reading one of them, or starts reading a new one into the upstream call; `test_litellm_route_assumptions.py` still pins the client-side credential keys. **Review checkpoint:** step 3 of the litellm checklist in [`ops/upgrade.md`](ops/upgrade.md). | **Medium** — accepted; a new key litellm reads would reach the provider until the list is extended |
+| (p) | **The edge mirror is checked one way only.** `tests/compose/test_nginx_allowlist_routes.py` still fails when nginx admits a route the gate refuses. No test fails when the nginx allow-list stops admitting a route the gate admits, puts a rate limit on a location it does not admit, or names a path litellm does not register. The runtime nginx suite (`test_nginx_runtime.py`) still exercises the edge. **Review checkpoint:** every change to `compose/nginx/templates/snippets/gateway-locations.inc.template`, and step 6 of the litellm checklist. | **Low** — accepted; the gate inside the image still decides |
+| (q) | **A test that starts skipping in the full environment does not fail CI.** The skip ledger that compared each run with the expected outcomes was removed. A skip is visible only in the `-rs` summary of CI's `test` job. `CI=true` still turns a Postgres skip into a failure, and `CORP_REQUIRE_PROXY_CAPTURE=1` a capture-suite skip. **Review checkpoint:** the skip summary of the `test` job, read when a PR changes the harness, markers or extras. | **Low** — accepted |
+| (r) | **No test checks the CI workflow's shape.** No test fails when CI's `test` job stops running the full environment, drops `CI=true` or `CORP_REQUIRE_PROXY_CAPTURE=1` (the skip guards), or changes its Python version. **Review checkpoint:** every change to `.github/workflows/ci.yml`. | **Low** — accepted; review only |
+| (s) | **No test checks that the litellm pin sites agree.** The `litellm==` / `LITELLM_VERSION` pins in `pyproject.toml`, `Dockerfile.gateway`, `build-image.yml`, `scripts/release/gates.sh`, the three `docker/*/Dockerfile`s and `scripts/test-env.full.txt` can diverge with no test failing; the `Dockerfile.gateway` build still fails when its base and the wheel's pin disagree. **Review checkpoint:** step 1 of the litellm checklist in [`ops/upgrade.md`](ops/upgrade.md). | **Low** — accepted |
+| (t) | **No test checks `tests/slow_tests.txt`.** A stale entry fails nothing. This costs only local-loop speed (`-m "not slow"`); CI runs every test. **Review checkpoint:** none; refresh the file as its header says when the local loop slows down. | **Low** — accepted; no security impact |
 
 **(a), (c) and (h) are fixed; (d) is correct by design; (g), (i) and (k) are
-accepted with no fix planned.** The remaining open items are **(b)** — wiring the SIEM sink (gated on
+accepted with no fix planned. (l)-(t) are checks the test suite dropped in 1.1.0,
+when it kept only tests that run production code; each names the review that
+replaces it.** The remaining open items are **(b)** — wiring the SIEM sink (gated on
 the SIEM target), see [`remaining-steps.md`](remaining-steps.md) — **(e)**,
 **(f)** — widening F9 to guard litellm's global `SSL_VERIFY` read, not just the
 oracle client's — and **(j)**, the bridge-supplied provider key in litellm's log kwargs.
@@ -738,8 +749,8 @@ Every assertion in the capture suite depends on docker, the pinned image and
 container → host reachability, so on a machine without them it skips. CI sets
 `CORP_REQUIRE_PROXY_CAPTURE=1`, which turns each of those skips into a failure —
 otherwise a daemon, registry or network fault produces a green job that verified
-none of it. The suite asserts that wiring against `.github/workflows/ci.yml`
-itself, so dropping the variable fails the run rather than silencing it.
+none of it. No test checks that CI keeps the variable (§11 (r)): a change to the
+workflow is reviewed for it.
 
 ### Provider gating is defence in depth, not a routing guarantee
 
@@ -753,10 +764,10 @@ land on a non-Anthropic upstream, taking the subscription token with it.
 The gate is therefore a cheap second line of defence against copying the token
 onto an OpenAI or corp-vLLM call. **The binding control is the deployment
 shape**: a litellm config in which every route is `anthropic/` and there is no
-wildcard. `compose/litellm/config.anthropic.yaml` (the `anthropic` provider,
-pinned by `tests/compose/test_providers.py`) and the demo's
-`docker/anthropic-oauth/litellm-config.yaml` (`tests/test_anthropic_oauth_profile.py`)
-are such configs. For the ChatGPT bridge the shape is
+wildcard. `compose/litellm/config.anthropic.yaml` (the `anthropic` provider) and
+the demo's `docker/anthropic-oauth/litellm-config.yaml` are such configs. No test
+reads their routes, so a change to either is reviewed for this shape, like a
+route-table row. For the ChatGPT bridge the shape is
 `compose/litellm/config.codex.yaml`: one route, whose `api_base` is the literal
 ChatGPT Codex URL, not an environment value. Do not read the gate as a
 guarantee it cannot make.
@@ -938,14 +949,14 @@ streaming has to flow through untouched.
 
 ### The table is generated, not written
 
-`route_gate/table.py` is regenerated from litellm's own source by an `ast`
-collector (`tests/route_gate/litellm_routes.py`), and
-`tests/route_gate/test_litellm_route_guard.py` re-runs that collector against
-the installed litellm on every CI run. A route litellm adds in a future bump has
-no entry, so it fails the guard until someone classifies it — and at runtime it
-is refused by default-deny in the meantime. A hook-less `POST`/`PUT`/`PATCH`
-route may only be PASSTHROUGH with a written justification, and the guard checks
-that justification against the `ast`: a handler whose body calls
+`route_gate/table.py` was generated from litellm 1.101.0's own source by an
+`ast` collector. No test re-runs it: a litellm bump runs it by hand, as step 2
+of the checklist in [`ops/upgrade.md`](ops/upgrade.md), "Bumping litellm"
+(§11 (m)). A route litellm adds in a future bump has no entry, so the collector
+reports it until someone classifies it — and at runtime it is refused by
+default-deny in the meantime. A hook-less `POST`/`PUT`/`PATCH` route may only be
+PASSTHROUGH with a written justification, and the collector checks that
+justification against the `ast`: a handler whose body calls
 `litellm.acompletion`, `aresponses`, `token_counter`, `router.a*` or
 `pass_through_request` cannot be excused by a comment.
 
@@ -1212,8 +1223,9 @@ shape-keyed map keeps every key far below both, so neither fires today; but a
 future change that relaxes `error_log /dev/stderr crit` (in `nginx.conf`) or
 sets `limit_req_log_level` / `limit_conn_log_level` turns the next oversize key
 into a token in the container log.
-`tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`
-pins both: `error_log` is `crit`, and no config sets either `*_log_level`. The
+`tests/compose/test_nginx_runtime.py::test_a_valid_config_renders_only_the_design`
+pins the first: the rendered config has exactly one `error_log`, at `crit`. No
+test checks the second, so a change to `nginx.conf` is reviewed for it. The
 one `[crit]` the limits can reach: a full `corp_conn` zone writes
 `[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone "corp_conn"` once
 per refused request, with no request context and no key, and the request gets
@@ -1324,8 +1336,8 @@ limiter. This section is what it decided and what holds today.
 
 The shipped litellm configs start no litellm guardrail at all: no top-level or
 `litellm_settings.guardrails`, and none of `litellm_content_filter`, `custom_code`,
-`on_sensitive_data` or `sensitive_data_route_to_model`
-(`tests/test_litellm_config_guards.py`).
+`on_sensitive_data` or `sensitive_data_route_to_model`. No test reads the
+shipped configs for this (§11 (n)), so a change to them is reviewed for it.
 
 ### Why the base class stays a plain `CustomLogger`
 
@@ -1339,10 +1351,9 @@ any `CustomGuardrail` also turns litellm's per-chunk hooks on for every callback
 `enforces_request_content` is an attribute of `CustomLogger`, and
 `guardrail_information` is written with litellm's own writer from a plain
 callback (hazard 16 did not reproduce). So the switch buys nothing and creates
-three bypasses. `tests/litellm_hook/test_acceptance_matrix.py::test_the_guardrail_stays_a_plain_custom_logger`
-reads the class and its base from source, so it holds in both venvs: the base name
-must be bound exactly once (the `ImportError` fallback to `object` aside), and its
-last binding must import litellm's `CustomLogger`.
+three bypasses. No test reads the base class (§11 (n)): a change to
+`CorpLlmGuardrail`'s base is reviewed for it. An `apply_guardrail` on it still
+refuses to arm (exit 70, hazard 7).
 
 **If adoption is ever chosen, the sentinel is not enough.** The plan's design for
 it is a second, plain callback after ours whose pre-call refuses a request our
@@ -1358,9 +1369,8 @@ nothing.
 ### Hazards 1-19
 
 "Where" names litellm 1.101.0 source files, relative to the `litellm/` package. Each row's tests are the ones that
-fail if it regresses; `tests/litellm_hook/test_acceptance_matrix.py` (`HAZARDS`)
-lists all of them and fails if a listed test is renamed, deleted, skipped or
-marked xfail. Tests on the throwaway `CustomGuardrail` fixture pin why the base
+fail if it regresses; "none" means no test does, and §11 (n) names the review
+that replaces it. Tests on the throwaway `CustomGuardrail` fixture pin why the base
 class stays.
 
 | # | Hazard | Where in litellm | Mitigation | Tests |
@@ -1369,7 +1379,7 @@ class stays.
 | 2 | Client opt-out: client-supplied `user_api_key_metadata` / team metadata switching a guardrail off | `integrations/custom_guardrail.py` (`_get_admin_metadata`) | litellm overwrites those keys on all 8 rewritten routes (measured); a plain callback has no opt-out | `test_fail_open_probes.py::test_opt_out_metadata_overwritten` |
 | 3 | `guardrails_only` dispatch skips a plain callback's pre-call (one record of a batch input file) | `proxy/utils.py`, `proxy/openai_files_endpoints/batch_guardrails.py` | Latent: files and batches are REFUSE. `enforces_request_content = True` is set anyway | `test_guardrails_only_dispatch.py` |
 | 4 | litellm's error handling rewrites a refusal's status | `integrations/custom_guardrail.py` (`_process_error`), `proxy/utils.py` | Measured: 401 / 422 / 503 / 500 and the stable code survive litellm on all three route families; nothing egresses | `test_fail_open_probes.py::test_m4_status_codes_through_proxy` |
-| 5 | litellm's own streaming scan is not preventive (sampled chunks go out unchecked) | guardrail streaming hooks | Ours rewrites every request before egress; no litellm guardrail is registered | `test_litellm_config_guards.py::test_{compose,helm}_litellm_config_starts_no_litellm_guardrail`, matrix `test_the_guardrail_stays_a_plain_custom_logger` |
+| 5 | litellm's own streaming scan is not preventive (sampled chunks go out unchecked) | guardrail streaming hooks | Ours rewrites every request before egress; no litellm guardrail is registered | none (§11 (n)) |
 | 6 | Registration: a `guardrails:` entry is called as a factory, starts without it if the constructor refuses, and the DB can remove it | `proxy/guardrails/guardrail_registry.py`, `proxy/guardrails/init_guardrails.py` | Registered through `callbacks:` only; the gateway does not arm without a `CorpLlmGuardrail` in `litellm.callbacks`, found by type, never by name (exit 70 `guardrail_absent`) | `test_asgi_entrypoint.py::test_the_process_exits_70_when_the_guardrail_is_not_registered`, `test_arm_checks.py::test_no_guardrail_of_ours_is_absent` |
 | 7 | **Critical.** Defining `apply_guardrail` flips dispatch to `unified_guardrail`: our pre-call never runs, originals egress on all six flows | `proxy/utils.py` (dispatch switch), `integrations/custom_guardrail.py` | Never defined; an `apply_guardrail` anywhere in the MRO refuses to arm (exit 70 `apply_guardrail`) | `test_proxy_dispatch.py::test_apply_guardrail_flips_dispatch`, `test_arm_checks.py::test_apply_guardrail_anywhere_in_the_mro_is_refused` |
 | 8 | Every `apply_guardrail` is auto-decorated; a raising one writes `str(exc)`, content included, into `guardrail_information` | `integrations/custom_guardrail.py` (`__init_subclass__`) | No `apply_guardrail`. Our entry is written by our pre-call with litellm's writer function and allow-listed; a failing write is logged by exception type only | `test_logging_surfaces.py::test_decorated_apply_guardrail_logs_exception_text`, `test_guardrail_information.py::test_a_raising_writer_is_logged_by_type_and_leaves_no_entry` |
@@ -1379,9 +1389,9 @@ class stays.
 | 12 | DEBUG: litellm's request DEBUG lines print the original request before any pre-call hook; the chunk log; per-chunk hooks turned on by any `CustomGuardrail` | `proxy/common_request_processing.py`, `proxy/litellm_pre_call_utils.py` | litellm DEBUG / `set_verbose` refuses to arm (exit 70); the test-only `CORP_LLM_ALLOW_LITELLM_DEBUG` is exit 78 in prod; no `CustomGuardrail` is registered | `test_arm_checks.py::test_a_logger_at_debug_is_refused`, `test_asgi_entrypoint.py::test_litellm_debug_exits_70_and_config_check_reports_it` |
 | 13 | Streaming iterator wrappers chain in callback order: a later wrapper consumes restored chunks | `proxy/utils.py` (iterator hook chain) | No reversal inside litellm | as 10 |
 | 14 | A policy pipeline naming the guardrail, in any mode, makes the pre-call loop skip it: zero sanitizer calls, originals egress | `proxy/policy_engine/policy_resolver.py`, `proxy/utils.py` (pre-call loop) | Only a `CustomGuardrail` is skipped; ours is a plain callback. `/polic*` and `/guardrail*` are REFUSE (§14); 14a-c below | `test_proxy_dispatch.py::test_today_plain_callback_runs_regardless_of_policies`, `::test_migrated_pipeline_skip_egresses_originals` |
-| 14a | A policy row in litellm's database is loaded at boot and at every reconcile when `supported_db_objects` is unset | `proxy/proxy_server.py` (`_init_non_llm_objects_in_db`), `proxy/policy_engine/policy_registry.py` | Shipped configs pin `general_settings.supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_{compose,helm}_litellm_config_loads_no_policies_from_the_db`, `::test_litellm_reads_the_pin_as_models_only` |
+| 14a | A policy row in litellm's database is loaded at boot and at every reconcile when `supported_db_objects` is unset | `proxy/proxy_server.py` (`_init_non_llm_objects_in_db`), `proxy/policy_engine/policy_registry.py` | Shipped configs pin `general_settings.supported_db_objects: ["models"]` | `test_litellm_config_guards.py::test_litellm_reads_the_pin_as_models_only`; the shipped configs' pin: none (§11 (n)) |
 | 14b | A top-level `policies` list in the client body applies those policies with no attachment | `proxy/litellm_pre_call_utils.py` (`add_guardrails_from_policy_engine`) | The gate refuses a JSON body with a top-level `policies` key (403 `route_gate_body_policies`) and any body that is not UTF-8 JSON (415 `route_gate_body_not_json`: media type, charset, or `json.detect_encoding` other than utf-8, or bytes that do not decode as UTF-8), before litellm parses it | `tests/route_gate/test_body_policies.py` (`::test_no_encoding_stdlib_json_decodes_carries_a_policies_key_past_the_gate`), served `test_a_body_naming_policies_is_refused_at_the_gate` |
-| 14c | **Closed in the shipped setups (1.1.0).** With a database and `store_model_in_db`, litellm applies `litellm_settings` and `general_settings` rows from `LiteLLM_Config` every 30 s; `supported_db_objects` gates neither | `proxy/proxy_server.py` (`_add_deployment_locked`, `_update_config_fields`, `_update_general_settings`) | Compose and Helm give litellm no database. If an operator adds one: characterised (below), an added callback gets placeholders only | `test_litellm_config_guards.py` (5 rows), served DB-overlay rows (5) |
+| 14c | **Closed in the shipped setups (1.1.0).** With a database and `store_model_in_db`, litellm applies `litellm_settings` and `general_settings` rows from `LiteLLM_Config` every 30 s; `supported_db_objects` gates neither | `proxy/proxy_server.py` (`_add_deployment_locked`, `_update_config_fields`, `_update_general_settings`) | Compose and Helm give litellm no database. If an operator adds one: characterised (below), an added callback gets placeholders only | `test_litellm_config_guards.py::test_a_db_litellm_settings_row_appends_callbacks_and_starts_no_guardrail`, `::test_a_db_general_settings_row_turns_on_prompts_in_spend_logs`, `compose/test_providers.py::test_no_gateway_image_service_gets_a_master_key_ui_provider_key_or_litellm_database`, served DB-overlay rows (5) |
 | 15 | `post_call_response_headers_hook` hands every callback the restored response | `proxy/common_request_processing.py`, `proxy/utils.py` | No reversal inside litellm | as 10 |
 | 15b | Guardrail-name load balancing runs another callback under our name | `proxy/utils.py` | A plain callback is not load-balanced; guardrail CRUD is REFUSE; the arm check finds ours by type | `test_proxy_dispatch.py::test_duplicate_guardrail_name_substitutes_callback`, `::test_a_stand_in_answering_to_our_name_is_not_our_guardrail` |
 | 16 | `guardrail_information` written to request metadata only would miss the logging object | `integrations/custom_guardrail.py`, `litellm_core_utils/litellm_logging.py` | Did not reproduce on 1.101.0; the sync into the logging object is kept as defence in depth. Timing is separate: litellm dispatches a Responses stream's payload at `response.completed` unless a post_call `CustomGuardrail` defers it, so a write after that stream ended misses it, synced or not; ours is written at pre-call | `test_guardrail_information.py::test_the_entry_lands_without_the_sync_too`, `::test_the_payload_carries_exactly_our_entry`, `test_logging_surfaces.py::test_a_write_after_a_responses_stream_ended_misses_the_payload` |
@@ -1602,6 +1612,8 @@ Two things come from litellm's database without an HTTP request through the gate
   gets — placeholders, counts, request metadata, and the provider key of 19b.
   The DRI closed it on 2026-10-09 by dropping litellm's database: the
   subscription setup never used it, and Mode A, its only user, went in 1.1.0.
-  Pinned by `tests/test_litellm_config_guards.py`
-  (`test_compose_litellm_has_no_database_to_read_a_config_table_from`, the Helm
-  twin, and the added-database rows) and `tests/test_desanitize_served_stack.py`.
+  Pinned by
+  `tests/compose/test_providers.py::test_no_gateway_image_service_gets_a_master_key_ui_provider_key_or_litellm_database`
+  (compose), the added-database rows of `tests/test_litellm_config_guards.py`
+  and `tests/test_desanitize_served_stack.py`. No test checks that the Helm chart
+  gives litellm no database (§11 (n)).

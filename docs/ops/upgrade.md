@@ -323,6 +323,105 @@ unaffected — this is operator auth only.
 `CORP_GATEWAY_RBAC=0` still bypasses RBAC entirely — **local dev only**. Do not
 set it in staging or prod: it disables the operator claim check.
 
+## Bumping litellm: the manual checklist
+
+Until 1.1.0 a set of drift tests read litellm's installed source and failed when a
+bump changed something the gateway depends on. They were removed
+(`../security.md` §11, rows (m), (o), (p) and (s)), so a bump now runs these steps
+by hand. A maintainer runs them in the bump PR and records the result there.
+Steps 2-5 need the new litellm installed: rebuild the full environment first
+(`scripts/test-env.sh full`, after the constraint file names the new version).
+
+1. **Pin sites.** Move all seven pin sites and `scripts/test-env.full.txt` to the
+   same version in one change. This prints nine lines (`build-image.yml` holds
+   two), and all of them must name the same version:
+
+   ```
+   git grep -nE '^(ARG )?LITELLM_VERSION=|^FROM ghcr\.io/berriai/litellm:v|"litellm==|^litellm==|litellm_version \|\||default: "v' -- ':!docs' ':!tests' ':!examples'
+   ```
+
+   `Dockerfile.gateway` also fails the build when the base image and the wheel's
+   pin disagree.
+
+2. **Routes against the table.** Run the route guard the suite had until 1.1.0,
+   from the release branch's history, against the new litellm and the current
+   table:
+
+   ```
+   REPO=$(git rev-parse --show-toplevel); D=$(mktemp -d); mkdir "$D/route_guard"
+   touch "$D/route_guard/__init__.py"
+   git show 8c46aeb:tests/route_gate/litellm_routes.py > "$D/route_guard/litellm_routes.py"
+   git show 8c46aeb:tests/route_gate/test_litellm_route_guard.py > "$D/route_guard/test_litellm_route_guard.py"
+   (cd "$D" && PYTHONPATH="$REPO/src" "$REPO/.venv-test-full/bin/python" -m pytest route_guard -q -p no:cacheprovider)
+   ```
+
+   On 1.101.0 it passes (23 tests). It reads litellm's `proxy/` source with `ast`
+   and fails on: a route the table does not classify; a REWRITTEN row whose
+   handler no longer reaches `pre_call_hook`; a hook-less route that now outranks
+   a REWRITTEN one; a hook-less `POST`/`PUT`/`PATCH` route that is neither REFUSE
+   nor justified; a new websocket route; a dynamic registration site that is new
+   or has moved. Classify each one in `src/corp_llm_gateway/route_gate/table.py`
+   ([`../extending.md`](../extending.md), "Classify a litellm route"). A moved
+   dynamic site also means updating `KNOWN_DYNAMIC_REGISTRATIONS` in your copy
+   after you have read the new site.
+
+3. **Body keys litellm turns into headers or a credential** (invariant 3). The
+   pre-call removes `_CLIENT_CONTROL_BODY_KEYS` (`litellm_hook.py`). Check that
+   litellm's `main.py` still reads `extra_headers`, `provider_specific_header`
+   and `organization` from the request kwargs, and read the diff of `main.py`
+   for any new kwarg it sends upstream as a header or a credential. Add such a
+   key to the list.
+
+4. **Startup config load.** litellm must start a guardrail only from
+   `load_config` in `proxy/proxy_server.py`; a database `guardrails` row is then
+   merged into a config nothing reads again (§15, hazard 14c).
+
+5. **Worker-config keys.** The keywords litellm's `proxy/proxy_cli.py` passes to
+   `save_worker_config` must equal `WORKER_CONFIG_KEYS` in
+   `src/corp_llm_gateway/litellm_cli.py`. A key litellm adds would otherwise keep
+   its `initialize()` default, and the gateway would boot differently from the
+   CLI it replaces.
+
+   Steps 3-5 in one run (expected output: three `True`, `[]`, `['load_config']`):
+
+   ```
+   PYTHONPATH=src .venv-test-full/bin/python - <<'EOF'
+   import ast
+   import inspect
+
+   import litellm.main
+   import litellm.proxy.proxy_cli
+   import litellm.proxy.proxy_server
+
+   from corp_llm_gateway.litellm_cli import WORKER_CONFIG_KEYS
+
+   main = inspect.getsource(litellm.main)
+   for key in ("extra_headers", "provider_specific_header", "organization"):
+       print("body key read:", key, f'kwargs.get("{key}"' in main)
+
+   cli = ast.parse(inspect.getsource(litellm.proxy.proxy_cli))
+   call = next(n for n in ast.walk(cli) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "save_worker_config")
+   print("worker-config drift:", sorted({k.arg for k in call.keywords if k.arg} ^ set(WORKER_CONFIG_KEYS)))
+
+   server = ast.parse(inspect.getsource(litellm.proxy.proxy_server))
+   starters = {"initialize_guardrails", "init_guardrails_v2"}
+   print("guardrails started from:", sorted(
+       f.name for f in ast.walk(server)
+       if isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef)
+       and any(isinstance(c, ast.Call) and getattr(c.func, "id", getattr(c.func, "attr", None)) in starters for c in ast.walk(f))
+   ))
+   EOF
+   ```
+
+6. **The edge.** If step 2 changed a REWRITTEN or PASSTHROUGH row, update
+   `compose/nginx/templates/snippets/gateway-locations.inc.template` to the same
+   admitted set, and check that every path it admits is one litellm registers.
+
+7. **The suites.** Run both test environments, `scripts/release/gates.sh`, and
+   CI's `integration-container` job (the route gate and the outbound capture on
+   the built image). Then update the litellm version this document and
+   `../security.md` §15 name.
+
 ## litellm base image pin: v1.101.0
 
 The litellm version is pinned in **seven** places, all now on **`v1.101.0`** (the
@@ -346,16 +445,13 @@ to a **different** manifest than `v1.101.0` (amd64 `sha256:266180fb…`). Use th
 explicit tag; do not assume the floating ones are equivalent.
 
 **`pyproject.toml` is now an exact pin, not a floor** — the route gate's table is
-generated from ONE litellm's route source and guarded against it
-(`tests/route_gate/`). With the old `>=1.40,<2.0` range, CI's `pip install -e .`
-resolved whatever PyPI called latest, so the guard read a different litellm than
-the image ships and would have passed against routes the gateway never serves.
-Move it with the other six; `tests/test_litellm_pin.py` fails if the sites
-disagree. The full test environment's constraints (`scripts/test-env.full.txt`)
-also carry `litellm==`. That file is not a pin site, but the fingerprint gate
-(`tests/_gates/fingerprint.py`, run by `scripts/test-gates.sh full` and by every
-`pytest tests/` run) fails when it differs from `pyproject.toml`, so regenerate it
-in the same change. The one
+generated from ONE litellm's route source. With the old `>=1.40,<2.0` range, CI's
+`pip install -e .` resolved whatever PyPI called latest, so CI tested a different
+litellm than the image ships. Move it with the other six. No test checks that the
+sites agree: step 1 of the checklist above does. The full test environment's
+constraints (`scripts/test-env.full.txt`) also carry `litellm==`. That file is not
+a pin site, but move it in the same change, or the full environment tests another
+litellm. The one
 litellm symbol the request path imports, `ANTHROPIC_OAUTH_TOKEN_PREFIX`, has an
 in-tree fallback (`litellm_hook.py`) and is unchanged since v1.85.0.
 
@@ -388,8 +484,8 @@ default `v1.85.0`, `scripts/release/gates.sh` `v1.85.0`, demo `v1.85.0`,
 chatgpt-codex `v1.89.3`, anthropic-oauth `v1.89.3`.
 
 Revert `build-image.yml` and `gates.sh` **together** — `gates.sh` names the
-workflow as the source of truth for the pin, and `tests/test_litellm_pin.py`
-fails if the sites disagree.
+workflow as the source of truth for the pin. No test checks that the sites agree;
+run step 1 of the checklist above after a revert too.
 
 ### What was checked before the bump
 

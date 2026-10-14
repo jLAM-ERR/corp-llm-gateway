@@ -16,6 +16,6 @@ door (nginx)" (RU: `../README.ru.md`, «HTTPS-фронт (nginx)»).
 | `templates/snippets/langfuse-locations.inc.template` | the Langfuse origin |
 | `certs/` | the certificate and key for `terminate`, installed on the server by hand: `certs/README.md` |
 
-Tests: `tests/compose/test_nginx_profile.py` (static), `test_nginx_runtime.py`
-(a real nginx container), `test_nginx_allowlist_routes.py` (the allow-list
-against litellm's route table and the gateway's route gate).
+Tests: `tests/compose/test_nginx_profile.py` (the rendered compose stack),
+`test_nginx_runtime.py` (a real nginx container), `test_nginx_allowlist_routes.py`
+(nginx admits nothing the gateway's route gate refuses).

@@ -12,8 +12,8 @@
 #      lands. This file is the binding control: with no catch-all and no
 #      foreign-provider route, no alias can carry the subscription token
 #      anywhere but api.anthropic.com. Same property as
-#      docker/anthropic-oauth/litellm-config.yaml, pinned by
-#      tests/compose/test_providers.py.
+#      docker/anthropic-oauth/litellm-config.yaml. No test reads these routes,
+#      so a change here is reviewed for this property (docs/security.md §13).
 #
 #   2. No `api_key: os.environ/ANTHROPIC_API_KEY`. There is no gateway-held
 #      Anthropic key at all; the developer's own token is the upstream

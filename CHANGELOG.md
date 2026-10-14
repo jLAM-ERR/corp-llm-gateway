@@ -178,6 +178,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`team create` is one atomic insert**, so a concurrent `create` never overwrites an existing
   team's settings.
 
+### Changed — test suite: logic tests only; the gate system is removed
+
+- **The suite keeps only tests that run production code and assert on what it does.** 340 of
+  3,687 test functions were removed: 138 that read config files as text, 122 that tested the
+  test harness itself, 60 that read source as text and 20 that checked documents. 8 mixed tests
+  keep their runtime half. Twelve test files had no logic test left and were deleted, among
+  them the launch-command, litellm pin-site and CI-workflow checks. The litellm route
+  collector (`tests/route_gate/litellm_routes.py`) went with them.
+- **The must-keep gate system is gone**: the must-keep ids, the expected-outcome ledgers, the
+  environment fingerprints, the name-pinned index, the negative-log review and the moves map
+  (the gate modules and manifests under `tests/`, and their doc in `docs/testing/`).
+  `scripts/test-gates.sh minimal|full` keeps its name and now runs plain
+  `pytest tests/ -q -rs`; its exit code is pytest's. CI's `test` job runs the same step and
+  no longer fetches the full git history.
+- **What the removed checks guarded is now a review step.** `docs/security.md` §11 rows
+  (l)-(t) list each gap and the review that replaces it. The litellm drift checks (routes
+  against the table, hook dispatch, the body keys litellm turns into headers, where litellm
+  starts guardrails, the worker-config keys, the pin sites) are a manual checklist in
+  `docs/ops/upgrade.md`, "Bumping litellm", run in every litellm bump PR.
+
 ## [1.0.0] — GA (2026-10-09)
 
 The first GA release — the **local-first detection cycle** (below) plus the **GA-readiness /

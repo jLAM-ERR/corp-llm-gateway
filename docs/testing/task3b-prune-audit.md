@@ -1,5 +1,7 @@
 # Task 3b prune audit (phase 1)
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 The audit of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 9, local only),
 Task 3b: prune within the integration and boundary layers. Phase 1 decides keep / delete /
 fold for every prunable id and deletes nothing; phase 2 (after review) does the deletions,

@@ -42,7 +42,7 @@ jobs:
     # The Postgres store contract tests (incl. the issuance race tests) run against
     # this service. GitHub sets CI=true, which turns their "Postgres unreachable"
     # skip into a failure (tests/postgres_support.py); the credentials mirror the
-    # demo stack's gateway/gateway/gateway, pinned by test_token_store_contract.py.
+    # demo stack's gateway/gateway/gateway.
     services:
       postgres:
         image: postgres:16

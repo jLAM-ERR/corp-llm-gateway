@@ -237,8 +237,9 @@ nginx's memory and start empty when the container restarts.
   them from firing today; relaxing `error_log … crit` or setting
   `limit_req_log_level` / `limit_conn_log_level` would put tokens in the
   container log.
-  `tests/compose/test_nginx_profile.py::test_nginxs_limiting_line_is_below_the_error_log_level`
-  pins both. The one `[crit]` the limits can reach: a full `corp_conn` zone
+  `tests/compose/test_nginx_runtime.py::test_a_valid_config_renders_only_the_design`
+  pins the `crit` level; no test checks the two `*_log_level` directives, so a
+  change to `nginx.conf` is reviewed for them. The one `[crit]` the limits can reach: a full `corp_conn` zone
   writes `[crit] ngx_slab_alloc() failed: no memory in limit_conn_zone
   "corp_conn"` per refused request — no request context, no
   key; the request gets 429. At 10m that needs about 10^5 distinct keys in

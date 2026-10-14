@@ -7,7 +7,7 @@ model_list:
   # so the alias gate cannot prove where the request lands. The binding control
   # is this file: every route is `anthropic/`, and there is no `model_name: "*"`
   # catch-all, so no alias can carry the subscription token to another provider.
-  # tests/test_anthropic_oauth_profile.py pins both properties.
+  # No test reads these routes: a change here is reviewed for both properties.
   - model_name: "claude-*"
     litellm_params:
       model: "anthropic/claude-*"

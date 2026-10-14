@@ -9,8 +9,9 @@ registers; ``GATEWAY_ROUTE_TABLE`` describes the routes the gateway itself
 serves (``/healthz/*``, ``/metrics``, ``POST /internal/issue-token``) and is exempt
 from the source guard.
 
-The litellm tables are generated from litellm 1.101.0's own source with the
-collector in ``tests/route_gate/litellm_routes.py`` and these rules, in order:
+The litellm tables are generated from litellm 1.101.0's own source with an
+``ast`` route collector (``docs/ops/upgrade.md``, "Bumping litellm", step 2) and
+these rules, in order:
 
 1. the eight generation spellings whose body the hook rewrites are REWRITTEN;
 2. a stored-response route addressed by id is PASSTHROUGH — it sends no
@@ -27,8 +28,8 @@ collector in ``tests/route_gate/litellm_routes.py`` and these rules, in order:
    login/SSO, public catalogue, UI, index, lazy warm-up and the other
    ``/health/*`` routes — and is REFUSE by design (``docs/security.md`` §14).
 
-A body-carrying PASSTHROUGH row must carry the written ``justification`` that
-``tests/route_gate/test_litellm_route_guard.py`` rule (c) re-checks by ``ast``.
+A body-carrying PASSTHROUGH row must carry a written ``justification``; the
+collector re-checks it by ``ast`` at every litellm bump.
 
 A path with a ``{parameter}`` becomes a ``LITELLM_REGEX_TABLE`` row: the table
 is matched against the path as received, never against the template. Rows are

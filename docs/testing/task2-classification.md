@@ -1,5 +1,7 @@
 # Task 2: old → new node ids
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 Plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (local only), Task 2: the 1:1 map of
 every test function moved out of `tests/test_litellm_hook.py` (238) and
 `tests/test_litellm_hook_adversarial.py` (11), and of every test in the five files renamed by

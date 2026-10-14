@@ -1,5 +1,7 @@
 # Task 5b config prune audit (phase 1)
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 The audit of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 13, local only), Task 5b:
 config-test pruning, a prune PR over `tests/test_settings.py`, `tests/test_config.py`,
 `tests/test_bootstrap.py` and `tests/test_bootstrap_edges.py`. Phase 1 decides keep / delete for

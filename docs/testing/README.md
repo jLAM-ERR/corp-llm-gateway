@@ -1,17 +1,24 @@
 # Running the tests
 
 ```
-PYTHONPATH=src .venv/bin/pytest tests/ -q                          # everything
+scripts/test-env.sh full && scripts/test-gates.sh full             # what CI runs (Postgres needed)
+scripts/test-env.sh minimal && scripts/test-gates.sh minimal       # the package without extras or litellm
 PYTHONPATH=src .venv/bin/pytest tests/ -q -m "not slow"            # skip the listed slow tests
-PYTHONPATH=src .venv/bin/pytest tests/ -q --shuffle-seed=20261006  # a seeded random order
-scripts/test-gates.sh minimal --shuffle-seed 20261006              # the gates in a seeded order
+scripts/test-gates.sh minimal --shuffle-seed 20261006              # a seeded random order
 ```
 
-The gated route is the two reproducible environments, `scripts/test-env.sh` and
-`scripts/test-gates.sh`; [must-keep.md](must-keep.md) has the commands and the gates they run.
-CI's `test` job runs the full environment once (`scripts/test-gates.sh full`); the minimal
-one, and its ledger, are checked locally only.
+There are two reproducible environments. `scripts/test-env.sh minimal|full` builds
+`.venv-test-<env>` from the pinned constraints in `scripts/test-env.<env>.txt`: minimal is
+the package with no extras and no litellm, full is every extra CI installs, litellm and the
+`en_core_web_md` wheel. `scripts/test-gates.sh minimal|full` sets the environment's
+variables (full also sets `CI=true` and needs Postgres at `CORP_TEST_PG_DSN`, which it checks
+first) and runs `pytest tests/ -q -rs` once; its exit code is pytest's, and `-rs` prints
+every skip reason. CI's `test` job runs the full environment; minimal is a local check.
 
+- Markers (`pyproject.toml`, `--strict-markers`): `requires_litellm`, `requires_ner`,
+  `requires_helm`, `requires_shellcheck` and `not_root` become setup-time skips when the
+  dependency is missing (`tests/conftest.py`). Under `CI=true` a Postgres-backed
+  test fails instead of skipping.
 - `slow` marks every test listed in `tests/slow_tests.txt`: over 2 s (setup + call +
   teardown) in either test environment when measured. A module-scoped fixture's setup counts
   against the first test that uses it, so some entries are slow only for that reason, and
@@ -37,8 +44,7 @@ A behaviour is asserted in the layer that owns it. A test that only repeats a lo
 case through a higher layer is a prune candidate; a test that adds what its layer adds is not.
 The layers: **unit** (one component's own contract, no hook; the plan's algorithm layer),
 **integration** (what the litellm hook adds), **boundary** (the gate, the limiter, the
-reversal, startup, the served stack, the edge, the leak surfaces). Boundary tests may be
-moved, never pruned.
+reversal, startup, the served stack, the edge, the leak surfaces).
 
 | `tests/…` | layer | owns |
 |---|---|---|
@@ -54,39 +60,15 @@ moved, never pruned.
 | `healthz/` | boundary | health checks and the gateway-owned issuance route |
 | `integration/`, `compose/` | boundary | the real image; the compose stack and its nginx front door |
 | `e2e/` | boundary | the e2e stack: Redis and the two mocks (skips without it; CI's `e2e` job runs it, where a skip fails) |
-| `cli/`, `deploy/`, `helm/`, `docs/` | — | the operator and laptop CLIs; the deploy and install scripts; the Helm chart; doc pins (counts, keys and codes the docs name) |
-| `tests/*.py` (root) | boundary and composition | the served-stack suites, the ASGI entrypoint and `serve`, launch-command and litellm pins, CI workflow pins; `bootstrap`, `config`, `settings`, `pg_session` and the conftest hooks |
-| `_gates/` | — | the test-suite gates ([must-keep.md](must-keep.md)) |
+| `cli/`, `deploy/`, `helm/` | — | the operator and laptop CLIs; the deploy and install scripts; the Helm chart |
+| `tests/*.py` (root) | boundary and composition | the served-stack suites, the ASGI entrypoint and `serve`, litellm's config checks; `bootstrap`, `config`, `settings` and `pg_session` |
 
 Shared helpers are flat modules at the root (`hook_fixtures.py`, `response_restore.py`,
 `postgres_support.py`, …), imported by name.
 
-## Move PRs and prune PRs
+## What a test here checks
 
-A PR either moves or renames tests, or prunes them; never both.
-
-- A **move** (a test to another module, a renamed module or test) changes no test body. It
-  records each move in `tests/_manifests/moves.json`, current id → baseline id, so every
-  gate keeps its key. Its manifest diff is only `moves.json`, `name_pinned.json` and the
-  `site` of moved negative-log checks.
-- A **prune** deletes or folds tests that are not must-keep. Every deleted or changed node id
-  gets a row in [deleted-tests.md](deleted-tests.md) in the same PR: the survivor, a semantic
-  note, and a fault injection where the replacement is disputed. A deleted test is in no
-  ledger, so its manifest changes are its own negative-log sites and, if it was moved
-  earlier, its `moves.json` entry (the moves gate refuses a key no longer in the tree); a
-  fold that creates a test under a must-keep path adds its ids to `must_keep/`, additions
-  only.
-- Both must leave `scripts/test-gates.sh minimal` and `full` green. The mechanics, and the
-  order to regenerate the manifests in, are in [must-keep.md](must-keep.md).
-
-## Name-pinned tests
-
-A test the acceptance matrix lists, or that `CLAUDE.md`, `README.md`, `docs/*.md`,
-`docs/ops/*.md`, `compose/*.md` or `compose/nginx/*.md` cites by name, is indexed in
-`tests/_manifests/name_pinned.json` with the `file:line` of every citation, and is
-must-keep; a cited test module path is indexed the same way. Renaming or moving one means
-updating every citation in the same PR and running
-`python -m tests._gates.name_pinned --write`. Every `pytest tests/` run fails until the
-index holds exactly the cited ids and paths. It does not compare line numbers, so a doc
-edit that only moves a citing line still passes; regenerate anyway to keep the sites
-current (the diff is line numbers only).
+A test runs production code and asserts on what it does. A check that only reads a
+document, reads source or config as text, or tests the test harness itself does not belong
+in `tests/`. What those checks used to guard is a review step now: `docs/security.md` §11
+lists each gap and the review that replaces it.
