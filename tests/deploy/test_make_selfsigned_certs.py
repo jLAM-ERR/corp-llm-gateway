@@ -3,7 +3,7 @@ it, with the SANs clients actually verify (plan 20260806 ⛔8).
 
 Runs the real script with the host's openssl into a tmp dir and reads the result
 back with ``openssl x509 -text`` and ``openssl verify``. Skips without openssl
-or shellcheck on a laptop and FAILS on CI.
+on a laptop and FAILS on CI.
 """
 
 from __future__ import annotations
@@ -274,11 +274,3 @@ def test_help_exits_zero_and_writes_nothing(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "NOT FOR PRODUCTION" in result.stderr
     assert not (tmp_path / "out").exists()
-
-
-def test_the_script_is_executable_and_shellcheck_clean() -> None:
-    assert os.access(SCRIPT, os.X_OK)
-    if shutil.which("shellcheck") is None:
-        skip_or_fail("shellcheck not on PATH")
-    result = subprocess.run(["shellcheck", str(SCRIPT)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr

@@ -49,7 +49,6 @@ ENTRYPOINT_KEYS = (
     "NGINX_GATEWAY_UPSTREAM",
     "COMPOSE_PROFILES",
 )
-COMPOSE_ONLY_KEYS = ("NGINX_PORT", "NGINX_LANGFUSE_PORT")
 
 # The 1.0 Mode A keys: no compose file reads them any more, and a value left in a
 # shell must not leak into a render either.

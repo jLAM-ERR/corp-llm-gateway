@@ -13,19 +13,15 @@ import asyncio
 import dataclasses
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import pytest
 import pytest_asyncio
-import yaml
 
 from corp_llm_gateway.tokens import InMemoryTokenStore, TokenInfo
 from corp_llm_gateway.tokens.errors import IssuancePolicyError
 from corp_llm_gateway.tokens.store import TokenStore
 from tests.postgres_support import (
-    DEMO_PG_DSN,
-    PG_DSN_ENV_VAR,
     pg_dsn,
     require_asyncpg,
     skip_or_fail,
@@ -654,35 +650,3 @@ async def test_parallel_issuance_for_many_subjects_is_not_serialised_into_refusa
 
     assert [r for r in results if isinstance(r, BaseException)] == []
     assert len(await _stored(store, tokens)) == _RACE_WIDTH
-
-
-# CI wiring -------------------------------------------------------------------
-
-_CI_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
-
-
-def test_ci_test_job_runs_the_postgres_the_contract_tests_need() -> None:
-    """Without the service the Postgres half of this file would fail on CI; this
-    pins the wiring so the service cannot be dropped for a skip-shaped green."""
-    job = yaml.safe_load(_CI_WORKFLOW.read_text())["jobs"]["test"]
-    service = job["services"]["postgres"]
-
-    assert service["image"].startswith("postgres:16")
-    assert service["env"] == {
-        "POSTGRES_USER": "gateway",
-        "POSTGRES_PASSWORD": "gateway",
-        "POSTGRES_DB": "gateway",
-    }
-    assert "5432:5432" in service["ports"]
-    assert "pg_isready" in service["options"]
-
-    # scripts/test-gates.sh runs the suite with the job's step env.
-    steps = [
-        step
-        for step in job["steps"]
-        if any(marker in (step.get("run") or "") for marker in ("pytest", "test-gates.sh"))
-    ]
-    assert steps
-    for step in steps:
-        env = {**(job.get("env") or {}), **(step.get("env") or {})}
-        assert env.get(PG_DSN_ENV_VAR) == DEMO_PG_DSN

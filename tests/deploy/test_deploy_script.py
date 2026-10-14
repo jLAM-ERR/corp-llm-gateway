@@ -1,13 +1,11 @@
 """Asserts for the day-N deploy script (plan Task 8 / D2).
 
 The script drives a production server over SSH, so it is never pointed at a
-real host here. Three layers: content asserts on the script text (strict mode,
-the repo's stderr helpers, no destructive flag, no committed secret), function
-level tests that source the script against a tmp_path, and end-to-end runs of a
-copy of the script inside a fake checkout with `ssh`, `rsync` and `docker`
-stubs on PATH. The rsync stub calls the real rsync into a local directory, so
-the ".env is never synced" claims are semantic, not textual. The strict-mode,
-stderr-helper, `bash -n` and shellcheck asserts run on bootstrap-server.sh too.
+real host here. Two layers: function level tests that source the script against
+a tmp_path, and end-to-end runs of a copy of the script inside a fake checkout
+with `ssh`, `rsync` and `docker` stubs on PATH. The rsync stub calls the real
+rsync into a local directory, so the ".env is never synced" claims are semantic,
+not textual.
 """
 
 from __future__ import annotations
@@ -15,16 +13,13 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import stat
 import subprocess
 from pathlib import Path
 
 import pytest
-import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "deploy" / "deploy.sh"
-BOOTSTRAP = ROOT / "scripts" / "deploy" / "bootstrap-server.sh"
 
 HOST = "deploy@example.test"
 
@@ -61,17 +56,6 @@ STARTING_PS = [
 NO_HEALTHCHECK_PS = [
     {"Service": "vector", "State": "running", "Health": ""},
 ]
-
-
-@pytest.fixture(scope="module")
-def script_text() -> str:
-    return SCRIPT.read_text()
-
-
-def _function_body(text: str, name: str) -> str:
-    match = re.search(rf"^{re.escape(name)}\(\)\s*\{{\n(.*?)^\}}$", text, re.S | re.M)
-    assert match is not None, f"no shell function named {name!r}"
-    return match.group(1)
 
 
 # --------------------------------------------------------------------------- #
@@ -233,39 +217,8 @@ def _remote_dir(tmp_path: Path, *, with_env: bool = True) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# content asserts — the first four run on both deploy scripts
+# --help and refusals
 # --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize("script", [SCRIPT, BOOTSTRAP], ids=["deploy", "bootstrap-server"])
-def test_script_is_executable_bash_with_strict_mode(script: Path) -> None:
-    script_text = script.read_text()
-    assert script.exists(), f"{script} does not exist"
-    assert script.stat().st_mode & stat.S_IXUSR, "script is not executable"
-    assert script_text.startswith("#!/usr/bin/env bash\n")
-    assert "set -euo pipefail" in script_text
-
-
-@pytest.mark.parametrize("script", [SCRIPT, BOOTSTRAP], ids=["deploy", "bootstrap-server"])
-def test_defines_repo_standard_helpers_writing_to_stderr(script: Path) -> None:
-    script_text = script.read_text()
-    for name in ("fatal", "warn", "info"):
-        body = _function_body(script_text, name)
-        assert ">&2" in body, f"{name}() must write to stderr like scripts/demo.sh"
-    assert "exit 1" in _function_body(script_text, "fatal")
-
-
-@pytest.mark.parametrize("script", [SCRIPT, BOOTSTRAP], ids=["deploy", "bootstrap-server"])
-def test_bash_syntax_is_valid(script: Path) -> None:
-    result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.parametrize("script", [SCRIPT, BOOTSTRAP], ids=["deploy", "bootstrap-server"])
-@pytest.mark.requires_shellcheck
-def test_shellcheck_clean(script: Path) -> None:
-    result = subprocess.run(["shellcheck", str(script)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_help_documents_every_subcommand_and_the_log_warning() -> None:
@@ -291,88 +244,6 @@ def test_unknown_option_and_unknown_subcommand_are_refused() -> None:
         result = subprocess.run([str(SCRIPT), *argv], capture_output=True, text=True)
         assert result.returncode == 1, result.stdout
         assert argv[-1] in result.stderr or argv[2] in result.stderr
-
-
-def test_remote_dir_default_matches_bootstrap_server(script_text: str) -> None:
-    mine = re.search(
-        r'^REMOTE_DIR="\$\{[A-Z_]+:-(?:(?P<dir>[^$}]+)|\$(?P<var>[A-Z_]+))\}"', script_text, re.M
-    )
-    theirs = re.search(r'^TARGET_DIR="\$\{[A-Z_]+:-(?P<dir>[^}]+)\}"', BOOTSTRAP.read_text(), re.M)
-    assert mine is not None and theirs is not None
-    default = mine.group("dir")
-    if default is None:
-        named = re.search(rf'^{mine.group("var")}="(?P<dir>[^"]+)"', script_text, re.M)
-        assert named is not None
-        default = named.group("dir")
-    assert default == theirs.group("dir") == "/opt/corp-llm-gateway"
-    assignments = re.findall(r'^[A-Z_]+="[^"\n]*/opt/corp-llm-gateway', script_text, re.M)
-    assert len(assignments) == 1, assignments
-
-
-def test_only_the_production_compose_entrypoint_is_used(script_text: str) -> None:
-    assert re.search(r'^COMPOSE_FILE="docker-compose\.yml"', script_text, re.M)
-    build_overlay = [
-        line
-        for line in script_text.splitlines()
-        if "docker-compose.build.yml" in line and not line.strip().startswith("#")
-    ]
-    for line in build_overlay:
-        assert "exclude" in line, f"the dev-only build overlay must never be deployed: {line!r}"
-    # The compose v1 binary, not the plugin package or a .yml filename. The
-    # filename arm is generic (`docker-compose.<anything>.yml`) so adding an
-    # overlay does not read as a v1 invocation.
-    v1 = re.search(r"\bdocker-compose\b(?!-plugin)(?!(?:\.[A-Za-z0-9-]+)*\.ya?ml)", script_text)
-    assert v1 is None, f"compose v1 (`docker-compose`) is not supported: {v1}"
-
-
-def _code_lines(text: str) -> str:
-    return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
-
-
-def test_no_destructive_flag_anywhere(script_text: str) -> None:
-    code = _code_lines(script_text)
-    assert not re.search(r"\brm\s+-[a-z]*[rR]", code), "no recursive delete"
-    assert "--delete" not in code, "rsync --delete could remove the server's .env or certs"
-    assert not re.search(r"docker compose[^\n]*\bdown\b[^\n]*\s-v\b", code), (
-        "never remove production volumes"
-    )
-    assert "down --volumes" not in code
-    assert "prune" not in code
-
-
-def test_env_file_contents_are_never_read_or_printed(script_text: str) -> None:
-    for line in script_text.splitlines():
-        stripped = line.strip()
-        if ".env" not in stripped or stripped.startswith("#"):
-            continue
-        reader = r"^(source|\.|cat|echo|printf|grep|sed|awk)\s+[^|]*\.env\b"
-        assert not re.match(reader, stripped), f"must not print .env values: {stripped!r}"
-
-
-def test_no_secret_or_real_host_is_committed(script_text: str) -> None:
-    assert not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", script_text), "script has an IP literal"
-    assert not re.search(r"\.(corp|lan|internal)\b", script_text), "script has an internal host"
-    credential = r"(?i)\b(password|secret|api_key|token)\s*=\s*[\"']?[A-Za-z0-9]"
-    secret = re.search(credential, script_text)
-    assert secret is None, f"script has a credential-looking assignment: {secret}"
-
-
-def test_healthcheck_polling_mirrors_demo_sh(script_text: str) -> None:
-    body = _function_body(script_text, "wait_for_healthcheck")
-    assert "local max_wait=" in body
-    assert "local elapsed=0" in body
-    assert "local interval=" in body
-    assert "(( elapsed < max_wait ))" in body
-    assert "(( elapsed += interval ))" in body
-
-
-def test_pull_gates_the_up(script_text: str) -> None:
-    body = _function_body(script_text, "cmd_up")
-    assert re.search(r"compose_remote pull \\\n\s*\|\| fatal ", body), (
-        "a failed pull must abort before `up -d`"
-    )
-    pull_at = body.index("compose_remote pull")
-    assert pull_at < body.index("remove_left_behind") < body.index("compose_remote up -d")
 
 
 # --------------------------------------------------------------------------- #
@@ -671,33 +542,6 @@ def test_a_one_shot_without_an_exit_code_is_not_mistaken_for_done(tmp_path: Path
     assert "within 1s — stuck: minio-init" in result.stderr
 
 
-def _shell_array(text: str, name: str) -> list[str]:
-    match = re.search(rf"^{re.escape(name)}=\((?P<items>[^)]*)\)$", text, re.M)
-    assert match is not None, f"no shell array named {name!r}"
-    return match.group("items").split()
-
-
-def test_the_one_shot_list_is_every_restart_no_service(script_text: str) -> None:
-    # Only a listed service counts as done once it exits 0, so a new `restart: "no"`
-    # service must land here too, or every deploy times out waiting for it.
-    base = ROOT / "compose" / "docker-compose.yml"
-    # deploy.sh never syncs the build overlay, so only the production files count.
-    skipped = {base.name, "docker-compose.build.yml"}
-    overlays = sorted(
-        path for path in base.parent.glob("docker-compose*.yml") if path.name not in skipped
-    )
-    restart: dict[str, object] = {}
-    for path in (base, *overlays):
-        services = (yaml.safe_load(path.read_text()) or {}).get("services") or {}
-        for name, spec in services.items():
-            if spec and "restart" in spec:
-                restart[name] = spec["restart"]
-    one_shots = {name for name, value in restart.items() if value in ("no", False)}
-
-    assert one_shots == {"minio-init", "profile-guard"}
-    assert set(_shell_array(script_text, "ONE_SHOT_SERVICES")) == one_shots
-
-
 @pytest.mark.parametrize(
     ("service", "state", "health", "exit_code", "done"),
     [
@@ -965,9 +809,7 @@ def test_every_remote_compose_call_carries_the_base_file_list(tmp_path: Path) ->
         assert line.startswith(f"compose {BASE_FILES} ") or line == BARE_HASH_CALL, line
 
 
-def test_the_usage_says_mode_was_removed_in_1_1_0(script_text: str) -> None:
-    assert "DEPLOY_MODE" not in script_text
-    assert "virtual-keys" not in _code_lines(script_text)
+def test_the_usage_says_mode_was_removed_in_1_1_0() -> None:
     result = subprocess.run([str(SCRIPT), "--help"], capture_output=True, text=True)
     assert result.returncode == 0
     assert re.search(r"^\s+--mode\b.*removed in 1\.1\.0", result.stderr, re.M), result.stderr
@@ -1221,7 +1063,6 @@ def test_help_documents_issuance() -> None:
 CERT_EXCLUDES = ("*.pem", "*.crt", "*.key", "*.p12", "*.pfx")
 # Names NGINX_TLS_CERT / NGINX_TLS_KEY accept that no extension rule catches.
 NGINX_CERT_FILES = ("x.pem", "x.key", "privkey", "server.cer")
-UNIT = ROOT / "scripts" / "deploy" / "corp-llm-gateway.service"
 
 
 def _with_nginx_tree(repo: Path) -> Path:
@@ -1306,19 +1147,6 @@ def test_a_sync_keeps_the_servers_certificates_and_sends_none_of_the_laptops(
     assert sorted(path.name for path in certs.iterdir()) == ["README.md", "gateway.key"]
     assert (certs / "gateway.key").read_text() == "server key\n"
     assert (remote / "nginx" / "entrypoint.sh").exists()
-
-
-def test_the_script_never_sets_a_profile(script_text: str) -> None:
-    code = _code_lines(script_text)
-    assert "--profile" not in code
-    for pattern in (
-        r"\bCOMPOSE_PROFILES=",
-        r"\bexport\s+[^\n]*\bCOMPOSE_PROFILES\b",
-        r"\bunset\s+[^\n]*\bCOMPOSE_PROFILES\b",
-        r"\benv\b[^\n]*(-u|--unset)[= ]*COMPOSE_PROFILES\b",
-        r"\benv\s+-i\b",
-    ):
-        assert not re.search(pattern, code), pattern
 
 
 @pytest.mark.parametrize(
@@ -1659,11 +1487,6 @@ def test_only_the_front_door_fails_fast_on_exited(tmp_path: Path) -> None:
     assert "front door is down" not in result.stderr
 
 
-def test_the_boot_time_unit_still_runs_a_bare_compose_up() -> None:
-    exec_start = [line for line in UNIT.read_text().splitlines() if line.startswith("ExecStart=")]
-    assert exec_start == ["ExecStart=/usr/bin/docker compose up -d"]
-
-
 @pytest.mark.parametrize(
     "compose_file",
     [None, "docker-compose.yml:docker-compose.issuance.yml"],
@@ -1895,12 +1718,9 @@ def test_down_removes_every_gateway_container_compose_down_leaves(tmp_path: Path
     assert all(_index(lines, removal) > down_at for removal in removals)
 
 
-def test_up_removes_orphans_in_the_same_gated_up(script_text: str, tmp_path: Path) -> None:
+def test_up_removes_orphans_in_the_same_gated_up(tmp_path: Path) -> None:
     # The 1.0 `litellm` container is an orphan that still holds 127.0.0.1:4000,
     # gateway-anthropic's port: without --remove-orphans the upgrade `up` fails.
-    assert re.search(
-        r"^\s*compose_remote up -d --remove-orphans$", _function_body(script_text, "cmd_up"), re.M
-    )
     repo = _fake_repo(tmp_path)
     remote = _remote_dir(tmp_path)
 

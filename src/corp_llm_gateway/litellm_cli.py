@@ -10,9 +10,9 @@ from __future__ import annotations
 from typing import Any
 
 # Exactly the keywords `proxy_cli.py:1061-1079` passes to `save_worker_config`.
-# tests/test_asgi_entrypoint.py reads that call with `ast` and fails if the two
-# drift, because a key litellm adds would otherwise silently keep its
-# `initialize()` default instead of the CLI's.
+# Re-checked at every litellm bump (docs/ops/upgrade.md, "Bumping litellm",
+# step 5): a key litellm adds would otherwise silently keep its `initialize()`
+# default instead of the CLI's.
 WORKER_CONFIG_KEYS: tuple[str, ...] = (
     "model",
     "alias",

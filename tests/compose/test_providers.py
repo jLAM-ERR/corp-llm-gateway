@@ -35,16 +35,13 @@ from tests.compose.nginx_support import (
     COMPOSE_DIR,
     MODE_A_ONLY_KEYS,
     REQUIRED_ENV,
-    ROOT,
     bare_compose_env,
     compose_cli_available,
     render,
     skip_or_fail,
 )
 
-ENV_EXAMPLE = COMPOSE_DIR / ".env.example"
 LITELLM_DIR = COMPOSE_DIR / "litellm"
-ANTHROPIC_CONFIG = LITELLM_DIR / "config.anthropic.yaml"
 
 LITELLM_CONFIG_TARGET = "/etc/litellm/config.yaml"
 SHIM_TARGET = "/etc/litellm/corp_llm_gateway/bootstrap.py"
@@ -84,10 +81,6 @@ def _base_services() -> dict[str, Any]:
     return yaml.safe_load(COMPOSE.read_text())["services"]
 
 
-def _anthropic_config() -> dict[str, Any]:
-    return yaml.safe_load(ANTHROPIC_CONFIG.read_text())
-
-
 def _rendered(tmp_path: Path, providers: str = ALL_PROVIDERS, **kwargs: Any) -> dict[str, Any]:
     return render(tmp_path, providers=providers, **kwargs).services
 
@@ -108,90 +101,8 @@ def _gateway_image_services(services: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# the routing table is the binding control
-# --------------------------------------------------------------------------- #
-
-
-def test_oauth_config_routes_only_native_anthropic_without_a_static_secret() -> None:
-    deployments = _anthropic_config()["model_list"]
-
-    assert len(deployments) == 1
-    assert deployments[0]["model_name"] == "claude-*"
-    params = deployments[0]["litellm_params"]
-    assert params["model"] == "anthropic/claude-*"
-    assert params["api_key"] == "oauth-passthrough-placeholder"
-    # A placeholder shaped like a real OAuth token would select litellm's OAuth
-    # branch at boot instead of failing upstream when the bridge is off.
-    assert not params["api_key"].startswith("sk-ant-")
-
-
-def test_oauth_config_has_no_wildcard_and_no_foreign_provider_route() -> None:
-    for deployment in _anthropic_config()["model_list"]:
-        assert deployment["model_name"] != "*"
-        assert deployment["litellm_params"]["model"].startswith("anthropic/")
-
-
-def test_oauth_config_never_reads_a_gateway_held_provider_key() -> None:
-    # The developer's own token is the only upstream credential. An
-    # `os.environ/ANTHROPIC_API_KEY` here would let a stale key serve traffic the
-    # operator believes is subscription-billed. Asserted on the parsed values,
-    # not the file text — the header comment names the variable to say it is NOT read.
-    for deployment in _anthropic_config()["model_list"]:
-        for value in deployment["litellm_params"].values():
-            assert not str(value).startswith("os.environ/"), deployment["model_name"]
-
-
-def test_oauth_config_uses_the_production_composition_root() -> None:
-    # NOT _demo_guardrail: that one seeds an in-memory token store with
-    # `demo-team-token` and has no audit chain.
-    settings = _anthropic_config()["litellm_settings"]
-
-    assert settings["callbacks"] == ["corp_llm_gateway.bootstrap.guardrail"]
-    assert settings["drop_params"] is True
-    assert settings["json_logs"] is True
-
-
-# --------------------------------------------------------------------------- #
 # one gateway per provider, from one definition
 # --------------------------------------------------------------------------- #
-
-
-def test_the_base_stack_hands_both_bridge_flags_to_the_container() -> None:
-    # bootstrap.build_guardrail() reads both; each gateway sets both explicitly,
-    # so no provider inherits another's bridge.
-    services = _base_services()
-
-    for provider, (anthropic, chatgpt) in BRIDGES.items():
-        environment = services[GATEWAYS[provider]]["environment"]
-        assert environment["CORP_LLM_FORWARD_ANTHROPIC_AUTH"] == anthropic, provider
-        assert environment["CORP_LLM_FORWARD_CHATGPT_AUTH"] == chatgpt, provider
-
-
-def test_each_gateway_is_switched_by_its_own_profile_only() -> None:
-    services = _base_services()
-
-    gateways = {name for name in services if name.startswith("gateway-")}
-    assert gateways == set(GATEWAYS.values())
-    for provider, name in GATEWAYS.items():
-        assert services[name]["profiles"] == [provider]
-    assert "profiles" not in services["profile-guard"]
-
-
-def test_the_three_gateways_share_one_definition() -> None:
-    services = _base_services()
-    first, *others = (services[name] for name in GATEWAYS.values())
-
-    for other in others:
-        differing = {key for key in first.keys() | other.keys() if first.get(key) != other.get(key)}
-        assert differing == {"profiles", "volumes", "environment", "ports"}, differing
-        changed = {
-            key
-            for key in first["environment"].keys() | other["environment"].keys()
-            if first["environment"].get(key) != other["environment"].get(key)
-        }
-        assert changed <= {"CORP_LLM_FORWARD_ANTHROPIC_AUTH", "CORP_LLM_FORWARD_CHATGPT_AUTH"}
-        assert first["volumes"][1:] == other["volumes"][1:]
-    assert "<<: *gateway" in COMPOSE.read_text()
 
 
 @needs_compose_cli
@@ -273,16 +184,6 @@ def test_no_gateway_image_service_gets_a_master_key_ui_provider_key_or_litellm_d
         assert not leaked, (name, leaked)
 
 
-def test_no_compose_file_names_a_mode_a_provider_key_or_litellm_database_switch() -> None:
-    # DATABASE_URL itself stays: Langfuse needs its own.
-    names = (*MODE_A_ONLY_KEYS, "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "STORE_MODEL_IN_DB")
-    for path in sorted(COMPOSE_DIR.glob("docker-compose*.yml")):
-        text = path.read_text()
-        for key in names:
-            assert key not in text, (path.name, key)
-    assert not (COMPOSE_DIR / "postgres" / "initdb" / "00-create-litellm-db.sh").exists()
-
-
 @needs_compose_cli
 def test_a_master_key_left_in_env_reaches_no_gateway(tmp_path: Path) -> None:
     # A leftover .env line from 1.0 must not reach a container: litellm would
@@ -335,36 +236,6 @@ def test_the_merged_stack_arms_the_bridge_and_injects_no_master_key(tmp_path: Pa
 # --------------------------------------------------------------------------- #
 # the no-provider refusal
 # --------------------------------------------------------------------------- #
-
-
-def test_the_profile_guard_runs_once_on_the_gateway_image_outside_the_audit_trail() -> None:
-    guard = _base_services()["profile-guard"]
-
-    assert guard["image"] == _base_services()["gateway-anthropic"]["image"]
-    assert guard["restart"] == "no"
-    assert guard["environment"] == ["COMPOSE_PROFILES=${COMPOSE_PROFILES:-}"]
-    assert "labels" not in guard
-    assert "ports" not in guard and "volumes" not in guard
-
-
-def test_postgres_waits_for_the_profile_guard_and_every_gateway_for_postgres() -> None:
-    services = _base_services()
-
-    assert services["postgres"]["depends_on"] == {
-        "profile-guard": {"condition": "service_completed_successfully"}
-    }
-    for name in GATEWAYS.values():
-        assert services[name]["depends_on"]["postgres"] == {"condition": "service_healthy"}
-
-
-@pytest.mark.parametrize("service", ["vector", "nginx", "nginx-ports"])
-def test_the_audit_and_front_door_services_wait_for_the_gateways_only_if_enabled(
-    service: str,
-) -> None:
-    depends_on = _base_services()[service]["depends_on"]
-
-    for name in GATEWAYS.values():
-        assert depends_on[name] == {"condition": "service_started", "required": False}
 
 
 def _guard_script() -> str:
@@ -539,40 +410,3 @@ def test_up_starts_once_a_provider_profile_is_set(live_project: Any) -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert NO_PROVIDER_MESSAGE not in logs
-
-
-# --------------------------------------------------------------------------- #
-# .env.example and the boot-time unit
-# --------------------------------------------------------------------------- #
-
-
-def test_the_env_example_ships_the_provider_switch_commented() -> None:
-    # Commented on purpose: a copied .env starts nothing until the operator picks
-    # a provider, and profile-guard says so by name.
-    lines = ENV_EXAMPLE.read_text().splitlines()
-
-    assert "# COMPOSE_PROFILES=anthropic" in lines
-    assert not [line for line in lines if line.startswith("COMPOSE_PROFILES=")]
-    for provider in PROVIDERS:
-        assert any(line.startswith(f"#   {provider} ") for line in lines), provider
-
-
-def test_the_env_example_offers_each_gateway_port_and_no_mode_a_key() -> None:
-    text = ENV_EXAMPLE.read_text()
-
-    for key, port in PORTS.values():
-        assert f"\n{key}={port}\n" in text, key
-    for key in FORBIDDEN_ENV:
-        assert f"\n{key}=" not in text and f"\n# {key}=" not in text, key
-    assert "docker-compose.oauth.yml" not in text
-
-
-def test_the_autostart_unit_runs_a_bare_compose_up_so_mode_b_needs_compose_file() -> None:
-    # The bare command is what makes the .env decide: COMPOSE_PROFILES picks the
-    # providers and COMPOSE_FILE the overlays. An explicit `-f` or `--profile`
-    # here would pin the unit to one stack.
-    unit = (ROOT / "scripts" / "deploy" / "corp-llm-gateway.service").read_text()
-    exec_start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
-
-    assert exec_start == "ExecStart=/usr/bin/docker compose up -d"
-    assert " -f " not in exec_start

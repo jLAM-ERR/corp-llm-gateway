@@ -10,8 +10,6 @@ skips, CI's 3.12 job runs them.
 
 from __future__ import annotations
 
-import inspect
-
 import pytest
 
 from corp_llm_gateway.litellm_hook import _NON_CHAT_INPUT_CALL_TYPES
@@ -179,12 +177,3 @@ def test_every_client_side_credential_key_is_removed_or_refused_by_litellm() -> 
     assert set(handler.clientside_credential_keys) <= _CLIENT_CONTROL_BODY_KEYS | banned
     for key in _CLIENT_CONTROL_BODY_KEYS:
         assert key not in banned, f"litellm now refuses {key}; the removal is redundant"
-
-
-def test_litellm_still_reads_the_removed_body_keys_into_the_upstream_call() -> None:
-    # If litellm stopped reading one of these, the removal list is stale, not unsafe;
-    # if it starts reading a new header or destination key, extend the list.
-    main = pytest.importorskip("litellm.main", reason=_SKIP_REASON)
-    source = inspect.getsource(main)
-    for key in ("extra_headers", "provider_specific_header", "organization"):
-        assert f'kwargs.get("{key}"' in source, key

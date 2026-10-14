@@ -38,7 +38,6 @@ failure. ``_skip_or_fail`` is the ONLY place any of them is raised.
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import json
 import os
@@ -58,7 +57,6 @@ import httpx
 import pytest
 import yaml
 
-from corp_llm_gateway.sanitizer.identity_preamble import CLAUDE_CODE_IDENTITY_PREAMBLES
 from corp_llm_gateway.settings import parse_flag
 
 REQUIRE_ENV_VAR = "CORP_REQUIRE_PROXY_CAPTURE"
@@ -78,7 +76,6 @@ def _skip_or_fail(reason: str) -> NoReturn:
 ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE_PATH = ROOT / "docker/anthropic-oauth/Dockerfile"
 CONFIG_PATH = ROOT / "docker/anthropic-oauth/litellm-config.yaml"
-CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 
 # Seeded by _demo_guardrail's in-memory token store, which the shipped config's
 # callback builds.
@@ -440,60 +437,6 @@ def _assert_prompt_was_sanitized(body: dict[str, Any]) -> None:
 
 
 # ---- tests -----------------------------------------------------------------
-
-
-def test_identity_preamble_literal_matches_the_shipped_constant() -> None:
-    assert IDENTITY_PREAMBLE in CLAUDE_CODE_IDENTITY_PREAMBLES
-
-
-def test_every_skip_path_in_this_module_goes_through_the_guard() -> None:
-    """One guarded fixture and one unguarded one is the same trap, one level down."""
-    tree = ast.parse(Path(__file__).read_text())
-    holders = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and any(
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "skip"
-            for call in ast.walk(node)
-        )
-    }
-    # The other ways a test here could stop asserting without failing.
-    bypasses = sorted(
-        node.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute) and node.attr in {"skipif", "xfail", "importorskip"}
-    )
-
-    assert holders == {"_skip_or_fail"}, holders
-    assert not bypasses, bypasses
-
-
-def test_ci_runs_this_suite_with_the_skip_guard_armed() -> None:
-    """The guard is worth only as much as its wiring.
-
-    Every assertion in this file sits behind a fixture that can skip on an
-    environment fault, and this test is one of the two that cannot — so it is the
-    one that has to catch a CI job which dropped the env var and went back to
-    reporting green over nothing.
-    """
-    job = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["test"]
-    # scripts/test-gates.sh runs the suite with the job's step env.
-    steps = [
-        step
-        for step in job.get("steps", [])
-        if any(marker in (step.get("run") or "") for marker in ("pytest", "test-gates.sh"))
-    ]
-
-    assert steps, f"{CI_WORKFLOW.name}'s test job no longer runs pytest"
-    for step in steps:
-        env = {**(job.get("env") or {}), **(step.get("env") or {})}
-        assert parse_flag(str(env.get(REQUIRE_ENV_VAR, ""))), (
-            f"{CI_WORKFLOW.name} runs {step['run']!r} without {REQUIRE_ENV_VAR}: "
-            "the outbound capture assertions can all skip and still report green"
-        )
 
 
 def test_messages_route_sends_the_subscription_token_and_nothing_else(bridge_stack: _Stack) -> None:

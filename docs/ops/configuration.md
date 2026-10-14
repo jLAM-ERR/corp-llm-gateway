@@ -187,9 +187,9 @@ only the **client-visible model alias**; litellm resolves the real deployment
 after the hook runs. That check is defence-in-depth, not a routing guarantee. The
 binding control is the deployment shape: a litellm config with no `model_name:
 "*"` catch-all and no non-`anthropic/` route, which is what
-`compose/litellm/config.anthropic.yaml` ships (pinned by
-`tests/compose/test_providers.py`), as does the demo's
-`docker/anthropic-oauth/litellm-config.yaml` (`tests/test_anthropic_oauth_profile.py`).
+`compose/litellm/config.anthropic.yaml` ships, as does the demo's
+`docker/anthropic-oauth/litellm-config.yaml`. No test reads their routes, so a
+change to either is reviewed for this shape.
 For the ChatGPT bridge the same control is `config.codex.yaml`'s one route,
 whose `api_base` is a literal, not an environment value.
 

@@ -1,5 +1,7 @@
 # Deleted-tests ledger
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 Every test node id a prune PR removes, or a helper-consolidation PR changes, gets one
 row here, in the same PR. The gates are in [must-keep.md](must-keep.md); a row is the
 semantic-equivalence note the check inventory asked for while the refactor ran. Task 10

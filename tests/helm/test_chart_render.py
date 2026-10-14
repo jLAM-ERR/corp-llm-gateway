@@ -187,13 +187,6 @@ def test_keycloak_egress_needs_the_network_policy_enabled() -> None:
     assert not any(doc.get("kind") == "NetworkPolicy" for doc in docs)
 
 
-def test_keycloak_egress_knobs_sit_under_network_policy() -> None:
-    values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
-
-    assert "keycloak" not in values
-    assert values["networkPolicy"]["keycloak"] == {"enabled": False, "cidr": "", "port": 443}
-
-
 # ── the in-flight cap and litellm's disconnect watch ─────────────────────────
 
 
@@ -369,27 +362,6 @@ def test_issuance_is_off_by_default_and_renders_no_config_file(
     for container in _gateway_and_check(rendered_docs):
         assert "gateway-config" not in _names(container.get("volumeMounts"))
         assert "CORP_LLM_GATEWAY_CONFIG_FILE" not in _names(container["env"])
-
-
-def test_issuance_values_default_to_off_with_the_settings_defaults() -> None:
-    values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
-
-    assert values["issuance"] == {
-        "enabled": False,
-        "issuer": "",
-        "audience": "",
-        "clientId": "",
-        "jwksUrl": "",
-        "teamClaim": "groups",
-        "userClaim": "preferred_username",
-        "ttlDays": 30,
-        "maxActive": 2,
-        "minIntervalSeconds": 600,
-        "maxInflight": 4,
-        "ratePerMinute": 30,
-        "storeTimeoutSeconds": 10,
-        "teamMap": [],
-    }
 
 
 def test_issuance_renders_the_config_toml_with_the_team_map_in_list_order(

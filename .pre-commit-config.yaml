@@ -13,16 +13,15 @@ repos:
         args: [--maxkb=500]
       - id: check-merge-conflict
       - id: detect-private-key
-        # The manifests and tests/sanitizer/test_allowlist.py hold a parametrize id
-        # that spells out a PEM header; test_deploy_script.py writes a one-line
+        # tests/sanitizer/test_allowlist.py holds a parametrize id that spells out
+        # a PEM header; test_deploy_script.py writes a one-line
         # placeholder server.key. test_dlp_guard.py and test_regex_checksum.py carry
         # a PEM header plus one truncated base64 line (the fixed 2048-bit RSA DER
         # prefix, ~39 bytes, no key material) so the detectors under test see a
         # PEM-shaped block.
         exclude: |
           (?x)^tests/(
-            _manifests/(expected_outcomes\.(minimal|full)\.json|must_keep/sanitizer\.txt)
-            |sanitizer/test_allowlist\.py
+            sanitizer/test_allowlist\.py
             |sanitizer/test_dlp_guard\.py
             |detectors/test_regex_checksum\.py
             |deploy/test_deploy_script\.py

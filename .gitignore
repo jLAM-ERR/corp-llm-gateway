@@ -65,7 +65,6 @@ connect-corp-ner.pdf
 # profile (.revmux/profile.md) IS tracked; only the task archive is ignored.
 .revmux/tasks/
 
-# Test-gate environments and run outputs (scripts/test-env.sh, scripts/test-gates.sh)
+# The two test environments (scripts/test-env.sh)
 .venv-test-minimal/
 .venv-test-full/
-.test-gates/

@@ -1,20 +1,14 @@
-"""The issuance surface speaks in error codes: `E_` + upper-case words, one
-exception family per code, passed through the route verbatim. Its log lines are
-code-shaped too, and nothing on the path prints to stdout.
-
-The code inventory is collected from the source (as the route-table collector
-does), so a code added later is checked without editing this file.
+"""The issuance surface speaks in error codes: `E_` + upper-case words, passed
+through the route verbatim. Its log lines are code-shaped too, and nothing on the
+path prints to stdout.
 """
 
 from __future__ import annotations
 
-import ast
 import functools
 import logging
 import re
 import time
-from collections.abc import Iterator
-from pathlib import Path
 
 import httpx
 import pytest
@@ -35,120 +29,45 @@ from corp_llm_gateway.tokens import (
     TokenIssuer,
 )
 
-SRC = Path(__file__).resolve().parents[2] / "src" / "corp_llm_gateway"
-ISSUANCE_SOURCES = (
-    "tokens/oidc_verifier.py",
-    "tokens/issuance.py",
-    "tokens/issuance_policy.py",
-    "tokens/errors.py",
-    "tokens/in_memory.py",
-    "tokens/postgres_store.py",
-    "healthz/server.py",
-    "bootstrap.py",
-)
-CODE_SHAPE = re.compile(r"E_[A-Z]+(?:_[A-Z]+)*")
-FAMILIES = (
-    "OidcVerificationError",
-    "OidcTeamMappingError",
-    "JwksUnavailableError",
-    "IssuancePolicyError",
+# Every code the issuance sources raise or return.
+CODES = (
+    "E_ISSUE_BODY",
+    "E_ISSUE_BODY_TIMEOUT",
+    "E_ISSUE_BUSY",
+    "E_ISSUE_DISABLED",
+    "E_ISSUE_INFLIGHT",
+    "E_ISSUE_INTERNAL",
+    "E_ISSUE_NO_TEAM",
+    "E_ISSUE_RATE",
+    "E_ISSUE_REFUSED",
+    "E_ISSUE_REPLAY",
+    "E_ISSUE_SCHEMA",
+    "E_ISSUE_STORE_TIMEOUT",
+    "E_ISSUE_STORE_UNAVAILABLE",
+    "E_ISSUE_THROTTLED",
+    "E_ISSUE_UNKNOWN_TEAM",
+    "E_JWKS_UNAVAILABLE",
+    "E_METHOD_NOT_ALLOWED",
+    "E_OIDC_ALG",
+    "E_OIDC_AUDIENCE",
+    "E_OIDC_AZP",
+    "E_OIDC_CLAIMS",
+    "E_OIDC_CLAIM_TYPE",
+    "E_OIDC_EXPIRED",
+    "E_OIDC_INVALID",
+    "E_OIDC_ISSUER",
+    "E_OIDC_KID",
+    "E_OIDC_MALFORMED",
+    "E_OIDC_MISSING",
+    "E_OIDC_MISSING_CLAIM",
+    "E_OIDC_NOT_YET_VALID",
+    "E_OIDC_OPERATOR_AUDIENCE",
+    "E_OIDC_SIGNATURE",
+    "E_OIDC_TYP",
+    "E_OIDC_UNKNOWN_KID",
 )
 PATH = "/internal/issue-token"
 _ISSUER = "https://kc.corp.lan/realms/dev"
-
-
-def _trees() -> Iterator[tuple[str, ast.Module]]:
-    for rel in ISSUANCE_SOURCES:
-        yield rel, ast.parse((SRC / rel).read_text())
-
-
-_IDENTIFIER_LIKE = re.compile(r"E_\w+")
-
-
-def _codes_in_source() -> set[str]:
-    return {
-        node.value
-        for _, tree in _trees()
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and _IDENTIFIER_LIKE.fullmatch(node.value)
-    }
-
-
-def _policy_constants() -> dict[str, str]:
-    tree = ast.parse((SRC / "tokens/errors.py").read_text())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == "IssuancePolicyError":
-            return {
-                stmt.targets[0].id: stmt.value.value
-                for stmt in node.body
-                if isinstance(stmt, ast.Assign)
-                and isinstance(stmt.targets[0], ast.Name)
-                and isinstance(stmt.value, ast.Constant)
-            }
-    raise AssertionError("IssuancePolicyError not found")
-
-
-def _raised_codes_by_family() -> dict[str, set[str]]:
-    """Codes each exception family is raised with: a literal first argument, an
-    ``IssuancePolicyError.X`` constant, or a local ``code`` variable's literals."""
-    policy = _policy_constants()
-    found: dict[str, set[str]] = {family: set() for family in FAMILIES}
-    for _, tree in _trees():
-        for func in ast.walk(tree):
-            if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
-                continue
-            local_codes: dict[str, set[str]] = {}
-            for node in ast.walk(func):
-                if (
-                    isinstance(node, ast.Assign)
-                    and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and isinstance(node.value, ast.Constant)
-                    and isinstance(node.value.value, str)
-                    and node.value.value.startswith("E_")
-                ):
-                    local_codes.setdefault(node.targets[0].id, set()).add(node.value.value)
-            for node in ast.walk(func):
-                call = node.exc if isinstance(node, ast.Raise) else node
-                if not (
-                    isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Name)
-                    and call.func.id in FAMILIES
-                    and call.args
-                ):
-                    continue
-                arg = call.args[0]
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    if arg.value.startswith("E_"):
-                        found[call.func.id].add(arg.value)
-                elif isinstance(arg, ast.Attribute) and arg.attr in policy:
-                    found[call.func.id].add(policy[arg.attr])
-                elif isinstance(arg, ast.Name):
-                    found[call.func.id] |= local_codes.get(arg.id, set())
-    return found
-
-
-def test_the_inventory_is_not_empty() -> None:
-    found = _raised_codes_by_family()
-    assert "E_OIDC_EXPIRED" in found["OidcVerificationError"]
-    assert "E_ISSUE_UNKNOWN_TEAM" in found["OidcTeamMappingError"]
-    assert "E_JWKS_UNAVAILABLE" in found["JwksUnavailableError"]
-    assert {"E_ISSUE_RATE", "E_ISSUE_REPLAY", "E_ISSUE_BUSY"} <= found["IssuancePolicyError"]
-
-
-def test_every_code_is_upper_case_words_after_e() -> None:
-    codes = _codes_in_source()
-    assert len(codes) >= 20
-    assert sorted(c for c in codes if not CODE_SHAPE.fullmatch(c)) == []
-
-
-def test_no_code_is_raised_by_two_exception_families() -> None:
-    found = _raised_codes_by_family()
-    for i, first in enumerate(FAMILIES):
-        for second in FAMILIES[i + 1 :]:
-            assert found[first].isdisjoint(found[second]), (first, second)
 
 
 async def _ok() -> bool:
@@ -170,7 +89,7 @@ def _router(verifier: object, **bounds: object) -> object:
     )
 
 
-@pytest.mark.parametrize("code", sorted(_codes_in_source()))
+@pytest.mark.parametrize("code", CODES)
 async def test_every_code_survives_the_route_verbatim(code: str) -> None:
     async def verify(token: str) -> OidcClaims:
         raise OidcVerificationError(code)

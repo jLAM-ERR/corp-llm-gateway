@@ -38,8 +38,8 @@ src/corp_llm_gateway/
   payload/      size threshold + gzip + per-team quota + oversize policy (fail-closed default)
   profiles/     plugin bundles — ProfileBundle/PolicyKnobs(merge) + loaders/resolver + DETECTOR_REGISTRY + manifest (hash-integrity) + defaults/
   providers/    ProviderRegistry + executable v1-guard (anthropic/openai/corp-vllm; v2 behind CORP_ALLOW_V2_PROVIDERS)
-  route_gate/   default-deny gate: table.py (hand-classified against litellm's source, guarded by the
-                collector test) + classify.py + middleware.py (also refuses a rewritten-route body that is not
+  route_gate/   default-deny gate: table.py (hand-classified against litellm's source, re-checked by
+                hand per litellm bump: docs/ops/upgrade.md) + classify.py + middleware.py (also refuses a rewritten-route body that is not
                 UTF-8 JSON (415) or has a top-level `policies` key (403)); litellm's admin/auth/spend/public/UI/non-probe
                 health surfaces are REFUSE (litellm rows 26 PASSTHROUGH / 879 REFUSE / 8 REWRITTEN + 6 gateway rows)
                 + inflight.py: the gateway-owned in-flight cap (CORP_LLM_MAX_INFLIGHT), single owner of `receive`,
@@ -79,8 +79,9 @@ compose/                 production compose stack for non-k8s hosts: one gateway
 docs/                    plans/ + audit-schema + security + ops/* (install/configuration/admin-cli/upgrade/profiles/runbook/capacity/release) + rbac-matrix + adr/*
 scripts/install.sh       laptop installer (bash/zsh/fish, macOS/Linux)
 tests/                   pytest, pytest-asyncio mode=auto; one directory per component or layer (table: docs/testing/README.md);
-                         5,048 passed / 455 skipped in the minimal env (.venv-test-minimal), 6,301 / 17 in the full one
-                         (.venv-test-full: every extra, litellm, Postgres, CI=true), both from scripts/test-env.sh
+                         4,352 passed / 432 skipped in the minimal env (.venv-test-minimal),
+                         5,575 / 17 in the full one (.venv-test-full: every extra, litellm, Postgres,
+                         CI=true), both from scripts/test-env.sh; logic tests only (docs/testing/README.md)
 ```
 
 The GA-readiness / security / extensibility build is `docs/plans/20260708-ga-readiness-security-extensibility.md`
@@ -135,8 +136,9 @@ proved (docs/security.md §15, hazards 1-19).
 The process that serves this is **ours**: `python -m corp_llm_gateway.serve` → `asgi.py`, which
 checks litellm's config, then imports litellm at step 3 (`save_worker_config`) and its app + our
 `bootstrap` at step 4. Neither the `litellm` CLI nor litellm's own `proxy_server` app may ever be a
-serve target again — both run litellm's routers with no gate in front (`tests/test_launch_command.py`
-greps the tree for either). Details: `docs/security.md` §14.
+serve target again — both run litellm's routers with no gate in front. No test checks this, so
+review every `ENTRYPOINT` / `command` / `entrypoint` change for it (`docs/security.md` §11).
+Details: `docs/security.md` §14.
 
 The old three tiers (FunctionCall → JSON → Regex, `sanitizer/engine.py`) still parse the oracle's
 response when it IS called; they are no longer the primary detection path. Local detectors live in
@@ -159,24 +161,24 @@ Two caches:
 ```
 # The two reproducible environments (Python 3.14). minimal = the package without extras
 # or litellm; full = every extra CI installs + litellm, Postgres at CORP_TEST_PG_DSN,
-# CI=true. test-gates.sh checks the venv's fingerprint and the static gates, runs the whole
-# suite, compares it with the must-keep ledger and prints OK. CI's test job runs the full
-# one once (scripts/test-gates.sh full) and never minimal: minimal is a local check. Run it
+# CI=true. test-gates.sh sets the environment's variables and runs `pytest tests/ -q -rs`
+# once; its exit code is pytest's. CI's test job runs the full one once
+# (scripts/test-gates.sh full) and never minimal: minimal is a local check. Run it
 # before changing optional-extra imports, lazy-import / graceful-degradation code, or the
 # laptop CLI / proxy install.
-scripts/test-env.sh minimal && scripts/test-gates.sh minimal   # 5,048 passed / 455 skipped, ~10 min
+scripts/test-env.sh minimal && scripts/test-gates.sh minimal   # 4,352 passed / 432 skipped, ~9 min
 docker run --rm -d --name pg-test -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=gateway \
   -e POSTGRES_DB=gateway -p 55432:5432 postgres:16
 scripts/test-env.sh full && CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
-  scripts/test-gates.sh full                                    # 6,301 passed / 17 skipped, ~21 min
+  scripts/test-gates.sh full                                    # 5,575 passed / 17 skipped, ~20 min
 
 # Run the full environment before every commit; minimal too when the cases above apply.
 
 # Local loop without the tests tests/slow_tests.txt lists (CI runs everything):
-CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"  # ~5.5 min
+CORP_REQUIRE_PROXY_CAPTURE=1 PYTHONPATH=src .venv-test-minimal/bin/python -m pytest tests/ -q -m "not slow"  # ~7 min
 CI=true CORP_REQUIRE_PROXY_CAPTURE=1 NO_PROXY=127.0.0.1,localhost \
   CORP_TEST_PG_DSN=postgresql://gateway:gateway@localhost:55432/gateway \
-  PYTHONPATH=src .venv-test-full/bin/python -m pytest tests/ -q -m "not slow"                  # ~10.5 min
+  PYTHONPATH=src .venv-test-full/bin/python -m pytest tests/ -q -m "not slow"                  # ~14 min
 
 # The older local venvs still work: .venv (Python 3.14, no extras, no litellm) and
 # .venv-bench (every extra + litellm 1.101.0). NO_PROXY: on a machine with a system HTTP
@@ -206,27 +208,10 @@ REDIS_URL=redis://localhost:6379/0 CORP_LLM_ENDPOINT=http://localhost:8000 CORP_
   `requires_helm`, `requires_shellcheck`, `not_root` become setup-time skips when the
   dependency is missing (the root conftest); `slow` marks the tests `tests/slow_tests.txt`
   lists. `--shuffle-seed N` runs the suite in a seeded random order.
-- Layout: `docs/testing/README.md` — which `tests/<dir>/` owns which behaviour, the move /
-  prune PR rule, the name-pinned rule.
-- Permanent gates (`docs/testing/must-keep.md`, manifests in `tests/_manifests/`):
-  - must-keep ids (`must_keep/`): tests no PR may delete, re-split or reduce;
-  - expected-outcome ledgers (`expected_outcomes.{minimal,full}.json`): each must-keep id's
-    outcome per environment;
-  - environment fingerprints (`env_fingerprint.{minimal,full}.json`): each venv's markers
-    and `name==version` set;
-  - name-pinned index (`name_pinned.json`): every test a doc or the acceptance matrix
-    cites, with its citing lines;
-  - negative-log review (`negative_log_checks.json`): every "a log line does not hold X"
-    assert, classified by hand;
-  - moves map (`moves.json`): each moved or renamed test back to its baseline id.
-
-  A plain `pytest tests/` run checks the static manifests and the recorded fingerprints
-  (the gate tests in `tests/_gates/`; the running venv against its fingerprint only with
-  `CORP_TEST_ENV=<env>`, which `scripts/test-gates.sh` sets). The run-vs-ledger compare
-  is `scripts/test-gates.sh` only.
-- After an approved change to a must-keep test: record both environments and rewrite the
-  ledgers as `docs/testing/must-keep.md` "Running the gates" says, ending with
-  `python -m tests._gates.ledger write --minimal .test-gates/minimal/ledger.json --full .test-gates/full/ledger.json`.
+- Layout: `docs/testing/README.md` — which `tests/<dir>/` owns which behaviour, and the
+  rule: a test runs production code and asserts on what it does. No test reads a doc, reads
+  source or config as text, or tests the harness. What such checks used to guard is a review
+  step, listed in `docs/security.md` §11.
 
 ## Tooling
 
@@ -251,10 +236,11 @@ REDIS_URL=redis://localhost:6379/0 CORP_LLM_ENDPOINT=http://localhost:8000 CORP_
   pytest suite once on Python **3.14**, through `scripts/test-env.sh full &&
   scripts/test-gates.sh full`: the pinned full environment (the `ner`/`postgres`/`oidc`/
   `asgi`/`metrics` extras + `en_core_web_md`), a Postgres 16 service and
-  `CORP_TEST_PG_DSN`, + helm render tests, checked against the full ledger (the minimal
+  `CORP_TEST_PG_DSN`, + helm render tests (the minimal
   environment is local only, see Running tests), an `integration-container` job
   (route gate on the real image), and an `e2e` job (`tests/e2e` against Redis and both
-  mocks). All four run Python 3.14; `tests/test_ci_workflow.py` pins that
+  mocks). All four run Python 3.14. No test checks the workflow's shape
+  (`docs/security.md` §11): review a CI change for the env, `CI=true` and the Python version
 
 ## CLI entry points
 
@@ -323,7 +309,8 @@ When adding a new tunable, plumb it through this loader — don't read
    parses it. The compose front door (`compose/nginx/`) mirrors
    the gate at the edge — an exact-path allow-list, 404 before a body byte is
    read — so adding a location there is the same security decision as adding
-   a table row. Two rules under it (rows 7a/7b):
+   a table row. No test catches a route a litellm bump adds: every bump runs
+   the manual checklist in `docs/ops/upgrade.md`. Two rules under it (rows 7a/7b):
    - **No slot before the body is complete.** The in-flight limiter drains
      the whole body under `CORP_LLM_BODY_READ_SECONDS`, `CORP_LLM_MAX_DRAINING`
      and `CORP_LLM_MAX_DRAINING_BYTES` before it takes a slot; never acquire

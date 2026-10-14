@@ -215,8 +215,9 @@ ASGI-десанитайзере (`route_gate/desanitize_middleware.py`), пок�
 `apply_guardrail` где угодно в MRO самого `CorpLlmGuardrail` отключает наш
 pre-call и не даёт взвести шлюз (exit 70); отдельный ваш класс с
 `apply_guardrail` — это guardrail litellm, которого проверка при взведении не
-видит: его отсекают guards конфигов (`tests/test_litellm_config_guards.py`:
-поставляемые конфиги не запускают ни одного guardrail litellm). `CustomGuardrail`
+видит. Поставляемые конфиги не запускают ни одного guardrail litellm, и ни один
+тест это не проверяет (`docs/security.ru.md` §11 (n)), поэтому изменение конфига
+проверяется на это ревью. `CustomGuardrail`
 включает per-chunk хуки litellm для всех callback-ов (`docs/security.ru.md` §15).
 
 ## Задачи, которые ждут несколько запросов: `inflight.spawn_shared`

@@ -309,29 +309,3 @@ async def test_a_refused_request_hands_no_failure_hook_the_corp_token(
     assert exchange.status == REFUSALS[refusal]
     assert exchange.provider_bodies == []
     assert capture.failure_hook_sites == [[]]
-
-
-def test_the_walker_finds_a_token_in_every_shape_it_reads() -> None:
-    request = httpx.Request("POST", "http://u/v1", headers={"x-corp-auth": CORP_TOKEN})
-    shapes: list[Any] = [
-        {"a": {"b": [CORP_TOKEN]}},
-        {CORP_TOKEN: 1},
-        (CORP_TOKEN.encode(),),
-        request,
-        httpx.Response(200, request=request),
-    ]
-
-    for shape in shapes:
-        assert token_sites(shape, CORP_TOKEN), shape
-    assert token_sites({"a": "clean"}, CORP_TOKEN) == []
-
-
-def test_the_walker_fails_loudly_at_its_depth_cap() -> None:
-    deep: Any = "clean"
-    for _ in range(MAX_WALK_DEPTH + 1):
-        deep = {"n": deep}
-
-    with pytest.raises(AssertionError, match="depth cap"):
-        token_sites(deep, CORP_TOKEN)
-    (site,) = _captured_sites(deep)
-    assert site.startswith("<walker failed")

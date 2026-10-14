@@ -139,25 +139,6 @@ async def test_the_shared_store_probe_is_bounded_by_the_pool_acquire(
     assert resp.json()["detail"] == "postgres_error:TimeoutError"
 
 
-def test_the_probe_never_dials_a_bare_connect() -> None:
-    # Every readiness connection carries the pools' startup parameters.
-    import ast
-    import inspect
-
-    tree = ast.parse(inspect.getsource(bootstrap))
-    bare = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "connect"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "asyncpg"
-    ]
-
-    assert bare == []
-
-
 # ── the token schema, when the boot could not check it ───────────────────────
 
 ROOT = Path(__file__).resolve().parents[2]

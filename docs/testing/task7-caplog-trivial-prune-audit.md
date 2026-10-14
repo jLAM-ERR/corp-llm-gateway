@@ -1,5 +1,7 @@
 # Task 7 caplog, call_count and trivial-test prune audit (phase 1)
 
+> Historical record of plan 20260926; the gate system was removed by plan 20261014.
+
 The audit of plan `docs/plans/20260926-test-suite-refactor-and-prune.md` (rev 16, local only), Task 7: `caplog`
 wording and trivial-test pruning, the last prune PR. Phase 1 decides keep / delete for every id of the universe
 below and changes no test. Phase 2 (after review) makes the deletions, the [deleted-tests.md](deleted-tests.md)

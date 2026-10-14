@@ -129,9 +129,11 @@ provider: the middleware enforces the table and refuses anything it does not
 know (default-deny). See [`security.md`](security.md) §14 for what the gate is
 and why.
 
-Bumping litellm means re-running the classification, because the guard test
-(`tests/route_gate/test_litellm_route_guard.py`) reads litellm's installed
-`proxy/` source with `ast` on every CI run and fails on:
+Bumping litellm means re-running the classification. No test does this any
+more: the manual checklist in [`ops/upgrade.md`](ops/upgrade.md), "Bumping
+litellm", replaces the drift tests (`security.md` §11 (m)). Its step 2 runs the
+route guard the suite had until 1.1.0. The guard reads litellm's installed
+`proxy/` source with `ast` and fails on:
 
 - a `(method, path)` the tables do not know — **every new or moved route**;
 - a REWRITTEN entry whose handler no longer reaches `pre_call_hook`;
@@ -140,34 +142,31 @@ Bumping litellm means re-running the classification, because the guard test
   handler that calls `litellm.acompletion`, `aresponses`, `token_counter`,
   `router.a*` or `pass_through_request` cannot be excused by a comment;
 - a **dynamic registration site** (a path the collector cannot resolve to a
-  literal) that is new or has moved line — `KNOWN_DYNAMIC_REGISTRATIONS` in
-  `tests/route_gate/litellm_routes.py` pins each one by `(file, line)` with its
-  policy.
+  literal) that is new or has moved line — `KNOWN_DYNAMIC_REGISTRATIONS` in the
+  collector pins each one by `(file, line)` with its policy.
 
 The loop:
 
-1. Bump the pin in all **seven** sites at once (`tests/test_litellm_pin.py`
-   names them; `pyproject.toml` is one of them, so CI's `pip install -e .`
-   reads the same proxy the image ships) and install it into `.venv-bench`.
-2. Run the guard: `PYTHONPATH=src .venv-bench/bin/python -m pytest
-   tests/route_gate/test_litellm_route_guard.py -q`. Its failure message names
+1. Bump the pin in all **seven** sites at once (step 1 of the checklist lists
+   them; `pyproject.toml` is one of them, so CI's `pip install -e .` reads the
+   same proxy the image ships) and rebuild the full environment.
+2. Run the guard as step 2 of the checklist shows. Its failure message names
    each unclassified route or moved dynamic site.
 3. **Add a row by hand** to `table.py` for each one, applying the five ordered
    rules in that module's docstring (REWRITTEN generation spellings → stored
    responses by id → any other provider-reaching handler is REFUSE → named
    user-text trees are REFUSE → the rest is the admin surface, PASSTHROUGH with
-   a `justification` when it writes). There is no generator script: the
-   collector is a test helper, and a row is a security decision.
+   a `justification` when it writes). There is no generator script: a row is a
+   security decision.
    A path with a `{parameter}` becomes a `LITELLM_REGEX_TABLE` row, ordered
    longest-static-prefix first.
 4. **Fail closed when unsure.** REFUSE is one line to flip later; a wrong
    PASSTHROUGH is a leak. Record the judgement in the row's `why`.
-5. Re-run the guard on both venvs plus `tests/route_gate/` and
-   `tests/test_asgi_entrypoint.py`.
+5. Re-run the guard, then the rest of the checklist and both test environments.
 
 `GATEWAY_ROUTE_TABLE` (the gateway's own `/healthz/*` and `/metrics`) is
-hand-written and exempt from the source guard — it describes routes litellm does
-not register.
+hand-written and exempt from the step-2 route guard — it describes routes litellm
+does not register.
 
 ## Add a provider (style 2)
 
@@ -257,9 +256,9 @@ works on placeholders, or is a detector on the way in. Do not add an
 `apply_guardrail` or a litellm `CustomGuardrail` for it. An `apply_guardrail`
 anywhere in `CorpLlmGuardrail`'s own MRO stops our pre-call from running and
 refuses to arm (exit 70); a separate class of yours with `apply_guardrail` is a
-litellm guardrail, which the arm check does not see: the config guards refuse it
-(`tests/test_litellm_config_guards.py`: the shipped configs start no litellm
-guardrail). A `CustomGuardrail` turns litellm's per-chunk hooks on for every
+litellm guardrail, which the arm check does not see. The shipped configs start
+no litellm guardrail, and no test checks that (`security.md` §11 (n)), so a config
+change is reviewed for it. A `CustomGuardrail` turns litellm's per-chunk hooks on for every
 callback (`docs/security.md` §15).
 
 ## Tasks several requests await: `inflight.spawn_shared`

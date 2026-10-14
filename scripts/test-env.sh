@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Creates one of the two reproducible test environments the suite gates run in.
+# Creates one of the two reproducible test environments the suite runs in.
 #
 #   scripts/test-env.sh minimal [VENV]   default VENV: .venv-test-minimal
 #   scripts/test-env.sh full    [VENV]   default VENV: .venv-test-full
@@ -11,8 +11,7 @@
 # full:    every extra CI installs + the en_core_web_md wheel, at .venv-bench's versions.
 #
 # Both install against a committed constraints file, so the same recipe gives the
-# same `name==version` set on a laptop and on the CI runner; scripts/test-gates.sh
-# asserts that set (tests/_manifests/env_fingerprint.<env>.json) before collection.
+# same `name==version` set on a laptop and on the CI runner.
 # PYTHON overrides the interpreter; it must be 3.14.
 set -euo pipefail
 
@@ -71,5 +70,4 @@ else
     "${PIP[@]}" install --no-deps "${EN_MODEL_WHEEL}"
 fi
 
-PYTHONPATH="${ROOT}" "${VENV}/bin/python" -m tests._gates.fingerprint "${ENV_NAME}" --print
 echo "OK: ${ENV_NAME} environment at ${VENV}"
