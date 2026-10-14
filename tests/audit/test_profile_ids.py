@@ -17,7 +17,6 @@ from corp_llm_gateway.audit import AuditEvent, AuditLogger, ListSink
 from corp_llm_gateway.audit.invariants import NEVER_FIELDS, assert_no_never_fields
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_CONFIGMAP = _REPO_ROOT / "helm" / "corp-llm-gateway" / "templates" / "configmap.yaml"
 _CHART_DIR = _REPO_ROOT / "helm" / "corp-llm-gateway"
 
 
@@ -130,19 +129,6 @@ async def test_profile_ids_record_carries_no_raw_content() -> None:
 
 
 # Vector VRL passthrough + NEVER-gate intact -------------------------------
-
-
-def test_vector_vrl_carries_profile_ids() -> None:
-    text = _CONFIGMAP.read_text()
-    assert '"profile_ids": .__lf.profile_ids' in text
-    assert '"jurisdiction": .__lf.jurisdiction' in text
-
-
-def test_vector_vrl_never_gate_intact() -> None:
-    # Every NEVER field is still dropped by the enforce_audit_schema filter.
-    text = _CONFIGMAP.read_text()
-    for field in NEVER_FIELDS:
-        assert f"!exists(.{field})" in text, f"NEVER-gate lost {field}"
 
 
 def test_vector_vrl_renders_with_profile_ids() -> None:

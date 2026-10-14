@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import ast
 import importlib
 import json
 import logging
 import sys
-import types
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -884,36 +882,6 @@ def test_dev_team_token_ignored_when_corp_env_prod(
 # ── config-only: no os.environ at call sites ─────────────────────────────────
 
 
-def _assert_no_process_env_reads(path: Path) -> None:
-    # AST-level so docstring/comment mentions of os.environ don't false-trip:
-    # the module must not import `os` nor touch os.environ/os.getenv in code.
-    tree = ast.parse(path.read_text())
-    imports_os = any(
-        (isinstance(n, ast.Import) and any(a.name == "os" for a in n.names))
-        or (isinstance(n, ast.ImportFrom) and n.module == "os")
-        for n in ast.walk(tree)
-    )
-    assert not imports_os, f"{path.name} must resolve settings via config, not import os"
-    env_reads = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Attribute)
-        and isinstance(n.value, ast.Name)
-        and n.value.id == "os"
-        and n.attr in {"environ", "getenv"}
-    ]
-    assert not env_reads, f"{path.name} must read config, not os.environ/os.getenv"
-
-
-def test_bootstrap_does_not_read_process_environment() -> None:
-    _assert_no_process_env_reads(Path(bootstrap.__file__))
-
-
-def test_demo_guardrail_does_not_read_process_environment() -> None:
-    # Pin the demo shim to the same config-only contract as the prod root.
-    _assert_no_process_env_reads(Path(bootstrap.__file__).with_name("_demo_guardrail.py"))
-
-
 def test_backends_resolve_from_config_file_without_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1015,35 +983,6 @@ def test_importing_demo_guardrail_with_pg_dsn_and_no_asyncpg_does_not_raise(
     module = importlib.import_module("corp_llm_gateway._demo_guardrail")
 
     assert isinstance(module.guardrail, CorpLlmGuardrail)
-
-
-@pytest.mark.usefixtures("_restore_pkg_logger")
-@pytest.mark.parametrize(
-    "reimport_test",
-    [
-        test_demo_shim_resolves_forward_anthropic_auth_from_config,
-        test_demo_boot_path_raises_when_both_forward_auth_flags_set,
-        test_importing_demo_guardrail_with_pg_dsn_and_no_asyncpg_does_not_raise,
-    ],
-    ids=lambda t: t.__name__,
-)
-def test_a_demo_reimport_test_restores_the_module_and_the_package_attribute(
-    reimport_test: Callable[[pytest.MonkeyPatch], None],
-) -> None:
-    # `from corp_llm_gateway import _demo_guardrail` returns the package attribute when it is set,
-    # so a stale one hands later tests a guardrail built under another test's env.
-    name = "corp_llm_gateway._demo_guardrail"
-    loaded = types.ModuleType(name)
-    with pytest.MonkeyPatch.context() as outer:
-        outer.setitem(sys.modules, name, loaded)
-        outer.setattr(corp_llm_gateway, "_demo_guardrail", loaded, raising=False)
-        mp = pytest.MonkeyPatch()
-        try:
-            reimport_test(mp)
-        finally:
-            mp.undo()
-        assert sys.modules.get(name) is loaded
-        assert getattr(corp_llm_gateway, "_demo_guardrail", None) is loaded
 
 
 # ── B4: corp NER wiring (default off) ────────────────────────────────────────

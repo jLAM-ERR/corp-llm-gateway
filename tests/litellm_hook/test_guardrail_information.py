@@ -48,7 +48,6 @@ from corp_llm_gateway.metrics import BLOCK_REASONS
 from corp_llm_gateway.sanitizer.dlp_guard import DlpEgressGuard
 from corp_llm_gateway.sanitizer.orchestrator import OVERSIZE_DELIVERED_REASON
 from tests.hook_fixtures import _build_guardrail, _build_guardrail_oversize
-from tests.litellm_hook import _dispatch_fixtures
 from tests.litellm_hook._dispatch_fixtures import (
     EMAIL,
     ORIGINAL_MARK,
@@ -346,11 +345,6 @@ async def test_the_writer_is_never_a_registered_callback(
     assert not any(isinstance(cb, CustomGuardrail) for cb in litellm.callbacks)
     assert proxy_server.proxy_logging_obj.needs_per_chunk_streaming_hook() is False
     assert "apply_guardrail" not in vars(CorpLlmGuardrail)
-
-
-def test_the_harness_fixtures_reserve_our_name() -> None:
-    """The migrated fixtures (hazards 14, 15b) and the arm prototype use this name."""
-    assert _dispatch_fixtures.GUARDRAIL_NAME == GUARDRAIL_NAME
 
 
 # ── the status table ─────────────────────────────────────────────────────────

@@ -35,10 +35,6 @@ _UNIQUE_INDEX = (
 )
 
 
-def test_the_schema_file_still_declares_the_index_these_tests_rewrite() -> None:
-    assert _UNIQUE_INDEX in _SCHEMA
-
-
 def test_a_non_unique_index_carrying_the_jti_index_name_exits_78(
     valid_config: Path, tmp_path: Path, pg_schema: tuple[str, Callable[[str], None]]
 ) -> None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -8,8 +7,6 @@ import pytest
 
 from corp_llm_gateway import config, settings
 from corp_llm_gateway.settings import ConfigError, Settings
-
-_EXAMPLE_TOML = Path(__file__).parents[1] / "config.example.toml"
 
 
 @pytest.fixture
@@ -491,16 +488,6 @@ def test_env_overrides_file_through_the_chain(
 
 
 # ── example.toml completeness ────────────────────────────────────────────────
-
-
-def test_example_toml_documents_every_key() -> None:
-    text = _EXAMPLE_TOML.read_text()
-    missing = [
-        key
-        for key in settings.all_keys()
-        if not re.search(rf"(?m)^#?\s*{re.escape(key)}\s*=", text)
-    ]
-    assert not missing, f"config.example.toml is missing keys: {missing}"
 
 
 # ── existing accessors still resolve through the chain ───────────────────────

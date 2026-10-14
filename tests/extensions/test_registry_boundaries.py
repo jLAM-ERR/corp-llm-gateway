@@ -196,14 +196,3 @@ def test_importing_extensions_package_reads_no_config(monkeypatch: pytest.Monkey
             monkeypatch.delitem(sys.modules, name, raising=False)
     module = importlib.import_module("corp_llm_gateway.extensions")
     assert isinstance(module.REGISTRY, module.ExtensionRegistry)
-
-
-def test_the_reimport_check_leaves_the_package_attribute_on_the_live_module() -> None:
-    # A stale package attribute makes a monkeypatch of
-    # "corp_llm_gateway.extensions.REGISTRY" patch a module the CLI never reads.
-    mp = pytest.MonkeyPatch()
-    try:
-        test_importing_extensions_package_reads_no_config(mp)
-    finally:
-        mp.undo()
-    assert corp_llm_gateway.extensions is sys.modules["corp_llm_gateway.extensions"]

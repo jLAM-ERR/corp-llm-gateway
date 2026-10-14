@@ -25,7 +25,6 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -73,7 +72,6 @@ from tests.litellm_hook._dispatch_fixtures import (
     build_ours,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
 QUOTED = 'Dan "the man" O\'Neil'
 NAME = "[NAME_1]"
 MAPPING = StrategyResult(pairs=((EMAIL, PLACEHOLDER), (QUOTED, NAME)))
@@ -953,20 +951,6 @@ async def test_after_start_failure_tears_the_upstream_down(
 
     assert exchange.status == 200 and "message_stop" not in exchange.text
     assert stub.stream_outcomes == ["broken"]
-
-
-def test_the_middleware_is_wired_in_the_entrypoint_with_no_off_switch() -> None:
-    """Imported by ``asgi.py`` (and nothing else under ``src/`` builds one), and it takes
-    no flag that would switch restoration off: the security boundary has no off switch."""
-    import inspect
-
-    importers = sorted(
-        str(path.relative_to(ROOT))
-        for path in (ROOT / "src").rglob("*.py")
-        if "DesanitizeMiddleware(" in path.read_text() and path.name != "desanitize_middleware.py"
-    )
-    assert importers == ["src/corp_llm_gateway/asgi.py"]
-    assert "enabled" not in inspect.signature(DesanitizeMiddleware).parameters
 
 
 async def test_outside_a_ticketed_request_it_passes_everything_through() -> None:

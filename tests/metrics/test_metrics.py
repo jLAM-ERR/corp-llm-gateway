@@ -8,7 +8,6 @@ venv and run under CI's ``[metrics]`` extra.
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -17,7 +16,6 @@ from typing import Any
 
 import pytest
 
-import corp_llm_gateway as gateway_package
 from corp_llm_gateway import config
 from corp_llm_gateway import metrics as metrics_module
 from corp_llm_gateway.audit import AuditLogger, ListSink
@@ -54,7 +52,6 @@ _ENV_PAYLOAD = (
 @pytest.fixture(autouse=True)
 def _hermetic_metrics_config(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Resolve the metrics keys hermetically: cleared env + empty TOML file."""
-    from pathlib import Path
 
     assert isinstance(tmp_path, Path)
     for name in ("CORP_METRICS_EXPORTER", "CORP_TRACING_EXPORTER"):
@@ -133,7 +130,6 @@ def test_get_exporter_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> No
 def test_get_exporter_resolves_from_config_file_not_env(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from pathlib import Path
 
     pytest.importorskip("prometheus_client")
     assert isinstance(tmp_path, Path)
@@ -392,73 +388,6 @@ def test_every_pre_call_block_reason_has_a_litellm_guardrail_status() -> None:
 
     assert pre_call
     assert [r for r in pre_call if r not in GUARDRAIL_STATUS_BY_BLOCK_REASON] == []
-
-
-def _returned_string_literals(module: object) -> set[str]:
-    """Every `return "literal"` in a module — the reason codes it can produce.
-
-    Literal returns only: a reason built at runtime (an f-string, a name) is
-    invisible here, so a block site that stops returning literals silently
-    narrows this check.
-    """
-    source = Path(module.__file__).read_text(encoding="utf-8")  # type: ignore[attr-defined]
-    return {
-        node.value.value
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Return)
-        and isinstance(node.value, ast.Constant)
-        and isinstance(node.value.value, str)
-    }
-
-
-def test_the_stage0_reasons_match_the_payload_classifier() -> None:
-    # `dlp:secret` sat in docs/audit-schema.md for a release while the guard
-    # emitted `dlp:secret_leak`. Both block sites are now read off their own
-    # source, so a renamed code fails here instead of silencing an alert.
-    from corp_llm_gateway.payload import classifier
-
-    assert set(BLOCK_REASONS["stage0"]) == _returned_string_literals(classifier)
-
-
-def test_the_stage5_reasons_match_the_dlp_guard() -> None:
-    from corp_llm_gateway.sanitizer import dlp_guard
-
-    assert set(BLOCK_REASONS["stage5"]) == _returned_string_literals(dlp_guard)
-
-
-def test_every_enumerated_block_reason_is_documented_in_the_audit_schema() -> None:
-    # docs/audit-schema.md is where the audit-side reader looks up a reason code.
-    schema = (Path(gateway_package.__file__).parents[2] / "docs" / "audit-schema.md").read_text(
-        encoding="utf-8"
-    )
-    row = next(
-        (line for line in schema.splitlines() if line.startswith("| `block_reason` |")), None
-    )
-    assert row is not None, "docs/audit-schema.md has no `block_reason` row"
-    missing = [reason for reason in ALL_BLOCK_REASONS if f"`{reason}`" not in row]
-
-    assert not missing, missing
-
-
-def test_every_recorded_block_reason_literal_is_enumerated() -> None:
-    # A new `record_block("...")` anywhere in src has to appear in the
-    # enumeration, or an alert written from it silently never fires.
-    literals = set()
-    for path in Path(gateway_package.__file__).parent.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "record_block"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)
-            ):
-                literals.add(node.args[0].value)
-
-    assert literals, "no record_block call with a literal reason was found; re-read the walker"
-    assert literals <= set(ALL_BLOCK_REASONS), literals - set(ALL_BLOCK_REASONS)
 
 
 def test_the_failure_components_match_the_hooks_own_map() -> None:

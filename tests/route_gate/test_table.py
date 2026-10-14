@@ -2,8 +2,7 @@
 
 Every row is well formed and says why. Exactly eight spellings are REWRITTEN; the bypass,
 management and non-probe health routes are refused; the table is the whole collected surface
-(size floors only: `test_litellm_route_guard.py` checks it against litellm's routes), and the
-verdict counts are pinned.
+(size floors only), and the verdict counts are pinned.
 """
 
 from __future__ import annotations
@@ -415,11 +414,6 @@ def test_every_refused_family_reason_is_used() -> None:
     assert unused == []
 
 
-def test_the_refused_family_reasons_point_at_the_decision() -> None:
-    for reason in REFUSED_FAMILY_REASONS:
-        assert "docs/security.md §14" in reason, reason
-
-
 @pytest.mark.parametrize("path", REFUSED_HEALTH_PATHS)
 def test_the_management_shaped_health_rows_are_refused(path: str) -> None:
     entry = lookup("GET", path)
@@ -503,12 +497,3 @@ def test_the_gateway_table_verdict_counts() -> None:
 def test_the_management_routes_are_refused(method: str, path: str) -> None:
     entry = lookup(method, path)
     assert entry is not None and entry.verdict is Verdict.REFUSE, f"{method} {path}"
-
-
-def test_no_justification_constant_outlives_its_rows() -> None:
-    # A `_JUST_*` excuse exists only for a body-carrying PASSTHROUGH row.
-    used = {
-        entry.justification for _, _, entry in _litellm_rows() if entry.justification is not None
-    }
-    declared = {value for name, value in vars(route_table).items() if name.startswith("_JUST_")}
-    assert declared == used

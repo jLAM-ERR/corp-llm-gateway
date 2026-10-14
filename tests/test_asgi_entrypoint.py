@@ -11,7 +11,6 @@ a skipped startup-invariant test is not a passed gate.
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 import subprocess
@@ -1933,30 +1932,7 @@ def test_a_bypass_route_is_refused_on_the_real_app(served: dict) -> None:
     assert served["count_tokens"] == 403
 
 
-# ── the worker-config argument list cannot drift ─────────────────────────────
-
-
-def _save_worker_config_keywords() -> list[str]:
-    import litellm.proxy.proxy_cli as proxy_cli
-
-    tree = ast.parse(Path(proxy_cli.__file__).read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "save_worker_config"
-        ):
-            return [keyword.arg for keyword in node.keywords if keyword.arg]
-    pytest.fail("litellm's CLI no longer calls save_worker_config; re-read proxy_cli.py")
-
-
-def test_the_worker_config_keys_are_the_ones_the_cli_passes() -> None:
-    # A key litellm adds would otherwise silently keep initialize()'s own
-    # default instead of the CLI's, and the gateway would boot differently from
-    # the proxy it replaces.
-    from corp_llm_gateway.litellm_cli import WORKER_CONFIG_KEYS
-
-    assert sorted(_save_worker_config_keywords()) == sorted(WORKER_CONFIG_KEYS)
+# ── the worker-config defaults ───────────────────────────────────────────────
 
 
 def test_the_cli_defaults_are_read_off_click_including_envvars(

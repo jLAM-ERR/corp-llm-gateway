@@ -32,9 +32,8 @@ SNIPPET_PLACEHOLDERS = frozenset(
 )
 
 # Every (method, path) litellm registers at an admitted path that nginx does not
-# admit, with what blocks it. Produced by the collector against litellm 1.101.0
-# — what that release shows, not a closed set: a bump that adds a pair at an
-# admitted path fails the guards until someone puts it on one of the two lists.
+# admit, with what blocks it, as read off litellm 1.101.0's routes — what that
+# release shows, not a closed set: a litellm bump has to re-check it by hand.
 BLOCKED_AT_NGINX: dict[tuple[str, str], str] = {
     (WEBSOCKET, "/v1/responses"): (
         "the handshake is a GET, which `limit_except POST` refuses; `Upgrade` and "

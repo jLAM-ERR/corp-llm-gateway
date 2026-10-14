@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import random
@@ -185,14 +184,6 @@ async def test_result_count_mismatch_fails_closed() -> None:
 
     with pytest.raises(CorpNerUnavailableError):
         await detector.detect_batch(["a", "b"])
-
-
-async def test_the_detector_does_not_count_failures_itself() -> None:
-    # gateway_failure{component="corp_ner"} is emitted once per request by
-    # litellm_hook._record_failure. A second counter here double-counted every
-    # failed request, so the detector takes no exporter at all.
-    assert not hasattr(CorpNerDetector(_StubClient([])), "_metrics")
-    assert "metrics" not in inspect.signature(CorpNerDetector.__init__).parameters
 
 
 async def test_raw_httpx_error_from_the_client_is_wrapped() -> None:

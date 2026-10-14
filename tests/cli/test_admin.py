@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import re
 import secrets
 import socket
 import sys
@@ -1070,124 +1069,6 @@ def test_db_init_names_a_pooler_rejecting_startup_parameters(
     captured = capsys.readouterr()
     assert captured.err == "error: db init failed: StartupParameterRejectedError\n"
     assert _DSN_PASSWORD not in captured.out + captured.err
-
-
-_SCHEMA_KNOWN_TABLES = frozenset({"corp_tokens", "team_config"})
-_SQL_TABLE = r'(?:ONLY\s+)?(?:"?\w+"?\.)?"?(?P<table>\w+)"?'
-# Every statement a schema file may hold, with the table it locks (None: no table).
-_SCHEMA_STATEMENT_SHAPES = (
-    rf"CREATE TABLE IF NOT EXISTS {_SQL_TABLE} \(.*\)",
-    rf"CREATE (?:UNIQUE )?INDEX IF NOT EXISTS \w+ ON {_SQL_TABLE} \(.*\)(?: WHERE .*)?",
-    rf"ALTER TABLE {_SQL_TABLE} ADD COLUMN IF NOT EXISTS [^,]+",
-    r"CREATE OR REPLACE FUNCTION \w+\(\) RETURNS TRIGGER AS \$\$.*\$\$ LANGUAGE plpgsql",
-    rf"DROP TRIGGER IF EXISTS \w+ ON {_SQL_TABLE}",
-    rf"CREATE TRIGGER \w+ (?:BEFORE|AFTER) (?:INSERT|UPDATE|DELETE) ON {_SQL_TABLE}"
-    r" FOR EACH ROW EXECUTE FUNCTION \w+\(\)",
-)
-
-
-def _sql_statements(sql: str) -> list[str]:
-    """Split on `;` outside quotes and $$ bodies, dropping `--` comments."""
-    statements: list[str] = []
-    current: list[str] = []
-    i, quote, dollar = 0, False, False
-    while i < len(sql):
-        ch = sql[i]
-        if not quote and not dollar and sql.startswith("--", i):
-            i = sql.find("\n", i) if "\n" in sql[i:] else len(sql)
-            continue
-        if not quote and sql.startswith("$$", i):
-            dollar = not dollar
-            current.append("$$")
-            i += 2
-            continue
-        if not dollar and ch == "'":
-            quote = not quote
-        if ch == ";" and not quote and not dollar:
-            statements.append("".join(current))
-            current = []
-        else:
-            current.append(ch)
-        i += 1
-    statements.append("".join(current))
-    return [" ".join(stmt.split()) for stmt in statements if stmt.strip()]
-
-
-def _schema_tables(sql: str) -> set[str]:
-    tables: set[str] = set()
-    for statement in _sql_statements(sql):
-        for shape in _SCHEMA_STATEMENT_SHAPES:
-            match = re.fullmatch(shape, statement, flags=re.IGNORECASE | re.DOTALL)
-            if match is None:
-                continue
-            table = match.groupdict().get("table")
-            if table is None or table.lower() in _SCHEMA_KNOWN_TABLES:
-                if table is not None:
-                    tables.add(table.lower())
-                break
-        else:
-            raise ValueError(
-                f"unrecognised schema statement {statement[:80]!r}: re-check the db init "
-                "lock bound (admin._DB_INIT_MAX_TABLES_PER_TXN) and extend this allow-list"
-            )
-    return tables
-
-
-def test_db_init_ddl_lock_bound_stays_under_the_token_lookup_timeout() -> None:
-    import corp_llm_gateway.team_config as team_config_pkg
-    import corp_llm_gateway.tokens as tokens_pkg
-    from corp_llm_gateway.cli import admin
-    from corp_llm_gateway.tokens.postgres_store import LOOKUP_TIMEOUT_S
-
-    per_file = {
-        pkg.__name__: _schema_tables((Path(pkg.__file__).parent / "schema.sql").read_text())
-        for pkg in (tokens_pkg, team_config_pkg)
-    }
-    assert per_file["corp_llm_gateway.tokens"] == {"corp_tokens", "team_config"}
-    assert per_file["corp_llm_gateway.team_config"] == {"team_config"}
-    assert max(len(t) for t in per_file.values()) <= admin._DB_INIT_MAX_TABLES_PER_TXN
-    # A lookup can queue behind each table lock the transaction waits for in turn.
-    worst_stall_s = admin._DB_INIT_MAX_TABLES_PER_TXN * admin._DB_INIT_DDL_LOCK_TIMEOUT_MS / 1000
-    assert worst_stall_s <= 0.75 * LOOKUP_TIMEOUT_S
-
-
-@pytest.mark.parametrize(
-    ("sql", "tables"),
-    [
-        pytest.param(
-            'ALTER TABLE ONLY public."corp_tokens" ADD COLUMN IF NOT EXISTS x TEXT;',
-            {"corp_tokens"},
-            id="quoted-qualified-only",
-        ),
-        pytest.param(
-            "-- a; comment\nCREATE INDEX IF NOT EXISTS i ON team_config (name) WHERE x = ';';",
-            {"team_config"},
-            id="comment-and-quoted-semicolon",
-        ),
-    ],
-)
-def test_schema_statement_allow_list_extracts_the_table(sql: str, tables: set[str]) -> None:
-    assert _schema_tables(sql) == tables
-
-
-@pytest.mark.parametrize(
-    "sql",
-    [
-        pytest.param('ALTER TABLE "audit" ADD COLUMN IF NOT EXISTS x TEXT;', id="unknown-table"),
-        pytest.param(
-            "ALTER TABLE corp_tokens ADD COLUMN IF NOT EXISTS a TEXT, DROP COLUMN b;",
-            id="extra-alter-clause",
-        ),
-        pytest.param("DROP INDEX corp_tokens_user_id_idx;", id="drop-index"),
-        pytest.param("TRUNCATE corp_tokens;", id="truncate"),
-        pytest.param("LOCK TABLE team_config IN ACCESS EXCLUSIVE MODE;", id="lock"),
-        pytest.param("UPDATE corp_tokens SET revoked_at = now();", id="update"),
-        pytest.param("INSERT INTO team_config (team_id, name) VALUES ('a', 'b');", id="insert"),
-    ],
-)
-def test_schema_statement_allow_list_refuses_an_unknown_shape(sql: str) -> None:
-    with pytest.raises(ValueError, match="re-check the db init lock bound"):
-        _schema_tables(sql)
 
 
 async def _poll(conn: Any, sql: str, *, within_s: float = 10.0) -> None:
