@@ -42,7 +42,8 @@ def _rewritten_rows() -> list[tuple[str, str]]:
 def test_the_rewritten_set_is_the_eight_generation_spellings() -> None:
     # Three more spellings reach the hook (`/openai/v1/responses`,
     # `/openai/v1/responses/compact`, `/openai/deployments/{model:path}/chat/completions`)
-    # and are REFUSE anyway — see the ordering test below.
+    # and are REFUSE anyway: litellm's raw `/openai/{endpoint:path}` passthrough
+    # also matches them (next test).
     assert _rewritten_rows() == [
         ("POST", "/chat/completions"),
         ("POST", "/engines/{model:path}/chat/completions"),
