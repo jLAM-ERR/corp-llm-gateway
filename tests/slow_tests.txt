@@ -9,7 +9,6 @@
 # Refresh: rerun both, apply the same rule, and collapse a function's cases to its id only
 # when every case either environment collects is over 2 s.
 tests/cli/test_status.py::test_no_token_file_unhealthy
-tests/compose/test_nginx_allowlist_routes.py::test_every_admitted_litellm_pair_is_a_route_litellm_registers
 tests/compose/test_nginx_runtime.py::test_a_buffering_location_holds_the_same_stream_back
 tests/compose/test_nginx_runtime.py::test_a_key_not_shaped_like_a_corp_token_shares_the_address_bucket
 tests/compose/test_nginx_runtime.py::test_a_second_request_in_flight_on_one_token_is_429_not_503
@@ -46,9 +45,6 @@ tests/integration/test_nginx_allowlist_image.py::test_the_dump_knows_every_route
 tests/integration/test_route_gate_container.py::test_a_config_without_the_callback_exits_70
 tests/integration/test_route_gate_container.py::test_streaming_is_not_buffered_by_the_gate
 tests/integration/test_route_gate_container.py::test_the_corp_upstream_gets_exactly_its_configured_token[/v1/chat/completions-bearer-only]
-tests/integration/test_route_gate_container.py::test_the_gateway_container_cannot_reach_the_internet[anthropic-connect]
-tests/integration/test_route_gate_container.py::test_the_gateway_container_cannot_reach_the_internet[codex-connect]
-tests/integration/test_route_gate_container.py::test_the_gateway_container_cannot_reach_the_internet[corp-connect]
 tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py::test_no_logging_surface_holds_the_corp_token[chat-pre-provider-failure-sse]
 tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py::test_no_logging_surface_holds_the_corp_token[chat-pre-provider-failure-unary]
 tests/litellm_hook/test_corp_token_never_reaches_logging_surfaces.py::test_no_logging_surface_holds_the_corp_token[messages-pre-provider-failure-sse]

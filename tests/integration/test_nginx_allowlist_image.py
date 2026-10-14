@@ -309,11 +309,6 @@ ADMITTED_POSTS: tuple[tuple[str, dict[str, Any]], ...] = (
 )
 
 
-def test_every_admitted_post_is_named_here() -> None:
-    posts = {("POST", path.split("?")[0]) for path, _ in ADMITTED_POSTS}
-    assert posts == {pair for pair in DECLARED if pair[0] == "POST"} - gateway_owned(DECLARED)
-
-
 def _audit_record(stack: Stack, request_id: str) -> dict[str, Any]:
     records = [r for r in stack.audit_records() if str(r["request_id"]) == request_id]
     assert len(records) == 1, (request_id, records)

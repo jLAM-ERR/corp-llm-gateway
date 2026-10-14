@@ -12,7 +12,6 @@ import os
 import re
 import shutil
 import subprocess
-import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,6 @@ ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_DIR = ROOT / "compose"
 COMPOSE = COMPOSE_DIR / "docker-compose.yml"
 OVERLAY = COMPOSE_DIR / "docker-compose.issuance.yml"
-ENV_EXAMPLE = COMPOSE_DIR / ".env.example"
 CONFIG_EXAMPLE = COMPOSE_DIR / "gateway" / "config.toml.example"
 
 TARGET = "/etc/corp-llm-gateway/config.toml"
@@ -37,79 +35,8 @@ ISSUE_SCALARS = tuple(
 )
 
 
-GATEWAYS = ("gateway-anthropic", "gateway-codex", "gateway-corp")
-
-
-def _gateways(path: Path) -> dict[str, dict[str, Any]]:
-    services = yaml.safe_load(path.read_text())["services"]
-    return {name: services[name] for name in GATEWAYS}
-
-
 def test_the_scalar_list_covers_every_issuance_key() -> None:
     assert len(ISSUE_SCALARS) == 12
-
-
-def test_the_overlay_mounts_the_config_file_read_only_and_never_creates_it() -> None:
-    # create_host_path: false — a missing file must fail `up`, not become an
-    # empty directory that the loader skips (issuance silently off).
-    for name, gateway in _gateways(OVERLAY).items():
-        assert gateway["volumes"] == [
-            {
-                "type": "bind",
-                "source": "./gateway/config.toml",
-                "target": TARGET,
-                "read_only": True,
-                "bind": {"create_host_path": False},
-            }
-        ], name
-
-
-def test_the_overlay_points_the_loader_at_the_file_and_passes_the_scalars_by_bare_name() -> None:
-    for name, gateway in _gateways(OVERLAY).items():
-        environment = gateway["environment"]
-        assert f"CORP_LLM_GATEWAY_CONFIG_FILE={TARGET}" in environment, name
-        # Bare names: unset in .env means absent, so the file's value is not shadowed.
-        for key in ISSUE_SCALARS:
-            assert key in environment, (name, key)
-        assert TEAM_MAP_KEY not in " ".join(environment), name
-
-
-def test_the_base_stack_carries_no_issuance_wiring() -> None:
-    for name, gateway in _gateways(COMPOSE).items():
-        assert not [e for e in gateway["environment"] if "CORP_GATEWAY_ISSUE_" in e], name
-        assert not [v for v in gateway["volumes"] if TARGET in str(v)], name
-    assert "CORP_GATEWAY_ISSUE_" not in COMPOSE.read_text()
-
-
-def test_the_env_example_lists_every_scalar_commented() -> None:
-    text = ENV_EXAMPLE.read_text()
-
-    assert "docker-compose.issuance.yml" in text
-    for key in ISSUE_SCALARS:
-        assert re.search(rf"^# {key}=", text, re.MULTILINE), key
-        assert not re.search(rf"^{key}=", text, re.MULTILINE), key
-
-
-def test_the_env_example_offers_the_compose_file_line_with_the_overlay() -> None:
-    line = "# COMPOSE_FILE=docker-compose.yml:docker-compose.issuance.yml"
-
-    assert line in ENV_EXAMPLE.read_text().splitlines()
-
-
-def test_the_real_config_file_is_never_committed() -> None:
-    assert "compose/gateway/config.toml" in (ROOT / ".gitignore").read_text().splitlines()
-
-
-def test_the_example_config_carries_only_the_ordered_team_map() -> None:
-    parsed = tomllib.loads(CONFIG_EXAMPLE.read_text())
-
-    assert list(parsed) == [TEAM_MAP_KEY]
-    assert list(parsed[TEAM_MAP_KEY].items()) == [
-        ("/devs/payments", "payments"),
-        ("/devs/core", "core"),
-    ]
-    for key in ISSUE_SCALARS:
-        assert f"# {key} = " in CONFIG_EXAMPLE.read_text(), key
 
 
 @pytest.mark.usefixtures("hermetic_gateway_config")

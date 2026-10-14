@@ -1480,7 +1480,7 @@ def test_the_gateway_never_sees_a_path_nginx_did_not_admit(
         assert (records[0]["method"], records[0]["target"]) in DECLARED, (target, records[0])
 
 
-# One value, kept so the must-keep case ids ([host-base], [port-base]) stay as recorded.
+# One value, kept so the case ids ([host-base], [port-base]) stay stable.
 @pytest.mark.parametrize("overlay", ["base"])
 @pytest.mark.parametrize("routing", ["host", "port"])
 def test_the_allow_list_holds_under_both_routings_on_the_subscription_stack(

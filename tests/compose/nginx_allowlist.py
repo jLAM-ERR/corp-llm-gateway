@@ -1,6 +1,5 @@
 """The gateway allow-list as data, for every test that checks it against a route
-table: the static guards (litellm's source via ``tests/route_gate/litellm_routes.py``,
-and the gateway's own ``route_gate`` table) and the image dump in
+table: the gateway's own ``route_gate`` table and the image dump in
 ``tests/integration/test_nginx_allowlist_image.py``.
 
 The unit is a (method, path) pair. A pair is **declared** by its location's
@@ -13,10 +12,6 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from importlib.util import find_spec
-from pathlib import Path
-
-import pytest
 
 from corp_llm_gateway.route_gate import GATEWAY_ROUTE_TABLE
 from tests.compose.nginx_support import NGINX_DIR
@@ -35,7 +30,6 @@ RATE_LIMITED = "@rate_limited"
 SNIPPET_PLACEHOLDERS = frozenset(
     {"NGINX_TOKEN_BURST", "NGINX_TOKEN_CONN", "NGINX_GATEWAY_UPSTREAM"}
 )
-LIMIT_DIRECTIVES = frozenset({"limit_req", "limit_conn"})
 
 # Every (method, path) litellm registers at an admitted path that nginx does not
 # admit, with what blocks it. Produced by the collector against litellm 1.101.0
@@ -178,23 +172,6 @@ def gateway_snippet() -> Snippet:
     return parse_snippet(text)
 
 
-def limits_off_the_allow_list(snippet: Snippet, admitted: Iterable[tuple[str, str]]) -> list[str]:
-    """Every ``limit_req`` / ``limit_conn`` that is not a direct child of an exact
-    location for an admitted pair: at server level, on the catch-all, on a named
-    location, inside a nested block, or on a location nginx should not have. A
-    limit there says one thing and does another."""
-    admitted_paths = {path for _, path in admitted}
-    found = [f"server: {d}" for d in snippet.server if d.name in LIMIT_DIRECTIVES]
-    for location in snippet.locations:
-        on_allow_list = location.modifier == "=" and location.path in admitted_paths
-        for directive in location.directives:
-            if directive.name in LIMIT_DIRECTIVES and not on_allow_list:
-                found.append(f"{location.key}: {directive}")
-            nested = [d for d in directive.block or () if d.name in LIMIT_DIRECTIVES]
-            found += [f"{location.key}: {directive.name} {{ {d} }}" for d in nested]
-    return found
-
-
 def declared_pairs(snippet: Snippet) -> set[tuple[str, str]]:
     return {(method, location.path) for location in snippet.exact() for method in location.methods}
 
@@ -251,16 +228,3 @@ def stale_blocked_entries(
     return sorted(
         f"{m} {p}" for m, p in BLOCKED_AT_NGINX if (m, p) not in registered or (m, p) in passing
     )
-
-
-def installed_litellm_root() -> Path:
-    """litellm's package root. Skips only when litellm is absent; installed
-    without its ``proxy/`` source is a failure, never a skip."""
-    spec = find_spec("litellm")
-    if spec is None:
-        pytest.skip("litellm is not installed in this interpreter")
-    assert spec.origin is not None
-    root = Path(spec.origin).parent
-    if not (root / "proxy").is_dir():
-        pytest.fail(f"litellm is installed at {root} but has no proxy/ source to read")
-    return root

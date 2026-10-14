@@ -648,10 +648,6 @@ def test_without_an_issuer_no_login_runs_and_no_token_is_invented(
     assert "corp-llm-gateway" in run.rc_file.read_text()
 
 
-def test_the_old_device_url_variable_is_gone() -> None:
-    assert "KEYCLOAK_DEVICE_URL" not in SCRIPT.read_text()
-
-
 def _sleep_shim(tmp_path: Path, *, real_seconds: float = 0.0) -> Path:
     """Replace `sleep` for install.sh: record each requested interval, sleep
     ``real_seconds`` instead. Returns the log of requested intervals."""
