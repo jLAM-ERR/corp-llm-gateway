@@ -67,7 +67,7 @@ jiter==0.17.0
 jmespath==1.1.0
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-litellm==1.101.0
+litellm==1.101.3
 litellm-enterprise==0.1.65
 litellm-proxy-extras==0.4.94
 markdown-it-py==4.2.0
